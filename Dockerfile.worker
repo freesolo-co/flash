@@ -1,11 +1,9 @@
-# Flash prebuilt WORKER image — the full training stack baked in so Vast/RunPod cold-start
-# skips the per-host dep install (the dominant cold-start cost; measured 7-86s on fresh Vast).
+# Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # The worker still fetches the flash `code/**` from HF at runtime, so only DEPS live here.
 #
-# This image is the default worker image — Vast always uses it; on RunPod, FLASH_WORKER_IMAGE
-# overrides it and the Flash live-endpoint path boot-installs deps instead. It is referenced by name
-# in providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be published to GHCR and the package set PUBLIC
-# (no registry login is configured) — otherwise Vast/RunPod can't pull it. Normally built by
+# This image is referenced by name in flash/providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be
+# published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
+# pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
 #
 #   docker build -f Dockerfile.worker -t ghcr.io/freesolo-co/flash-worker:cu128 .
@@ -14,13 +12,22 @@
 #
 # Base is torch 2.10 / cu12.8 / cudnn9 (-devel = has nvcc for any source builds); it ships the
 # CUDA 12.8 runtime libs the PyPI wheels link against. The pinned stack mirrors
-# providers/runpod/train/deps.py:WORKER_DEPS.
+# flash/providers/runpod/train/deps.py:WORKER_DEPS.
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1
+
+# Compiled-kernel cache dirs (Triton JIT + TorchInductor). Point both backends at a stable on-image
+# location so a BAKED mega-cache (below, opt-in) lands where the runtime looks, and so a first-run
+# JIT on a cold worker writes here too. These ENVs are always set (cheap); whether the dir is
+# pre-populated is what the opt-in bake controls. engine.worker._load_kernel_cache_if_present reads
+# /opt/flash/kernelcache at boot.
+ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
+    TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor
+RUN mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor
 
 # build-essential for Triton/Inductor (Liger) + any source builds; git for pip VCS installs.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl \
@@ -38,16 +45,22 @@ RUN pip install --no-cache-dir \
     "accelerate>=1.4" \
     "wandb>=0.17" \
     "liger-kernel>=0.5" \
-    "flash-linear-attention==0.5.0" \
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \
+    "tilelang==0.1.11" \
+    "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
-    "freesolo>=0.2.46" \
+    "freesolo>=0.2.49" \
     "runpod"
-# Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels, which are correct
-# on consumer cards (Ampere/Ada/Blackwell). On Hopper (sm90) fla's GDN chunk_bwd is miscomputed
-# (fla #640) and its cumsum kernels hit a num_warps=8 LinearLayout assertion (fla #734); both fixes
-# are unreleased (post-0.5.0 git main) and #640's backward correctness is unconfirmed, so on Hopper
-# the worker DROPS fla (engine.worker._drop_fla_on_hopper) and transformers uses its native
-# pure-PyTorch delta rule — slower but correct.
+# Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
+# (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
+# miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
+# we bake the pinned tilelang==0.1.11 + apache-tvm-ffi==0.1.11 (0.1.12 double-registers TVM-FFI ->
+# `import tilelang` aborts) and KEEP fla on every arch; flash.engine.worker._ensure_fla_fastpath_on_hopper
+# ensures the tilelang backend is live on sm90 before any model import. Validated win vs the old
+# pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
+# seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
+# (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
+# reproducible image builds — keep this SHA in lockstep with flash/providers/runpod/train/deps.py:WORKER_DEPS.
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
@@ -66,6 +79,97 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" MAX_JOBS=4 \
     pip install --no-cache-dir "${FLASH_ATTN_SPEC}" --no-build-isolation \
     && echo "flash-attn: installed (${FLASH_ATTN_SPEC})" || echo "flash-attn: build failed, SDPA fallback"
 
+# FlashAttention-3 (used on Hopper sm90: H100/H200). transformers routes
+# attn_implementation="flash_attention_3" to a LOCAL ``flash_attn_interface`` module (the
+# ``flash-attn-3`` build) — NOT the HF Kernels-Hub, whose torch2.10-compatible versions break
+# ``import transformers``. Baking it in lets the trainer use FA3 on the model's FULL-attention
+# (softmax) layers on Hopper (engine.worker.perf.optimal_attn_impl); the Qwen3.5 Gated-DeltaNet
+# linear-attention layers are unaffected (FA does not apply to linear attention).
+# DEFAULT-ON, like FA2: FLASH_ATTN_3_SPEC defaults to a validated prebuilt cu128/torch2.10 wheel so
+# ``flash_attn_interface`` is ALWAYS present on Hopper — we control the image, so FA3 should never be
+# missing and the engine's SDPA fallback is pure defense-in-depth (only hit via FLASH_DISABLE_FA3).
+# It's a no-op on non-Hopper archs (optimal_attn_impl only probes FA3 on sm90); the wheel just rides
+# along. Override FLASH_ATTN_3_SPEC to pin a different wheel, or set it to "" to drop FA3. Best-effort:
+# a failed install never blocks the image, and ``import flash_attn_interface`` is verified so a broken
+# install can't ship as "present" and then crash a run.
+# NOTE: keep this default in sync with .github/workflows/worker-image.yml's flash_attn_3_spec input.
+ARG FLASH_ATTN_3_SPEC=https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl
+RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
+      FLASH_ATTN_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=4 \
+      pip install --no-cache-dir "${FLASH_ATTN_3_SPEC}" --no-build-isolation \
+      && python -c "import flash_attn_interface; print('flash_attn_interface: import OK')" \
+      && echo "flash-attn-3: installed (${FLASH_ATTN_3_SPEC})" \
+      || echo "flash-attn-3: install failed -> SDPA fallback on Hopper"; \
+    else echo "flash-attn-3: skipped (FLASH_ATTN_3_SPEC unset) -> SDPA on Hopper"; fi
+
+# causal_conv1d: the short depthwise causal conv kernel whose ``seq_idx`` arg resets the conv at
+# example boundaries. Together with fla's ``cu_seqlens`` (which resets the DeltaNet recurrence) it
+# lets the GatedDeltaNet hybrids (Qwen3.5/3.6) PACK boundary-correctly — a 4D block-diagonal mask
+# alone only fixes the full-attention layers (engine.worker.packing.gdn_packing_available gates the
+# SFT packing path on this import). GPU-validated (RTX 5090, Qwen3.5-0.8B): a packed example's output
+# is byte-identical regardless of its neighbors' content (zero cross-example leakage). Best-effort
+# source build (small + fast vs flash-attn); on failure GDN packing simply stays off and Qwen3.5/3.6
+# train UNPACKED as before — no correctness risk. Arch-bounded to the catalog GPUs to cap build time.
+# PINNED (compiled CUDA extension) for reproducible image builds — an unpinned upstream release could
+# silently change behavior or break the build. On a build that compiles but then fails to IMPORT
+# (ABI/symbol mismatch), UNINSTALL it: transformers' is_causal_conv1d_available() is a find_spec probe,
+# so a present-but-broken package would pass it and then crash at Qwen3.5 model load instead of safely
+# training unpacked. (engine.worker.packing.gdn_packing_available also re-imports it as defense.)
+# 1.6.2.post1 builds Blackwell/sm120 kernels (RTX 5090, flash's default GPU); older lines (e.g. 1.5.2)
+# import fine but raise "no kernel image is available for execution on the device" at the first conv
+# forward on sm120 — GPU-verified. engine.worker.packing.gdn_packing_available runs a conv smoke too,
+# so even a wrong-arch build can't crash a run (it just keeps GDN packing off).
+RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+    pip install --no-cache-dir "causal-conv1d==1.6.2.post1" --no-build-isolation \
+    && python -c "import causal_conv1d" \
+    && echo "causal_conv1d: installed (GDN packing enabled)" \
+    || { echo "causal_conv1d: build/import failed -> removing + GDN packing stays off (Qwen3.5/3.6 train unpacked)"; \
+         pip uninstall -y causal-conv1d 2>/dev/null || true; }
+
+# Weight cache (this PR, RUNTIME not baked): when the shared weight-cache network volume is attached
+# (flash runner._assign_weight_cache_volume), the control plane points HF_HOME at the persistent mount
+# per-run (providers/.../deps.weight_cache_env), so the MODEL DOWNLOAD is reused across runs landing in
+# the same region. ONLY HF_HOME (inert model blobs) is redirected — the executable kernel-JIT caches
+# below are deliberately NOT shared (the volume is multi-tenant; a poisoned compiled artifact could
+# affect another tenant). The redirect can't be a static image ENV: the volume mounts at a fixed path
+# only at runtime and only when attached, so a baked ENV would break cache-less (no-volume) cold runs.
+#
+# Compiled-kernel cache: OPT-IN bake, JIT fallback. The fused Triton (Liger/fla/chalk),
+# TorchInductor, and Hopper tilelang kernels the trainer builds on first use are content-addressed
+# by GPU ARCH + toolchain version, so they can only be compiled on a real GPU of each catalog arch
+# (8.0/8.6/8.9/9.0/12.0) — which the CI image builder normally lacks (the FA2 *source* path above
+# already OOMs runners; arch-specific kernel compiles are worse). #194 reintroduced that ~10-15 min
+# first-use JIT as a per-run RUNTIME cost on a cold worker.
+#
+# OPT-IN PATH: build on a real GPU runner with --build-arg BUILD_KERNEL_CACHE=true after running
+# flash/engine/worker/kernel_warmup.py there to produce a portable mega-cache under build/kernel_cache/
+# (torch.compiler.save_cache_artifacts). The conditional COPY below then bakes it into
+# /opt/flash/kernelcache, and engine.worker._load_kernel_cache_if_present loads it at boot
+# (torch.compiler.load_cache_artifacts) — measured cold compile ~124s -> warm load ~0.2s (537x).
+#
+# FALLBACK (the DEFAULT, BUILD_KERNEL_CACHE=false): NOTHING is baked and the build needs no GPU. The
+# first-run JIT happens on the worker exactly as before; flash #163's init heartbeat keeps the stall
+# detector quiet through it. So the opt-in is purely additive — an absent cache changes nothing.
+#
+# The COPY is made safe-when-absent with the standard "COPY a path that always exists + a guard"
+# trick. `build/kernel_cache/` is checked into the repo with just a `.keep` placeholder, so the COPY
+# source ALWAYS exists (a bare glob that matches nothing is a hard BuildKit error — this avoids it).
+# kernel_warmup.py drops `mega_cache.bin` + `mega_cache.json` (+ triton/inductor cache trees) next
+# to that placeholder on a GPU builder. COPY STRAIGHT to the final /opt/flash/kernelcache so a
+# multi-GB baked cache lives in exactly ONE layer -- staging in /tmp then cp/mv would leave the
+# bytes in BOTH the COPY layer and the RUN layer (doubling image size). with the default the dir
+# holds only `.keep`, so the copy is harmless; the guard just removes any stale cache + logs.
+ARG BUILD_KERNEL_CACHE=false
+COPY build/kernel_cache/ /opt/flash/kernelcache/
+RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.bin ]; then \
+      echo "kernel-cache: baked from build/kernel_cache/ -> /opt/flash/kernelcache"; \
+    else \
+      rm -rf /opt/flash/kernelcache/mega_cache.bin /opt/flash/kernelcache/mega_cache.json \
+        /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
+      mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
+      echo "kernel-cache: not baked (BUILD_KERNEL_CACHE=${BUILD_KERNEL_CACHE}) -> first-run JIT fallback"; \
+    fi
+
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
 # bootstrap code + the WORKER_DEPS list above): the core stack, the optimizer/accelerator libs
@@ -81,9 +185,11 @@ liger_kernel, fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
+fa3_ok = False; \
+exec('try:\n import flash_attn_interface\n fa3_ok = True\nexcept Exception:\n fa3_ok = False'); \
 cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into torch'; \
 ver = lambda n: M.version(n); \
-print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)'); \
+print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)'); \
 [print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','datasets','huggingface-hub', \
 'accelerate','wandb','liger-kernel','flash-linear-attention','bitsandbytes', \
 'hf-transfer','freesolo','runpod']]"
@@ -91,9 +197,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;
 # _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
-# image is a self-contained RunPod Serverless worker. On Vast the image is launched in args-mode
-# (`bash -c <onstart>`), which OVERRIDES this CMD — so ONE image serves both providers (Vast bash
-# bootstrap vs RunPod serverless handler reading job["input"]). Build context is the repo root.
+# image is a self-contained RunPod Serverless worker. Build context is the repo root.
 COPY flash/providers/runpod/train/endpoints.py docker/make_rp_handler.py /tmp/rpgen/
 RUN python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /rp_handler.py \
     && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"

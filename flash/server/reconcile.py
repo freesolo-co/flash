@@ -2,8 +2,8 @@
 finished run and report it to the freesolo backend for estimator accuracy tracking.
 
 Flash charges customer-facing training usage from the completed run's final ``cost_usd``. This
-job is the COGS side: the realized provider invoice (RunPod /v1/billing/endpoints, Vast
-/v0/charges/). The backend's training_cost_accuracy view joins the two per run to surface
+job is the COGS side: the realized provider invoice (RunPod /v1/billing/endpoints).
+The backend's training_cost_accuracy view joins the two per run to surface
 charged-vs-realized error.
 
 Best-effort and entirely off the run hot path: it runs in a background loop (see the server
@@ -73,6 +73,18 @@ def _report(body: dict) -> bool:
         return False
 
 
+def _terminal_ts(status: runner.RunStatus) -> float:
+    """The run's training-teardown time, used for both billing (``run_end``) and eligibility
+    (settle delay + window). Prefer the frozen ``finished_at`` over the mutable ``updated_at``:
+    deploy / late heartbeat / reconcile all move ``updated_at`` past teardown, which would both
+    DELAY the settle gate (it counts from the bump, not the finish) and let a long-finished run
+    that was merely bumped look "recent" and slip back inside ``_WINDOW_SECONDS``. ``finished_at``
+    is stamped once at the terminal transition and never moved; falls back to ``updated_at`` for
+    pre-feature runs. ``is not None`` (not truthiness) so a legitimate ``finished_at == 0.0`` is
+    honored rather than silently falling back to ``updated_at``."""
+    return float(status.finished_at if status.finished_at is not None else status.updated_at)
+
+
 def _due(status: runner.RunStatus, now: float) -> bool:
     """Whether a run should be reconciled this pass: a billable run whose training is finished
     (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), not yet reconciled,
@@ -81,7 +93,7 @@ def _due(status: runner.RunStatus, now: float) -> bool:
         return False
     if status.reconciled_at:
         return False
-    age = now - float(status.updated_at)
+    age = now - _terminal_ts(status)  # from teardown, not a later updated_at bump (see _terminal_ts)
     if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
         return False
     return bool(status.remote)
@@ -93,9 +105,18 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     later cycle (within the window) retries once the provider invoice settles."""
     now = time.time() if now is None else now
     remote = status.remote or {}
+    # Truthiness (`or`), NOT `is not None`: this started_ts comes from a persisted provider handle
+    # whose from_dict coerces a MISSING started_ts to 0.0 (see Lambda/HyperstackJobHandle.from_dict),
+    # so 0.0 means "unknown launch", not a 1970 epoch launch. Billing the flat $/hr from 0.0 would
+    # massively inflate realized cost, so fall back to created_at when started_ts is falsey/missing.
     start = float(remote.get("started_ts") or status.created_at)
-    end = float(status.updated_at) + _SETTLE_SECONDS
-    realized = realized_cost_for_remote(remote, start=start, end=end)
+    # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
+    # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past
+    # teardown and would make the instance providers' flat $/hr bill until that later event).
+    run_end = _terminal_ts(status)
+    # RunPod's billing query pads past run end so the settled invoice is in range; the instance
+    # providers bill flat $/hr to teardown, so they get the UN-padded run_end (no extra settle hour).
+    realized = realized_cost_for_remote(remote, start=start, end=run_end + _SETTLE_SECONDS, run_end=run_end)
     if realized is None or realized.realized_usd <= 0:
         return False
 

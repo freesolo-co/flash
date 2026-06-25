@@ -45,10 +45,13 @@ _CANONICAL_OUTPUT_KEY = "output"
 
 
 class GitHubRateLimitError(RuntimeError):
-    """Raised when the GitHub API returns a 429 or rate-limit 403.
+    """Raised when the GitHub API rate-limits us (HTTP 429, or a 403 whose body says "rate limit").
 
-    The worker's top-level handler catches this and stamps ``retriable=True`` so the
-    control plane reschedules the job instead of permanently failing it.
+    Raised by ``_urlopen`` only after the in-process jittered retry is exhausted, so it signals a
+    *persistent* limit. The worker's top-level handler catches it and stamps ``retriable=True`` so
+    the control plane reschedules the job on a fresh worker once the limit window resets, instead of
+    permanently failing the run. The real spawn-wave mitigation is the control-plane resolve-once
+    pin (EnvironmentSpec.resolved_sha) that lets workers skip the GitHub resolve entirely.
     """
 
 
@@ -208,16 +211,36 @@ def _is_commit_sha(value: str) -> bool:
     return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
-def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
+def _resolve_ref_sha(
+    parsed: GitHubEnvironmentRef,
+    pinned_sha: str | None = None,
+    *,
+    timeout: float = 60.0,
+    max_rate_limit_retries: int = 5,
+) -> str:
+    # Resolve-once hook: the control plane resolves ref->sha ONCE (runner._assign_resolved_env_sha)
+    # and threads the pinned commit sha through, so every worker in a fan-out short-circuits here
+    # without hitting GitHub at all — this is what actually defuses a cold spawn wave (the prior
+    # in-process cache could not, since each worker is a separate process). Same effect as the
+    # immutable-ref fast path below, but applied to a symbolic ref (e.g. "main"). Only a real
+    # 40-char sha is trusted; anything else falls through to a live resolve. The control plane
+    # passes a short timeout + max_rate_limit_retries=0 so its best-effort pin can't block run
+    # creation; the worker keeps the full retry budget.
+    if pinned_sha and _is_commit_sha(pinned_sha):
+        return pinned_sha
     if _is_commit_sha(parsed.ref):
         return parsed.ref
+    # No pin (legacy spec / non-managed ref / control-plane resolve failed): resolve the symbolic
+    # ref live every time. We deliberately do NOT cache symbolic refs in-process — a long-lived
+    # process must see a moved branch (managed slugs point at environment-hub@main, which moves on
+    # `flash env push`), and the immutable-sha cases above already skip the network.
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
     req = urllib.request.Request(commit_url, headers=headers)
-    data = _urlopen(req, timeout=60.0)
+    data = _urlopen(req, timeout=timeout, max_rate_limit_retries=max_rate_limit_retries)
     try:
         payload = json.loads(data)
     except json.JSONDecodeError as exc:
@@ -230,22 +253,55 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
     return sha
 
 
-def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        if exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower()):
-            raise GitHubRateLimitError(
-                f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
-            ) from exc
-        raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
+def _urlopen(
+    req: urllib.request.Request, *, timeout: float = 60.0, max_rate_limit_retries: int = 5
+) -> bytes:
+    """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
+
+    On a 429 or a 403 whose body says "rate limit" (a cold spawn wave of workers all hitting the
+    commits/tarball endpoint trips GitHub's abuse detection), retry up to ``max_rate_limit_retries``
+    times with jitter so concurrent workers don't all retry in lockstep. If the limit persists past
+    the retries, raise ``GitHubRateLimitError`` so the worker's top-level handler stamps
+    ``retriable=True`` and the run reschedules on a fresh worker, instead of hard-failing on a
+    transient limit. Any other HTTP / URL error raises a plain ``RuntimeError`` (non-retriable).
+
+    ``max_rate_limit_retries=0`` makes it fail fast (one request, no sleeps): the control plane uses
+    that for its best-effort resolve-once pin so a persistent limit can never block run creation —
+    the long retry belongs on the worker, which can afford to wait.
+    """
+    import random
+    import time
+
+    _RATE_LIMIT_BASE_DELAY = 10.0
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            is_rate_limit = exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower())
+            if is_rate_limit and attempt < max_rate_limit_retries:
+                delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
+                time.sleep(delay)
+                attempt += 1
+                continue
+            if is_rate_limit:
+                # Persistent limit: signal retriable so the control plane reschedules (#209).
+                raise GitHubRateLimitError(
+                    f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
+                ) from exc
+            raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
+    # Callers download the tarball for the ALREADY-resolved commit sha (see
+    # _resolve_github_environment_file), which extracts it into the content-addressed disk cache
+    # under _CACHE_ROOT/<hash(repo@sha:path)> and never re-downloads on a hit. So reuse is handled
+    # on disk; we deliberately do NOT also retain the (up to _MAX_ARCHIVE_BYTES) archive bytes in a
+    # module-level cache for the worker's lifetime — that wasted hundreds of MiB of RAM per process.
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -306,11 +362,15 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
     return extracted
 
 
-def _resolve_github_environment_file(env_ref: str) -> Path:
+def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
-    resolved_ref = _resolve_ref_sha(parsed)
+    # Only forward pinned_sha when set, so the unpatched _resolve_ref_sha(parsed) call shape stays
+    # single-arg (a test monkeypatch like ``lambda parsed: ...`` keeps working).
+    resolved_ref = (
+        _resolve_ref_sha(parsed, pinned_sha=pinned_sha) if pinned_sha else _resolve_ref_sha(parsed)
+    )
     cache_key = hashlib.sha256(
         f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
@@ -345,16 +405,21 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
         shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
-def _resolve_environment_reference(env_ref: str) -> str:
+def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
+    # pinned_sha (resolve-once hook, item 3): when the control plane already resolved this env's
+    # ref->sha, it threads the commit sha here so the GitHub commits API is skipped entirely. None
+    # (the default and today's behavior) means the worker resolves the ref itself.
     if is_managed_environment_slug(env_ref):
-        return str(_resolve_github_environment_file(managed_slug_to_github_ref(env_ref)))
+        return str(
+            _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
+        )
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         path = Path(env_ref)
         if path.exists():
             return str(path)
         return env_ref
-    return str(_resolve_github_environment_file(env_ref))
+    return str(_resolve_github_environment_file(env_ref, pinned_sha))
 
 
 def _resolve_path_arg(value: object, base_dir: Path) -> object:
@@ -438,7 +503,42 @@ class FreesoloEnvironment(BaseEnvironment):
         self._EnvironmentTurn = tools["EnvironmentTurn"]
         self.multi_turn = isinstance(sdk_env, tools["EnvironmentMultiTurn"])
         self.is_tool_env = False
-        self.max_turns = 8
+        self._max_turns_cache: int | None = None
+        self._dataset_cache: list[dict] | None = None
+
+    @property
+    def max_turns(self) -> int:
+        """Rollout turn ceiling the worker reads for the batch-level loop cap.
+
+        A pure multi-turn freesolo env sets a *per-example* budget via
+        ``max_episode_turns(example)`` (e.g. #user turns + a tool-iteration budget per
+        turn). The batch cap the rollout loop uses must be at least the largest such
+        budget, or it would truncate the deepest scenarios before they finish (e.g.
+        support-chat's 4-customer-turn rollouts need ~20 turns, not 8). Take the
+        dataset-wide max once, bounded so a pathological env can't make rollouts
+        unbounded; single-turn / non-multi-turn envs keep the small default. The exact
+        per-example budget is still enforced in :meth:`rollout_done`.
+        """
+        if self._max_turns_cache is not None:
+            return self._max_turns_cache
+        cap = 8
+        if self.multi_turn:
+            cap = 24  # safe default if no per-example budget can be read at all
+            best: int | None = None  # running max — no intermediate list for large datasets
+            for ex in self.dataset():  # cached; see dataset()
+                # Per-example so ONE malformed row (or an env whose max_episode_turns raises on it)
+                # is skipped rather than discarding every budget and silently falling back to 24,
+                # which would reintroduce the truncation this is meant to prevent.
+                try:
+                    turns = int(self._env.max_episode_turns(self._task_example(ex)))
+                except Exception:
+                    continue
+                if best is None or turns > best:
+                    best = turns
+            if best is not None:
+                cap = max(8, min(64, best))
+        self._max_turns_cache = cap
+        return cap
 
     def _task_example(self, example: dict):
         return self._task_example_from_record(self._canonical_record(example))
@@ -475,6 +575,11 @@ class FreesoloEnvironment(BaseEnvironment):
         return out
 
     def dataset(self) -> list[dict]:
+        # Parse once and cache: the worker reads ``env.dataset()`` AND ``env.max_turns`` (which
+        # also scans the dataset), so without this a multi-turn run would parse/load the whole
+        # dataset twice at startup.
+        if self._dataset_cache is not None:
+            return self._dataset_cache
         if self._source is None:
             rows = getattr(self._env, "dataset", None) or getattr(self._env, "examples", None)
             if rows is None:
@@ -502,19 +607,35 @@ class FreesoloEnvironment(BaseEnvironment):
                 raw.setdefault("metadata", metadata)
             record = self._canonical_record(raw)
             records.append(record)
+        self._dataset_cache = records
         return records
 
     def prompt_messages(self, example: dict) -> list[dict]:
         messages = self._env.start_episode(self._task_example(example), self._contract_text)
         return [dict(message) for message in messages]
 
-    def sft_target(self, example: dict) -> str:
+    def sft_completion(self, example: dict) -> list[dict]:
+        """Target completion messages to append after the prompt for one SFT example.
+
+        Delegates to the freesolo-sdk env's first-class ``Environment.sft_completion``, which turns
+        the record's ``output`` into the target messages: a MULTI-TURN target trajectory —
+        assistant turns, tool calls, tool results, replies (authored as ``output = {"messages":
+        [...]}`` or a bare message list) — when the row ships one, else a single assistant turn from
+        a scalar output. So the SFT example shape is owned by the freesolo-sdk dataset layer
+        (``freesolo.datasets.target_messages``), not a flash-only convention; ``len(...) > 1`` is
+        multi-turn. Falls back to reading the raw record only for an older installed SDK that
+        predates the method."""
+        fn = getattr(self._env, "sft_completion", None)
+        if callable(fn):
+            msgs = fn(self._task_example(example))
+            if msgs:
+                return [dict(m) for m in msgs]
         value = example.get(_CANONICAL_OUTPUT_KEY)
-        if value is not None:
-            if isinstance(value, list) and value and isinstance(value[-1], dict):
-                return str(value[-1].get("content", ""))
-            return str(value)
-        return ""
+        if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
+            return [dict(m) for m in value]
+        if isinstance(value, dict) and list(value) == ["messages"] and isinstance(value["messages"], list):
+            return [dict(m) for m in value["messages"]]
+        return [{"role": "assistant", "content": "" if value is None else str(value)}]
 
     def scores_breakdown(
         self, completion: str, example: dict, state: dict | None = None
@@ -530,6 +651,54 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(self.scores_breakdown(completion, example, state)["total"])
+
+    def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
+        """Reward for many ``(example, state)`` rollouts at once, in input order.
+
+        For multi-turn, episodes that share a task go through ONE ``score_episodes`` call, which the
+        env scores concurrently (``Environment.max_score_concurrency``) — replacing one blocking
+        scoring call per rollout. For a judge / network-reward env (where scoring dominates) this is
+        the multi-turn analogue of batched generation. Equals one :meth:`reward` per item:
+        ``score_episodes`` scores each episode independently, so batching changes only concurrency,
+        not values. Single-turn falls back to per-item :meth:`reward`."""
+        if not self.multi_turn:
+            # Single-turn scoring ignores state and grades the completion, so pass the rollout's
+            # actual response (stored on the state) — not "" (which would score every item empty).
+            return [self.reward(str(st.get("response_text") or ""), ex, st) for ex, st in items]
+        groups: dict[str, dict] = {}
+        order: list[str] = []
+        for i, (ex, st) in enumerate(items):
+            # Group rollouts of the same example (a GRPO group shares one prompt) so their episodes
+            # are scored together; the example dict is the stable grouping key.
+            key = json.dumps(ex, sort_keys=True, default=str)
+            grp = groups.get(key)
+            if grp is None:
+                grp = groups[key] = {
+                    "task": st.get("task") or self._task_example(ex),
+                    "idxs": [],
+                    "episodes": [],
+                }
+                order.append(key)
+            grp["idxs"].append(i)
+            grp["episodes"].append(self._episode_from_state(st))
+        out: list[float] = [0.0] * len(items)
+        for key in order:
+            grp = groups[key]
+            rewards = self._env.score_episodes(grp["task"], grp["episodes"])
+            if len(rewards) != len(grp["episodes"]):
+                raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
+            for idx, rw in zip(grp["idxs"], rewards, strict=True):
+                out[idx] = float(rw.score)
+        return out
+
+    @property
+    def reward_thread_safe(self) -> bool:
+        """Whether ``reward`` may be called concurrently across rollouts (multiturn_rollout's
+        ``_score_rollouts`` thread-pool fallback, used when the env has no ``reward_many``). The
+        verifiers reward contract is a pure scorer — ``score_responses`` reads the per-call inputs +
+        immutable env config — so the default is True. An underlying env whose scorer keeps mutable
+        state or a thread-bound client opts out with ``reward_thread_safe = False`` (scored serially)."""
+        return bool(getattr(self._env, "reward_thread_safe", True))
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         if state and self.multi_turn:
@@ -547,6 +716,13 @@ class FreesoloEnvironment(BaseEnvironment):
     def new_rollout_state(self, example: dict) -> dict:
         task = self._task_example(example)
         prompt = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
+        # Per-example turn budget (env's max_episode_turns) so rollout_done caps THIS
+        # rollout at its own budget rather than the batch-wide ceiling -- a single-turn
+        # scenario stops after a few turns while a deep one gets its full budget.
+        try:
+            episode_turns: int | None = int(self._env.max_episode_turns(task))
+        except Exception:
+            episode_turns = None
         return {
             "task": task,
             "prompt": [dict(message) for message in prompt],
@@ -555,6 +731,7 @@ class FreesoloEnvironment(BaseEnvironment):
             "done": False,
             "response_text": "",
             "turn": 0,
+            "max_episode_turns": episode_turns,
         }
 
     def record_model_turn(self, state: dict, content: str) -> dict:
@@ -596,7 +773,13 @@ class FreesoloEnvironment(BaseEnvironment):
             return True
         if bool(state.get("done")):
             return True
-        return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+        # Prefer THIS rollout's own per-example budget (set in new_rollout_state); fall
+        # back to the batch-wide cap the worker passes. The env normally terminates via
+        # step.done well before either, so this is a non-termination guard.
+        cap = state.get("max_episode_turns")
+        if cap is None:
+            cap = max_turns
+        return cap is not None and int(state.get("turn", 0)) >= int(cap)
 
     def _episode_from_state(self, state: dict):
         return self._EnvironmentEpisode(
@@ -638,9 +821,16 @@ class FreesoloEnvironment(BaseEnvironment):
         return float(rewards[0].score)
 
 
-def load_freesolo_environment(env_id: str, **kwargs) -> FreesoloEnvironment:
+def load_freesolo_environment(
+    env_id: str, pinned_sha: str | None = None, /, **kwargs
+) -> FreesoloEnvironment:
+    # pinned_sha is a POSITIONAL-ONLY resolve-once hook (the control-plane-pinned commit sha). It is
+    # positional-only (the `/`) precisely so a user [environment.params] entry of ANY name — even
+    # one literally named "pinned_sha" — lands in **kwargs and is forwarded verbatim to the Freesolo
+    # SDK loader, never binding to or shadowing this internal pin. None (default) preserves today's
+    # behavior — the worker resolves the env ref->sha itself.
     tools = _import_freesolo_environment_tools()
-    reference = _resolve_environment_reference(env_id)
+    reference = _resolve_environment_reference(env_id, pinned_sha)
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 

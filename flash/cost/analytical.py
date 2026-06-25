@@ -25,7 +25,7 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-# Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod/Vast
+# Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
 # wall clock. LoRA + small batches sit well below dense-pretraining MFU.
 MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
@@ -138,7 +138,7 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost calculation."""
     gpu, need = select_gpu(config)
-    hourly = gpu_hourly_usd(gpu)
+    hourly = gpu_hourly_usd(gpu, provider=config.provider)
     # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
 

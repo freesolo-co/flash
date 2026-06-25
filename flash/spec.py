@@ -69,6 +69,24 @@ def _coerce_wandb(value: Any) -> WandbSpec:
     return WandbSpec(project=_label(value.get("project")), run_name=_label(value.get("run_name")))
 
 
+def _volume_gb(value: Any, default: int = 100) -> int:
+    """Parse the platform-managed weight-cache volume size, defaulting on anything not a positive int.
+
+    Tolerant by design (the field is platform-set, and stale/hand-edited specs must still load): a
+    missing / null / empty / non-numeric value, or a non-positive size (incl. the string "0" or a
+    negative), all fall back to ``default`` rather than crashing or round-tripping a nonsensical size.
+    """
+    if isinstance(value, bool):
+        # bool is an int subclass (int(True) == 1), so a stray boolean would become a 1 GB volume;
+        # treat it as invalid and default (mirrors the bool rejection in _opt_int).
+        return default
+    try:
+        gb = int(value)
+    except (TypeError, ValueError):
+        return default
+    return gb if gb > 0 else default
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
@@ -110,6 +128,14 @@ class EnvironmentSpec:
     # spec; the client reads matching local env/.env values and sends them out-of-band via
     # runtime_secrets.
     secrets: tuple[str, ...] = ()
+    # Optional pinned commit SHA for the environment's GitHub ref, resolved ONCE in the control
+    # plane (runner._assign_resolved_env_sha, called from submit_job after the spec is finalized) so
+    # every worker boots from an immutable sha instead of each one re-resolving the symbolic ref
+    # (e.g. "main") against the GitHub commits API — which trips GitHub's secondary rate limit on a
+    # cold spawn wave. Empty (the default, and whenever the control-plane resolve fails) preserves
+    # today's behavior: the worker resolves the ref itself. The adapter only trusts a real 40-char
+    # sha (see adapter._resolve_ref_sha), so a stale/garbage value falls back to live resolution.
+    resolved_sha: str = ""
 
 
 @dataclass(frozen=True)
@@ -159,31 +185,24 @@ class TrainSpec:
 class GpuSpec:
     # The parse-time provisional GPU class (cheapest VALIDATED class that fits the model). GPU
     # pinning is gone: the submit-time allocator always re-picks the cheapest fitting validated
-    # class across ALL providers, so a config's gpu.type does NOT pin — ``type`` is just the
-    # offline sizing/display default and the carrier the runner overwrites with the
-    # actually-allocated class.
+    # active RunPod class, so a config's gpu.type does NOT pin — ``type`` is just the offline
+    # sizing/display default and the carrier the runner overwrites with the actually-allocated
+    # class.
     type: str = DEFAULT_GPU
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
     # each retry resumes from the latest streamed checkpoint.
     max_retries: int = 2
-    # OPT-IN persistent RunPod network volume mounted at /runpod-volume, used as a
-    # cross-run HF model cache (repeat runs skip the model download). Trade-offs: it
-    # pins the run to the volume's datacenter (smaller GPU pool — usually the bigger
-    # cost) and the volume bills monthly while it exists. Off (None) by default.
-    # RunPod-specific: network_volume/datacenter are read only by the RunPod provider
-    # and ignored by Vast (which rents single-GPU instances with no network volume).
+    # Persistent RunPod network-volume weight cache (platform-managed, NOT user config). When set,
+    # the RunPod provider attaches a same-named volume in EVERY datacenter in the cache fleet and
+    # allows the endpoint across all of them (no single-DC pin), and the worker points HF_HOME at
+    # the mount so a model download is a one-time cost per region instead of per run. Assigned by
+    # the runner (``_assign_weight_cache_volume``); a single fixed datacenter is intentionally NOT
+    # a field — the DC SET is deploy-time platform policy (see jobs.weight_cache_datacenters), so a
+    # run can never be region-pinned. ``None`` = no volume (cold download, cross-region).
     network_volume: str | None = None
     network_volume_gb: int = 100
-    datacenter: str | None = None  # e.g. "EU-RO-1"; required pool pin for the volume
-    # OPT-IN per-run provider pin. Unlike gpu.type (no pin — the submit-time allocator always
-    # re-picks the cheapest fitting validated CLASS across ALL providers), provider pins which
-    # SUBSTRATE the allocator may use: "vast" or "runpod" restricts allocation to that provider;
-    # None (default) keeps the cross-provider cheapest-wins behavior. Used for A/B-ing one provider
-    # against the full pool. The allocator raises a clear error if the pinned provider isn't
-    # available/configured.
-    provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -251,6 +270,7 @@ class JobSpec:
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
                 secrets=_str_tuple(env.get("secrets")),
+                resolved_sha=str(env.get("resolved_sha") or ""),
             ),
             train=TrainSpec(
                 steps=_opt_int(train.get("steps")),
@@ -279,10 +299,15 @@ class JobSpec:
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 2)),
+                # network_volume/network_volume_gb round-trip so the runner-assigned weight cache
+                # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
+                # _assign_managed_hf_repo before deploy. A legacy ``datacenter`` key (from the
+                # reverted single-DC pin) is intentionally ignored — the DC set is deploy-time
+                # policy now, so stale specs carrying it are tolerated, never region-pinned.
                 network_volume=gpu.get("network_volume"),
-                network_volume_gb=int(gpu.get("network_volume_gb", 100)),
-                datacenter=gpu.get("datacenter"),
-                provider=gpu.get("provider"),
+                # Tolerant: null / "" / "0" / 0 / negative / non-numeric / missing -> the default.
+                # Platform-managed, so a stale or hand-edited spec must still load with a sane size.
+                network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),

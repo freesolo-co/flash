@@ -1,9 +1,19 @@
 name: Publish flash package
 
+# Auto-publish freesolo-flash to PyPI when a push to main bumps the version in pyproject.toml.
+# Mirrors freesolo-sdk's publish flow: a push that touches package files MUST also raise the
+# version (else CI fails), and a version already on PyPI is rejected — so merging dev -> main
+# with a bumped version is all it takes to release. Manual runs are still possible via
+# workflow_dispatch.
 on:
   push:
-    tags:
-      - "flash-v*"
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "flash/**"
+      - ".github/workflows/publish.yml"
   workflow_dispatch:
 
 concurrency:
@@ -24,20 +34,141 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Pin Python >= 3.11 BEFORE any step that imports tomllib (stdlib only since 3.11).
+      # The metadata + version-bump steps below run `python3 -c "import tomllib"`, which would
+      # fail on a runner whose default python3 predates 3.11 — so set it up here, not later
+      # (the uv step that follows brings its own interpreter, but only after those tomllib steps).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read package metadata
+        id: metadata
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              project = tomllib.load(f)["project"]
+
+          print(f"name={project['name']}")
+          print(f"version={project['version']}")
+          PY
+
+      - name: Require version bump for package changes
+        id: changes
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+
+          def set_package_changed(value: bool) -> None:
+              with output_path.open("a", encoding="utf-8") as output:
+                  output.write(f"package_changed={'true' if value else 'false'}\n")
+
+          before = os.environ["BEFORE_SHA"]
+          current = os.environ["CURRENT_SHA"]
+          # First push to the branch (no parent): publish whatever version is present.
+          if not before or set(before) == {"0"}:
+              set_package_changed(True)
+              raise SystemExit(0)
+
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", before, current],
+              text=True,
+          ).splitlines()
+          # Package files = the importable source, the project metadata, and the lockfile.
+          package_changed = any(
+              path == "pyproject.toml"
+              or path == "uv.lock"
+              or path.startswith("flash/")
+              for path in changed
+          )
+          if not package_changed:
+              set_package_changed(False)
+              raise SystemExit(0)
+          set_package_changed(True)
+
+          def read_version(data: str) -> str:
+              return tomllib.loads(data)["project"]["version"]
+
+          def version_key(value: str) -> tuple[int, ...]:
+              return tuple(int(part) for part in re.findall(r"\d+", value))
+
+          previous_version = read_version(
+              subprocess.check_output(
+                  ["git", "show", f"{before}:pyproject.toml"],
+                  text=True,
+              )
+          )
+          current_version = read_version(Path("pyproject.toml").read_text())
+          if version_key(current_version) <= version_key(previous_version):
+              print(
+                  "::error::Package files changed but pyproject.toml version "
+                  f"did not increase: {previous_version} -> {current_version}"
+              )
+              sys.exit(1)
+          PY
+
+      - name: Fail if PyPI version already exists
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
+        env:
+          PACKAGE_NAME: ${{ steps.metadata.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.error
+          import urllib.request
+
+          name = os.environ["PACKAGE_NAME"]
+          version = os.environ["PACKAGE_VERSION"]
+          url = f"https://pypi.org/pypi/{name}/{version}/json"
+
+          try:
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  if response.status == 200:
+                      raise SystemExit(
+                          f"{name} {version} is already on PyPI. "
+                          "Bump pyproject.toml before publishing."
+                      )
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          PY
+
       - name: Install uv
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
         uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.11"
 
       - name: Build distributions
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
         run: |
           rm -rf dist
           uv build
 
       - name: Publish to PyPI
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
         run: |
           if [ -z "$UV_PUBLISH_TOKEN" ]; then
-            echo "::error::PYPI_API_TOKEN is not configured; refusing to skip publish."
+            echo "::error::UV_PUBLISH_TOKEN is empty (sourced from the PYPI_API_TOKEN repo secret); refusing to publish without credentials. Set the PYPI_API_TOKEN secret on this repository."
             exit 1
           fi
-          uv publish --token "$UV_PUBLISH_TOKEN"
+          uv publish
+
+      - name: No package changes
+        if: github.event_name == 'push' && steps.changes.outputs.package_changed == 'false'
+        run: echo "No package files changed; nothing to publish."

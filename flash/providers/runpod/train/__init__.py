@@ -22,19 +22,20 @@ import inspect
 import os
 
 # Re-export the package's public surface so ``from flash.providers.runpod.train import <name>``
-# (callers in providers/runpod, providers/vast, runner, and the tests) keeps working unchanged.
+# keeps working unchanged for callers and tests.
 from flash.providers.runpod.train.deps import (  # noqa: F401
     DEFAULT_CHALK_SPEC,
     DEFAULT_EXECUTION_TIMEOUT_MS,
     WORKER_DEPS,
     WORKER_IMAGE,
     WORKER_SYSTEM_DEPS,
-    _chalk_selected,
     _effective_worker_env,
     build_worker_env,
     chalk_extra_pip,
     logger,
     resolve_worker_deps,
+    strip_runpod_volume_env,
+    worker_image_for_gpu,
 )
 from flash.providers.runpod.train.endpoints import (  # noqa: F401
     _ENDPOINT_CACHE,
@@ -103,7 +104,9 @@ def upload_code(repo: str | None = None) -> str:
     return repo
 
 
-def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
+def submit_train(
+    spec: JobSpec, seed: int, log=None, runtime_secrets: dict[str, str] | None = None
+) -> dict:
     """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     from flash.envs.registry import worker_pip_for_env
@@ -120,7 +123,7 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
-        "env": build_worker_env(spec, seed),
+        "env": build_worker_env(spec, seed, runtime_secrets=runtime_secrets),
         # extra_pip is installed by the worker for EVERY job (baked-image RunPod _train_body and
         # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
         # default run — see chalk_extra_pip().

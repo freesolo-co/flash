@@ -564,6 +564,35 @@ def test_logs_offset_paging(api):
     assert page2["logs"] == "line two\n"
 
 
+def test_worker_output_route(api, monkeypatch):
+    # /worker surfaces the train-subprocess stdout/traceback from the run's HF repo (operator
+    # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+
+    # Stub _worker_artifacts to {} BEFORE the first request: the real impl would hf_hub_download from
+    # the run's HF repo (slow/flaky network in a unit test). This keeps the "no artifacts -> {}"
+    # assertion fully offline/deterministic.
+    monkeypatch.setattr(app_mod, "_worker_artifacts", lambda spec: {})
+    empty = api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(key)).json()
+    assert empty["run_id"] == run_id
+    assert empty["worker"] == {}
+
+    monkeypatch.setattr(
+        app_mod, "_worker_artifacts", lambda spec: {"console_sft.txt": "real worker stdout\n"}
+    )
+    got = api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(key)).json()
+    assert got["worker"] == {"console_sft.txt": "real worker stdout\n"}
+
+    # Another user can't read it (same ownership gate as /logs).
+    other = _login()
+    assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
+
+
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()
@@ -625,6 +654,82 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
     assert "serving backend unreachable" in resp.json()["detail"]
     # The failed deploy left no active deployment record behind.
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
+
+
+def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
+    """The adapter is registered under the RUN's owning org (its persisted billing_context) so
+    serving can authorize external chat by org — not merely whatever key initiated the deploy."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.billing_context = {"org_id": "run-owner-org"}
+    runner._save_status(status)
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return Deployment(
+            run_id=run_id,
+            model=kwargs["model"],
+            adapter_hf_prefix="x/adapter",
+            gpu="RTX 5090",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            state="ready",
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", capture)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 200, resp.text
+    # The run's owning org (billing_context) is what's attributed, not the bare caller key.
+    assert seen["org_id"] == "run-owner-org"
+
+
+def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
+    """An internal/operator deploy has no billing_context but persists the org in
+    platform_context; the adapter must still be attributed to that run-owning org."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.billing_context = None
+    status.platform_context = {"org_id": "platform-org"}
+    runner._save_status(status)
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return Deployment(
+            run_id=run_id,
+            model=kwargs["model"],
+            adapter_hf_prefix="x/adapter",
+            gpu="RTX 5090",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            state="ready",
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", capture)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 200, resp.text
+    assert seen["org_id"] == "platform-org"
 
 
 def test_chat_streams_deployed_run(api, monkeypatch):
@@ -739,6 +844,73 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     out = runner.mark_deployed("dep-3", {"endpoint_name": "e2"}, expect_state="deployed")
     assert out.state == "done"
     assert out.deployment["state"] == "undeployed"  # not re-advertised
+
+
+def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monkeypatch, tmp_path):
+    # The legacy finished_at backfill (for runs that went `done` before finished_at existed) must
+    # run ONLY on the done->deployed transition, where updated_at == training teardown. On an
+    # already-`deployed` run (the CAS finalization with expect_state="deployed"), updated_at is the
+    # DEPLOY time, so stamping finished_at from it would reintroduce the instance over-billing this
+    # whole change fixes.
+    import flash.runner as runner
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-leg"}
+
+    # (1) done -> deployed: legacy run, finished_at=None, updated_at == teardown -> backfilled.
+    teardown = 1_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg",
+            state="done",
+            spec=spec,
+            remote=None,
+            updated_at=teardown,
+            finished_at=None,
+        )
+    )
+    out = runner.mark_deployed("dep-leg", {"endpoint_name": "e"})
+    assert out.state == "deployed"
+    assert out.finished_at == teardown  # frozen to the real teardown time
+    assert out.updated_at > teardown  # the deploy bumped updated_at past teardown
+
+    # (2) already-`deployed` legacy run whose finished_at was never backfilled: a CAS-finalization
+    # re-call must NOT turn the deploy-time updated_at into finished_at.
+    deploy_time = 5_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg2",
+            state="deployed",
+            spec={**spec, "run_id": "dep-leg2"},
+            remote=None,
+            updated_at=deploy_time,
+            finished_at=None,
+            deployment={"endpoint_name": "e"},
+        )
+    )
+    out2 = runner.mark_deployed("dep-leg2", {"endpoint_name": "e2"}, expect_state="deployed")
+    assert out2.state == "deployed"
+    assert out2.finished_at is None  # NOT stamped from the deploy-time updated_at
+
+    # (3) reconciled-then-deployed legacy `done` run: record_realized_cost bumped updated_at to the
+    # reconcile time, so the backfill must NOT freeze that (later) stamp as teardown.
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg3",
+            state="done",
+            spec={**spec, "run_id": "dep-leg3"},
+            remote=None,
+            updated_at=9_000.0,  # reconcile-time bump, well after teardown
+            finished_at=None,
+            reconciled_at=8_500.0,
+        )
+    )
+    out3 = runner.mark_deployed("dep-leg3", {"endpoint_name": "e3"})
+    assert out3.state == "deployed"
+    assert out3.finished_at is None  # not frozen from the reconcile-bumped updated_at
 
 
 def test_deploy_lock_is_usable_and_weakly_cleaned():
@@ -1020,3 +1192,176 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     r2 = api.post("/v1/envs", headers=_bearer(_login()), json={"name": "e", "package_b64": False})
     assert r2.status_code == 400, r2.text
     assert "must be a base64 string" in r2.text.lower()
+
+
+# --------------------------------------------------------------------------------------------
+# Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
+# --------------------------------------------------------------------------------------------
+_FAKE_CKPTS = [
+    {"step": 40, "adapter_prefix": "rl/X/seed0/checkpoints/step-40",
+     "subfolder": "rl/X/seed0/checkpoints/step-40/adapter",
+     "repo_id": "org/test-runs", "repo_type": "dataset"},
+    {"step": 80, "adapter_prefix": "rl/X/seed0/checkpoints/step-80",
+     "subfolder": "rl/X/seed0/checkpoints/step-80/adapter",
+     "repo_id": "org/test-runs", "repo_type": "dataset"},
+]
+
+
+class _FakeDeployment:
+    def __init__(self, adapter_prefix):
+        self.adapter_prefix = adapter_prefix
+
+    def to_dict(self):
+        return {"state": "ready", "run_id": "X", "adapter_hf_prefix": f"{self.adapter_prefix}/adapter"}
+
+
+def _make_run(api, key, state):
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    import flash.runner as runner
+
+    status = runner.get_status(run_id)
+    status.state = state
+    runner._save_status(status)
+    return run_id
+
+
+def test_list_checkpoints_endpoint(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    r = api.get(f"/v1/runs/{run_id}/checkpoints", headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert [c["step"] for c in r.json()["checkpoints"]] == [40, 80]
+
+
+def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    captured = {}
+
+    def fake_deploy(**kwargs):
+        captured.update(kwargs)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    # Served the step-40 checkpoint's adapter, not the run's final adapter.
+    assert captured["adapter_prefix"].endswith("/checkpoints/step-40")
+    assert r.json()["checkpoint_step"] == 40
+    # A finished run flips to `deployed` as usual.
+    import flash.runner as runner
+
+    assert runner.get_status(run_id).state == "deployed"
+
+
+def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatch):
+    """The headline fix: a run cancelled mid-RL can deploy a checkpoint, and stays `cancelled`."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(
+        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
+    )
+
+    key = _login()
+    run_id = _make_run(api, key, "cancelled")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 80}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert r.json()["checkpoint_step"] == 80
+    # Training outcome preserved (NOT flipped to `deployed`)...
+    assert runner.get_status(run_id).state == "cancelled"
+    # ...but the serving deployment is recorded and listed as active.
+    deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
+    assert any(d["run_id"] == run_id for d in deployments)
+
+
+def test_deploy_cancelled_run_without_step_is_409(api):
+    """Without a step, a cancelled run is still undeployable (no final adapter)."""
+    key = _login()
+    run_id = _make_run(api, key, "cancelled")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert r.status_code == 409, r.text
+
+
+def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 999}, headers=_bearer(key))
+    assert r.status_code == 404, r.text
+    assert "available: 40, 80" in r.json()["detail"]
+
+
+def test_deploy_rejects_non_integer_step(api, monkeypatch):
+    """A bool (True->1) or non-integer step must be rejected, not silently coerced."""
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    for bad in (True, 40.9, "40.9"):
+        r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": bad}, headers=_bearer(key))
+        assert r.status_code == 400, f"{bad!r} -> {r.status_code} {r.text}"
+
+
+def test_create_run_records_managed_environment_use(api, monkeypatch):
+    import flash.server.environment_registry as registry
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_environment_use",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    spec = {**SPEC, "environment": {"id": "dev-clado-ai/my-env"}}
+    key = _login()
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert calls
+    assert calls[0]["slug"] == "dev-clado-ai/my-env"
+    assert calls[0]["run_id"] == resp.json()["run_id"]
+    assert calls[0]["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
+
+
+def test_create_run_records_flash_training_run(api, monkeypatch):
+    import flash.server.run_registry as registry
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_training_run",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    key = _login()
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "dry_run": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert calls
+    last = calls[-1]
+    assert last["status"].run_id == resp.json()["run_id"]
+    # Org attribution rides on the persisted platform_context (org_id/user_id/api_key_id),
+    # which submit_job reports for us — create_run no longer double-POSTs with an explicit key.
+    assert last["status"].platform_context["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"

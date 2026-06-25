@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import subprocess
 import tarfile
 from pathlib import Path
@@ -36,6 +37,26 @@ def test_namespace_is_stable_and_repo_safe():
 
 def test_namespace_requires_email():
     for key in ({"id": 7}, {"key_prefix": "fslo-abc"}, {}, {"email": "missing-email"}):
+        with pytest.raises(envs.EnvPublishError, match="email"):
+            envs.namespace_for(key)
+
+
+def test_internal_key_gets_reserved_namespace_without_email():
+    # The internal/operator service key has a synthetic/shared identity (no per-user email) but is
+    # trusted to submit runs and read everything, so it must be able to publish too. It gets a
+    # fixed reserved namespace instead of raising — regardless of whether its row carries an email.
+    assert envs.namespace_for({"auth_kind": "internal"}) == envs._INTERNAL_NAMESPACE
+    assert envs.namespace_for({"auth_kind": "internal", "email": ""}) == envs._INTERNAL_NAMESPACE
+    assert (
+        envs.namespace_for({"auth_kind": "internal", "email": "missing-email"})
+        == envs._INTERNAL_NAMESPACE
+    )
+
+
+def test_internal_special_case_does_not_loosen_user_keys():
+    # The bypass is reserved for auth_kind == "internal" ONLY: a user key (any other auth_kind, or
+    # none) without a valid email must still be rejected so two users can't collide on a namespace.
+    for key in ({"auth_kind": "external"}, {"auth_kind": "user", "email": "no-at"}, {"email": ""}):
         with pytest.raises(envs.EnvPublishError, match="email"):
             envs.namespace_for(key)
 
@@ -110,6 +131,224 @@ def test_publish_does_not_accept_github_pat_alias(monkeypatch):
         envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", key={})
     assert excinfo.value.status == 503
     assert "GITHUB_TOKEN" in str(excinfo.value)
+
+
+def test_record_published_environment_posts_to_backend(monkeypatch):
+    from flash.server import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["headers"] = dict(req.header_items())
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
+
+    ok = environment_registry.record_published_environment(
+        slug="dev-clado-ai/my-env",
+        name="My Env",
+        key={"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"},
+    )
+
+    assert ok is True
+    assert seen["url"] == "https://backend.test/api/flash/environments/internal"
+    assert seen["headers"]["Authorization"] == "Bearer internal-test"
+    body = json.loads(seen["body"])
+    assert body == {
+        "orgId": "org-1",
+        "slug": "dev-clado-ai/my-env",
+        "name": "My Env",
+        "hubRepo": "freesolo-co/environment-hub",
+        "hubRef": "main",
+        "hubPath": "dev-clado-ai/my-env/environment.py",
+        "publishedByUserId": "user-1",
+        "apiKeyId": "key-1",
+        "metadata": {"source": "flash.env.push"},
+    }
+
+
+def test_record_published_environment_is_best_effort(monkeypatch):
+    from flash.server import environment_registry
+
+    monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
+    assert (
+        environment_registry.record_published_environment(
+            slug="dev-clado-ai/my-env",
+            name="My Env",
+            key={"org_id": "org-1"},
+        )
+        is False
+    )
+
+
+def test_record_environment_use_posts_to_backend(monkeypatch):
+    from flash.server import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["headers"] = dict(req.header_items())
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
+
+    ok = environment_registry.record_environment_use(
+        slug="dev-clado-ai/my-env",
+        run_id="flash-1",
+        key={"org_id": "org-1"},
+    )
+
+    assert ok is True
+    assert seen["url"] == "https://backend.test/api/flash/environments/use/internal"
+    assert seen["headers"]["Authorization"] == "Bearer internal-test"
+    assert json.loads(seen["body"]) == {
+        "orgId": "org-1",
+        "slug": "dev-clado-ai/my-env",
+        "runId": "flash-1",
+    }
+
+
+def test_record_training_run_posts_to_backend(monkeypatch):
+    from flash.runner import RunStatus
+    from flash.server import run_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["headers"] = dict(req.header_items())
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+
+    ok = run_registry.record_training_run(
+        status=RunStatus(
+            run_id="flash-1",
+            state="running",
+            spec={
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "grpo",
+                "phase": "rl",
+                "environment": {"id": "dev-clado-ai/my-env"},
+                "gpu": {"type": "RTX 5090"},
+            },
+            platform_context={
+                "org_id": "org-1",
+                "user_id": "user-1",
+                "api_key_id": "key-1",
+            },
+        )
+    )
+
+    assert ok is True
+    assert seen["url"] == "https://backend.test/api/flash/runs/internal"
+    assert seen["headers"]["Authorization"] == "Bearer internal-test"
+    body = json.loads(seen["body"])
+    assert body["orgId"] == "org-1"
+    assert body["runId"] == "flash-1"
+    assert body["status"] == "running"
+    assert body["environmentSlug"] == "dev-clado-ai/my-env"
+    assert body["model"] == "Qwen/Qwen3.5-4B"
+
+
+def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
+    from flash import runner
+    from flash.runner import RunStatus
+    from flash.server import run_registry
+    from flash.spec import JobSpec
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["headers"] = dict(req.header_items())
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+    spec = JobSpec.from_dict(
+        {
+            "run_id": "flash-1",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"steps": 1, "seeds": [0], "hf_repo": "Freesolo-Co/flashrun-flash-1"},
+        }
+    )
+    runner._save_status(
+        RunStatus(
+            run_id="flash-1",
+            state="running",
+            spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
+        )
+    )
+
+    ok = run_registry.record_training_checkpoint(
+        spec=spec,
+        seed=0,
+        metrics={"cost_usd": 0.25},
+        artifact_path="/tmp/seed0",
+    )
+
+    assert ok is True
+    assert seen["url"] == "https://backend.test/api/flash/runs/checkpoints/internal"
+    assert seen["headers"]["Authorization"] == "Bearer internal-test"
+    body = json.loads(seen["body"])
+    assert body["orgId"] == "org-1"
+    assert body["runId"] == "flash-1"
+    assert body["checkpointId"] == "seed0"
+    assert body["adapterRef"] == "Freesolo-Co/flashrun-flash-1:rl/flash-1/seed0"
+    assert body["metrics"] == {"cost_usd": 0.25}
 
 
 def test_redacts_raw_and_url_encoded_token():

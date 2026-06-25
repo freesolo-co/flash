@@ -68,6 +68,9 @@ class _FakeClient:
             "state": "done",
         }
 
+    def get_worker_output(self, run_id: str) -> dict[str, str]:
+        return {"console_sft.txt": "worker stdout line\n"}
+
     def cancel_run(self, run_id: str) -> dict:
         self.calls.append(("cancel", run_id))
         return {"run_id": run_id, "state": "cancelled"}
@@ -173,8 +176,11 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
-    assert "Qwen/Qwen3.5-2B\t2.3B" in out
-    assert "openbmb/MiniCPM5-1B\t1.2B dense" in out
+    assert "Qwen/Qwen3.5-2B" in out
+    assert "openbmb/MiniCPM5-1B" in out
+    # only bare model ids, none of the extra per-model detail columns
+    assert "2.3B" not in out
+    assert "dense" not in out
     assert "(text-only fine-tune)" not in out
     assert "algos=" not in out
     assert "bf16" not in out
@@ -205,6 +211,9 @@ def test_status_runs_and_status_logs(fake_client, capsys) -> None:
     assert _run(["status", "flash-1", "--logs"]) == 0
     out = capsys.readouterr().out
     assert "hello from the worker" in out
+    # --logs always appends the real train-subprocess stdout fetched from the run's HF repo.
+    assert "----- console_sft.txt -----" in out
+    assert "worker stdout line" in out
     assert "cost_usd" in out
 
     assert _run(["status", "flash-1", "--follow"]) == 0
@@ -215,6 +224,7 @@ def test_status_runs_and_status_logs(fake_client, capsys) -> None:
 
 def test_status_logs_separates_partial_log_line_from_json(fake_client, capsys) -> None:
     fake_client.log_text = "partial log line"
+    fake_client.get_worker_output = lambda run_id: {}  # isolate: log->status separation only
 
     assert _run(["status", "flash-1", "--logs"]) == 0
     out = capsys.readouterr().out
@@ -294,7 +304,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     dataset = tmp_path / "datasets/train.jsonl"
     assert dataset.is_file()
     assert '"input":"What is 2 + 2?"' in dataset.read_text()
-    grpo = tmp_path / "configs/grpo.toml"
+    grpo = tmp_path / "configs/rl.toml"
     sft = tmp_path / "configs/sft.toml"
     assert grpo.is_file()
     assert sft.is_file()
@@ -303,9 +313,15 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "steps = 150" in grpo.read_text()
     assert 'algorithm = "sft"' in sft.read_text()
     assert "epochs = 1" in sft.read_text()
+    training = tmp_path / "TRAINING.md"
+    assert training.is_file()
+    training_text = training.read_text(encoding="utf-8")
+    assert "how to actually improve a model with Flash" in training_text
+    assert "## Using Flash" in training_text  # end-to-end library usage, not just conventions
     out = capsys.readouterr().out
     assert "datasets/train.jsonl" in out
-    assert "configs/grpo.toml" in out
+    assert "configs/rl.toml" in out
+    assert "TRAINING.md" in out
 
 
 def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:

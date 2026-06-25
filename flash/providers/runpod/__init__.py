@@ -51,16 +51,20 @@ class RunpodProvider:
         log: Any = None,
         on_handle: Any = None,
         attempt: int = 0,
-        offers: Any = None,
-        exclude_machine_ids: Any = frozenset(),
         runtime_secrets: dict[str, str] | None = None,
+        on_last_gpu: bool = False,
     ) -> PollResult:
-        # ``offers``/``exclude_machine_ids`` are Vast live-market concerns; RunPod
-        # provisions a fresh serverless endpoint and never re-searches a market, so it
-        # ignores both (kept in the signature for cross-provider symmetry).
+        # ``on_last_gpu`` stretches the no-capacity grace when no further GPU attempt will be made
+        # after this one — either the candidate list is exhausted or the retry budget is exhausted (see
+        # ``jobs.stall_kwargs``); waiting longer can't cost a fallback there is none.
         from flash.providers.runpod.jobs import submit_run
 
-        kwargs = {"log": log, "on_handle": on_handle, "attempt": attempt}
+        kwargs = {
+            "log": log,
+            "on_handle": on_handle,
+            "attempt": attempt,
+            "on_last_gpu": on_last_gpu,
+        }
         if runtime_secrets:
             kwargs["runtime_secrets"] = runtime_secrets
         return submit_run(spec, seed, **kwargs)
@@ -83,13 +87,18 @@ class RunpodProvider:
         rh = RunpodJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
-        # Same stall tuning as the submit path so a reattached run isn't judged differently.
+        # Same stall tuning as the submit path so a reattached run isn't judged differently:
+        # the original submit's ``on_last_gpu`` is persisted in the handle (by the runner's
+        # on_handle), so reproduce its no-capacity grace here instead of defaulting to the
+        # shorter non-last window. Absent (a pre-persist / non-runpod handle) => False, the
+        # historical default.
+        on_last_gpu = bool(handle.to_dict().get("on_last_gpu", False))
         return poll_job(
             rh,
             log=log,
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
-            **stall_kwargs(),
+            **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 
     def cancel(self, handle: JobHandle) -> None:
@@ -114,7 +123,7 @@ class RunpodProvider:
     def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
         # No-op: RunPod serverless endpoints have no standing per-run billing to reap on
         # crash recovery (a failed-before-submit endpoint is GC'd by reconstructed name in
-        # recover_runs). Present for ``base.Provider`` symmetry with Vast's instance sweep.
+        # recover_runs). Present for the ``base.Provider`` protocol.
         return []
 
 

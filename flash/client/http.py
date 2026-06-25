@@ -242,21 +242,52 @@ class ApiClient:
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
 
+    def get_worker_output(self, run_id: str) -> dict[str, str]:
+        # The train-subprocess console/traceback ({console_<phase>.txt, error_<phase>.txt}) from the
+        # run's HF artifact repo, fetched server-side with the operator token — the real worker
+        # output the offset-paged log can't carry. Kept off the hot get_logs poll path. {} if none.
+        #
+        # Tolerate a managed server that predates the /worker route: a CLI upgraded ahead of the
+        # service rollout would otherwise hard-fail. FastAPI returns a bare 404 "Not Found" for an
+        # unmatched path -> treat ONLY that as "no worker output" ({}); real 404s still surface (an
+        # unknown run_id carries detail "unknown run_id: ...", not "Not Found").
+        try:
+            return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
+        except ApiError as exc:
+            if exc.status == 404 and str(exc).strip().lower() == "not found":
+                return {}
+            raise
+
     def cancel_run(self, run_id: str) -> dict:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")
+
+    def checkpoints(self, run_id: str) -> list[dict]:
+        """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""
+        return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
 
     # -- serving -----------------------------------------------------------------------
     def deploy(
         self,
         run_id: str,
         dry_run: bool = False,
+        step: int | None = None,
     ) -> dict:
         # Deploy blocks on registration and serving warmup, which can take many minutes.
         deploy_timeout = 30 * 60 if not dry_run else None
+        body: dict = {"dry_run": dry_run}
+        if step is not None:
+            # Deploy a specific intermediate checkpoint instead of the run's final adapter.
+            # Reject a bool explicitly: `int(True)`/`int(False)` would silently coerce to step
+            # 1/0, but the server guard (_resolve_deploy_step) treats a bool as an invalid step
+            # and 400s — so fail fast here with a clear client-side error instead of sending a
+            # bogus 0/1 that the server rejects (or, worse, that hits a real checkpoint 0/1).
+            if isinstance(step, bool):
+                raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
+            body["step"] = int(step)
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/deploy",
-            body={"dry_run": dry_run},
+            body=body,
             timeout=deploy_timeout,
         )
 

@@ -1,9 +1,7 @@
 # Flash
 
-Managed LoRA post-training service: SFT and GRPO on managed GPUs across multiple
-providers — RunPod Flash (serverless queue; RTX 4090/5090 classes) and Vast.ai
-(rented verified-datacenter instances; L40S / RTX Pro 4000 / A100 classes). The
-allocator picks the cheapest GPU class that fits the run across both providers.
+Managed LoRA post-training service: SFT and GRPO on managed RunPod Flash GPUs.
+The allocator picks the cheapest validated RunPod GPU class that fits the run.
 
 ## Scope
 
@@ -26,9 +24,9 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash/schema.py`, `flash/spec.py` — TOML → `JobSpec`
 - `flash/runner.py` — server-side run supervisor (durable job handle,
   retries, cost guard, endpoint GC)
-- `flash/providers/` — RunPod Flash + Vast.ai provider subtrees (pricing,
-  gpus, durable submit/poll, preflight) behind one `base.Provider` protocol,
-  with a cross-provider `allocator.py` that picks the cheapest fitting class
+- `flash/providers/` — RunPod Flash provider code (pricing, gpus, durable
+  submit/poll, preflight) behind the `base.Provider` protocol, with an
+  `allocator.py` that picks the cheapest fitting class
 - `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
@@ -53,11 +51,12 @@ uv run flash --help
 uv run flash-server                      # control plane (operator-side, run once)
 ```
 
-The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
-(RunPod is the default substrate), `VAST_API_KEY` is opt-in (only checked when set),
+The control plane owns provider credentials: `RUNPOD_API_KEY` is always required,
 plus the shared `HF_TOKEN`.
-The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
-operator-wide env var. Clients authenticate with their freesolo API key (`flash login`).
+The artifact repo is platform-managed and per-run (each run gets its own
+`Freesolo-Co/flashrun-<run_id>`, written by the operator `HF_TOKEN`); it is not a user
+knob and not an operator-wide env var. Clients authenticate with their freesolo API key
+(`flash login`).
 
 ## Serving From an API
 

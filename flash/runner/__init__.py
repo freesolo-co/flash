@@ -1,4 +1,4 @@
-"""Platform runner: drives managed GPUs across providers (RunPod Flash + Vast), one allocation per seed."""
+"""Platform runner: drives managed RunPod GPUs, one allocation per seed."""
 
 from __future__ import annotations
 
@@ -94,12 +94,25 @@ class RunStatus:
     # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
+    # Wall-clock the run first went terminal (~training teardown). Stamped ONCE on the first
+    # terminal transition and never moved, so it survives later ``updated_at`` bumps from
+    # deploy / heartbeat / reconcile. Reconciliation uses it as the instance-billing ``run_end``:
+    # a run deployed after completion has ``updated_at`` = deploy time, which would over-bill the
+    # flat $/hr from launch until deployment instead of until training teardown. None pre-feature.
+    finished_at: float | None = None
     # Non-secret customer billing context, set for externally-submitted runs. Completion-time
     # billing uses this org id with the operator internal key; user API keys are not persisted.
     billing_context: dict | None = None
     billing_state: str | None = None
     billing_error: str | None = None
     billing_charge: dict | None = None
+    # Non-secret Freesolo identity used to mirror run status to the platform UI.
+    platform_context: dict | None = None
+    # Last worker heartbeat observed by the provider poller. This is intentionally
+    # duplicated from the HF artifact channel into local run status so `flash status`
+    # can show live worker/GPU state without doing a fresh HF read.
+    last_heartbeat: dict | None = None
+    gpu_status: dict | None = None
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -182,7 +195,160 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
+    """Resolve the environment's GitHub ref->SHA ONCE here so every worker in the fan-out boots from
+    an immutable pinned sha instead of each re-resolving the symbolic ref (e.g. "main") against the
+    GitHub commits API. A cold spawn wave of N workers otherwise fires N concurrent commit-API calls
+    and trips GitHub's secondary rate limit; a worker-side in-process cache cannot help, because
+    each worker is a separate process. Best-effort: any failure (no network/token, transient limit,
+    or a non-GitHub env) leaves resolved_sha empty and the worker resolves the ref itself via the
+    in-worker jittered retry + retriable-reschedule path, so submission never blocks on GitHub.
+    """
+    import logging
+
+    env_id = spec.environment.id
+    if not env_id or spec.environment.resolved_sha:
+        return spec
+    try:
+        from flash.envs.adapter import (
+            _parse_github_environment_ref,
+            _resolve_ref_sha,
+            is_managed_environment_slug,
+            managed_slug_to_github_ref,
+        )
+
+        ref_str = (
+            managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
+        )
+        parsed = _parse_github_environment_ref(ref_str)
+        if parsed is None:
+            return spec  # local/path or non-GitHub env: nothing to pin
+        # Fail fast: a single short request, no rate-limit sleeps. This best-effort pin must never
+        # delay/block run creation (esp. submit_job(background=True)); if GitHub is slow or limiting,
+        # we fall straight through and the worker resolves the ref itself with the full retry budget.
+        sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
+    except Exception as e:
+        # Never block submission on a control-plane resolve; the worker falls back to resolving the
+        # ref itself. Log for visibility (consistent with the rest of this module's logging).
+        logging.getLogger(__name__).warning(
+            "resolve-once: could not pin env ref->sha for %r (%s); worker will resolve", env_id, e
+        )
+        return spec
+    if not sha:
+        return spec
+    d = spec.to_dict()
+    d["environment"] = {**d["environment"], "resolved_sha": sha}
+    return JobSpec.from_dict(d)
+
+
+# Shared, platform-wide model-weight cache (NOT per-org). The cache holds downloaded base-model
+# weights — a run's trained adapters/checkpoints upload to the per-run managed HF repo
+# (_assign_managed_hf_repo), never here — so one global volume reused by every run is both safe and
+# the highest-hit-rate option: a popular base model (e.g. the 4B) is downloaded once per region,
+# ever, instead of once per run. The RunPod provider attaches a per-DC volume in EVERY cache
+# datacenter and allows the endpoint across all of them, so there is NO single-DC pin (the failure
+# mode that sank the earlier per-org EU-RO-1 attempt — runs wedged IN_QUEUE on one full region).
+# Fully managed: a fixed name + size, no env knobs. 100 GB holds the whole curated catalog (the
+# largest, the 9B, is ~19 GB of weights) with ample headroom; the preload step warms it.
+# COST/GC: provisioned EAGERLY — one ``flash-weights-<dc>`` volume in EVERY storage datacenter, so the
+# cache exists in every region a run could land in (no first-run-cold-then-warm-next-time gap). The
+# endpoint deploy creates-or-attaches all of them (jobs.weight_cache_volumes over the full storage-DC
+# set), and ``preload`` warms them with the catalog weights. Standing storage is therefore the whole
+# fleet: (#storage DCs) x 100 GB of PERMANENT billed storage (~11 x 100 GB ~= 1.1 TB ~= $77/mo today;
+# grows by one volume if the SDK adds a storage region). RunPod never auto-deletes network volumes;
+# reclaim the fleet with ``python -m flash.providers.runpod.preload --teardown`` (also reclaims the
+# Lambda/Hyperstack caches). Lambda filesystems + Hyperstack volumes are likewise pre-created in every
+# region/environment by ``preload --provision`` (pure control-plane API, no GPU).
+#
+# TRUST MODEL (shared multi-tenant cache). The catalog gate makes the run's SPEC model public:
+# ``_assign_weight_cache_volume`` attaches the cache only for ``model_policy == "catalog"`` runs
+# (always public; resolve_model validates catalog membership) and leaves open-model ("allow") runs
+# cache-less, so a spec that NAMES a private/gated model never persists it onto the shared mount.
+# CONFIDENTIALITY CAVEAT (not fully closed): the redirect is process-global (``weight_cache_env`` sets
+# ``HF_HOME`` onto the mount), so it scopes the SPEC model but NOT additional HF repos the run's
+# environment/reward code may fetch at execution time with the forwarded platform HF_TOKEN — those
+# would also land on the shared mount and be readable by a later tenant in the region. The residual is
+# bounded by (a) the catalog gate on the base model, (b) the scope of the platform HF_TOKEN, and (c)
+# flash environments being published/reviewed Hub/GitHub artifacts (not anonymous code) — but it is a
+# real limitation. The proper hardening (scope the mount to the trusted base-model prefetch via an
+# explicit ``cache_dir`` while env/reward code uses an ephemeral HF cache, or a READ-ONLY mount
+# populated only by preload) is worker-side and tracked as a follow-up.
+# A second residual is INTEGRITY: the mount is read-WRITE on every run and a run executes
+# its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a cached
+# public model's content-addressed blobs and poison a later run loading that same model in the region.
+# That is the accepted flip side of "one shared cache for everything" — flash environments are
+# published/reviewed Hub artifacts, not anonymous code, and the data at risk is public weights, not
+# secrets. The clean isolation — mounting the volume READ-ONLY for the run and writing only via the
+# trusted preload — is NOT yet expressible through the runpod_flash SDK (NetworkVolume has no
+# mount-mode field; ``extra="forbid"``). When the SDK gains a read-only mount, switch runs to RO +
+# populate exclusively via preload. Until then this is a documented integrity tradeoff; flip to per-org
+# volumes (keyed off platform_context.org_id) if strict tenant isolation is required.
+WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
+WEIGHT_CACHE_VOLUME_GB = 100
+
+
+def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
+    """Attach the shared, platform-managed weight-cache volume — ONLY for PUBLIC catalog models.
+
+    Platform-managed (never user config), exactly like the managed HF repo: assigned here, not
+    surfaced in the config schema. The provider builds the per-region volume fleet + the cross-DC
+    endpoint at deploy time (jobs.weight_cache_endpoint_kwargs) off this name, and the worker env
+    redirects HF_HOME onto the mount whenever the volume is attached.
+
+    CONFIDENTIALITY GATE: the cache is SHARED cross-tenant, and attaching it redirects HF_HOME onto
+    the shared mount, so a model's downloaded weights persist there for every later run in the region.
+    That is only safe for PUBLIC weights. Managed config runs are always catalog-only (the schema
+    hardcodes model_policy="catalog"), and ``submit_job`` runs ``resolve_model`` BEFORE this — so a
+    ``catalog``-policy spec is already guaranteed to be a curated PUBLIC catalog model (resolve_model
+    raises otherwise). The ONLY way to reach a non-catalog, possibly PRIVATE/GATED HF repo is
+    model_policy="allow" (programmatic/internal use; not selectable from a submitted config). Such a
+    model would be downloaded with the forwarded platform HF_TOKEN, and persisting its weights to the
+    shared multi-tenant cache would leak them cross-tenant. So the cache is attached ONLY for
+    ``model_policy == "catalog"`` runs; an open/"allow" run is left cache-less, confining its weights
+    to the worker's ephemeral disk (it can still use the per-org escape-hatch volume).
+
+    The confidentiality gate takes PRECEDENCE over the "don't override an explicit volume" no-op: an
+    open-model ("allow") run that ALREADY carries the SHARED cache name (e.g. a programmatic spec that
+    pre-set it) is FORCED cache-less here — its possibly-private weights must never reach the shared
+    mount. A different (per-org / custom) volume name on an open run is left intact: that's the
+    escape-hatch isolation, not the shared cache.
+
+    Outcomes: (a) open-model run -> never on the SHARED cache (strip it if pre-set; keep a non-shared
+    volume); (b) catalog run with a pre-set volume -> left as-is (explicit/test assignment honored);
+    (c) catalog run with no volume -> attach the shared cache.
+
+    See the module-level TRUST MODEL note above for the shared-cache integrity tradeoff (a run's env
+    code has write access to the shared mount; RO mount isn't SDK-expressible yet).
+    """
+    is_catalog = getattr(spec, "model_policy", "catalog") == "catalog"
+    existing = getattr(spec.gpu, "network_volume", None)
+    # CONFIDENTIALITY: an open-model run must NEVER ride the SHARED cross-tenant cache — even if the
+    # spec already pinned it. Strip the shared name (force cache-less); a non-shared per-org volume is
+    # the intended escape hatch and is left intact. This is checked BEFORE the "honor an existing
+    # volume" no-op so a pre-set flash-weights can't bypass the gate.
+    if not is_catalog:
+        if existing == WEIGHT_CACHE_VOLUME_NAME:
+            d = spec.to_dict()
+            d["gpu"] = {**d["gpu"], "network_volume": None}
+            return JobSpec.from_dict(d)
+        return spec  # no shared cache to strip (cache-less already, or a non-shared escape-hatch volume)
+    if existing:
+        return spec  # catalog run with an explicit/test volume already assigned — honor it
+    d = spec.to_dict()
+    d["gpu"] = {
+        **d["gpu"],
+        "network_volume": WEIGHT_CACHE_VOLUME_NAME,
+        "network_volume_gb": WEIGHT_CACHE_VOLUME_GB,
+    }
+    return JobSpec.from_dict(d)
+
+
+def _run_job_background(
+    spec: JobSpec,
+    runtime_secrets: dict[str, str] | None = None,
+    *,
+    resolve_env_sha: bool = False,
+) -> None:
     """Daemon-thread entrypoint for background runs.
 
     ``_run_job`` -> ``_run_job_inner`` persists the terminal state (failed/cancelled) BEFORE the
@@ -194,10 +360,23 @@ def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = 
     terminal-sticky ``_update`` (covers a crash BEFORE ``_run_job_inner`` persisted anything, e.g. an
     import/model-resolve error), leaving the synchronous raise path untouched. Defined in this module
     (not lifecycle) so it dispatches through the package-level ``_run_job`` that tests monkeypatch.
+
+    ``resolve_env_sha`` defers the (network) env ref->sha pin to THIS background thread, off the
+    run-creation critical path: ``submit_job(background=True)`` (the managed API path) saves + reports
+    the run status FIRST and returns, so a slow/rate-limited GitHub commits API can never block or
+    delay run creation. The resolve is still best-effort (any failure leaves ``resolved_sha`` empty
+    and the worker resolves the ref itself); the pinned spec is handed to the fan-out below — it is
+    only a boot optimization, so it does not need to be re-persisted into the run status JSON.
     """
     import logging
 
     try:
+        if resolve_env_sha:
+            # Pin the env ref->sha HERE (in the background) instead of before status save, so a slow
+            # GitHub commits API can't delay run creation. Best-effort: on any failure the spec stays
+            # unpinned and each worker resolves the ref itself with its full retry budget.
+            with contextlib.suppress(Exception):
+                spec = _assign_resolved_env_sha(spec)
         if runtime_secrets:
             _run_job(spec, runtime_secrets=runtime_secrets)
         else:
@@ -222,9 +401,10 @@ def submit_job(
     background: bool = False,
     runtime_secrets: dict[str, str] | None = None,
     billing_context: dict | None = None,
+    platform_context: dict | None = None,
 ) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
-    across the configured providers (RunPod Flash or Vast); dry-run only records state."""
+    that fits the run; dry-run only records state."""
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
     # Finalize the run_id BEFORE assigning the per-run artifact repo. The JobSpec default run_id is
     # the placeholder "local" (truthy), so `or new_run_id()` alone would keep it; treat "local" as
@@ -233,25 +413,45 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
     spec = _assign_managed_hf_repo(spec)
+    # Attach the shared model-weight cache (platform-managed). Before the RunStatus build so a
+    # dry-run spec carries it too (the dry-run short-circuits below) — keeps the assignment testable
+    # without a real provision and visible in `flash status`.
+    spec = _assign_weight_cache_volume(spec)
+    # NB: the env ref->sha pin (_assign_resolved_env_sha) makes a GitHub commits-API call, so it is
+    # deliberately NOT done here, on the run-creation critical path. The status is created + saved +
+    # reported FIRST (below) so creation never blocks/delays on a slow or rate-limited GitHub — the
+    # pin is deferred into the background run thread (background=True) or done just before the
+    # synchronous fan-out (background=False), both AFTER the run record exists.
     status = RunStatus(
         run_id=spec.run_id,
         state="queued",
         spec=spec.to_dict(),
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
+        platform_context=platform_context,
     )
     _save_status(status)
+    _report_status(status)
     if dry_run:
         status.state = "dry_run"
         _save_status(status)
+        _report_status(status)
         return status
     if background:
+        # Run creation is now done (status saved + reported); the GitHub env-sha pin happens INSIDE
+        # this thread (resolve_env_sha=True), so the API response is never blocked by GitHub retries.
         threading.Thread(
             target=_run_job_background,
             args=(spec, runtime_secrets or {}),
+            kwargs={"resolve_env_sha": True},
             daemon=True,
         ).start()
         return get_status(spec.run_id)
+    # Synchronous path: the status record already exists, so resolving the pin here no longer blocks
+    # the creation of the run record (only this in-process caller's own wait). Resolve once before
+    # the fan-out so workers boot from the pin and skip the GitHub commits API (cold-spawn rate-limit
+    # wave). Best-effort, as before.
+    spec = _assign_resolved_env_sha(spec)
     if runtime_secrets:
         _run_job(spec, runtime_secrets=runtime_secrets)
     else:
@@ -285,13 +485,52 @@ def get_logs(run_id: str) -> str:
         return f.read()
 
 
+def _sanitize_status_value(value, *, depth: int = 0):
+    """Bound a heartbeat payload before persisting it in run status JSON."""
+    if depth > 5:
+        return str(value)[:200]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, list):
+        return [_sanitize_status_value(v, depth=depth + 1) for v in value[:16]]
+    if isinstance(value, dict):
+        out = {}
+        for i, (k, v) in enumerate(value.items()):
+            if i >= 64:
+                out["truncated"] = True
+                break
+            out[str(k)[:120]] = _sanitize_status_value(v, depth=depth + 1)
+        return out
+    return str(value)[:500]
+
+
+def record_heartbeat(run_id: str, heartbeat: dict) -> None:
+    """Persist the latest worker heartbeat/GPU snapshot without changing run state."""
+    if not run_id or not isinstance(heartbeat, dict):
+        return
+    if not os.path.exists(runs_file_path(run_id, ".json")):
+        return
+    hb = _sanitize_status_value(heartbeat)
+    gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
+    with _STATUS_LOCK:
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        status.last_heartbeat = hb
+        status.gpu_status = gpu if isinstance(gpu, dict) else None
+        status.updated_at = time.time()
+        _save_status(status)
+    _report_status(status)
+
+
 def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     """Write metrics to results/runpod/<phase>/<run_id>/seedN and return the cost.
 
     The run id keeps concurrent/sequential runs of the same phase+seed from
-    overwriting each other's artifacts. Vast runs arrive with ``cost_usd`` already
-    stamped from the offer's real $/hr (plus provider notes) and short-circuit the
-    rate fallback below (the RunPod projection)."""
+    overwriting each other's artifacts."""
     dest = os.path.join(artifacts_dir(spec), f"seed{seed}")
     os.makedirs(dest, exist_ok=True)
     # Rate the actually-allocated class, not the parse-time provisional spec.gpu.type:
@@ -299,19 +538,8 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     # the worker stamps "allocated_gpu" into metrics for the cost fallback below.
     gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
     rate = _gpu_rate(gpu_type)
-    # A non-runpod provider (e.g. Vast) stamps the real cost_usd from its offer's $/hr
-    # AND tags notes["provider"] with its own name — and a near-zero-duration run can
-    # legitimately stamp cost_usd == 0.0. The RunPod arm, by contrast, never stamps a real
-    # cost: it arrives with cost_usd absent (or a 0.0 placeholder) and no provider note, so
-    # the wall-based projection below must run. A bare `cost or 0.0` would treat the Vast
-    # 0.0 as "absent" and re-rate it against RunPod pricing while overwriting the provider
-    # notes, mis-attributing the run to 'runpod'. So fall back only when the cost is
-    # missing/zero AND it has NOT already been attributed to a non-runpod provider.
-    _notes = metrics.get("notes")
-    _stamped_provider = _notes.get("provider") if isinstance(_notes, dict) else None
-    _non_runpod = bool(_stamped_provider) and _stamped_provider != "runpod"
     cost = metrics.get("cost_usd")
-    if cost or _non_runpod:
+    if cost:
         cost = float(cost or 0.0)
     else:
         wall = float(metrics.get("wall_seconds") or 0.0)
@@ -324,6 +552,10 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
             metrics["notes"]["runpod_gpu"] = gpu_type
     with open(os.path.join(dest, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
+    with contextlib.suppress(Exception):
+        from flash.server.run_registry import record_training_checkpoint
+
+        record_training_checkpoint(spec=spec, seed=seed, metrics=metrics, artifact_path=dest)
     return float(cost)
 
 
@@ -340,6 +572,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     # otherwise be clobbered by this stale background update, resurrecting a cancelled
     # run. The control plane is single-instance with per-run threads, so a process-wide
     # lock serializes all status transitions into a compare-and-set.
+    report_status: RunStatus | None = None
     with _STATUS_LOCK:
         status = get_status(run_id)
         # Terminal states are STICKY: once a run is done/failed/cancelled/dry_run, no
@@ -362,12 +595,27 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         # thread is protected by the CAS below — cancel correctly loses to a real finish.
         if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
             return False
+        was_terminal = status.state in TERMINAL_STATES  # before this write overwrites updated_at
+        prev_updated_at = status.updated_at
         status.state = state
         status.updated_at = time.time()
+        # Freeze the training-teardown time on the FIRST terminal transition (and only then) so
+        # reconciliation has an immutable run-end even after deploy/heartbeat/reconcile later bump
+        # updated_at. A same-state terminal re-write (terminal field updates) keeps the original.
+        if state in TERMINAL_STATES and status.finished_at is None:
+            # A genuine non-terminal -> terminal transition: the just-set updated_at == teardown.
+            # But a LEGACY run (finished_at never stamped) that is ALREADY terminal and gets a
+            # same-state field-only touch (e.g. billing_state via _update(run_id, current_state,...))
+            # must backfill from the PRE-update updated_at -- the prior persisted terminal time --
+            # not the freshly-set now, which would skew run_end / the reconcile window.
+            status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
         _save_status(status)
-        return True
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
 
 
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
@@ -386,6 +634,14 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
         status.reconciled_at = reconciled_at
         status.updated_at = time.time()
         _save_status(status)
+    _report_status(status)
+
+
+def _report_status(status: RunStatus) -> None:
+    with contextlib.suppress(Exception):
+        from flash.server.run_registry import record_training_run
+
+        record_training_run(status=status)
 
 
 def _save_status(status: RunStatus) -> None:
@@ -412,6 +668,7 @@ def _save_status(status: RunStatus) -> None:
 # run AFTER the store layer above is fully defined; lifecycle/deploy import the store via
 # FUNCTION-LOCAL lazy `from flash.runner import ...` to avoid a partially-initialized cycle.
 from flash.runner.deploy import (  # noqa: E402,F401
+    attach_checkpoint_deployment,
     attach_run,
     cancel_run,
     mark_deployed,

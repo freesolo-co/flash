@@ -1,8 +1,8 @@
-"""On-GPU fine-tuning worker (RunPod or Vast.ai). Modes: sft | rl.
+"""On-GPU fine-tuning worker (RunPod). Modes: sft | rl.
 
-This module runs on the provisioned GPU (RunPod or Vast.ai) launched by the selected
-``flash.providers`` backend. It uses the shared recipe (``flash.engine.recipe``) so
-SFT targets and RL rewards are rendered and scored consistently.
+This module runs on the provisioned RunPod GPU. It uses the shared recipe
+(``flash.engine.recipe``) so SFT targets and RL rewards are rendered and scored
+consistently.
 
 Artifacts (adapter, metrics.json, heartbeat.json, checkpoints) are streamed to a
 Hugging Face dataset repo. HF checkpoints give preemption resilience: if a worker is
@@ -24,10 +24,14 @@ JobSpec [train] table is the source of truth for per-run knobs.
 from __future__ import annotations
 
 import contextlib
+import faulthandler
 import json
+import math
 import os
 import random
+import re
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -52,9 +56,11 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
+    disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
     lora_exclude_modules,
     model_quant,  # noqa: F401
+    patch_grpo_mask_aware_lm_head,
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
     remap_adapter_keys,  # noqa: F401
@@ -62,16 +68,27 @@ from flash.engine.worker.lora import (
     strip_language_model_infix,  # noqa: F401
     vllm_language_model_only_kwargs,  # noqa: F401
 )
+from flash.engine.worker.packing import (
+    BlockDiagonalCollator,
+    gdn_packing_available,
+    model_is_gdn_hybrid,
+    model_is_pure_attention,
+    pack_token_ids,
+    packing_efficiency,
+    tokenize_for_packing,
+)
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
-    _drop_fla_on_hopper,
+    _ensure_fla_fastpath_on_hopper,
     _estimate_params,  # noqa: F401
+    _flash_attn_3_available,  # noqa: F401
     _flash_attn_available,
     _GpuPeakSampler,
     _liger_default_for_model,  # noqa: F401
     _memory_mode,
     _metric_curve,
+    _neutralize_tilelang_cudart_stub,
     _peak_gpu_gb,
     _remove_fla_from_disk,  # noqa: F401
     _reset_peak_gpu,
@@ -80,6 +97,7 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
+    grpo_sleep_mode,
     liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
@@ -125,10 +143,14 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-name/your-env', returned by "
             "`flash env push --name <name>`)."
         )
-    return load_environment(env_id, JOB_SPEC.environment.params)
+    # Pass the control-plane-pinned commit sha (resolve-once hook) when present so the adapter
+    # skips the GitHub ref->sha resolve; "" (the default) keeps the worker resolving it itself.
+    return load_environment(
+        env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
+    )
 
 
-ACTIVE_ENV = _load_active_env()
+ACTIVE_ENV = None
 
 
 def require_active_env():
@@ -141,6 +163,9 @@ def require_active_env():
     actionable message instead — mirrors the explicit RuntimeError raised when a JobSpec is
     present but names no environment.
     """
+    global ACTIVE_ENV
+    if ACTIVE_ENV is None:
+        ACTIVE_ENV = _load_active_env()
     if ACTIVE_ENV is None:
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
@@ -320,8 +345,67 @@ def prefetch_model(model_id: str) -> float:
         model=model_id,
         download_seconds=secs,
         hf_transfer=os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
+        gpu=gpu_diagnostics(),
     )
     return secs
+
+
+# Trainer-state files a serving engine never needs: optimizer/scheduler/rng/loss-curve
+# state. Excluded when publishing the deployable per-step adapter so each step's snapshot is
+# just the LoRA weights + config (a few MB), small enough to KEEP every step (no pruning).
+_CHECKPOINT_TRAINER_STATE = (
+    "optimizer.pt",
+    "optimizer.bin",
+    "scheduler.pt",
+    "scaler.pt",
+    "rng_state*.pth",
+    "trainer_state.json",
+    "training_args.bin",
+    "*.distcp",
+    "global_step*/**",
+    "latest",
+    "zero_to_fp32.py",
+)
+
+# The PEFT adapter weights file a checkpoint must carry to be loadable/servable (safetensors is
+# the default; .bin is the legacy fallback). A step with adapter_config.json but no weights is
+# NOT deployable, so it's never published/listed.
+_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
+
+
+def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
+    """Mirror a trainer checkpoint's LoRA adapter to a stable, NON-pruned per-step path so a
+    run cancelled mid-RL is still one-command-deployable from its last good step.
+
+    The trainer's checkpoint folder already contains the PEFT adapter (``adapter_config.json``
+    + ``adapter_model.safetensors``) that ``deploy_adapter`` serves; we re-upload just those
+    (dropping optimizer/scheduler/rng state) to ``<prefix>/checkpoints/step-<step>/adapter``.
+    Unlike the resume checkpoint (``checkpoint/**``, kept latest-only), these accumulate, so
+    EVERY step stays deployable. Returns the deployable adapter subfolder, or ``None`` when
+    there's no adapter to publish. Best-effort: a failure here never fails a paid run.
+    """
+    if not HF_REPO:
+        return None
+    # Only publish a checkpoint that actually carries a loadable adapter (config AND weights) —
+    # never advertise a non-deployable step.
+    has_config = os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json"))
+    has_weights = any(os.path.isfile(os.path.join(ckpt_dir, w)) for w in _ADAPTER_WEIGHT_FILES)
+    if not (has_config and has_weights):
+        return None
+    subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
+    try:
+        hf_api().upload_folder(
+            folder_path=ckpt_dir,
+            path_in_repo=subfolder,
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+        )
+        heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+        return subfolder
+    except Exception as e:
+        print(f"[ckpt] deployable publish warn (step {step}):", e)
+        return None
 
 
 def make_checkpoint_upload_callback():
@@ -330,6 +414,9 @@ def make_checkpoint_upload_callback():
     Uploads run in a background thread (the train loop never blocks on the network);
     older checkpoints are deleted in the same commit. If an upload is still in flight
     when the next save fires, the new save is skipped (the following one catches up).
+
+    Each save also publishes a deployable per-step adapter snapshot (``publish_deployable_
+    checkpoint``) so a run cancelled mid-RL can still be deployed from its latest step.
     """
     from transformers import TrainerCallback
 
@@ -357,6 +444,9 @@ def make_checkpoint_upload_callback():
                         delete_patterns=[f"{hf_prefix()}/checkpoint/**"],
                     )
                     heartbeat("checkpoint_uploaded", step=step)
+                    # Mirror this step's adapter to its own kept-forever path so the run
+                    # stays deployable even if it never reaches "done".
+                    publish_deployable_checkpoint(ckpt_dir, step)
                 except Exception as e:
                     print("ckpt upload warn:", e)
                 finally:
@@ -385,7 +475,7 @@ _HB_THROTTLED_STAGES = frozenset({"rl_step"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 _HB_TERMINAL_ONLY = False
 # Even in terminal-only mode, emit a SLOW heartbeat at this cadence so the control plane's stall
-# detector (poll_vast_job stall_after_s, default 1500s) keeps seeing progress through a long
+# detector keeps seeing progress through a long
 # training phase and doesn't false-stall the run. 600s -> ~6 commits/hr, far under the 128/hr cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
 
@@ -401,6 +491,24 @@ _HB_LOCK = threading.Lock()
 # one on HF (reorder), so this lock makes uploads strictly ordered.
 _HB_UPLOAD_LOCK = threading.Lock()
 
+# Stall diagnostics: when FLASH_STALL_FAULTHANDLER_S > 0, arm a faulthandler watchdog that dumps
+# every thread's Python stack (then exits, so the run FAILS instead of hanging until the
+# control-plane stall watchdog kills it ~25 min later, and the dump is uploaded with
+# console_<phase>.txt). The timer is re-armed on every heartbeat, so it only fires when NO progress
+# heartbeat lands for the whole window -- i.e. a real hang. OFF by default (0); opt-in per run via
+# [worker_env]. Used to localize the GRPO sleep-mode rollout hang.
+_STALL_FAULTHANDLER_S = 0
+with contextlib.suppress(Exception):
+    _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "0") or 0)
+
+
+def _rearm_stall_faulthandler() -> None:
+    if _STALL_FAULTHANDLER_S <= 0:
+        return
+    with contextlib.suppress(Exception):
+        faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(_STALL_FAULTHANDLER_S, exit=True)
+
 
 def heartbeat(stage: str, **kw):
     global _HB_LAST_UPLOAD
@@ -413,6 +521,13 @@ def heartbeat(stage: str, **kw):
         "attempt": ATTEMPT,
         **kw,
     }
+    # The datacenter the worker actually landed in (RunPod serverless sets RUNPOD_DC_ID) — a
+    # diagnostic so the control plane / logs show which region a run hit (the eager weight-cache fleet
+    # already has a volume in every storage DC). Empty/absent on non-RunPod (instance) workers and
+    # harmless; only emitted when present.
+    _dc = os.environ.get("RUNPOD_DC_ID") or ""
+    if _dc:
+        payload.setdefault("dc", _dc)
     os.makedirs("/tmp/hb", exist_ok=True)
     p = "/tmp/hb/heartbeat.json"
     # _HB_LOCK guards ONLY the fast local work (atomic write + _HB_LAST_UPLOAD + snapshot capture);
@@ -454,6 +569,8 @@ def heartbeat(stage: str, **kw):
             finally:
                 with contextlib.suppress(OSError):
                     os.remove(up)
+    # Re-arm the stall watchdog: progress landed, so reset the no-heartbeat timer.
+    _rearm_stall_faulthandler()
     print("HEARTBEAT", json.dumps(payload))
 
 
@@ -513,9 +630,7 @@ def force_vllm_backend_for_sm120() -> str | None:
     FLASHINFER is vLLM's Blackwell-native backend (no flash-attn PTX dependency) and trains on a 5090
     (measured: FLASHINFER/TORCH_SDPA/TRITON_ATTN all train, ~116 s). This mirrors the trainer's
     cuDNN-SDPA forcing on sm120 (``_attn_impl_for_capability``). The GRPO no-op guard remains the
-    backstop. Returns the backend set (None if not sm120, or the operator already pinned one)."""
-    if os.environ.get("VLLM_ATTENTION_BACKEND"):
-        return None  # operator override wins
+    backstop. Returns the backend set (None if not sm120). Fixed — no operator override."""
     try:
         import torch
 
@@ -533,30 +648,56 @@ def force_vllm_backend_for_sm120() -> str | None:
 
 
 def finalize_alloc_conf_for_sleep() -> None:
-    """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default.
+    """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default (RL runs only).
 
-    The launcher (providers/*/train.py build_worker_env) must pick PYTORCH_ALLOC_CONF before this
-    process starts, but it can't always know the GRPO sleep decision: for a small model the worker
-    resolves sleep OFF (the speed default), yet the launcher conservatively assumes sleep ON and
-    picks the non-expandable conf (safe, but fragments a long colocate run). When the launcher cedes
-    the decision (it sets FLASH_ALLOC_AUTO=1 for RL runs), we resolve the same sleep default here (we
-    have the model config + GPU) and, if sleep is OFF, switch to expandable_segments — which only
-    crashes WITH sleep on, a case we've just ruled out. PYTORCH_ALLOC_CONF is read lazily at the
-    first CUDA allocation, so this must run before any allocation (it does — called at boot)."""
-    if os.environ.get("FLASH_ALLOC_AUTO") != "1":
+    The launcher (providers/*/train.py build_worker_env) picks the sleep-SAFE non-expandable
+    PYTORCH_ALLOC_CONF for RL before this process starts, but it can't know the GRPO sleep decision:
+    for a small model the worker resolves sleep OFF (the speed default), so the non-expandable conf
+    is safe but fragments a long colocate run. Here (we have the model config + GPU) we resolve the
+    SAME deterministic sleep default (``_memory_mode``, exactly run_rl's gate) and, if sleep is OFF,
+    switch to expandable_segments — which only crashes WITH sleep on, a case we've just ruled out.
+    PYTORCH_ALLOC_CONF is read lazily at the first CUDA allocation, so this must run before any
+    allocation (it does — called at boot)."""
+    if PHASE != "rl":
         return
     try:
         model_id = JOB_SPEC.model if JOB_SPEC else ""
-        # Resolve the GRPO context the SAME way the sleep gate does (run_rl): the run's
-        # [train].max_length, so a long-context run gets the right sleep default + alloc conf.
-        _spec_len = 0
+        # Resolve the sleep decision EXACTLY as run_rl does (grpo_sleep_mode: the size/context gate
+        # PLUS the resident-fit check against the live card), so the alloc conf matches the sleep
+        # mode the trainer will actually use.
+        _t = JOB_SPEC.train if JOB_SPEC else None
+        ctx = 0
         try:
-            if JOB_SPEC and JOB_SPEC.train and JOB_SPEC.train.max_length:
-                _spec_len = int(JOB_SPEC.train.max_length)
+            if _t and _t.max_length:
+                ctx = int(_t.max_length)
         except Exception:
-            _spec_len = 0
-        ctx = int(_spec_len or 0)
-        if not _memory_mode(model_id, ctx):  # sleep resolves OFF -> expandable is safe + better
+            ctx = 0
+        card_gb = 0.0
+        try:
+            import torch as _torch_card
+
+            if _torch_card.cuda.is_available():
+                # Binary GiB to match grpo_fits_resident (see run_rl); /1e9 over-reports ~7%.
+                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
+        except Exception:
+            card_gb = 0.0
+        # Resolve group_size EXACTLY as run_rl does (gcfg override, else the recipe default), not a
+        # flat 8: if the recipe's rl.group_size differs from 8 the alloc-conf sleep decision here
+        # would diverge from the trainer's, picking the wrong expandable/non-expandable conf.
+        from flash.engine.recipe import RECIPE as _RECIPE
+
+        _gcfg = grpo_overrides()
+        _group_size = int(_gcfg.get("group_size") or _RECIPE.rl.group_size)
+        sleep_on = grpo_sleep_mode(
+            model_id,
+            max_length=ctx,
+            group_size=_group_size,
+            max_tokens=(_t.max_tokens if _t else None),
+            lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
+            thinking=THINKING,
+            card_vram_gb=card_gb,
+        )
+        if not sleep_on:  # sleep resolves OFF -> expandable is safe + better
             conf = "expandable_segments:True"
             os.environ["PYTORCH_ALLOC_CONF"] = conf
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = conf
@@ -703,19 +844,13 @@ def run_sft():
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
 
-    require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
+    env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
-    heartbeat("sft_start")
-    # SFT only fits the single assistant `sft_target` per row; a multi-turn/ToolEnv env's
-    # tool/env turns are not represented, so SFT on one would silently mis-train (imitating a
-    # collapsed single-turn target). Warn loudly so it is not mistaken for proper multi-turn SFT.
-    if getattr(ACTIVE_ENV, "multi_turn", False):
-        print(
-            "[sft][warn] this is a multi-turn Freesolo environment, but SFT only fits "
-            "the single assistant target per row (tool/env turns are ignored). The model will be "
-            "trained on collapsed single-turn targets; multi-turn SFT is not supported. Use a "
-            "single-turn environment, or expect a single-turn-only fit."
-        )
+    heartbeat("sft_start", gpu=gpu_diagnostics())
+    # SFT on a multi-turn env: rows whose target completion is a full trajectory train on the whole
+    # transcript (proper multi-turn SFT, handled below); rows with a single-turn target completion
+    # collapse to one assistant turn. Warn only for the collapsing case (computed during the
+    # dataset build below), not unconditionally.
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
@@ -725,7 +860,7 @@ def run_sft():
         tok.pad_token = tok.eos_token
 
     # Build SFT text dataset (seeded shuffle for reproducibility)
-    train = ACTIVE_ENV.dataset()
+    train = env.dataset()
     rng = random.Random(SEED)
     rng.shuffle(train)
     max_examples = int(
@@ -736,17 +871,31 @@ def run_sft():
     if max_examples > 0:
         train = train[:max_examples]
     texts = []
+    multiturn_targets = 0
     for ex in train:
-        msgs = [
-            *ACTIVE_ENV.prompt_messages(ex),
-            {"role": "assistant", "content": ACTIVE_ENV.sft_target(ex)},
-        ]
+        # The env (via the freesolo-sdk Environment.sft_completion) owns the target completion: the
+        # full multi-turn target trajectory (assistant turns + tool calls + tool results + replies)
+        # when the row ships one, else a single target assistant turn. Training on the whole
+        # transcript is what makes SFT actually multi-turn (the tool-call protocol + replies) — the
+        # warm start the GRPO recipe expects. A >1-message completion is a multi-turn trajectory.
+        completion = env.sft_completion(ex)
+        if len(completion) > 1:  # a multi-turn target trajectory (vs a single assistant turn)
+            multiturn_targets += 1
+        msgs = [*env.prompt_messages(ex), *completion]
         texts.append(
             {
                 "text": tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=False, enable_thinking=THINKING
                 )
             }
+        )
+    if multiturn_targets:
+        print(f"[sft] multi-turn SFT: {multiturn_targets}/{len(train)} rows train on a full target transcript")
+    elif getattr(env, "multi_turn", False):
+        print(
+            "[sft][warn] this is a multi-turn Freesolo environment but no row ships a multi-turn "
+            "target completion; SFT collapses to a single assistant turn per row (tool/env turns "
+            "ignored). Provide target transcripts (output={\"messages\": [...]}) for proper multi-turn SFT."
         )
     if THINKING and not any("<think>" in t["text"] for t in texts[:256]):
         print(
@@ -757,7 +906,7 @@ def run_sft():
     ds = Dataset.from_list(texts)
 
     setup_seconds = time.time() - t_start
-    heartbeat("sft_model_load", setup_seconds=setup_seconds)
+    heartbeat("sft_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
     # Epochs come from the run's [train] epochs (already in JOB_SPEC), else the recipe default.
     epochs = int(
@@ -820,10 +969,15 @@ def run_sft():
         "logging_steps": 10,
         "save_steps": sft_save_default,
         "save_total_limit": 1,
-        # Memory-light checkpoints: save ONLY the (small LoRA) model, not the optimizer /
-        # scheduler / RNG state — skips the optimizer-state serialization spike at save and
-        # writes just the adapter. (We don't resume mid-run; seeds restart cleanly.)
-        "save_only_model": True,
+        # Resumable checkpoints: save the optimizer / scheduler / RNG state alongside the (small)
+        # LoRA adapter. We DO resume mid-run — make_checkpoint_upload_callback streams each save to
+        # HF and a replacement worker calls resume_from_checkpoint(hf_resume_checkpoint()) after a
+        # preemption — so without this the resumed run would re-initialize the optimizer (Adam
+        # moments) and LR schedule instead of truly continuing. For LoRA the optimizer state is tiny
+        # (it covers only the trainable adapter params), so the save spike is negligible. The
+        # deployable per-step snapshot (publish_deployable_checkpoint) strips this trainer state
+        # separately, so serving still gets adapter-only files.
+        "save_only_model": False,
         "max_length": sft_max_len,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
@@ -858,27 +1012,169 @@ def run_sft():
     # packing is ON then (varlen keeps 'bfd' example boundaries correct). If the best-effort install
     # failed, _fa_ok is False and we SKIP packing — without a boundary-correct attn backend examples
     # would cross-contaminate under SDPA.
+    # Pure full-attention vs GatedDeltaNet hybrid (Qwen3.5/3.6) — probed ONCE here and reused across
+    # the whole packing decision (each probe reads the cached HF config). TRL 'bfd' packing keeps
+    # example boundaries via position_ids that a varlen attn honors, but it provides NO seq_idx, so it
+    # can't reset a GDN hybrid's causal conv -> bfd-packing a GDN model silently cross-contaminates its
+    # linear-attention layers. So bfd is enabled for PURE full-attention models only; GDN hybrids pack
+    # via the cu_seqlens/seq_idx varlen collator branch below (when their kernels are present).
+    _pure_attn = model_is_pure_attention(model_id)
+    _gdn = model_is_gdn_hybrid(model_id)
     _fa_ok = _flash_attn_available()
-    if _fa_ok:
+    if _fa_ok and _pure_attn:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
-    else:
+    elif _fa_ok and _gdn:
         print(
-            "[sft] packing SKIPPED: flash_attn not importable (best-effort image build failed) "
-            "— no boundary-correct attn backend, falling back to SDPA without packing."
+            "[sft] TRL bfd packing NOT used for the GatedDeltaNet hybrid (bfd can't reset the conv); "
+            "the cu_seqlens/seq_idx varlen collator handles its packing when both kernels are present."
         )
+    else:
+        # FA2 bfd packing not enabled here — either flash_attn isn't importable, or it is but the arch
+        # isn't bfd-safe (e.g. sliding-window). This is NOT the final word: the SDPA block-diagonal /
+        # GDN-varlen block below may still turn packing on for a pure-attention or GDN-hybrid model.
+        _bfd_why = "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
+        print(f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below.")
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
     if liger_on(_memory_mode(model_id, sft_max_len)):
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
-    _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
-    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen attn.
-    # With FA2 importable force flash_attention_2 — a pure win over the SDPA default which would
-    # cross-contaminate packed examples.
-    if cfg_kwargs.get("packing") and _fa_ok:
-        _attn = "flash_attention_2"
-        print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+    _attn = optimal_attn_impl()  # arch-best FlashAttention (FA3 Hopper / FA2 Ampere·Ada) or SDPA
+    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen-capable attn
+    # (FA2 and FA3 both expose flash_attn_varlen_func; plain SDPA cross-contaminates packed examples).
+    # Use the ARCH-BEST flash impl optimal_attn_impl already picked (so Hopper packs under FA3, not
+    # FA2). Cases when it did NOT pick a flash impl:
+    #   * _attn == "sdpa" (sm120, the deliberate no-flash exception): DISABLE packing — consumer
+    #     Blackwell stays plain SDPA; do NOT force FA2 (its sm120 kernel coverage is unverified).
+    #   * _attn is None (Hopper without FA3): force FA2 for boundary-correct varlen IF the wheel is
+    #     importable; else drop packing rather than silently cross-contaminate.
+    if cfg_kwargs.get("packing"):
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] attn_implementation={_attn} (packing boundary-correct varlen)")
+        elif _attn == "sdpa":
+            cfg_kwargs["packing"] = False
+            print("[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)")
+        elif _fa_ok:
+            _attn = "flash_attention_2"
+            print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+        else:
+            cfg_kwargs["packing"] = False
+            print("[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA")
+
+    # --- True token packing via a 4D block-diagonal SDPA mask (no flash-attn / no flex) ---------
+    # When the run lands on plain SDPA (no varlen flash backend) the block above left packing OFF —
+    # notably on sm120 (RTX 5090, flash's DEFAULT GPU), and anywhere the best-effort flash-attn
+    # build didn't land. For a PURE full-attention model we can still pack: concatenate examples
+    # into max_length blocks and feed a 4D block-diagonal causal mask SDPA honors natively, so
+    # packed examples never attend across boundaries (boundary-correct, numerically identical to
+    # unpacked — verified on a tiny Qwen3/Llama: |packed-separate| logits ~1e-7). This reclaims the packing
+    # throughput win on the default GPU with neither flash-attn nor flex_attention. GatedDeltaNet
+    # hybrids (Qwen3.5/3.6) take the NEXT branch instead — a mask alone can't reset their linear-
+    # attention state, so they also need the cu_seqlens/seq_idx varlen kwargs.
+    _collator = None
+    # The mask paths materialize a dense [B, 1, T, T] mask — O(T^2) memory. At very long context that
+    # tax (hundreds of MB to >1 GB) can OOM a run that previously fit under memory-efficient SDPA, and
+    # packing buys little there anyway (long rows already fill a block). Above this cap, leave packing
+    # off (train unpacked, as today). 16384: the dense bf16/bool mask stays <=~256 MB at bsz=1.
+    _PACK_MASK_MAX_LEN = 16384
+    _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
+    _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
+    if _sdpa_pack:
+        # The 4D mask requires a MASK-READING attn (SDPA). DOWNGRADE any flash impl optimal_attn_impl
+        # picked — e.g. FA3 on a Hopper worker whose FA2 wheel didn't build — to SDPA: a flash varlen
+        # kernel SILENTLY IGNORES the 4D mask, so packed examples would attend across boundaries. (A
+        # bare ``_attn or "sdpa"`` would leave the truthy flash string in place — the bug this avoids.)
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)")
+        _attn = "sdpa"
+        cfg_kwargs["packing"] = False  # we own the packing; TRL must not also pack
+        # Hand TRL pre-tokenized, pre-packed rows + our collator: skip its dataset prep and stop the
+        # signature-based column pruning from dropping our seq_lengths column before collation.
+        _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
+        _dk["skip_prepare_dataset"] = True
+        cfg_kwargs["dataset_kwargs"] = _dk
+        cfg_kwargs["remove_unused_columns"] = False
+        # Tokenize EXACTLY like TRL's non-packed prep (EOS-append parity so the model still learns to
+        # stop; batched; truncate to max_length) then bin-pack into <= max_length blocks.
+        _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
+        _packed_rows = pack_token_ids(_tokenized, sft_max_len)
+        ds = Dataset.from_list(_packed_rows)
+        _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
+        # Memory: re-size the per-device micro-batch (in BLOCKS) for the full-block [pd, max_length,
+        # vocab] fp32 logits budget — a no-op under Liger's fused CE. Quality: each block holds
+        # ~ex_per_block examples, so KEEP the effective batch in EXAMPLES at the configured value by
+        # re-deriving grad_accum from the block count. Without this, packing balloons the effective
+        # batch ~ex_per_block-fold (fewer, larger updates -> mild undertraining at the same epochs:
+        # an A/B measured +5.2% held-out loss vs unpacked, closed to +0.1% once matched).
+        _pd_pack, _ = sft_grad_accum(
+            effective_batch, seq_len=sft_max_len, vocab=vocab_size_for(model_id),
+            fused=bool(cfg_kwargs.get("use_liger_kernel")),
+        )
+        # The dense [pd, 1, T, T] bool mask is pd*T^2 bytes — under Liger the logits cap doesn't bind
+        # so pd can be 4, and at long context that mask alone is GBs. Cap pd so the mask stays <=512MB
+        # (a no-op at short ctx: at T=2048 it allows pd up to ~125; it only bites past ~12k tokens).
+        _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
+        _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
+        cfg_kwargs["per_device_train_batch_size"] = _pd_pack
+        cfg_kwargs["gradient_accumulation_steps"] = max(
+            1, math.ceil(effective_batch / max(1.0, _pd_pack * _ex_per_block))
+        )
+        print(
+            "[sft] true token packing ENABLED (4D block-diagonal SDPA mask): "
+            f"{len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} ex/block, "
+            f"{packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} tok; "
+            f"pd={_pd_pack} ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept "
+            f"~{effective_batch} ex); no flash-attn / no flex_attention"
+        )
+    elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available(model_id) and _mask_pack_ok:
+        # GatedDeltaNet hybrid (Qwen3.5/3.6, flash's flagship tier): the 4D block-diagonal mask makes
+        # the FULL-attention layers boundary-correct, and the linear-attention (DeltaNet) layers reset
+        # their recurrence + causal conv at example boundaries via cu_seq_lens_q (fla kernel) + seq_idx
+        # (causal_conv1d). GPU-validated on Qwen3.5-0.8B (RTX 5090): a packed example's output is
+        # byte-identical regardless of its neighbors' content (ZERO cross-example leakage); the only
+        # diff vs unpacked is benign bf16 GDN-kernel tiling numerics (~0.3 on logits). Gated on BOTH
+        # kernels being importable (gdn_packing_available) so a worker without them stays unpacked.
+        # Pin SDPA for the full-attn layers (downgrade any flash impl, e.g. FA3 on Hopper — it would
+        # ignore the 4D mask); the DeltaNet layers are unaffected (they use cu_seqlens/seq_idx).
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] GDN packing under SDPA: downgrading {_attn} -> sdpa for the full-attn layers")
+        _attn = "sdpa"
+        cfg_kwargs["packing"] = False
+        _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
+        _dk["skip_prepare_dataset"] = True
+        cfg_kwargs["dataset_kwargs"] = _dk
+        cfg_kwargs["remove_unused_columns"] = False
+        # EOS-append parity + batched + truncated tokenization (same as the unpacked path), then pack.
+        _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
+        _packed_rows = pack_token_ids(_tokenized, sft_max_len)
+        ds = Dataset.from_list(_packed_rows)
+        _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
+        # cu_seqlens spans ONE packed block, so per-device is a single block; keep the effective batch
+        # in EXAMPLES at the configured value via grad-accum (each block holds ~ex_per_block examples —
+        # without this the effective batch would balloon ~ex_per_block-fold -> undertraining).
+        _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
+        cfg_kwargs["per_device_train_batch_size"] = 1
+        cfg_kwargs["gradient_accumulation_steps"] = max(1, math.ceil(effective_batch / max(1.0, _ex_per_block)))
+        print(
+            "[sft] true token packing ENABLED for GatedDeltaNet hybrid (4D mask + cu_seqlens/seq_idx "
+            f"varlen): {len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} "
+            f"ex/block, {packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} "
+            f"tok; pd=1 ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept ~{effective_batch} ex)"
+        )
+    elif not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
+        print(
+            f"[sft] packing stays OFF: max_length {sft_max_len} > {_PACK_MASK_MAX_LEN} — the dense "
+            "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
+            "efficient there, and long rows already fill a block)."
+        )
+    elif not cfg_kwargs.get("packing") and not _pure_attn:
+        _why = (
+            "hybrid GatedDeltaNet but the fla/causal_conv1d varlen kernels aren't both importable"
+            if _gdn
+            else "non-full-attention arch (e.g. sliding-window) a block-diagonal mask can't pack"
+        )
+        print(f"[sft] packing stays OFF: {_why}. (Pure full-attention models pack via the SDPA mask.)")
     # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
     # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
     # accelerate-offload large models to meta ("expected device meta but got
@@ -971,14 +1267,30 @@ def run_sft():
 
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
-    trainer = _SFT(
-        model=model_id,
-        args=cfg,
-        train_dataset=ds,
-        peft_config=make_lora(model_id),
-        processing_class=tok,
-        callbacks=[make_sft_heartbeat_callback(), make_checkpoint_upload_callback()],
-    )
+    # SFTTrainer.__init__ blocks for 10-15 min on first use (FA2 CUDA kernel JIT compilation);
+    # without a heartbeat the control plane can't distinguish this from a real hang and may
+    # recycle the worker. A daemon thread pings every 30s so the stall detector stays quiet.
+    _sft_init_done = threading.Event()
+
+    def _sft_init_heartbeat() -> None:
+        while not _sft_init_done.wait(30.0):
+            heartbeat("sft_initializing", gpu=gpu_diagnostics())
+
+    _sft_init_hb = threading.Thread(target=_sft_init_heartbeat, daemon=True)
+    _sft_init_hb.start()
+    try:
+        trainer = _SFT(
+            model=model_id,
+            args=cfg,
+            train_dataset=ds,
+            peft_config=make_lora(model_id),
+            processing_class=tok,
+            # Our block-diagonal collator on the SDPA-packing path; None elsewhere == TRL default.
+            data_collator=_collator,
+            callbacks=[make_sft_heartbeat_callback(), make_checkpoint_upload_callback()],
+        )
+    finally:
+        _sft_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
     # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
     # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
@@ -998,7 +1310,7 @@ def run_sft():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     hf_upload_folder(adapter_dir, "adapter", required=True)
-    heartbeat("sft_trained", train_wall=train_wall)
+    heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # count train tokens
     train_tokens = int(sum(len(tok(t["text"])["input_ids"]) for t in texts) * epochs)
@@ -1071,8 +1383,6 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     factor, so a run intended as 64 prompts/step actually optimized only
     ``64 / group_size = 8`` prompts/step (an 8x smaller effective batch).
     """
-    import math
-
     group_size = max(1, int(group_size))
     prompts_per_step = max(1, int(prompts_per_step))
     per_device = max(1, int(per_device_comps))
@@ -1081,15 +1391,21 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     # a small prompts_per_step would otherwise overshoot it (mirrors run_sft's
     # `min(per_device_bs, effective_batch)`). No-op at the default (prompts_per_step=64).
     per_device = max(1, min(per_device, target_comps))
+    # per_device is the fixed VRAM knob, but when it does NOT divide target_comps neither floor
+    # nor ceil of grad_accum is right: floor (the old bug) silently optimizes FEWER prompts than
+    # requested, while ceil over-shoots and asks TRL for MORE unique prompts than the (already
+    # dataset-capped) prompts_per_step -- which, on a small retained dataset, yields no batches
+    # after the paid worker is provisioned. Instead shrink per_device to the largest divisor of
+    # target_comps that is <= the requested per_device: that lowers (never raises) peak VRAM and
+    # makes per_device * grad_accum == target_comps EXACTLY, so unique prompts == prompts_per_step
+    # with no over/under-shoot. (per_device=16, target_comps=40 -> 10 -> grad_accum=4 -> 40 comps
+    # = exactly 5 prompts. A divisor always exists since 1 divides everything.)
+    while target_comps % per_device != 0:
+        per_device -= 1
     grad_accum = max(1, target_comps // per_device)
-    # TRL rejects a global completion batch (per_device * grad_accum) that is not
-    # divisible by num_generations (= group_size), failing only AFTER the paid worker
-    # is provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the
-    # next multiple that makes the batch divisible (grad_accum must be a multiple of
-    # group_size // gcd(per_device, group_size)). This only ever raises the effective
-    # batch slightly; the common per_device|group_size cases are unchanged.
-    accum_step = group_size // math.gcd(per_device, group_size)
-    grad_accum = ((grad_accum + accum_step - 1) // accum_step) * accum_step
+    # The global completion batch (per_device * grad_accum == target_comps) is divisible by
+    # num_generations (= group_size) by construction, since target_comps = prompts_per_step *
+    # group_size; TRL's divisibility requirement is satisfied with no further rounding.
     generations_per_step = per_device * grad_accum
     unique_prompts_per_step = generations_per_step // group_size
     return {
@@ -1118,38 +1434,119 @@ def resolve_grpo_prompts_per_step(requested: int, available_prompts: int) -> int
     return min(requested, available_prompts)
 
 
+def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
+    """Arrow-safe GRPO rollout rows + the parallel example lookup ``reward_fn`` maps back through.
+
+    ``Dataset.from_list`` lets PyArrow infer ONE column type per (nested) field across ALL rows, so
+    embedding the rich per-example record makes a *valid* env whose per-row ``info``/``metadata``
+    legitimately mixes types crash dataset construction with ``ArrowInvalid`` — and the whole RL
+    phase dies at startup, AFTER the paid GPU is provisioned, on input that passed offline
+    single-example validation. (Observed with ifeval-lite: ``metadata.param`` is an int target word
+    count for some rows and a required-word string ``'gentle'`` for others; Arrow infers ``int64``
+    from the leading rows then fails on the first string.)
+
+    Fix: keep the dataset columns trivially typed — the TRL-required ``prompt`` plus a stable integer
+    ``example_idx`` — and return the original example objects in a parallel list. ``reward_fn`` maps
+    the index back, so the env still sees its EXACT record (no JSON/Arrow round-trip, no type
+    coercion). ``rows[i]["example_idx"] == i`` and ``examples[i]`` is that row's record.
+    """
+    examples = [p["example"] for p in prompts]
+    rows = [{"prompt": p["prompt"], "example_idx": i} for i, p in enumerate(prompts)]
+    return rows, examples
+
+
+# Hard ceiling on the per-device completion micro-batch when growing on a SHORT-seq run. MEASURED
+# (RunPod, Qwen3.5-0.8B GRPO, group8, gsm8k, seq1024, 6 steps): trainer throughput rises from
+# per_device 4 -> 8 (~+12%) and plateaus 8..16 (A100 80GB: 375/407/411 tok/s at pd 4/8/16), then
+# REGRESSES at pd 32 (326 tok/s, -20%) as the larger forward stops buying MFU. So we never grow
+# past the top of that plateau, even on a card with VRAM to spare. (Reward histories at pd 4 and
+# 16 were identical -> per_device is a pure speed/VRAM knob, not an optimization change.)
+_RL_PER_DEVICE_MAX = 16
+# Reference sequence length the activation/VRAM divisor is calibrated at. The colocate activation
+# peak grows with the training sequence length; the cap is scaled by seq_len/_RL_ACT_SEQ_REF so a
+# short-seq run (the underfed regime) is allowed a proportionally bigger micro-batch.
+_RL_ACT_SEQ_REF = 2048.0
+# VRAM-per-(micro-batch element) divisor at the reference seq, normalized to ~2B width (1.41).
+# MEASURED: Qwen3.5-2B group8 seq2048 OOMs a 32 GB card at per_device=8 but trains at 4 ->
+# 32 / (7.5 * 1.0 * 1.0) = 4. (Unchanged from the historical colocate cap, so at/above the
+# reference seq the value is byte-for-byte the old one — no regression.)
+_RL_ACT_DIVISOR = 7.5
+# Floor on the seq scale: caps how far a short sequence may grow the micro-batch. Set so the
+# underfed case that motivated this — Qwen3.5-0.8B GRPO on a 24 GB card at seq<=1024 — lands on
+# the MEASURED-SAFE per_device 8 (RunPod RTX 4090 24 GB: pd8 fits at 19.0 GB and is +12.6% over
+# pd4, while the old seq-independent cap under-fed it at ~5; pd16 there would need ~27 GB -> OOM).
+# 24 / (7.5 * (0.894/1.41) * 0.63) = 8.0. Bounds short-seq growth to ~1.6x the reference cap.
+_RL_ACT_SEQ_SCALE_FLOOR = 0.63
+# Clamp the seq scale at 1.0 (never ABOVE the reference). Combined with the short_seq growth gate,
+# this makes a seq>=reference run byte-for-byte the old value: seq_scale==1.0 -> vram_cap == the
+# old colocate cap, and the ceiling falls back to the historical default, so min(default, ...) is
+# exactly what the old code returned. We deliberately do NOT tighten long-seq below the historical
+# value (grad checkpointing makes activations sub-linear in seq there, so the linear model would
+# over-cap), nor grow above it (unvalidated — the regression is in tokens-in-flight = pd x seq).
+_RL_ACT_SEQ_SCALE_CEIL = 1.0
+
+
 def rl_per_device_comps(
     completion_len: int = 0,
     vocab: int = 248_320,
     *,
     use_vllm: bool = True,
     params_b: float | None = None,
+    seq_len: int = 0,
 ) -> int:
     """Per-device *completion* micro-batch for GRPO (TRL counts completions, not prompts).
 
-    This, not grad-accum, sets peak trainer VRAM: the logprob pass materializes fp32 logits
-    of shape [per_device, completion_len, vocab]. At Qwen3.5's ~248k vocab a long completion is
-    enormous (measured: per_device 8 x 4096 tok x 248k x 4 B = ~30 GiB single alloc -> OOMs
-    a small card). So we MEMORY-CAP per_device to a logits budget (6 GB) for the
-    given completion length, then push the difference into grad-accum
-    (compute_grpo_batching) so the effective batch is unchanged. This keeps long-completion
-    GRPO on a cheaper GPU.
+    This, not grad-accum, sets peak trainer VRAM AND the trainer step's MFU: a bigger
+    micro-batch means bigger, fewer GEMMs (less launch overhead, fuller tensor cores) at the
+    same effective batch (compute_grpo_batching pushes the remainder into grad-accum, so the
+    optimization is identical — only speed/VRAM change). MEASURED on RunPod (Qwen3.5-0.8B GRPO,
+    group8, seq1024): the old seq-independent colocate cap under-fed a 24 GB card at per_device ~5,
+    while per_device 8 fits (19.0 GB) and is +12.6% throughput; on an 80 GB card throughput
+    plateaus at per_device 8..16 and regresses by per_device 32. So on a SHORT-seq run we grow the
+    micro-batch into the card's measured VRAM headroom up to the plateau ceiling.
 
-    The logits budget is NOT the whole story: the per-device forward also holds the model's
-    attention/activation memory (the Qwen3.5 GDN/FLA kernels peak per micro-batch even with
-    grad checkpointing), which the logits term can't see. Under colocated vLLM (the rollout
-    engine + its card-sized KV pool + a 2nd weight copy share the GPU) that activation peak is
-    what OOMs a small card -- and Liger, which fuses away the logits, does NOT touch it.
-    MEASURED: Qwen3.5-2B (width ~1.41) group8 seq2048 OOMs a 32 GB card at per_device=8 but
-    TRAINS at 4. So for colocate, additionally cap per_device to the live card's VRAM scaled
-    by model width (~sqrt(params)): ~vram_gb/8 at 2B-width, tightened for wider models (4B/9B).
+    Growth is GATED to short sequences (seq < the reference). At/above the reference seq the value
+    is byte-for-byte the historical one — bigger per_device at long context is unvalidated and the
+    regression is driven by tokens-in-flight (per_device x seq), which a fixed-per_device ceiling
+    would not catch.
+
+    Two upper bounds cap the growth:
+
+    * **logits budget (6 GB)** — a HARD correctness cap. The logprob pass can materialize fp32
+      logits of shape [per_device, completion_len, vocab]; at Qwen3.5's ~248k vocab a long
+      completion is enormous (per_device 8 x 4096 tok x 248k x 4 B = ~30 GiB -> OOMs a small
+      card). Liger normally fuses these away, but this stays a safety net for the fallback path.
+
+    * **activation/VRAM cap** — the per-device forward holds the model's attention/activation
+      memory (the Qwen3.5 GDN/FLA kernels peak per micro-batch even with grad checkpointing),
+      which the logits term can't see and which Liger does NOT touch. Calibrated against the live
+      card's VRAM, model width (~sqrt(params)), and — unlike the old seq-independent cap — the
+      training sequence length: activations scale ~linearly with seq, so a SHORT-seq run gets a
+      proportionally bigger cap. MEASURED at seq_ref=2048: Qwen3.5-2B (width ~1.41) group8 OOMs a
+      32 GB card at per_device=8 but trains at 4 -> 32 / 7.5 = 4.
+
+    Off a live card (allocator / unit tests) there is no VRAM signal, so we fall back to the
+    conservative historical default (8, or 2 with thinking) bounded by the logits budget — the
+    allocator already provisions for that floor, and the worker only ever grows INTO the spare
+    VRAM the chosen card actually reports, so it cannot over-fill the card it was routed to.
     """
-    # Default prompts/step; the auto-caps below (logits budget + colocate VRAM/width) handle OOM.
-    base = 2 if THINKING else 8
+    default = 2 if THINKING else 8
+
+    # Logits budget: hard upper bound on the fp32 [per_device, completion, vocab] logprob tensor.
+    logits_cap = _RL_PER_DEVICE_MAX
     if completion_len > 0:
-        budget = 6.0 * 1e9
-        cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
-        base = min(base, cap)
+        logits_cap = max(1, int(6.0e9 / (max(1, completion_len) * vocab * 4)))
+
+    # Growth is gated to SHORT sequences (seq < the reference). At/above the reference seq the
+    # micro-batch is left exactly as the historical code computed it: bigger per_device at long
+    # context is unvalidated and risky — the measured throughput regression is driven by
+    # tokens-in-flight (per_device x seq), so per_device 16 at seq 2048 (~the regression-zone
+    # per_device 32 at seq 1024) could regress, and a fixed-per_device ceiling would not catch it.
+    short_seq = (seq_len or _RL_ACT_SEQ_REF) < _RL_ACT_SEQ_REF
+
+    # Activation/VRAM cap — only computable on a live card. It both caps DOWN (big model / small
+    # card / long seq) and, on a SHORT-seq run, lets the micro-batch GROW into spare VRAM.
+    vram_cap = None
     if use_vllm:
         try:
             import torch
@@ -1157,11 +1554,31 @@ def rl_per_device_comps(
             if torch.cuda.is_available():
                 vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                 width = (max(float(params_b), 0.1) ** 0.5) if params_b else 1.41
-                act_cap = max(1, int(vram_gb / (7.5 * (width / 1.41))))
-                base = min(base, act_cap)
+                seq_scale = min(
+                    _RL_ACT_SEQ_SCALE_CEIL,
+                    max(_RL_ACT_SEQ_SCALE_FLOOR, (seq_len or _RL_ACT_SEQ_REF) / _RL_ACT_SEQ_REF),
+                )
+                vram_cap = max(
+                    1, int(vram_gb / (_RL_ACT_DIVISOR * (width / 1.41) * seq_scale))
+                )
         except Exception as e:
             print("rl_per_device_comps colocate cap probe failed (keeping logits cap):", e)
-    return max(1, base)
+
+    if vram_cap is None:
+        # No live card (allocator / offline / unit tests): conservative default, logits-bounded.
+        return max(1, min(default, logits_cap))
+    # Short seq -> grow into measured VRAM headroom up to the plateau ceiling. At/above the
+    # reference seq the ceiling is the historical default, and seq_scale is clamped to 1.0 so
+    # vram_cap == the old colocate cap -> the result is byte-for-byte the old value (no regression,
+    # no unvalidated long-seq growth).
+    #
+    # THINKING runs are EXCLUDED from the growth path: they emit long completions whose
+    # activation/logprob cost the prompt-only `seq_len` gate cannot see, so letting short-seq
+    # growth raise the ceiling to _RL_PER_DEVICE_MAX would silently override the conservative
+    # thinking default (2) and risk OOM / unstable training. They keep `default` as the ceiling,
+    # i.e. byte-for-byte the historical value.
+    ceiling = _RL_PER_DEVICE_MAX if (short_seq and not THINKING) else default
+    return max(1, min(ceiling, logits_cap, vram_cap))
 
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
@@ -1365,9 +1782,9 @@ def run_rl():
     from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
 
-    require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
+    env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
-    heartbeat("rl_start")
+    heartbeat("rl_start", gpu=gpu_diagnostics())
     # GRPO rollout strategy by env shape (trl 1.6 adds the hooks these need):
     #   * single-turn          -> TRL single-shot generation + per-completion reward (below);
     #   * tool (ToolEnv & subs:
@@ -1377,9 +1794,23 @@ def run_rl():
     #   * pure multi-turn      -> a custom rollout_func (flash.engine.multiturn_rollout)
     #     drives THIS env's turn loop on the colocate engine and returns the interleaved
     #     token sequence with an env_mask so only the model's tokens are trained.
-    is_tool_env = getattr(ACTIVE_ENV, "is_tool_env", False)
-    is_multi_turn = getattr(ACTIVE_ENV, "multi_turn", False)
+    is_tool_env = getattr(env, "is_tool_env", False)
+    is_multi_turn = getattr(env, "multi_turn", False)
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
+    if is_multi_turn:
+        # The Liger fused GRPO loss (use_liger_kernel, kept ON to avoid the 248k-vocab fp32-logits
+        # OOM) torch.compiles, and on the VARIABLE-length multi-turn completions its dynamo guard
+        # build trips a torch 2.10 bug (symbol_to_source IndexError) that crashes the first
+        # training step. Let dynamo FALL BACK TO EAGER for the offending function instead of
+        # raising. This is NOT `TORCHDYNAMO_DISABLE` (which would also break the colocate vLLM
+        # engine's required compilation) — dynamo stays enabled; only erroring graphs run eager.
+        try:
+            import torch._dynamo
+
+            torch._dynamo.config.suppress_errors = True
+            print("[rl] multi-turn: torch._dynamo suppress_errors=True (Liger loss falls back to eager on dynamic shapes)")
+        except Exception as exc:  # never let a torch internals change block the run
+            print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
@@ -1409,13 +1840,38 @@ def run_rl():
     _adv_clip = float(gcfg.get("advantage_clip") or 0.0)
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # vLLM sleep mode offloads the rollout engine's weights between steps to free memory for the
-    # optimizer, but reloading each step is a large per-step cost — PR #174 measured ~2-2.6x faster
-    # GRPO with it OFF on models that fit. Gate it by model size (same small=speed / large=memory
-    # gate as gradient checkpointing): OFF for small/fitting models, ON for large.
-    # Gate on the GRPO rollout context (the run's [train].max_length sizes the engine + KV cache):
-    # a long-context GRPO run is memory-tight and needs sleep mode. Matches the liger-loss gate below.
+    # optimizer, but reloading each step is a large per-step cost (PR #174 measured ~2-2.6x faster
+    # GRPO with it OFF on models that fit) AND on the large-model GRPO path the sleep/wake cycle
+    # STALLS the colocated rollout (the rollout emits unparseable completions, then the worker
+    # hangs mid-training). So enable sleep only when the run genuinely can't fit RESIDENT on THIS
+    # card: large/long-context AND the policy + colocated rollout engine + training peak don't fit
+    # on the live GPU. When they fit (the common allocator-sized case), skip sleep entirely.
     _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
-    sleep_mode = _memory_mode(model_id, _grpo_ctx)
+    _card_vram_gb = 0.0
+    try:
+        import torch as _torch_card
+
+        if _torch_card.cuda.is_available():
+            # Binary GiB (/(1024**3)), NOT decimal GB (/1e9 over-reports ~7%): grpo_fits_resident's
+            # VRAM estimate is in GiB, so a decimal card size would make a marginal card look big
+            # enough to fit resident and wrongly disable sleep, risking OOM.
+            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
+    except Exception as _e:
+        print("[rl] card VRAM probe failed (sleep-mode gate falls back to size/context):", _e)
+    _lora_rank = int(_t.lora_rank) if _t and _t.lora_rank else 32
+    sleep_mode = grpo_sleep_mode(
+        model_id,
+        max_length=_grpo_ctx,
+        group_size=group_size,
+        max_tokens=gcfg.get("max_tokens"),
+        lora_rank=_lora_rank,
+        thinking=THINKING,
+        card_vram_gb=_card_vram_gb,
+    )
+    print(
+        f"[rl] vLLM sleep mode = {sleep_mode} "
+        f"(model={model_id}, ctx={_grpo_ctx}, card={_card_vram_gb:.0f}GB)"
+    )
     # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
     # colocated vLLM; there is no transformers-generation fallback.
     use_vllm = True
@@ -1427,13 +1883,13 @@ def run_rl():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    train = ACTIVE_ENV.dataset()
+    train = env.dataset()
     rng = random.Random(SEED)
     rng.shuffle(train)
     if conversational:
         # Message-list prompts so the chat template applies roles + (for tool envs) the tool
         # schemas; per-turn length is managed by the tool loop / rollout_func, not a flat budget.
-        prompts = [{"prompt": ACTIVE_ENV.prompt_messages(ex), "example": ex} for ex in train]
+        prompts = [{"prompt": env.prompt_messages(ex), "example": ex} for ex in train]
     else:
         prompts = [{"prompt": render_prompt(tok, ex), "example": ex} for ex in train]
     # The colocated vLLM engine's model length is the hard cap on prompt+completion at
@@ -1473,7 +1929,7 @@ def run_rl():
     # Tool schemas TRL injects into the prompt for native tools= GRPO — include them in the
     # budget for a tool env so a prompt isn't undercounted at filter time vs. rollout time.
     _oai_tools = (
-        getattr(getattr(ACTIVE_ENV, "_env", None), "oai_tools", None) if is_tool_env else None
+        getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
     )
 
     def _prompt_tokens(p) -> int:
@@ -1521,7 +1977,11 @@ def run_rl():
             f"{resolved_prompts_per_step}: only {len(prompts)} prompt(s) fit after filtering"
         )
         prompts_per_step = resolved_prompts_per_step
-    ds = Dataset.from_list(prompts)
+    # Carry a stable integer index instead of the rich record so PyArrow can't crash on an env whose
+    # per-row info/metadata legitimately mixes types (see build_grpo_prompt_dataset). reward_fn maps
+    # the index back to the original example object below.
+    ds_rows, rollout_examples = build_grpo_prompt_dataset(prompts)
+    ds = Dataset.from_list(ds_rows)
 
     def reward_fn(completions, **kwargs):
         # rollout_func (pure multi-turn) path: the per-rollout reward is computed by the env
@@ -1530,7 +1990,26 @@ def run_rl():
             return [float(r) for r in kwargs["reward"]]
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
-        examples = kwargs.get("example")
+        # The dataset carries example_idx (not the record); map each back to its original object.
+        # Fail LOUD if TRL stops forwarding example_idx (column pruning / a TRL change): defaulting to
+        # [] would zip to ZERO examples -> empty rewards -> silent no-op / broken training (issues
+        # #206 / #210). A reward over the wrong/empty examples is far worse than crashing the run.
+        example_idx = kwargs.get("example_idx")
+        if example_idx is None:
+            raise RuntimeError(
+                "GRPO reward_fn received no 'example_idx' column from TRL — the reward cannot be "
+                "mapped back to its training example, so every reward would be empty/misaligned "
+                f"(got kwargs keys {sorted(kwargs)}). This usually means TRL dropped the dataset "
+                "column (remove_unused_columns / a TRL version change); the run is aborted rather "
+                "than silently training on no signal."
+            )
+        if len(example_idx) != len(completions):
+            raise RuntimeError(
+                f"GRPO reward_fn example_idx/completions length mismatch "
+                f"({len(example_idx)} vs {len(completions)}) — rewards would be misaligned with "
+                "the sampled completions; aborting rather than training on a shifted reward signal."
+            )
+        examples = [rollout_examples[int(i)] for i in example_idx]
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
@@ -1539,16 +2018,16 @@ def run_rl():
                     # Tool / conversational transcript (TRL passes a list of messages): score the
                     # whole transcript via the environment reward (no <think> stripping —
                     # multi-turn content).
-                    r = ACTIVE_ENV.reward_from_messages(comp, ex)
+                    r = env.reward_from_messages(comp, ex)
                     rewards.append(r)
                     continue
                 graded = graded_text(comp)
                 breakdown = None
-                if hasattr(ACTIVE_ENV, "scores_breakdown"):
-                    breakdown = ACTIVE_ENV.scores_breakdown(graded, ex)
+                if hasattr(env, "scores_breakdown"):
+                    breakdown = env.scores_breakdown(graded, ex)
                     r = float(breakdown.get("total", 0.0))
                 else:
-                    r = ACTIVE_ENV.reward(graded, ex)
+                    r = env.reward(graded, ex)
                 if _think_penalty > 0 and THINKING:
                     r -= _think_penalty * think_token_count(comp, tok)
             except Exception as _reward_exc:
@@ -1595,9 +2074,27 @@ def run_rl():
     _params_b = resolve_params_b(model_id)
     from flash.catalog import vocab_size_for
 
+    # Per-device completion-logits cap: a multi-turn rollout accumulates a FULL transcript (model
+    # turns + masked env tokens) up to the engine context — far longer than the single-turn per-turn
+    # budget `_max_completion` — and the trainer's logprob forward processes that whole completion.
+    # So size the fp32 [per_device, completion, vocab] cap against the WORST-CASE multi-turn
+    # completion length (the engine context) instead of `_max_completion`, or a long multi-turn run
+    # OOMs the trainer forward. Single-turn keeps `_max_completion` (its true completion length).
+    _cap_completion_len = vllm_max_len if is_multi_turn else _max_completion
     per_device_comps = rl_per_device_comps(
-        _max_completion, vocab=vocab_size_for(model_id), use_vllm=use_vllm, params_b=_params_b
+        _cap_completion_len,
+        vocab=vocab_size_for(model_id),
+        use_vllm=use_vllm,
+        params_b=_params_b,
+        # The trainer forward processes prompt+completion up to the engine context, so the
+        # activation/VRAM cap is sized against the worst-case training sequence length.
+        seq_len=vllm_max_len,
     )
+    if is_multi_turn and _cap_completion_len != _max_completion:
+        print(
+            f"[rl] multi-turn: sizing the per-device logits cap against the full transcript length "
+            f"{_cap_completion_len} (engine context), not the per-turn budget {_max_completion}"
+        )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
         print(
@@ -1632,9 +2129,12 @@ def run_rl():
         "logging_steps": 1,
         "save_steps": _t.save_every if _t and _t.save_every is not None else 20,
         "save_total_limit": 1,
-        # Memory-light checkpoints: adapter only, no optimizer/scheduler/RNG state -> no
-        # serialization spike at save (the save-step OOM guard).
-        "save_only_model": True,
+        # Resumable checkpoints: keep the optimizer/scheduler/RNG state with the LoRA adapter so a
+        # preempted GRPO run resumed via resume_from_checkpoint(hf_resume_checkpoint()) continues
+        # with intact optimizer state + step instead of a fresh optimizer. For LoRA this state is
+        # small (trainable adapter params only). The deployable per-step snapshot strips it
+        # separately, so serving still gets adapter-only files.
+        "save_only_model": False,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
         "run_name": wandb_run_name(),
@@ -1675,12 +2175,29 @@ def run_rl():
         force_vllm_backend_for_sm120()
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
-        # the model's FULL context and won't start on a consumer GPU). vllm_gpu_memory_utilization
-        # sizes vLLM's pool; sleep mode offloads its weights between steps.
+        # the model's FULL context and won't start on a consumer GPU).
+        # vllm_gpu_memory_utilization sizes vLLM's KV pool. The blanket sleep-path 0.45 was a
+        # misjudgement: on an 80 GB A100 it reserves 0.45 x 80 = 36 GB of KV, but a GRPO rollout only
+        # holds ~num_generations x context tokens. MEASURED (Qwen3.5-4B colocate): that 36 GB
+        # reservation is the dominant resident allocation and sets the step peak (~46 GB) — exactly why
+        # trainer-side optimisations (mask-aware lm_head, fused layers) moved nothing. colocate_kv_util
+        # sizes both paths from flash's per-model KV estimate instead (vram.py); MEASURED 4B/80 GB peak
+        # 46 -> 26 GB, reward byte-identical, train_wall neutral.
+        try:
+            import torch as _torch_vram
+
+            from flash.engine.vram import colocate_kv_util
+
+            _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
+            _vllm_gpu_mem_util = colocate_kv_util(
+                _params_b, vllm_max_len, _total_vram_gb, sleep_mode, num_generations=group_size
+            )
+        except Exception:
+            _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10  # safe fallback to the old constants
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,
-            vllm_gpu_memory_utilization=0.45,
+            vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
             vllm_enable_sleep_mode=sleep_mode,
         )
         # Rollout-memory + throughput knobs, applied ONLY if this TRL exposes the field (so an
@@ -1720,11 +2237,44 @@ def run_rl():
             True,
             "vLLM chunked prefill",
         )
-        _set_vllm_field(
-            ("vllm_compilation_config", "compilation_config"),
-            {"cudagraph_mode": "FULL_AND_PIECEWISE"},
-            "vLLM cudagraph_mode (verl rollout default)",
-        )
+        # vLLM 0.19.1 regressed the Triton _compute_slot_mapping_kernel: it launches
+        # (num_reqs + 1) thread blocks but the block table only has num_reqs rows, so the
+        # extra block causes an illegal memory access (cudaErrorIllegalAddress) on the first
+        # generation step. CUDA graph compilation triggers this path. Skip FULL_AND_PIECEWISE
+        # for vLLM versions outside TRL's supported range (0.12.0-0.19.0) until a fix lands.
+        _cudagraph_safe = True
+        try:
+            import vllm as _vllm_mod
+
+            _ver_base = _vllm_mod.__version__.split("+")[0]  # strip PEP440 local (e.g. +cu121)
+            _vllm_ver = tuple(int(x) for x in _ver_base.split(".")[:3])
+            if _vllm_ver > (0, 19, 0):
+                _cudagraph_safe = False
+                print(
+                    f"[rl][warn] vLLM {_vllm_mod.__version__} > 0.19.0: skipping "
+                    "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
+                    "crash workaround; update vLLM to a TRL-supported version to re-enable)"
+                )
+                # vLLM 0.19.1 ALSO hits `RuntimeError: aot_compile is not supported by the
+                # current configuration` through its DEFAULT torch.compile path on some GPU
+                # arches (Ampere sm_86: A6000, A100) — it fires from vllm/compilation/wrapper.py
+                # when torch._dynamo.is_compiling() is False inside the CUDA-graph capture path.
+                # Skipping FULL_AND_PIECEWISE above is not enough (the vllm_compilation_config
+                # GRPOConfig field doesn't exist in this TRL, so that _set_vllm_field is a no-op).
+                # VLLM_TORCH_COMPILE_LEVEL=0 (NO_COMPILATION) forces vLLM to execute the model
+                # eagerly, preventing the AOT path entirely. Official vLLM env var (vllm/envs.py);
+                # a no-op on a vLLM that doesn't define it. Don't override an operator-set value.
+                if "VLLM_TORCH_COMPILE_LEVEL" not in os.environ:
+                    os.environ["VLLM_TORCH_COMPILE_LEVEL"] = "0"
+                    print("[rl][warn] VLLM_TORCH_COMPILE_LEVEL=0 (prevent aot_compile on vLLM 0.19.1)")
+        except Exception:
+            pass
+        if _cudagraph_safe:
+            _set_vllm_field(
+                ("vllm_compilation_config", "compilation_config"),
+                {"cudagraph_mode": "FULL_AND_PIECEWISE"},
+                "vLLM cudagraph_mode (verl rollout default)",
+            )
     # Adapter init: continue training the SFT adapter (peft_config=None, model is the
     # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
@@ -1769,9 +2319,33 @@ def run_rl():
     if "num_iterations" in _grpo_fields:
         grpo_kwargs["num_iterations"] = 2
         print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
+    # truncated importance sampling (tis): trl's grpo applies an importance-sampling correction by
+    # default, but with mode="sequence_mask" and clip_max=3.0. the verl/openrlhf recipe for the
+    # rollout(vllm)-vs-training token-distribution mismatch is TOKEN-LEVEL truncated is with the
+    # per-token ratio clipped at c=2 (verl rollout_is_threshold=2.0). adopt that recipe here:
+    # token_truncate + c_max=2.0. feature-detected against this trl's GRPOConfig fields (canonical
+    # clip field first, then the pre-2.0 deprecated alias), so a trl that lacks a field is skipped.
+    # note: this deliberately changes trl's defaults (sequence_mask / 3.0) to the recipe values.
+    if "vllm_importance_sampling_mode" in _grpo_fields:
+        grpo_kwargs["vllm_importance_sampling_mode"] = "token_truncate"
+        print("[rl] tis mode=token_truncate (token-level truncated importance sampling)")
+    _tis_c = 2.0
+    _tis_clip_field = next(
+        (
+            f
+            for f in ("vllm_importance_sampling_clip_max", "vllm_importance_sampling_cap")
+            if f in _grpo_fields
+        ),
+        None,
+    )
+    if _tis_clip_field:
+        grpo_kwargs[_tis_clip_field] = _tis_c
+        print(f"[rl] tis clip c_max={_tis_c} ({_tis_clip_field})")
+    else:
+        print("[rl] tis: trl default importance-sampling correction in effect; no clip field on this trl")
     cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
-    heartbeat("rl_train_start", setup_seconds=setup_seconds)
+    heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
     # VL checkpoints (Qwen3.5/3.6) train text-only: make TRL's colocated rollout
     # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
@@ -1789,7 +2363,7 @@ def run_rl():
     # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
     # env's own turn loop on the colocate engine (env_mask masks the non-model tokens).
     extra_trainer_kwargs: dict = {}
-    tools = ACTIVE_ENV.tools() if is_tool_env else []
+    tools = env.tools() if is_tool_env else []
     # A tool env exposing NO tools would silently degrade to single-shot under tools=[]; drive
     # it through the rollout_func turn loop instead so it isn't mis-trained as single-turn.
     if is_tool_env and not tools:
@@ -1806,19 +2380,19 @@ def run_rl():
             index_collisions,
         )
 
-        examples_by_key = build_examples_index(train, ACTIVE_ENV.prompt_messages)
-        ncol = index_collisions(train, ACTIVE_ENV.prompt_messages)
+        examples_by_key = build_examples_index(train, env.prompt_messages)
+        ncol = index_collisions(train, env.prompt_messages)
         if ncol:
             print(
                 f"[rl][warn] {ncol} duplicate prompt(s) collide in the reward index; the shared "
                 "prompt scores against the last example's answer/info"
             )
         extra_trainer_kwargs["rollout_func"] = build_rollout_func(
-            active_env=ACTIVE_ENV,
+            active_env=env,
             tok=tok,
             examples_by_key=examples_by_key,
             max_completion=_max_completion,
-            max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
+            max_turns=getattr(env, "max_turns", 10),
             temperature=_temperature,
             top_p=rl.sampling_top_p,
             stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
@@ -1826,21 +2400,66 @@ def run_rl():
             engine_max_len=vllm_max_len,
         )
         print("[rl] multi-turn env: driving the turn loop via rollout_func")
-    trainer = GRPOTrainer(
-        model=init_model,
-        args=cfg,
-        train_dataset=ds,
-        reward_funcs=reward_fn,
-        peft_config=init_peft,
-        processing_class=tok,
-        callbacks=[hb_cb, make_checkpoint_upload_callback()],
-        **extra_trainer_kwargs,
-    )
+    # GRPOTrainer.__init__ blocks during model/vLLM init + FA2 kernel compilation (can be
+    # 10-20 min on first use). Background heartbeats keep the stall detector quiet.
+    _rl_init_done = threading.Event()
+
+    def _rl_init_heartbeat() -> None:
+        while not _rl_init_done.wait(30.0):
+            heartbeat("rl_initializing", gpu=gpu_diagnostics())
+
+    _rl_init_hb = threading.Thread(target=_rl_init_heartbeat, daemon=True)
+    _rl_init_hb.start()
+    try:
+        trainer = GRPOTrainer(
+            model=init_model,
+            args=cfg,
+            train_dataset=ds,
+            reward_funcs=reward_fn,
+            peft_config=init_peft,
+            processing_class=tok,
+            callbacks=[hb_cb, make_checkpoint_upload_callback()],
+            **extra_trainer_kwargs,
+        )
+    finally:
+        _rl_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
     # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
     # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    # Liger fused-loss chunk_size: TRL leaves it at the default 1, so the fused GRPO loss runs its
+    # whole detach -> chunk_forward -> compiled-loss -> autograd.grad cycle ONCE PER SEQUENCE
+    # (per_device_train_batch_size times) — Python/kernel-launch/compile-guard overhead that
+    # dominates at small-model scale where the GEMMs are tiny. Collapse it to ONE invocation over the
+    # whole per-device micro-batch. Numerically identical (every loss_type normalizes by the GLOBAL
+    # token count, not the chunk-local size, and chunk losses are summed). Must run BEFORE the
+    # mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure that has no
+    # chunk_size attribute.
+    _liger_loss = getattr(trainer, "liger_grpo_loss", None)
+    if _liger_loss is not None and hasattr(_liger_loss, "chunk_size"):
+        _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
+        if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
+            _liger_loss.chunk_size = _cs
+            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
+    # Run liger's fused GRPO loss EAGER: drop ONLY its torch.compile (BROKEN on torch 2.10 — its
+    # dynamo guard-gen trips a symbol_to_source IndexError that crashes the first GRPO step on every
+    # path), keep the chunked memory path that prevents the 248k-vocab fp32-logit OOM. Must run BEFORE
+    # the mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure. See the helper.
+    if disable_liger_grpo_torch_compile(trainer):
+        print(
+            "[rl] liger GRPO loss: torch.compile DISABLED (eager loss math; chunked memory path "
+            "retained) — dodges the torch 2.10 dynamo guard-gen crash (symbol_to_source IndexError)"
+        )
+    # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
+    # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
+    # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
+    # the right-PADDING (GRPO samples variable-length completions, padded to the batch max). Either
+    # way those positions add zero loss/gradient but pay full FLOPs. Loss-preserving; applies to ALL
+    # GRPO with the Liger fused loss; no-op when nothing is masked (uniform-length single-turn).
+    if grpo_kwargs.get("use_liger_kernel") and patch_grpo_mask_aware_lm_head(trainer):
+        _masked_kind = "env + padding" if use_rollout_func else "padding"
+        print(f"[rl] mask-aware lm_head: skipping masked ({_masked_kind}) positions in the GRPO loss")
     # The trainer (and its colocated vLLM engine + initial checkpoint load) is now built. Activate
     # the TRL->vLLM weight-sync name remap ONLY now (see patch_vllm_lm_weight_sync) so the initial
     # checkpoint load stayed untouched while the train-time syncs get remapped. No-op unless the VL
@@ -1852,10 +2471,14 @@ def run_rl():
     # Mid-run eval is intentionally NOT run during training: held-out evaluation happens on the
     # deploy/serving side (against the trained adapter), keeping training pure (no eval-phase cost
     # or eval-boundary stalls). Training streams only the per-step reward heartbeat.
+    _reset_peak_gpu()  # peak_gpu_gb reflects the train loop (verifies the micro-batch headroom)
+    _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. vLLM colocate + bnb pages
     t_train = time.time()
     with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
+    rl_peak_gpu_gb = _peak_gpu_gb()
+    rl_device_peak_gpu_gb = _gpu_sampler.stop_gb()
     reward_history = list(getattr(hb_cb, "reward_history", []))
     # A GRPO run that finishes WITHOUT the reward callback ever firing (empty reward_history)
     # produced NO real training — the rollout scored nothing (e.g. vLLM generation silently
@@ -1895,7 +2518,7 @@ def run_rl():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     hf_upload_folder(adapter_dir, "adapter", required=True)
-    heartbeat("rl_trained", train_wall=train_wall)
+    heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens: completions actually optimized (the intended
     # prompts_per_step after the batch fix) x the max completion length. Over-counts (most
@@ -1916,6 +2539,12 @@ def run_rl():
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
             "loss_curve": _metric_curve(trainer, "loss"),
+            # Peak torch-allocated GPU memory during the GRPO train loop (excludes bnb managed
+            # pages). device_peak_gpu_gb is the TRUE device footprint (total-free, incl. the vLLM
+            # colocate engine + bnb pages): the headline for verifying the per-device micro-batch
+            # left the card with headroom (no OOM) at the sized batch.
+            "peak_gpu_gb": rl_peak_gpu_gb,
+            "device_peak_gpu_gb": rl_device_peak_gpu_gb,
             # Which chalk gap-filling kernels actually ENGAGED (None = chalk not installed or every
             # kernel fell back) — verifies the chalk stack on a GRPO run without the console.
             "chalk_kernels": active_kernels(_chalk_report) or None,
@@ -1951,6 +2580,7 @@ def run_rl():
 def write_train_meta(
     phase, adapter_dir, model_id, train_wall, setup_seconds, train_tokens, generated_tokens, notes
 ):
+    env = require_active_env()
     meta = {
         "phase": phase,
         "adapter_dir": adapter_dir,
@@ -1967,14 +2597,14 @@ def write_train_meta(
     heartbeat(
         f"{phase}_train_done",
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
+        gpu=gpu_diagnostics(),
     )
     # Finalize directly from the training phase: build the run-metrics record (training
     # metrics only — loss/reward are streamed by the trainer; reward_history is in notes)
     # and write the completion sentinel. There is no separate eval phase.
     m = RunMetrics(
-        # Substrate the worker actually ran on. Each provider's launcher sets FLASH_ARM
-        # in the worker env (runpod -> "runpod", vast -> "vast"); default to "runpod" only
-        # when unset so the persisted metrics correctly attribute the compute backend.
+        # Substrate the worker actually ran on. The RunPod launcher sets FLASH_ARM; default to
+        # "runpod" when unset so persisted metrics correctly attribute the compute backend.
         arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
         seed=SEED,
@@ -1992,7 +2622,7 @@ def write_train_meta(
             "thinking": THINKING,
             "train_wall": train_wall,
             "model_id": model_id,
-            "environment": ACTIVE_ENV.id,
+            "environment": env.id,
             "job_spec": JOB_SPEC.to_dict() if JOB_SPEC else None,
         },
     )
@@ -2005,12 +2635,16 @@ def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     The only public form is the exact adapter_ref emitted by ``flash status``:
     ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
     """
-    repo, sep, prefix = adapter_ref.partition(":")
-    if not (sep and repo and prefix):
+    adapter_ref = adapter_ref.strip()
+    match = re.fullmatch(
+        r"(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*):"
+        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})/seed(?P<seed>\d+)",
+        adapter_ref,
+    )
+    if not match:
         return None
-    if repo.count("/") != 1 or not prefix.startswith(("sft/", "rl/")):
-        return None
-    return repo, prefix
+    repo, phase, run_id, seed = match.groups()
+    return repo, f"{phase}/{run_id}/seed{seed}"
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
@@ -2046,8 +2680,146 @@ def _finalize(metrics: RunMetrics):
     with open("/tmp/DONE", "w") as f:
         f.write(str(time.time()))
     hf_upload_file("/tmp/DONE", "DONE", required=True)
-    heartbeat("done")
+    heartbeat("done", gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
+
+
+# How long to wait for wandb.finish() to flush. On SUCCESS the full run must sync (a slow network /
+# large run can exceed the old 5s and leave the run "crashed"), so give it a generous-but-bounded
+# window; on FAILURE abort fast (the run is failing regardless and the worker is hard-exiting).
+_WANDB_FINISH_WAIT_S = 120.0
+_WANDB_FINISH_FAIL_WAIT_S = 5.0
+
+
+# Baked compiled-kernel cache (opt-in; see Dockerfile.worker + flash/engine/worker/kernel_warmup.py).
+# The Dockerfile points TRITON_CACHE_DIR/TORCHINDUCTOR_CACHE_DIR here and, when built with
+# --build-arg BUILD_KERNEL_CACHE=true, bakes a portable mega-cache produced on a real GPU. These
+# names are kept in lockstep with kernel_warmup.DEFAULT_CACHE_DIR / MEGA_CACHE_FILENAME.
+_KERNEL_CACHE_DIR = "/opt/flash/kernelcache"
+_KERNEL_CACHE_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.bin")
+_KERNEL_CACHE_META_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.json")
+
+
+def _current_cuda_sm(torch) -> str | None:
+    try:
+        if not torch.cuda.is_available():
+            return None
+        cap = torch.cuda.get_device_capability(0)
+        return f"sm{cap[0]}{cap[1]}"
+    except Exception:
+        return None
+
+
+def _load_kernel_cache_if_present() -> bool:
+    """Best-effort: if a baked mega-cache blob exists, load it so the worker skips first-run JIT.
+
+    Loads the portable cache that kernel_warmup.py wrote on a GPU builder via
+    ``torch.compiler.load_cache_artifacts()`` — measured cold compile ~124s -> warm load ~0.2s.
+    OPT-IN: when no baked cache is present (the default image build), this is a no-op and the worker
+    JITs on first use exactly as before (#163's init heartbeat covers that stall). Never raises:
+    a missing torch / missing file / unusable blob just logs and leaves the JIT path intact.
+    """
+    def _reject(reason: str) -> bool:
+        # a baked cache is present but unusable (no/garbled metadata or wrong arch): repoint
+        # triton/inductor OFF the baked trees (Dockerfile points them at /opt/flash/kernelcache)
+        # so the JIT fallback compiles fresh into scratch instead of reusing wrong-arch baked
+        # entries that would collide with this worker's arch.
+        print(f"[kernel-cache] {reason} -> first-run JIT fallback")
+        scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
+        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
+            d = os.path.join(scratch, sub)
+            os.makedirs(d, exist_ok=True)
+            os.environ[var] = d
+        return False
+
+    if not os.path.isfile(_KERNEL_CACHE_FILE):
+        print(f"[kernel-cache] no baked cache at {_KERNEL_CACHE_FILE} -> first-run JIT (expected default)")
+        return False
+    try:
+        import torch
+
+        current_sm = _current_cuda_sm(torch)
+        try:
+            with open(_KERNEL_CACHE_META_FILE) as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            return _reject("baked cache has no metadata")
+        except Exception as e:
+            return _reject(f"metadata unreadable ({e})")
+        cached_sm = str(meta.get("sm") or "")
+        if not current_sm:
+            # can't verify the worker's GPU arch -> don't risk loading a wrong-arch blob; JIT instead.
+            return _reject("worker GPU arch undetermined")
+        if cached_sm != current_sm:
+            return _reject(
+                f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
+            )
+        with open(_KERNEL_CACHE_FILE, "rb") as f:
+            blob = f.read()
+        torch.compiler.load_cache_artifacts(blob)
+        print(
+            f"[kernel-cache] loaded baked mega-cache for {cached_sm or 'unknown'} "
+            f"({len(blob)} bytes) -> skipping first-run JIT"
+        )
+        return True
+    except Exception as e:
+        # never block boot on a bad/absent cache: fall back to the normal JIT path. repoint off the
+        # baked trees too — if the mega blob was present + arch-matched but load raised, the on-disk
+        # triton/inductor entries may be partial/corrupt, so JIT fresh into scratch.
+        return _reject(f"load skipped ({e})")
+
+
+def wandb_finish(exit_code: int = 0) -> None:
+    """Finalize the W&B run before the worker's hard ``os._exit()``.
+
+    The worker hard-exits to dodge the colocated-vLLM teardown deadlock (see main),
+    which skips wandb's atexit sync — so a *successfully completed* run was left
+    dangling and W&B eventually marked it ``crashed`` even though all metrics were
+    logged. Explicitly finish the run (we own it: we called ``wandb.init`` in
+    ``wandb_report_to``) so it shows ``finished``. Best-effort; never raises (W&B is
+    optional, metrics.json is the source of truth)."""
+    if not os.environ.get("WANDB_API_KEY"):
+        return
+    import importlib.util
+
+    # find_spec can RAISE (not just return None) when wandb is already in sys.modules with an
+    # absent/partial __spec__ (e.g. a namespace-package or a partially-initialized import) — that
+    # would propagate out of the shutdown path and skip the hard exit. Keep it best-effort: treat any
+    # probe failure as "wandb present enough to try", and let the import + finish below (already
+    # wrapped) decide. Only a definitive None (probe succeeded, module truly absent) returns early.
+    try:
+        if importlib.util.find_spec("wandb") is None:
+            return
+    except Exception:
+        pass  # ambiguous probe -> fall through and try to finish (still fully guarded below)
+    try:
+        import wandb
+
+        if getattr(wandb, "run", None) is None:
+            return
+
+        errs: list[Exception] = []
+
+        def _finish() -> None:
+            try:
+                wandb.finish(exit_code=exit_code)
+            except Exception as e:
+                errs.append(e)
+
+        t = threading.Thread(target=_finish, daemon=True)
+        t.start()
+        # On SUCCESS (exit_code == 0) wandb.finish() must flush the full run; a slow network / large
+        # run can take well over 5s, and cutting it off there is what leaves the run dangling ->
+        # "crashed". Allow a longer, still-bounded wait on success; keep the short cut-off on the
+        # FAILURE path (exit_code != 0) where we want to abort fast and the run is failing anyway.
+        wait_s = _WANDB_FINISH_WAIT_S if exit_code == 0 else _WANDB_FINISH_FAIL_WAIT_S
+        t.join(timeout=wait_s)
+        if t.is_alive():
+            print(f"[wandb] finish() did not complete within {wait_s}s; continuing with hard exit")
+        elif errs:
+            print(f"[wandb] finish() warning: {errs[0]}")
+    except Exception as e:  # pragma: no cover - logging-only path
+        print(f"[wandb] finish() warning: {e}")
 
 
 def main():
@@ -2057,8 +2829,8 @@ def main():
     try:
         # Idempotency FIRST — before any env-mutating pip install / package removal: a re-delivered
         # job whose DONE already exists must return the persisted metrics and exit WITHOUT running
-        # _drop_fla_on_hopper() (pip-uninstalls fla) — that wasted a worker mutating its env on an
-        # already-complete run. It is called after the DONE check below (see _drop_fla_on_hopper()).
+        # _ensure_fla_fastpath_on_hopper() (mutates the env: pip-installs tilelang/fla) — that wasted
+        # a worker mutating its env on an already-complete run. It runs after the DONE check below.
         if HF_REPO:
             from huggingface_hub import hf_hub_download
 
@@ -2074,7 +2846,7 @@ def main():
                 done = False
             if done:
                 print("Run already complete (DONE present); returning persisted metrics.")
-                heartbeat("already_done")
+                heartbeat("already_done", gpu=gpu_diagnostics(include_torch=False))
                 try:
                     got = hf_hub_download(
                         repo_id=HF_REPO,
@@ -2090,9 +2862,20 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
-        heartbeat("boot")
-        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
+        _ensure_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
+        # Repoint tilelang's libcudart_stub.so at the real CUDA runtime so it can't shadow libcudart
+        # in vLLM's CudaRTLibrary (intermittent `undefined symbol: cudaDeviceReset` on GRPO vLLM
+        # init, any model size/arch). AFTER the fla fast path (a tilelang reinstall there rewrites
+        # the stub) and BEFORE the model/vLLM import. See perf.py / flash #184.
+        _neutralize_tilelang_cudart_stub()
+        heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
+        # Opt-in: load a baked compiled-kernel mega-cache (if the image shipped one) so the worker
+        # skips the ~10-15 min first-run JIT. Best-effort + no-op when absent (the default), so the
+        # normal JIT path is untouched. Runs AFTER finalize_alloc_conf_for_sleep: _load probes CUDA
+        # (_current_cuda_sm -> get_device_capability triggers CUDA init), so the allocator conf must be
+        # resolved first; still before any model/kernel import that would otherwise trigger compilation.
+        _load_kernel_cache_if_present()
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
             "sft": run_sft,  # SFT (TRL SFTTrainer)
@@ -2109,11 +2892,16 @@ def main():
         # handler's *blocking* `subprocess.run` (heartbeat frozen at "rl_train_done") and the
         # whole run stalls until the wall-clock cap. Hard-exit to bypass the hanging teardown now that
         # every output is safely persisted.
+        wandb_finish(exit_code=0)  # mark the W&B run finished BEFORE os._exit (which skips wandb's atexit sync)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
         # Structured retry signal both pollers read: an infra failure -> retry on a fresh worker.
+        # GitHubRateLimitError (env ref resolution hit a persistent GitHub rate limit) is retriable:
+        # reschedule on a fresh worker once the limit window resets rather than hard-failing. Env
+        # resolution runs lazily inside this try (require_active_env, called by the handlers above),
+        # never at import, so a rate-limit raise reaches here and is classified correctly.
         retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
         tb = traceback.format_exc()
         traceback.print_exc()
@@ -2131,6 +2919,7 @@ def main():
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags)
         # keep container alive briefly so logs flush, then exit non-zero -> restart
+        wandb_finish(exit_code=1)  # finalize the W&B run as failed (don't leave it dangling -> "crashed")
         time.sleep(10)
         raise
 

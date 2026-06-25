@@ -1,10 +1,4 @@
-"""Orchestrator provider routing: vast vs runpod submit/cancel/attach, cross-provider
-failover, handle persistence, cost flow, and config provider fields (all mocked).
-
-Everything dispatches through the ``base.Provider`` interface (the registry), so these
-tests patch the provider's job functions / api modules — the same objects the
-provider methods import lazily — rather than any hardcoded orchestrator branch.
-"""
+"""Orchestrator RunPod routing: submit/cancel, retry, handle persistence, and cost flow."""
 
 from __future__ import annotations
 
@@ -16,7 +10,7 @@ from flash.spec import JobSpec
 
 
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
-    gpu = {"type": "RTX 3090", "max_retries": 2}
+    gpu = {"type": "RTX A6000", "max_retries": 2}
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
         {
@@ -29,38 +23,30 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     )
 
 
-def _offer_obj(offer_id=5, machine_id=2, gpu="RTX 3090", dph=0.25):
-    from tests._helpers.vast import make_vast_offer
-
-    return make_vast_offer(offer_id=offer_id, machine_id=machine_id, gpu=gpu, dph_total=dph)
-
-
-def _alloc(provider="vast", gpu="RTX 3090", rate=0.25, offer=None, provider_offers=()):
+def _alloc(gpu="RTX A6000", rate=0.49, candidates=None):
     from flash.providers.base import Allocation, Candidate
 
-    cand = Candidate(provider, gpu, rate, 24, offer=offer)
+    if candidates is None:
+        candidates = (Candidate("runpod", gpu, rate, 48),)
     return Allocation(
-        provider=provider,
-        gpu=gpu,
-        hourly_usd=rate,
+        provider=candidates[0].provider,
+        gpu=candidates[0].gpu,
+        hourly_usd=candidates[0].hourly_usd,
         min_vram_gb=12,
-        offer=offer,
-        candidates=(cand,),
-        provider_offers=tuple(provider_offers),
+        candidates=tuple(candidates),
     )
 
 
-def _vast_handle_dict(instance_id=1, machine_id=2):
+def _hs_handle(vm_id="vm1"):
+    return {"provider": "hyperstack", "vm_id": vm_id, "region": "CANADA-1", "name": "n"}
+
+
+def _runpod_handle(endpoint_id="ep", job_id="j"):
     return {
-        "provider": "vast",
-        "instance_id": instance_id,
-        "offer_id": 5,
-        "machine_id": machine_id,
-        "label": "flash-x-s0-a0",
-        "gpu": "RTX 3090",
-        "hourly_usd": 0.25,
-        "attempt": 0,
-        "started_ts": 0.0,
+        "provider": "runpod",
+        "endpoint_id": endpoint_id,
+        "endpoint_name": f"{endpoint_id}-name",
+        "job_id": job_id,
     }
 
 
@@ -79,52 +65,12 @@ def _seed_status(orch, spec):
     return st
 
 
-def test_vast_allocation_routes_to_vast_runner(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.vast import jobs as vast_jobs
-
-    offer = _offer_obj()
-    monkeypatch.setattr(
-        allocator, "allocate", lambda *a, **k: _alloc(offer=offer, provider_offers=[offer])
-    )
-    captured = {}
-
-    def fake_vast_submit(
-        run_spec,
-        seed,
-        log=None,
-        on_handle=None,
-        attempt=0,
-        offers=None,
-        exclude_machine_ids=frozenset(),
-    ):
-        captured["gpu_type"] = run_spec.gpu.type
-        captured["offers"] = offers
-        on_handle(_vast_handle_dict())
-        return PollResult(
-            True,
-            metrics={"train_tokens": 4096, "cost_usd": 0.123, "notes": {"provider": "vast"}},
-        )
-
-    monkeypatch.setattr(vast_jobs, "submit_run_vast", fake_vast_submit)
-    spec = _spec()
-    _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert metrics["cost_usd"] == 0.123
-    # the attempt ran with the ALLOCATED class, not the parse-time provisional
-    assert captured["gpu_type"] == "RTX 3090"
-    assert [o.offer_id for o in captured["offers"]] == [5]
-    # handle persisted for cross-process cancel/attach
-    assert orch.get_status(spec.run_id).remote["provider"] == "vast"
-
-
-def test_user_wandb_runtime_secret_reaches_selected_provider(orch, monkeypatch):
+def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
 
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(provider="runpod", gpu="RTX 3090", rate=0.46))
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
     captured = {}
 
     def fake_runpod_submit(
@@ -134,155 +80,314 @@ def test_user_wandb_runtime_secret_reaches_selected_provider(orch, monkeypatch):
         on_handle=None,
         attempt=0,
         runtime_secrets=None,
+        **_,
     ):
+        captured["gpu_type"] = run_spec.gpu.type
         captured["runtime_secrets"] = dict(runtime_secrets or {})
         if on_handle:
-            on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j"})
+            on_handle(_runpod_handle())
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     spec = _spec()
     _seed_status(orch, spec)
-    orch._submit_seed_supervised(
+    metrics = orch._submit_seed_supervised(
         spec,
         0,
         io.StringIO(),
         runtime_secrets={"WANDB_API_KEY": "user-wb"},
     )
+    assert metrics["train_tokens"] == 4096
+    assert captured["gpu_type"] == "RTX A6000"
     assert captured["runtime_secrets"] == {"WANDB_API_KEY": "user-wb"}
+    remote = orch.get_status(spec.run_id).remote
+    assert remote["provider"] == "runpod"
+    assert remote["allocated_gpu"] == "RTX A6000"
 
 
-def test_vast_cost_flows_into_run_status(orch, monkeypatch):
+def test_runpod_cost_projection_flows_into_run_status(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
     cost = orch._persist_metrics(
-        spec, 0, {"train_tokens": 4096, "cost_usd": 0.2, "notes": {"provider": "vast"}}
+        spec,
+        0,
+        {"train_tokens": 4096, "wall_seconds": 1800, "allocated_gpu": "RTX A6000"},
     )
-    assert cost == 0.2  # the stamped vast cost short-circuits the runpod projection
+    assert cost == pytest.approx(0.245)  # 0.5 hr x $0.49/hr (RTX A6000)
 
 
-def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
+def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monkeypatch):
     from flash.providers import allocator
-    from flash.providers.base import PollResult
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
-    from flash.providers.vast import api as vast_api
-    from flash.providers.vast import jobs as vast_jobs
 
-    offer = _offer_obj(machine_id=42)
-    allocate_calls = []
-
-    def fake_allocate(model, algorithm, **kw):
-        allocate_calls.append(kw["exclude_machine_ids"])
-        if not kw["exclude_machine_ids"]:
-            return _alloc(offer=offer, provider_offers=[offer])
-        return _alloc(provider="runpod", gpu="RTX 3090", rate=0.46)
-
-    monkeypatch.setattr(allocator, "allocate", fake_allocate)
-
-    submit_excludes = []
-
-    def fake_vast_submit(
-        run_spec,
-        seed,
-        log=None,
-        on_handle=None,
-        attempt=0,
-        offers=None,
-        exclude_machine_ids=frozenset(),
-    ):
-        submit_excludes.append(exclude_machine_ids)
-        on_handle(_vast_handle_dict(instance_id=77, machine_id=42))
-        return PollResult(False, failure="stalled", detail="no worker progress")
-
-    monkeypatch.setattr(vast_jobs, "submit_run_vast", fake_vast_submit)
-    destroyed = []
-    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
-    monkeypatch.setattr(
-        rp_jobs,
-        "submit_run",
-        lambda spec, seed, log=None, on_handle=None, attempt=0: PollResult(
-            True, metrics={"train_tokens": 4096}
-        ),
+    candidates = (
+        Candidate("runpod", "L4", 0.39, 24),
+        Candidate("runpod", "RTX A6000", 0.49, 48),
     )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    cancelled, deleted, submitted_gpus = [], [], []
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e) or True)
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_gpus.append(run_spec.gpu.type)
+        if attempt == 0:
+            on_handle(_runpod_handle("ep1", "j1"))
+            return PollResult(False, failure="stalled", detail="no worker progress")
+        on_handle(_runpod_handle("ep2", "j2"))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, 0, log)
     assert metrics["train_tokens"] == 4096
-    # the stalled attempt's instance was torn down and its machine blacklisted
-    assert destroyed == [77]
-    assert allocate_calls[0] == frozenset()
-    assert allocate_calls[1] == frozenset({42})
-    assert "blacklisted" in log.getvalue()
-    # the blacklist is threaded into the provider submit too, so an in-provider offer
-    # refresh keeps the sick machine excluded (Fix #3)
-    assert submit_excludes[0] == frozenset()
+    assert submitted_gpus == ["L4", "RTX A6000"]
+    assert cancelled == [("ep1", "j1")]
+    assert "ep1" in deleted
+    assert "walking past the cheapest class" in log.getvalue()
+
+
+def test_select_candidate_escapes_failed_provider_then_walks_classes():
+    """The retry picker prefers cheapest first, escapes a failed provider cross-provider on retry,
+    and only walks classes within a provider once every provider has been burned."""
+    from flash.providers.base import Candidate
+    from flash.runner.lifecycle import _select_candidate
+
+    cands = (
+        Candidate("runpod", "RTX A6000", 0.49, 48),
+        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),
+        Candidate("hyperstack", "RTX A6000", 0.50, 48),
+    )
+    # Attempt 0 (nothing failed): cheapest overall.
+    assert _select_candidate(cands, set(), set()) is cands[0]
+    # RunPod burned an infra attempt -> escape to the OTHER provider, not the next RunPod class.
+    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "RTX A6000")})
+    assert (chosen.provider, chosen.gpu) == ("hyperstack", "RTX A6000")
+    # Both providers burned -> fall back to the cheapest class NOT yet tried (within-provider walk).
+    chosen = _select_candidate(
+        cands,
+        {"runpod", "hyperstack"},
+        {("runpod", "RTX A6000"), ("hyperstack", "RTX A6000")},
+    )
+    assert (chosen.provider, chosen.gpu) == ("runpod", "RTX 6000 Ada")
+
+
+def test_select_candidate_single_provider_walks_classes():
+    """With only one provider configured, the picker degrades to the cheapest untried class."""
+    from flash.providers.base import Candidate
+    from flash.runner.lifecycle import _select_candidate
+
+    cands = (Candidate("runpod", "L4", 0.39, 24), Candidate("runpod", "RTX A6000", 0.49, 48))
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "L4")}).gpu == "RTX A6000"
+
+
+def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
+    """Issue 7: a RunPod queue / no-capacity failure must retry on a DIFFERENT provider
+    (Hyperstack) rather than walking to the next RunPod class while Hyperstack sits available."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.hyperstack import jobs as hs_jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "RTX A6000", 0.49, 48),  # cheapest -> attempt 0
+        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # next RunPod class (the WRONG retry target)
+        Candidate("hyperstack", "RTX A6000", 0.50, 48),  # the right cross-provider escape
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    rp_gpus, hs_gpus = [], []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        rp_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle("ep1", "j1"))
+        return PollResult(
+            False, failure="no_capacity", detail="job stuck IN_QUEUE (no RunPod capacity)"
+        )
+
+    def fake_hs(spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        hs_gpus.append(spec.gpu.type)
+        if on_handle:
+            on_handle(_hs_handle())
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    monkeypatch.setattr(hs_jobs, "submit_run_hyperstack", fake_hs)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+    assert metrics["train_tokens"] == 4096
+    assert rp_gpus == ["RTX A6000"]  # RunPod tried exactly once...
+    assert hs_gpus == ["RTX A6000"]  # ...then the retry escaped cross-provider to Hyperstack
+    assert orch.get_status(spec.run_id).remote["provider"] == "hyperstack"
+    assert "walking past the cheapest class" in log.getvalue()
+
+
+def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatch):
+    """The platform auto-attaches the SHARED weight cache, so its endpoint-pinning DC-set
+    restriction must not cost the user a GPU-walk retry: a no_capacity on the cached spec earns ONE
+    extra, cache-less cross-region attempt even at max_retries=0 (else the auto-cache could fail a
+    run a cache-less launch would have won). Regression for the cache-fallback-vs-retry-budget gap.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: _alloc(candidates=(Candidate("runpod", "RTX A6000", 0.49, 48),)),
+    )
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    volumes_seen = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        vol = getattr(run_spec.gpu, "network_volume", None)
+        volumes_seen.append(vol)
+        if on_handle:
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        # Cache-attached attempt -> no_capacity (the cache's DC set is starved); the cache-less
+        # fallback attempt -> success.
+        if vol == WEIGHT_CACHE_VOLUME_NAME:
+            return PollResult(False, failure="no_capacity", detail="IN_QUEUE (cache DC set starved)")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=0, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
+    _seed_status(orch, spec)
+    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    assert metrics["train_tokens"] == 4096
+    # Exactly two attempts: the cache-attached one (no_capacity) then the bonus cache-less retry.
+    assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME, None]
+
+
+def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
+    """The cache-drop fallback is a FREE attempt — it must not spend the user's GPU-walk retry budget.
+    With max_retries=1 and both the cache attempt AND the cache-less same-class fallback hitting
+    no_capacity, the run must still walk to a DIFFERENT class (its one real retry), not stop after the
+    cache drop. Regression for the cache-fallback-steals-the-only-retry gap (the stop check counted the
+    cache-drop attempt against max_retries)."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    candidates = (
+        Candidate("runpod", "RTX A6000", 0.49, 48),  # cheapest -> cache attempt, then cache-less same class
+        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # the GPU-walk target the real retry must reach
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    seen = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        vol = getattr(run_spec.gpu, "network_volume", None)
+        seen.append((run_spec.gpu.type, vol))
+        if on_handle:
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        # Cache attempt AND its cache-less same-class fallback both starve; only the walk to the OTHER
+        # class (the genuine retry that must survive the cache drop) succeeds.
+        if run_spec.gpu.type == "RTX 6000 Ada":
+            return PollResult(True, metrics={"train_tokens": 4096})
+        return PollResult(False, failure="no_capacity", detail="IN_QUEUE (no capacity)")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
+    _seed_status(orch, spec)
+    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    assert metrics["train_tokens"] == 4096
+    # cache attempt -> cache-less SAME class (free fallback) -> GPU-walk to the OTHER class (real retry).
+    assert seen == [
+        ("RTX A6000", WEIGHT_CACHE_VOLUME_NAME),
+        ("RTX A6000", None),
+        ("RTX 6000 Ada", None),
+    ]
+
+
+def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
+    """Issue 5: a Hyperstack VM whose CUDA never inits fails job_preempted; the retry must move to
+    a DIFFERENT provider (RunPod) instead of re-rolling another broken Hyperstack VM, and the sick
+    VM is torn down before the retry."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs as hs_jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("hyperstack", "L40", 0.40, 48),  # cheapest -> attempt 0 (lands on broken VM)
+        Candidate("hyperstack", "RTX A6000", 0.45, 48),  # next class on the SAME (sick) provider
+        Candidate("runpod", "RTX A6000", 0.49, 48),  # the right cross-provider escape
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    deleted_vms = []
+    monkeypatch.setattr(hs_api, "delete_vm", lambda vid: deleted_vms.append(vid) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    hs_gpus, rp_gpus = [], []
+
+    def fake_hs(spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        hs_gpus.append(spec.gpu.type)
+        if on_handle:
+            on_handle(_hs_handle("vm-broken"))
+        return PollResult(
+            False,
+            failure="job_preempted",
+            detail="GPU never became ready after 12 tries: cuda not available",
+        )
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        rp_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle("ep2", "j2"))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(hs_jobs, "submit_run_hyperstack", fake_hs)
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+    assert metrics["train_tokens"] == 4096
+    assert hs_gpus == ["L40"]  # broken Hyperstack VM tried once...
+    assert rp_gpus == ["RTX A6000"]  # ...then escaped cross-provider to RunPod
+    assert "vm-broken" in deleted_vms  # sick VM torn down before the retry
+    assert orch.get_status(spec.run_id).remote["provider"] == "runpod"
 
 
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
-    from flash.providers.vast import jobs as vast_jobs
+    from flash.providers.runpod import jobs as rp_jobs
 
-    offer = _offer_obj()
-    monkeypatch.setattr(
-        allocator, "allocate", lambda *a, **k: _alloc(offer=offer, provider_offers=[offer])
-    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
     calls = []
 
-    def fake_vast_submit(
-        run_spec,
-        seed,
-        log=None,
-        on_handle=None,
-        attempt=0,
-        offers=None,
-        exclude_machine_ids=frozenset(),
-    ):
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         calls.append(attempt)
         return PollResult(False, failure="job_failed", detail="ValueError: bad reward fn")
 
-    monkeypatch.setattr(vast_jobs, "submit_run_vast", fake_vast_submit)
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     spec = _spec()
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError, match="bad reward fn"):
         orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert calls == [0]  # code errors burn no retry budget
-
-
-# ---------------------------------------------------------------------------
-# cancel / attach routing
-# ---------------------------------------------------------------------------
-def test_cancel_routes_vast(orch, monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import train as rp_train
-    from flash.providers.vast import api as vast_api
-    from flash.providers.vast import jobs as vast_jobs
-
-    cancelled, destroyed, swept, runpod_calls, terminated = [], [], [], [], []
-    monkeypatch.setattr(vast_jobs, "cancel", lambda remote: cancelled.append(remote))
-    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
-    monkeypatch.setattr(vast_jobs, "destroy_run_instances", lambda rid: swept.append(rid) or [])
-    monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: terminated.append(a))
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a: runpod_calls.append(a))
-    # make the vast provider "available" so _gc_run_endpoints invokes its gc sweep
-    monkeypatch.setenv("VAST_API_KEY", "x")
-
-    spec = _spec()
-    st = _seed_status(orch, spec)
-    st.state = "running"
-    st.remote = _vast_handle_dict(instance_id=7)
-    orch._save_status(st)
-    out = orch.cancel_run(spec.run_id)
-    assert out.state == "cancelled"
-    # cancel + belt-and-suspenders destroy both routed to vast via the handle's provider
-    # (cancel_run destroys the handle; _gc_run_endpoints destroys it again — idempotent).
-    assert cancelled
-    assert cancelled[0]["instance_id"] == 7
-    assert destroyed
-    assert all(i == 7 for i in destroyed)
-    assert swept == [spec.run_id]  # _gc_run_endpoints -> vast provider gc
-    assert not runpod_calls  # never touched the runpod cancel path
+    assert calls == [0]
 
 
 def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
@@ -296,49 +401,14 @@ def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
     spec = _spec()
     st = _seed_status(orch, spec)
     st.state = "running"
-    st.remote = {"endpoint_id": "ep1", "endpoint_name": "n", "job_id": "j1"}  # pre-provider era
+    st.remote = {"endpoint_id": "ep1", "endpoint_name": "n", "job_id": "j1"}
     orch._save_status(st)
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled"
-    assert cancelled_jobs == [("ep1", "j1")]  # no `provider` -> defaults to runpod
+    assert cancelled_jobs == [("ep1", "j1")]
     assert "ep1" in deleted_eps
 
 
-def test_attach_routes_vast_and_destroys(orch, monkeypatch):
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import train as rp_train
-    from flash.providers.vast import api as vast_api
-    from flash.providers.vast import jobs as vast_jobs
-
-    seen_kwargs: dict = {}
-
-    def _fake_poll(handle, spec, seed, log=None, heartbeat_reader=None, **kwargs):
-        # The reattach path must forward the stall tuning + wall-cap deadline (matching
-        # submit_run_vast / RunPod's reattach), not silently drop them.
-        seen_kwargs.update(kwargs)
-        return PollResult(True, metrics={"train_tokens": 4096, "cost_usd": 0.3})
-
-    monkeypatch.setattr(vast_jobs, "poll_vast_job", _fake_poll)
-    destroyed = []
-    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
-    monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
-    spec = _spec()
-    st = _seed_status(orch, spec)
-    st.state = "running"
-    st.remote = _vast_handle_dict(instance_id=8)
-    orch._save_status(st)
-    out = orch.attach_run(spec.run_id, log_stream=io.StringIO())
-    assert out.state == "done"
-    assert out.cost_usd == 0.3
-    assert 8 in destroyed  # _gc_run_endpoints destroyed the instance via the handle
-    # Reattach forwarded the stall window + wall-cap deadline (not dropped on recovery).
-    assert "stall_after_s" in seen_kwargs
-    assert seen_kwargs.get("deadline_s") == max(60, int(spec.gpu.max_wall_seconds)) + 1800
-
-
-# ---------------------------------------------------------------------------
-# config: gpu fields
-# ---------------------------------------------------------------------------
 def test_config_gpu_fields(monkeypatch):
     from flash.schema import spec_from_dict
 
@@ -348,14 +418,9 @@ def test_config_gpu_fields(monkeypatch):
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
-    # GPU pinning is gone: gpu.type is always the cheapest-fitting VALIDATED provisional regardless
-    # of what the config says. Omitted gpu.type -> the deterministic offline cheapest validated
-    # provisional: post-2026-06-22 expansion that's the 16 GB RTX 2000 Ada for 0.8B SFT (~12 GB).
     spec = spec_from_dict(dict(base), run_id="x")
-    assert spec.gpu.type == "RTX 2000 Ada"  # deterministic offline cheapest-fitting validated provisional
-    # round-trip preserves the resolved class
+    assert spec.gpu.type == "RTX A6000"
     again = JobSpec.from_dict(spec.to_dict())
-    assert again.gpu.type == "RTX 2000 Ada"
-    # a config gpu.type is IGNORED (no pin) -> still the cheapest validated provisional
-    spec = spec_from_dict({**base, "gpu": {"type": "L40S"}}, run_id="x")
-    assert spec.gpu.type == "RTX 2000 Ada"
+    assert again.gpu.type == "RTX A6000"
+    spec = spec_from_dict({**base, "gpu": {"type": "A100 SXM"}}, run_id="x")
+    assert spec.gpu.type == "RTX A6000"

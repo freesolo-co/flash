@@ -90,8 +90,7 @@ def cancel_run(run_id: str) -> RunStatus:
             handle = JobHandle.from_dict(remote)
             provider = get_provider(handle.provider)
             provider.cancel(handle)
-            # Vast bills until destroyed, so also belt-and-suspenders destroy the
-            # instance (a no-op cost-wise for runpod, whose endpoint GC follows).
+            # Belt-and-suspenders destroy after cancel; RunPod endpoint GC follows.
             provider.destroy(handle)
         except Exception:
             # Best-effort remote stop; _gc_run_endpoints below still tears the endpoint down.
@@ -115,6 +114,14 @@ def cancel_run(run_id: str) -> RunStatus:
     # an undeploy artifact (cancel wins); elsewhere a racing `done` is a genuine completion that
     # _update's CAS correctly protects (cancel loses to a real finish).
     _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
+    # A run cancelled mid-RL keeps whatever per-step adapters the worker already streamed to
+    # HF; mirror them to the backend store now so the cancelled run is immediately listable +
+    # deployable (`flash checkpoints` / `flash deploy --step N`). Best-effort: never let
+    # checkpoint bookkeeping fail a cancel.
+    with contextlib.suppress(Exception):
+        from flash.server.checkpoints import register_checkpoints_best_effort
+
+        register_checkpoints_best_effort(get_status(run_id))
     return get_status(run_id)
 
 
@@ -326,8 +333,42 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
             return status
         if expect_state is not None and status.state != expect_state:
             return status
+        # Freeze the training-teardown time before the deploy bumps updated_at. New terminal runs
+        # already stamp finished_at on their first terminal transition, but a LEGACY run that went
+        # `done` before that field existed has finished_at=None while its current updated_at still
+        # holds the real teardown time. Capture it ONLY on the `done` -> `deployed` transition, where
+        # updated_at == teardown (mark_deployed is also called on an already-`deployed` run via the
+        # CAS finalization with expect_state="deployed", where updated_at is the DEPLOY time), and
+        # only when not yet reconciled — record_realized_cost moves updated_at to the reconcile time,
+        # so a reconciled-then-deployed legacy run would otherwise freeze that later stamp. Both
+        # guards keep us from stamping past the real teardown (the over-billing this fixes); a
+        # reconciled run is never re-billed, so leaving finished_at unset there is harmless.
+        if status.state == "done" and status.finished_at is None and not status.reconciled_at:
+            status.finished_at = status.updated_at
         status.deployment = deployment
         status.state = "deployed"
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def attach_checkpoint_deployment(run_id: str, deployment: dict) -> RunStatus:
+    """Attach a serving deployment to a run WITHOUT changing its training state.
+
+    Used when deploying a specific intermediate checkpoint of a run that never reached
+    ``done`` — e.g. one cancelled or failed mid-RL. The checkpoint adapter exists on HF, so it
+    can be served, but the run's terminal training outcome (``cancelled``/``failed``) must be
+    preserved: flipping it to ``deployed`` would both erase that outcome and make a later
+    undeploy wrongly restore it to ``done`` (``mark_undeployed`` sends non-terminal runs to
+    ``done``). The deployment is tracked via the ``deployment`` field exactly like a normal
+    deploy, so ``/v1/deployments`` lists it and undeploy clears it. Lock-guarded so it
+    serializes with a racing deploy/undeploy on the same run.
+    """
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        status.deployment = deployment
         status.updated_at = time.time()
         _save_status(status)
         return status

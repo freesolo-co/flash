@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import render
+
 if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
 
@@ -27,8 +29,11 @@ def cmd_env_install(args) -> int:
         )
         return 1
     record_installed_env(env_id, package="freesolo")
-    print(f"installed {env_id}; recorded in {INSTALLED_MANIFEST}")
-    print(f'use it via:  [environment]\\nid = "{env_id}"')
+    if render.styled():
+        print(render.env_installed(env_id, str(INSTALLED_MANIFEST)))
+    else:
+        print(f"installed {env_id}; recorded in {INSTALLED_MANIFEST}")
+        print(f'use it via:  [environment]\\nid = "{env_id}"')
     return 0
 
 
@@ -243,8 +248,11 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | No
     if not slug:
         print("warning: the env was uploaded but the server returned no id", file=sys.stderr)
         return 1
-    print(f"published {slug}")
-    print(f'reference it in your config:\n\n  [environment]\n  id = "{slug}"')
+    if render.styled():
+        print(render.env_published(slug))
+    else:
+        print(f"published {slug}")
+        print(f'reference it in your config:\n\n  [environment]\n  id = "{slug}"')
     return 0
 
 
@@ -302,5 +310,8 @@ def cmd_env_push(args) -> int:
         # packaging (walk + gzip, slow for large datasets) and the upload itself.
         bar = _UploadProgress(env_name)
         bar.status("packaging environment")
-        package_b64 = _tar_b64(pkg)
-        return _upload_and_report(env_name, package_b64=package_b64, bar=bar)
+        try:
+            package_b64 = _tar_b64(pkg)
+            return _upload_and_report(env_name, package_b64=package_b64, bar=bar)
+        finally:
+            bar.clear()

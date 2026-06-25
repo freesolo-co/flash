@@ -13,6 +13,7 @@ import sys
 
 from flash import __version__
 from flash._logging import configure_logging, get_logger
+from flash._update_check import emit_update_notice, maybe_start_update_check
 
 # Command handlers + the patched client surface live in submodules; re-export them so
 # `flash.cli.main` stays the single public import surface (and so monkeypatching
@@ -27,6 +28,7 @@ from flash.cli.main.commands import (  # noqa: F401
     client_from_config,
     cmd_cancel,
     cmd_chat,
+    cmd_checkpoints,
     cmd_deploy,
     cmd_deployments,
     cmd_env_list,
@@ -148,7 +150,12 @@ def main(argv: list[str] | None = None) -> int:
 
     status = sub.add_parser("status", help="show a run's status, logs, or follow logs")
     status.add_argument("run_id")
-    status.add_argument("--logs", action="store_true", help="print current logs before status")
+    status.add_argument(
+        "--logs",
+        action="store_true",
+        help="print current logs before status — the orchestrator log plus the train-subprocess "
+        "stdout + traceback (console_/error_<phase>.txt) fetched from the run's HF artifact repo",
+    )
     status.add_argument(
         "-f",
         "--follow",
@@ -164,9 +171,22 @@ def main(argv: list[str] | None = None) -> int:
     cancel.add_argument("run_id")
     cancel.set_defaults(func=cmd_cancel)
 
+    checkpoints = sub.add_parser(
+        "checkpoints", help="list a run's deployable per-step RL checkpoints"
+    )
+    checkpoints.add_argument("run_id")
+    checkpoints.set_defaults(func=cmd_checkpoints)
+
     deploy = sub.add_parser("deploy")
     deploy.add_argument("run_id")
     deploy.add_argument("--dry-run", action="store_true")
+    deploy.add_argument(
+        "--step",
+        type=int,
+        default=None,
+        help="deploy a specific intermediate checkpoint (see `flash checkpoints <run_id>`) "
+        "instead of the run's final adapter; works even for a run cancelled mid-RL",
+    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")
@@ -189,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
+    # Kick off a once-a-day PyPI version check in the background; the "new release available"
+    # notice (if any) prints to stderr after the command output (see emit_update_notice).
+    update_check = maybe_start_update_check()
     try:
         return args.func(args)
     except _USER_ERRORS as exc:
@@ -199,3 +222,5 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("aborted", file=sys.stderr)
         return 130
+    finally:
+        emit_update_notice(update_check)
