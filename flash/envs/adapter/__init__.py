@@ -44,6 +44,17 @@ _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
 
 
+class GitHubRateLimitError(RuntimeError):
+    """Raised when the GitHub API rate-limits us (HTTP 429, or a 403 whose body says "rate limit").
+
+    Raised by ``_urlopen`` only after the in-process jittered retry is exhausted, so it signals a
+    *persistent* limit. The worker's top-level handler catches it and stamps ``retriable=True`` so
+    the control plane reschedules the job on a fresh worker once the limit window resets, instead of
+    permanently failing the run. The real spawn-wave mitigation is the control-plane resolve-once
+    pin (EnvironmentSpec.resolved_sha) that lets workers skip the GitHub resolve entirely.
+    """
+
+
 @dataclass(frozen=True)
 class GitHubEnvironmentRef:
     owner: str
@@ -200,16 +211,36 @@ def _is_commit_sha(value: str) -> bool:
     return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
-def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
+def _resolve_ref_sha(
+    parsed: GitHubEnvironmentRef,
+    pinned_sha: str | None = None,
+    *,
+    timeout: float = 60.0,
+    max_rate_limit_retries: int = 5,
+) -> str:
+    # Resolve-once hook: the control plane resolves ref->sha ONCE (runner._assign_resolved_env_sha)
+    # and threads the pinned commit sha through, so every worker in a fan-out short-circuits here
+    # without hitting GitHub at all — this is what actually defuses a cold spawn wave (the prior
+    # in-process cache could not, since each worker is a separate process). Same effect as the
+    # immutable-ref fast path below, but applied to a symbolic ref (e.g. "main"). Only a real
+    # 40-char sha is trusted; anything else falls through to a live resolve. The control plane
+    # passes a short timeout + max_rate_limit_retries=0 so its best-effort pin can't block run
+    # creation; the worker keeps the full retry budget.
+    if pinned_sha and _is_commit_sha(pinned_sha):
+        return pinned_sha
     if _is_commit_sha(parsed.ref):
         return parsed.ref
+    # No pin (legacy spec / non-managed ref / control-plane resolve failed): resolve the symbolic
+    # ref live every time. We deliberately do NOT cache symbolic refs in-process — a long-lived
+    # process must see a moved branch (managed slugs point at environment-hub@main, which moves on
+    # `flash env push`), and the immutable-sha cases above already skip the network.
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
     req = urllib.request.Request(commit_url, headers=headers)
-    data = _urlopen(req, timeout=60.0)
+    data = _urlopen(req, timeout=timeout, max_rate_limit_retries=max_rate_limit_retries)
     try:
         payload = json.loads(data)
     except json.JSONDecodeError as exc:
@@ -222,11 +253,25 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
     return sha
 
 
-def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
+def _urlopen(
+    req: urllib.request.Request, *, timeout: float = 60.0, max_rate_limit_retries: int = 5
+) -> bytes:
+    """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
+
+    On a 429 or a 403 whose body says "rate limit" (a cold spawn wave of workers all hitting the
+    commits/tarball endpoint trips GitHub's abuse detection), retry up to ``max_rate_limit_retries``
+    times with jitter so concurrent workers don't all retry in lockstep. If the limit persists past
+    the retries, raise ``GitHubRateLimitError`` so the worker's top-level handler stamps
+    ``retriable=True`` and the run reschedules on a fresh worker, instead of hard-failing on a
+    transient limit. Any other HTTP / URL error raises a plain ``RuntimeError`` (non-retriable).
+
+    ``max_rate_limit_retries=0`` makes it fail fast (one request, no sleeps): the control plane uses
+    that for its best-effort resolve-once pin so a persistent limit can never block run creation —
+    the long retry belongs on the worker, which can afford to wait.
+    """
     import random
     import time
 
-    _MAX_RATE_LIMIT_RETRIES = 5
     _RATE_LIMIT_BASE_DELAY = 10.0
     attempt = 0
     while True:
@@ -235,20 +280,28 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
                 return resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
-            if exc.code == 403 and "rate limit" in body.lower() and attempt < _MAX_RATE_LIMIT_RETRIES:
-                # GitHub secondary rate limit: many workers booting simultaneously all
-                # hit the same commits/tarball endpoint, triggering abuse detection.
-                # Retry with jitter so concurrent workers don't all retry at once.
+            is_rate_limit = exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower())
+            if is_rate_limit and attempt < max_rate_limit_retries:
                 delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
                 time.sleep(delay)
                 attempt += 1
                 continue
+            if is_rate_limit:
+                # Persistent limit: signal retriable so the control plane reschedules (#209).
+                raise GitHubRateLimitError(
+                    f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
+                ) from exc
             raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
+    # Callers download the tarball for the ALREADY-resolved commit sha (see
+    # _resolve_github_environment_file), which extracts it into the content-addressed disk cache
+    # under _CACHE_ROOT/<hash(repo@sha:path)> and never re-downloads on a hit. So reuse is handled
+    # on disk; we deliberately do NOT also retain the (up to _MAX_ARCHIVE_BYTES) archive bytes in a
+    # module-level cache for the worker's lifetime — that wasted hundreds of MiB of RAM per process.
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -309,11 +362,15 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
     return extracted
 
 
-def _resolve_github_environment_file(env_ref: str) -> Path:
+def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
-    resolved_ref = _resolve_ref_sha(parsed)
+    # Only forward pinned_sha when set, so the unpatched _resolve_ref_sha(parsed) call shape stays
+    # single-arg (a test monkeypatch like ``lambda parsed: ...`` keeps working).
+    resolved_ref = (
+        _resolve_ref_sha(parsed, pinned_sha=pinned_sha) if pinned_sha else _resolve_ref_sha(parsed)
+    )
     cache_key = hashlib.sha256(
         f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
@@ -348,16 +405,21 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
         shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
-def _resolve_environment_reference(env_ref: str) -> str:
+def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
+    # pinned_sha (resolve-once hook, item 3): when the control plane already resolved this env's
+    # ref->sha, it threads the commit sha here so the GitHub commits API is skipped entirely. None
+    # (the default and today's behavior) means the worker resolves the ref itself.
     if is_managed_environment_slug(env_ref):
-        return str(_resolve_github_environment_file(managed_slug_to_github_ref(env_ref)))
+        return str(
+            _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
+        )
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         path = Path(env_ref)
         if path.exists():
             return str(path)
         return env_ref
-    return str(_resolve_github_environment_file(env_ref))
+    return str(_resolve_github_environment_file(env_ref, pinned_sha))
 
 
 def _resolve_path_arg(value: object, base_dir: Path) -> object:
@@ -629,6 +691,15 @@ class FreesoloEnvironment(BaseEnvironment):
                 out[idx] = float(rw.score)
         return out
 
+    @property
+    def reward_thread_safe(self) -> bool:
+        """Whether ``reward`` may be called concurrently across rollouts (multiturn_rollout's
+        ``_score_rollouts`` thread-pool fallback, used when the env has no ``reward_many``). The
+        verifiers reward contract is a pure scorer — ``score_responses`` reads the per-call inputs +
+        immutable env config — so the default is True. An underlying env whose scorer keeps mutable
+        state or a thread-bound client opts out with ``reward_thread_safe = False`` (scored serially)."""
+        return bool(getattr(self._env, "reward_thread_safe", True))
+
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         if state and self.multi_turn:
             reward = self._score_episode(example, state)
@@ -750,9 +821,16 @@ class FreesoloEnvironment(BaseEnvironment):
         return float(rewards[0].score)
 
 
-def load_freesolo_environment(env_id: str, **kwargs) -> FreesoloEnvironment:
+def load_freesolo_environment(
+    env_id: str, pinned_sha: str | None = None, /, **kwargs
+) -> FreesoloEnvironment:
+    # pinned_sha is a POSITIONAL-ONLY resolve-once hook (the control-plane-pinned commit sha). It is
+    # positional-only (the `/`) precisely so a user [environment.params] entry of ANY name — even
+    # one literally named "pinned_sha" — lands in **kwargs and is forwarded verbatim to the Freesolo
+    # SDK loader, never binding to or shadowing this internal pin. None (default) preserves today's
+    # behavior — the worker resolves the env ref->sha itself.
     tools = _import_freesolo_environment_tools()
-    reference = _resolve_environment_reference(env_id)
+    reference = _resolve_environment_reference(env_id, pinned_sha)
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 

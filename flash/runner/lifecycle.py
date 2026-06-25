@@ -136,6 +136,23 @@ def _submit_seed_supervised(
                 except Exception:
                     # Logging the host-escape note is cosmetic; never let it abort the retry.
                     pass
+            elif last_handle.get("provider") in ("lambda", "hyperstack"):
+                # An instance-based provider bills until terminated: tear the previous attempt's
+                # instance down so the retry lands on a fresh host (and we stop paying for the sick
+                # one). Dispatched generically through the handle's provider (destroy() knows the
+                # provider's own id field — instance_id for Lambda, vm_id for Hyperstack).
+                with contextlib.suppress(Exception):
+                    from flash.providers import get_provider
+                    from flash.providers.base import JobHandle
+
+                    _prov = last_handle["provider"]
+                    get_provider(_prov).destroy(JobHandle.from_dict(last_handle))
+                    _iid = last_handle.get("instance_id") or last_handle.get("vm_id")
+                    print(
+                        f"retry {attempt}: terminated {_prov} instance {_iid} (escaping sick host)",
+                        file=log,
+                        flush=True,
+                    )
             # The previous endpoint is now deleted; clear the persisted handle so a cancel
             # or control-plane restart during the fresh deploy doesn't operate on (or get
             # shielded by) the dead handle. The next on_handle() records the new one.
@@ -181,7 +198,14 @@ def _submit_seed_supervised(
             # first attempt takes the cheapest; each retry that provisioned a class and lost
             # it to an infra failure steps to the next-cheapest, so a capacity-starved class
             # can't burn the whole budget.
-            chosen = alloc.candidates[min(gpu_walk_offset, len(alloc.candidates) - 1)]
+            last_idx = len(alloc.candidates) - 1
+            walk_idx = min(gpu_walk_offset, last_idx)
+            chosen = alloc.candidates[walk_idx]
+            # Once the walk lands on (or clamps to) the last candidate there is no next-best class
+            # left to fall to — tell the provider so its no-capacity backstops wait longer before
+            # giving up rather than burning a retry on a class with no fallback. A pinned/single-
+            # candidate run is "last" from attempt 0, which is what we want.
+            on_last_gpu = walk_idx == last_idx
             print(allocation_summary(alloc), file=log, flush=True)
             if chosen.gpu != alloc.gpu:
                 print(
@@ -198,6 +222,7 @@ def _submit_seed_supervised(
                     "log": log,
                     "on_handle": on_handle,
                     "attempt": attempt,
+                    "on_last_gpu": on_last_gpu,
                 }
                 if runtime_secrets:
                     submit_kwargs["runtime_secrets"] = runtime_secrets
@@ -475,3 +500,13 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
+    # Instance-based providers (Lambda, Hyperstack) bill until terminated: the runner's per-attempt
+    # `finally` already tears them down, but a crashed supervisor thread can leave one behind. Reap
+    # any instance still named for this run via each configured provider's gc (best-effort).
+    from flash.providers import available_providers, get_provider
+
+    _avail = available_providers()
+    for _prov in ("lambda", "hyperstack"):
+        if _prov in _avail:
+            with contextlib.suppress(Exception):
+                get_provider(_prov).gc(spec)

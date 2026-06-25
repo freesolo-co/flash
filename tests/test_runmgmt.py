@@ -76,6 +76,87 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
         assert out.gpu_status["gpu_util_pct"] == 94
 
 
+def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypatch):
+    """finished_at freezes the training-teardown time on the FIRST terminal transition and is NOT
+    moved by later updated_at bumps (heartbeat/deploy/reconcile) — so reconciliation has an
+    immutable instance run_end even for a run deployed (or heartbeat-touched) after completion."""
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        from flash.spec import JobSpec
+
+        runner.submit_job(
+            JobSpec(run_id="fa", model="Qwen/Qwen3.5-4B", algorithm="grpo"), dry_run=True
+        )
+        s = runner.get_status("fa")
+        s.state = "running"
+        s.finished_at = None  # dry_run created via direct state set, never stamped finished_at
+        runner._save_status(s)
+
+        # first terminal transition stamps finished_at to the teardown time
+        assert runner._update("fa", "done", cost_usd=1.0) is True
+        done = runner.get_status("fa")
+        assert done.finished_at is not None
+        teardown = done.finished_at
+        assert teardown == done.updated_at
+
+        # a later updated_at bump (a late heartbeat after terminal) must NOT move finished_at
+        runner.record_heartbeat("fa", {"stage": "rl", "step": 1, "ts": 123.0})
+        bumped = runner.get_status("fa")
+        assert bumped.updated_at >= done.updated_at
+        assert bumped.finished_at == teardown
+
+        # a same-state terminal re-write (e.g. terminal cost fields) keeps the original too
+        runner._update("fa", "done", cost_usd=2.0)
+        assert runner.get_status("fa").finished_at == teardown
+
+
+def test_legacy_finished_at_backfill_uses_prior_updated_at_on_same_state_touch(monkeypatch):
+    """A LEGACY run (finished_at never stamped) that is ALREADY terminal and gets a same-state
+    field-only touch (e.g. billing_state via _update(run_id, current_state, ...)) must backfill
+    finished_at from the PRIOR persisted terminal updated_at, NOT the freshly-set now — otherwise
+    a routine post-completion update would move the billed run_end / reconcile window forward."""
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        from flash.spec import JobSpec
+
+        runner.submit_job(
+            JobSpec(run_id="leg", model="Qwen/Qwen3.5-4B", algorithm="grpo"), dry_run=True
+        )
+        # Simulate a legacy record: already `done`, real teardown time in updated_at, no finished_at.
+        teardown = 1_000.0
+        s = runner.get_status("leg")
+        s.state = "done"
+        s.updated_at = teardown
+        s.finished_at = None
+        runner._save_status(s)
+
+        # A same-state field-only touch (the run is ALREADY done) backfills from the PRIOR updated_at,
+        # not now -- and updated_at still advances to now as usual.
+        assert runner._update("leg", "done", billing_state="charged") is True
+        out = runner.get_status("leg")
+        assert out.finished_at == teardown  # frozen to the prior terminal time, NOT now
+        assert out.updated_at > teardown  # the touch still bumped updated_at
+
+        # Contrast: a genuine non-terminal -> terminal transition stamps finished_at to the NEW
+        # updated_at (the real teardown), as before.
+        runner.submit_job(
+            JobSpec(run_id="fresh", model="Qwen/Qwen3.5-4B", algorithm="grpo"), dry_run=True
+        )
+        s2 = runner.get_status("fresh")
+        s2.state = "running"
+        s2.finished_at = None
+        runner._save_status(s2)
+        assert runner._update("fresh", "done") is True
+        done2 = runner.get_status("fresh")
+        assert done2.finished_at == done2.updated_at  # transition: stamps to now
+
+
 def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
     import json
     import os

@@ -35,6 +35,7 @@ import queue
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict
 
 
@@ -362,15 +363,35 @@ def _turn_budget(r: _RolloutState, per_turn_max_tokens: int) -> int | None:
 def _score_rollouts(active_env, rollouts: list[_RolloutState]) -> list[float]:
     """Reward for each rollout, in order. Uses ``active_env.reward_many`` when the env provides it
     (one batched, env-concurrent scoring call per task instead of a blocking call per rollout — the
-    win for judge/expensive-reward envs), else one sequential ``active_env.reward()`` per rollout.
-    Both yield identical values; reward_many only changes scoring concurrency."""
+    win for judge/expensive-reward envs). Otherwise falls back to per-rollout ``active_env.reward()``,
+    run CONCURRENTLY in a thread pool when the env declares its reward thread-safe (PR #224) so an
+    IO-bound judge/tool reward still overlaps instead of N serial GPU-idle round-trips. Every path
+    reassembles in INPUT ORDER and yields identical values — only scoring concurrency differs."""
     reward_many = getattr(active_env, "reward_many", None)
     if callable(reward_many):
         rewards = reward_many([(r.example, r.state) for r in rollouts])
         if len(rewards) != len(rollouts):
             raise RuntimeError("env.reward_many returned the wrong number of rewards")
         return [float(x) for x in rewards]
-    return [float(active_env.reward("", r.example, r.state)) for r in rollouts]
+
+    def _score(r: _RolloutState) -> float:
+        return float(active_env.reward("", r.example, r.state))
+
+    # Serial for a single rollout, or when the env declares its reward NOT thread-safe (a scorer that
+    # keeps mutable state or a thread-bound client) — it worked serially and must not be raced.
+    if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
+        return [_score(r) for r in rollouts]
+    # Concurrent. On the first reward error, cancel not-yet-started scorers and drain in-flight ones
+    # so a failed step spends no further judge/API calls and leaves no scorer running into the next.
+    pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
+    try:
+        futures = {pool.submit(_score, r): i for i, r in enumerate(rollouts)}
+        scores: list[float] = [0.0] * len(rollouts)
+        for fut in as_completed(futures):
+            scores[futures[fut]] = fut.result()  # re-raises the first failed scorer
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return scores
 
 
 def rollout_async(

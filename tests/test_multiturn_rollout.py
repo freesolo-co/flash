@@ -555,6 +555,86 @@ def test_reward_many_batches_scoring():
     assert [r["reward"] for r in out] == [1.0, 3.0, 2.0]
 
 
+def _run_async(examples, active_env):
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    return rollout_async(
+        examples=examples, active_env=active_env, render=render, submit=submit, poll=poll,
+        busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+    )
+
+
+# _score_rollouts thread-pool fallback (PR #224): when the env has NO reward_many, the per-rollout
+# reward — often an IO-bound judge/tool round-trip — is scored concurrently, in input order, with a
+# reward_thread_safe opt-out. Exercised via rollout_async (the one shipped path through _score_rollouts).
+def test_async_scores_rewards_concurrently():
+    """No reward_many -> the fallback scores the batch CONCURRENTLY: correct + in INPUT ORDER, and N
+    slow rewards take ~1x (not Nx) the per-call latency."""
+    import time
+
+    class _SlowRewardEnv(_VarTurnEnv):
+        def reward(self, completion, example, state=None):
+            time.sleep(0.2)  # stand in for an IO-bound judge/tool round-trip (releases the GIL)
+            return float(example["rid"])  # per-rollout id -> proves order survives the pool
+
+    examples = [{"max_model": 1, "rid": i} for i in range(8)]
+    t0 = time.perf_counter()
+    out = _run_async(examples, _SlowRewardEnv())
+    elapsed = time.perf_counter() - t0
+    assert [r["reward"] for r in out] == [float(i) for i in range(8)]  # correct + in input order
+    # 8 x 0.2s = 1.6s if serial; concurrent (<=16 workers) is ~0.2s. Generous bound for CI jitter.
+    assert elapsed < 1.0, f"reward scoring did not run concurrently ({elapsed:.2f}s for 8x0.2s)"
+
+
+def test_async_serial_when_reward_not_thread_safe():
+    """An env that declares ``reward_thread_safe = False`` is scored SERIALLY — a scorer with mutable
+    state or a thread-bound client is never raced (it worked serially and must keep working)."""
+    import time
+
+    class _UnsafeSlowEnv(_VarTurnEnv):
+        reward_thread_safe = False  # opt out of concurrent scoring
+
+        def reward(self, completion, example, state=None):
+            time.sleep(0.15)
+            return float(example["rid"])
+
+    examples = [{"max_model": 1, "rid": i} for i in range(6)]
+    t0 = time.perf_counter()
+    out = _run_async(examples, _UnsafeSlowEnv())
+    elapsed = time.perf_counter() - t0
+    assert [r["reward"] for r in out] == [float(i) for i in range(6)]  # correct + in order
+    # 6 x 0.15s = 0.9s serial vs ~0.15s concurrent -> a >=0.6s floor proves it did NOT parallelize.
+    assert elapsed >= 0.6, f"reward_thread_safe=False env was parallelized ({elapsed:.2f}s)"
+
+
+def test_async_reward_failure_drains_not_backgrounds():
+    """On a reward failure: scorers that haven't started are cancelled (no new calls launched) and the
+    few already in flight are DRAINED before we raise — none keep scoring in the background after
+    rollout_async returns (no spent calls / mutated scorer state bleeding into the next step)."""
+    import threading
+    import time
+
+    started, finished = [], []
+    lock = threading.Lock()
+
+    class _FailEnv(_VarTurnEnv):
+        def reward(self, completion, example, state=None):
+            with lock:
+                started.append(example["rid"])
+            if example["rid"] == 0:
+                raise RuntimeError("judge 500")  # fails right away
+            time.sleep(0.25)  # the in-flight peers are slow
+            with lock:
+                finished.append(example["rid"])  # records ONLY if the call ran to completion
+            return 1.0
+
+    examples = [{"max_model": 1, "rid": i} for i in range(8)]  # 8 <= max_workers(=8): all start at once
+    with pytest.raises(RuntimeError, match="judge 500"):
+        _run_async(examples, _FailEnv())
+    # Every scorer that STARTED has also FINISHED by the time we get here (drained, not backgrounded);
+    # nothing is still running. With wait=False the slow peers would still be sleeping -> finished < started.
+    assert sorted(finished) == sorted(s for s in started if s != 0), "in-flight rewards were not drained"
+
+
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_no_wakesleep_when_sleep_mode_off():
     engine = _FakeEngine()
