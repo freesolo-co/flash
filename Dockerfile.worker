@@ -146,17 +146,19 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE M
 # The COPY is made safe-when-absent with the standard "COPY a path that always exists + a guard"
 # trick. `build/kernel_cache/` is checked into the repo with just a `.keep` placeholder, so the COPY
 # source ALWAYS exists (a bare glob that matches nothing is a hard BuildKit error — this avoids it).
-# kernel_warmup.py drops `mega_cache.bin` + `mega_cache.json` next to that placeholder on a GPU
-# builder; the guard then bakes the dir into /opt/flash/kernelcache only when
-# BUILD_KERNEL_CACHE=true. with the default the dir holds only `.keep`, so the copy is harmless and
-# nothing meaningful is baked.
+# kernel_warmup.py drops `mega_cache.bin` + `mega_cache.json` (+ triton/inductor cache trees) next
+# to that placeholder on a GPU builder. COPY STRAIGHT to the final /opt/flash/kernelcache so a
+# multi-GB baked cache lives in exactly ONE layer -- staging in /tmp then cp/mv would leave the
+# bytes in BOTH the COPY layer and the RUN layer (doubling image size). with the default the dir
+# holds only `.keep`, so the copy is harmless; the guard just removes any stale cache + logs.
 ARG BUILD_KERNEL_CACHE=false
-COPY build/kernel_cache/ /tmp/kcstage/
-RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /tmp/kcstage/mega_cache.bin ]; then \
-      cp -a /tmp/kcstage/. /opt/flash/kernelcache/ \
-      && echo "kernel-cache: baked from build/kernel_cache/ -> /opt/flash/kernelcache"; \
-    else echo "kernel-cache: not baked (BUILD_KERNEL_CACHE=${BUILD_KERNEL_CACHE}) -> first-run JIT fallback"; fi \
-    && rm -rf /tmp/kcstage
+COPY build/kernel_cache/ /opt/flash/kernelcache/
+RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.bin ]; then \
+      echo "kernel-cache: baked from build/kernel_cache/ -> /opt/flash/kernelcache"; \
+    else \
+      rm -f /opt/flash/kernelcache/mega_cache.bin /opt/flash/kernelcache/mega_cache.json; \
+      echo "kernel-cache: not baked (BUILD_KERNEL_CACHE=${BUILD_KERNEL_CACHE}) -> first-run JIT fallback"; \
+    fi
 
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
