@@ -101,7 +101,7 @@ def launch_and_submit(
             f"no Hyperstack stock for {spec.gpu.type} (no region advertises the flavor)"
         )
     payload = build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets)
-    user_data = build_user_data(payload)
+    user_data = build_user_data(payload, gpu=spec.gpu.type)
     name = instance_label(spec.run_id, seed, attempt)
 
     tried_regions: set[str] = set()
