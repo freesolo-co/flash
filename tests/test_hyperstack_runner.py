@@ -244,6 +244,33 @@ def test_no_cache_never_touches_volumes(monkeypatch):
     assert "/weight-cache" not in launched[0]["user_data"]
 
 
+def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
+    """In preload mode a cache-ensure failure SKIPS the region — never a cold full-training launch.
+
+    Regression: the cold user_data carries no mode/models, so cold-fallback for a preload would boot
+    a full training run (GPU billing, timeout) and warm nothing. The walk must skip and fail if no
+    region can host the cache.
+    """
+    import pytest
+
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: (_ for _ in ()).throw(RuntimeError("quota")))
+    launched = []
+    monkeypatch.setattr(hs_api, "launch_vm", lambda **kw: launched.append(kw) or "vm")
+
+    insts = [_inst(region="CANADA-1"), _inst(region="NORWAY-1")]
+    with pytest.raises(hs_api.HyperstackApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=insts, attempt=0,
+            mode="preload", models=["a/b"],
+        )
+    assert launched == []  # no region ever launched a cold (training) VM
+
+
 # ---------------------------------------------------------------------------
 # poll_hs_job state machine
 # ---------------------------------------------------------------------------

@@ -160,10 +160,14 @@ def launch_and_submit(
             refresh_once(inst.gpu)
             continue
         # Ensure the cache volume exists in this environment (create-if-absent); on success use the
-        # cache user_data and attach the volume after launch. Any failure -> launch cold here.
+        # cache user_data and attach the volume after launch. Any failure -> launch cold here — EXCEPT
+        # in preload mode, where the cold user_data carries no mode/models, so a cold fallback would
+        # boot a full training bootstrap (GPU billing, timeout) and warm nothing. There we SKIP the
+        # region instead and let the walk try the next one (failing if none can host the cache).
         vol_id, user_data = None, cold_user_data
+        cache_unavailable_reason = None
         if cache_name and not hs_api.region_supports_cache(inst.region):
-            say(f"weight cache not supported in {inst.region}; launching cold")
+            cache_unavailable_reason = "weight cache not supported in region"
         elif cache_name:
             try:
                 # Per-region physical name (Hyperstack volume names are GLOBALLY unique — a bare
@@ -172,9 +176,21 @@ def launch_and_submit(
                 vol_id = hs_api.ensure_volume(vol_name, inst.environment, cache_gb) or None
                 if vol_id is not None:
                     user_data = cache_user_data
+                else:
+                    cache_unavailable_reason = "ensure_volume returned no id"
             except Exception as e:
                 vol_id = None
-                say(f"weight cache unavailable in {inst.region} ({e}); launching cold")
+                cache_unavailable_reason = str(e)
+        if cache_name and cache_unavailable_reason is not None:
+            if mode == "preload":
+                say(f"weight cache unavailable in {inst.region} ({cache_unavailable_reason}); "
+                    "skipping (preload needs it)")
+                last_err = hs_api.HyperstackApiError(
+                    f"preload: weight cache unavailable in {inst.region} ({cache_unavailable_reason})"
+                )
+                refresh_once(inst.gpu)
+                continue
+            say(f"weight cache unavailable in {inst.region} ({cache_unavailable_reason}); launching cold")
         try:
             vm_id = hs_api.launch_vm(
                 name=name,

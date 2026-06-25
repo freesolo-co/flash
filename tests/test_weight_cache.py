@@ -1356,3 +1356,39 @@ def test_warm_instances_cli_dry_run(monkeypatch):
     monkeypatch.setattr(preload, "warm_instances", lambda **k: called.__setitem__("n", called["n"] + 1) or [])
     assert preload.main(["--warm-instances", "--dry-run"]) == 0
     assert called["n"] == 0  # dry-run launches nothing
+
+
+def test_cli_gpu_default_is_none_per_mode(monkeypatch):
+    """--gpu defaults to None; each mode applies its OWN default downstream (no sentinel hack).
+
+    Regression: --gpu used to default to _PRELOAD_GPU ('RTX 4090') and --warm-instances used a
+    `args.gpu != _PRELOAD_GPU` comparison — so a user explicitly asking for RTX 4090 on instance
+    warming was wrongly treated as 'no override'. None must pass through cleanly.
+    """
+    from flash.providers.runpod import preload
+
+    # --warm-instances, no --gpu -> warm_instances receives gpu=None (it applies _PRELOAD_INSTANCE_GPU)
+    seen = {}
+    monkeypatch.setattr(preload, "warm_instances", lambda **k: seen.update(k) or [])
+    assert preload.main(["--warm-instances"]) == 0
+    assert seen["gpu"] is None
+
+    # --warm-instances --gpu 'RTX 4090' -> passed THROUGH (the previously-broken explicit-default case)
+    seen.clear()
+    assert preload.main(["--warm-instances", "--gpu", "RTX 4090"]) == 0
+    assert seen["gpu"] == "RTX 4090"
+
+
+def test_cli_runpod_warm_gpu_falls_back_to_preload_default(monkeypatch):
+    """RunPod warm path: a None --gpu resolves to _PRELOAD_GPU so None never reaches deploy."""
+    from flash.providers.runpod import preload
+
+    seen = {}
+    monkeypatch.setattr(preload, "warm_weight_cache", lambda **k: seen.update(k) or [])
+    # default (no --gpu) -> the RunPod warm default
+    assert preload.main(["--datacenters", "US-CA-2"]) == 0
+    assert seen["gpu"] == preload._PRELOAD_GPU
+    # explicit override still wins (even a non-default class)
+    seen.clear()
+    assert preload.main(["--datacenters", "US-CA-2", "--gpu", "H100"]) == 0
+    assert seen["gpu"] == "H100"

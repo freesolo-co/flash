@@ -539,7 +539,13 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Preload the flash weight-cache volumes.")
     ap.add_argument("--models", help="comma-separated HF model ids (default: whole catalog)")
     ap.add_argument("--datacenters", help="comma-separated DC ids (default: all storage DCs)")
-    ap.add_argument("--gpu", default=_PRELOAD_GPU, help="GPU class for the preload worker")
+    ap.add_argument(
+        "--gpu", default=None,
+        help="GPU class for the preload worker. Defaults are per-mode (RunPod warm -> "
+             f"{_PRELOAD_GPU!r}; --warm-instances -> {_PRELOAD_INSTANCE_GPU!r}); pass this to override "
+             "either. Defaulting to None (not a sentinel string) lets you explicitly pick even the "
+             "per-mode default GPU without it being mistaken for 'no override'.",
+    )
     ap.add_argument("--timeout-s", type=int, default=1800, help="per-DC job timeout")
     ap.add_argument(
         "--max-workers", type=int, default=4,
@@ -601,7 +607,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print("would warm Lambda + Hyperstack caches (one download-only launch per region with capacity)")
             return 0
-        results = warm_instances(models=models, gpu=args.gpu if args.gpu != _PRELOAD_GPU else None,
+        # gpu=None lets warm_instances apply its own per-mode default (_PRELOAD_INSTANCE_GPU). Passing
+        # args.gpu directly (no sentinel comparison) means an explicit --gpu, even RTX 4090, overrides.
+        results = warm_instances(models=models, gpu=args.gpu,
                                  timeout_s=args.timeout_s, max_workers=args.max_workers)
         failed = [r for r in results if r.get("status") not in ("ok",)]
         for r in results:
@@ -643,7 +651,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     results = warm_weight_cache(
-        models=models, datacenters=dcs, gpu=args.gpu,
+        # args.gpu defaults to None -> fall back to the RunPod warm default here so None never reaches
+        # _preload_one_dc / deploy_train_endpoint; an explicit --gpu (incl. RTX 4090) still overrides.
+        models=models, datacenters=dcs, gpu=args.gpu or _PRELOAD_GPU,
         timeout_s=args.timeout_s, max_workers=args.max_workers,
     )
     failed = [r for r in results if r.get("status") != "ok"]
