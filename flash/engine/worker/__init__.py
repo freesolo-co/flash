@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import random
 import re
@@ -1054,10 +1055,14 @@ def run_sft():
             effective_batch, seq_len=sft_max_len, vocab=vocab_size_for(model_id),
             fused=bool(cfg_kwargs.get("use_liger_kernel")),
         )
+        # The dense [pd, 1, T, T] bool mask is pd*T^2 bytes — under Liger the logits cap doesn't bind
+        # so pd can be 4, and at long context that mask alone is GBs. Cap pd so the mask stays <=512MB
+        # (a no-op at short ctx: at T=2048 it allows pd up to ~125; it only bites past ~12k tokens).
+        _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
         _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
         cfg_kwargs["per_device_train_batch_size"] = _pd_pack
         cfg_kwargs["gradient_accumulation_steps"] = max(
-            1, round(effective_batch / max(1.0, _pd_pack * _ex_per_block))
+            1, math.ceil(effective_batch / max(1.0, _pd_pack * _ex_per_block))
         )
         print(
             "[sft] true token packing ENABLED (4D block-diagonal SDPA mask): "
@@ -1094,7 +1099,7 @@ def run_sft():
         # without this the effective batch would balloon ~ex_per_block-fold -> undertraining).
         _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
         cfg_kwargs["per_device_train_batch_size"] = 1
-        cfg_kwargs["gradient_accumulation_steps"] = max(1, round(effective_batch / max(1.0, _ex_per_block)))
+        cfg_kwargs["gradient_accumulation_steps"] = max(1, math.ceil(effective_batch / max(1.0, _ex_per_block)))
         print(
             "[sft] true token packing ENABLED for GatedDeltaNet hybrid (4D mask + cu_seqlens/seq_idx "
             f"varlen): {len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} "

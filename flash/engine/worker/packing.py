@@ -19,9 +19,11 @@ GATING — pure full-attention only. A 4D mask isolates examples only in layers 
 attention mask. Hybrid GatedDeltaNet models (Qwen3.5/3.6) interleave linear-attention layers
 whose recurrence + short causal conv1d carry state ACROSS example boundaries regardless of any
 mask — their boundaries reset only via the ``fla`` kernel's ``cu_seqlens`` and ``causal_conv1d``'s
-``seq_idx``, which a mask cannot supply. So this module is gated to architectures whose every
-layer is full softmax attention (``model_is_pure_attention``); the GDN-hybrid tier stays unpacked
-(same as today), pending the separate cu_seqlens/seq_idx packing path.
+``seq_idx``. So a pure full-attention arch (``model_is_pure_attention``) packs with the 4D mask
+alone, while a GDN hybrid ALSO needs the varlen path: ``BlockDiagonalCollator(emit_varlen=True)``
+emits ``cu_seq_lens_q/k`` + ``seq_idx``, gated on both kernels being importable + arch-correct
+(``gdn_packing_available`` + ``model_is_gdn_hybrid``). Without those kernels the hybrid tier stays
+unpacked.
 
 This is a leaf module: torch is imported lazily inside the collator so it stays CPU-importable
 (the arch probe needs only ``transformers.AutoConfig``). ``flash.engine.worker`` re-exports the
@@ -240,6 +242,21 @@ def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[l
     return enc["input_ids"]
 
 
+# Process-local cache of the lower-triangular causal matrix: the collator runs on every batch, and
+# torch.tril(torch.ones(T, T)) is a non-trivial CPU alloc at T=2048+. Keep the LARGEST one seen and
+# slice it for smaller T (it's read-only). Dataloader workers are separate processes, so each holds
+# its own copy — no cross-thread race.
+_CAUSAL_TRIL: dict = {}
+
+
+def _causal_lower_triangular(total: int, torch):
+    cached = _CAUSAL_TRIL.get("m")
+    if cached is None or cached.shape[0] < total:
+        cached = torch.tril(torch.ones(total, total, dtype=torch.bool))
+        _CAUSAL_TRIL["m"] = cached
+    return cached[:total, :total]
+
+
 @dataclass
 class BlockDiagonalCollator:
     """Collate pre-packed rows (from :func:`pack_token_ids`) into a batch whose 4D **block-diagonal
@@ -317,7 +334,7 @@ class BlockDiagonalCollator:
         #                 all-False row; real tokens never attend pad because real seg != -1)
         #   causal:       k <= q
         same = seg.unsqueeze(2) == seg.unsqueeze(1)  # [B, T, T]
-        causal = torch.tril(torch.ones(total, total, dtype=torch.bool))
+        causal = _causal_lower_triangular(total, torch)  # cached + sliced (not rebuilt per batch)
         attention_mask = (same & causal).unsqueeze(1)  # [B, 1, T, T]
 
         # Labels: real tokens predict their own continuation; first token of each example (and all

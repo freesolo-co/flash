@@ -262,6 +262,19 @@ def test_collator_pads_and_masks_pad_no_nan_rows():
     assert batch["attention_mask"][0, 0].any(dim=-1).all().item() is True
 
 
+def test_causal_tril_cache_grows_and_slices():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.packing import _CAUSAL_TRIL, _causal_lower_triangular
+
+    _CAUSAL_TRIL.clear()
+    big = _causal_lower_triangular(5, torch)
+    assert big.shape == (5, 5)
+    assert big.equal(torch.tril(torch.ones(5, 5, dtype=torch.bool)))
+    small = _causal_lower_triangular(3, torch)  # sliced from the cached 5x5, not rebuilt
+    assert small.shape == (3, 3)
+    assert small.equal(torch.tril(torch.ones(3, 3, dtype=torch.bool)))
+
+
 def test_collator_emit_varlen_kwargs():
     torch = pytest.importorskip("torch")
     col = BlockDiagonalCollator(pad_token_id=0, emit_varlen=True)
@@ -290,7 +303,7 @@ def test_collator_emit_varlen_requires_bsz_one():
 
 # --------------------------------------------------------------------------- the gold test
 @pytest.mark.parametrize("arch", ["qwen3", "llama"])
-def test_packed_forward_bit_identical_to_separate(arch):
+def test_packed_forward_matches_separate(arch):
     """Packed forward (collator mask) == per-example separate forwards, under plain SDPA."""
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
