@@ -9,7 +9,7 @@ wiring itself is exercised by the live smokes).
 
 from __future__ import annotations
 
-from flash.engine.vram import estimate_vram_gb, grpo_fits_resident
+from flash.engine.vram import estimate_vram_gb, grpo_fits_resident, grpo_rollout_seq_len
 
 
 def test_resident_peak_is_at_least_sleep_peak():
@@ -35,6 +35,41 @@ def test_4b_grpo_fits_resident_on_roomy_cards_not_tight_ones():
     assert grpo_fits_resident("Qwen/Qwen3.5-4B", card_vram_gb=48, **kw) is True
     assert grpo_fits_resident("Qwen/Qwen3.5-4B", card_vram_gb=32, **kw) is False
     assert grpo_fits_resident("Qwen/Qwen3.5-4B", card_vram_gb=24, **kw) is False
+
+
+def test_rollout_seq_len_mirrors_run_rl_defaults():
+    # When [train].max_length is unset, the gate must size to the engine context run_rl() launches
+    # (max(1024, prompt+completion)), not a flat 1024 -- the Codex P2 fix.
+    from flash.engine.recipe import RECIPE
+
+    rl = RECIPE.rl
+    assert grpo_rollout_seq_len(0) == max(1024, rl.max_prompt_len + rl.max_completion_len)
+    assert grpo_rollout_seq_len(0, thinking=True) == max(
+        1024, rl.max_prompt_len + rl.max_completion_len_thinking
+    )
+    assert grpo_rollout_seq_len(4096) == 4096  # explicit max_length wins
+    assert grpo_rollout_seq_len(0, max_tokens=128) == max(1024, rl.max_prompt_len + 128)
+
+
+def test_resident_estimate_sizes_to_real_default_not_1024():
+    # The gate's resident estimate at the REAL default rollout length is >= the (too-small) 1024-token
+    # estimate, so a marginal card is not wrongly told the run fits resident.
+    kw = {"max_tokens": 64, "group_size": 8, "lora_rank": 32}
+    big = estimate_vram_gb(
+        4.7, "grpo", "bf16", seq_len=grpo_rollout_seq_len(0), sleep_offload=False, **kw
+    )
+    small = estimate_vram_gb(4.7, "grpo", "bf16", seq_len=1024, sleep_offload=False, **kw)
+    assert big >= small
+
+
+def test_resident_kv_uncapped_for_long_context():
+    # The resident estimate's rollout KV must grow with context (vLLM holds it through the backward);
+    # a 32k run estimates materially higher than a 1k run, so grpo_fits_resident won't admit a
+    # long-context run that the flat-_KV_CAP estimate used to wave through.
+    kw = {"max_tokens": 64, "group_size": 8, "sleep_offload": False}
+    assert estimate_vram_gb(4.7, "grpo", "bf16", seq_len=32768, **kw) > estimate_vram_gb(
+        4.7, "grpo", "bf16", seq_len=1024, **kw
+    )
 
 
 def test_fits_resident_is_conservative_when_unknown():

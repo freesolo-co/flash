@@ -442,11 +442,15 @@ def grpo_sleep_mode(
         return False  # small / short-context -> never needed
     if card_vram_gb and card_vram_gb > 0:
         try:
-            from flash.engine.vram import grpo_fits_resident
+            from flash.engine.vram import grpo_fits_resident, grpo_rollout_seq_len
 
             if grpo_fits_resident(
                 model_id,
-                seq_len=max_length or 1024,
+                # Size the resident-fit check to the engine context run_rl() actually launches
+                # (max(1024, prompt+completion) when [train].max_length is unset, 2368 default / 3584
+                # thinking), NOT a flat 1024 -- otherwise a marginal card is wrongly told the run fits
+                # resident and sleep is disabled, risking an OOM on the real longer rollout.
+                seq_len=grpo_rollout_seq_len(max_length, max_tokens, thinking),
                 max_tokens=max_tokens,
                 lora_rank=lora_rank,
                 group_size=group_size,

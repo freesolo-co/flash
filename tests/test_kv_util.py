@@ -6,7 +6,7 @@ both, scales the KV with context + the generation group, and caps the utilizatio
 
 from __future__ import annotations
 
-from flash.engine.vram import _KV_CAP, colocate_kv_util
+from flash.engine.vram import _KV_CAP, _resident_kv_gb, colocate_kv_util
 
 
 def test_validated_4b_config_is_025():
@@ -45,7 +45,17 @@ def test_non_sleep_path_budgets_weights_plus_kv():
     for params_b, card in [(0.8, 80.0), (2.0, 48.0), (4.0, 80.0), (4.7, 48.0)]:
         u = colocate_kv_util(params_b, 2048, card, sleep_mode=False)
         assert u * card >= params_b * 2.0  # the engine can actually load its weight copy (the fix)
-        assert u == max(0.10, min(0.45, (params_b * 2.0 + _KV_CAP) / card))
+        # weights + resident KV (context+group scaled, floored at _KV_CAP for the short-ctx lean point)
+        kv = max(_KV_CAP, _resident_kv_gb(params_b, 2048))
+        assert u == max(0.10, min(0.45, (params_b * 2.0 + kv) / card))
+
+
+def test_non_sleep_kv_scales_with_long_context():
+    # vLLM's cache blocks must cover vllm_max_model_length, so a long-context resident run needs a
+    # bigger KV budget than a short one -- the old flat _KV_CAP starved the cache blocks (Codex P2).
+    short = colocate_kv_util(4.0, 2048, 80.0, sleep_mode=False)
+    long = colocate_kv_util(4.0, 32768, 80.0, sleep_mode=False)
+    assert long > short
 
 
 def test_non_sleep_bigger_model_gets_a_bigger_budget():
