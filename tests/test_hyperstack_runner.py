@@ -200,7 +200,8 @@ def test_poll_success_stamps_real_cost(monkeypatch):
         monkeypatch, vms=[{"status": "ACTIVE"}], done="10500.0",
         metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
     )
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
+    # started_ts precedes the mocked clock (starts 10_000) so wall is positive on the first tick.
+    res = jobs.poll_hs_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
     assert res.ok
     assert res.metrics["cost_usd"] > 0
     assert res.metrics["notes"]["provider"] == "hyperstack"

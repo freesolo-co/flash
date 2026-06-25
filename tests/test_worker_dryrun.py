@@ -37,28 +37,37 @@ def test_grpo_batching_matches_prompts_per_step():
     assert (8 * old_grad_accum) // 8 == 8
 
 
-def test_grpo_batching_covers_requested_prompts_when_per_device_does_not_divide():
-    """When the short-seq micro-batch growth returns a large per_device that does NOT divide the
-    target completion batch, grad-accum must round UP (ceil) so we never optimize FEWER prompts
-    than requested. Floor would silently shrink the effective batch (the bug this guards)."""
+def test_grpo_batching_matches_requested_prompts_when_per_device_does_not_divide():
+    """When the short-seq micro-batch growth returns a per_device that does NOT divide the target
+    completion batch, we must optimize EXACTLY the requested prompts -- neither fewer (the floor
+    bug) nor more (ceil over-shoots and asks TRL for more unique prompts than the dataset-capped
+    prompts_per_step, which yields no batches on a small retained dataset). The fix shrinks
+    per_device to the largest divisor of target_comps <= the requested per_device, lowering (never
+    raising) peak VRAM, so per_device * grad_accum == target_comps exactly."""
     import flash.engine.worker as ne
 
-    # codex P2 case: batch_size=5, group_size=8, per_device=16 -> target=40; 40//16=2 would give
-    # 32 completions = 4 prompts/step (< the requested 5). Ceil covers it.
+    # codex P2 case: batch_size=5, group_size=8, per_device=16 -> target=40. Floor (40//16=2) gives
+    # 4 prompts (< 5); ceil gives 6 prompts (> the 5 retained). Shrinking per_device 16->10 yields
+    # exactly 40 completions = 5 prompts, never exceeding the dataset.
     b = ne.compute_grpo_batching(prompts_per_step=5, group_size=8, per_device_comps=16)
-    assert b["unique_prompts_per_step"] >= 5, b
-    assert b["generations_per_step"] >= 5 * 8, b  # never under-shoot the target completion batch
+    assert b["unique_prompts_per_step"] == 5, b  # exactly the request, no over/under-shoot
+    assert b["generations_per_step"] == 40, b
+    assert b["per_device_train_batch_size"] <= 16, b  # never raised above the VRAM cap
     assert b["divisible_by_group"] is True, b
 
     # General invariant across odd prompt counts and per_device that doesn't divide the target:
-    # always cover (>=) the request and stay group-divisible, for any per_device the cap can return.
+    # optimize EXACTLY the requested prompts, stay group-divisible, and never raise per_device
+    # above the requested VRAM knob, for any per_device the cap can return.
     for prompts in (1, 3, 5, 7, 13):
         for per_device in (1, 4, 8, 12, 16):
             b = ne.compute_grpo_batching(
                 prompts_per_step=prompts, group_size=8, per_device_comps=per_device
             )
-            assert b["generations_per_step"] >= prompts * 8, (prompts, per_device, b)
-            assert b["unique_prompts_per_step"] >= prompts, (prompts, per_device, b)
+            assert b["generations_per_step"] == prompts * 8, (prompts, per_device, b)
+            assert b["unique_prompts_per_step"] == prompts, (prompts, per_device, b)
+            assert b["per_device_train_batch_size"] <= max(1, min(per_device, prompts * 8)), (
+                prompts, per_device, b,
+            )
             assert b["divisible_by_group"] is True, (prompts, per_device, b)
 
 

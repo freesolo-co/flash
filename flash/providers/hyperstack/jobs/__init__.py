@@ -308,8 +308,13 @@ def poll_hs_job(
         status = ((vm or {}).get("status") or ("missing" if vm is None else "unknown")).upper()
         if status != last_status:
             say(f"vm {handle.vm_id}: {status}")
+            # Treat a status TRANSITION as progress, but NOT the first observation: last_status
+            # starts None, so on a reattach the very first read always "changes" — counting it as
+            # progress would overwrite the launch-anchored last_progress and hand a silent-since-
+            # launch worker a fresh full setup grace after every control-plane restart.
+            if last_status is not None:
+                last_progress = time.time()
             last_status = status
-            last_progress = time.time()
         if status == "ACTIVE":
             became_active = True
 
