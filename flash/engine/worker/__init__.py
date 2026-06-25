@@ -1030,29 +1030,35 @@ def run_sft():
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
         cfg_kwargs["remove_unused_columns"] = False
-        # Each packed row is a FULL max_length block (not a short example) + a dense [B,1,T,T] mask, so
-        # the unpacked micro-batch sizing (assumes short rows) can OOM the [pd, max_length, vocab] fp32
-        # logits. Re-size per-device for the full-block logits budget — a no-op when Liger's fused CE
-        # is on (no logits materialized -> per_device stays at the default).
         from flash.catalog import vocab_size_for
 
-        _pd_pack, _ga_pack = sft_grad_accum(
-            effective_batch, seq_len=sft_max_len, vocab=vocab_size_for(model_id),
-            fused=bool(cfg_kwargs.get("use_liger_kernel")),
-        )
-        cfg_kwargs["per_device_train_batch_size"] = _pd_pack
-        cfg_kwargs["gradient_accumulation_steps"] = _ga_pack
         # Tokenize EXACTLY like TRL's non-packed prep (EOS-append parity so the model still learns to
         # stop; batched; truncate to max_length) then bin-pack into <= max_length blocks.
         _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
         _packed_rows = pack_token_ids(_tokenized, sft_max_len)
         ds = Dataset.from_list(_packed_rows)
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
+        # Memory: re-size the per-device micro-batch (in BLOCKS) for the full-block [pd, max_length,
+        # vocab] fp32 logits budget — a no-op under Liger's fused CE. Quality: each block holds
+        # ~ex_per_block examples, so KEEP the effective batch in EXAMPLES at the configured value by
+        # re-deriving grad_accum from the block count. Without this, packing balloons the effective
+        # batch ~ex_per_block-fold (fewer, larger updates -> mild undertraining at the same epochs:
+        # an A/B measured +5.2% held-out loss vs unpacked, closed to +0.1% once matched).
+        _pd_pack, _ = sft_grad_accum(
+            effective_batch, seq_len=sft_max_len, vocab=vocab_size_for(model_id),
+            fused=bool(cfg_kwargs.get("use_liger_kernel")),
+        )
+        _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
+        cfg_kwargs["per_device_train_batch_size"] = _pd_pack
+        cfg_kwargs["gradient_accumulation_steps"] = max(
+            1, round(effective_batch / max(1.0, _pd_pack * _ex_per_block))
+        )
         print(
             "[sft] true token packing ENABLED (4D block-diagonal SDPA mask): "
-            f"{len(_tokenized)} examples -> {len(_packed_rows)} blocks of <= {sft_max_len} tok "
-            f"({packing_efficiency(_packed_rows, sft_max_len):.0%} dense); "
-            "no flash-attn / no flex_attention required"
+            f"{len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} ex/block, "
+            f"{packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} tok; "
+            f"pd={_pd_pack} ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept "
+            f"~{effective_batch} ex); no flash-attn / no flex_attention"
         )
     elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available() and _mask_pack_ok:
         # GatedDeltaNet hybrid (Qwen3.5/3.6, flash's flagship tier): the 4D block-diagonal mask makes
@@ -1072,20 +1078,22 @@ def run_sft():
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
         cfg_kwargs["remove_unused_columns"] = False
-        # cu_seqlens spans ONE packed block, so the per-device batch must be a single block; fold the
-        # effective batch into grad-accumulation instead.
-        cfg_kwargs["per_device_train_batch_size"] = 1
-        cfg_kwargs["gradient_accumulation_steps"] = max(1, per_device_bs * grad_accum)
         # EOS-append parity + batched + truncated tokenization (same as the unpacked path), then pack.
         _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
         _packed_rows = pack_token_ids(_tokenized, sft_max_len)
         ds = Dataset.from_list(_packed_rows)
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
+        # cu_seqlens spans ONE packed block, so per-device is a single block; keep the effective batch
+        # in EXAMPLES at the configured value via grad-accum (each block holds ~ex_per_block examples —
+        # without this the effective batch would balloon ~ex_per_block-fold -> undertraining).
+        _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
+        cfg_kwargs["per_device_train_batch_size"] = 1
+        cfg_kwargs["gradient_accumulation_steps"] = max(1, round(effective_batch / max(1.0, _ex_per_block)))
         print(
             "[sft] true token packing ENABLED for GatedDeltaNet hybrid (4D mask + cu_seqlens/seq_idx "
-            f"varlen): {len(_tokenized)} examples -> {len(_packed_rows)} blocks of <= {sft_max_len} "
-            f"tok ({packing_efficiency(_packed_rows, sft_max_len):.0%} dense); per_device_bs forced "
-            "to 1 (cu_seqlens spans one block), effective batch via grad-accum"
+            f"varlen): {len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} "
+            f"ex/block, {packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} "
+            f"tok; pd=1 ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept ~{effective_batch} ex)"
         )
     elif not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
         print(
