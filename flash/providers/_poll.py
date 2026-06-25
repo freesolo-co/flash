@@ -224,6 +224,39 @@ def surface_heartbeat(
     return key, stage
 
 
+def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tuple[float, bool]:
+    """Wall-clock to credit as 'last worker progress' for a just-surfaced heartbeat, plus whether
+    that heartbeat actually belongs to THIS attempt.
+
+    Use the heartbeat's OWN ``ts`` (key[2] = when the worker actually made progress), not the
+    poll time. On a delayed reattach after a control-plane restart, a heartbeat that was already
+    stale BEFORE the restart must not buy a fresh full stall window — crediting the poll time
+    would hand a hung worker another grace period while the instance keeps billing. Clamp to
+    ``[launch, now]`` so worker/control-plane clock skew can neither make a healthy worker look
+    ancient (premature stall) nor land its progress in the future.
+
+    Returns ``(ts, fresh)``. ``fresh`` is False when the heartbeat's ts predates this attempt's
+    launch: that is a LEFTOVER heartbeat from a prior attempt (retries reuse the same seed
+    heartbeat path), so the caller must NOT treat it as current progress — otherwise a stale
+    training-stage heartbeat would arm the tighter training stall window and fail a healthy new
+    attempt mid-setup before it has overwritten the old file. ``launch_ts`` uses truthiness (not
+    ``is not None``): the instance handles store started_ts as a non-Optional float coerced to 0.0
+    when missing, so 0.0 means "unknown launch" (a real launch is a large epoch ts). When launch is
+    UNKNOWN we cannot date heartbeats relative to it, so the clamp floor drops to 0.0 and every
+    heartbeat counts as fresh (the safe default: don't discard progress we can't date — clamping the
+    floor to ``now`` instead would mark every normal heartbeat, timestamped before it is read, stale
+    and stall a healthy recovered worker)."""
+    now = time.time()
+    ts = hb_key[2] if (isinstance(hb_key, tuple) and len(hb_key) >= 3) else None
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return now, False
+    lo = float(launch_ts) if launch_ts else 0.0  # unknown launch -> floor 0.0 (all heartbeats fresh)
+    fresh = ts >= lo
+    return min(now, max(lo, ts)), fresh
+
+
 def surface_forced_heartbeat(
     heartbeat_reader: Callable[..., Any] | None,
     last_hb_key: tuple | None,

@@ -19,7 +19,12 @@ import time
 from collections.abc import Callable
 
 from flash._logging import get_logger
-from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
+from flash.providers._poll import (
+    PollErrorTracker,
+    heartbeat_progress_ts,
+    make_say,
+    surface_heartbeat,
+)
 from flash.providers.base import GPU_INFO, PollResult, min_cuda_modern
 from flash.providers.hyperstack import api as hs_api
 from flash.providers.hyperstack.jobs.builders import (
@@ -219,6 +224,12 @@ def poll_hs_job(
 ) -> PollResult:
     """Poll VM status + HF artifacts to a terminal state (cf. lambda.jobs.poll_lambda_job)."""
     say = make_say(log)
+    # Single source of truth for "when did this VM launch". started_ts is a non-Optional float that
+    # HyperstackJobHandle.from_dict coerces to 0.0 when MISSING (old/corrupt handle), so 0.0 means
+    # "unknown launch" (a real launch is a large epoch ts, never 0.0). Fall back to now so EVERY use
+    # below -- the load/stall clocks AND done_is_fresh / finish_ok's wall+cost stamping -- treats a
+    # recovered corrupt handle consistently, instead of billing/comparing from the 1970 epoch.
+    launch_ts = handle.started_ts or time.time()
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     done_reader = _make_hf_file_reader(hf_repo, f"{prefix}/DONE")
@@ -236,11 +247,11 @@ def poll_hs_job(
         if done_content:
             try:
                 done_ts = float(done_content.strip())
-                if handle.started_ts <= done_ts <= end_ts:
+                if launch_ts <= done_ts <= end_ts:
                     end_ts = done_ts
             except ValueError:
                 pass
-        wall_h = (end_ts - handle.started_ts) / 3600.0
+        wall_h = (end_ts - launch_ts) / 3600.0
         metrics["cost_usd"] = round(wall_h * handle.hourly_usd, 6)
         notes = metrics.get("notes") if isinstance(metrics.get("notes"), dict) else {}
         notes.update(
@@ -256,8 +267,10 @@ def poll_hs_job(
         return PollResult(True, metrics=metrics)
 
     def done_is_fresh(content: str) -> bool:
+        # launch_ts (not handle.started_ts) so an unknown-launch (0.0) handle doesn't accept every
+        # leftover DONE as fresh.
         try:
-            return float(content.strip()) > handle.started_ts - 120.0
+            return float(content.strip()) > launch_ts - 120.0
         except ValueError:
             return False
 
@@ -278,16 +291,45 @@ def poll_hs_job(
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker),
         )
 
+    def terminal_artifact_result() -> PollResult | None:
+        # One forced read of the worker's terminal HF artifacts (DONE / attempt ok-marker). Returns a
+        # terminal PollResult when the worker definitively finished or errored, else None. Used both
+        # when the host is dead AND before returning a recovered client-side-deadline `stalled`: a
+        # control-plane outage longer than max_wall+grace must not discard a seed the worker actually
+        # completed during the downtime (the deadline check would otherwise fire before any DONE read).
+        d = done_reader(force=True)
+        if d is not None and done_is_fresh(d):
+            return finish_ok(d)
+        raw = marker_reader(force=True)
+        if raw:
+            with contextlib.suppress(ValueError):
+                m = json.loads(raw)
+                if m.get("ok"):
+                    return finish_from_ok_marker()  # finished (stale DONE ok)
+                return fail_from_marker(m)
+        return None
+
     poll_errors = PollErrorTracker(say, interval_s)
-    start = time.time()
+    # Seed the load/stall clocks from the VM's LAUNCH (launch_ts), not this poll's start: on a
+    # delayed reattach after a control-plane restart the box has been billing since launch, so a
+    # still-booting VM that already blew LOAD_TIMEOUT_S must fail over NOW instead of getting another
+    # full window. launch_ts already maps an unknown-launch (0.0) handle to now (see above), so a
+    # fresh launch is a no-op and a corrupt handle won't peg the clocks to the epoch.
+    start = launch_ts
     last_status = None
     last_hb_key = None
-    last_progress = time.time()
+    last_progress = start
     became_active = False
     seen_training_hb = False
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
+            # A recovered run can blow a launch-anchored deadline on the FIRST reattach tick (the
+            # outage lasted past max_wall+grace). Read terminal artifacts once before giving up: if
+            # the worker finished/errored during the downtime, persist that instead of retrying.
+            terminal = terminal_artifact_result()
+            if terminal is not None:
+                return terminal
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
         try:
             vm = hs_api.get_vm(handle.vm_id)
@@ -300,8 +342,13 @@ def poll_hs_job(
         status = ((vm or {}).get("status") or ("missing" if vm is None else "unknown")).upper()
         if status != last_status:
             say(f"vm {handle.vm_id}: {status}")
+            # Treat a status TRANSITION as progress, but NOT the first observation: last_status
+            # starts None, so on a reattach the very first read always "changes" — counting it as
+            # progress would overwrite the launch-anchored last_progress and hand a silent-since-
+            # launch worker a fresh full setup grace after every control-plane restart.
+            if last_status is not None:
+                last_progress = time.time()
             last_status = status
-            last_progress = time.time()
         if status == "ACTIVE":
             became_active = True
 
@@ -311,18 +358,9 @@ def poll_hs_job(
 
         dead = missing_streak >= 3 or status in _DEAD_STATES
         if dead:
-            done = done_reader(force=True)
-            if done is not None and done_is_fresh(done):
-                return finish_ok(done)
-            raw_marker = marker_reader(force=True)
-            marker = None
-            if raw_marker:
-                with contextlib.suppress(ValueError):
-                    marker = json.loads(raw_marker)
-            if marker is not None and marker.get("ok"):
-                return finish_from_ok_marker()  # finished right before teardown (stale DONE ok)
-            if marker is not None and not marker.get("ok"):
-                return fail_from_marker(marker)
+            terminal = terminal_artifact_result()
+            if terminal is not None:
+                return terminal
             return PollResult(
                 False,
                 failure="job_preempted",
@@ -351,9 +389,19 @@ def poll_hs_job(
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
-            last_progress = time.time()
-            if stage not in _SETUP_HEARTBEAT_STAGES:
-                seen_training_hb = True
+            # Credit the heartbeat's OWN timestamp, not the poll time: a heartbeat that was
+            # already stale before a control-plane restart must not reset the stall clock to now
+            # on the first reattach read (last_hb_key starts None, so even an old heartbeat looks
+            # "new"). Clamped to [launch, now]. Healthy workers heartbeat well inside the stall
+            # window, so their ts ~= now (no behavior change on the normal path). ``fresh`` is False
+            # for a LEFTOVER heartbeat from a prior attempt (ts < launch); we then neither advance
+            # last_progress nor mark training seen, so a stale training heartbeat can't arm the
+            # tighter training stall window before this attempt overwrites the file.
+            hb_ts, fresh = heartbeat_progress_ts(new_key, handle.started_ts)
+            if fresh:
+                last_progress = hb_ts
+                if stage not in _SETUP_HEARTBEAT_STAGES:
+                    seen_training_hb = True
         if became_active:
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
