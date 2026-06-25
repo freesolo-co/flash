@@ -23,7 +23,12 @@ import json
 import time
 
 from flash._logging import get_logger
-from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
+from flash.providers._poll import (
+    PollErrorTracker,
+    heartbeat_progress_ts,
+    make_say,
+    surface_heartbeat,
+)
 from flash.providers.base import GPU_INFO, PollResult
 from flash.providers.lambdalabs import api as lambda_api
 from flash.providers.lambdalabs.jobs.builders import (
@@ -328,10 +333,14 @@ def poll_lambda_job(
         )
 
     poll_errors = PollErrorTracker(say, interval_s)
-    start = time.time()
+    # Seed the load/stall clocks from the instance's LAUNCH (handle.started_ts), not this poll's
+    # start: on a delayed reattach after a control-plane restart the box has been billing since
+    # launch, so a still-booting instance that already blew LOAD_TIMEOUT_S must fail over NOW
+    # instead of getting another full window. On a fresh launch started_ts ~= now (no-op).
+    start = handle.started_ts or time.time()
     last_status = None
     last_hb_key = None
-    last_progress = time.time()
+    last_progress = handle.started_ts or time.time()
     became_active = False
     seen_training_hb = False
     missing_streak = 0
@@ -404,7 +413,12 @@ def poll_lambda_job(
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
-            last_progress = time.time()
+            # Credit the heartbeat's OWN timestamp, not the poll time: a heartbeat that was
+            # already stale before a control-plane restart must not reset the stall clock to now
+            # on the first reattach read (last_hb_key starts None, so even an old heartbeat looks
+            # "new"). Clamped to [launch, now]. Healthy workers heartbeat well inside the stall
+            # window, so their ts ~= now (no behavior change on the normal path).
+            last_progress = heartbeat_progress_ts(new_key, handle.started_ts)
             if stage not in _SETUP_HEARTBEAT_STAGES:
                 seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +

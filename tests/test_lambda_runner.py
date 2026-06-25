@@ -365,6 +365,51 @@ def test_poll_heartbeat_stall(monkeypatch):
     assert "no worker progress" in res.detail
 
 
+def test_poll_recovery_seeds_load_clock_from_launch(monkeypatch):
+    """Reattach after a control-plane restart: a still-booting box has been billing since LAUNCH
+    (handle.started_ts), so LOAD_TIMEOUT_S is measured from launch, NOT from this poll's first
+    tick. A box already past the load window fails over on the first reattach iteration instead of
+    getting another full window. (The mocked clock starts at 10_000; launch was 5000s earlier.)"""
+    import re
+
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "booting"}], step=10.0)
+    res = jobs.poll_lambda_job(_handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "never became active" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    # launch-relative (~5000s); the old "reset to reattach tick" code would report ~LOAD_TIMEOUT_S.
+    assert int(m.group(1)) >= 2000, res.detail
+
+
+def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
+    """A heartbeat that was already stale before a restart must not reset the stall clock to the
+    reattach time: its OWN ts is credited as last-progress, so an active worker frozen long ago
+    stalls promptly instead of getting another full stall window. (Clock starts 10_000; the
+    worker's last heartbeat was at 8500, launch at 8000, stall budget 500s.)"""
+    import re
+
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    hb = {"stage": "rl", "step": 7, "ts": 8500.0}
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=8_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: hb,
+        stall_after_s=500.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "no worker progress" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    # measured from the heartbeat ts (~1500s+), not the reattach tick (which the old code used,
+    # yielding only ~stall_after_s).
+    assert int(m.group(1)) >= 1000, res.detail
+
+
 def test_poll_client_deadline(monkeypatch):
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
     res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, deadline_s=250.0)

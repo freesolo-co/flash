@@ -231,6 +231,25 @@ def surface_heartbeat(
     return key, stage
 
 
+def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> float:
+    """Wall-clock to credit as 'last worker progress' for a just-surfaced heartbeat.
+
+    Use the heartbeat's OWN ``ts`` (key[2] = when the worker actually made progress), not the
+    poll time. On a delayed reattach after a control-plane restart, a heartbeat that was already
+    stale BEFORE the restart must not buy a fresh full stall window — crediting the poll time
+    would hand a hung worker another grace period while the instance keeps billing. Clamp to
+    ``[launch, now]`` so worker/control-plane clock skew can neither make a healthy worker look
+    ancient (premature stall) nor land its progress in the future."""
+    now = time.time()
+    ts = hb_key[2] if (isinstance(hb_key, tuple) and len(hb_key) >= 3) else None
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return now
+    lo = float(launch_ts) if launch_ts else now
+    return min(now, max(lo, ts))
+
+
 def surface_forced_heartbeat(
     heartbeat_reader: Callable[..., Any] | None,
     last_hb_key: tuple | None,

@@ -123,6 +123,75 @@ def test_reconcile_run_reports_and_persists(monkeypatch):
     assert updates["reconciled_at"] == now
 
 
+def test_instance_realized_cost_bills_launch_to_run_end_not_padded_end():
+    """Instance providers bill flat $/hr over launch->run_end; the settle-padded billing `end`
+    (used only for RunPod's invoice query) must NOT inflate their wall."""
+    remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 2.0, "started_ts": 1000.0}
+    rc = realized.realized_cost_for_remote(
+        remote, start=1000.0, end=1_000_000.0, run_end=4600.0  # 1h of wall, end padded way past
+    )
+    assert rc is not None
+    assert rc.provider == "lambda"
+    assert rc.wall_seconds == 3600.0  # 4600 - 1000, NOT the padded end
+    assert rc.realized_usd == 2.0  # 1h x $2/hr
+
+
+def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(monkeypatch):
+    """A Lambda/Hyperstack run deployed AFTER completion has updated_at moved to the deploy time;
+    reconciliation must pass the FROZEN training-teardown (finished_at) as the instance run_end,
+    not that later deploy time, or it over-reports COGS (flat $/hr from launch until deployment)."""
+    now = 1_000_000.0
+    teardown = now - 7200.0  # training finished (and instance torn down) 2h ago
+    deploy_t = now - 600.0  # deployed 10 min ago -> updated_at bumped to here
+    captured: dict = {}
+
+    def fake_realized(remote, *, start, end, run_end=None):
+        captured.update(start=start, end=end, run_end=run_end)
+        return realized.RealizedCost(provider="lambda", realized_usd=1.0)
+
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
+    monkeypatch.setattr(reconcile, "_report", lambda body: True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
+
+    status = _status(
+        state="deployed",
+        updated_at=deploy_t,
+        finished_at=teardown,
+        remote={
+            "provider": "lambda",
+            "instance_id": "i-1",
+            "hourly_usd": 1.29,
+            "started_ts": now - 10800,
+        },
+    )
+    assert reconcile.reconcile_run(status, now=now) is True
+    assert captured["run_end"] == teardown  # frozen training end, not the deploy bump
+    assert captured["run_end"] != deploy_t
+
+
+def test_reconcile_falls_back_to_updated_at_when_no_finished_at(monkeypatch):
+    """Pre-feature runs (finished_at is None) keep the old behavior: run_end == updated_at."""
+    now = 1_000_000.0
+    captured: dict = {}
+
+    def fake_realized(remote, *, start, end, run_end=None):
+        captured.update(run_end=run_end)
+        return realized.RealizedCost(provider="lambda", realized_usd=1.0)
+
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
+    monkeypatch.setattr(reconcile, "_report", lambda body: True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
+
+    status = _status(
+        state="done",
+        updated_at=now - 7200.0,
+        finished_at=None,
+        remote={"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29, "started_ts": now - 9000},
+    )
+    assert reconcile.reconcile_run(status, now=now) is True
+    assert captured["run_end"] == now - 7200.0
+
+
 def test_reconcile_run_skips_zero_and_unreported(monkeypatch):
     now = 1_000_000.0
     status = _status(updated_at=now - 7200, remote={"provider": "runpod", "endpoint_id": "e"})

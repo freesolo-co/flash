@@ -1338,13 +1338,17 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     # a small prompts_per_step would otherwise overshoot it (mirrors run_sft's
     # `min(per_device_bs, effective_batch)`). No-op at the default (prompts_per_step=64).
     per_device = max(1, min(per_device, target_comps))
-    grad_accum = max(1, target_comps // per_device)
-    # TRL rejects a global completion batch (per_device * grad_accum) that is not
-    # divisible by num_generations (= group_size), failing only AFTER the paid worker
-    # is provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the
-    # next multiple that makes the batch divisible (grad_accum must be a multiple of
-    # group_size // gcd(per_device, group_size)). This only ever raises the effective
-    # batch slightly; the common per_device|group_size cases are unchanged.
+    # Round UP (ceil), never floor: per_device is the fixed VRAM knob, and when it does not
+    # divide target_comps the floor would silently optimize FEWER prompts than requested. With
+    # the short-seq growth path returning per_device=16, prompts_per_step=5, group_size=8 gives
+    # target_comps=40 -> 40 // 16 = 2 -> 32 completions = 4 prompts/step, NOT the requested 5.
+    # Ceil covers the target (48 comps = 6 prompts here); it only ever optimizes >= the request.
+    grad_accum = max(1, -(-target_comps // per_device))
+    # TRL also rejects a global completion batch (per_device * grad_accum) that is not
+    # divisible by num_generations (= group_size), failing only AFTER the paid worker is
+    # provisioned, so round grad_accum UP again to the next multiple that makes the batch
+    # divisible (a multiple of group_size // gcd(per_device, group_size)). Both round-ups only
+    # raise the effective batch; the common per_device|group_size cases are unchanged.
     accum_step = group_size // math.gcd(per_device, group_size)
     grad_accum = ((grad_accum + accum_step - 1) // accum_step) * accum_step
     generations_per_step = per_device * grad_accum

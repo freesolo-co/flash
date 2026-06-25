@@ -94,6 +94,12 @@ class RunStatus:
     # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
+    # Wall-clock the run first went terminal (~training teardown). Stamped ONCE on the first
+    # terminal transition and never moved, so it survives later ``updated_at`` bumps from
+    # deploy / heartbeat / reconcile. Reconciliation uses it as the instance-billing ``run_end``:
+    # a run deployed after completion has ``updated_at`` = deploy time, which would over-bill the
+    # flat $/hr from launch until deployment instead of until training teardown. None pre-feature.
+    finished_at: float | None = None
     # Non-secret customer billing context, set for externally-submitted runs. Completion-time
     # billing uses this org id with the operator internal key; user API keys are not persisted.
     billing_context: dict | None = None
@@ -459,6 +465,11 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
             return False
         status.state = state
         status.updated_at = time.time()
+        # Freeze the training-teardown time on the FIRST terminal transition (and only then) so
+        # reconciliation has an immutable run-end even after deploy/heartbeat/reconcile later bump
+        # updated_at. A same-state terminal re-write (terminal field updates) keeps the original.
+        if state in TERMINAL_STATES and status.finished_at is None:
+            status.finished_at = status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
         _save_status(status)
