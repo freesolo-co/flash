@@ -71,7 +71,12 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
-        dry_run = bool(payload.get("dry_run", False))
+        # Validate ``dry_run`` is an actual JSON boolean — never ``bool(...)`` a truthy non-bool
+        # (e.g. the string "false" would coerce to True and silently change deploy behavior).
+        dry_run_raw = payload.get("dry_run", False)
+        if not isinstance(dry_run_raw, bool):
+            raise HTTPException(status_code=400, detail="dry_run must be a boolean")
+        dry_run = dry_run_raw
         # Optional `step`: deploy a specific intermediate checkpoint instead of the run's
         # final adapter. We resolve it against what's actually on HF (the source of truth),
         # so a missing step 404s with the available list rather than 500ing at serve time.

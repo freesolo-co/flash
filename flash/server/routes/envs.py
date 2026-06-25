@@ -32,5 +32,7 @@ def publish_env(payload: dict, key: Annotated[dict, Depends(require_key)]):
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     from flash.server.environment_registry import record_published_environment
 
-    record_published_environment(slug=slug, name=str(_name), key=key)
+    # Record the same normalized name passed to publish_package — "" for an unnamed upload, NOT
+    # str(None) == "None", which would pollute platform metadata for unnamed uploads.
+    record_published_environment(slug=slug, name="" if _name is None else _name, key=key)
     return {"id": slug}
