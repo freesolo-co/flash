@@ -254,33 +254,60 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # Lambda/Hyperstack caches). Lambda filesystems + Hyperstack volumes are likewise pre-created in every
 # region/environment by ``preload --provision`` (pure control-plane API, no GPU).
 #
-# TRUST MODEL (shared multi-tenant cache): the mount is read-WRITE on every run, and a run executes
-# its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a
-# cached model's content-addressed blobs and poison a later run that loads that model in the same
-# region (a cross-tenant integrity risk). This is the accepted flip side of "one shared cache for
-# everything": the cache holds only PUBLIC base weights (no secret/data exfiltration — the poison
-# risk is integrity, not confidentiality), and flash environments are published/reviewed Hub
-# artifacts, not anonymous code. The clean isolation — mounting the volume READ-ONLY for the run and
-# writing only via the trusted preload — is NOT yet expressible through the runpod_flash SDK
-# (NetworkVolume has no mount-mode field; ``extra="forbid"``). When the SDK gains a read-only mount,
-# switch runs to RO + populate exclusively via preload. Until then this is a documented tradeoff;
-# flip to per-org volumes (keyed off platform_context.org_id) if strict tenant isolation is required.
+# TRUST MODEL (shared multi-tenant cache): the cache holds ONLY PUBLIC catalog base weights. This is
+# ENFORCED, not assumed — ``_assign_weight_cache_volume`` attaches the cache only for
+# ``model_policy == "catalog"`` runs (always public; resolve_model validates catalog membership), and
+# leaves open-model ("allow") runs cache-less so a possibly PRIVATE/GATED HF repo (downloaded with the
+# forwarded platform HF_TOKEN) NEVER persists onto the shared mount where another tenant in the region
+# could read it. So there is NO cross-tenant CONFIDENTIALITY exposure: only inert public weights ever
+# land here.
+# The remaining residual is INTEGRITY only: the mount is read-WRITE on every run and a run executes
+# its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a cached
+# public model's content-addressed blobs and poison a later run loading that same model in the region.
+# That is the accepted flip side of "one shared cache for everything" — flash environments are
+# published/reviewed Hub artifacts, not anonymous code, and the data at risk is public weights, not
+# secrets. The clean isolation — mounting the volume READ-ONLY for the run and writing only via the
+# trusted preload — is NOT yet expressible through the runpod_flash SDK (NetworkVolume has no
+# mount-mode field; ``extra="forbid"``). When the SDK gains a read-only mount, switch runs to RO +
+# populate exclusively via preload. Until then this is a documented integrity tradeoff; flip to per-org
+# volumes (keyed off platform_context.org_id) if strict tenant isolation is required.
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 WEIGHT_CACHE_VOLUME_GB = 100
 
 
 def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
-    """Attach the shared, platform-managed weight-cache volume to every run.
+    """Attach the shared, platform-managed weight-cache volume — ONLY for PUBLIC catalog models.
 
     Platform-managed (never user config), exactly like the managed HF repo: assigned here, not
-    surfaced in the config schema. The only no-op is when the spec already carries a volume (an
-    explicit/test assignment is never overridden). The provider builds the per-region volume fleet
-    + the cross-DC endpoint at deploy time (jobs.weight_cache_endpoint_kwargs) off this name.
+    surfaced in the config schema. The provider builds the per-region volume fleet + the cross-DC
+    endpoint at deploy time (jobs.weight_cache_endpoint_kwargs) off this name, and the worker env
+    redirects HF_HOME onto the mount whenever the volume is attached.
+
+    CONFIDENTIALITY GATE: the cache is SHARED cross-tenant, and attaching it redirects HF_HOME onto
+    the shared mount, so a model's downloaded weights persist there for every later run in the region.
+    That is only safe for PUBLIC weights. Managed config runs are always catalog-only (the schema
+    hardcodes model_policy="catalog"), and ``submit_job`` runs ``resolve_model`` BEFORE this — so a
+    ``catalog``-policy spec is already guaranteed to be a curated PUBLIC catalog model (resolve_model
+    raises otherwise). The ONLY way to reach a non-catalog, possibly PRIVATE/GATED HF repo is
+    model_policy="allow" (programmatic/internal use; not selectable from a submitted config). Such a
+    model would be downloaded with the forwarded platform HF_TOKEN, and persisting its weights to the
+    shared multi-tenant cache would leak them cross-tenant. So the cache is attached ONLY for
+    ``model_policy == "catalog"`` runs; an open/"allow" run is left cache-less, confining its weights
+    to the worker's ephemeral disk (it can still use the per-org escape-hatch volume).
+
+    No-ops (return the spec unchanged): (a) the spec already carries a volume (explicit/test
+    assignment is never overridden), or (b) the run is open-model ("allow") — not provably public.
 
     See the module-level TRUST MODEL note above for the shared-cache integrity tradeoff (a run's env
     code has write access to the shared mount; RO mount isn't SDK-expressible yet).
     """
     if getattr(spec.gpu, "network_volume", None):
+        return spec
+    # Only provably-PUBLIC catalog runs may enter the shared cross-tenant cache (see the gate note).
+    # An open-model run (model_policy="allow") could target a private/gated repo, so keep it
+    # cache-less — its weights must never persist onto the shared mount where another tenant in the
+    # region could read them.
+    if getattr(spec, "model_policy", "catalog") != "catalog":
         return spec
     d = spec.to_dict()
     d["gpu"] = {

@@ -345,7 +345,8 @@ def test_instance_payload_strips_runpod_volume_redirect():
 
 
 # ---------------------------------------------------------------------------
-# runner._assign_weight_cache_volume — fully managed, attaches to EVERY run, no knobs/gating
+# runner._assign_weight_cache_volume — fully managed, no knobs; gated to PUBLIC catalog runs only
+# (the shared cross-tenant cache must never hold private/gated weights — confidentiality boundary)
 # ---------------------------------------------------------------------------
 def test_assign_weight_cache_attaches_to_catalog_run():
     from flash import runner
@@ -355,12 +356,22 @@ def test_assign_weight_cache_attaches_to_catalog_run():
     assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB == 100
 
 
-def test_assign_weight_cache_attaches_for_allow_policy_too():
-    # Regression: the private-model gating is REMOVED — every run gets the cache, allow-policy too.
+def test_assign_weight_cache_default_policy_attaches():
+    # The JobSpec default policy is "catalog" (managed runs), so a default-policy run is cached.
     from flash import runner
 
-    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r", model_policy="allow"))
+    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
     assert out.gpu.network_volume == "flash-weights"
+
+
+def test_assign_weight_cache_skips_open_model_policy():
+    # CONFIDENTIALITY GATE: an open-model ("allow") run may target a PRIVATE/GATED HF repo; its
+    # weights must NOT enter the shared cross-tenant cache. So the cache is NOT attached and HF_HOME
+    # is never redirected onto the shared mount — the weights stay on the worker's ephemeral disk.
+    from flash import runner
+
+    out = runner._assign_weight_cache_volume(JobSpec(model="some-org/private-model", run_id="r", model_policy="allow"))
+    assert out.gpu.network_volume is None  # cache-less: no shared-mount redirect for a possibly-private model
 
 
 def test_assign_weight_cache_ignores_removed_kill_switch(monkeypatch):
