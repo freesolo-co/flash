@@ -179,7 +179,9 @@ def build_payload(
     # because deps are baked into WORKER_IMAGE. FLASH_EXTRA_PIP (whitespace-separated, or a JSON list
     # for specs with commas) is the ONE knob that rides the always-installed `extra_pip` to a baked
     # run — used to A/B a wheel (e.g. causal-conv1d) on top of the published image without rebuilding
-    # it. Resolved from the effective worker env (per-run [worker_env] over os.environ).
+    # it. Resolved from the EFFECTIVE worker env: build_worker_env forwards FLASH_EXTRA_PIP from the
+    # control-plane os.environ (it's in the allowlist) AND merges the run's [worker_env] on top, so
+    # either a control-plane default OR a per-run [worker_env] override is honored (the latter wins).
     # NOTE: this is Vast-only — the RunPod baked submit (providers/runpod/jobs.build_function_input
     # and train/__init__.submit_train) builds extra_pip from chalk_extra_pip + local_env_extra_pip
     # and does NOT append FLASH_EXTRA_PIP. Keep that in mind before relying on it for a RunPod run.

@@ -393,3 +393,17 @@ def test_maybe_seed_backends_rejects_malformed_entry(monkeypatch):
     monkeypatch.setenv("FLASH_POOL_BACKENDS", "broken-entry-no-delimiters")
     with pytest.raises(ValueError, match="FLASH_POOL_BACKENDS"):
         _maybe_seed_backends(app)
+
+
+def test_maybe_seed_backends_preserves_userinfo_at_in_url(monkeypatch):
+    # `@` legitimately appears in a URL's userinfo (http://user:pass@host:8000). The parser splits id
+    # off on the FIRST '=' and base_model off on the LAST '@' (rsplit), so the userinfo '@' stays in
+    # the URL and only the trailing '@base_model' is peeled off — a naive split('@') would corrupt it.
+    from flash.pool.server import _maybe_seed_backends, build_app
+
+    app = build_app()
+    monkeypatch.setenv("FLASH_POOL_BACKENDS", "gpu0=http://user:pass@10.0.0.5:8000@Qwen/Qwen3.5-2B")
+    _maybe_seed_backends(app)
+    be = app.state.router.state.backends["gpu0"]
+    assert be.url == "http://user:pass@10.0.0.5:8000"
+    assert be.base_model == "Qwen/Qwen3.5-2B"

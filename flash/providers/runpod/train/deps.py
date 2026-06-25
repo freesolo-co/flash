@@ -518,6 +518,12 @@ def build_worker_env(
         "FLASH_USE_DORA",
         "FLASH_ROLLOUT_TUNE",
         "FLASH_FP8_KV",
+        # Per-run additive pip specs for the BAKED-image path. The worker process never reads this;
+        # the Vast submit (jobs.builders.build_payload) reads it back off the EFFECTIVE worker env
+        # (this allowlist + [worker_env]) and appends it to the payload's extra_pip. Forward it from
+        # os.environ so a control-plane FLASH_EXTRA_PIP actually takes effect (a per-run [worker_env]
+        # still overrides). Without this forward it only worked when duplicated into [worker_env].
+        "FLASH_EXTRA_PIP",
     ):
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
