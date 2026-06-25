@@ -111,15 +111,20 @@ SETUP_HEARTBEAT_STAGES = frozenset(
 
 
 def is_training_stage(stage) -> bool:
-    """True only if a heartbeat stage means the TRAINING loop actually began (a real step). NOT a
-    setup/cold-start stage, and NOT one of the worker's ``error_*`` crash stages.
+    """True if a heartbeat stage means training has been REACHED (training-or-later), i.e. the worker
+    is at/past the first training step. Deliberately broad: any stage that is NOT a setup/cold-start
+    stage AND NOT an ``error_*`` crash stage -- so it covers the training steps (``sft_step``/
+    ``rl_step``) AND every post-training stage the worker emits afterward (``sft_trained``/``rl_trained``/
+    ``checkpoint_uploaded``/``checkpoint_deployable``/``done``/``already_done``). All of those mean the
+    worker became productive, which is exactly what the callers need: a host loss AFTER training is not
+    a sick-region fault, and the stall window can tighten. It is NOT a precise "current step" predicate.
 
-    The worker overwrites its latest heartbeat with ``error_<phase>`` (e.g. ``error_sft``) on ANY
-    raise -- including a pre-training ``RetriableInfraError`` during model load / trainer-vLLM init --
-    so an ``error_*`` stage is NOT evidence training was reached. Treating it as training would let a
-    pre-training GPU/driver crash masquerade as "training reached" and suppress the region quarantine
-    (and flip stall detection to the tight training window). Whether training was ACTUALLY reached is
-    tracked separately by the pollers' ``seen_training_hb`` latch over real training-step heartbeats."""
+    The exclusions are what matter for correctness: a setup stage (still cold-starting) or an
+    ``error_<phase>`` stage (the worker overwrites its heartbeat with ``error_<phase>`` on ANY raise,
+    incl. a pre-training ``RetriableInfraError`` during model load / trainer-vLLM init) must NOT count as
+    training-reached -- else a pre-training crash masquerades as "training reached", suppressing the
+    region quarantine and flipping stall detection to the tight window. Whether the FIRST step was
+    actually reached this attempt is latched separately by the pollers' ``seen_training_hb``."""
     return bool(stage) and stage not in SETUP_HEARTBEAT_STAGES and not str(stage).startswith("error_")
 
 

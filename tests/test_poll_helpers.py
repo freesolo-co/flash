@@ -53,14 +53,16 @@ def test_heartbeat_progress_no_ts_is_not_fresh():
 
 
 def test_is_training_stage_excludes_setup_init_and_error_stages():
-    """Only a real training-STEP heartbeat counts as training. Every cold-start/setup stage the worker
-    emits before the first step (incl. model_prefetched and the *_initializing stages) must be excluded,
-    or reached_training_now() would suppress the region quarantine for a pre-training infra fault. The
-    error_* crash stages (stamped on any raise, incl. a pre-training RetriableInfraError) are excluded by
-    prefix. This is the taxonomy guard: a new pre-training worker stage missing from SETUP_HEARTBEAT_STAGES
-    would regress quarantine, so it must also be added here."""
-    # Real training steps -> training.
-    for stage in ("sft_step", "rl_step"):
+    """is_training_stage() means training-REACHED (training-or-later), deliberately broad: any stage
+    that is NOT setup/cold-start AND NOT an error_* crash. So the training steps AND every post-training
+    stage (sft_trained/done/checkpoint_*) count -- all mean the worker became productive. The CORRECTNESS
+    invariant is the EXCLUSIONS: every cold-start/setup stage the worker emits before the first step
+    (incl. model_prefetched and the *_initializing stages) and every error_* crash stage must be
+    excluded, or reached_training_now() would suppress the region quarantine for a pre-training infra
+    fault. Taxonomy guard: a new PRE-training worker stage missing from SETUP_HEARTBEAT_STAGES would
+    regress quarantine, so it must also be added there."""
+    # Training steps AND post-training/terminal stages -> training-reached (worker became productive).
+    for stage in ("sft_step", "rl_step", "sft_trained", "rl_trained", "checkpoint_uploaded", "done"):
         assert is_training_stage(stage) is True
     # Cold-start / setup stages -> NOT training (every member of the shared set, plus model_prefetched).
     assert "model_prefetched" in SETUP_HEARTBEAT_STAGES  # prefetch_model() emits it pre-training

@@ -23,6 +23,8 @@ RunPod-static provisional for validation/dry-run display.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from flash._logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
@@ -184,9 +186,9 @@ def allocate(
     healthy_keys = {(c.provider, c.gpu) for c in candidates}
     sick: list[Candidate] = []
     if "lambda" in available:
-        sick += [c for c in _lambda_candidates(need, ignore_sick=True) if (c.provider, c.gpu) not in healthy_keys]
+        sick += [replace(c, sick=True) for c in _lambda_candidates(need, ignore_sick=True) if (c.provider, c.gpu) not in healthy_keys]
     if "hyperstack" in available:
-        sick += [c for c in _hyperstack_candidates(need, ignore_sick=True) if (c.provider, c.gpu) not in healthy_keys]
+        sick += [replace(c, sick=True) for c in _hyperstack_candidates(need, ignore_sick=True) if (c.provider, c.gpu) not in healthy_keys]
     if not candidates and not sick:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
@@ -197,15 +199,16 @@ def allocate(
             "every fitting instance-provider region is quarantined (sick); allocating into a "
             "quarantined region rather than hard-failing the run (quarantine is bounded-demotion)"
         )
-    # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small job), then
-    # registry order. Sick (quarantine-only) candidates are price-ranked AMONG THEMSELVES but always
-    # sorted strictly after every healthy candidate, so quarantine demotes without ever winning the pick.
+    # Healthy candidates first (a SICK quarantine-only candidate is never preferred over a healthy one,
+    # even when cheaper); within each tier cheapest first, equal rates prefer less VRAM (don't burn a big
+    # card on a small job), then registry order. The runner's _select_candidate applies the SAME sick-last
+    # tie-break per attempt, so the demotion survives its per-attempt min()-by-price re-selection.
     order = {n: i for i, n in enumerate(PROVIDER_NAMES)}
 
     def rank_key(c: Candidate) -> tuple:
-        return (c.hourly_usd, c.vram_gb, order.get(c.provider, 99))
+        return (c.sick, c.hourly_usd, c.vram_gb, order.get(c.provider, 99))
 
-    ranked = sorted(candidates, key=rank_key) + sorted(sick, key=rank_key)
+    ranked = sorted(candidates + sick, key=rank_key)
     best = ranked[0]
     return Allocation(
         provider=best.provider,

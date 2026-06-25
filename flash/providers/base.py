@@ -357,6 +357,10 @@ class Candidate:
     gpu: str
     hourly_usd: float
     vram_gb: int
+    # True when this (provider, class) only has capacity in a currently-QUARANTINED region
+    # (flash.providers._health). A LAST-RESORT candidate: ranked strictly after every healthy one and
+    # demoted in the runner's per-attempt selection, so quarantine can only demote, never win the pick.
+    sick: bool = False
 
 
 @dataclass(frozen=True)
