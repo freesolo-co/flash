@@ -8,7 +8,6 @@ from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 # ===== GPU facts =====
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
-    "RTX 3090": 71.0,
     "L4": 60.0,
     "RTX 4090": 165.0,
     "RTX 5090": 210.0,
@@ -28,11 +27,26 @@ def gpu_tflops(name: str) -> float:
     return GPU_COMPUTE_TFLOPS.get(name, _DEFAULT_TFLOPS)
 
 
-def gpu_hourly_usd(name: str) -> float:
-    """Static representative $/hr for a class."""
+def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
+    """Representative $/hr for a class, on ``provider`` when given.
+
+    The nominal ``GpuClass.hourly_usd`` is the RunPod rate, which is WRONG for a provider-specific
+    quote (e.g. a Lambda RTX A6000 is $1.09/hr, not RunPod's $0.49). When ``provider`` is
+    ``lambda``/``hyperstack`` and the class is offered there, price it through that provider's
+    pricing module (live with a static fallback); otherwise (runpod/auto/None) use the nominal rate.
+    """
     info = GPU_INFO.get(name)
     if info is None:
         raise KeyError(f"unknown GPU class {name!r}")
+    p = (provider or "").strip().lower()
+    if p == "lambda" and info.lambda_name:
+        from flash.providers.lambdalabs.pricing import hourly_rate
+
+        return hourly_rate(name)
+    if p == "hyperstack" and info.hyperstack_name:
+        from flash.providers.hyperstack.pricing import hourly_rate
+
+        return hourly_rate(name)
     return info.hourly_usd
 
 
@@ -58,7 +72,9 @@ def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     candidates = [g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)]
     if not candidates:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
-    best = min(candidates, key=lambda g: (gpu_hourly_usd(g.name), g.vram_gb, g.name))
+    # Rank by the rate on the REQUESTED provider so a provider-specific quote picks that provider's
+    # cheapest fit (not the cheapest by the RunPod nominal rate).
+    best = min(candidates, key=lambda g: (gpu_hourly_usd(g.name, provider=provider), g.vram_gb, g.name))
     return best.name
 
 
