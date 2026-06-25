@@ -273,7 +273,7 @@ def test_resolve_ssh_key_names(monkeypatch):
 # ---------------------------------------------------------------------------
 # poll_lambda_job state machine
 # ---------------------------------------------------------------------------
-def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boot=None, step=10.0):
+def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
 
@@ -299,6 +299,8 @@ def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boo
                 return metrics() if callable(metrics) else metrics
             if path.endswith("lambda_boot.log"):
                 return boot() if callable(boot) else boot
+            if "/error_" in path:
+                return error() if callable(error) else error
             return None
 
         return read
@@ -374,6 +376,40 @@ def test_poll_dead_host_without_marker_is_preempted(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"
     assert "gpu never became ready" in res.detail  # the host boot log is the only console window
+
+
+def test_poll_dead_host_with_error_file_is_job_failed(monkeypatch):
+    """A worker that RAN and crashed early (left error_<phase>.txt) but died before writing the
+    attempt marker is a DETERMINISTIC worker error -> fail fast (job_failed), not burn fresh GPUs
+    retrying a crash that will repeat. Surfaces the traceback in the detail."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback (most recent call last):\nFileNotFoundError: environment archive did not contain ...",
+    )
+    res = jobs.poll_lambda_job(
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {}
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert "environment archive" in res.detail
+
+
+def test_poll_dead_host_with_retriable_error_still_preempted(monkeypatch):
+    """Even WITH an error_<phase>.txt, a crash the worker flagged retriable (RetriableInfraError,
+    stamped in the heartbeat) retries on a fresh host (job_preempted) -- same contract as
+    fail_from_marker. This is also what keeps a stale prior-attempt error file from flipping a
+    genuine preemption to job_failed."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback ...\nRetriableInfraError: cuda device not ready",
+    )
+    res = jobs.poll_lambda_job(
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {"retriable": True}
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"
 
 
 def test_poll_loading_timeout(monkeypatch):

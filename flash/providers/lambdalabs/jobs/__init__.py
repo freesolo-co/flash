@@ -413,11 +413,23 @@ def poll_lambda_job(
             terminal = terminal_artifact_result()
             if terminal is not None:
                 return terminal
-            # Dead host, no marker, no DONE: a host loss, not a worker code error -> retry on a
-            # fresh host/class. Surface whatever the boot log captured.
+            # Dead host with no ok-marker/DONE. Distinguish a genuine host LOSS (retry on a fresh
+            # host/class) from a worker that actually RAN and CRASHED early -- before it could write
+            # the attempt marker terminal_artifact_result() reads -- but DID leave error_{phase}.txt
+            # (a bad env id, a config/code error, an OOM). That is a DETERMINISTIC worker error, so
+            # fail FAST: classifying it job_preempted burns fresh GPUs re-running a crash that will
+            # repeat. A crash the worker flagged retriable (RetriableInfraError, stamped in the
+            # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is not
+            # attempt-scoped, but this can't flip a genuine preemption to job_failed: a prior
+            # attempt's NON-retriable crash already ended the run via this same branch, and a prior
+            # retriable crash leaves a retriable heartbeat that keeps this path on job_preempted.
+            from flash.providers.runpod.jobs import worker_flagged_retriable
+
+            err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
+            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,
-                failure="job_preempted",
+                failure="job_failed" if worker_crashed else "job_preempted",
                 detail=_failure_detail(hf_repo, prefix, spec.phase, None),
             )
 
