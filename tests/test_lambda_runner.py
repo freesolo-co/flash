@@ -972,7 +972,8 @@ def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
 
     captured = {}
 
-    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None):
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None,
+                  first_liveness_s=None, setup_grace_s=None):
         captured["deadline_s"] = deadline_s
         from flash.providers.base import PollResult
 
@@ -985,6 +986,41 @@ def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
     handle = JobHandle.from_dict({"provider": "lambda", **_handle(started_ts=1.0).to_dict()})
     LambdaProvider().poll(handle, spec, seed=0)
     assert captured["deadline_s"] == max(60.0, 3600 + PROVISION_GRACE_S)
+
+
+def test_provider_poll_reuses_on_last_gpu_first_liveness_scaling(monkeypatch):
+    """On recovery the reattach must reproduce the SUBMIT path's last-GPU stall tuning: a handle with
+    persisted on_last_gpu=True (written by the runner's on_handle) gets the 1.5x-scaled first_liveness /
+    setup grace, else a control-plane restart on the LAST candidate would fail an in-flight,
+    cold-starting instance early — terminal there, with no GPU left to walk to. Mirrors RunPodProvider."""
+    from flash.providers.base import JobHandle
+    from flash.providers.lambdalabs import LambdaProvider
+    from flash.providers.lambdalabs.jobs import FIRST_LIVENESS_S, SETUP_GRACE_S
+
+    captured = {}
+
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None,
+                  first_liveness_s=None, setup_grace_s=None):
+        captured["first_liveness_s"] = first_liveness_s
+        captured["setup_grace_s"] = setup_grace_s
+        from flash.providers.base import PollResult
+
+        return PollResult(True)
+
+    monkeypatch.setattr("flash.providers.lambdalabs.jobs.poll_lambda_job", fake_poll)
+    monkeypatch.setattr("flash.providers.lambdalabs.api.terminate_instances", lambda ids: ids)
+    spec = _spec()
+    # on_last_gpu persisted in the handle -> 1.5x scaling reproduced on recovery.
+    handle = JobHandle.from_dict({**_handle().to_dict(), "provider": "lambda", "on_last_gpu": True})
+    LambdaProvider().poll(handle, spec, seed=0)
+    assert captured["first_liveness_s"] == FIRST_LIVENESS_S * 1.5
+    assert captured["setup_grace_s"] == SETUP_GRACE_S * 1.5
+    # Without it -> un-scaled default.
+    captured.clear()
+    handle2 = JobHandle.from_dict({**_handle().to_dict(), "provider": "lambda"})
+    LambdaProvider().poll(handle2, spec, seed=0)
+    assert captured["first_liveness_s"] == FIRST_LIVENESS_S
+    assert captured["setup_grace_s"] == SETUP_GRACE_S
 
 
 def test_poll_surfaces_worker_progress_in_log(monkeypatch):

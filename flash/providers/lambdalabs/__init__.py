@@ -75,7 +75,9 @@ class LambdaProvider:
 
         from flash.providers.lambdalabs import api as lambda_api
         from flash.providers.lambdalabs.jobs import (
+            FIRST_LIVENESS_S,
             PROVISION_GRACE_S,
+            SETUP_GRACE_S,
             LambdaJobHandle,
             poll_lambda_job,
         )
@@ -94,8 +96,23 @@ class LambdaProvider:
         # launch-relative budget here; pre-subtracting elapsed too would double-count and tear down
         # a still-valid instance the moment a recovered run is past half its window.
         deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S)
+        # Reproduce the submit path's last-GPU stall tuning on recovery: the runner persists
+        # ``on_last_gpu`` in the handle/status (lifecycle on_handle), so a reattach must apply the SAME
+        # 1.5x first-liveness / setup grace rather than reverting to the un-scaled default. Otherwise a
+        # control-plane restart on the LAST candidate could fail an in-flight, still-cold-starting
+        # instance early — terminal there, since there's no GPU left to walk to. Mirrors RunPodProvider.
+        last_gpu_mult = 1.5 if bool(handle.to_dict().get("on_last_gpu", False)) else 1.0
         try:
-            return poll_lambda_job(lh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
+            return poll_lambda_job(
+                lh,
+                spec,
+                seed,
+                log=log,
+                heartbeat_reader=reader,
+                deadline_s=deadline,
+                first_liveness_s=FIRST_LIVENESS_S * last_gpu_mult,
+                setup_grace_s=SETUP_GRACE_S * last_gpu_mult,
+            )
         finally:
             # Recovery (attach_run) has no submit_run_lambda teardown ``finally``; terminate the
             # reattached instance here so a finished/abandoned recovered seed stops billing
