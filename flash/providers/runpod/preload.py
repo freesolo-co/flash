@@ -166,11 +166,20 @@ def _poll_until_done(
         st = runpod_api.job_status(endpoint_id, job_id)
         status = (st or {}).get("status")
         if status in _TERMINAL_OK:
-            # RunPod may surface a completed job's ``output`` as a JSON STRING (not a dict); decode it
-            # to the handler's metrics dict (the same helper the normal poller uses) so the caller's
-            # ``result.get(...)`` never crashes on a str and mis-reports a warmed region as failed.
+            # RunPod may surface a completed job's ``output`` as a JSON STRING (not a dict) or as the
+            # flash live-function envelope; decode_output normalizes both to the handler's metrics dict
+            # so the caller's ``result.get(...)`` never crashes on a str and mis-reports a warmed region.
             output = (st or {}).get("output")
-            return (decode_output(output) or {}) if output else {}
+            if not output:
+                return {}
+            try:
+                return decode_output(output) or {}
+            except Exception as exc:
+                # decode_output RAISES on an error / unexpected-shape envelope. Don't let that surface as
+                # a bare exception — it would skip _preload_one_dc's structured ``result.get("error")``
+                # classification. Return the message AS the result's error so the region is still
+                # reported as a structured error rather than an opaque crash.
+                return {"error": str(exc)}
         if status in _TERMINAL_FAIL:
             raise RuntimeError(f"preload job {job_id} ended {status}: {(st or {}).get('error')}")
         time.sleep(poll_interval_s)
@@ -801,6 +810,15 @@ def main(argv: list[str] | None = None) -> int:
         # args.gpu directly (no sentinel comparison) means an explicit --gpu, even RTX 4090, overrides.
         results = warm_instances(models=models, gpu=args.gpu,
                                  timeout_s=args.timeout_s, max_workers=args.max_workers)
+        if not results:
+            # NOT the same as "warmed everything": zero launch targets means no Lambda/Hyperstack
+            # region had capacity to warm right now (or every candidate region is cache-incapable —
+            # each such skip is logged above). This is a best-effort no-op, not a failure: those
+            # regions' weights simply download cold on first run. Make it explicit so "0/0" isn't read
+            # as success. (See the per-region "skipping cache-incapable region" / "no capacity" logs.)
+            print("0 regions warmed — no Lambda/Hyperstack region had capacity to warm right now "
+                  "(weights download cold on first run). Nothing launched.")
+            return 0
         failed = [r for r in results if r.get("status") not in ("ok",)]
         for r in results:
             print(f"  {r['provider']}/{r['region']}: {r['status']}"
