@@ -63,6 +63,12 @@ from flash.engine.worker.lora import (
     strip_language_model_infix,  # noqa: F401
     vllm_language_model_only_kwargs,  # noqa: F401
 )
+from flash.engine.worker.packing import (
+    BlockDiagonalCollator,
+    model_is_pure_attention,
+    pack_token_ids,
+    packing_efficiency,
+)
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
@@ -974,6 +980,48 @@ def run_sft():
         else:
             cfg_kwargs["packing"] = False
             print("[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA")
+
+    # --- True token packing via a 4D block-diagonal SDPA mask (no flash-attn / no flex) ---------
+    # When the run lands on plain SDPA (no varlen flash backend) the block above left packing OFF —
+    # notably on sm120 (RTX 5090, flash's DEFAULT GPU), and anywhere the best-effort flash-attn
+    # build didn't land. For a PURE full-attention model we can still pack: concatenate examples
+    # into max_length blocks and feed a 4D block-diagonal causal mask SDPA honors natively, so
+    # packed examples never attend across boundaries (boundary-correct, bit-identical to unpacked —
+    # verified on a tiny Qwen3/Llama: max|packed-separate| logits == 0.0). This reclaims the packing
+    # throughput win on the default GPU with neither flash-attn nor flex_attention. Hybrid
+    # GatedDeltaNet models (Qwen3.5/3.6) are excluded by model_is_pure_attention — their
+    # linear-attention layers carry recurrent/conv state across boundaries a mask cannot reset.
+    _collator = None
+    _pure_attn = model_is_pure_attention(model_id)
+    _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn)
+    if _sdpa_pack:
+        # The 4D mask is consumed by SDPA (a varlen flash kernel would ignore it) -> pin SDPA.
+        _attn = _attn or "sdpa"
+        cfg_kwargs["packing"] = False  # we own the packing; TRL must not also pack
+        # Hand TRL pre-tokenized, pre-packed rows + our collator: skip its dataset prep and stop the
+        # signature-based column pruning from dropping our seq_lengths column before collation.
+        _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
+        _dk["skip_prepare_dataset"] = True
+        cfg_kwargs["dataset_kwargs"] = _dk
+        cfg_kwargs["remove_unused_columns"] = False
+        # Pre-tokenize the already chat-templated texts (the template carries its own special tokens
+        # -> add_special_tokens=False to avoid a double BOS) and bin-pack into <= max_length blocks.
+        _tokenized = [tok(t["text"], add_special_tokens=False)["input_ids"] for t in texts]
+        _packed_rows = pack_token_ids(_tokenized, sft_max_len)
+        ds = Dataset.from_list(_packed_rows)
+        _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
+        print(
+            "[sft] true token packing ENABLED (4D block-diagonal SDPA mask): "
+            f"{len(_tokenized)} examples -> {len(_packed_rows)} blocks of <= {sft_max_len} tok "
+            f"({packing_efficiency(_packed_rows, sft_max_len):.0%} dense); "
+            "no flash-attn / no flex_attention required"
+        )
+    elif not cfg_kwargs.get("packing") and not _pure_attn:
+        print(
+            "[sft] packing stays OFF: hybrid/linear-attention arch (GatedDeltaNet) — a block-"
+            "diagonal mask cannot reset its cross-boundary recurrent/conv state (needs the "
+            "cu_seqlens/seq_idx path). Pure full-attention models pack via the SDPA mask."
+        )
     # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
     # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
     # accelerate-offload large models to meta ("expected device meta but got
@@ -1084,6 +1132,8 @@ def run_sft():
             train_dataset=ds,
             peft_config=make_lora(model_id),
             processing_class=tok,
+            # Our block-diagonal collator on the SDPA-packing path; None elsewhere == TRL default.
+            data_collator=_collator,
             callbacks=[make_sft_heartbeat_callback(), make_checkpoint_upload_callback()],
         )
     finally:
