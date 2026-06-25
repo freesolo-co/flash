@@ -113,8 +113,8 @@ def colocate_kv_util(
     path (which offloads under the backward) takes a generous 2.5x margin + a 12 GB floor. On small
     cards the 0.45 cap binds and behaviour is unchanged."""
     if not sleep_mode:
-        return min(0.45, 8.0 / max(1.0, total_vram_gb))  # unchanged: cap resident KV at _KV_CAP=8 GB
-    kv_width = (max(float(params_b), 0.1) ** 0.5) if params_b else 1.41
+        return min(0.45, _KV_CAP / max(1.0, total_vram_gb))  # unchanged: cap resident KV at _KV_CAP
+    kv_width = math.sqrt(max(float(params_b), 0.1)) if params_b else math.sqrt(2.0)
     kv_est_gb = min(_KV_COEF * (max(1, vllm_max_len) / 1024.0) * kv_width, _KV_CAP)
     kv_target_gb = max(12.0, 2.5 * kv_est_gb)
     return min(0.45, kv_target_gb / max(1.0, total_vram_gb))
