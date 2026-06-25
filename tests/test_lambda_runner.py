@@ -335,6 +335,40 @@ def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
     assert launched == []  # no region ever launched a cold (training) instance
 
 
+def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
+    """In preload mode a capacity rejection must NOT refresh to a NEW region and launch there.
+
+    Regression: warm_instances pins each preload launch to one TARGET region and reports that exact
+    region as warmed. If the launch is rejected and the walk refreshed (usable_instances) to a
+    different region and launched there, the caller would report the cold target region as warmed.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: f"/lambda/nfs/{n}")  # cache OK
+    launched = []
+
+    def reject(**kw):
+        launched.append(kw)
+        raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")  # clean reject
+
+    monkeypatch.setattr(lambda_api, "launch_instance", reject)
+    refresh_calls = []
+    monkeypatch.setattr(
+        jobs, "usable_instances",
+        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="us-fresh-9")],
+    )
+
+    with pytest.raises(lambda_api.LambdaApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=[_inst(region="us-east-1")],
+            attempt=0, mode="preload", models=["a/b"],
+        )
+    assert [c["region_name"] for c in launched] == ["us-east-1"]  # only the TARGET region attempted
+    assert refresh_calls == []  # the stale-stock refresh was NOT consulted in preload mode
+
+
 def test_no_cache_never_touches_filesystems(monkeypatch):
     jobs, lambda_api, calls = _wire_launch(monkeypatch)
 

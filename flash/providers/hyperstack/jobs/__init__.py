@@ -134,8 +134,17 @@ def launch_and_submit(
     last_err: Exception | None = None
 
     def refresh_once(gpu: str) -> None:
-        """One forced stock re-fetch when the walk is exhausted (the alloc cache is ~45s stale)."""
+        """One forced stock re-fetch when the walk is exhausted (the alloc cache is ~45s stale).
+
+        NO-OP in preload mode: ``warm_instances`` pins each preload launch to ONE specific target
+        region (``instances=[candidate]``) and reports that exact region as warmed. Refreshing to a
+        DIFFERENT region here would warm region B while the caller reports the target region A as
+        warmed (its cache actually still cold). A preload that can't run in its target region must
+        FAIL that region (the walk exhausts -> raise), never silently warm another.
+        """
         nonlocal refreshed, candidates
+        if mode == "preload":
+            return
         if not candidates and not refreshed:
             refreshed = True
             candidates = [

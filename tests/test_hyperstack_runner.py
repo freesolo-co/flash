@@ -271,6 +271,41 @@ def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
     assert launched == []  # no region ever launched a cold (training) VM
 
 
+def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
+    """In preload mode the walk must NOT refresh to a NEW region on a target-region miss.
+
+    Regression: warm_instances pins each preload launch to one TARGET region and reports that exact
+    region as warmed. If the walk refreshed (usable_instances) to a different region and launched
+    there, the caller would report the cold target region as warmed. The walk must stay confined to
+    the given candidate(s) and FAIL when none can host the cache.
+    """
+    import pytest
+
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    # target region's cache is unavailable
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: (_ for _ in ()).throw(RuntimeError("quota")))
+    launched = []
+    monkeypatch.setattr(hs_api, "launch_vm", lambda **kw: launched.append(kw) or "vm")
+    # the refresh source offers a DIFFERENT region with a working cache — it must NOT be consulted
+    refresh_calls = []
+    monkeypatch.setattr(
+        jobs, "usable_instances",
+        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="ELSEWHERE-9")],
+    )
+
+    with pytest.raises(hs_api.HyperstackApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=[_inst(region="CANADA-1")],
+            attempt=0, mode="preload", models=["a/b"],
+        )
+    assert launched == []  # never launched anywhere (not in the refreshed region)
+    assert refresh_calls == []  # the stale-stock refresh was NOT consulted in preload mode
+
+
 # ---------------------------------------------------------------------------
 # poll_hs_job state machine
 # ---------------------------------------------------------------------------

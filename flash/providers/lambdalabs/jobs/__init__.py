@@ -231,7 +231,12 @@ def launch_and_submit(
                     f"ambiguous Lambda launch failure (possible phantom reaped): {e}"
                 ) from e
             say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {e}")
-            if not candidates and not refreshed:
+            # NOT in preload mode: warm_instances pins each preload launch to ONE specific target
+            # region and reports that exact region as warmed. Refreshing to a DIFFERENT region here
+            # would warm region B while the caller reports the target region A as warmed (cache still
+            # cold). A preload that can't run in its target region must FAIL it (walk exhausts ->
+            # raise), never silently warm another.
+            if mode != "preload" and not candidates and not refreshed:
                 refreshed = True
                 # Force a fresh capacity fetch (the allocation cache is ~45s stale) so the refresh
                 # can discover regions that freed up since the walk started.
