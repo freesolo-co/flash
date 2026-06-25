@@ -374,6 +374,31 @@ def test_assign_weight_cache_skips_open_model_policy():
     assert out.gpu.network_volume is None  # cache-less: no shared-mount redirect for a possibly-private model
 
 
+def test_assign_weight_cache_strips_preset_shared_cache_on_open_model():
+    # The gate takes PRECEDENCE over the "honor an existing volume" no-op: a programmatic open-model
+    # spec that ALREADY pinned the SHARED cache name must be FORCED cache-less, not bypass the gate.
+    from flash import runner
+
+    spec = JobSpec.from_dict({
+        "model": "some-org/private-model", "run_id": "r", "model_policy": "allow",
+        "gpu": {"type": "A10", "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME, "network_volume_gb": 100},
+    })
+    out = runner._assign_weight_cache_volume(spec)
+    assert out.gpu.network_volume is None  # the pre-set shared cache was stripped
+
+
+def test_assign_weight_cache_keeps_per_org_volume_on_open_model():
+    # A NON-shared (per-org / custom) volume on an open run is the intended escape hatch — left intact.
+    from flash import runner
+
+    spec = JobSpec.from_dict({
+        "model": "some-org/private-model", "run_id": "r", "model_policy": "allow",
+        "gpu": {"type": "A10", "network_volume": "org-123-private-cache", "network_volume_gb": 100},
+    })
+    out = runner._assign_weight_cache_volume(spec)
+    assert out.gpu.network_volume == "org-123-private-cache"  # not the shared cache -> kept
+
+
 def test_assign_weight_cache_ignores_removed_kill_switch(monkeypatch):
     # Regression: the FLASH_WEIGHT_CACHE=0 kill switch is GONE — fully managed, always on.
     from flash import runner

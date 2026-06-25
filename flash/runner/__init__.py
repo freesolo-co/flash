@@ -295,20 +295,33 @@ def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
     ``model_policy == "catalog"`` runs; an open/"allow" run is left cache-less, confining its weights
     to the worker's ephemeral disk (it can still use the per-org escape-hatch volume).
 
-    No-ops (return the spec unchanged): (a) the spec already carries a volume (explicit/test
-    assignment is never overridden), or (b) the run is open-model ("allow") — not provably public.
+    The confidentiality gate takes PRECEDENCE over the "don't override an explicit volume" no-op: an
+    open-model ("allow") run that ALREADY carries the SHARED cache name (e.g. a programmatic spec that
+    pre-set it) is FORCED cache-less here — its possibly-private weights must never reach the shared
+    mount. A different (per-org / custom) volume name on an open run is left intact: that's the
+    escape-hatch isolation, not the shared cache.
+
+    Outcomes: (a) open-model run -> never on the SHARED cache (strip it if pre-set; keep a non-shared
+    volume); (b) catalog run with a pre-set volume -> left as-is (explicit/test assignment honored);
+    (c) catalog run with no volume -> attach the shared cache.
 
     See the module-level TRUST MODEL note above for the shared-cache integrity tradeoff (a run's env
     code has write access to the shared mount; RO mount isn't SDK-expressible yet).
     """
-    if getattr(spec.gpu, "network_volume", None):
-        return spec
-    # Only provably-PUBLIC catalog runs may enter the shared cross-tenant cache (see the gate note).
-    # An open-model run (model_policy="allow") could target a private/gated repo, so keep it
-    # cache-less — its weights must never persist onto the shared mount where another tenant in the
-    # region could read them.
-    if getattr(spec, "model_policy", "catalog") != "catalog":
-        return spec
+    is_catalog = getattr(spec, "model_policy", "catalog") == "catalog"
+    existing = getattr(spec.gpu, "network_volume", None)
+    # CONFIDENTIALITY: an open-model run must NEVER ride the SHARED cross-tenant cache — even if the
+    # spec already pinned it. Strip the shared name (force cache-less); a non-shared per-org volume is
+    # the intended escape hatch and is left intact. This is checked BEFORE the "honor an existing
+    # volume" no-op so a pre-set flash-weights can't bypass the gate.
+    if not is_catalog:
+        if existing == WEIGHT_CACHE_VOLUME_NAME:
+            d = spec.to_dict()
+            d["gpu"] = {**d["gpu"], "network_volume": None}
+            return JobSpec.from_dict(d)
+        return spec  # no shared cache to strip (cache-less already, or a non-shared escape-hatch volume)
+    if existing:
+        return spec  # catalog run with an explicit/test volume already assigned — honor it
     d = spec.to_dict()
     d["gpu"] = {
         **d["gpu"],
