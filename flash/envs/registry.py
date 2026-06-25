@@ -39,8 +39,14 @@ def worker_pip_for_env(env_id: str) -> list[str]:
     return ["freesolo"]
 
 
-def load_environment(env_id: str, params: dict | None = None) -> Environment:
-    """Load a Freesolo SDK environment and wrap it in Flash's protocol."""
+def load_environment(
+    env_id: str, params: dict | None = None, resolved_sha: str | None = None
+) -> Environment:
+    """Load a Freesolo SDK environment and wrap it in Flash's protocol.
+
+    ``resolved_sha`` is the optional resolve-once hint (the control-plane-pinned commit sha for the
+    env's GitHub ref). None/"" preserves today's behavior — the adapter resolves the ref itself.
+    """
     params = params or {}
     from .adapter import load_freesolo_environment
 
@@ -49,4 +55,8 @@ def load_environment(env_id: str, params: dict | None = None) -> Environment:
             "no environment specified: set [environment] id to the id returned by "
             "`flash env push --name <name>` (for example 'your-name/your-env')"
         )
-    return load_freesolo_environment(env_id, **params)
+    # User [environment.params] are freeform and forwarded verbatim to the SDK loader. The
+    # control-plane resolve-once pin is passed out-of-band as a POSITIONAL-ONLY argument, so a user
+    # param of ANY name (even "pinned_sha"/"resolved_sha") lands in **params and reaches the SDK
+    # unchanged — it can never bind to or disable the pin. None/"" keeps today's behavior.
+    return load_freesolo_environment(env_id, resolved_sha or None, **params)
