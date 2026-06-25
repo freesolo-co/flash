@@ -200,17 +200,6 @@ def _record_heartbeat(hb: dict) -> None:
     except Exception:
         # Status persistence is diagnostic only; polling/liveness must not depend on it.
         pass
-    # Grow the LAZY RunPod weight-cache fleet: a RunPod worker reports the DC it landed in (hb["dc"]);
-    # record it so the next run there attaches+warms a volume. Only RunPod workers emit "dc"
-    # (RUNPOD_DC_ID), so this is a no-op for instance providers. Best-effort, never affects polling.
-    dc = str(hb.get("dc") or "").strip()
-    if dc:
-        try:
-            from flash.runner import record_weight_cache_dc
-
-            record_weight_cache_dc(dc)
-        except Exception:
-            pass
 
 
 def surface_heartbeat(

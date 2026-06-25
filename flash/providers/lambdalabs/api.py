@@ -98,6 +98,23 @@ def regions_with_capacity(instance_type: str, force: bool = False) -> list[str]:
     ]
 
 
+def all_regions(force: bool = False) -> list[str]:
+    """Every Lambda region the account can reach, capacity-independent — the UNION of the regions
+    advertised across all instance types (the API has no standalone region list). Used by the
+    eager weight-cache provision step to create the ``flash-weights`` filesystem in every region.
+
+    A region that currently advertises ZERO capacity for every instance type won't appear (Lambda
+    only surfaces regions through the per-type capacity list); the launch-time ``ensure_filesystem``
+    backstop covers any such region the moment a run lands there. Sorted for a stable provision order.
+    """
+    regions: set[str] = set()
+    for info in list_instance_types(force=force).values():
+        for r in (info or {}).get("regions_with_capacity_available", []):
+            if r.get("name"):
+                regions.add(r["name"])
+    return sorted(regions)
+
+
 def instance_type_price_usd_hr(instance_type: str) -> float | None:
     """Live $/hr for a Lambda instance type (``price_cents_per_hour`` / 100), or None."""
     info = (list_instance_types().get(instance_type) or {}).get("instance_type") or {}

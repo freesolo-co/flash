@@ -1,10 +1,10 @@
 """Preload (warm) the shared weight-cache volumes with the catalog's base-model weights.
 
-The weight cache (a same-named ``flash-weights`` network volume in every storage datacenter) is
-populated lazily by real runs: the first run to land in a region downloads the model onto that
-region's volume, and every later run there hits the cache. This module makes that first hit free by
-PRE-warming every region up front — an operator/setup action, not a user one (the cache is fully
-managed, so there is no user-facing knob).
+The weight cache is the eager ``flash-weights-<dc>`` network-volume fleet (one volume per storage
+datacenter, created-or-attached on every endpoint deploy). This module WARMS that fleet — downloads
+the catalog's base-model weights onto each region's volume up front — so the very first run in any
+region is already warm. An operator/setup action, not a user one (the cache is fully managed, so
+there is no user-facing knob).
 
 Mechanism: for each datacenter, deploy a short-lived worker with ONLY that region's volume attached
 (pinned to that single DC, so the worker provably lands there), run the baked handler in ``preload``
@@ -12,11 +12,12 @@ mode (download-only, ``HF_HOME`` -> the mounted volume), then tear the endpoint 
 existing baked worker image + deploy/submit/quota machinery; the only new worker code is the
 ``preload`` branch in ``train.endpoints._train_body``.
 
-COST / GC NOTE: the fleet is permanent, billed standing storage. A run (or a full preload) creates a
-``flash-weights-<dc>`` volume in EVERY storage datacenter (one per DataCenter.all() entry — currently
-~11 x 100 GB ~= 1.1 TB, ~$77/mo; grows by one volume if the SDK adds a storage region), and RunPod
-network volumes are NOT auto-deleted — there is no GC. Reclaim them with ``--teardown`` (deletes
-every per-DC weight-cache volume across ALL pool accounts via the RunPod REST API).
+COST / GC NOTE: the fleet is permanent, billed standing storage. Eager provisioning means a
+``flash-weights-<dc>`` volume exists in EVERY storage datacenter (one per DataCenter.all() entry —
+currently ~11 x 100 GB ~= 1.1 TB, ~$77/mo; grows by one volume if the SDK adds a storage region),
+created by the first endpoint deploy (or ``--provision`` / a full preload), and RunPod network
+volumes are NOT auto-deleted — there is no GC. Reclaim them with ``--teardown`` (deletes every
+per-DC weight-cache volume across ALL pool accounts via the RunPod REST API).
 
 Run it::
 
@@ -140,11 +141,8 @@ def _preload_one_dc(
         # region. Surface those so the driver/CLI don't count a no-op (or partial) warm as success.
         if result.get("error"):
             return {"datacenter": dc_id, "status": "error", "error": result["error"], "result": result}
-        # Warmed this DC's volume -> record it so the LAZY training path attaches+uses it (operator
-        # preload is how a DC enters the used set without waiting for a cold run to land there first).
-        from flash.runner import record_weight_cache_dc
-
-        record_weight_cache_dc(dc_id)
+        # Warmed this DC's volume. Nothing else to record: the training path attaches the eager fleet
+        # (a volume in every storage DC) regardless, so the warm weights are picked up automatically.
         if result.get("failed"):
             return {"datacenter": dc_id, "status": "partial", "result": result}
         return {"datacenter": dc_id, "status": "ok", "result": result}
@@ -312,6 +310,84 @@ def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
     return deleted
 
 
+def provision_lambda_filesystems(name: str | None = None) -> list[str]:
+    """Eagerly create the ``flash-weights`` filesystem in EVERY Lambda region (create-if-absent), so
+    the cache storage exists region-wide before any run lands — pure control-plane API, no GPU.
+
+    Idempotent (``ensure_filesystem`` reuses an existing same-name FS). Returns ``lambda:<region>``
+    per region provisioned. A missing/empty Lambda key is not an error (logs + returns ``[]``); a
+    per-region failure is logged and skipped so one bad region never aborts the rest.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    target = name or WEIGHT_CACHE_VOLUME_NAME
+    done: list[str] = []
+    try:
+        regions = lambda_api.all_regions()
+    except Exception as exc:
+        logger.warning("provision: lambda all_regions failed (skipping): %s", exc)
+        return done
+    for region in regions:
+        try:
+            lambda_api.ensure_filesystem(target, region)
+            done.append(f"lambda:{region}")
+        except Exception as exc:
+            logger.warning("provision: lambda ensure_filesystem(%s, %s) failed: %s", target, region, exc)
+    return done
+
+
+def provision_hyperstack_volumes(name: str | None = None, size_gb: int | None = None) -> list[str]:
+    """Eagerly create the ``flash-weights`` block volume in EVERY Hyperstack environment
+    (create-if-absent), so the cache storage exists before any run lands — pure control-plane API, no
+    GPU.
+
+    Idempotent (``ensure_volume`` reuses an existing same-name volume in the env). Returns
+    ``hyperstack:<env>`` per environment provisioned. A missing Hyperstack key is not an error; a
+    per-environment failure is logged and skipped.
+    """
+    from flash.providers.hyperstack import api as hs_api
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+
+    target = name or WEIGHT_CACHE_VOLUME_NAME
+    gb = int(size_gb or WEIGHT_CACHE_VOLUME_GB)
+    done: list[str] = []
+    try:
+        regions = hs_api._regions()
+    except Exception as exc:
+        logger.warning("provision: hyperstack _regions failed (skipping): %s", exc)
+        return done
+    # One env per region (the per-region default env a launch targets); dedupe so a shared env isn't
+    # provisioned twice.
+    envs: list[str] = []
+    for region in regions:
+        try:
+            env = hs_api.environment_for_region(region)
+        except Exception as exc:
+            logger.warning("provision: hyperstack environment_for_region(%s) failed: %s", region, exc)
+            continue
+        if env and env not in envs:
+            envs.append(env)
+    for env in envs:
+        try:
+            hs_api.ensure_volume(target, env, gb)
+            done.append(f"hyperstack:{env}")
+        except Exception as exc:
+            logger.warning("provision: hyperstack ensure_volume(%s, %s) failed: %s", target, env, exc)
+    return done
+
+
+def provision_all() -> list[str]:
+    """Eagerly create the cache storage on every instance provider, in every region/environment
+    (pure control-plane API, no GPU). RunPod's per-DC network volumes are NOT provisioned here: they
+    are create-or-attached automatically by the eager endpoint deploy (jobs.weight_cache_volumes
+    covers every storage DC) and warmed by ``warm_weight_cache`` — there is no GPU-free RunPod
+    volume-create in the SDK. Returns ``provider:<region/env>`` per storage created/confirmed."""
+    provisioned = provision_lambda_filesystems()
+    provisioned += provision_hyperstack_volumes()
+    return provisioned
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Preload the flash weight-cache volumes.")
     ap.add_argument("--models", help="comma-separated HF model ids (default: whole catalog)")
@@ -320,6 +396,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout-s", type=int, default=1800, help="per-DC job timeout")
     ap.add_argument("--max-workers", type=int, default=8, help="datacenters warmed concurrently")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, provision nothing")
+    ap.add_argument(
+        "--provision", action="store_true",
+        help="CREATE the Lambda/Hyperstack cache storage in every region/env (pure API, no GPU) and "
+             "exit; RunPod volumes are auto-created by the eager deploy/warm. Run before --teardown's "
+             "inverse to set up all storage up front.",
+    )
     ap.add_argument(
         "--teardown", action="store_true",
         help="DELETE the per-DC weight-cache volumes (reclaim standing storage) and exit",
@@ -332,6 +414,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.datacenters
         else [dc.value for dc in weight_cache_datacenters()]
     )
+    if args.provision:
+        # Eagerly create the instance-provider cache storage in every region/env (GPU-free). RunPod's
+        # per-DC fleet materializes on the next eager endpoint deploy / warm, so it's not created here.
+        if args.dry_run:
+            print("would provision Lambda filesystems + Hyperstack volumes in every region/env")
+            return 0
+        provisioned = provision_all()
+        print(f"provisioned {len(provisioned)} instance-provider cache store(s): "
+              f"{', '.join(provisioned) or '(none — no Lambda/Hyperstack key, or no regions)'}")
+        return 0
     if args.teardown:
         # Reclaim the cache storage on EVERY provider: RunPod network volumes, Lambda filesystems,
         # and Hyperstack block volumes (each best-effort; a provider with no configured key is a no-op).

@@ -499,9 +499,10 @@ def heartbeat(stage: str, **kw):
         "attempt": ATTEMPT,
         **kw,
     }
-    # The datacenter the worker actually landed in (RunPod serverless sets RUNPOD_DC_ID). The control
-    # plane records it to grow the LAZY weight-cache fleet — attach a volume only in DCs runs use.
-    # Empty/absent on non-RunPod (instance) workers and harmless; only emitted when present.
+    # The datacenter the worker actually landed in (RunPod serverless sets RUNPOD_DC_ID) — a
+    # diagnostic so the control plane / logs show which region a run hit (the eager weight-cache fleet
+    # already has a volume in every storage DC). Empty/absent on non-RunPod (instance) workers and
+    # harmless; only emitted when present.
     _dc = os.environ.get("RUNPOD_DC_ID") or os.environ.get("RUNPOD_DATACENTER_ID") or ""
     if _dc:
         payload.setdefault("dc", _dc)

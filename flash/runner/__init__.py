@@ -244,12 +244,15 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # mode that sank the earlier per-org EU-RO-1 attempt — runs wedged IN_QUEUE on one full region).
 # Fully managed: a fixed name + size, no env knobs. 100 GB holds the whole curated catalog (the
 # largest, the 9B, is ~19 GB of weights) with ample headroom; the preload step warms it.
-# COST/GC: the provider realizes this as one ``flash-weights-<dc>`` volume PER storage datacenter
-# (jobs.weight_cache_volumes, one per DataCenter.all() entry — currently ~11), so the first run (or
-# a full preload) provisions the whole fleet = (#storage DCs) x 100 GB of PERMANENT billed storage
-# (~11 x 100 GB ~= 1.1 TB ~= $77/mo today; grows by one volume if the SDK adds a storage region).
-# RunPod never auto-deletes network volumes; reclaim the fleet with
-# ``python -m flash.providers.runpod.preload --teardown``.
+# COST/GC: provisioned EAGERLY — one ``flash-weights-<dc>`` volume in EVERY storage datacenter, so the
+# cache exists in every region a run could land in (no first-run-cold-then-warm-next-time gap). The
+# endpoint deploy creates-or-attaches all of them (jobs.weight_cache_volumes over the full storage-DC
+# set), and ``preload`` warms them with the catalog weights. Standing storage is therefore the whole
+# fleet: (#storage DCs) x 100 GB of PERMANENT billed storage (~11 x 100 GB ~= 1.1 TB ~= $77/mo today;
+# grows by one volume if the SDK adds a storage region). RunPod never auto-deletes network volumes;
+# reclaim the fleet with ``python -m flash.providers.runpod.preload --teardown`` (also reclaims the
+# Lambda/Hyperstack caches). Lambda filesystems + Hyperstack volumes are likewise pre-created in every
+# region/environment by ``preload --provision`` (pure control-plane API, no GPU).
 #
 # TRUST MODEL (shared multi-tenant cache): the mount is read-WRITE on every run, and a run executes
 # its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a
@@ -264,65 +267,6 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # flip to per-org volumes (keyed off platform_context.org_id) if strict tenant isolation is required.
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 WEIGHT_CACHE_VOLUME_GB = 100
-
-# LAZY per-region: the cache fleet is NOT pre-created in every datacenter (that materialized ~1.1 TB
-# of standing storage on the very first run). Instead we persist the set of DCs a run has ACTUALLY
-# landed in, and attach a volume only in those — the endpoint is still allowed across all DCs (so it
-# lands wherever there's capacity), and the used set grows as the worker self-reports its DC. Cost
-# therefore tracks regions actually used, not the whole fleet. Stored next to the run state.
-_WEIGHT_CACHE_DC_FILE = os.path.join(_STATE_DIR, "weight_cache_dcs.json")
-
-
-def weight_cache_used_dcs() -> set[str]:
-    """The DCs a run has landed in (so the cache is attached there). Empty until the first run reports
-    one — fully lazy. Best-effort read; a missing/corrupt file is treated as empty."""
-    try:
-        with open(_WEIGHT_CACHE_DC_FILE) as f:
-            data = json.load(f)
-        return {str(d) for d in data} if isinstance(data, list) else set()
-    except (FileNotFoundError, ValueError, OSError):
-        return set()
-
-
-def record_weight_cache_dc(dc: str) -> None:
-    """Add a landed DC to the used set so the NEXT run in that region attaches+warms its volume.
-
-    Idempotent + tolerant: a blank value or an unwritable state dir is a no-op (the cache just stays
-    lazier), never an error on the run's hot path.
-    """
-    dc = (dc or "").strip()
-    if not dc:
-        return
-    try:
-        os.makedirs(_STATE_DIR, exist_ok=True)
-        # Serialize the read-modify-write across concurrent pollers (multiple run heartbeats can land
-        # the same instant): an exclusive flock on a sidecar lock file means a DC reported by one
-        # poller is never clobbered by another's stale read. Best-effort — if flock is unavailable
-        # (non-POSIX) we fall back to the unlocked path; a lost DC just keeps the cache lazier.
-        import fcntl
-
-        with open(_WEIGHT_CACHE_DC_FILE + ".lock", "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            used = weight_cache_used_dcs()  # re-read UNDER the lock
-            if dc in used:
-                return
-            used.add(dc)
-            tmp = _WEIGHT_CACHE_DC_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(sorted(used), f)
-            os.replace(tmp, _WEIGHT_CACHE_DC_FILE)
-    except OSError:
-        pass
-    except ImportError:  # no fcntl (non-POSIX): degrade to an unlocked best-effort write
-        with contextlib.suppress(OSError):
-            used = weight_cache_used_dcs()
-            if dc in used:
-                return
-            used.add(dc)
-            tmp = _WEIGHT_CACHE_DC_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(sorted(used), f)
-            os.replace(tmp, _WEIGHT_CACHE_DC_FILE)
 
 
 def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:

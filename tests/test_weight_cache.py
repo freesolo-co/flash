@@ -38,16 +38,6 @@ def _ndc() -> int:
     return n
 
 
-def _seed_used(monkeypatch, dcs=("US-CA-2", "US-IL-1", "US-KS-2")) -> list:
-    """Seed the LAZY used-DC set (DCs runs have landed in) so volume helpers produce volumes. Without
-    this, the cache is fully lazy/cold (no volumes) and reads the real ~/.flash, so tests MUST seed.
-    Returns the seeded DC id list."""
-    import flash.runner as runner
-
-    monkeypatch.setattr(runner, "weight_cache_used_dcs", lambda: set(dcs))
-    return list(dcs)
-
-
 # ---------------------------------------------------------------------------
 # spec carrier round-trips (the field must survive every to_dict()->from_dict() hop)
 # ---------------------------------------------------------------------------
@@ -105,71 +95,21 @@ def test_weight_cache_datacenters_ignores_removed_env_knob(monkeypatch):
     assert len(jobs.weight_cache_datacenters()) == len(DataCenter.all())  # env ignored
 
 
-def test_weight_cache_volumes_distinct_name_per_dc(monkeypatch):
+def test_weight_cache_volumes_distinct_name_per_dc():
     from flash.providers.runpod import jobs
 
-    used = _seed_used(monkeypatch)
     vols = jobs.weight_cache_volumes(_vol_spec(gb=100))
-    assert len(vols) == len(used)  # one volume per USED (landed-in) DC, lazily
+    # EAGER: one volume in EVERY storage DC (no lazy used-set gating).
+    assert len(vols) == _ndc()
     # DISTINCT physical name per DC (the SDK keys resource tracking on name only, so same-named
     # volumes across DCs collide -> a 2nd-volume "replace" -> unimplemented undeploy -> crash).
-    assert len({v.name for v in vols}) == len(used)
+    assert len({v.name for v in vols}) == len(vols)
     assert all(v.name.startswith("flash-weights-") for v in vols)
     # the name encodes the DC, lowercased
     assert {v.name for v in vols} == {f"flash-weights-{v.dataCenterId.value.lower()}" for v in vols}
-    assert {v.dataCenterId.value for v in vols} == set(used)
+    # exactly the full storage-DC set
+    assert {v.dataCenterId for v in vols} == set(jobs.weight_cache_datacenters())
     assert {v.size for v in vols} == {100}
-
-
-def test_weight_cache_volumes_empty_until_a_dc_is_used(monkeypatch):
-    import flash.runner as runner
-    from flash.providers.runpod import jobs
-
-    monkeypatch.setattr(runner, "weight_cache_used_dcs", lambda: set())  # nothing landed yet
-    assert jobs.weight_cache_volumes(_vol_spec()) == []  # fully lazy: no fleet pre-created
-    assert jobs.weight_cache_endpoint_kwargs(_vol_spec()) == {}  # cold (RunPod picks any region)
-
-
-def test_used_dc_set_persist_roundtrip(monkeypatch, tmp_path):
-    import os as _os
-
-    import flash.runner as runner
-
-    f = str(tmp_path / "weight_cache_dcs.json")
-    monkeypatch.setattr(runner, "_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(runner, "_WEIGHT_CACHE_DC_FILE", f)
-    assert runner.weight_cache_used_dcs() == set()  # empty until a run lands
-    runner.record_weight_cache_dc("US-CA-2")
-    runner.record_weight_cache_dc("US-CA-2")  # idempotent
-    runner.record_weight_cache_dc("EU-RO-1")
-    runner.record_weight_cache_dc("")  # blank is a no-op
-    assert runner.weight_cache_used_dcs() == {"US-CA-2", "EU-RO-1"}
-    assert _os.path.exists(f)
-
-
-def test_volume_datacenters_intersects_used_with_sdk(monkeypatch):
-    import flash.runner as runner
-    from flash.providers.runpod import jobs
-
-    # a used value the SDK doesn't know is ignored; known ones pass through
-    monkeypatch.setattr(runner, "weight_cache_used_dcs", lambda: {"US-CA-2", "NOT-A-DC"})
-    vals = [dc.value for dc in jobs.weight_cache_volume_datacenters()]
-    assert vals == ["US-CA-2"]
-
-
-def test_heartbeat_dc_grows_used_set(monkeypatch):
-    # A RunPod worker reports its landed DC in the heartbeat; the poller records it (instance
-    # providers emit no "dc", so this is a RunPod-only growth path).
-    from flash.providers import _poll
-
-    recorded = []
-    import flash.runner as runner
-
-    monkeypatch.setattr(runner, "record_weight_cache_dc", lambda dc: recorded.append(dc))
-    monkeypatch.setattr(runner, "record_heartbeat", lambda *a, **k: None)
-    _poll._record_heartbeat({"run_id": "r1", "stage": "rl_step", "dc": "US-KS-2"})
-    _poll._record_heartbeat({"run_id": "r1", "stage": "rl_step"})  # no dc -> nothing
-    assert recorded == ["US-KS-2"]
 
 
 def test_weight_cache_volume_name_includes_datacenter():
@@ -186,17 +126,16 @@ def test_weight_cache_volumes_empty_without_volume_name():
     assert jobs.weight_cache_volumes(JobSpec(model="m")) == []
 
 
-def test_weight_cache_endpoint_kwargs_lazy_volumes_all_dc_allow(monkeypatch):
+def test_weight_cache_endpoint_kwargs_volume_in_every_dc():
     from flash.providers.runpod import jobs
 
-    used = _seed_used(monkeypatch)
     kw = jobs.weight_cache_endpoint_kwargs(_vol_spec())
     assert sorted(kw) == ["datacenter", "volume"]
-    # LAZY: volumes only in USED DCs, but the endpoint is allowed across ALL storage DCs (so it can
-    # still land in — and then warm — a new region). volume DCs are a SUBSET of the allowed list.
-    assert len(kw["volume"]) == len(used)
-    assert len(kw["datacenter"]) == _ndc()  # all storage DCs
-    assert {v.dataCenterId for v in kw["volume"]} <= set(kw["datacenter"])
+    # EAGER: a volume in EVERY storage DC, and the endpoint allowed across exactly that same set, so
+    # whichever DC it lands in is warm. The two lists span the identical storage-DC set.
+    assert len(kw["volume"]) == _ndc()
+    assert len(kw["datacenter"]) == _ndc()
+    assert {v.dataCenterId for v in kw["volume"]} == set(kw["datacenter"])
 
 
 def test_weight_cache_endpoint_kwargs_empty_without_volume():
@@ -221,7 +160,6 @@ def test_weight_cache_satisfies_real_sdk_superset_validation(monkeypatch):
     # DC must be within the endpoint datacenter list (serverless.py superset rule) and the locations
     # string must span all the DCs.
     monkeypatch.setenv("FLASH_IS_LIVE_PROVISIONING", "true")
-    _seed_used(monkeypatch)  # some DCs used -> volumes attached; allowed set is still ALL DCs
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.gpu import GpuGroup
 
@@ -231,7 +169,7 @@ def test_weight_cache_satisfies_real_sdk_superset_validation(monkeypatch):
     ep = Endpoint(name="wc-test", gpu=GpuGroup.AMPERE_48, gpu_count=1, **kw)
     cfg = ep._build_resource_config()  # raises if the superset rule is violated
     vol_dcs = {v.dataCenterId for v in cfg.networkVolumes}
-    assert vol_dcs <= set(cfg.datacenter)  # superset holds (used volume DCs ⊆ all allowed DCs)
+    assert vol_dcs <= set(cfg.datacenter)  # superset rule holds (eager: the sets are in fact equal)
     assert len(cfg.locations.split(",")) == _ndc()  # endpoint allowed across all storage DCs
 
 
@@ -261,12 +199,11 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
 
-    used = _seed_used(monkeypatch)
     eid, _name = jobs.deploy_train_endpoint("RTX 4090", spec=_vol_spec(), disk_gb=None)
     assert eid == "ep-abc"
-    assert len(captured["volume"]) == len(used)  # volumes only in used DCs (lazy)
+    assert len(captured["volume"]) == _ndc()  # EAGER: a volume in every storage DC
     assert len(captured["datacenter"]) == _ndc()  # allowed across all storage DCs
-    assert len({v.name for v in captured["volume"]}) == len(used)  # distinct per-DC names
+    assert len({v.name for v in captured["volume"]}) == _ndc()  # distinct per-DC names
     assert all(v.name.startswith("flash-weights-") for v in captured["volume"])
 
 
@@ -774,6 +711,104 @@ def test_teardown_cli_reclaims_all_three_providers(monkeypatch):
     assert preload.main(["--teardown"]) == 0
 
 
+# ---------------------------------------------------------------------------
+# Eager PROVISION — create the instance-provider cache storage in every region/env (no GPU)
+# ---------------------------------------------------------------------------
+def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.runpod import preload
+
+    ensured = []
+    monkeypatch.setattr(lambda_api, "all_regions", lambda: ["us-east-1", "us-west-2", "europe-central-1"])
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem",
+        lambda name, region: ensured.append((name, region)) or f"/lambda/nfs/{name}",
+    )
+    out = preload.provision_lambda_filesystems()
+    # one create-if-absent per region, with the managed cache name
+    assert ensured == [("flash-weights", "us-east-1"), ("flash-weights", "us-west-2"), ("flash-weights", "europe-central-1")]
+    assert out == ["lambda:us-east-1", "lambda:us-west-2", "lambda:europe-central-1"]
+
+
+def test_provision_lambda_skips_failed_region(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.runpod import preload
+
+    def flaky(name, region):
+        if region == "bad-1":
+            raise lambda_api.LambdaApiError("region down")
+        return f"/lambda/nfs/{name}"
+
+    monkeypatch.setattr(lambda_api, "all_regions", lambda: ["ok-1", "bad-1", "ok-2"])
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", flaky)
+    # one bad region never aborts the rest
+    assert preload.provision_lambda_filesystems() == ["lambda:ok-1", "lambda:ok-2"]
+
+
+def test_provision_lambda_no_key_is_noop(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        lambda_api, "all_regions",
+        lambda: (_ for _ in ()).throw(lambda_api.LambdaApiError("LAMBDA_API_KEY not set")),
+    )
+    assert preload.provision_lambda_filesystems() == []
+
+
+def test_provision_hyperstack_volumes_one_per_env(monkeypatch):
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.runpod import preload
+
+    ensured = []
+    monkeypatch.setattr(hs_api, "_regions", lambda: ["CANADA-1", "US-1", "NORWAY-1"])
+    monkeypatch.setattr(hs_api, "environment_for_region", lambda r: f"default-{r}")
+    monkeypatch.setattr(
+        hs_api, "ensure_volume",
+        lambda name, env, gb: ensured.append((name, env, gb)) or 1,
+    )
+    out = preload.provision_hyperstack_volumes()
+    assert ensured == [
+        ("flash-weights", "default-CANADA-1", 100),
+        ("flash-weights", "default-US-1", 100),
+        ("flash-weights", "default-NORWAY-1", 100),
+    ]
+    assert out == ["hyperstack:default-CANADA-1", "hyperstack:default-US-1", "hyperstack:default-NORWAY-1"]
+
+
+def test_provision_hyperstack_dedupes_shared_env(monkeypatch):
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.runpod import preload
+
+    ensured = []
+    # two regions mapping to the SAME env -> ensure_volume runs once
+    monkeypatch.setattr(hs_api, "_regions", lambda: ["US-1", "US-2"])
+    monkeypatch.setattr(hs_api, "environment_for_region", lambda r: "shared-env")
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda name, env, gb: ensured.append(env) or 1)
+    out = preload.provision_hyperstack_volumes()
+    assert ensured == ["shared-env"]
+    assert out == ["hyperstack:shared-env"]
+
+
+def test_provision_cli_creates_instance_storage(monkeypatch):
+    """`preload --provision` creates Lambda + Hyperstack storage (GPU-free) and exits 0."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "provision_lambda_filesystems", lambda: ["lambda:us-east-1"])
+    monkeypatch.setattr(preload, "provision_hyperstack_volumes", lambda: ["hyperstack:default-US-1"])
+    assert preload.main(["--provision"]) == 0
+
+
+def test_provision_cli_dry_run_provisions_nothing(monkeypatch):
+    from flash.providers.runpod import preload
+
+    called = {"n": 0}
+    monkeypatch.setattr(preload, "provision_lambda_filesystems", lambda: called.__setitem__("n", called["n"] + 1) or [])
+    monkeypatch.setattr(preload, "provision_hyperstack_volumes", lambda: called.__setitem__("n", called["n"] + 1) or [])
+    assert preload.main(["--provision", "--dry-run"]) == 0
+    assert called["n"] == 0  # dry-run touches no provider
+
+
 def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
     from flash.providers.runpod import preload
 
@@ -793,9 +828,6 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
         return "job-1"
 
     deleted = []
-    import flash.runner as runner
-
-    monkeypatch.setattr(runner, "record_weight_cache_dc", lambda dc: None)  # don't touch real ~/.flash
     monkeypatch.setattr(preload, "deploy_train_endpoint", fake_deploy)
     monkeypatch.setattr(preload.runpod_api, "submit_job", fake_submit)
     monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: deleted.append(eid))
@@ -855,10 +887,8 @@ def test_preload_one_dc_tears_down_on_failure(monkeypatch):
 
 
 def _stub_preload_deploy(monkeypatch, job_output):
-    import flash.runner as runner
     from flash.providers.runpod import preload
 
-    monkeypatch.setattr(runner, "record_weight_cache_dc", lambda dc: None)  # don't touch real ~/.flash
     monkeypatch.setattr(preload, "deploy_train_endpoint", lambda *a, **k: ("ep", "n"))
     monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, p: "job")
     monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: None)
