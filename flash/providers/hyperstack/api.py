@@ -298,6 +298,11 @@ def delete_vm(vm_id: str) -> bool:
         request_with_retries(f"/core/virtual-machines/{vm_id}", method="DELETE", retries=2)
         return True
     except Exception as exc:
+        exc_str = str(exc)
+        # Hyperstack returns 409 when a prior delete request is still being processed.
+        # The VM is already queued for teardown so billing will stop — treat as success.
+        if "409" in exc_str and "conflict" in exc_str.lower():
+            return True
         logger.warning("hyperstack delete_vm(%s) failed: %s", vm_id, exc)
         return False
 
