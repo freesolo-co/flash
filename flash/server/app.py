@@ -98,10 +98,20 @@ async def _reconcile_cost_loop() -> None:
     interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
     while True:
         await asyncio.sleep(interval)
-        with contextlib.suppress(Exception):
+        # Handle cancellation EXPLICITLY (re-raise it) and swallow only real Exceptions, exactly
+        # like the sibling loops below (_reap_idle_endpoints_loop / _sweep_orphan_instances_loop).
+        # On the supported Pythons (>=3.11) asyncio.CancelledError already derives from
+        # BaseException, so the old `contextlib.suppress(Exception)` did not swallow a shutdown
+        # cancel arriving during the blocking sweep — but being explicit makes the cancel path
+        # obvious and uniform, and logs a failed sweep instead of silently dropping it.
+        try:
             reported = await asyncio.to_thread(reconcile_once)
             if reported:
                 _log.info("reconciled realized cost for %d run(s)", reported)
+        except asyncio.CancelledError:
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except Exception:
+            _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
 
 
 def _protected_train_endpoint_names() -> set[str]:
@@ -661,9 +671,11 @@ def create_app():
             if platform_context:
                 submit_kwargs["platform_context"] = platform_context
             status = submit_job(spec, **submit_kwargs)
-            from flash.server.run_registry import record_training_run
-
-            record_training_run(status=status, key=key)
+            # submit_job already reports the freshly-created status to the backend via
+            # _report_status -> record_training_run, and the status carries platform_context
+            # (org_id/user_id/api_key_id derived from `key`), so a second explicit
+            # record_training_run(status, key) here would just re-POST the same creation record.
+            # Don't duplicate it.
             from flash.envs.adapter import is_managed_environment_slug
             from flash.server.environment_registry import record_environment_use
 

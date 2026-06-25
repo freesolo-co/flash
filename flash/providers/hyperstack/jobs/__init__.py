@@ -396,8 +396,13 @@ def poll_hs_job(
             # window, so their ts ~= now (no behavior change on the normal path). ``fresh`` is False
             # for a LEFTOVER heartbeat from a prior attempt (ts < launch); we then neither advance
             # last_progress nor mark training seen, so a stale training heartbeat can't arm the
-            # tighter training stall window before this attempt overwrites the file.
-            hb_ts, fresh = heartbeat_progress_ts(new_key, handle.started_ts)
+            # tighter training stall window before this attempt overwrites the file. Dates against
+            # ``launch_ts`` (NOT the raw handle.started_ts) so an unknown-launch (0.0) handle is
+            # anchored to the SAME ``now`` reference as done_is_fresh / the load+stall clocks: a
+            # leftover heartbeat predating this reattach is then consistently rejected instead of
+            # blanket-trusted (which could otherwise arm the tighter training window off a prior
+            # attempt's training heartbeat). On a real launch this is exactly handle.started_ts.
+            hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts)
             if fresh:
                 last_progress = hb_ts
                 if stage not in _SETUP_HEARTBEAT_STAGES:

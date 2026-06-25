@@ -400,6 +400,47 @@ def test_capacity_grace_scales_with_gpu_walk_position():
     assert sig.parameters["setup_grace_s"].default >= 1800.0
 
 
+def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
+    # A recovery (RunpodProvider.poll on a persisted handle) must reproduce the ORIGINAL submit's
+    # on_last_gpu stall tuning — the runner persists it into the handle, so a last-candidate run
+    # keeps its longer no-capacity grace after a control-plane restart instead of being judged on
+    # the shorter non-last window.
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import PROVIDER
+    from flash.providers.runpod import jobs as jobs
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    captured: dict = {}
+
+    def fake_poll_job(handle, **kw):
+        captured.update(kw)
+        return jobs.PollResult(True, metrics={})
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+
+    spec = JobSpec(
+        run_id="reattach",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="grpo",
+        train=TrainSpec(seeds=(0,), steps=1, hf_repo=""),
+        gpu=GpuSpec(type="A100"),
+    )
+    base = {"provider": "runpod", "endpoint_id": "ep", "endpoint_name": "n", "job_id": "j"}
+
+    # on_last_gpu=True persisted -> the longer (~15 min) capacity grace is reproduced.
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, 0)
+    assert captured["queue_grace_s"] == 900.0
+    assert captured["throttled_grace_s"] == 900.0
+
+    # on_last_gpu=False (and a legacy handle with the key ABSENT) -> the default non-last grace.
+    captured.clear()
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, 0)
+    assert captured["queue_grace_s"] == 300.0
+    captured.clear()
+    PROVIDER.poll(JobHandle.from_dict(base), spec, 0)  # pre-persist handle: defaults to False
+    assert captured["queue_grace_s"] == 300.0
+
+
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     # A job that leaves IN_QUEUE (a worker picks it up) must clear the queue timer: the later
     # IN_PROGRESS/COMPLETED path is governed by the heartbeat/setup windows, never by queue_grace_s.
@@ -1002,6 +1043,9 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         # attempt 0: cheaper class, a next-best still exists -> False; attempts 1 & 2: on the last
         # candidate (and clamped onto it) -> True.
         assert last_flags == [False, True, True]
+        # The winning (last) attempt persisted on_last_gpu into the handle so a reattach reproduces
+        # its stall tuning (see test_reattach_poll_reproduces_persisted_on_last_gpu).
+        assert orch.get_status("lastgpu").remote.get("on_last_gpu") is True
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -1448,8 +1492,9 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
 
 def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
     """When EVERY account is quota-exhausted, deploy fails over once per account and then RAISES —
-    it must NOT loop forever. advance_key() wraps (always True for a multi-key pool), so the deploy
-    bounds its own failovers by key_count(); a regression would spin here indefinitely."""
+    it must NOT loop forever. The deploy bounds its failovers by a key_count()-based COUNT (NOT by
+    advance_key()'s return value, which always advances/wraps for a multi-key pool); a regression
+    would spin here indefinitely."""
     import flash.providers.runpod.jobs as jobs
     import flash.providers.runpod.keys as keys
 
@@ -1478,6 +1523,56 @@ def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
         jobs.deploy_train_endpoint("A100", name_suffix="testrun")
     # 2 accounts x _QUOTA_MAX_RETRIES (3) = 6 deploy attempts, then it stops — never the unbounded spin.
     assert calls["count"] == 6
+
+
+def test_deploy_failover_from_midpool_tries_every_remaining_account(monkeypatch):
+    """REGRESSION: a deploy whose failover STARTS on a non-first account (a prior run already
+    advanced the active key) must still try EVERY remaining account before giving up. The earlier
+    'advance_key() returns False on wrap-to-index-0' exhaustion heuristic broke this — starting on
+    kB, the wrap kB→kC→kA hit index 0 at kA and stopped one account early, skipping kA. The fix
+    bounds failovers by key_count()-1, so each remaining account is tried exactly once from any
+    start. Here only kA has room; a mid-pool start MUST still reach it."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB,kC")
+    keys.reset()
+    # Simulate a prior run that left the pointer on kB (mid-pool start for THIS deploy).
+    assert keys.advance_key() is True
+    assert keys.active_key() == "kB"
+
+    tried: list[str] = []
+
+    class FakeResource:
+        id = "ep-on-kA"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            tried.append(keys.active_key())
+            # Only kA has worker quota; kB and kC are exhausted. The deploy must fail over off the
+            # mid-pool start, wrap past kC, and reach kA — not stop at the index-0 wrap.
+            if keys.active_key() != "kA":
+                raise RuntimeError(
+                    "GraphQL errors: Max workers across all endpoints must not exceed "
+                    "your workers quota (30)"
+                )
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
+
+    ep_id, _name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    assert ep_id == "ep-on-kA"
+    assert keys.active_key() == "kA"  # wrapped past kC to the working account
+    # Every account was tried (each exhausted one _QUOTA_MAX_RETRIES times before failover); the
+    # mid-pool start reached kA via the wrap kB→kC→kA instead of stopping at the index-0 wrap.
+    assert set(tried) == {"kA", "kB", "kC"}
+    # Order: the failover walks kB then kC then wraps to kA — kA is the LAST distinct account tried.
+    first_seen = list(dict.fromkeys(tried))
+    assert first_seen == ["kB", "kC", "kA"]
 
 
 def test_sweep_idle_flash_endpoints(monkeypatch):
