@@ -33,7 +33,6 @@ import argparse
 import contextlib
 import json
 import os
-import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -349,26 +348,23 @@ def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
     try:
         fleet |= {hs_api.cache_volume_name(base, r) for r in hs_api.cache_regions()}
     except Exception as exc:
-        # cache_regions() failed (API down / auth). Do NOT silently narrow to just the legacy bare
-        # name — that would skip every per-region ``flash-weights-<region>`` and exit "successfully",
-        # leaking those billed volumes. Instead derive the canonical per-region targets from the
-        # ACTUALLY-LISTED names by round-tripping each candidate region segment through
-        # cache_volume_name: a listed ``<base>-<seg>`` is a fleet volume only if its region segment is
-        # region-SHAPED (``country-number``, e.g. ``us-1``) AND reproduces the exact listed name. That
-        # admits ``flash-weights-us-1`` but never the user's ``flash-weights-backup`` / ``-test``.
-        logger.warning("teardown: hyperstack cache_regions failed (%s) — deriving per-region cache "
-                       "targets from the listed volumes instead of skipping them", exc)
-        prefix = f"{base.lower()}-"
-        region_seg = re.compile(r"^[a-z]+(?:-[a-z]+)*-\d+$")  # canonical region shape (e.g. ``us-1``, ``canada-1``)
-        for v in vols:
-            vname = (v.get("name") or "").lower()
-            if not vname.startswith(prefix):
-                continue
-            seg = vname[len(prefix):]
-            # Round-trip: only accept names cache_volume_name(base, seg) would itself have produced,
-            # and only when the segment is region-shaped (excludes arbitrary user suffixes).
-            if region_seg.match(seg) and hs_api.cache_volume_name(base, seg) == vname:
-                fleet.add(vname)
+        # cache_regions() failed (API down / auth) — we genuinely cannot enumerate the canonical
+        # region set, so we CANNOT distinguish a fleet volume ``flash-weights-us-1`` from a user volume
+        # ``flash-weights-backup-1`` / ``flash-weights-test-1`` (both are region-shaped). FAVOR DATA
+        # SAFETY: do NOT guess-delete per-region volumes by pattern — a missed cache volume is just
+        # recoverable leftover billing, but deleting a user's volume is unrecoverable data loss. Delete
+        # ONLY the unambiguous legacy bare ``base`` name, and warn LOUDLY that the per-region cache
+        # volumes could not be enumerated and were LEFT INTACT (re-run once regions are reachable, or
+        # clean them manually). This still satisfies "failure is loud/observable, never silently
+        # narrowed" without the over-broad deletion.
+        logger.warning(
+            "teardown: hyperstack cache_regions failed (%s) — could NOT enumerate per-region cache "
+            "volumes; deleting only the legacy bare %r and LEAVING any per-region "
+            "flash-weights-<region> volumes INTACT (re-run teardown once regions are reachable, or "
+            "delete them manually). Refusing to pattern-match region-shaped names to avoid deleting "
+            "unrelated user volumes.",
+            exc, base,
+        )
     for v in vols:
         vname = v.get("name") or ""
         if vname in fleet and v.get("id") and hs_api.delete_volume(v["id"]):
@@ -655,12 +651,14 @@ def main(argv: list[str] | None = None) -> int:
 
     catalog = catalog_model_ids()
     models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else catalog
-    # Confidentiality gate: an explicit --models override may ONLY name public catalog ids. Warming an
-    # arbitrary (private/gated) repo with the operator HF_TOKEN would leave those weights on the
-    # platform-wide WRITABLE shared cache for every other tenant — bypassing the same catalog gate the
-    # normal run path enforces. Reject any off-catalog id BEFORE launching any preload worker. Teardown
-    # (which only deletes, never downloads) is exempt — it never reaches a download path.
-    if args.models and not args.teardown:
+    # Confidentiality gate: an explicit --models override may ONLY name public catalog ids on the paths
+    # that actually DOWNLOAD weights into the shared cache (the default RunPod warm + --warm-instances).
+    # Warming an arbitrary (private/gated) repo with the operator HF_TOKEN would leave those weights on
+    # the platform-wide WRITABLE shared cache for every other tenant — bypassing the same catalog gate
+    # the normal run path enforces. Reject any off-catalog id BEFORE launching any preload worker.
+    # --teardown (only deletes) and --provision (only CREATES empty storage — downloads NOTHING) are
+    # both exempt: neither reaches a download path, so an off-catalog id there is harmless.
+    if args.models and not args.teardown and not args.provision:
         off_catalog = [m for m in models if m not in set(catalog)]
         if off_catalog:
             print("--models: refusing to preload off-catalog model id(s) into the shared cache: "

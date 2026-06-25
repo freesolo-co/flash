@@ -168,10 +168,15 @@ def build_payload(
         if cache_block_device:
             payload["cache_block_device"] = True
             # The block-device preamble matches the attached volume by its EXACT provisioned size, so
-            # carry the runner-assigned size (falls back to the default cache size).
+            # carry the runner-assigned size (falls back to the default cache size). Parse tolerantly
+            # via _volume_gb so a non-int / stale spec value ("0", "", "abc", bool) can't crash the
+            # instance bootstrap on this best-effort device-matching hint — it defaults instead.
             from flash.runner import WEIGHT_CACHE_VOLUME_GB
+            from flash.spec import _volume_gb
 
-            payload["cache_size_gb"] = int(getattr(spec.gpu, "network_volume_gb", 0) or WEIGHT_CACHE_VOLUME_GB)
+            payload["cache_size_gb"] = _volume_gb(
+                getattr(spec.gpu, "network_volume_gb", None), default=WEIGHT_CACHE_VOLUME_GB
+            )
     # Preload (warm) mode: the bootstrap downloads ``models`` into the mounted cache and exits — no
     # code fetch, no worker. Only meaningful with a cache attached (else there's nothing to warm).
     if mode:

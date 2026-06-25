@@ -116,9 +116,12 @@ def launch_and_submit(
     cache_gb = 0
     if cache_name:
         from flash.runner import WEIGHT_CACHE_VOLUME_GB
+        from flash.spec import _volume_gb
 
-        # Honor the runner-assigned size (mirrors RunPod), defaulting to the standard cache size.
-        cache_gb = int(getattr(spec.gpu, "network_volume_gb", 0) or WEIGHT_CACHE_VOLUME_GB)
+        # Honor the runner-assigned size (mirrors RunPod), defaulting to the standard cache size. Parse
+        # tolerantly via _volume_gb: this best-effort weight-cache path must never crash the run on a
+        # non-int / stale / hand-edited size ("0", "", "abc", bool) — it just falls back to the default.
+        cache_gb = _volume_gb(getattr(spec.gpu, "network_volume_gb", None), default=WEIGHT_CACHE_VOLUME_GB)
         cache_user_data = build_user_data(
             build_payload(
                 spec, seed, attempt, runtime_secrets=runtime_secrets,
