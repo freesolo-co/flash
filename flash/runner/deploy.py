@@ -253,8 +253,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # persisted): a cancel landing during the long poll above must NOT let the not-ok
         # resume branch relaunch paid work for a run the user already cancelled (mirrors
         # lifecycle._is_cancel_intent — the entry guard above only catches a pre-poll cancel).
+        # FINISH the cancel via cancel_run (like the entry guard) rather than returning a
+        # non-terminal status: if the original cancel_run died after recording intent, just
+        # returning would leave the run stuck non-terminal until the next recovery sweep.
+        # cancel_run is idempotent and no-ops if the run is already terminal.
         if _is_cancel_intent(get_status(run_id)):
-            return get_status(run_id)
+            return cancel_run(run_id)
         if not res.ok:
             # Job ended not-ok — usually because it was abandoned during the redeploy. Resume the
             # in-flight seed from its last HF checkpoint instead of failing; the seed loop
@@ -345,15 +349,19 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         else:
             _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
     except _RunCancelled:
-        # Intentional: cancel_run already wrote the terminal `cancelled` state; leave it.
-        pass
+        # A cancel was detected mid-flight (the pre-done intent re-check or _run_seed_loop raised).
+        # Finish it via cancel_run so the run converges to terminal `cancelled` even if the original
+        # cancel_run died after recording intent — idempotent + a no-op if already terminal.
+        return cancel_run(run_id)
     except Exception as exc:
         # Don't stamp `failed` over an in-progress cancel: a concurrent cancel_run sets the
         # intent then tears the box down (which is often what raised here), and a terminal
         # `failed` write would be sticky and reject cancel_run's later `cancelled` — losing the
-        # user's intent. Skip on cancel_requested too, not just the already-persisted state.
-        if not _is_cancel_intent(get_status(run_id)):
-            _update(run_id, "failed", error=str(exc))
+        # user's intent. On cancel intent, FINISH the cancel (don't just skip the failed write and
+        # leave the run dangling non-terminal); otherwise record the genuine failure.
+        if _is_cancel_intent(get_status(run_id)):
+            return cancel_run(run_id)
+        _update(run_id, "failed", error=str(exc))
     finally:
         _gc_run_endpoints(spec)
     return get_status(run_id)
@@ -410,13 +418,17 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
             prior_cost=float(status.cost_usd or 0.0),
         )
     except _RunCancelled:
-        pass  # cancel_run already set the terminal state
+        # Converge to terminal `cancelled` via cancel_run (idempotent / no-op if already terminal)
+        # rather than leaving the run non-terminal if the original cancel_run died after intent.
+        return cancel_run(run_id)
     except Exception as exc:
         # Same as attach_run: don't let a `failed` write clobber an in-progress cancel
-        # (cancel_requested set, `cancelled` not yet persisted) — its sticky CAS would
-        # then reject cancel_run's terminal write and lose the user's intent.
-        if not _is_cancel_intent(get_status(run_id)):
-            _update(run_id, "failed", error=str(exc))
+        # (cancel_requested set, `cancelled` not yet persisted) — its sticky CAS would then reject
+        # cancel_run's terminal write and lose the user's intent. On cancel intent, FINISH the
+        # cancel instead of leaving the run dangling non-terminal.
+        if _is_cancel_intent(get_status(run_id)):
+            return cancel_run(run_id)
+        _update(run_id, "failed", error=str(exc))
     finally:
         # Mirror _run_job: GC any endpoint a transient destroy left behind rather than
         # leaking a billable RunPod endpoint.

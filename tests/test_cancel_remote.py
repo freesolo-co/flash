@@ -498,13 +498,14 @@ def test_attach_run_recovery_resumes_seed_loop_when_still_active(tmp_path, monke
     assert out.state == "running"
 
 
-def test_attach_run_recovery_bails_on_cancel_intent_mid_poll(tmp_path, monkeypatch):
-    """A cancel can land DURING attach_run's long poll: cancel_run records the INTENT
-    (cancel_requested=True) and tears the box down, but the terminal `cancelled` write may not
-    have landed yet (state still "running"). The not-ok recovery branch must honor the intent --
-    not just the persisted state -- and skip _run_seed_loop, else it relaunches PAID GPU work for
-    a run the user already cancelled. The entry guard only catches a PRE-poll cancel; this covers
-    the cancel that arrives mid-poll. Mirrors lifecycle._is_cancel_intent."""
+def test_attach_run_recovery_finishes_cancel_intent_mid_poll(tmp_path, monkeypatch):
+    """A cancel can land DURING attach_run's long poll: the INTENT (cancel_requested=True) is
+    recorded but the terminal `cancelled` write may not have landed (state still "running"). The
+    not-ok recovery branch must honor the intent -- not just the persisted state -- and (a) skip
+    _run_seed_loop (no PAID relaunch for a cancelled run) AND (b) FINISH the cancel via cancel_run
+    so the run converges to terminal `cancelled` even if the original cancel_run died after
+    recording intent (rather than leaving it dangling until the next recovery sweep). The entry
+    guard only catches a PRE-poll cancel; this covers the cancel that arrives mid-poll."""
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -530,8 +531,8 @@ def test_attach_run_recovery_bails_on_cancel_intent_mid_poll(tmp_path, monkeypat
     from flash.providers.base import PollResult
 
     def cancel_intent_poll(handle, spec, seed):
-        # cancel_run records the intent BEFORE the terminal `cancelled` write; its teardown deletes
-        # the box, which the poller then reports as a failure -- all while state is still "running".
+        # Only the INTENT is recorded (no concurrent cancel_run finishes the teardown -- simulating
+        # the original cancel_run dying after recording intent). State stays "running".
         orch.mark_cancel_requested(spec.run_id)
         assert orch.get_status(spec.run_id).state == "running"  # terminal NOT yet persisted
         assert orch.get_status(spec.run_id).cancel_requested is True
@@ -541,14 +542,15 @@ def test_attach_run_recovery_bails_on_cancel_intent_mid_poll(tmp_path, monkeypat
 
     out = orch.attach_run(spec.run_id)
     assert seed_loop_calls["n"] == 0, "must NOT resume paid work for a cancel-in-progress run"
-    assert out.cancel_requested is True  # intent preserved (cancel_run finishes the terminal flip)
+    assert out.state == "cancelled", "attach_run must FINISH the cancel, not leave it non-terminal"
+    assert orch.get_status(spec.run_id).state == "cancelled"
 
 
-def test_attach_run_ok_poll_honors_cancel_intent_before_done(tmp_path, monkeypatch):
+def test_attach_run_ok_poll_finishes_cancel_intent_before_done(tmp_path, monkeypatch):
     """The success branch persists metrics then writes terminal `done`. If a cancel lands while
     metrics persist (intent recorded, `cancelled` not yet written), attach_run must raise
-    _RunCancelled and NOT mark the run `done` -- which would resurrect a user-cancelled run. The
-    guard honors the INTENT (cancel_requested), not just the persisted terminal state."""
+    _RunCancelled and NOT mark the run `done` -- and then FINISH the cancel (terminal `cancelled`)
+    rather than leave it dangling. The guard honors the INTENT (cancel_requested), not just state."""
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -576,8 +578,8 @@ def test_attach_run_ok_poll_honors_cancel_intent_before_done(tmp_path, monkeypat
     _make_poll_provider(monkeypatch, on_poll=lambda h, s, seed: PollResult(True, metrics={"a": 1}))
 
     out = orch.attach_run(spec.run_id)
-    assert out.state != "done", "a cancel-in-progress run must NOT be marked done"
-    assert orch.get_status(spec.run_id).state != "done"
+    assert out.state == "cancelled", "a cancel-in-progress run must finish cancelled, never done"
+    assert orch.get_status(spec.run_id).state == "cancelled"
 
 
 def test_run_seed_loop_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
