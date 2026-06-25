@@ -497,9 +497,11 @@ def provision_hyperstack_volumes(name: str | None = None, size_gb: int | None = 
     gb = int(size_gb or WEIGHT_CACHE_VOLUME_GB)
     done: list[str] = []
     try:
-        regions = hs_api._regions()
+        # cache_regions() drops volume-incapable regions (e.g. CANADA-2) so we don't burn a
+        # guaranteed-400 create on a region that can't host the cache anyway.
+        regions = hs_api.cache_regions()
     except Exception as exc:
-        logger.warning("provision: hyperstack _regions failed (skipping): %s", exc)
+        logger.warning("provision: hyperstack cache_regions failed (skipping): %s", exc)
         return done
     # One PER-REGION volume (Hyperstack names are globally unique — see cache_volume_name), created in
     # that region's default environment.

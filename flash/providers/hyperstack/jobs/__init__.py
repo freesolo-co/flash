@@ -162,7 +162,9 @@ def launch_and_submit(
         # Ensure the cache volume exists in this environment (create-if-absent); on success use the
         # cache user_data and attach the volume after launch. Any failure -> launch cold here.
         vol_id, user_data = None, cold_user_data
-        if cache_name:
+        if cache_name and not hs_api.region_supports_cache(inst.region):
+            say(f"weight cache not supported in {inst.region}; launching cold")
+        elif cache_name:
             try:
                 # Per-region physical name (Hyperstack volume names are GLOBALLY unique — a bare
                 # cache_name can exist in only one environment account-wide).

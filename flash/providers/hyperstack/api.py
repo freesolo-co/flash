@@ -72,6 +72,25 @@ def _regions() -> list[str]:
     return names or ["NORWAY-1", "CANADA-1", "US-1", "CANADA-2"]
 
 
+# Hyperstack regions that DON'T support block-volume operations. LIVE-FOUND: CANADA-2 returns HTTP 400
+# "Volume operations are not supported in this region" on create — the region is launchable for COMPUTE
+# but has no volume backend, so the cache can't live there. Mirrors RunPod's _VOLUME_INCAPABLE_DATACENTERS.
+# These regions stay in `_regions()` (still usable for GPU launches), but the cache provisioner and the
+# launch-time attach skip them rather than burning a guaranteed-failing API call (the launch path already
+# degrades to a cold run there, so a stale list is graceful — but list a region here to silence the noise).
+_VOLUME_INCAPABLE_REGIONS = frozenset({"CANADA-2"})
+
+
+def region_supports_cache(region: str) -> bool:
+    """Whether the weight cache can be stored in ``region`` (False for known volume-incapable regions)."""
+    return region not in _VOLUME_INCAPABLE_REGIONS
+
+
+def cache_regions() -> list[str]:
+    """The subset of ``_regions()`` that supports block volumes — where the cache is provisioned."""
+    return [r for r in _regions() if region_supports_cache(r)]
+
+
 def flavors_by_region(force: bool = False) -> dict[str, list[dict]]:
     """``region -> [flavor dict]`` across all regions, cached for ``_FLAVORS_TTL_S``.
 

@@ -908,6 +908,27 @@ def test_provision_hyperstack_skips_region_with_no_volume_id(monkeypatch):
     assert out == ["hyperstack:GOOD-1", "hyperstack:GOOD-2"]  # BAD-1 dropped, no false success
 
 
+def test_provision_hyperstack_skips_volume_incapable_region(monkeypatch):
+    """LIVE-FOUND: CANADA-2 has no volume backend (HTTP 400 "Volume operations are not supported in this
+    region"). The provisioner must skip it (via cache_regions) instead of burning a guaranteed-400 create."""
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.runpod import preload
+
+    assert "CANADA-2" in hs_api._VOLUME_INCAPABLE_REGIONS
+    assert not hs_api.region_supports_cache("CANADA-2")
+    assert hs_api.region_supports_cache("CANADA-1")
+
+    ensured = []
+    monkeypatch.setattr(hs_api, "_regions", lambda: ["CANADA-1", "CANADA-2", "US-1"])
+    monkeypatch.setattr(hs_api, "environment_for_region", lambda r: f"default-{r}")
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda name, env, gb: ensured.append(name) or 1)
+    out = preload.provision_hyperstack_volumes()
+    # CANADA-2 never even attempted (no guaranteed-400 create), the capable regions are provisioned
+    assert ensured == ["flash-weights-canada-1", "flash-weights-us-1"]
+    assert out == ["hyperstack:CANADA-1", "hyperstack:US-1"]
+    assert hs_api.cache_regions() == ["CANADA-1", "US-1"]  # filtered view excludes the incapable region
+
+
 def test_provision_cli_creates_instance_storage(monkeypatch):
     """`preload --provision` creates Lambda + Hyperstack storage (GPU-free) and exits 0."""
     from flash.providers.runpod import preload
