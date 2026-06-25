@@ -71,7 +71,8 @@ def _require_gpu():
 
 
 def warm_flash_attn(torch) -> bool:
-    """Compile FlashAttention fwd + bwd by running one tiny attention with grad."""
+    """Compile FlashAttention fwd + bwd (FA2 everywhere, + FA3 on Hopper) with one tiny attention."""
+    warmed = False
     try:
         from flash_attn import flash_attn_func
 
@@ -82,11 +83,30 @@ def warm_flash_attn(torch) -> bool:
         out = flash_attn_func(q, k, v, causal=True)
         out.sum().backward()  # exercise the bwd kernel too
         torch.cuda.synchronize()
-        _log("flash-attn fwd/bwd compiled")
-        return True
+        _log("flash-attn (FA2) fwd/bwd compiled")
+        warmed = True
     except Exception as e:
-        _log(f"flash-attn warm skipped: {e}")
-        return False
+        _log(f"flash-attn (FA2) warm skipped: {e}")
+    try:
+        # FA3: on Hopper (sm90) the worker selects attn_implementation="flash_attention_3" (the local
+        # flash_attn_interface build) for full-attention layers, so a baked H100 cache must cover it
+        # too. a no-op/skip off-Hopper (the kernel is Hopper-only; the wheel just rides along).
+        import flash_attn_interface
+
+        q, k, v = (
+            torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(3)
+        )
+        out = flash_attn_interface.flash_attn_func(q, k, v, causal=True)
+        if isinstance(out, tuple):
+            out = out[0]
+        out.sum().backward()
+        torch.cuda.synchronize()
+        _log("flash-attn-3 (Hopper) fwd/bwd compiled")
+        warmed = True
+    except Exception as e:
+        _log(f"flash-attn-3 warm skipped (expected off-Hopper): {e}")
+    return warmed
 
 
 def warm_liger_ce(torch) -> bool:
@@ -145,10 +165,12 @@ def warm_liger_ce(torch) -> bool:
                 out.backward()
                 torch.cuda.synchronize()
                 _log("liger fused-linear loss compiled")
-                return True
+                warmed = True
+                break  # fall through to the model-layer warm below; don't exit the function
             except Exception:
                 continue
-        raise RuntimeError("fused-linear Liger calls were not accepted")
+        else:
+            raise RuntimeError("fused-linear Liger calls were not accepted")
     except Exception as e:
         _log(f"liger fused-linear warm skipped: {e}")
     try:
@@ -329,16 +351,19 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
     if torch is None:
         return 1
     if arch:
-        # --arch pins the compile target but the JIT/source builds still key off the LIVE GPU; if they
-        # disagree the bake records the physical sm while arch-pinned artifacts target another arch.
-        # surface the mismatch instead of silently baking a misleading cache.
+        # --arch pins the compile target but the JIT/source builds key off the LIVE GPU, and the
+        # saved metadata records the physical sm. a mismatch (e.g. the sm90 publish step mis-scheduled
+        # onto an sm89 runner) would bake a cu128-sm90 image whose metadata says sm89 -> every H100
+        # worker rejects it and cold-JITs. FAIL the bake rather than publish a mislabeled artifact.
         want_sm = "sm" + arch.replace(".", "")
         live_sm = _torch_sm(torch)
         if want_sm != live_sm:
             _log(
-                f"WARNING: --arch {arch} ({want_sm}) does not match live GPU {live_sm}; "
-                "baked kernels target the live arch and metadata records it — re-run on a matching GPU"
+                f"ERROR: --arch {arch} ({want_sm}) does not match live GPU {live_sm}; refusing to "
+                f"bake a mislabeled cache (a {want_sm} image would carry {live_sm} metadata). "
+                "re-run on a matching GPU."
             )
+            return 1
     warmed = sum(
         [
             warm_flash_attn(torch),
