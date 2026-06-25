@@ -31,6 +31,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -2626,6 +2627,84 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
+# Baked compiled-kernel cache (opt-in; see Dockerfile.worker + flash/engine/worker/kernel_warmup.py).
+# The Dockerfile points TRITON_CACHE_DIR/TORCHINDUCTOR_CACHE_DIR here and, when built with
+# --build-arg BUILD_KERNEL_CACHE=true, bakes a portable mega-cache produced on a real GPU. These
+# names are kept in lockstep with kernel_warmup.DEFAULT_CACHE_DIR / MEGA_CACHE_FILENAME.
+_KERNEL_CACHE_DIR = "/opt/flash/kernelcache"
+_KERNEL_CACHE_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.bin")
+_KERNEL_CACHE_META_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.json")
+
+
+def _current_cuda_sm(torch) -> str | None:
+    try:
+        if not torch.cuda.is_available():
+            return None
+        cap = torch.cuda.get_device_capability(0)
+        return f"sm{cap[0]}{cap[1]}"
+    except Exception:
+        return None
+
+
+def _load_kernel_cache_if_present() -> bool:
+    """Best-effort: if a baked mega-cache blob exists, load it so the worker skips first-run JIT.
+
+    Loads the portable cache that kernel_warmup.py wrote on a GPU builder via
+    ``torch.compiler.load_cache_artifacts()`` — measured cold compile ~124s -> warm load ~0.2s.
+    OPT-IN: when no baked cache is present (the default image build), this is a no-op and the worker
+    JITs on first use exactly as before (#163's init heartbeat covers that stall). Never raises:
+    a missing torch / missing file / unusable blob just logs and leaves the JIT path intact.
+    """
+    def _reject(reason: str) -> bool:
+        # a baked cache is present but unusable (no/garbled metadata or wrong arch): repoint
+        # triton/inductor OFF the baked trees (Dockerfile points them at /opt/flash/kernelcache)
+        # so the JIT fallback compiles fresh into scratch instead of reusing wrong-arch baked
+        # entries that would collide with this worker's arch.
+        print(f"[kernel-cache] {reason} -> first-run JIT fallback")
+        scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
+        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
+            d = os.path.join(scratch, sub)
+            os.makedirs(d, exist_ok=True)
+            os.environ[var] = d
+        return False
+
+    if not os.path.isfile(_KERNEL_CACHE_FILE):
+        print(f"[kernel-cache] no baked cache at {_KERNEL_CACHE_FILE} -> first-run JIT (expected default)")
+        return False
+    try:
+        import torch
+
+        current_sm = _current_cuda_sm(torch)
+        try:
+            with open(_KERNEL_CACHE_META_FILE) as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            return _reject("baked cache has no metadata")
+        except Exception as e:
+            return _reject(f"metadata unreadable ({e})")
+        cached_sm = str(meta.get("sm") or "")
+        if not current_sm:
+            # can't verify the worker's GPU arch -> don't risk loading a wrong-arch blob; JIT instead.
+            return _reject("worker GPU arch undetermined")
+        if cached_sm != current_sm:
+            return _reject(
+                f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
+            )
+        with open(_KERNEL_CACHE_FILE, "rb") as f:
+            blob = f.read()
+        torch.compiler.load_cache_artifacts(blob)
+        print(
+            f"[kernel-cache] loaded baked mega-cache for {cached_sm or 'unknown'} "
+            f"({len(blob)} bytes) -> skipping first-run JIT"
+        )
+        return True
+    except Exception as e:
+        # never block boot on a bad/absent cache: fall back to the normal JIT path. repoint off the
+        # baked trees too — if the mega blob was present + arch-matched but load raised, the on-disk
+        # triton/inductor entries may be partial/corrupt, so JIT fresh into scratch.
+        return _reject(f"load skipped ({e})")
+
+
 def wandb_finish(exit_code: int = 0) -> None:
     """Finalize the W&B run before the worker's hard ``os._exit()``.
 
@@ -2714,6 +2793,12 @@ def main():
         _neutralize_tilelang_cudart_stub()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
+        # Opt-in: load a baked compiled-kernel mega-cache (if the image shipped one) so the worker
+        # skips the ~10-15 min first-run JIT. Best-effort + no-op when absent (the default), so the
+        # normal JIT path is untouched. Runs AFTER finalize_alloc_conf_for_sleep: _load probes CUDA
+        # (_current_cuda_sm -> get_device_capability triggers CUDA init), so the allocator conf must be
+        # resolved first; still before any model/kernel import that would otherwise trigger compilation.
+        _load_kernel_cache_if_present()
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
             "sft": run_sft,  # SFT (TRL SFTTrainer)
