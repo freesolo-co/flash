@@ -50,6 +50,10 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
         want = int(raw_step) if raw_step.is_integer() else None
     elif isinstance(raw_step, str) and raw_step.strip().lstrip("-").isdigit():
         want = int(raw_step.strip())
+    # Checkpoint steps are always non-negative (derived from ``step-<N>``); reject a negative
+    # value as malformed (400) rather than letting it fall through to the 404 below.
+    if want is not None and want < 0:
+        want = None
     if want is None:
         raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {raw_step!r}")
     checkpoints = _app.list_checkpoints(spec)
