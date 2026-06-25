@@ -275,7 +275,6 @@ def _train_body(input_data: dict) -> dict:
                         ignore_patterns=ignore_patterns, local_files_only=True,
                     )
                     already.append(repo_id)
-                    done.append(repo_id)
                     continue
                 except Exception:
                     pass
