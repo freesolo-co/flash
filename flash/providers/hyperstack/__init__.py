@@ -11,6 +11,7 @@ HF artifacts. It implements the SAME ``base.Provider`` interface as RunPod/Lambd
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from flash.providers.base import GpuClass, JobHandle, PollResult, Provider
@@ -111,7 +112,9 @@ class HyperstackProvider:
 
         terminate_run_instances(spec.run_id)
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[str]:
+    def sweep_orphans(
+        self, active_labels: set[str] | Callable[[], set[str]] | None = None
+    ) -> list[str]:
         """Hyperstack VM ids are opaque STRINGS (the ``base.Provider`` protocol widens the return to
         ``list[int | str]`` to cover both substrates); the orchestrator only logs/counts them."""
         from flash.providers.hyperstack.jobs import sweep_orphans

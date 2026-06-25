@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+from collections.abc import Callable
 
 from flash._logging import get_logger
 from flash.providers._poll import (
@@ -450,18 +451,35 @@ def terminate_run_instances(run_id: str) -> list[str]:
     return hs_api.delete_vms(ids) if ids else []
 
 
-def sweep_orphans(active_labels: set[str] | None = None) -> list[str]:
+def sweep_orphans(
+    active_labels: set[str] | Callable[[], set[str]] | None = None,
+) -> list[str]:
     """Delete Flash-named VMs that no live run owns; return deleted ids. Run at startup + post-run.
 
     Only names with the ``flash-`` run prefix are touched. ``active_labels`` may be RAW run ids;
     each is passed through ``run_label_prefix`` so it matches the forced prefix the names carry.
+
+    ``active_labels`` may also be a CALLABLE returning that set — it is then resolved AFTER the VM
+    list is fetched. The periodic in-lifetime sweep passes one so the protection set is read
+    post-listing: any VM present in the list had its run's status row committed before the VM was
+    launched (hence before this list call), so resolving the live set now is guaranteed to include
+    it — closing the launch race where a run started after a pre-captured set could have its fresh
+    worker reaped as a phantom orphan.
     """
     try:
         vms = hs_api.list_vms()
     except Exception as exc:
         logger.warning("hyperstack orphan sweep skipped: %s", exc)
         return []
-    active = {run_label_prefix(a) for a in (active_labels or set())}
+    try:
+        labels = active_labels() if callable(active_labels) else active_labels
+    except Exception as exc:
+        # Resolving the protection set failed (e.g. a db/status read error in the callable). SKIP the
+        # sweep — never fall through to an empty set, which would treat every live run's VM as an
+        # orphan and reap it. Honors the "never raises" contract.
+        logger.warning("hyperstack orphan sweep skipped: could not resolve active set: %s", exc)
+        return []
+    active = {run_label_prefix(a) for a in (labels or set())}
     orphans: list[str] = []
     for v in vms:
         name = str(v.get("name") or "")
