@@ -26,6 +26,7 @@ from collections.abc import Callable
 from flash._logging import get_logger
 from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
+    FIRST_LIVENESS_OBSERVED_GRACE_S,
     FIRST_LIVENESS_S,
     PollErrorTracker,
     heartbeat_progress_ts,
@@ -445,6 +446,30 @@ def poll_lambda_job(
         d = done_reader(force=True)
         return finish_ok(d if (d is not None and done_is_fresh(d)) else None)
 
+    def reached_training_now() -> bool:
+        """True if a FRESH training-stage heartbeat exists right now (not just one the poll loop has
+        already surfaced). The terminal marker/dead branches decide ``host_fault`` BEFORE
+        ``surface_heartbeat()`` advances ``seen_training_hb`` this iteration, so a worker that started
+        training and then failed within a single poll interval would otherwise look pre-training and
+        wrongly quarantine a HEALTHY region for the TTL. Force-reads past the rate limit and rejects a
+        stale prior-attempt heartbeat (ts < launch) with the SAME freshness gate as the loop, so a
+        leftover training heartbeat can't suppress a genuine region fault either."""
+        if seen_training_hb:
+            return True
+        if heartbeat_reader is None:
+            return False
+        try:
+            hb = heartbeat_reader(force=True)
+        except Exception:
+            return False
+        if not isinstance(hb, dict):
+            return False
+        stage = hb.get("stage")
+        if stage is None or stage in _SETUP_HEARTBEAT_STAGES:
+            return False
+        _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
+        return fresh
+
     def fail_from_marker(marker: dict | None) -> PollResult:
         # A real worker error fails fast UNLESS it is flagged retriable — the host failure marker
         # (docker/GPU never ready) sets retriable=True, and the worker stamps it in heartbeat for a
@@ -457,10 +482,11 @@ def poll_lambda_job(
             failure="job_preempted" if retriable else "job_failed",
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.attempt),
             # A retriable failure BEFORE any training heartbeat is a host/GPU fault (broken driver,
-            # docker/GPU never ready) -> the region is sick. ``seen_training_hb`` is read at call time
-            # from the enclosing poll loop (this closure runs only from inside it). A retriable crash
-            # AFTER training started is NOT a region fault (the region was working), so don't quarantine.
-            host_fault=retriable and not seen_training_hb,
+            # docker/GPU never ready) -> the region is sick. A retriable crash AFTER training started is
+            # NOT a region fault (the region was working), so don't quarantine. Use reached_training_now
+            # (not the bare loop flag): this branch runs before surface_heartbeat() this iteration, so a
+            # worker that trained then failed within one poll interval would otherwise look pre-training.
+            host_fault=retriable and not reached_training_now(),
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -497,6 +523,11 @@ def poll_lambda_job(
     # does NOT hand a box that has been silent since before a control-plane restart a fresh window.
     # Advanced to now only on a genuine inactive->active transition observed in this poll session.
     active_since = start
+    # Wall time we FIRST OBSERVED the box active (vs active_since, which is launch-anchored on a
+    # reattach). Used only to floor the first-liveness stall by FIRST_LIVENESS_OBSERVED_GRACE_S so a
+    # box that just became active (after a long provision the control plane missed) gets its boot-log
+    # uploader's publication window before being failed over -- without handing it a full fresh window.
+    active_obs_since: float | None = None
     seen_training_hb = False
     # Any FRESH heartbeat from THIS attempt (boot stage included) proves the worker started — clears
     # the first-liveness deadline. Distinct from seen_training_hb (which gates only the tighter
@@ -542,6 +573,8 @@ def poll_lambda_job(
             last_status = status
         if status == "active":
             became_active = True
+            if active_obs_since is None:
+                active_obs_since = time.time()  # first time WE saw it active (reattach-safe floor)
 
         done = done_reader()
         if done is not None and done_is_fresh(done):
@@ -573,9 +606,10 @@ def poll_lambda_job(
                 failure="job_failed" if worker_crashed else "job_preempted",
                 detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.attempt),
                 # A host that died (preempted) BEFORE any training heartbeat never got a worker
-                # productive here -> quarantine the region; a host loss after training is not a
-                # region fault.
-                host_fault=not worker_crashed and not seen_training_hb,
+                # productive here -> quarantine the region; a host loss after training is not a region
+                # fault. reached_training_now (not the bare loop flag) covers a worker that trained then
+                # died within one poll interval, before surface_heartbeat() ran this iteration.
+                host_fault=not worker_crashed and not reached_training_now(),
             )
 
         raw_marker = marker_reader()
@@ -634,6 +668,13 @@ def poll_lambda_job(
                 not seen_fresh_hb
                 and not boot_log_seen
                 and time.time() - active_since > first_liveness_s
+                # AND we've actually watched it active for the uploader's publication window. On the
+                # normal path active_obs_since ~= active_since so this is already satisfied when the
+                # launch-anchored deadline trips (no slowdown); on a reattach that first saw it already
+                # active it floors the stall so a just-became-active box isn't failed over before its
+                # boot.log could publish (a silent-since-restart box is still caught by the setup grace).
+                and active_obs_since is not None
+                and time.time() - active_obs_since >= FIRST_LIVENESS_OBSERVED_GRACE_S
             ):
                 # make_hf_text_reader returns None for BOTH a missing file AND a rate-limited/errored
                 # read, so a bare ``not boot_log_reader()`` would spuriously stall a healthy box on a

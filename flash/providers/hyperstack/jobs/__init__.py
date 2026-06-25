@@ -21,6 +21,7 @@ from collections.abc import Callable
 from flash._logging import get_logger
 from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
+    FIRST_LIVENESS_OBSERVED_GRACE_S,
     FIRST_LIVENESS_S,
     PollErrorTracker,
     heartbeat_progress_ts,
@@ -390,6 +391,29 @@ def poll_hs_job(
         d = done_reader(force=True)
         return finish_ok(d if (d is not None and done_is_fresh(d)) else None)
 
+    def reached_training_now() -> bool:
+        """True if a FRESH training-stage heartbeat exists right now (not just one the poll loop has
+        already surfaced). The terminal marker/dead branches decide ``host_fault`` BEFORE
+        ``surface_heartbeat()`` advances ``seen_training_hb`` this iteration, so a worker that started
+        training and then failed within a single poll interval would otherwise look pre-training and
+        wrongly quarantine a HEALTHY region for the TTL. Force-reads past the rate limit and rejects a
+        stale prior-attempt heartbeat (ts < launch) with the SAME freshness gate as the loop."""
+        if seen_training_hb:
+            return True
+        if heartbeat_reader is None:
+            return False
+        try:
+            hb = heartbeat_reader(force=True)
+        except Exception:
+            return False
+        if not isinstance(hb, dict):
+            return False
+        stage = hb.get("stage")
+        if stage is None or stage in _SETUP_HEARTBEAT_STAGES:
+            return False
+        _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
+        return fresh
+
     def fail_from_marker(marker: dict | None) -> PollResult:
         from flash.providers.runpod.jobs import worker_flagged_retriable
 
@@ -400,10 +424,11 @@ def poll_hs_job(
             failure="job_preempted" if retriable else "job_failed",
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.attempt),
             # A retriable failure BEFORE any training heartbeat is a host/GPU fault (broken driver,
-            # docker/GPU never ready) -> the region is sick (this is the CANADA-1 case). seen_training_hb
-            # is read at call time from the enclosing poll loop; a retriable crash after training
-            # started is NOT a region fault.
-            host_fault=retriable and not seen_training_hb,
+            # docker/GPU never ready) -> the region is sick (this is the CANADA-1 case). A retriable
+            # crash after training started is NOT a region fault. Use reached_training_now (not the bare
+            # loop flag): this branch runs before surface_heartbeat() this iteration, so a worker that
+            # trained then failed within one poll interval would otherwise look pre-training.
+            host_fault=retriable and not reached_training_now(),
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -440,6 +465,10 @@ def poll_hs_job(
     # hand a box silent since before a control-plane restart a fresh window. Advanced to now only on a
     # genuine inactive->active transition observed in this poll session.
     active_since = start
+    # Wall time we FIRST OBSERVED the VM active (vs active_since, launch-anchored on a reattach). Floors
+    # the first-liveness stall by FIRST_LIVENESS_OBSERVED_GRACE_S so a VM that just became active (after
+    # a long provision the control plane missed) gets its boot-log uploader window before failover.
+    active_obs_since: float | None = None
     seen_training_hb = False
     # Any FRESH heartbeat from THIS attempt (boot stage included) proves the worker started — clears
     # the first-liveness deadline. A leftover prior-attempt heartbeat (ts < launch) is NOT fresh, so
@@ -484,6 +513,8 @@ def poll_hs_job(
             last_status = status
         if status == "ACTIVE":
             became_active = True
+            if active_obs_since is None:
+                active_obs_since = time.time()  # first time WE saw it active (reattach-safe floor)
 
         done = done_reader()
         if done is not None and done_is_fresh(done):
@@ -513,7 +544,9 @@ def poll_hs_job(
                 # A VM that died before any training heartbeat never got a worker productive in this
                 # region -> quarantine it; a worker-CODE crash (not infra) or a loss after training is
                 # NOT a region fault, so it must not quarantine an otherwise-healthy region.
-                host_fault=not worker_crashed and not seen_training_hb,
+                # reached_training_now (not the bare loop flag) covers a worker that trained then died
+                # within one poll interval, before surface_heartbeat() ran this iteration.
+                host_fault=not worker_crashed and not reached_training_now(),
             )
 
         raw_marker = marker_reader()
@@ -570,6 +603,13 @@ def poll_hs_job(
                 not seen_fresh_hb
                 and not boot_log_seen
                 and time.time() - active_since > first_liveness_s
+                # AND we've actually watched it active for the uploader's publication window. On the
+                # normal path active_obs_since ~= active_since so this is already satisfied when the
+                # launch-anchored deadline trips (no slowdown); on a reattach that first saw it already
+                # active it floors the stall so a just-became-active VM isn't failed over before its
+                # boot.log could publish (a silent-since-restart VM is still caught by the setup grace).
+                and active_obs_since is not None
+                and time.time() - active_obs_since >= FIRST_LIVENESS_OBSERVED_GRACE_S
             ):
                 # make_hf_text_reader returns None for BOTH a missing file AND a rate-limited/errored
                 # read, so a bare ``not boot_log_reader()`` would spuriously stall a healthy VM on a

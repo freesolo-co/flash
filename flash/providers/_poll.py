@@ -74,6 +74,18 @@ FIRST_LIVENESS_S = 900.0
 # intervals on top of the ~15 min ``FIRST_LIVENESS_S`` — negligible.
 BOOT_LOG_ABSENT_POLLS = 3
 
+# On a reattach whose first poll already sees the box ACTIVE, the inactive->active transition was
+# never observed, so ``active_since`` stays launch-anchored and the launch-relative first-liveness
+# deadline can already be blown the instant we reattach. A box that genuinely *just* became active
+# (after a long provision the control plane missed while it was down) would then be failed over before
+# its host boot.log uploader had any window to publish. So, in addition to the launch-anchored
+# deadline, require the box to have been OBSERVED active for at least this long before a first-liveness
+# stall — roughly the uploader's publication window. It is small vs ``FIRST_LIVENESS_S`` so it does NOT
+# slow the normal-path fast failover (the launch-anchored deadline dominates there); it only adds a
+# brief floor on the reattach path, still far faster than the launch-anchored setup grace, and a box
+# silent since before the restart is still caught by that setup grace.
+FIRST_LIVENESS_OBSERVED_GRACE_S = 120.0
+
 
 def make_say(log) -> Callable[[str], None]:
     """A timestamped line logger that no-ops when ``log`` is None."""

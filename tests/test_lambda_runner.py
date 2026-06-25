@@ -571,7 +571,9 @@ def test_poll_marker_failure_is_job_failed(monkeypatch):
 
 
 def test_poll_retriable_marker_is_job_preempted(monkeypatch):
-    """A worker-flagged retriable failure retries on a fresh host (job_preempted), not job_failed."""
+    """A worker-flagged retriable failure retries on a fresh host (job_preempted), not job_failed.
+    With NO training heartbeat (only the retriable bit), it is a pre-training infra fault -> the region
+    is quarantined (host_fault)."""
     jobs = _wire_poll(
         monkeypatch,
         instances=[{"status": "active"}],
@@ -582,6 +584,50 @@ def test_poll_retriable_marker_is_job_preempted(monkeypatch):
     )
     assert not res.ok
     assert res.failure == "job_preempted"
+    assert res.host_fault  # retriable crash before any training heartbeat -> sick region
+
+
+def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
+    """A retriable failure marker can land in the SAME poll iteration the worker first reaches training
+    -- the marker branch decides host_fault BEFORE surface_heartbeat() advances seen_training_hb.
+    reached_training_now() force-reads the heartbeat and sees the training stage, so a mid-training
+    RetriableInfraError retries (job_preempted) WITHOUT quarantining the healthy region."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: gpu fell off the bus", "retriable": True}),
+    )
+    res = jobs.poll_lambda_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"stage": "sft_train", "step": 7, "ts": 10_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"
+    assert not res.host_fault  # training already reached -> region healthy, do NOT quarantine
+
+
+def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
+    """On a reattach whose first poll already sees the box active, active_since is launch-anchored, so
+    the launch-relative first_liveness deadline is already blown. The observed-grace floor stops a box
+    that only JUST became active (after a long provision the control plane missed) from being failed
+    over before its boot-log uploader's publication window: even with the boot.log absent past
+    BOOT_LOG_ABSENT_POLLS and the deadline exceeded, no 'no worker liveness' stall fires until we've
+    watched it active for FIRST_LIVENESS_OBSERVED_GRACE_S. Here the box dies (host loss) inside that
+    window -> job_preempted, not the premature liveness stall (which the pre-fix code would return)."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}] * 4 + [{"status": "terminated"}],
+        boot=None,  # uploader has not published yet
+        step=0.1,  # tiny steps so the 120s observed-grace floor is NOT reached in these few polls
+    )
+    # Launch 1_000s ago (clock starts 10_000): the first_liveness deadline (10s) is blown, but the
+    # 3_000s setup grace is NOT (else its launch-anchored stall would fire first and mask the floor).
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=10.0
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # died inside the observed-grace window
+    assert "no worker liveness" not in (res.detail or "")
 
 
 def test_poll_dead_host_without_marker_is_preempted(monkeypatch):
@@ -862,8 +908,12 @@ def test_poll_reattach_already_active_anchors_liveness_to_launch(monkeypatch):
     )
     assert not res.ok
     assert res.failure == "stalled"
-    # Elapsed counts from LAUNCH (5_000s ago), not the reattach — proves active_since stayed anchored.
-    assert "5020s" in res.detail
+    # Elapsed counts from LAUNCH (~5_000s ago), not the reattach (~0s) — proves active_since stayed
+    # anchored. Parse the reported elapsed rather than hard-coding it (clock-call count is incidental).
+    import re
+
+    elapsed = int(re.search(r"for (\d+)s", res.detail).group(1))
+    assert elapsed >= 5_000  # launch-anchored, not reattach-anchored
 
 
 def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
