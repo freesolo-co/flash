@@ -122,14 +122,20 @@ def warm_liger_ce(torch) -> bool:
                 continue
         if loss_cls is None:
             raise ImportError("no fused-linear Liger loss class found")
+        # representative catalog vocab width (qwen3.5/3.6 lm_head ~248k); triton/liger specialize the
+        # fused-ce chunking to the vocab shape, so warm the production width, not a toy 4096.
+        vocab = 248_320
         hidden = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        weight = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        labels = torch.randint(0, 4096, (64,), device="cuda")
+        weight = torch.randn(vocab, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        labels = torch.randint(0, vocab, (64,), device="cuda")
         loss_fn = loss_cls()
+        # upstream signature is forward(self, lin_weight, _input, target): weight first, then hidden.
+        # call the known-good form first so we never launch a mismatched shape (which would trigger a
+        # cuda illegal access and poison the context before a later attempt can run).
         attempts = (
-            lambda: loss_fn(hidden, weight, labels),
             lambda: loss_fn(weight, hidden, labels),
-            lambda: loss_fn(hidden, weight, target=labels),
+            lambda: loss_fn(weight, hidden, target=labels),
+            lambda: loss_fn(hidden, weight, labels),
         )
         for call in attempts:
             try:
@@ -145,12 +151,41 @@ def warm_liger_ce(torch) -> bool:
         raise RuntimeError("fused-linear Liger calls were not accepted")
     except Exception as e:
         _log(f"liger fused-linear warm skipped: {e}")
+    try:
+        # model-layer liger kernels (rmsnorm + rope) that use_liger_kernel patches in besides the
+        # loss; these still jit on the first real forward/backward if only the ce loss was warmed.
+        from liger_kernel.transformers.rms_norm import LigerRMSNorm
+        from liger_kernel.transformers.rope import liger_rotary_pos_emb
+
+        rms = LigerRMSNorm(hidden_size=256).to(device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        rms(x).sum().backward()
+        b, h, t, d = 1, 4, 64, 64
+        q = torch.randn(b, h, t, d, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(b, h, t, d, device="cuda", dtype=torch.bfloat16)
+        cos = torch.randn(b, t, d, device="cuda", dtype=torch.bfloat16)
+        sin = torch.randn(b, t, d, device="cuda", dtype=torch.bfloat16)
+        liger_rotary_pos_emb(q, k, cos, sin)
+        torch.cuda.synchronize()
+        _log("liger model-layer kernels (rmsnorm/rope) compiled")
+        warmed = True
+    except Exception as e:
+        _log(f"liger model-layer warm skipped: {e}")
     return warmed
 
 
 def warm_fla_gdn(torch) -> bool:
     """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path)."""
     try:
+        # mirror the worker boot: on Hopper (sm90) the production path runs this first so fla's GDN
+        # chunk_bwd uses the CORRECT tilelang backend (fla #640: the Triton path miscomputes/raises).
+        # off-Hopper this is a no-op. bake the same backend the runtime will actually select.
+        try:
+            from flash.engine.worker.perf import _ensure_fla_fastpath_on_hopper
+
+            _ensure_fla_fastpath_on_hopper()
+        except Exception as e:
+            _log(f"hopper fla fast-path setup skipped: {e}")
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
         b, h, t, d = 1, 4, 256, 64
@@ -165,6 +200,28 @@ def warm_fla_gdn(torch) -> bool:
         out.sum().backward()
         torch.cuda.synchronize()
         _log("flash-linear-attention GDN fwd/bwd compiled")
+        # also warm the varlen path SFT token-packing (#218) uses: BlockDiagonalCollator(emit_varlen=True)
+        # feeds cu_seq_lens into the fla DeltaNet so the recurrence resets per packed example, which
+        # compiles different chunk kernels than the equal-length call above. shape it like one packed
+        # block (batch flattened to 1) with two unequal segments.
+        try:
+            tv = 128 + 96  # two example lengths packed into one sequence
+            qv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            kv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            vv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            gv = torch.randn(1, tv, h, device="cuda", dtype=torch.float32, requires_grad=True)
+            betav = torch.rand(1, tv, h, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            cu = torch.tensor([0, 128, tv], device="cuda", dtype=torch.int32)
+            outv = chunk_gated_delta_rule(
+                qv, kv, vv, gv, betav, use_qk_l2norm_in_kernel=True, cu_seqlens=cu
+            )
+            if isinstance(outv, tuple):
+                outv = outv[0]
+            outv.sum().backward()
+            torch.cuda.synchronize()
+            _log("flash-linear-attention GDN varlen (cu_seqlens) fwd/bwd compiled")
+        except Exception as e:
+            _log(f"fla GDN varlen warm skipped: {e}")
         return True
     except Exception as e:
         _log(f"fla GDN warm skipped: {e}")
@@ -179,6 +236,14 @@ def warm_chalk_kernels() -> bool:
 
         warmed = bool(install_qwen35_rope()) or warmed
         warmed = bool(install_fused_lora_delta()) or warmed
+        # embedding gather is chalk's third default gap-filler (chalk_kernels._KERNELS); import it
+        # separately so a name/version skew can't also drop the rope + lora-delta warms above.
+        try:
+            from chalk.transformers import install_fused_embedding
+
+            warmed = bool(install_fused_embedding()) or warmed
+        except Exception as e:
+            _log(f"chalk fused-embedding warm skipped: {e}")
         _log(f"chalk default kernel installers ran (warmed={warmed})")
     except Exception as e:
         _log(f"chalk warm skipped: {e}")
@@ -263,6 +328,17 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
     torch = _require_gpu()
     if torch is None:
         return 1
+    if arch:
+        # --arch pins the compile target but the JIT/source builds still key off the LIVE GPU; if they
+        # disagree the bake records the physical sm while arch-pinned artifacts target another arch.
+        # surface the mismatch instead of silently baking a misleading cache.
+        want_sm = "sm" + arch.replace(".", "")
+        live_sm = _torch_sm(torch)
+        if want_sm != live_sm:
+            _log(
+                f"WARNING: --arch {arch} ({want_sm}) does not match live GPU {live_sm}; "
+                "baked kernels target the live arch and metadata records it — re-run on a matching GPU"
+            )
     warmed = sum(
         [
             warm_flash_attn(torch),
