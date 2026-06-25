@@ -143,6 +143,38 @@ def test_launch_raises_when_no_stock(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=[], attempt=0)
 
 
+def test_regions_excludes_canada1_by_default(monkeypatch):
+    """CANADA-1 (known broken-driver on-demand fleet) is dropped from the region list by default, so
+    the allocator + launcher never offer or boot there. The API still returns it; flash filters it."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(
+        hs_api,
+        "request_with_retries",
+        lambda *a, **k: {"regions": [{"name": "NORWAY-1"}, {"name": "CANADA-1"}, {"name": "US-1"}]},
+    )
+    monkeypatch.delenv("HYPERSTACK_BLOCKED_REGIONS", raising=False)
+    regions = hs_api._regions()
+    assert "CANADA-1" not in regions
+    assert regions == ["NORWAY-1", "US-1"]
+
+
+def test_regions_blocklist_is_env_overridable(monkeypatch):
+    """HYPERSTACK_BLOCKED_REGIONS overrides the default: set to "" re-enables CANADA-1 (operator
+    opt-in once the fleet recovers); set to another region blocks that instead."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(
+        hs_api,
+        "request_with_retries",
+        lambda *a, **k: {"regions": [{"name": "NORWAY-1"}, {"name": "CANADA-1"}, {"name": "US-1"}]},
+    )
+    monkeypatch.setenv("HYPERSTACK_BLOCKED_REGIONS", "")  # explicit empty -> nothing blocked
+    assert "CANADA-1" in hs_api._regions()
+    monkeypatch.setenv("HYPERSTACK_BLOCKED_REGIONS", "norway-1, us-1")  # case-insensitive
+    assert hs_api._regions() == ["CANADA-1"]
+
+
 def test_throwaway_keypair_missing_ssh_keygen_is_clear_error(monkeypatch):
     """A slim control plane without ssh-keygen must raise an actionable HyperstackApiError (install
     openssh-client / pin HYPERSTACK_KEYPAIR_NAME), not a bare FileNotFoundError that reads like an
