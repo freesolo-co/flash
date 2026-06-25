@@ -393,8 +393,9 @@ class Provider(Protocol):
     ) -> PollResult:
         """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll.
 
-        ``on_last_gpu`` is True when the runner's gpu-walk has reached the last candidate class
-        (no next-best to fall to), so capacity backstops should wait longer before giving up.
+        ``on_last_gpu`` is True when no further GPU attempt will be made after this one — either the
+        candidate list is exhausted or the retry budget is exhausted — so there is no next-best class to fall
+        to and capacity backstops should wait longer before giving up.
         """
         ...
 

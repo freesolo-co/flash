@@ -933,13 +933,15 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
         assert orch.get_status("code-crash").state == "failed"
 
 
-def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
-    # The candidate walk steps to the next-cheapest class on each infra retry but CLAMPS at
-    # the last fitting candidate — it must never index past the ranked list. Force a VRAM need that
-    # only the 80 GB+ VALIDATED tier satisfies, then trim the ranked candidate list to exactly the
-    # two cheapest 80 GB classes (A100 PCIe, A100 SXM) for a clean walk+clamp assertion: attempt 0
-    # takes the cheaper (A100 PCIe @ $1.39), attempt 1 walks to the pricier (A100 SXM @ $1.49),
-    # attempt 2's walk offset clamps back onto that same last class.
+def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch):
+    # The candidate walk steps to the next class on each infra retry, then — once every distinct
+    # class on the (single) provider has been tried — falls back to the CHEAPEST one rather than
+    # clamping on the priciest (no point re-rolling the most expensive card when re-trying an
+    # already-tried option). It must never index past the ranked list. Force a VRAM need that only
+    # the 80 GB+ VALIDATED tier satisfies, then trim the ranked candidate list to exactly the two
+    # cheapest 80 GB classes (A100 PCIe, A100 SXM): attempt 0 takes the cheaper (A100 PCIe @ $1.39),
+    # attempt 1 walks to the pricier (A100 SXM @ $1.49), attempt 2 (both now tried) re-rolls the
+    # cheapest (A100 PCIe).
     import dataclasses
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -986,8 +988,8 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         orch.submit_job(spec, dry_run=False, background=False)
 
         assert orch.get_status("clamp").state == "done"
-        # Walk advances to the last candidate then clamps on it (never out of range).
-        assert gpus_seen == ["A100 PCIe", "A100 SXM", "A100 SXM"]
+        # Walk advances through both classes, then re-rolls the cheapest (never out of range).
+        assert gpus_seen == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
 
 
 def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
