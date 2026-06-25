@@ -1552,7 +1552,13 @@ def rl_per_device_comps(
     # reference seq the ceiling is the historical default, and seq_scale is clamped to 1.0 so
     # vram_cap == the old colocate cap -> the result is byte-for-byte the old value (no regression,
     # no unvalidated long-seq growth).
-    ceiling = _RL_PER_DEVICE_MAX if short_seq else default
+    #
+    # THINKING runs are EXCLUDED from the growth path: they emit long completions whose
+    # activation/logprob cost the prompt-only `seq_len` gate cannot see, so letting short-seq
+    # growth raise the ceiling to _RL_PER_DEVICE_MAX would silently override the conservative
+    # thinking default (2) and risk OOM / unstable training. They keep `default` as the ceiling,
+    # i.e. byte-for-byte the historical value.
+    ceiling = _RL_PER_DEVICE_MAX if (short_seq and not THINKING) else default
     return max(1, min(ceiling, logits_cap, vram_cap))
 
 
