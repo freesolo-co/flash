@@ -2616,9 +2616,10 @@ def _load_kernel_cache_if_present() -> bool:
         )
         return True
     except Exception as e:
-        # never block boot on a bad/absent cache: fall back to the normal JIT path.
-        print(f"[kernel-cache] load skipped ({e}) -> first-run JIT fallback")
-        return False
+        # never block boot on a bad/absent cache: fall back to the normal JIT path. repoint off the
+        # baked trees too — if the mega blob was present + arch-matched but load raised, the on-disk
+        # triton/inductor entries may be partial/corrupt, so JIT fresh into scratch.
+        return _reject(f"load skipped ({e})")
 
 
 def wandb_finish(exit_code: int = 0) -> None:
