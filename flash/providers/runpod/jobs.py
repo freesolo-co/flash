@@ -89,7 +89,11 @@ _SETUP_HEARTBEAT_STAGES = frozenset(
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
-    run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
+    run uses the same tuning as the original submit. The original submit's ``on_last_gpu`` is
+    PERSISTED in the run handle (the runner's ``on_handle`` writes it into ``remote``), so a
+    cross-process reattach (``RunpodProvider.poll``) reads it back and calls this with the same
+    value — a last-candidate run keeps its longer no-capacity grace after a control-plane restart
+    instead of being judged on the shorter non-last window. ``stall_after_s`` = post-training-heartbeat
     window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat;
     ``queue_grace_s``/``throttled_grace_s`` = the two no-capacity backstops — how long a job may
     sit IN_QUEUE with no worker (``queue_grace_s``) or wait on a worker stuck THROTTLED

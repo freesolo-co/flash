@@ -223,3 +223,53 @@ def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch)
     # Already pinned.
     pinned = JobSpec(environment=EnvironmentSpec(id=_GH_ENV, resolved_sha="c" * 40))
     assert runner._assign_resolved_env_sha(pinned).environment.resolved_sha == "c" * 40
+
+
+def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_path):
+    """#217: submit_job(background=True) (the managed API path) must NOT resolve the env ref->sha
+    synchronously — the GitHub commits API is on a thread, so a slow/rate-limited resolve cannot
+    block or delay run creation. The status is saved + reported FIRST, then the pin is deferred into
+    the background run thread."""
+    import threading
+
+    from flash import runner
+    from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    main_thread = threading.current_thread().ident
+    resolve_threads: list[int | None] = []
+    ran = threading.Event()
+
+    def fake_resolve(spec):
+        # Record WHICH thread asked for the env-sha pin (creation path vs background thread).
+        resolve_threads.append(threading.current_thread().ident)
+        return spec
+
+    def fake_run_job(spec, **kwargs):
+        ran.set()
+
+    monkeypatch.setattr(runner, "_assign_resolved_env_sha", fake_resolve)
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
+
+    spec = JobSpec(
+        run_id="flash-bg-resolve",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=1, seeds=(0,)),
+        gpu=GpuSpec(type="RTX 4090"),
+        environment=EnvironmentSpec(id=_GH_ENV),
+    )
+    status = runner.submit_job(spec, background=True)
+
+    # Run creation returned immediately with a persisted queued record...
+    assert status.run_id == "flash-bg-resolve"
+    assert runner.get_status("flash-bg-resolve").state == "queued"
+    # ...and the env-sha resolve had NOT run on the creating (request) thread by the time we returned.
+    assert main_thread not in resolve_threads
+
+    # The background thread resolves the pin (off the critical path) and then runs the job.
+    assert ran.wait(timeout=5.0)
+    assert resolve_threads, "background thread must resolve the env ref->sha"
+    assert all(tid != main_thread for tid in resolve_threads)
