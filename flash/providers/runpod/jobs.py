@@ -363,7 +363,11 @@ def deploy_train_endpoint(
 
     ``endpoint_kwargs`` overrides the volume/datacenter attachment (default: the full multi-DC
     weight-cache fleet from ``weight_cache_endpoint_kwargs(spec)``). The preload driver passes a
-    SINGLE-DC volume+datacenter so the worker provably lands in that region and warms its volume.
+    SINGLE-DC volume+datacenter so the worker provably lands in that region and warms its volume. It
+    may be a dict OR a zero-arg FACTORY: under a multi-key pool the deploy retries on the next account
+    after a quota failover, and the SDK can stamp an account-scoped id onto a NetworkVolume object —
+    so a callable is re-invoked per account to build a FRESH volume (else the next account reuses the
+    first account's stale volume id and the single-DC preload fails).
     """
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
@@ -407,10 +411,10 @@ def deploy_train_endpoint(
             # Attach the multi-region weight cache (best-effort: {} when no cache / on any error).
             # The endpoint is allowed across every cache DC, so it is NOT pinned to one region.
             # A caller (preload) may override with a single-DC volume+datacenter.
-            kwargs.update(
-                endpoint_kwargs if endpoint_kwargs is not None
-                else weight_cache_endpoint_kwargs(spec)
-            )
+            # Resolve a factory FRESH on each account attempt (see docstring: avoids reusing a
+            # NetworkVolume the SDK stamped with the prior account's id across a quota failover).
+            override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
+            kwargs.update(override if override is not None else weight_cache_endpoint_kwargs(spec))
             ep = Endpoint(**kwargs)
             ep._qb_target = _train_body
             config = ep._build_resource_config()

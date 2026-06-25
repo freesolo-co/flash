@@ -811,13 +811,18 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
 
     assert out["status"] == "ok"
     assert out["result"]["preloaded"] == ["Qwen/Qwen3.5-0.8B"]
+    # endpoint_kwargs is a FACTORY (re-invoked per account on failover) — build a fresh override.
+    factory = calls["endpoint_kwargs"]
+    assert callable(factory)
+    ek = factory()
     # pinned to exactly ONE datacenter, with that DC's single volume
-    ek = calls["endpoint_kwargs"]
     assert len(ek["volume"]) == 1
     assert [d.value for d in ek["datacenter"]] == ["EU-RO-1"]
     assert ek["volume"][0].dataCenterId.value == "EU-RO-1"
     # preload warms the SAME per-DC physical name a training run in this DC will mount
     assert ek["volume"][0].name == "flash-weights-eu-ro-1"
+    # each invocation builds a FRESH NetworkVolume (so a failover account never reuses a stale id)
+    assert factory()["volume"][0] is not ek["volume"][0]
     # preload payload: download-only, HF_HOME on the mount, token forwarded
     p = submitted["payload"]
     assert p["mode"] == "preload"

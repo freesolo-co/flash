@@ -103,8 +103,16 @@ def _preload_one_dc(
     # SAME per-DC physical name the training path uses (weight_cache_volume_name), so preload warms
     # exactly the volume a later run in this DC will mount.
     vol_name = weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, dc)
-    vol = NetworkVolume(name=vol_name, size=WEIGHT_CACHE_VOLUME_GB, datacenter=dc)
-    endpoint_kwargs = {"volume": [vol], "datacenter": [dc]}
+    # Pass a FACTORY (not a prebuilt dict): deploy_train_endpoint may fail over across accounts under
+    # a multi-key pool, and the SDK stamps an account-scoped id onto a NetworkVolume — so each account
+    # attempt must build a fresh volume, else the next account reuses the first's stale id and the
+    # single-DC preload fails.
+    def _endpoint_kwargs():
+        return {
+            "volume": [NetworkVolume(name=vol_name, size=WEIGHT_CACHE_VOLUME_GB, datacenter=dc)],
+            "datacenter": [dc],
+        }
+
     endpoint_id = None
     try:
         endpoint_id, _name = deploy_train_endpoint(
@@ -115,7 +123,7 @@ def _preload_one_dc(
             # long-lived control plane. A fresh suffix each run sidesteps that.
             name_suffix=f"preload-{dc_id.lower()}-{uuid.uuid4().hex[:6]}",
             spec=None,
-            endpoint_kwargs=endpoint_kwargs,
+            endpoint_kwargs=_endpoint_kwargs,
         )
         # HF_HUB_ENABLE_HF_TRANSFER is exported by the worker image (Dockerfile.worker ENV), so it is
         # not passed here — only HF_HOME (the per-region mount) and the token need overriding.
