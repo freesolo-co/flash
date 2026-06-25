@@ -108,8 +108,14 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
 
     def upload_console_tail(extra: str = "") -> None:
         tail_path = console + ".tail"
-        with open(console) as f:
-            tail = f.read()[-64_000:]
+        # Seek to the last 64k instead of reading the whole file: on long-running jobs the
+        # console grows unbounded and this runs on a periodic loop, so an O(n) read each pass
+        # would balloon the bootstrap container's memory/time. Read binary + decode with
+        # errors="replace" so a seek landing mid-UTF-8-sequence can't raise.
+        with open(console, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 64_000))
+            tail = f.read().decode("utf-8", "replace")
         if extra:
             tail += extra
         with open(tail_path, "w") as f:
