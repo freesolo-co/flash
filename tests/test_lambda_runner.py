@@ -512,11 +512,11 @@ def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boo
         def read(force=False):
             if path.endswith("/DONE"):
                 return done() if callable(done) else done
-            if "lambda_attempt" in path:
+            if "lambda_attempt" in path and path.endswith(".json"):  # not the _boot.log
                 return marker() if callable(marker) else marker
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
-            if path.endswith("lambda_boot.log"):
+            if path.endswith("_boot.log"):  # attempt-scoped: lambda_attempt<N>_boot.log
                 return boot() if callable(boot) else boot
             if "/error_" in path:
                 return error() if callable(error) else error
@@ -642,7 +642,10 @@ def test_poll_loading_timeout(monkeypatch):
 
 def test_poll_heartbeat_stall(monkeypatch):
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
-    frozen = {"stage": "rl", "step": 3, "ts": 1.0}
+    # A FRESH training heartbeat (ts >= launch 10_000) that then FROZE: it proves liveness (so the
+    # fast first-liveness failover is satisfied) AND arms the tight training stall window, so the
+    # subsequent no-progress gap past stall_after_s is the stall actually under test here.
+    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0}
     res = jobs.poll_lambda_job(
         _handle(),
         _spec(),
@@ -654,6 +657,105 @@ def test_poll_heartbeat_stall(monkeypatch):
     assert not res.ok
     assert res.failure == "stalled"
     assert "no worker progress" in res.detail
+
+
+def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
+    """The observed Lambda us-east-1 sick region: the instance reaches OS 'active' but the worker
+    NEVER starts — no host boot.log, no heartbeat, no marker. The first-liveness deadline fails it
+    over fast as a retriable 'stalled' (escaped cross-provider by the runner) instead of burning the
+    full ~50 min setup grace."""
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=500.0)
+    assert not res.ok
+    assert res.failure == "stalled"  # infra-shaped -> retried + escaped cross-provider (PR #241)
+    assert "no worker liveness" in res.detail
+    assert "limit 500s" in res.detail
+
+
+def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
+    """A HEALTHY box still in its long cold start (multi-GB image pull) emits the host boot.log but
+    no heartbeat yet — the first-liveness deadline must NOT fire (that would kill a good box). Modeled
+    by an active box whose attempt-scoped boot.log is present; it later dies, so the terminal result
+    is job_preempted, NOT the 'no worker liveness' stalled."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        boot="+ docker pull ... (still pulling the worker image)",
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert not res.ok
+    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
+    """Any FRESH heartbeat (even the early 'boot' stage) proves the worker started, so the
+    first-liveness deadline is satisfied and must not fire."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        first_liveness_s=50.0,
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
+    )
+    assert res.failure == "job_preempted"
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_stale_heartbeat_does_not_satisfy_liveness(monkeypatch):
+    """A LEFTOVER heartbeat from a PRIOR attempt (ts < this launch; the heartbeat path is not
+    attempt-scoped) must NOT disarm the deadline — otherwise the retry INTO the sick region it must
+    catch would be let through. With no fresh boot.log either, first-liveness still fires."""
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=10_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        first_liveness_s=50.0,
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 1.0},  # < launch
+    )
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+
+
+def test_poll_reattach_already_active_anchors_liveness_to_launch(monkeypatch):
+    """On a reattach after a control-plane restart, the FIRST status read is already ACTIVE
+    (last_status starts None, so it is not a transition). active_since must stay anchored to LAUNCH,
+    so a box silent since before the restart fails over on the first tick rather than getting a fresh
+    full first-liveness window. (Clock starts 10_000; launch was 5_000s earlier.)"""
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=500.0
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+
+
+def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
+    """The host boot-log uploader must run BEFORE the docker image pull (so a box that ran cloud-init
+    leaves an HF liveness artifact within ~2 min, well before the worker's first heartbeat), and its
+    HF path must be attempt-scoped so a prior attempt's boot.log can't falsely prove liveness."""
+    from flash.providers.lambdalabs.jobs import builders
+
+    monkeypatch.setenv("LAMBDA_API_KEY", "lk")
+    monkeypatch.setenv("HF_TOKEN", "hf")
+    payload = builders.build_payload(_spec(), seed=0, attempt=2)
+    script = builders.build_user_data(payload)
+    # the uploader INVOCATION precedes the image pull
+    assert "python3 /opt/flash/hostlog.py" in script
+    assert "docker pull" in script
+    assert script.index("python3 /opt/flash/hostlog.py") < script.index("docker pull")
+    # attempt-scoped boot.log path is emitted by the embedded uploader
+    assert '_attempt" + str(att) + "_boot.log' in script
 
 
 def test_poll_recovery_seeds_load_clock_from_launch(monkeypatch):
@@ -750,7 +852,12 @@ def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
     measured from launch. (Clock starts 10_000; launch 9000; old heartbeat ts 8000 < launch.)"""
     import re
 
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    # boot.log present: the box DID run cloud-init THIS attempt (so the fast first-liveness failover
+    # is satisfied), isolating the behavior under test — a STALE heartbeat must not arm the tighter
+    # training stall, leaving the longer SETUP grace to govern.
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
+    )
     stale = {"stage": "rl", "step": 2, "ts": 8000.0}  # training stage, but predates this launch
     res = jobs.poll_lambda_job(
         _handle(started_ts=9_000.0),

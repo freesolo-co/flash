@@ -25,6 +25,7 @@ from collections.abc import Callable
 
 from flash._logging import get_logger
 from flash.providers._poll import (
+    FIRST_LIVENESS_S,
     PollErrorTracker,
     heartbeat_progress_ts,
     make_say,
@@ -324,12 +325,13 @@ def launch_and_submit(
 _make_hf_file_reader = make_hf_text_reader
 
 
-def _failure_detail(hf_repo: str, prefix: str, phase: str, marker: dict | None) -> str:
+def _failure_detail(hf_repo: str, prefix: str, phase: str, marker: dict | None, attempt: int) -> str:
     """Best root-cause detail we can assemble from the HF artifacts.
 
-    Lambda exposes NO instance console/log API, so the box's own ``lambda_boot.log`` (pushed to HF
-    by the cloud-init host uploader) is the substitute for Vast's ``instance_logs`` — the only home
-    of early-bootstrap failures (docker/GPU not ready, image-pull failure).
+    Lambda exposes NO instance console/log API, so the box's own attempt-scoped
+    ``lambda_attempt<N>_boot.log`` (pushed to HF by the cloud-init host uploader) is the substitute
+    for Vast's ``instance_logs`` — the only home of early-bootstrap failures (docker/GPU not ready,
+    image-pull failure). It is attempt-scoped so a retry reads ITS OWN boot log, not a prior one.
     """
     parts = []
     if marker and marker.get("error"):
@@ -337,9 +339,9 @@ def _failure_detail(hf_repo: str, prefix: str, phase: str, marker: dict | None) 
     err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{phase}.txt")(force=True)
     if err:
         parts.append(f"--- error_{phase}.txt ---\n{err[-2000:]}")
-    boot = _make_hf_file_reader(hf_repo, f"{prefix}/lambda_boot.log")(force=True)
+    boot = _make_hf_file_reader(hf_repo, f"{prefix}/lambda_attempt{attempt}_boot.log")(force=True)
     if boot:
-        parts.append(f"--- lambda_boot.log (host) ---\n{boot[-3000:]}")
+        parts.append(f"--- lambda_attempt{attempt}_boot.log (host) ---\n{boot[-3000:]}")
     return "\n".join(parts) or "lambda worker terminated without a DONE sentinel"
 
 
@@ -352,6 +354,7 @@ def poll_lambda_job(
     heartbeat_reader=None,
     setup_grace_s: float = SETUP_GRACE_S,
     stall_after_s: float = STALL_AFTER_S,
+    first_liveness_s: float = FIRST_LIVENESS_S,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll instance status + HF artifacts to a terminal state (cf. runpod.jobs.poll_job).
@@ -360,7 +363,9 @@ def poll_lambda_job(
     job_failed  attempt marker with ok=false (a real worker error; fails fast unless the worker
                 flagged it retriable).
     job_preempted  instance died without DONE/marker (host loss) -> infra-shaped, retried.
-    stalled     never became active within LOAD_TIMEOUT_S, heartbeat frozen, or deadline passed.
+    stalled     never became active within LOAD_TIMEOUT_S; OR became active but emitted NO liveness
+                (no boot.log/heartbeat) within ``first_liveness_s`` (sick region / worker never
+                started); OR heartbeat frozen past the setup/stall window; OR deadline passed.
     """
     say = make_say(log)
 
@@ -378,6 +383,13 @@ def poll_lambda_job(
         hf_repo, f"{prefix}/lambda_attempt{handle.attempt}.json", min_interval_s=60.0
     )
     metrics_reader = _make_hf_file_reader(hf_repo, f"{prefix}/metrics.json")
+    # Attempt-scoped host boot log: present within ~2 min iff THIS attempt's cloud-init actually ran
+    # (the host uploader starts before the image pull). Its ABSENCE while active is the signal that
+    # nothing ever started (see the first-liveness check). Throttled — only fetched once the deadline
+    # is in question, never on the hot path.
+    boot_log_reader = _make_hf_file_reader(
+        hf_repo, f"{prefix}/lambda_attempt{handle.attempt}_boot.log", min_interval_s=60.0
+    )
 
     def finish_ok(done_content: str | None = None) -> PollResult:
         raw = metrics_reader(force=True)
@@ -437,7 +449,7 @@ def poll_lambda_job(
         return PollResult(
             False,
             failure="job_preempted" if retriable else "job_failed",
-            detail=_failure_detail(hf_repo, prefix, spec.phase, marker),
+            detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.attempt),
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -469,7 +481,17 @@ def poll_lambda_job(
     last_hb_key = None
     last_progress = start
     became_active = False
+    # When this instance became active, anchored to launch (like last_progress) so a reattach whose
+    # first read is already ACTIVE measures the first-liveness window from the original launch — it
+    # does NOT hand a box that has been silent since before a control-plane restart a fresh window.
+    # Advanced to now only on a genuine inactive->active transition observed in this poll session.
+    active_since = start
     seen_training_hb = False
+    # Any FRESH heartbeat from THIS attempt (boot stage included) proves the worker started — clears
+    # the first-liveness deadline. Distinct from seen_training_hb (which gates only the tighter
+    # training stall window). A leftover prior-attempt heartbeat (ts < launch) is NOT fresh, so it
+    # cannot disarm the deadline on the retry into a sick region it must catch.
+    seen_fresh_hb = False
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
@@ -497,6 +519,8 @@ def poll_lambda_job(
             # launch worker a fresh full setup grace after every control-plane restart.
             if last_status is not None:
                 last_progress = time.time()
+                if status == "active":
+                    active_since = time.time()  # genuine inactive->active: start the liveness clock
             last_status = status
         if status == "active":
             became_active = True
@@ -529,7 +553,7 @@ def poll_lambda_job(
             return PollResult(
                 False,
                 failure="job_failed" if worker_crashed else "job_preempted",
-                detail=_failure_detail(hf_repo, prefix, spec.phase, None),
+                detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.attempt),
             )
 
         raw_marker = marker_reader()
@@ -570,11 +594,31 @@ def poll_lambda_job(
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts)
             if fresh:
                 last_progress = hb_ts
+                seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
                 if stage not in _SETUP_HEARTBEAT_STAGES:
                     seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
         if became_active:
+            # Fast failover for a box that reached OS 'active' but never started a worker (sick
+            # region / wedged cloud-init): no fresh heartbeat AND no attempt-scoped host boot.log. A
+            # healthy box — even one still pulling the multi-GB image — emits its boot.log within
+            # ~2 min, so the log's ABSENCE past first_liveness_s means cloud-init/the worker never
+            # ran. 'stalled' is infra-shaped, so the runner escapes it cross-provider (PR #241)
+            # instead of burning the full setup grace (~50 min). boot_log_reader() is consulted only
+            # AFTER the timer (short-circuit), so the normal cold-start path makes no extra HF read.
+            if (
+                not seen_fresh_hb
+                and time.time() - active_since > first_liveness_s
+                and not boot_log_reader()
+            ):
+                return PollResult(
+                    False,
+                    failure="stalled",
+                    detail=f"no worker liveness (boot.log/heartbeat) for "
+                    f"{int(time.time() - active_since)}s after instance became active "
+                    f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
+                )
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 phase = "training" if seen_training_hb else "setup (pre-training)"
@@ -619,7 +663,9 @@ def submit_run_lambda(
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         # On the last GPU class there is nowhere left to walk, so be more patient before giving up.
-        setup_grace = SETUP_GRACE_S * (1.5 if on_last_gpu else 1.0)
+        last_gpu_mult = 1.5 if on_last_gpu else 1.0
+        setup_grace = SETUP_GRACE_S * last_gpu_mult
+        first_liveness = FIRST_LIVENESS_S * last_gpu_mult
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
         return poll_lambda_job(
             handle,
@@ -628,6 +674,7 @@ def submit_run_lambda(
             log=log,
             heartbeat_reader=reader,
             setup_grace_s=setup_grace,
+            first_liveness_s=first_liveness,
             deadline_s=deadline,
         )
     finally:

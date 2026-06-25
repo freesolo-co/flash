@@ -432,11 +432,11 @@ def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None
         def read(force=False):
             if path.endswith("/DONE"):
                 return done() if callable(done) else done
-            if "hyperstack_attempt" in path:
+            if "hyperstack_attempt" in path and path.endswith(".json"):  # not the _boot.log
                 return marker() if callable(marker) else marker
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
-            if path.endswith("hyperstack_boot.log"):
+            if path.endswith("_boot.log"):  # attempt-scoped: hyperstack_attempt<N>_boot.log
                 return boot() if callable(boot) else boot
             return None
 
@@ -505,6 +505,31 @@ def test_poll_dead_vm_without_marker_is_preempted(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"
     assert "gpu never became ready" in res.detail
+
+
+def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
+    """Hyperstack CANADA-1 (or any HS region) equivalent of the Lambda sick-region case: a VM that
+    reaches ACTIVE but never starts a worker (no boot.log/heartbeat/marker) fails over fast as a
+    retriable 'stalled' instead of burning the full ~50 min setup grace."""
+    jobs = _wire_poll(monkeypatch, vms=[{"status": "ACTIVE"}], step=100.0)
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=500.0)
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+
+
+def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
+    """A healthy VM still pulling the image emits the boot.log but no heartbeat yet — the
+    first-liveness deadline must NOT fire."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot="+ docker pull ... (still pulling)",
+        step=100.0,
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"
+    assert "no worker liveness" not in (res.detail or "")
 
 
 def test_poll_loading_timeout(monkeypatch):
@@ -807,14 +832,20 @@ def test_allocator_capacity_aware(monkeypatch):
     monkeypatch.setenv("HYPERSTACK_API_KEY", "hk")
 
     def fake_usable(gpu):
-        if gpu == "L40":
+        if gpu == "RTX A6000":
+            return [
+                HyperstackInstance("RTX A6000", "n3-RTX-A6000x1", "NORWAY-1", "default-NORWAY-1", 48, 0.49)
+            ]
+        if gpu == "L40":  # in stock, but L40 is DROPPED from auto-allocation (broken-fleet only home)
             return [HyperstackInstance("L40", "n3-L40x1", "CANADA-1", "default-CANADA-1", 48, 1.00)]
         return []  # other hyperstack classes out of stock
 
     monkeypatch.setattr("flash.providers.hyperstack.jobs.usable_instances", fake_usable)
     a = allocator.allocate("Qwen/Qwen3.5-4B", "sft", train={"max_length": 4096, "lora_rank": 16})
     hs = {c.gpu for c in a.candidates if c.provider == "hyperstack"}
-    assert hs == {"L40"}  # only the in-stock class
+    # Only the in-stock, non-excluded class: capacity-aware filtering drops the out-of-stock classes,
+    # and L40 is excluded even though it HAS stock (its sole home is the broken CANADA-1 fleet).
+    assert hs == {"RTX A6000"}
 
 
 # --- review-fix regressions ---

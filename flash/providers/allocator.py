@@ -33,6 +33,14 @@ from flash.providers.base import (
 
 logger = get_logger(__name__)
 
+# Classes that stay in the catalog (the name resolves; provider runner machinery/tests use them) but
+# are NEVER auto-allocated. L40 is here because its only Flash home is Hyperstack's on-demand L40
+# stock — the CANADA-1 fleet, which shipped a broken NVIDIA driver — and it is strictly dominated by
+# RTX A6000 (same 48 GB, half the price, on all three providers). Excluding it at the candidate-
+# generation seam means the cheapest-fitting walk never lands on the broken fleet via L40, even if
+# CANADA-1 is re-enabled via HYPERSTACK_BLOCKED_REGIONS. See base.py's L40 row.
+_POOL_EXCLUDED = frozenset({"L40"})
+
 # "Comfortably" = the open-model VRAM estimate plus headroom, so a full SFT+GRPO run
 # never lands in check_fit's "tight" band by construction. Curated catalog entries
 # already carry measured minimums and are used as-is. The headroom (default 1.1 ==
@@ -81,7 +89,7 @@ def _runpod_candidates(need: int) -> list[Candidate]:
     return [
         Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb)
         for g in provider.gpu_classes()
-        if g.vram_gb >= need and g.validated
+        if g.vram_gb >= need and g.validated and g.name not in _POOL_EXCLUDED
     ]
 
 
@@ -100,7 +108,7 @@ def _lambda_candidates(need: int) -> list[Candidate]:
     out: list[Candidate] = []
     try:
         for g in provider.gpu_classes():
-            if g.vram_gb < need:
+            if g.vram_gb < need or g.name in _POOL_EXCLUDED:
                 continue
             # usable_instances reads the cached /instance-types, so only the first call hits the API.
             if usable_instances(g.name):
@@ -124,7 +132,7 @@ def _hyperstack_candidates(need: int) -> list[Candidate]:
     out: list[Candidate] = []
     try:
         for g in provider.gpu_classes():
-            if g.vram_gb < need:
+            if g.vram_gb < need or g.name in _POOL_EXCLUDED:
                 continue
             # usable_instances reads the cached /core/flavors, so only the first call hits the API.
             if usable_instances(g.name):

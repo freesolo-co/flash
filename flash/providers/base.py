@@ -103,8 +103,15 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.77,
     ),
-    # L40 48 GB (Ada, sm89): datacenter card on Hyperstack (+ Nebius/DO/Vultr/Scaleway), NOT on
-    # RunPod or Lambda. Hyperstack-only here. hourly_usd is the Hyperstack list price.
+    # L40 48 GB (Ada, sm89): a datacenter card whose only Flash home is Hyperstack (no RunPod L40 in
+    # the runpod_flash GpuType enum; not on Lambda). The class stays defined (so the name resolves and
+    # the Hyperstack runner machinery/tests keep working), but it is DROPPED FROM AUTO-ALLOCATION in
+    # ``allocator._POOL_EXCLUDED`` — Hyperstack's only on-demand L40 stock is the CANADA-1 fleet, which
+    # shipped a broken NVIDIA driver (NVML init fail / cuda_available=false; that region is also
+    # statically quarantined in hyperstack/api.py), and L40 is strictly DOMINATED by RTX A6000 (same
+    # 48 GB, $0.49 vs $1.00, on all three providers), so any job that fits on L40 fits on A6000 for
+    # half the price. Excluding it in the allocator means a run never lands on the broken fleet via
+    # L40 even if CANADA-1 is re-enabled via HYPERSTACK_BLOCKED_REGIONS. hourly_usd kept for reference.
     GpuClass("L40", None, 48, "l40", "sm89", 1.00, hyperstack_name="n3-L40x1"),
     # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
     # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
