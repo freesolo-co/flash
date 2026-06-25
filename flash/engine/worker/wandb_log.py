@@ -12,6 +12,7 @@ always resolves to the real top-level W&B package, never this sibling module.
 from __future__ import annotations
 
 import os
+import threading
 
 from flash.engine.worker._pkg import W as _w
 
@@ -80,3 +81,43 @@ def wandb_run_info() -> dict:
         }
     except Exception:
         return {}
+
+
+def wandb_finish(exit_code: int = 0) -> None:
+    """Finalize the W&B run before the worker's hard ``os._exit()``.
+
+    The worker hard-exits to dodge the colocated-vLLM teardown deadlock (see main),
+    which skips wandb's atexit sync — so a *successfully completed* run was left
+    dangling and W&B eventually marked it ``crashed`` even though all metrics were
+    logged. Explicitly finish the run (we own it: we called ``wandb.init`` in
+    ``wandb_report_to``) so it shows ``finished``. Best-effort; never raises (W&B is
+    optional, metrics.json is the source of truth)."""
+    if not os.environ.get("WANDB_API_KEY"):
+        return
+    import importlib.util
+
+    if importlib.util.find_spec("wandb") is None:
+        return
+    try:
+        import wandb
+
+        if getattr(wandb, "run", None) is None:
+            return
+
+        errs: list[Exception] = []
+
+        def _finish() -> None:
+            try:
+                wandb.finish(exit_code=exit_code)
+            except Exception as e:
+                errs.append(e)
+
+        t = threading.Thread(target=_finish, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        if t.is_alive():
+            print("[wandb] finish() timed out; continuing with hard exit")
+        elif errs:
+            print(f"[wandb] finish() warning: {errs[0]}")
+    except Exception as e:  # pragma: no cover - logging-only path
+        print(f"[wandb] finish() warning: {e}")

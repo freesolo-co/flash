@@ -150,6 +150,7 @@ from flash.engine.worker.perf import (
 from flash.engine.worker.rl import run_rl
 from flash.engine.worker.sft import run_sft
 from flash.engine.worker.wandb_log import (
+    wandb_finish,
     wandb_report_to,
     wandb_run_info,
     wandb_run_name,
@@ -326,6 +327,7 @@ def main():
         # handler's *blocking* `subprocess.run` (heartbeat frozen at "rl_train_done") and the
         # whole run stalls until the wall-clock cap. Hard-exit to bypass the hanging teardown now that
         # every output is safely persisted.
+        wandb_finish(exit_code=0)  # mark the W&B run finished BEFORE os._exit (which skips wandb's atexit sync)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
@@ -352,6 +354,7 @@ def main():
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags)
         # keep container alive briefly so logs flush, then exit non-zero -> restart
+        wandb_finish(exit_code=1)  # finalize the W&B run as failed (don't leave it dangling -> "crashed")
         time.sleep(10)
         raise
 
@@ -465,6 +468,7 @@ __all__ = [
     "vllm_language_model_only_kwargs",
     "wait_for_gpu",
     # wandb
+    "wandb_finish",
     "wandb_report_to",
     "wandb_run_info",
     "wandb_run_name",
