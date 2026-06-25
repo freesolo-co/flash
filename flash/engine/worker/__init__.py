@@ -45,6 +45,12 @@ import json
 import os
 import sys
 import tempfile
+
+# Imported (unused in this hub) so ``worker.threading`` resolves to the stdlib module: tests patch
+# ``worker.threading.Thread`` to run the daemon HF-upload thread inline, and since ``threading`` is a
+# process-wide singleton the patch reaches the submodules' ``threading.Thread`` (e.g. hf.py). Dev's
+# pre-split monolith imported threading at top level, so this preserves that attribute on the package.
+import threading  # noqa: F401
 import time
 import traceback
 

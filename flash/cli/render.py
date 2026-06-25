@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import sys
 
+from flash._channel import CLI_NAME
+
 # Identity fields the control plane may return (flash/server/app.py `/v1/me`), in the
 # order we show them. ``key_prefix``/``kind`` render separately on the key line.
 _ROWS = (
@@ -249,7 +251,7 @@ def _rule(width: int | None = None) -> str:
 
 def header(cmd: str, desc: str | None = None) -> str:
     """Brand header line + a faint rule: the wordmark, the command, and an optional descriptor."""
-    mark = _paint("flash", _ACCENT, "1")
+    mark = _paint(CLI_NAME, _ACCENT, "1")
     sep = _paint(_glyph("›", ">"), _FAINT)  # noqa: RUF001 (the glyph is the point)
     line = f"{mark} {sep} {_bold(cmd)}"
     if desc:
@@ -363,7 +365,7 @@ def _color_json(obj, depth: int) -> str:
 
 def version(value: str) -> str:
     """The wordmark + version."""
-    mark = _paint("flash", _ACCENT, "1")
+    mark = _paint(CLI_NAME, _ACCENT, "1")
     return _safe(f"{mark} {_dim('v' + value)}")
 
 
