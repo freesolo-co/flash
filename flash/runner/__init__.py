@@ -94,6 +94,12 @@ class RunStatus:
     # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
+    # Wall-clock the run first went terminal (~training teardown). Stamped ONCE on the first
+    # terminal transition and never moved, so it survives later ``updated_at`` bumps from
+    # deploy / heartbeat / reconcile. Reconciliation uses it as the instance-billing ``run_end``:
+    # a run deployed after completion has ``updated_at`` = deploy time, which would over-bill the
+    # flat $/hr from launch until deployment instead of until training teardown. None pre-feature.
+    finished_at: float | None = None
     # Non-secret customer billing context, set for externally-submitted runs. Completion-time
     # billing uses this org id with the operator internal key; user API keys are not persisted.
     billing_context: dict | None = None
@@ -189,6 +195,52 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
+    """Resolve the environment's GitHub ref->SHA ONCE here so every worker in the fan-out boots from
+    an immutable pinned sha instead of each re-resolving the symbolic ref (e.g. "main") against the
+    GitHub commits API. A cold spawn wave of N workers otherwise fires N concurrent commit-API calls
+    and trips GitHub's secondary rate limit; a worker-side in-process cache cannot help, because
+    each worker is a separate process. Best-effort: any failure (no network/token, transient limit,
+    or a non-GitHub env) leaves resolved_sha empty and the worker resolves the ref itself via the
+    in-worker jittered retry + retriable-reschedule path, so submission never blocks on GitHub.
+    """
+    import logging
+
+    env_id = spec.environment.id
+    if not env_id or spec.environment.resolved_sha:
+        return spec
+    try:
+        from flash.envs.adapter import (
+            _parse_github_environment_ref,
+            _resolve_ref_sha,
+            is_managed_environment_slug,
+            managed_slug_to_github_ref,
+        )
+
+        ref_str = (
+            managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
+        )
+        parsed = _parse_github_environment_ref(ref_str)
+        if parsed is None:
+            return spec  # local/path or non-GitHub env: nothing to pin
+        # Fail fast: a single short request, no rate-limit sleeps. This best-effort pin must never
+        # delay/block run creation (esp. submit_job(background=True)); if GitHub is slow or limiting,
+        # we fall straight through and the worker resolves the ref itself with the full retry budget.
+        sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
+    except Exception as e:
+        # Never block submission on a control-plane resolve; the worker falls back to resolving the
+        # ref itself. Log for visibility (consistent with the rest of this module's logging).
+        logging.getLogger(__name__).warning(
+            "resolve-once: could not pin env ref->sha for %r (%s); worker will resolve", env_id, e
+        )
+        return spec
+    if not sha:
+        return spec
+    d = spec.to_dict()
+    d["environment"] = {**d["environment"], "resolved_sha": sha}
+    return JobSpec.from_dict(d)
+
+
 def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     """Daemon-thread entrypoint for background runs.
 
@@ -241,6 +293,11 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
     spec = _assign_managed_hf_repo(spec)
+    if not dry_run:
+        # Resolve the env ref->sha ONCE before fan-out so workers boot from the pin and skip the
+        # GitHub commits API (defuses the cold-spawn rate-limit wave). Skipped on dry-run: no
+        # workers fan out, and it avoids a network call on a preview/test submission.
+        spec = _assign_resolved_env_sha(spec)
     status = RunStatus(
         run_id=spec.run_id,
         state="queued",
@@ -406,8 +463,20 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         # thread is protected by the CAS below — cancel correctly loses to a real finish.
         if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
             return False
+        was_terminal = status.state in TERMINAL_STATES  # before this write overwrites updated_at
+        prev_updated_at = status.updated_at
         status.state = state
         status.updated_at = time.time()
+        # Freeze the training-teardown time on the FIRST terminal transition (and only then) so
+        # reconciliation has an immutable run-end even after deploy/heartbeat/reconcile later bump
+        # updated_at. A same-state terminal re-write (terminal field updates) keeps the original.
+        if state in TERMINAL_STATES and status.finished_at is None:
+            # A genuine non-terminal -> terminal transition: the just-set updated_at == teardown.
+            # But a LEGACY run (finished_at never stamped) that is ALREADY terminal and gets a
+            # same-state field-only touch (e.g. billing_state via _update(run_id, current_state,...))
+            # must backfill from the PRE-update updated_at -- the prior persisted terminal time --
+            # not the freshly-set now, which would skew run_end / the reconcile window.
+            status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
         _save_status(status)
