@@ -131,11 +131,11 @@ def test_image_per_sm_opt_in_selects_arch_tag(monkeypatch):
     assert builders.lambda_image("H100") == "ghcr.io/freesolo-co/flash-worker:hotfix"
 
 
-def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
+def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True, train_reached=False):
     from flash.providers import _instance_bootstrap as lb
 
     calls: list[str] = []
-    markers: list[tuple[bool, str, bool, bool]] = []
+    markers: list[tuple[bool, str, bool, bool, bool]] = []
     monkeypatch.setattr(
         lb,
         "load_payload",
@@ -157,9 +157,19 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     monkeypatch.setattr(
         lb,
         "write_attempt_marker",
-        lambda p, ok, error="", retriable=False, trained=False: markers.append((ok, error, retriable, trained)),
+        lambda p, ok, error="", retriable=False, trained=False, host_neutral=False: markers.append(
+            (ok, error, retriable, trained, host_neutral)
+        ),
     )
-    monkeypatch.setattr(lb.os.path, "exists", lambda p: metrics if "metrics.json" in p else False)
+
+    def _exists(p):
+        if "train_reached" in p:
+            return train_reached
+        if "metrics.json" in p:
+            return metrics
+        return False
+
+    monkeypatch.setattr(lb.os.path, "exists", _exists)
     return lb, calls, markers
 
 
@@ -167,20 +177,37 @@ def test_bootstrap_train_success(monkeypatch):
     lb, calls, markers = _bootstrap_env(monkeypatch)
     assert lb.main() == 0
     assert calls == ["sft"]  # one fresh worker process
-    # success marker, not retriable; trained=True (local metrics.json exists).
-    assert markers == [(True, "", False, True)]
+    # success marker, not retriable; trained=True (local metrics.json exists); host_neutral=False.
+    assert markers == [(True, "", False, True, False)]
 
 
 def test_bootstrap_fails_without_metrics(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
     assert lb.main() == 1
-    ok, error, retriable, trained = markers[0]
+    ok, error, retriable, trained, host_neutral = markers[0]
     assert not ok
     assert "metrics.json" in error
     # A genuine no-metrics crash (the worker never produced metrics) is a REAL failure, not infra:
     # it must NOT be flagged retriable (that would loop a deterministically-broken run).
     assert retriable is False
-    assert trained is False  # no local metrics -> training was NOT reached
+    assert trained is False  # no sentinel and no local metrics -> training was NOT reached
+    assert host_neutral is False  # non-retriable -> never host_neutral (worker-hb drives any quarantine)
+
+
+def test_bootstrap_marks_trained_when_adapter_upload_fails_before_metrics(monkeypatch):
+    """Thread 1: the REQUIRED adapter upload runs AFTER trainer.train() but BEFORE /tmp/metrics.json.
+    If it fails (RetriableInfraError), the worker exits non-zero with no metrics.json -> the bootstrap
+    still raises (the run did not finish), but the /tmp/train_reached sentinel (stamped right before the
+    upload) marks trained=True, so the poller treats it as a post-training failure on a HEALTHY region,
+    NOT a pre-training host fault -> no quarantine. metrics.json alone would miss this (it never lands)."""
+    lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=False, train_reached=True)
+    assert lb.main() == 1
+    ok, error, retriable, trained, host_neutral = markers[0]
+    assert not ok
+    assert "metrics.json" in error  # the run did NOT finish -> still fails/retries
+    assert trained is True  # sentinel proves training was reached -> poller does not quarantine
+    assert retriable is False  # a plain no-metrics RuntimeError; the worker's own hb drives the retry
+    assert host_neutral is False  # not a bootstrap-RAISED retriable failure
 
 
 def test_bootstrap_sets_lambda_arm():
@@ -736,6 +763,42 @@ def test_poll_trained_completion_upload_retry_not_quarantined(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"  # retriable upload failure -> retry on a fresh host
     assert not res.host_fault  # trained: post-training completion retry on a healthy region -> NO quarantine
+
+
+def test_poll_host_neutral_marker_not_quarantined(monkeypatch):
+    """A bootstrap-raised retriable marker flagged ``host_neutral`` (the pre-worker spilled-spec HF
+    fetch) is a region-INDEPENDENT delivery failure -- it would fail identically in any region -- so it
+    retries (job_preempted) WITHOUT quarantining the region, even pre-training (no fresh heartbeat)."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        marker=json.dumps(
+            {"ok": False, "attempt": 0, "retriable": True, "host_neutral": True,
+             "error": "failed to fetch the spilled job spec from HF"}
+        ),
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable -> retry on a fresh host
+    assert not res.host_fault  # host_neutral: HF-delivery failure, not a sick region -> NO quarantine
+
+
+def test_poll_host_failmark_still_quarantines(monkeypatch):
+    """The HOST cloud-init failmark (docker/GPU never ready) is a GENUINELY sick region: it sets
+    retriable=True but OMITS host_neutral (it is written by the host, not the in-container bootstrap),
+    so -- unlike a host_neutral bootstrap marker -- it must STILL quarantine the region. Guards the
+    host_neutral suppression from silently disabling real broken-region failover."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        marker=json.dumps(
+            {"ok": False, "attempt": 0, "retriable": True, "error": "host: docker run failed"}
+        ),
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable host fault -> retry on a fresh host
+    assert res.host_fault  # docker/GPU never ready, no host_neutral -> region quarantined
 
 
 def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
@@ -1836,13 +1899,16 @@ def test_bootstrap_honors_nonzero_exit_without_remote_artifacts(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
     assert lb.main() == 1
-    ok, error, retriable, trained = markers[0]
+    ok, error, retriable, trained, host_neutral = markers[0]
     assert not ok
     assert "non-zero" in error  # propagated as a real (retriable) failure, not a false ok=true
     assert retriable is True  # infra/upload failure -> retried, not job_failed
     # The worker REACHED end-of-training (local metrics.json exists); only the upload failed. trained=True
     # tells the poller this is a post-training completion retry on a HEALTHY region -> do NOT quarantine.
     assert trained is True
+    # A bootstrap-RAISED retriable failure (the required upload) is region-independent HF delivery, so it
+    # is host_neutral -> the poller never quarantines on it (defense-in-depth alongside trained).
+    assert host_neutral is True
 
 
 def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
@@ -1852,7 +1918,8 @@ def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
     assert lb.main() == 0
-    assert markers[0] == (True, "", False, True)  # ok, no error, not retriable, trained (metrics exist)
+    # ok, no error, not retriable, trained (metrics exist), not host_neutral (success).
+    assert markers[0] == (True, "", False, True, False)
 
 
 def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
@@ -1924,7 +1991,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""
     from flash.providers import _instance_bootstrap as lb
 
-    markers: list[tuple[bool, str, bool, bool]] = []
+    markers: list[tuple[bool, str, bool, bool, bool]] = []
     monkeypatch.setattr(
         lb,
         "load_payload",
@@ -1936,17 +2003,22 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
     monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503")))
-    monkeypatch.setattr(lb.os.path, "exists", lambda p: False)  # no local metrics (fails before training)
+    monkeypatch.setattr(lb.os.path, "exists", lambda p: False)  # no sentinel/metrics (fails before training)
     monkeypatch.setattr(
         lb, "write_attempt_marker",
-        lambda p, ok, error="", retriable=False, trained=False: markers.append((ok, error, retriable, trained)),
+        lambda p, ok, error="", retriable=False, trained=False, host_neutral=False: markers.append(
+            (ok, error, retriable, trained, host_neutral)
+        ),
     )
     assert lb.main() == 1
-    ok, error, retriable, trained = markers[0]
+    ok, error, retriable, trained, host_neutral = markers[0]
     assert not ok
     assert "spilled job spec" in error
     assert retriable is True
-    assert trained is False  # the spilled-spec fetch fails BEFORE training -> pre-training (region may quarantine)
+    assert trained is False  # the spilled-spec fetch fails BEFORE training -> pre-training
+    # ...but it is a region-INDEPENDENT HF read failure, so host_neutral=True keeps the poller from
+    # quarantining the (healthy) region for it -- it would fail identically in any region.
+    assert host_neutral is True
 
 
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):

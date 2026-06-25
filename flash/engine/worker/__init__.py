@@ -1309,6 +1309,9 @@ def run_sft():
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
+    # Training is fully done; record it locally BEFORE the first required upload so the bootstrap
+    # doesn't quarantine a healthy region if this adapter upload (which precedes metrics.json) fails.
+    mark_train_reached()
     hf_upload_folder(adapter_dir, "adapter", required=True)
     heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
@@ -2522,6 +2525,10 @@ def run_rl():
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
+    # Training is fully done (the no-reward guards above passed); record it locally BEFORE the first
+    # required upload so the bootstrap doesn't quarantine a healthy region if this adapter upload
+    # (which precedes metrics.json) fails.
+    mark_train_reached()
     hf_upload_folder(adapter_dir, "adapter", required=True)
     heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
@@ -2580,6 +2587,22 @@ def run_rl():
 # ---------------------------------------------------------------------------
 # Completion: train phase writes metrics.json + the DONE sentinel (see _finalize).
 # ---------------------------------------------------------------------------
+
+# Local sentinel that this attempt finished training (``trainer.train()`` returned), written BEFORE
+# the first REQUIRED upload (the trained adapter). The instance bootstrap reads it to tell a
+# post-training upload failure (the adapter/metrics/DONE never landed -> retriable, but the region
+# was healthy and productive) from a pre-training host fault. ``/tmp/metrics.json`` is written only
+# AFTER the adapter upload (see the SFT/RL paths), so on its own it can't cover a failure of that
+# adapter upload itself; this sentinel closes that gap. /tmp is shared with the bootstrap parent
+# process (same container), so a literal path (not an import) is the contract — keep it in sync with
+# _instance_bootstrap.py's reader.
+TRAIN_REACHED_SENTINEL = "/tmp/train_reached"
+
+
+def mark_train_reached() -> None:
+    """Stamp the post-training sentinel right before the first required upload (best-effort)."""
+    with contextlib.suppress(OSError), open(TRAIN_REACHED_SENTINEL, "w") as f:
+        f.write("1")
 
 
 def write_train_meta(

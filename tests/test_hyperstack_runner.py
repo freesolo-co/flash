@@ -643,6 +643,40 @@ def test_poll_trained_completion_upload_retry_not_quarantined(monkeypatch):
     assert not res.host_fault  # trained: post-training completion retry on a healthy region -> NO quarantine
 
 
+def test_poll_host_neutral_marker_not_quarantined(monkeypatch):
+    """A bootstrap-raised retriable marker flagged ``host_neutral`` (the pre-worker spilled-spec HF
+    fetch) is a region-INDEPENDENT delivery failure, so it retries (job_preempted) WITHOUT quarantining
+    the region even pre-training (no fresh heartbeat). Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}],
+        marker=json.dumps(
+            {"ok": False, "attempt": 0, "retriable": True, "host_neutral": True,
+             "error": "failed to fetch the spilled job spec from HF"}
+        ),
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable -> retry on a fresh host
+    assert not res.host_fault  # host_neutral: HF-delivery failure, not a sick region -> NO quarantine
+
+
+def test_poll_host_failmark_still_quarantines(monkeypatch):
+    """The HOST cloud-init failmark (docker/GPU never ready) sets retriable=True but OMITS host_neutral
+    (it is written by the host, not the in-container bootstrap), so it must STILL quarantine the region
+    -- guarding the host_neutral suppression from disabling real broken-region failover (the CANADA-1
+    case). Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}],
+        marker=json.dumps(
+            {"ok": False, "attempt": 0, "retriable": True, "error": "host: docker run failed"}
+        ),
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable host fault -> retry on a fresh host
+    assert res.host_fault  # docker/GPU never ready, no host_neutral -> region quarantined
+
+
 def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
     """On a reattach whose first poll already sees the VM active, active_since is launch-anchored, so
     the launch-relative first_liveness deadline is already blown. The observed-grace floor stops a VM

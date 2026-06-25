@@ -559,11 +559,15 @@ def poll_lambda_job(
             # heartbeat) -- a stale prior-attempt retriable heartbeat must not quarantine a healthy region
             # for THIS attempt's non-retriable error -- even though the (lenient) retry classification
             # above still honors the seed-scoped heartbeat. A marker flagged ``trained`` (the worker
-            # reached end-of-training; only the DONE/metrics UPLOAD failed -> retriable) is a post-training
-            # completion retry on a HEALTHY region, NOT a pre-training host fault -> never quarantine.
+            # reached end-of-training; only the adapter/DONE/metrics UPLOAD failed -> retriable) is a
+            # post-training completion retry on a HEALTHY region, NOT a pre-training host fault. And a
+            # marker flagged ``host_neutral`` is a bootstrap-raised region-independent HF-delivery
+            # failure (the spilled-spec fetch / a required-artifact upload) -> not a sick region; only
+            # the HOST cloud-init failmark (docker/GPU never ready), which omits the flag, quarantines.
             host_fault=(marker_retriable or fresh_retriable_hb())
             and not reached_training_now()
-            and not bool(marker and marker.get("trained")),
+            and not bool(marker and marker.get("trained"))
+            and not bool(marker and marker.get("host_neutral")),
         )
 
     def terminal_artifact_result() -> PollResult | None:
