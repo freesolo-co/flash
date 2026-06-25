@@ -221,7 +221,11 @@ def main() -> int:
                 f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF dataset repo"
             )
         ok = True
-    except Exception as exc:
+    except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt
+        # SIGTERM (docker stop / wall cap) raises SystemExit via the handler above; catching only
+        # Exception would skip it, uploading an ok=false marker with an EMPTY error and obscuring the
+        # cause from reattach/debugging. BaseException records a useful error and still re-exits
+        # nonzero (return 1) with the marker written in `finally`.
         error = f"{type(exc).__name__}: {exc}"
         print(f"bootstrap failed: {error}", flush=True)
     finally:

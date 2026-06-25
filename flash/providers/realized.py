@@ -63,16 +63,18 @@ def _instance_realized_cost(
     rate persisted) so the run stays unreconciled rather than booking $0.
     """
     rate = remote.get("hourly_usd")
-    if not rate:
+    rid = remote.get("instance_id") or remote.get("vm_id")
+    # Honor the module contract: no rate OR no auditable resource id -> unattributable (None), so the
+    # run stays unreconciled rather than booking instance cost we can't tie to a resource.
+    if not rate or not rid:
         return None
     launch = remote.get("started_ts") or start
     wall = max(0.0, float(end) - float(launch))
     usd = round(wall / 3600.0 * float(rate), 6)
-    rid = remote.get("instance_id") or remote.get("vm_id")
     return RealizedCost(
         provider=str(remote.get("provider")),
         realized_usd=usd,
         by_resource={"gpu": usd},
         wall_seconds=wall,
-        source={"resource_id": rid, "hourly_usd": float(rate), "started_ts": float(launch)},
+        source={"resource_id": str(rid), "hourly_usd": float(rate), "started_ts": float(launch)},
     )

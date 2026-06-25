@@ -146,11 +146,12 @@ def allocate(
 
     There is no GPU pin — every fitting class on every available provider is eligible, and the
     cheapest wins. RunPod is restricted to its validated pool (``GpuClass.validated``) because the
-    deployed control plane rejects a submit for any non-validated class; Lambda (opt-in via
-    LAMBDA_API_KEY) contributes its fitting classes that have live regional capacity. RunPod's
-    cheaper static rates usually win, with Lambda joining as a capacity complement lower in the
-    ranked list. ``train``/``thinking`` size the requirement to the run's actual knobs (context,
-    group, rank, batch) via the matrix.
+    deployed control plane rejects a submit for any non-validated class; the instance providers
+    (Lambda via LAMBDA_API_KEY, Hyperstack via HYPERSTACK_API_KEY — both opt-in) each contribute
+    their fitting classes that currently have live capacity/stock. RunPod's cheaper static rates
+    usually win, with Lambda and Hyperstack joining as capacity complements lower in the ranked list.
+    ``train``/``thinking`` size the requirement to the run's actual knobs (context, group, rank,
+    batch) via the matrix.
     """
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     available = available_providers()

@@ -93,29 +93,6 @@ except Exception:
     pass
 """
 
-# Host helper: on a CLEAN container exit (code 0), confirm the worker actually left a success
-# artifact on HF (DONE or metrics.json for this run). A clean exit normally means the worker finished
-# and uploaded its artifacts — genuine success, OR the already-complete-retry path that restores
-# metrics + writes its ok-marker (which the host must NOT clobber with a failure marker). But the
-# worker's HF uploads are best-effort, so an exit-0 with NO artifact (every upload failed) would
-# otherwise be read as success and idle the billed box until the setup-stall grace (~50 min). So:
-# artifact present -> exit 0 (real success; host writes no marker, never clobbers the worker's);
-# absent -> exit 1 so the caller writes a RETRIABLE failmark and the run fails fast on a fresh host.
-# If HF is unreachable from the box (can't tell), exit 0 — never destroy a possibly-good run; defer
-# to the poller's own stall detection. Reads creds from the on-box payload.json.
-_DONECHECK_PY = """\
-import json, sys
-try:
-    p = json.load(open("/opt/flash/payload.json"))
-    from huggingface_hub import HfApi
-    files = set(HfApi(token=(p.get("env") or {}).get("HF_TOKEN")).list_repo_files(
-        repo_id=p["hf_repo"], repo_type="dataset"))
-    pfx = p["hf_prefix"]
-    sys.exit(0 if (pfx + "/DONE" in files or pfx + "/metrics.json" in files) else 1)
-except Exception:
-    sys.exit(0)
-"""
-
 # Host helper: write the attempt-failure marker (<arm>_attempt<N>.json, ok=false, RETRIABLE) to HF
 # when the box can't even start the worker container (docker/GPU never ready, image pull failure).
 # Without it a pre-container failure leaves NO marker, so the poller would burn the whole setup
@@ -170,8 +147,6 @@ cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'
 {_HOSTLOG_PY}FLASH_HOSTLOG_EOF
 cat > /opt/flash/failmark.py <<'FLASH_FAILMARK_EOF'
 {_FAILMARK_PY}FLASH_FAILMARK_EOF
-cat > /opt/flash/donecheck.py <<'FLASH_DONECHECK_EOF'
-{_DONECHECK_PY}FLASH_DONECHECK_EOF
 IMAGE={image!r}
 # huggingface_hub on the host for the boot-log + failure-marker uploaders (best-effort).
 pip3 install -q huggingface_hub >/dev/null 2>&1 \\
@@ -197,19 +172,16 @@ docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
   -v /opt/flash:/root/flash -w /root/flash \\
   "$IMAGE" python /root/flash/bootstrap.py || fail "docker run failed"
 sleep 5
-# The container must be running OR have already exited CLEANLY: an already-complete retry restores
-# the prior metrics and writes DONE in well under 5s, so a clean exit (code 0) is success, not a
-# failed start. A non-zero exit (or never-started) fails fast. A clean exit is trusted ONLY if the
-# worker actually left a success artifact on HF (donecheck) — exit 0 with no artifact (all uploads
-# failed) fails fast too, instead of idling the box to the stall grace.
+# The container must be running OR have already exited CLEANLY. The bootstrap returns 0 ONLY on
+# genuine success (it confirms metrics.json and uploads its ok-marker first) — so an exit code of 0
+# is itself the success signal (e.g. an already-complete retry that finished in <5s), and the host
+# must NOT write any marker for it: the worker OWNS the attempt marker, and writing to that path here
+# would clobber its ok-marker (HF listing can lag the worker's just-finished upload). Only a NON-zero
+# exit (a real crash) — or a never-started container — gets the retriable host failmark.
 if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
   EXIT="$(docker inspect -f '{{{{.State.ExitCode}}}}' flashrun 2>/dev/null || echo 1)"
   docker logs flashrun >>/opt/flash/host_boot.log 2>&1 || true
-  if [ "$EXIT" = "0" ]; then
-    python3 /opt/flash/donecheck.py || fail "worker exited 0 but left no success artifact on HF"
-  else
-    fail "worker container did not start (exit ${{EXIT}})"
-  fi
+  [ "$EXIT" = "0" ] || fail "worker container did not start (exit ${{EXIT}})"
 fi
 # Mirror the container's stdout into the host boot log (detached) so an early in-container crash is
 # visible on HF even if it dies before uploading its own console artifact.

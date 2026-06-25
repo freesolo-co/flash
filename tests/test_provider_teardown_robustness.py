@@ -138,14 +138,12 @@ def test_user_data_fails_fast_and_throttles_bootlog():
     assert 'fail "worker container did not start' in s
     assert "sleep 120" in s  # boot-log throttled to 120s
     assert "sleep 30;" not in s  # NOT the old 30s-forever loop
-    # A fast CLEAN exit (already-complete retry restores metrics + DONE in <5s) is success, not a
-    # failed start: the script inspects the container exit code and only fails on a non-zero exit.
+    # A fast CLEAN exit (code 0 — an already-complete retry restores metrics + writes its ok-marker
+    # in <5s) is the success signal itself: the host inspects the exit code and writes the retriable
+    # failmark ONLY on a non-zero exit, so it never clobbers the worker's just-written ok-marker.
     assert "{{.State.ExitCode}}" in s
-    assert '[ "$EXIT" = "0" ]' in s
-    # ...but a clean exit (code 0) with NO success artifact on HF (all best-effort uploads failed)
-    # still fails fast via the host donecheck instead of idling the billed box to the stall grace.
-    assert "donecheck.py" in s
-    assert "worker exited 0 but left no success artifact" in s
+    assert '[ "$EXIT" = "0" ] || fail' in s
+    assert "donecheck" not in s  # no host-side HF check (it would race the worker's marker upload)
 
 
 def test_instance_realized_cost_is_wall_times_rate():
@@ -159,8 +157,9 @@ def test_instance_realized_cost_is_wall_times_rate():
     assert rc.realized_usd == 1.20  # 1h x $1.20
     assert rc.wall_seconds == 3600.0
     assert rc.by_resource == {"gpu": 1.20}
-    # no rate on the handle -> unattributable (stays unreconciled, never books $0)
+    # no rate, or no auditable resource id -> unattributable (stays unreconciled, never books cost)
     assert realized_cost_for_remote({"provider": "hyperstack", "vm_id": "v"}, start=0, end=10) is None
+    assert realized_cost_for_remote({"provider": "lambda", "hourly_usd": 1.0}, start=0, end=10) is None
 
 
 def test_instance_realized_cost_uses_run_end_not_settle_padded_end():
