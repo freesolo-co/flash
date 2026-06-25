@@ -339,6 +339,13 @@ class PollResult:
     # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
     failure: str | None = None
     detail: str | None = None
+    # Set by the instance pollers (Lambda/Hyperstack) when the failure proves the REGION/HOST never
+    # got a worker to training — the instance reached 'active' but cloud-init/the worker never booted
+    # (first-liveness 'stalled'), or the GPU/driver never initialized before any training heartbeat
+    # (pre-training 'job_preempted'). The provider then quarantines that region (flash.providers.
+    # _health) so the allocator + the retry's region walk avoid it for a TTL, instead of re-rolling
+    # the same sick region. NOT set for a mid-training stall, no_capacity, or a genuine worker error.
+    host_fault: bool = False
 
 
 # ---------------------------------------------------------------------------

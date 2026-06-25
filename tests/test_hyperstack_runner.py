@@ -516,6 +516,7 @@ def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
     assert not res.ok
     assert res.failure == "stalled"
     assert "no worker liveness" in res.detail
+    assert res.host_fault  # region quarantined by submit_run_hyperstack on this result
 
 
 def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):

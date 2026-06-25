@@ -66,12 +66,17 @@ def usable_instances(gpu_class: str, force: bool = False) -> list[HyperstackInst
     Hyperstack prices per flavor (not per region), so every candidate carries the same $/hr; the
     list is the regions whose flavor currently advertises stock. Empty == no Hyperstack capacity now.
     """
+    from flash.providers._health import healthy_regions
     from flash.providers.hyperstack.gpus import flavor_for
     from flash.providers.hyperstack.pricing import hourly_rate
 
     info = GPU_INFO[gpu_class]
     flavor = flavor_for(gpu_class)
     rate = hourly_rate(gpu_class)
+    # Drop regions under a dynamic health quarantine (a region that recently failed a worker before
+    # training — see flash.providers._health), on top of the static HYPERSTACK_BLOCKED_REGIONS denylist
+    # already applied in regions_with_stock. Both the allocator and the launch walk read this.
+    regions = healthy_regions("hyperstack", hs_api.regions_with_stock(flavor, force=force))
     return [
         HyperstackInstance(
             gpu=gpu_class,
@@ -81,7 +86,7 @@ def usable_instances(gpu_class: str, force: bool = False) -> list[HyperstackInst
             vram_gb=info.vram_gb,
             price_usd_hr=rate,
         )
-        for region in hs_api.regions_with_stock(flavor, force=force)
+        for region in regions
     ]
 
 
@@ -394,6 +399,11 @@ def poll_hs_job(
             False,
             failure="job_preempted" if retriable else "job_failed",
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.attempt),
+            # A retriable failure BEFORE any training heartbeat is a host/GPU fault (broken driver,
+            # docker/GPU never ready) -> the region is sick (this is the CANADA-1 case). seen_training_hb
+            # is read at call time from the enclosing poll loop; a retriable crash after training
+            # started is NOT a region fault.
+            host_fault=retriable and not seen_training_hb,
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -488,6 +498,9 @@ def poll_hs_job(
                 False,
                 failure="job_preempted",
                 detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.attempt),
+                # A VM that died before any training heartbeat never got a worker productive in this
+                # region -> quarantine it; a loss after training is not a region fault.
+                host_fault=not seen_training_hb,
             )
 
         raw_marker = marker_reader()
@@ -563,6 +576,7 @@ def poll_hs_job(
                             detail=f"no worker liveness (boot.log/heartbeat) for "
                             f"{int(time.time() - active_since)}s after vm became active "
                             f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
+                            host_fault=True,  # the region never got the worker to boot -> quarantine it
                         )
                 else:
                     boot_log_seen = True
@@ -609,10 +623,18 @@ def submit_run_hyperstack(
         setup_grace = SETUP_GRACE_S * last_gpu_mult
         first_liveness = FIRST_LIVENESS_S * last_gpu_mult
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
-        return poll_hs_job(
+        res = poll_hs_job(
             handle, spec, seed, log=log, heartbeat_reader=reader,
             setup_grace_s=setup_grace, first_liveness_s=first_liveness, deadline_s=deadline,
         )
+        if res.host_fault and handle.region:
+            # The region proved sick (worker never reached training). Quarantine it so this run's
+            # retry AND other runs avoid it until the TTL self-heals, instead of re-rolling it.
+            from flash.providers._health import mark_region_sick
+
+            mark_region_sick("hyperstack", handle.region)
+            make_say(log)(f"region {handle.region} quarantined (host fault: {res.detail})")
+        return res
     finally:
         hs_api.delete_vm(handle.vm_id)
 

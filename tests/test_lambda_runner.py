@@ -657,6 +657,33 @@ def test_poll_heartbeat_stall(monkeypatch):
     assert not res.ok
     assert res.failure == "stalled"
     assert "no worker progress" in res.detail
+    # a mid-TRAINING stall is NOT a region fault (the region was working) -> no quarantine
+    assert not res.host_fault
+
+
+def test_submit_quarantines_region_on_host_fault(monkeypatch):
+    """When the poll returns a host fault (worker never reached training in this region),
+    submit_run_lambda quarantines the region so the next allocation/launch avoids it."""
+    import flash.providers._health as health
+    from flash.providers.base import PollResult
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    health.clear()
+    handle = _handle()  # region us-east-1
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
+    monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: handle)
+    monkeypatch.setattr(
+        jobs,
+        "poll_lambda_job",
+        lambda *a, **k: PollResult(False, failure="stalled", detail="no worker liveness", host_fault=True),
+    )
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: None)
+
+    assert not health.region_is_sick("lambda", "us-east-1")
+    res = jobs.submit_run_lambda(_spec(), seed=0)
+    assert res.host_fault
+    assert health.region_is_sick("lambda", "us-east-1")  # region now quarantined
 
 
 def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
@@ -670,6 +697,7 @@ def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
     assert res.failure == "stalled"  # infra-shaped -> retried + escaped cross-provider (PR #241)
     assert "no worker liveness" in res.detail
     assert "limit 500s" in res.detail
+    assert res.host_fault  # the region never booted a worker -> submit_run quarantines it
 
 
 def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
@@ -687,6 +715,8 @@ def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
     assert "no worker liveness" not in (res.detail or "")
+    # died before any training heartbeat -> still a host fault (region quarantined)
+    assert res.host_fault
 
 
 def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):

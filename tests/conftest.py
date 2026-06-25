@@ -43,5 +43,12 @@ def _offline(monkeypatch):
     import flash.providers.runpod.keys as rp_keys
 
     rp_keys.reset()
+
+    # Dynamic instance-provider region quarantine is process-global; clear it around every test so a
+    # region one test marks sick can't leak into the next.
+    import flash.providers._health as _health
+
+    _health.clear()
     yield
     rp_keys.reset()
+    _health.clear()

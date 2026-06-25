@@ -103,12 +103,17 @@ def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance
     in-launch refresh so it can actually discover newly-freed regions rather than re-reading the
     just-populated allocation cache.
     """
+    from flash.providers._health import healthy_regions
     from flash.providers.lambdalabs.gpus import instance_type_for
     from flash.providers.lambdalabs.pricing import hourly_rate
 
     info = GPU_INFO[gpu_class]
     itype = instance_type_for(gpu_class)
     rate = hourly_rate(gpu_class)
+    # Drop regions under a dynamic health quarantine (a region that recently failed a worker before
+    # training — see flash.providers._health). Both the allocator's capacity view and the launch
+    # region walk read this, so a sick region is avoided everywhere until its TTL self-heals.
+    regions = healthy_regions("lambda", lambda_api.regions_with_capacity(itype, force=force))
     return [
         LambdaInstance(
             gpu=gpu_class,
@@ -117,7 +122,7 @@ def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance
             vram_gb=info.vram_gb,
             price_usd_hr=rate,
         )
-        for region in lambda_api.regions_with_capacity(itype, force=force)
+        for region in regions
     ]
 
 
@@ -451,6 +456,11 @@ def poll_lambda_job(
             False,
             failure="job_preempted" if retriable else "job_failed",
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.attempt),
+            # A retriable failure BEFORE any training heartbeat is a host/GPU fault (broken driver,
+            # docker/GPU never ready) -> the region is sick. ``seen_training_hb`` is read at call time
+            # from the enclosing poll loop (this closure runs only from inside it). A retriable crash
+            # AFTER training started is NOT a region fault (the region was working), so don't quarantine.
+            host_fault=retriable and not seen_training_hb,
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -562,6 +572,10 @@ def poll_lambda_job(
                 False,
                 failure="job_failed" if worker_crashed else "job_preempted",
                 detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.attempt),
+                # A host that died (preempted) BEFORE any training heartbeat never got a worker
+                # productive here -> quarantine the region; a host loss after training is not a
+                # region fault.
+                host_fault=not worker_crashed and not seen_training_hb,
             )
 
         raw_marker = marker_reader()
@@ -639,6 +653,7 @@ def poll_lambda_job(
                             detail=f"no worker liveness (boot.log/heartbeat) for "
                             f"{int(time.time() - active_since)}s after instance became active "
                             f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
+                            host_fault=True,  # the region never got the worker to boot -> quarantine it
                         )
                 else:
                     boot_log_seen = True
@@ -690,7 +705,7 @@ def submit_run_lambda(
         setup_grace = SETUP_GRACE_S * last_gpu_mult
         first_liveness = FIRST_LIVENESS_S * last_gpu_mult
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
-        return poll_lambda_job(
+        res = poll_lambda_job(
             handle,
             spec,
             seed,
@@ -700,6 +715,14 @@ def submit_run_lambda(
             first_liveness_s=first_liveness,
             deadline_s=deadline,
         )
+        if res.host_fault and handle.region:
+            # The region proved sick (worker never reached training). Quarantine it so this run's
+            # retry AND other runs avoid it until the TTL self-heals, instead of re-rolling it.
+            from flash.providers._health import mark_region_sick
+
+            mark_region_sick("lambda", handle.region)
+            make_say(log)(f"region {handle.region} quarantined (host fault: {res.detail})")
+        return res
     finally:
         lambda_api.terminate_instances([handle.instance_id])
 
