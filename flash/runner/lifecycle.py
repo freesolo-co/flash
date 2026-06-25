@@ -204,7 +204,15 @@ def _submit_seed_supervised(
     # retry before walking classes within it.
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
+    # Attempts spent on the cache-drop fallback, EXCLUDED from the GPU-walk budget. The bonus slot
+    # ``cache_fallback_attempts`` widens the loop range, but the budget checks below use the raw attempt
+    # counter; without this offset the cache-drop attempt would still tick the budget, so a run that
+    # spends its bonus on the cache drop could never reach its real ``max_retries`` GPU-walk retries
+    # (the fallback would silently steal the only user retry). ``walk_attempt`` = attempt index with the
+    # cache-drop attempt(s) removed, so the GPU walk gets its full budget AFTER a cache drop.
+    cache_drop_consumed = 0
     for attempt in range(max_retries + 1 + cache_fallback_attempts):
+        walk_attempt = attempt - cache_drop_consumed
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
@@ -309,7 +317,7 @@ def _submit_seed_supervised(
                 and chosen.provider == "runpod"
             )
             on_last_gpu = len(untried) <= 1 or (
-                attempt >= max_retries and not cache_fallback_available
+                walk_attempt >= max_retries and not cache_fallback_available
             )
             # Mirror into the closure cell so on_handle persists THIS attempt's value (see
             # current_on_last_gpu) for a recovery to reproduce the same stall tuning.
@@ -404,7 +412,7 @@ def _submit_seed_supervised(
         # continues with the reserved cache-less fallback attempt.
         print(
             f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and (attempt < max_retries or first_cache_drop) else 'not retrying'}"
+            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < max_retries or first_cache_drop) else 'not retrying'}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
@@ -415,10 +423,13 @@ def _submit_seed_supervised(
         # available. The bonus attempt granted above is reserved for exactly this transition; once the
         # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
         # and the loop cannot spin past its one extra cache-less attempt.
-        if attempt >= max_retries and not first_cache_drop:
+        if walk_attempt >= max_retries and not first_cache_drop:
             break
         if first_cache_drop:
             drop_weight_cache = True
+            # This attempt was the FREE cache-drop fallback, not a GPU-walk retry — exclude it from the
+            # budget so the subsequent ``walk_attempt`` still counts ``max_retries`` real retries.
+            cache_drop_consumed += 1
             # Do NOT advance the GPU walk on this transition: the next attempt should retry the SAME
             # cheapest GPU without the volume on the wider all-DC pool first — the miss may have been
             # the cache's datacenter set, not the GPU class globally. Only walk if THAT also fails.

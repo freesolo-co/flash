@@ -23,6 +23,7 @@ from flash.providers._poll import (
     PollErrorTracker,
     heartbeat_progress_ts,
     make_say,
+    preload_box_reap_due,
     surface_heartbeat,
 )
 from flash.providers.base import GPU_INFO, PollResult, min_cuda_modern
@@ -597,6 +598,7 @@ def sweep_orphans(
         logger.warning("hyperstack orphan sweep skipped: could not resolve active set: %s", exc)
         return []
     active = {run_label_prefix(a) for a in (labels or set())}
+    now = time.time()
     orphans: list[str] = []
     for v in vms:
         name = str(v.get("name") or "")
@@ -606,9 +608,18 @@ def sweep_orphans(
         # preload.warm_instances (mode="preload"), NEVER persisted in the run DB (so never in
         # ``active``), and self-terminated in _warm_one_instance's ``finally`` (and by startup
         # recover_runs). A catalog warm can outlast this ~10-min sweep, so reaping them by the bare
-        # ``flash-`` prefix would kill an in-progress preload mid-download; exempt them. Billing stays
-        # bounded by their own teardown.
+        # ``flash-`` prefix would kill an in-progress preload mid-download; normally exempt them.
+        # EXCEPTION: a box still alive past its embedded wall deadline + grace has lost its driver (the
+        # only thing that terminates instance providers — nothing on the box self-terminates the VM), so
+        # reap it to bound the leak rather than exempt it forever (see preload_box_reap_due).
         if name.startswith("flash-preload-"):
+            if preload_box_reap_due(name, now):
+                vid = v.get("id")
+                if vid:
+                    orphans.append(str(vid))
+                    logger.warning(
+                        "reaping orphaned hyperstack preload vm %s (outlived its wall deadline + "
+                        "grace; driver lost)", name)
             continue
         if any(name == a or name.startswith(a + "-s") for a in active):
             continue

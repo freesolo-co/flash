@@ -1023,14 +1023,20 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
 def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
     """Warm/preload boxes (``flash-preload-...``) are driver-owned: launched by
     preload.warm_instances, never persisted in the run DB (so never in the active set), and
-    self-terminated by the warm driver. The periodic sweep must NOT reap them by the bare
-    ``flash-`` prefix — a catalog warm can outlast the ~10-min sweep and would be killed mid-download.
+    self-terminated by the warm driver. The periodic sweep must NOT reap an IN-DEADLINE preload box by
+    the bare ``flash-`` prefix — a catalog warm can outlast the ~10-min sweep and would be killed
+    mid-download. A box with no embedded deadline (legacy launch) is likewise exempt.
     """
+    import time
+
+    from flash.providers._poll import preload_instance_run_id
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
 
+    fresh = preload_instance_run_id("lambda", "us-east-1", int(time.time()) + 1800, "abcdef")
     instances = [
-        {"id": "i-1", "name": "flash-preload-lambda-us-east-1-abcdef-s0-a0"},  # warm box -> KEEP
+        {"id": "i-1", "name": f"{fresh}-s0-a0"},  # in-deadline warm box -> KEEP
+        {"id": "i-legacy", "name": "flash-preload-lambda-us-east-1-abcdef-s0-a0"},  # no deadline -> KEEP
         {"id": "i-2", "name": "flash-1700-cccc-s0-a0"},  # genuine orphan -> terminate
     ]
     terminated = []
@@ -1038,9 +1044,33 @@ def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
-    out = jobs.sweep_orphans(active_labels=set())  # neither is a tracked active run
+    out = jobs.sweep_orphans(active_labels=set())  # none is a tracked active run
     assert out == ["i-2"]
     assert terminated == ["i-2"]
+
+
+def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
+    """A preload box still alive past its embedded wall deadline + grace has lost its driver (the only
+    thing that terminates an instance provider — nothing on the box self-terminates the VM). The sweep
+    must reap it to bound the billing leak rather than exempt it forever."""
+    import time
+
+    from flash.providers._poll import PRELOAD_REAP_GRACE_S, preload_instance_run_id
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    # Deadline well past now + the reap grace -> driver provably gone.
+    stale_deadline = int(time.time()) - int(PRELOAD_REAP_GRACE_S) - 600
+    stale = preload_instance_run_id("lambda", "us-west-1", stale_deadline, "deadbe")
+    instances = [{"id": "i-9", "name": f"{stale}-s0-a0"}]
+    terminated = []
+    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+    )
+    out = jobs.sweep_orphans(active_labels=set())
+    assert out == ["i-9"]
+    assert terminated == ["i-9"]
 
 
 # ---------------------------------------------------------------------------

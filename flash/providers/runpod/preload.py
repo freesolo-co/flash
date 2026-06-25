@@ -38,6 +38,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._logging import get_logger
+from flash.providers._poll import preload_instance_run_id
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.jobs import (
     build_function_input,
@@ -171,7 +172,12 @@ def _poll_until_done(
             # so the caller's ``result.get(...)`` never crashes on a str and mis-reports a warmed region.
             output = (st or {}).get("output")
             if not output:
-                return {}
+                # A COMPLETED RunPod job with no ``output`` is NOT evidence of a warmed region — an
+                # API/handler-shape mismatch or a broken worker image can finish the job yet return
+                # nothing, so there's no ``preloaded``/``already_cached`` record for any model. Surface a
+                # structured error so _preload_one_dc reports the DC FAILED instead of counting an empty
+                # terminal output as ``status: ok`` and mis-reporting the cache as warm.
+                return {"error": f"preload job {job_id} completed with no output"}
             try:
                 return decode_output(output) or {}
             except Exception as exc:
@@ -450,13 +456,17 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
     """Launch a download-only preload instance pinned to ``candidate``'s region, poll its status
     marker, then ALWAYS terminate. One region failing never aborts the others."""
     region = getattr(candidate, "region", "?")
-    run_id = f"flash-preload-{provider}-{region.lower()}-{uuid.uuid4().hex[:6]}"
     # ONE effective budget shared by the worker wall cap AND the driver poll, so the two can't disagree.
     # The worker spec floors the wall cap at 60s (a sub-minute cap can't even boot+download), so the
     # driver must poll for that SAME floored budget — otherwise a `--timeout-s` under 60 would have the
     # driver report timeout + terminate the box at e.g. 30s while the worker still had ~60s to finish,
     # aborting an in-progress preload.
     effective_s = max(60, int(timeout_s))
+    # Embed the wall-clock reap deadline in the name so an orphan sweep can free this box if THIS driver
+    # process dies before its ``finally`` (terminate_run_instances) — instance providers self-terminate
+    # nothing, so a lost driver would otherwise leak a billing box forever (see preload_box_reap_due).
+    reap_deadline = int(time.time()) + effective_s
+    run_id = preload_instance_run_id(provider, region, reap_deadline, uuid.uuid4().hex[:6])
     spec = _preload_instance_spec(gpu, run_id, wall_s=effective_s)
     prefix = f"{spec.phase}/{run_id}/seed0"
     reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",

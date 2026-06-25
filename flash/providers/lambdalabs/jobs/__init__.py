@@ -28,6 +28,7 @@ from flash.providers._poll import (
     PollErrorTracker,
     heartbeat_progress_ts,
     make_say,
+    preload_box_reap_due,
     surface_heartbeat,
 )
 from flash.providers.base import GPU_INFO, PollResult
@@ -686,6 +687,7 @@ def sweep_orphans(
         logger.warning("lambda orphan sweep skipped: could not resolve active set: %s", exc)
         return []
     active = {run_label_prefix(a) for a in (labels or set())}
+    now = time.time()
     orphans: list[str] = []
     for inst in instances:
         name = str(inst.get("name") or "")
@@ -695,9 +697,18 @@ def sweep_orphans(
         # preload.warm_instances (mode="preload"), NEVER persisted in the run DB (so never in
         # ``active``), and self-terminated in _warm_one_instance's ``finally`` (and by startup
         # recover_runs). A catalog warm can outlast this ~10-min sweep, so reaping them by the bare
-        # ``flash-`` prefix would kill an in-progress preload mid-download; exempt them. Billing stays
-        # bounded by their own teardown.
+        # ``flash-`` prefix would kill an in-progress preload mid-download; normally exempt them.
+        # EXCEPTION: a box still alive past its embedded wall deadline + grace has lost its driver (the
+        # only thing that terminates instance providers — nothing on the box self-terminates the VM), so
+        # reap it to bound the leak rather than exempt it forever (see preload_box_reap_due).
         if name.startswith("flash-preload-"):
+            if preload_box_reap_due(name, now):
+                iid = inst.get("id")
+                if iid:
+                    orphans.append(str(iid))
+                    logger.warning(
+                        "reaping orphaned lambda preload box %s (outlived its wall deadline + grace; "
+                        "driver lost)", name)
             continue
         # Match on the name boundary, not a raw string prefix: a live run's prefix must EQUAL the
         # name or be followed by the ``-s`` seed boundary, so ``flash-100`` can't shield
