@@ -185,10 +185,12 @@ def _active_run_ids() -> set[str]:
     ``running`` ahead of ``_submit_seed_supervised``), and the launched instance is torn down BEFORE
     the run can leave these states for ``done``/``deployed``/terminal (the provider lifecycle's
     ``finally``). So a billed instance exists ONLY while its run is in this set — ownership is a
-    deterministic name->run mapping, not the noisy idle signal the RunPod reaper must grace.
-    (Startup recovery in ``recover_runs`` deliberately uses a NARROWER set — only handle-backed/resume
-    runs — because it is simultaneously RESUBMITTING handle-less runs and must reap their stale
-    half-rented instances; in-lifetime we instead protect every instance-owning run.)"""
+    deterministic name->run mapping, not the noisy idle signal the RunPod reaper must grace. The
+    sweep passes this function itself (a callable) so the set is read AFTER the provider lists, which
+    closes the launch race — see ``_sweep_orphan_instances_once``. (Startup recovery in
+    ``recover_runs`` deliberately uses a NARROWER set — only handle-backed/resume runs — because it
+    is simultaneously RESUBMITTING handle-less runs and must reap their stale half-rented instances;
+    in-lifetime we instead protect every instance-owning run.)"""
     ids: set[str] = set()
     for row in db.all_runs():
         try:
@@ -204,19 +206,21 @@ def _sweep_orphan_instances_once() -> int:
     """One run-aware sweep of orphaned instance-provider workers — Lambda/Hyperstack VMs whose run
     finished or crashed without the per-run ``finally`` tearing them down. Returns the count torn
     down. Dispatched to every configured provider; RunPod's ``sweep_orphans`` is a no-op (its
-    serverless endpoints carry no standing per-run billing and are handled by the idle reaper)."""
+    serverless endpoints carry no standing per-run billing and are handled by the idle reaper).
+
+    ``_active_run_ids`` is passed as a CALLABLE, not a precomputed set, so each instance provider
+    resolves the live-run protection set AFTER it has listed its instances. That ordering closes the
+    launch race: any instance already present in the list had its run's status row committed before
+    the instance was launched, so it is guaranteed to be in the set read post-listing — a run that
+    started a worker concurrently with this sweep can never be mis-reaped as a phantom orphan. (The
+    instance APIs expose no creation timestamp, so this post-listing read — not an age grace — is
+    what makes it airtight.)"""
     from flash.providers import configured_providers
 
     torn = 0
     for prov in configured_providers():
-        # Re-read the active set immediately before EACH provider sweep and UNION it with the set
-        # captured after, so a run submitted DURING this sweep (its instance now visible to the
-        # provider's list call, but its run id absent from a once-captured snapshot) is protected
-        # rather than mis-reaped as an orphan mid-training. The instance APIs expose no creation
-        # timestamp here, so a fresh re-snapshot — not an age grace — closes the launch race.
-        active = _active_run_ids()
         try:
-            deleted = prov.sweep_orphans(active_labels=active | _active_run_ids())
+            deleted = prov.sweep_orphans(active_labels=_active_run_ids)
         except Exception:
             # One provider's API blip / outage must not skip the others — and must NOT be silent
             # (the loop docstring promises failures are logged + retried next cycle), so a

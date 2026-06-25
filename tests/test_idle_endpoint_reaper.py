@@ -82,7 +82,9 @@ def test_protected_names_skip_unreadable_run(monkeypatch):
 
 class _FakeProvider:
     """A configured provider whose ``sweep_orphans`` records the active set it was handed and
-    returns a fixed list of torn-down ids (or raises, to model an API blip)."""
+    returns a fixed list of torn-down ids (or raises, to model an API blip). It RESOLVES a callable
+    ``active_labels`` exactly as the real instance providers do (after they list), so the recorded
+    set reflects the post-listing resolution the periodic sweep relies on."""
 
     def __init__(self, name, torn=(), raises=False):
         self.name = name
@@ -93,7 +95,7 @@ class _FakeProvider:
     def sweep_orphans(self, active_labels=None):
         if self._raises:
             raise RuntimeError(f"{self.name} api blip")
-        self.seen_active = active_labels
+        self.seen_active = active_labels() if callable(active_labels) else active_labels
         return self._torn
 
 
@@ -223,3 +225,35 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
     assert torn == 2  # one Lambda instance + one Hyperstack VM
     assert terminated == ["i-orphan"]  # leaked reaped, live + foreign untouched
     assert deleted == ["vm-orphan"]
+
+
+def test_sweep_resolves_active_labels_after_listing(monkeypatch):
+    """Launch-race fix: when ``active_labels`` is a callable, the real provider resolves it AFTER it
+    lists instances. A run that only enters the live set concurrently with the sweep therefore still
+    shields its fresh worker, instead of having it reaped as a phantom orphan."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    events = []
+    fresh = jobs.instance_label("flash-fresh", 0, 0)
+    orphan = jobs.instance_label("flash-old", 0, 0)
+
+    def fake_list():
+        events.append("list")
+        return [{"id": "i-fresh", "name": fresh}, {"id": "i-orphan", "name": orphan}]
+
+    def active_fn():
+        events.append("active")
+        return {"flash-fresh"}  # the fresh run is live only at RESOLUTION time (post-listing)
+
+    terminated = []
+    monkeypatch.setattr(lambda_api, "list_instances", fake_list)
+    monkeypatch.setattr(
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+    )
+
+    out = jobs.sweep_orphans(active_labels=active_fn)
+
+    assert events == ["list", "active"]  # protection set resolved AFTER the instance list
+    assert out == ["i-orphan"]  # fresh worker protected, orphan reaped
+    assert terminated == ["i-orphan"]

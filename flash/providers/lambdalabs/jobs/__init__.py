@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+from collections.abc import Callable
 
 from flash._logging import get_logger
 from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
@@ -491,20 +492,30 @@ def terminate_run_instances(run_id: str) -> list[str]:
     return lambda_api.terminate_instances(ids) if ids else []
 
 
-def sweep_orphans(active_labels: set[str] | None = None) -> list[str]:
+def sweep_orphans(
+    active_labels: set[str] | Callable[[], set[str]] | None = None,
+) -> list[str]:
     """Terminate Flash-named instances that no live run owns; return terminated ids.
 
     Run at server startup (crash recovery) and after runs. Only names carrying the ``flash-`` run
     prefix are ever touched — nothing else on the account is ours to terminate. ``active_labels``
     may be RAW run ids; each is passed through ``run_label_prefix`` so it matches the same forced
     prefix the instance names carry. Best-effort: never raises.
+
+    ``active_labels`` may also be a CALLABLE returning that set — it is then resolved AFTER the
+    instance list is fetched. The periodic in-lifetime sweep passes one so the protection set is
+    read post-listing: any instance present in the list had its run's status row committed before
+    the instance was launched (hence before this list call), so resolving the live set now is
+    guaranteed to include it — closing the launch race where a run started after a pre-captured set
+    could have its fresh worker reaped as a phantom orphan.
     """
     try:
         instances = lambda_api.list_instances()
     except Exception as exc:
         logger.warning("lambda orphan sweep skipped: %s", exc)
         return []
-    active = {run_label_prefix(a) for a in (active_labels or set())}
+    labels = active_labels() if callable(active_labels) else active_labels
+    active = {run_label_prefix(a) for a in (labels or set())}
     orphans: list[str] = []
     for inst in instances:
         name = str(inst.get("name") or "")
