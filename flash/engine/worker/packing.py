@@ -18,8 +18,8 @@ so the masked-attention overhead is dwarfed by the pad-removal win.
 GATING — pure full-attention only. A 4D mask isolates examples only in layers that READ the
 attention mask. Hybrid GatedDeltaNet models (Qwen3.5/3.6) interleave linear-attention layers
 whose recurrence + short causal conv1d carry state ACROSS example boundaries regardless of any
-mask — their boundaries reset only via the ``fla`` kernel's ``cu_seqlens`` and ``causal_conv1d``'s
-``seq_idx``. So a pure full-attention arch (``model_is_pure_attention``) packs with the 4D mask
+mask — their boundaries reset only via the ``fla`` kernel's ``cu_seq_lens_q/k`` and
+``causal_conv1d``'s ``seq_idx``. So a pure full-attention arch (``model_is_pure_attention``) packs with the 4D mask
 alone, while a GDN hybrid ALSO needs the varlen path: ``BlockDiagonalCollator(emit_varlen=True)``
 emits ``cu_seq_lens_q/k`` + ``seq_idx``, gated on both kernels being importable + arch-correct
 (``gdn_packing_available`` + ``model_is_gdn_hybrid``). Without those kernels the hybrid tier stays
