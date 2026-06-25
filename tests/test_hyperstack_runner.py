@@ -728,13 +728,16 @@ def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
     """
     import time
 
+    from flash.providers._instance import instance_label
     from flash.providers._poll import preload_instance_run_id
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs
 
+    # Build the name the way a launch does (instance_label bounds it to the provider name budget) so the
+    # reap parser is tested against the REAL, possibly-truncated VM name, not the raw run id.
     fresh = preload_instance_run_id("hyperstack", "canada-1", int(time.time()) + 1800, "abcdef")
     vms = [
-        {"id": "vm-1", "name": f"{fresh}-s0-a0"},  # in-deadline warm box -> KEEP
+        {"id": "vm-1", "name": instance_label(fresh, 0, 0)},  # in-deadline warm box -> KEEP
         {"id": "vm-legacy", "name": "flash-preload-hyperstack-canada-1-abcdef-s0-a0"},  # no deadline -> KEEP
         {"id": "vm-2", "name": "flash-1700-cccc-s0-a0"},  # genuine orphan -> delete
     ]
@@ -752,13 +755,16 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
     to bound the billing leak rather than exempt it forever."""
     import time
 
+    from flash.providers._instance import instance_label
     from flash.providers._poll import PRELOAD_REAP_GRACE_S, preload_instance_run_id
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs
 
+    # Name built via instance_label (longest provider, "hyperstack") so the front-loaded deadline token
+    # must survive the provider name-budget truncation to be reaped.
     stale_deadline = int(time.time()) - int(PRELOAD_REAP_GRACE_S) - 600
     stale = preload_instance_run_id("hyperstack", "norway-1", stale_deadline, "deadbe")
-    vms = [{"id": "vm-9", "name": f"{stale}-s0-a0"}]
+    vms = [{"id": "vm-9", "name": instance_label(stale, 0, 0)}]
     deleted = []
     monkeypatch.setattr(hs_api, "list_vms", lambda: vms)
     monkeypatch.setattr(hs_api, "delete_vms", lambda ids: deleted.extend(ids) or list(ids))
