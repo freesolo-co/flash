@@ -159,7 +159,7 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
 
     cands = (
         Candidate("runpod", "RTX A6000", 0.49, 48),
-        Candidate("runpod", "L40", 0.50, 48),
+        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),
         Candidate("hyperstack", "RTX A6000", 0.50, 48),
     )
     # Attempt 0 (nothing failed): cheapest overall.
@@ -173,7 +173,7 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
         {"runpod", "hyperstack"},
         {("runpod", "RTX A6000"), ("hyperstack", "RTX A6000")},
     )
-    assert (chosen.provider, chosen.gpu) == ("runpod", "L40")
+    assert (chosen.provider, chosen.gpu) == ("runpod", "RTX 6000 Ada")
 
 
 def test_select_candidate_single_provider_walks_classes():
@@ -196,7 +196,7 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
 
     candidates = (
         Candidate("runpod", "RTX A6000", 0.49, 48),  # cheapest -> attempt 0
-        Candidate("runpod", "L40", 0.50, 48),  # next RunPod class (the WRONG retry target)
+        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # next RunPod class (the WRONG retry target)
         Candidate("hyperstack", "RTX A6000", 0.50, 48),  # the right cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))

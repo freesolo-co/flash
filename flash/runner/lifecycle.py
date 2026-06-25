@@ -238,10 +238,14 @@ def _submit_seed_supervised(
             # failure ESCAPES that provider before walking classes within it (see _select_candidate),
             # so a congested/sick provider can't burn the whole budget.
             chosen = _select_candidate(alloc.candidates, failed_providers, tried_classes)
-            # "Last GPU" == no untried alternative remains after this pick (or this is the final
-            # attempt). Tell the provider so its no-capacity backstops wait longer before giving up
-            # rather than burning a retry on a class with no fallback. A pinned/single-candidate run
-            # is "last" from attempt 0, which is what we want.
+            # ``on_last_gpu`` == NO further GPU attempt will be made after this one — either the
+            # candidate list is exhausted (``len(untried) <= 1``) OR the retry budget is exhausted
+            # (``attempt >= max_retries``, including the single-attempt ``max_retries == 0`` case).
+            # Any remaining alternates are only ever reached on a RETRY, so on the final iteration
+            # there is no next-best GPU to fall back to regardless of how many candidates remain.
+            # Tell the provider so its no-capacity backstops wait longer before giving up rather than
+            # failing fast into a retry that will never happen. A pinned/single-candidate run is
+            # "last" from attempt 0, which is what we want.
             untried = [c for c in alloc.candidates if (c.provider, c.gpu) not in tried_classes]
             on_last_gpu = len(untried) <= 1 or attempt >= max_retries
             print(allocation_summary(alloc), file=log, flush=True)

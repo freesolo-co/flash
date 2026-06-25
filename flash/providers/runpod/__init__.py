@@ -54,8 +54,9 @@ class RunpodProvider:
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
     ) -> PollResult:
-        # ``on_last_gpu`` stretches the no-capacity grace when the gpu-walk has no next-best
-        # class to fall to (see ``jobs.stall_kwargs``).
+        # ``on_last_gpu`` stretches the no-capacity grace when no further GPU attempt will be made
+        # after this one — either the candidate list is exhausted or the retry budget is (see
+        # ``jobs.stall_kwargs``); waiting longer can't cost a fallback there is none.
         from flash.providers.runpod.jobs import submit_run
 
         kwargs = {
