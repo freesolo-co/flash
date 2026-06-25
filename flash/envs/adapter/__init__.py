@@ -652,6 +652,15 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(self.scores_breakdown(completion, example, state)["total"])
 
+    @property
+    def reward_thread_safe(self) -> bool:
+        """Whether ``reward`` may be called concurrently across rollouts (multiturn_rollout scores a
+        batch in a thread pool). The verifiers reward contract is a pure scorer — ``score_responses``
+        reads the per-call inputs + immutable env config — so the default is True. An underlying env
+        whose scorer keeps mutable state or a thread-bound client opts out with
+        ``reward_thread_safe = False`` and is scored serially."""
+        return bool(getattr(self._env, "reward_thread_safe", True))
+
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         if state and self.multi_turn:
             reward = self._score_episode(example, state)
