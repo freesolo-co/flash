@@ -305,6 +305,16 @@ def launch_and_submit(
                     for c in usable_instances(inst.gpu, force=True, ignore_sick=ignore_sick)
                     if c.region not in tried_regions
                 ]
+                if not candidates and not ignore_sick:
+                    # Healthy regions exhausted mid-walk (capacity vanished since the allocation fetch).
+                    # Relax the quarantine as a TRUE last resort -- try a quarantined-but-in-capacity
+                    # region rather than fail the attempt while sick capacity exists (matches allocate()'s
+                    # bounded-demotion fallback; a still-sick region just host_faults + the run retries).
+                    candidates = [
+                        c
+                        for c in usable_instances(inst.gpu, force=True, ignore_sick=True)
+                        if c.region not in tried_regions
+                    ]
             continue
         say(
             f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
@@ -476,15 +486,14 @@ def poll_lambda_job(
         _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
 
-    def in_early_setup_now() -> bool:
-        """True if THIS attempt's worker is (per a FRESH heartbeat) still in an early boot/setup stage.
-        ``error_<phase>.txt`` is SEED-scoped (shared across attempts), so a stale traceback from a
-        retriable PRIOR attempt could otherwise flip a fresh attempt's host loss to a terminal
-        job_failed. A worker that actually crashed THIS attempt stamps a fresh ``error_<phase>``
-        heartbeat as its LAST signal, so a current heartbeat still in boot/setup means this attempt has
-        not crashed and the error file is stale -> the loss is retriable. Same launch-freshness gate as
-        the loop; an absent/empty heartbeat (the worker died before any heartbeat) is NOT early-setup,
-        so a genuine early crash that left only the file is still classified terminal."""
+    def fresh_error_heartbeat() -> bool:
+        """True if THIS attempt's worker stamped a FRESH ``error_<phase>`` crash heartbeat -- the last
+        signal it writes on ANY raise (after uploading ``error_<phase>.txt``). ``error_<phase>.txt`` is
+        SEED-scoped (shared across attempts), so on a RETRY a stale traceback from a prior attempt could
+        flip a current host loss to a terminal job_failed. A fresh error heartbeat is positive proof the
+        worker actually crashed THIS attempt (trust the file); its ABSENCE -- a fresh setup heartbeat
+        (still booting) or no fresh heartbeat at all (the box was lost before producing anything this
+        attempt) -- means the file is stale and the loss is a host loss, so retry rather than fail."""
         if heartbeat_reader is None:
             return False
         try:
@@ -494,7 +503,7 @@ def poll_lambda_job(
         if not isinstance(hb, dict):
             return False
         stage = hb.get("stage")
-        if stage not in _SETUP_HEARTBEAT_STAGES:
+        if not (stage and str(stage).startswith("error_")):
             return False
         _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
@@ -658,14 +667,14 @@ def poll_lambda_job(
             # fail FAST: classifying it job_preempted burns fresh GPUs re-running a crash that will
             # repeat. A crash the worker flagged retriable (RetriableInfraError, stamped in the
             # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is SEED-scoped
-            # (NOT attempt-scoped), so a retriable PRIOR attempt's traceback can linger; a fresh retry
-            # that posts a boot heartbeat then loses the box would be mis-failed terminal. Guard with
-            # in_early_setup_now(): if THIS attempt's fresh heartbeat is still boot/setup, the worker
-            # has not crashed yet and the error file is stale -> the loss stays retriable. That guard
-            # only applies on a RETRY (attempt > 0): on the FIRST attempt no prior attempt exists, so a
-            # present error file is unambiguously THIS attempt's crash and is trusted even if the worker
-            # died before stamping its terminal heartbeat (a genuine setup-stage crash must not be
-            # misread as stale -> job_failed, not a wasteful job_preempted retry of a repeatable crash).
+            # (NOT attempt-scoped), so on a RETRY a PRIOR attempt's traceback can linger while THIS
+            # attempt's box is lost before producing anything. Trust the file as a current crash only
+            # with positive THIS-attempt evidence: fresh_error_heartbeat() (the worker stamps a fresh
+            # error_<phase> hb on any raise). Without it -- a fresh setup hb (still booting) OR no fresh
+            # hb at all (host lost before producing anything) -- the file is stale and the loss is a host
+            # loss -> job_preempted (over-retry, not a wrongful terminal job_failed). attempt == 0 has no
+            # prior attempt, so a present error file is unambiguously this attempt's crash (trusted even
+            # if the worker died before its hb -> job_failed, not a wasteful retry of a repeatable crash).
             # Use fresh_retriable_hb() (launch-fresh), NOT bare worker_flagged_retriable(): the heartbeat
             # is seed-scoped, so a STALE prior-attempt retriable heartbeat would otherwise suppress
             # worker_crashed for THIS attempt's deterministic crash -> mis-quarantining a healthy region.
@@ -673,7 +682,7 @@ def poll_lambda_job(
             worker_crashed = (
                 bool(err and err.strip())
                 and not fresh_retriable_hb()
-                and not (handle.attempt > 0 and in_early_setup_now())
+                and (handle.attempt == 0 or fresh_error_heartbeat())
             )
             return PollResult(
                 False,

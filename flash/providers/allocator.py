@@ -173,34 +173,39 @@ def allocate(
         candidates += _lambda_candidates(need)
     if "hyperstack" in available:
         candidates += _hyperstack_candidates(need)
-    if not candidates:
-        # The instance providers contribute nothing when a fitting class has no live capacity OR all
-        # its capacity-having regions are quarantined (flash.providers._health). Quarantine's contract
-        # is bounded DEMOTION, never a hard-fail: if every fitting region is merely quarantined, a
-        # last-resort pass that ignores the quarantine recovers those candidates so the run launches
-        # (into a possibly-sick region) instead of raising the config-shaped UnsupportedGpuError that
-        # _run_seed_loop treats as terminal. A still-sick region just host_faults again (re-quarantine
-        # + cross-provider escape) -- the run is never killed at submit purely by our own quarantine.
-        relaxed: list[Candidate] = []
-        if "lambda" in available:
-            relaxed += _lambda_candidates(need, ignore_sick=True)
-        if "hyperstack" in available:
-            relaxed += _hyperstack_candidates(need, ignore_sick=True)
-        if relaxed:
-            logger.warning(
-                "every fitting instance-provider region is quarantined (sick); allocating into a "
-                "quarantined region rather than hard-failing the run (quarantine is bounded-demotion)"
-            )
-            candidates = relaxed
-    if not candidates:
+    # Quarantine's contract is bounded DEMOTION, never removal: an instance-provider class whose
+    # capacity exists ONLY in currently-quarantined regions is kept as a LAST-RESORT candidate,
+    # appended AFTER every healthy candidate so it is only ever reached once healthy capacity is
+    # exhausted. Without this, RunPod's always-present static candidates keep the global list non-empty,
+    # so a run that has burned every RunPod class on retries would hard-fail rather than walk to the
+    # quarantined instance capacity that still exists (a "relax only when the list is globally empty"
+    # fallback never fires while RunPod offers a class). A still-sick region just host_faults again
+    # (re-quarantine + cross-provider escape); the run is never killed while ANY capacity remains.
+    healthy_keys = {(c.provider, c.gpu) for c in candidates}
+    sick: list[Candidate] = []
+    if "lambda" in available:
+        sick += [c for c in _lambda_candidates(need, ignore_sick=True) if (c.provider, c.gpu) not in healthy_keys]
+    if "hyperstack" in available:
+        sick += [c for c in _hyperstack_candidates(need, ignore_sick=True) if (c.provider, c.gpu) not in healthy_keys]
+    if not candidates and not sick:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
             f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
         )
-    # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small job),
-    # then registry order.
+    if not candidates:
+        logger.warning(
+            "every fitting instance-provider region is quarantined (sick); allocating into a "
+            "quarantined region rather than hard-failing the run (quarantine is bounded-demotion)"
+        )
+    # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small job), then
+    # registry order. Sick (quarantine-only) candidates are price-ranked AMONG THEMSELVES but always
+    # sorted strictly after every healthy candidate, so quarantine demotes without ever winning the pick.
     order = {n: i for i, n in enumerate(PROVIDER_NAMES)}
-    ranked = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, order.get(c.provider, 99)))
+
+    def rank_key(c: Candidate) -> tuple:
+        return (c.hourly_usd, c.vram_gb, order.get(c.provider, 99))
+
+    ranked = sorted(candidates, key=rank_key) + sorted(sick, key=rank_key)
     best = ranked[0]
     return Allocation(
         provider=best.provider,

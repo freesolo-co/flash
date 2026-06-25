@@ -158,26 +158,28 @@ def test_quarantine_hiding_last_capacity_falls_back_not_hard_fail(monkeypatch):
     assert seen["relaxed"] > 0  # then the last-resort fallback recovered the quarantined candidate
 
 
-def test_quarantine_fallback_not_used_when_a_healthy_candidate_exists(monkeypatch):
-    """The fallback is LAST-RESORT only: when a healthy (non-quarantined) candidate exists, allocate()
-    must never relax the quarantine, so a sick region is genuinely demoted rather than resurrected and
-    ranked ahead of a healthy option."""
+def test_quarantine_demotes_sick_candidate_strictly_below_healthy(monkeypatch):
+    """A class whose capacity is ONLY in a quarantined region is kept as a demoted last-resort
+    candidate -- ranked strictly AFTER every healthy candidate even when it is CHEAPER -- so quarantine
+    never lets a sick region WIN the pick, only serve as a fallback once healthy capacity is exhausted
+    (which the runner reaches by walking the ranked list across retries)."""
     from flash.providers import allocator
-    from flash.providers.lambdalabs import jobs as lambda_jobs
+    from flash.providers.base import Candidate
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ["lambda"])
+    healthy = Candidate("lambda", "A100 SXM 40GB", 1.79, 40)
+    sick_only = Candidate("lambda", "A10", 0.75, 24)  # CHEAPER, but capacity only in a quarantined region
 
-    used_relaxed = {"v": False}
+    def fake_lambda(need, ignore_sick=False):
+        # healthy view: only the A100; relaxed view additionally surfaces the sick-only A10.
+        return [healthy, sick_only] if ignore_sick else [healthy]
 
-    def fake_usable(gpu_class, force=False, ignore_sick=False):
-        if ignore_sick:
-            used_relaxed["v"] = True  # would only be called by the last-resort pass
-        return [object()]  # healthy view already non-empty
-
-    monkeypatch.setattr(lambda_jobs, "usable_instances", fake_usable)
+    monkeypatch.setattr(allocator, "_lambda_candidates", fake_lambda)
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "lambda"
-    assert used_relaxed["v"] is False  # healthy candidates existed -> no quarantine relaxation
+    assert a.gpu == "A100 SXM 40GB"  # healthy wins despite the sick A10 being cheaper
+    # the sick candidate is still PRESENT (reachable as a last resort) but demoted strictly last.
+    assert [c.gpu for c in a.candidates] == ["A100 SXM 40GB", "A10"]
 
 
 def test_estimator_matches_measured_seq_boundaries():

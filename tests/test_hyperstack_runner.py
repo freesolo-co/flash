@@ -127,6 +127,35 @@ def test_launch_walks_regions_on_rejection(monkeypatch):
     assert h.name == "flash-1700000000-abcd1234-s0-a2"
 
 
+def test_launch_relaxes_to_quarantined_region_when_healthy_exhausted(monkeypatch):
+    """If the initial healthy region rejects and the forced refresh finds NO healthy stock, the walk
+    relaxes the quarantine (ignore_sick) and launches into a quarantined-but-in-stock region rather than
+    failing the attempt while sick stock exists -- relax after the healthy walk is exhausted, not only on
+    an initially-empty healthy list. Mirrors Lambda."""
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "flash-managed")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "Ubuntu Docker CUDA 12.8")
+    created = []
+
+    def fake_launch(*, name, environment_name, image_name, flavor_name, key_name, user_data):
+        if environment_name != "default-SICK-1":
+            raise hs_api.HyperstackApiError("POST /core/virtual-machines -> HTTP 400: no stock")
+        created.append(environment_name)
+        return "vm-99"
+
+    def fake_usable(gpu, force=False, ignore_sick=False):
+        # Healthy refresh empty; only the relaxed (quarantine-ignoring) refresh finds stock.
+        return [_inst(region="SICK-1")] if ignore_sick else []
+
+    monkeypatch.setattr(hs_api, "launch_vm", fake_launch)
+    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
+    h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="US-1")], attempt=0)
+    assert created == ["default-SICK-1"]
+    assert h.vm_id == "vm-99"
+
+
 def test_launch_raises_when_no_stock(monkeypatch):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs
@@ -720,8 +749,9 @@ def test_poll_dead_vm_error_stage_hb_quarantines_pretraining_fault(monkeypatch):
 def test_poll_dead_vm_stale_error_with_fresh_boot_heartbeat_is_preempted(monkeypatch):
     """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. On
     a RETRY (attempt > 0) that posts a boot heartbeat (THIS attempt is still booting) then loses the VM,
-    the loss must NOT be classified terminal job_failed off the stale file: in_early_setup_now() sees
-    the fresh boot-stage heartbeat and keeps it retriable (job_preempted). Mirrors the Lambda path."""
+    the loss must NOT be classified terminal job_failed off the stale file: fresh_error_heartbeat() is
+    false for a setup-stage heartbeat, so without positive current-crash evidence the loss stays
+    retriable (job_preempted). Mirrors the Lambda path."""
     jobs = _wire_poll(
         monkeypatch,
         vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
@@ -752,6 +782,26 @@ def test_poll_dead_vm_first_attempt_error_with_setup_heartbeat_is_job_failed(mon
     )
     assert not res.ok
     assert res.failure == "job_failed"  # current-attempt crash trusted despite the setup-stage heartbeat
+
+
+def test_poll_dead_vm_retry_stale_error_no_current_liveness_is_preempted(monkeypatch):
+    """On a RETRY (attempt > 0) the seed-scoped error_<phase>.txt may be a PRIOR attempt's, and THIS
+    attempt's VM can be lost before producing ANY fresh heartbeat. With no current-attempt liveness,
+    there is no proof the worker crashed this attempt, so the loss is a HOST LOSS -> job_preempted, NOT
+    a wrongful terminal job_failed off the stale file (over-retry is the documented safe bias on
+    retries). Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
+        error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a prior attempt
+    )
+    res = jobs.poll_hs_job(
+        _handle(attempt=1), _spec(), seed=0, interval_s=0,  # a RETRY
+        heartbeat_reader=lambda force=False: {},  # NO fresh heartbeat this attempt (cold VM loss)
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # host loss, not the stale file's deterministic crash
+    assert res.host_fault  # pre-training host loss with no cancel -> region quarantined
 
 
 def test_poll_active_no_liveness_fails_over_fast(monkeypatch):

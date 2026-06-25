@@ -239,6 +239,35 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
     assert h.instance_id == "i-7"
 
 
+def test_launch_relaxes_to_quarantined_region_when_healthy_exhausted(monkeypatch):
+    """If the initial healthy region rejects and the forced refresh finds NO healthy regions, the walk
+    relaxes the quarantine (ignore_sick) as a true last resort and launches into a quarantined-but-in-
+    capacity region rather than failing the attempt while sick capacity exists -- relax after the
+    healthy walk is exhausted, not only on an initially-empty healthy list."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    created = []
+
+    def fake_launch(*, region_name, **kw):
+        if region_name != "sick-region-1":
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")
+        created.append(region_name)
+        return "i-9"
+
+    def fake_usable(gpu, force=False, ignore_sick=False):
+        # Healthy refresh empty; only the relaxed (quarantine-ignoring) refresh finds capacity.
+        return [_inst(region="sick-region-1")] if ignore_sick else []
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
+    # Start on a healthy region that rejects -> healthy refresh empty -> relax to the quarantined region.
+    h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
+    assert created == ["sick-region-1"]
+    assert h.instance_id == "i-9"
+
+
 def test_launch_raises_when_no_capacity(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
@@ -813,9 +842,9 @@ def test_poll_dead_host_stale_error_with_fresh_boot_heartbeat_is_preempted(monke
     """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. On
     a RETRY (attempt > 0) that posts a boot heartbeat (THIS attempt overwrote the prior retriable one
     and is still booting) then loses the host, the loss must NOT be classified terminal job_failed off
-    the stale file: in_early_setup_now() sees the fresh boot-stage heartbeat and keeps it retriable
-    (job_preempted). (The pre-fix code, keyed only on the seed-scoped file + heartbeat retriable bit,
-    returned job_failed here.)"""
+    the stale file: fresh_error_heartbeat() is false for a setup-stage heartbeat, so without positive
+    current-crash evidence the loss stays retriable (job_preempted). (The pre-fix code, keyed only on
+    the seed-scoped file + heartbeat retriable bit, returned job_failed here.)"""
     jobs = _wire_poll(
         monkeypatch,
         instances=[{"status": "active"}, {"status": "terminating"}],
@@ -846,6 +875,26 @@ def test_poll_dead_host_first_attempt_error_with_setup_heartbeat_is_job_failed(m
     )
     assert not res.ok
     assert res.failure == "job_failed"  # current-attempt crash trusted despite the setup-stage heartbeat
+
+
+def test_poll_dead_host_retry_stale_error_no_current_liveness_is_preempted(monkeypatch):
+    """On a RETRY (attempt > 0) the seed-scoped error_<phase>.txt may be a PRIOR attempt's, and THIS
+    attempt's host can be lost before producing ANY fresh heartbeat. With no current-attempt liveness
+    (no fresh heartbeat at all), there is no proof the worker crashed this attempt, so the loss is a
+    HOST LOSS -> job_preempted (retry), NOT a wrongful terminal job_failed off the stale file. (Trusting
+    the file here would strand a recoverable run; over-retry is the documented safe bias on retries.)"""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a prior attempt
+    )
+    res = jobs.poll_lambda_job(
+        _handle(attempt=1), _spec(), seed=0, interval_s=0,  # a RETRY
+        heartbeat_reader=lambda force=False: {},  # NO fresh heartbeat this attempt (cold host loss)
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # host loss, not the stale file's deterministic crash
+    assert res.host_fault  # pre-training host loss with no cancel -> region quarantined
 
 
 def test_poll_loading_timeout(monkeypatch):
