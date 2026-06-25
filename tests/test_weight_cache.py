@@ -49,12 +49,16 @@ def test_legacy_datacenter_key_tolerated():
     assert not hasattr(spec.gpu, "datacenter")
 
 
-def test_network_volume_gb_tolerant_of_null_and_empty():
-    # Platform-managed field: a null/empty/missing value must default, not crash int() on load.
-    for raw in (None, "", 0):
+def test_network_volume_gb_tolerant_of_bad_values():
+    # Platform-managed field: null/empty/"0"/0/negative/non-numeric/missing -> default 100 (never
+    # crash int(), never round-trip a nonsensical size). Valid positive sizes pass through.
+    for raw in (None, "", 0, "0", -5, "-5", "abc"):
         spec = JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}})
-        assert spec.gpu.network_volume_gb == 100
+        assert spec.gpu.network_volume_gb == 100, f"{raw!r} should default to 100"
     assert JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v"}}).gpu.network_volume_gb == 100
+    for raw in (200, "150"):
+        spec = JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}})
+        assert spec.gpu.network_volume_gb == int(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +455,7 @@ def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
     from flash.providers.runpod.train import endpoints
 
     monkeypatch.setattr(_os, "environ", dict(_os.environ))  # isolate the branch's os.environ.update
+    monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # pretend the volume IS mounted
     calls = []
 
     def fake_snapshot(repo_id, token=None, cache_dir=None, local_files_only=False):
@@ -474,23 +479,27 @@ def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
 def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
     from flash.providers.runpod import preload
 
-    deleted = []
+    vols = {
+        "v1": "flash-weights-us-ca-2",
+        "v2": "flash-weights-eu-ro-1",
+        "v3": "someone-elses-volume",  # must NOT be touched
+        "v4": "flash-kernel-cache-abc",  # different fleet, must NOT touch
+    }
+    deletes = []
 
     class FakeRest:
-        def __init__(self, api_key=None):  # teardown passes api_key per pool account
+        def __init__(self, api_key=None):
             self.api_key = api_key
 
         async def list_network_volumes(self):
-            return {"networkVolumes": [
-                {"name": "flash-weights-us-ca-2", "id": "v1"},
-                {"name": "flash-weights-eu-ro-1", "id": "v2"},
-                {"name": "someone-elses-volume", "id": "v3"},  # must NOT be touched
-                {"name": "flash-kernel-cache-abc", "id": "v4"},  # different fleet, must NOT touch
-            ]}
+            return {"networkVolumes": [{"name": n, "id": i} for i, n in vols.items()]}
 
         async def _execute_rest(self, method, url):
-            deleted.append((method, url))
-            return {}
+            assert method == "DELETE"
+            vid = url.rsplit("/", 1)[-1]
+            deletes.append(vid)
+            vols.pop(vid, None)  # actually delete
+            raise Exception("204 No Content")  # empty-body parse error MUST be tolerated
 
     import runpod_flash.core.api.runpod as rp_api
 
@@ -499,10 +508,11 @@ def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
     monkeypatch.setattr(rp_keys, "keys", lambda: ["k1"])  # single-account pool
     monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
     out = preload.teardown_weight_cache(["US-CA-2", "EU-RO-1"])
+    # returns names CONFIRMED gone by re-list (not by trusting the 204-erroring delete response)
     assert sorted(out) == ["flash-weights-eu-ro-1", "flash-weights-us-ca-2"]
-    assert len(deleted) == 2
-    assert all(m == "DELETE" for m, _ in deleted)
-    assert all(("v1" in u or "v2" in u) for _, u in deleted)  # only the two fleet volumes
+    assert sorted(deletes) == ["v1", "v2"]  # only the two fleet volumes were deleted
+    assert "v3" in vols  # other accounts' / fleets' volumes untouched
+    assert "v4" in vols
 
 
 def test_teardown_weight_cache_sweeps_all_pool_accounts(monkeypatch):
@@ -513,11 +523,13 @@ def test_teardown_weight_cache_sweeps_all_pool_accounts(monkeypatch):
     class FakeRest:
         def __init__(self, api_key=None):
             seen_keys.append(api_key)
+            self.vols = {"v1": "flash-weights-us-ca-2"}  # each account independently holds it
 
         async def list_network_volumes(self):
-            return {"networkVolumes": [{"name": "flash-weights-us-ca-2", "id": "v1"}]}
+            return {"networkVolumes": [{"name": n, "id": i} for i, n in self.vols.items()]}
 
         async def _execute_rest(self, method, url):
+            self.vols.pop(url.rsplit("/", 1)[-1], None)
             return {}
 
     import runpod_flash.core.api.runpod as rp_api
@@ -602,6 +614,60 @@ def test_preload_one_dc_tears_down_on_failure(monkeypatch):
     )
     assert out["status"] == "error"
     assert deleted == ["ep-9"]  # still torn down on failure
+
+
+def _stub_preload_deploy(monkeypatch, job_output):
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "deploy_train_endpoint", lambda *a, **k: ("ep", "n"))
+    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, p: "job")
+    monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: None)
+    monkeypatch.setattr(
+        preload.runpod_api, "job_status",
+        lambda eid, jid: {"status": "COMPLETED", "output": job_output},
+    )
+
+
+def test_preload_one_dc_partial_when_a_model_fails(monkeypatch):
+    # A COMPLETED job whose handler reports per-model failures is NOT a fully warmed region.
+    from flash.providers.runpod import preload
+
+    _stub_preload_deploy(monkeypatch, {
+        "preloaded": ["a"], "already_cached": [], "failed": {"b": "gated repo"},
+    })
+    out = preload._preload_one_dc("US-CA-2", ["a", "b"], token=None, gpu="g", timeout_s=60, poll_interval_s=0.0)
+    assert out["status"] == "partial"
+    assert out["result"]["failed"] == {"b": "gated repo"}
+
+
+def test_preload_one_dc_error_when_volume_not_mounted(monkeypatch):
+    # The handler's mount-not-mounted hard error must surface as a DC-level error (not silent ok).
+    from flash.providers.runpod import preload
+
+    _stub_preload_deploy(monkeypatch, {
+        "preloaded": [], "already_cached": [], "failed": {},
+        "error": "weight-cache volume not mounted at /runpod-volume",
+    })
+    out = preload._preload_one_dc("US-CA-2", ["a"], token=None, gpu="g", timeout_s=60, poll_interval_s=0.0)
+    assert out["status"] == "error"
+    assert "not mounted" in out["error"]
+
+
+def test_preload_branch_errors_when_volume_not_mounted(monkeypatch):
+    # In the worker handler: if /runpod-volume isn't a real mount, preload must NOT silently warm
+    # ephemeral disk — it returns an explicit error and downloads nothing.
+    import os as _os
+
+    from flash.providers.runpod.train import endpoints
+
+    monkeypatch.setattr(_os, "environ", dict(_os.environ))
+    monkeypatch.setattr(_os.path, "isdir", lambda p: False)  # /runpod-volume not mounted
+    out = endpoints._train_body({
+        "mode": "preload", "models": ["Qwen/Qwen3.5-0.8B"],
+        "env": {"HF_HOME": "/runpod-volume/hf-cache"},
+    })
+    assert out["preloaded"] == []
+    assert "not mounted" in out["error"]
 
 
 def test_warm_weight_cache_fans_out_over_datacenters(monkeypatch):

@@ -13,9 +13,10 @@ existing baked worker image + deploy/submit/quota machinery; the only new worker
 ``preload`` branch in ``train.endpoints._train_body``.
 
 COST / GC NOTE: the fleet is permanent, billed standing storage. A run (or a full preload) creates a
-``flash-weights-<dc>`` volume in EVERY storage datacenter (default 11 x 100 GB ~= 1.1 TB, ~$77/mo),
-and RunPod network volumes are NOT auto-deleted — there is no GC. Reclaim them with ``--teardown``
-(deletes every per-DC weight-cache volume via the RunPod REST API).
+``flash-weights-<dc>`` volume in EVERY storage datacenter (one per DataCenter.all() entry — currently
+~11 x 100 GB ~= 1.1 TB, ~$77/mo; grows by one volume if the SDK adds a storage region), and RunPod
+network volumes are NOT auto-deleted — there is no GC. Reclaim them with ``--teardown`` (deletes
+every per-DC weight-cache volume across ALL pool accounts via the RunPod REST API).
 
 Run it::
 
@@ -106,6 +107,13 @@ def _preload_one_dc(
         job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
         logger.info("preload %s: job %s submitted (%d models)", dc_id, job_id, len(models))
         result = _poll_until_done(endpoint_id, job_id, timeout_s, poll_interval_s)
+        # The job COMPLETED, but the handler reports per-model failures (and a hard error if the
+        # volume wasn't mounted) inside its result — a completed job is NOT necessarily a warmed
+        # region. Surface those so the driver/CLI don't count a no-op (or partial) warm as success.
+        if result.get("error"):
+            return {"datacenter": dc_id, "status": "error", "error": result["error"], "result": result}
+        if result.get("failed"):
+            return {"datacenter": dc_id, "status": "partial", "result": result}
         return {"datacenter": dc_id, "status": "ok", "result": result}
     except Exception as exc:  # one region failing must not abort the others
         logger.warning("preload %s FAILED: %s", dc_id, exc)
@@ -187,18 +195,24 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     }
     pool = rp_keys.keys() or [None]  # [None] -> RunpodRestClient() resolves the key from the env
 
+    async def _names(client) -> set:
+        res = await client.list_network_volumes()
+        vols = res if isinstance(res, list) else res.get("networkVolumes", [])
+        return {v.get("name") for v in vols}
+
     async def _go_one(api_key) -> list[str]:
         client = RunpodRestClient(api_key=api_key) if api_key else RunpodRestClient()
         res = await client.list_network_volumes()
         vols = res if isinstance(res, list) else res.get("networkVolumes", [])
-        deleted: list[str] = []
-        for v in vols:
-            if v.get("name") in targets and v.get("id"):
-                await client._execute_rest(
-                    "DELETE", f"{RUNPOD_REST_API_URL}/networkvolumes/{v['id']}"
-                )
-                deleted.append(v["name"])
-        return deleted
+        to_delete = {v["name"]: v["id"] for v in vols if v.get("name") in targets and v.get("id")}
+        for vid in to_delete.values():
+            # RunPod's DELETE /networkvolumes/{id} returns 204 No Content, which the SDK's
+            # _execute_rest chokes on (it always await response.json()). Swallow that — we confirm
+            # the actual outcome by RE-LISTING below, not by trusting the delete's parsed response.
+            with contextlib.suppress(Exception):
+                await client._execute_rest("DELETE", f"{RUNPOD_REST_API_URL}/networkvolumes/{vid}")
+        remaining = await _names(client)
+        return [name for name in to_delete if name not in remaining]  # provably gone
 
     multi = len(pool) > 1
     deleted: list[str] = []

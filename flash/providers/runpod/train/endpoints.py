@@ -245,6 +245,16 @@ def _train_body(input_data: dict) -> dict:
         # instead of the worker's ephemeral default cache. (The training path is immune: it spawns a
         # subprocess that imports huggingface_hub fresh with HF_HOME already in its env.)
         hf_home = overrides.get("HF_HOME")
+        # The whole point of preload is to write onto the per-region network volume. If it isn't
+        # actually mounted (e.g. the endpoint was deployed without the volume / RunPod didn't mount
+        # it), downloading would silently warm the worker's EPHEMERAL disk and report success while
+        # warming nothing. Fail loudly instead so the driver records this region as failed.
+        if hf_home and hf_home.startswith("/runpod-volume") and not os.path.isdir("/runpod-volume"):
+            return {
+                "preloaded": [], "already_cached": [], "failed": {},
+                "error": f"weight-cache volume not mounted at /runpod-volume (HF_HOME={hf_home})",
+                "hf_home": hf_home,
+            }
         cache_dir = os.path.join(hf_home, "hub") if hf_home else None
         done, already, failed = [], [], {}
         for repo_id in input_data.get("models") or []:

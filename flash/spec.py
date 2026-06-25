@@ -69,6 +69,20 @@ def _coerce_wandb(value: Any) -> WandbSpec:
     return WandbSpec(project=_label(value.get("project")), run_name=_label(value.get("run_name")))
 
 
+def _volume_gb(value: Any, default: int = 100) -> int:
+    """Parse the platform-managed weight-cache volume size, defaulting on anything not a positive int.
+
+    Tolerant by design (the field is platform-set, and stale/hand-edited specs must still load): a
+    missing / null / empty / non-numeric value, or a non-positive size (incl. the string "0" or a
+    negative), all fall back to ``default`` rather than crashing or round-tripping a nonsensical size.
+    """
+    try:
+        gb = int(value)
+    except (TypeError, ValueError):
+        return default
+    return gb if gb > 0 else default
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
@@ -287,9 +301,9 @@ class JobSpec:
                 # reverted single-DC pin) is intentionally ignored — the DC set is deploy-time
                 # policy now, so stale specs carrying it are tolerated, never region-pinned.
                 network_volume=gpu.get("network_volume"),
-                # Tolerant: null / "" / 0 / missing -> the default. This field is platform-managed,
-                # so a stale or hand-edited spec must still load, not crash on int(None)/int("").
-                network_volume_gb=int(gpu.get("network_volume_gb") or 100),
+                # Tolerant: null / "" / "0" / 0 / negative / non-numeric / missing -> the default.
+                # Platform-managed, so a stale or hand-edited spec must still load with a sane size.
+                network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),

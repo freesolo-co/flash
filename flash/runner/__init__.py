@@ -245,9 +245,11 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # Fully managed: a fixed name + size, no env knobs. 100 GB holds the whole curated catalog (the
 # largest, the 9B, is ~19 GB of weights) with ample headroom; the preload step warms it.
 # COST/GC: the provider realizes this as one ``flash-weights-<dc>`` volume PER storage datacenter
-# (see jobs.weight_cache_volumes), so the first run (or a full preload) provisions the whole fleet —
-# ~11 x 100 GB ~= 1.1 TB of PERMANENT billed storage (~$77/mo). RunPod never auto-deletes network
-# volumes; reclaim the fleet with ``python -m flash.providers.runpod.preload --teardown``.
+# (jobs.weight_cache_volumes, one per DataCenter.all() entry — currently ~11), so the first run (or
+# a full preload) provisions the whole fleet = (#storage DCs) x 100 GB of PERMANENT billed storage
+# (~11 x 100 GB ~= 1.1 TB ~= $77/mo today; grows by one volume if the SDK adds a storage region).
+# RunPod never auto-deletes network volumes; reclaim the fleet with
+# ``python -m flash.providers.runpod.preload --teardown``.
 #
 # TRUST MODEL (shared multi-tenant cache): the mount is read-WRITE on every run, and a run executes
 # its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a

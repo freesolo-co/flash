@@ -144,6 +144,13 @@ def weight_cache_volumes(spec) -> list:
     eligible runs) and the DC set is non-empty. Each physical volume is ``<base>-<dc>`` (see
     ``weight_cache_volume_name``), idempotent by (name, datacenter): runpod_flash reuses an existing
     volume of that name/DC, so this is create-or-attach, not always-create.
+
+    Multi-account pools: ``deploy_train_endpoint`` deploys volumes+endpoint together via the SDK's
+    ResourceManager, and on a quota failover it re-runs the WHOLE deploy on the next account — so the
+    volumes are re-created on whichever account ends up hosting the endpoint (they are account-scoped;
+    the endpoint never references volumes from a different account). Volumes created on the account it
+    failed over FROM are harmless orphans, reclaimed by ``preload --teardown`` (which sweeps every
+    pool account).
     """
     base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
     if not base:

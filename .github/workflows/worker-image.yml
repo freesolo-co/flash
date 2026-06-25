@@ -28,6 +28,11 @@ on:
     paths:
       - Dockerfile.worker
       - .github/workflows/worker-image.yml
+      # The baked rp_handler is generated from _train_body at build time (docker/make_rp_handler.py),
+      # so handler changes (e.g. the weight-cache preload branch) MUST rebuild the image or they
+      # never reach a worker. Watch the handler source + the generator.
+      - flash/providers/runpod/train/endpoints.py
+      - docker/make_rp_handler.py
 
 permissions:
   contents: read
