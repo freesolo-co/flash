@@ -37,8 +37,12 @@ match at boot (`load_cache_artifacts` silently won't load it). build the base im
 warm inside it on a GPU runner:
 
 ```sh
-# 1. warm the kernels INSIDE the worker image; write the mega-cache into the build context
-docker run --rm --gpus all -v "$PWD/build/kernel_cache:/out" \
+# 1. warm the kernels INSIDE the worker image; write the mega-cache into the build context.
+# the image ships DEPS only (the flash package is normally fetched from HF at runtime), so MOUNT the
+# flash package in and put it on PYTHONPATH -- otherwise this fails with "No module named flash".
+docker run --rm --gpus all \
+  -v "$PWD/flash:/src/flash:ro" -e PYTHONPATH=/src \
+  -v "$PWD/build/kernel_cache:/out" \
   ghcr.io/freesolo-co/flash-worker:cu128 \
   python -m flash.engine.worker.kernel_warmup --arch 9.0 --out /out
 
