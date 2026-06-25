@@ -1253,38 +1253,98 @@ def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
     return rows, examples
 
 
+# Hard ceiling on the per-device completion micro-batch when growing on a SHORT-seq run. MEASURED
+# (RunPod, Qwen3.5-0.8B GRPO, group8, gsm8k, seq1024, 6 steps): trainer throughput rises from
+# per_device 4 -> 8 (~+12%) and plateaus 8..16 (A100 80GB: 375/407/411 tok/s at pd 4/8/16), then
+# REGRESSES at pd 32 (326 tok/s, -20%) as the larger forward stops buying MFU. So we never grow
+# past the top of that plateau, even on a card with VRAM to spare. (Reward histories at pd 4 and
+# 16 were identical -> per_device is a pure speed/VRAM knob, not an optimization change.)
+_RL_PER_DEVICE_MAX = 16
+# Reference sequence length the activation/VRAM divisor is calibrated at. The colocate activation
+# peak grows with the training sequence length; the cap is scaled by seq_len/_RL_ACT_SEQ_REF so a
+# short-seq run (the underfed regime) is allowed a proportionally bigger micro-batch.
+_RL_ACT_SEQ_REF = 2048.0
+# VRAM-per-(micro-batch element) divisor at the reference seq, normalized to ~2B width (1.41).
+# MEASURED: Qwen3.5-2B group8 seq2048 OOMs a 32 GB card at per_device=8 but trains at 4 ->
+# 32 / (7.5 * 1.0 * 1.0) = 4. (Unchanged from the historical colocate cap, so at/above the
+# reference seq the value is byte-for-byte the old one — no regression.)
+_RL_ACT_DIVISOR = 7.5
+# Floor on the seq scale: caps how far a short sequence may grow the micro-batch. Set so the
+# underfed case that motivated this — Qwen3.5-0.8B GRPO on a 24 GB card at seq<=1024 — lands on
+# the MEASURED-SAFE per_device 8 (RunPod RTX 4090 24 GB: pd8 fits at 19.0 GB and is +12.6% over
+# pd4, while the old seq-independent cap under-fed it at ~5; pd16 there would need ~27 GB -> OOM).
+# 24 / (7.5 * (0.894/1.41) * 0.63) = 8.0. Bounds short-seq growth to ~1.6x the reference cap.
+_RL_ACT_SEQ_SCALE_FLOOR = 0.63
+# Clamp the seq scale at 1.0 (never ABOVE the reference). Combined with the short_seq growth gate,
+# this makes a seq>=reference run byte-for-byte the old value: seq_scale==1.0 -> vram_cap == the
+# old colocate cap, and the ceiling falls back to the historical default, so min(default, ...) is
+# exactly what the old code returned. We deliberately do NOT tighten long-seq below the historical
+# value (grad checkpointing makes activations sub-linear in seq there, so the linear model would
+# over-cap), nor grow above it (unvalidated — the regression is in tokens-in-flight = pd x seq).
+_RL_ACT_SEQ_SCALE_CEIL = 1.0
+
+
 def rl_per_device_comps(
     completion_len: int = 0,
     vocab: int = 248_320,
     *,
     use_vllm: bool = True,
     params_b: float | None = None,
+    seq_len: int = 0,
 ) -> int:
     """Per-device *completion* micro-batch for GRPO (TRL counts completions, not prompts).
 
-    This, not grad-accum, sets peak trainer VRAM: the logprob pass materializes fp32 logits
-    of shape [per_device, completion_len, vocab]. At Qwen3.5's ~248k vocab a long completion is
-    enormous (measured: per_device 8 x 4096 tok x 248k x 4 B = ~30 GiB single alloc -> OOMs
-    a small card). So we MEMORY-CAP per_device to a logits budget (6 GB) for the
-    given completion length, then push the difference into grad-accum
-    (compute_grpo_batching) so the effective batch is unchanged. This keeps long-completion
-    GRPO on a cheaper GPU.
+    This, not grad-accum, sets peak trainer VRAM AND the trainer step's MFU: a bigger
+    micro-batch means bigger, fewer GEMMs (less launch overhead, fuller tensor cores) at the
+    same effective batch (compute_grpo_batching pushes the remainder into grad-accum, so the
+    optimization is identical — only speed/VRAM change). MEASURED on RunPod (Qwen3.5-0.8B GRPO,
+    group8, seq1024): the old seq-independent colocate cap under-fed a 24 GB card at per_device ~5,
+    while per_device 8 fits (19.0 GB) and is +12.6% throughput; on an 80 GB card throughput
+    plateaus at per_device 8..16 and regresses by per_device 32. So on a SHORT-seq run we grow the
+    micro-batch into the card's measured VRAM headroom up to the plateau ceiling.
 
-    The logits budget is NOT the whole story: the per-device forward also holds the model's
-    attention/activation memory (the Qwen3.5 GDN/FLA kernels peak per micro-batch even with
-    grad checkpointing), which the logits term can't see. Under colocated vLLM (the rollout
-    engine + its card-sized KV pool + a 2nd weight copy share the GPU) that activation peak is
-    what OOMs a small card -- and Liger, which fuses away the logits, does NOT touch it.
-    MEASURED: Qwen3.5-2B (width ~1.41) group8 seq2048 OOMs a 32 GB card at per_device=8 but
-    TRAINS at 4. So for colocate, additionally cap per_device to the live card's VRAM scaled
-    by model width (~sqrt(params)): ~vram_gb/8 at 2B-width, tightened for wider models (4B/9B).
+    Growth is GATED to short sequences (seq < the reference). At/above the reference seq the value
+    is byte-for-byte the historical one — bigger per_device at long context is unvalidated and the
+    regression is driven by tokens-in-flight (per_device x seq), which a fixed-per_device ceiling
+    would not catch.
+
+    Two upper bounds cap the growth:
+
+    * **logits budget (6 GB)** — a HARD correctness cap. The logprob pass can materialize fp32
+      logits of shape [per_device, completion_len, vocab]; at Qwen3.5's ~248k vocab a long
+      completion is enormous (per_device 8 x 4096 tok x 248k x 4 B = ~30 GiB -> OOMs a small
+      card). Liger normally fuses these away, but this stays a safety net for the fallback path.
+
+    * **activation/VRAM cap** — the per-device forward holds the model's attention/activation
+      memory (the Qwen3.5 GDN/FLA kernels peak per micro-batch even with grad checkpointing),
+      which the logits term can't see and which Liger does NOT touch. Calibrated against the live
+      card's VRAM, model width (~sqrt(params)), and — unlike the old seq-independent cap — the
+      training sequence length: activations scale ~linearly with seq, so a SHORT-seq run gets a
+      proportionally bigger cap. MEASURED at seq_ref=2048: Qwen3.5-2B (width ~1.41) group8 OOMs a
+      32 GB card at per_device=8 but trains at 4 -> 32 / 7.5 = 4.
+
+    Off a live card (allocator / unit tests) there is no VRAM signal, so we fall back to the
+    conservative historical default (8, or 2 with thinking) bounded by the logits budget — the
+    allocator already provisions for that floor, and the worker only ever grows INTO the spare
+    VRAM the chosen card actually reports, so it cannot over-fill the card it was routed to.
     """
-    # Default prompts/step; the auto-caps below (logits budget + colocate VRAM/width) handle OOM.
-    base = 2 if THINKING else 8
+    default = 2 if THINKING else 8
+
+    # Logits budget: hard upper bound on the fp32 [per_device, completion, vocab] logprob tensor.
+    logits_cap = _RL_PER_DEVICE_MAX
     if completion_len > 0:
-        budget = 6.0 * 1e9
-        cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
-        base = min(base, cap)
+        logits_cap = max(1, int(6.0e9 / (max(1, completion_len) * vocab * 4)))
+
+    # Growth is gated to SHORT sequences (seq < the reference). At/above the reference seq the
+    # micro-batch is left exactly as the historical code computed it: bigger per_device at long
+    # context is unvalidated and risky — the measured throughput regression is driven by
+    # tokens-in-flight (per_device x seq), so per_device 16 at seq 2048 (~the regression-zone
+    # per_device 32 at seq 1024) could regress, and a fixed-per_device ceiling would not catch it.
+    short_seq = (seq_len or _RL_ACT_SEQ_REF) < _RL_ACT_SEQ_REF
+
+    # Activation/VRAM cap — only computable on a live card. It both caps DOWN (big model / small
+    # card / long seq) and, on a SHORT-seq run, lets the micro-batch GROW into spare VRAM.
+    vram_cap = None
     if use_vllm:
         try:
             import torch
@@ -1292,11 +1352,25 @@ def rl_per_device_comps(
             if torch.cuda.is_available():
                 vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                 width = (max(float(params_b), 0.1) ** 0.5) if params_b else 1.41
-                act_cap = max(1, int(vram_gb / (7.5 * (width / 1.41))))
-                base = min(base, act_cap)
+                seq_scale = min(
+                    _RL_ACT_SEQ_SCALE_CEIL,
+                    max(_RL_ACT_SEQ_SCALE_FLOOR, (seq_len or _RL_ACT_SEQ_REF) / _RL_ACT_SEQ_REF),
+                )
+                vram_cap = max(
+                    1, int(vram_gb / (_RL_ACT_DIVISOR * (width / 1.41) * seq_scale))
+                )
         except Exception as e:
             print("rl_per_device_comps colocate cap probe failed (keeping logits cap):", e)
-    return max(1, base)
+
+    if vram_cap is None:
+        # No live card (allocator / offline / unit tests): conservative default, logits-bounded.
+        return max(1, min(default, logits_cap))
+    # Short seq -> grow into measured VRAM headroom up to the plateau ceiling. At/above the
+    # reference seq the ceiling is the historical default, and seq_scale is clamped to 1.0 so
+    # vram_cap == the old colocate cap -> the result is byte-for-byte the old value (no regression,
+    # no unvalidated long-seq growth).
+    ceiling = _RL_PER_DEVICE_MAX if short_seq else default
+    return max(1, min(ceiling, logits_cap, vram_cap))
 
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
@@ -1745,7 +1819,13 @@ def run_rl():
     # OOMs the trainer forward. Single-turn keeps `_max_completion` (its true completion length).
     _cap_completion_len = vllm_max_len if is_multi_turn else _max_completion
     per_device_comps = rl_per_device_comps(
-        _cap_completion_len, vocab=vocab_size_for(model_id), use_vllm=use_vllm, params_b=_params_b
+        _cap_completion_len,
+        vocab=vocab_size_for(model_id),
+        use_vllm=use_vllm,
+        params_b=_params_b,
+        # The trainer forward processes prompt+completion up to the engine context, so the
+        # activation/VRAM cap is sized against the worst-case training sequence length.
+        seq_len=vllm_max_len,
     )
     if is_multi_turn and _cap_completion_len != _max_completion:
         print(
@@ -2060,10 +2140,14 @@ def run_rl():
     # Mid-run eval is intentionally NOT run during training: held-out evaluation happens on the
     # deploy/serving side (against the trained adapter), keeping training pure (no eval-phase cost
     # or eval-boundary stalls). Training streams only the per-step reward heartbeat.
+    _reset_peak_gpu()  # peak_gpu_gb reflects the train loop (verifies the micro-batch headroom)
+    _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. vLLM colocate + bnb pages
     t_train = time.time()
     with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
+    rl_peak_gpu_gb = _peak_gpu_gb()
+    rl_device_peak_gpu_gb = _gpu_sampler.stop_gb()
     reward_history = list(getattr(hb_cb, "reward_history", []))
     # A GRPO run that finishes WITHOUT the reward callback ever firing (empty reward_history)
     # produced NO real training — the rollout scored nothing (e.g. vLLM generation silently
@@ -2124,6 +2208,12 @@ def run_rl():
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
             "loss_curve": _metric_curve(trainer, "loss"),
+            # Peak torch-allocated GPU memory during the GRPO train loop (excludes bnb managed
+            # pages). device_peak_gpu_gb is the TRUE device footprint (total-free, incl. the vLLM
+            # colocate engine + bnb pages): the headline for verifying the per-device micro-batch
+            # left the card with headroom (no OOM) at the sized batch.
+            "peak_gpu_gb": rl_peak_gpu_gb,
+            "device_peak_gpu_gb": rl_device_peak_gpu_gb,
             # Which chalk gap-filling kernels actually ENGAGED (None = chalk not installed or every
             # kernel fell back) — verifies the chalk stack on a GRPO run without the console.
             "chalk_kernels": active_kernels(_chalk_report) or None,
@@ -2328,6 +2418,46 @@ def _load_kernel_cache_if_present() -> bool:
         return False
 
 
+def wandb_finish(exit_code: int = 0) -> None:
+    """Finalize the W&B run before the worker's hard ``os._exit()``.
+
+    The worker hard-exits to dodge the colocated-vLLM teardown deadlock (see main),
+    which skips wandb's atexit sync — so a *successfully completed* run was left
+    dangling and W&B eventually marked it ``crashed`` even though all metrics were
+    logged. Explicitly finish the run (we own it: we called ``wandb.init`` in
+    ``wandb_report_to``) so it shows ``finished``. Best-effort; never raises (W&B is
+    optional, metrics.json is the source of truth)."""
+    if not os.environ.get("WANDB_API_KEY"):
+        return
+    import importlib.util
+
+    if importlib.util.find_spec("wandb") is None:
+        return
+    try:
+        import wandb
+
+        if getattr(wandb, "run", None) is None:
+            return
+
+        errs: list[Exception] = []
+
+        def _finish() -> None:
+            try:
+                wandb.finish(exit_code=exit_code)
+            except Exception as e:
+                errs.append(e)
+
+        t = threading.Thread(target=_finish, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        if t.is_alive():
+            print("[wandb] finish() timed out; continuing with hard exit")
+        elif errs:
+            print(f"[wandb] finish() warning: {errs[0]}")
+    except Exception as e:  # pragma: no cover - logging-only path
+        print(f"[wandb] finish() warning: {e}")
+
+
 def main():
     # Idempotency: if DONE was already uploaded, a re-delivered job re-fetches the final
     # metrics from HF and returns them immediately. (The previous behavior — sleeping in
@@ -2397,6 +2527,7 @@ def main():
         # handler's *blocking* `subprocess.run` (heartbeat frozen at "rl_train_done") and the
         # whole run stalls until the wall-clock cap. Hard-exit to bypass the hanging teardown now that
         # every output is safely persisted.
+        wandb_finish(exit_code=0)  # mark the W&B run finished BEFORE os._exit (which skips wandb's atexit sync)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
@@ -2423,6 +2554,7 @@ def main():
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags)
         # keep container alive briefly so logs flush, then exit non-zero -> restart
+        wandb_finish(exit_code=1)  # finalize the W&B run as failed (don't leave it dangling -> "crashed")
         time.sleep(10)
         raise
 
