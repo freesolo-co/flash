@@ -2272,11 +2272,33 @@ def wandb_finish(exit_code: int = 0) -> None:
     logged. Explicitly finish the run (we own it: we called ``wandb.init`` in
     ``wandb_report_to``) so it shows ``finished``. Best-effort; never raises (W&B is
     optional, metrics.json is the source of truth)."""
+    if not os.environ.get("WANDB_API_KEY"):
+        return
+    import importlib.util
+
+    if importlib.util.find_spec("wandb") is None:
+        return
     try:
         import wandb
 
-        if getattr(wandb, "run", None) is not None:
-            wandb.finish(exit_code=exit_code)
+        if getattr(wandb, "run", None) is None:
+            return
+
+        errs: list[Exception] = []
+
+        def _finish() -> None:
+            try:
+                wandb.finish(exit_code=exit_code)
+            except Exception as e:
+                errs.append(e)
+
+        t = threading.Thread(target=_finish, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        if t.is_alive():
+            print("[wandb] finish() timed out; continuing with hard exit")
+        elif errs:
+            print(f"[wandb] finish() warning: {errs[0]}")
     except Exception as e:  # pragma: no cover - logging-only path
         print(f"[wandb] finish() warning: {e}")
 
