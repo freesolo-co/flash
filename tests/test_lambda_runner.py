@@ -727,7 +727,7 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
         def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
             uploaded["path"] = path_in_repo
             uploaded["repo"] = repo_id
-            uploaded["body"] = path_or_fileobj
+            uploaded["fileobj"] = path_or_fileobj
 
     monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
 
@@ -744,7 +744,12 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     embedded = json.loads(base64.b64decode(ud.split("FLASH_PAYLOAD_EOF")[1].strip()))
     assert embedded["job_spec_json"] == ""
     assert embedded["job_spec_in_hf"] is True
-    assert uploaded == {"path": "sft/x/seed0/job_spec.json", "repo": "o/r", "body": big.encode()}
+    assert uploaded["path"] == "sft/x/seed0/job_spec.json"
+    assert uploaded["repo"] == "o/r"
+    # The spec is uploaded as an unambiguous file-like object (io.BytesIO), NOT raw bytes — raw
+    # bytes is a valid path type and huggingface_hub could misread it as a (huge) filesystem path.
+    assert isinstance(uploaded["fileobj"], io.BytesIO)
+    assert uploaded["fileobj"].getvalue() == big.encode()
     # user_data is tiny despite a 100KB spec, and the caller's payload is untouched.
     assert len(ud) < 25_000
     assert payload["job_spec_json"] == big

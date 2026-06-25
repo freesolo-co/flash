@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -155,8 +156,10 @@ def _spill_large_spec_to_hf(payload: dict) -> dict:
     if len(spec_json) <= _SPEC_SPILL_THRESHOLD:
         return payload
     from huggingface_hub import HfApi
-    import io
 
+    # Wrap the bytes in BytesIO: huggingface_hub.upload_file accepts a path-like for
+    # path_or_fileobj, and raw ``bytes`` is itself a valid path type, so it could be
+    # misinterpreted as a (huge) filesystem path. BytesIO makes it an unambiguous file-like upload.
     HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
         path_or_fileobj=io.BytesIO(spec_json.encode("utf-8")),
         path_in_repo=f"{payload['hf_prefix']}/job_spec.json",
