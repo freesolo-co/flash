@@ -2235,6 +2235,14 @@ def run_rl():
                     "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
                     "crash workaround; update vLLM to a TRL-supported version to re-enable)"
                 )
+                # vLLM 0.19.1 also hits RuntimeError: aot_compile is not supported
+                # through its default torch.compile path on some GPU architectures
+                # (Ampere sm_86: A6000, A100). VLLM_TORCH_COMPILE_LEVEL=0 forces
+                # eager execution inside vLLM to prevent this secondary crash.
+                import os as _os
+                if "VLLM_TORCH_COMPILE_LEVEL" not in _os.environ:
+                    _os.environ["VLLM_TORCH_COMPILE_LEVEL"] = "0"
+                    print("[rl][warn] VLLM_TORCH_COMPILE_LEVEL=0 (prevent aot_compile on vLLM 0.19.1)")
         except Exception:
             pass
         if _cudagraph_safe:
