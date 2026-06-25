@@ -2045,12 +2045,15 @@ def run_rl():
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
     # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
-    # Mask-aware lm_head: for MULTI-TURN GRPO, skip the 248k-vocab projection at the ~half of
-    # completion tokens that are masked env/tool text (the trainer step — not the rollout — dominates
-    # multi-turn train_wall, and that projection is its most expensive op). Loss-preserving; only for
-    # the rollout_func (multi-turn) path with the Liger fused loss present. No-op otherwise.
-    if use_rollout_func and grpo_kwargs.get("use_liger_kernel") and patch_grpo_mask_aware_lm_head(trainer):
-        print("[rl] mask-aware lm_head: skipping masked (env/pad) positions in the GRPO loss")
+    # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
+    # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
+    # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
+    # the right-PADDING (GRPO samples variable-length completions, padded to the batch max). Either
+    # way those positions add zero loss/gradient but pay full FLOPs. Loss-preserving; applies to ALL
+    # GRPO with the Liger fused loss; no-op when nothing is masked (uniform-length single-turn).
+    if grpo_kwargs.get("use_liger_kernel") and patch_grpo_mask_aware_lm_head(trainer):
+        _masked_kind = "env + padding" if use_rollout_func else "padding"
+        print(f"[rl] mask-aware lm_head: skipping masked ({_masked_kind}) positions in the GRPO loss")
     # The trainer (and its colocated vLLM engine + initial checkpoint load) is now built. Activate
     # the TRL->vLLM weight-sync name remap ONLY now (see patch_vllm_lm_weight_sync) so the initial
     # checkpoint load stayed untouched while the train-time syncs get remapped. No-op unless the VL

@@ -85,5 +85,21 @@ def test_mask_aware_lm_head_noop_when_nothing_masked():
     assert rec["T"] == 6  # untouched (no gather)
 
 
+def test_mask_aware_lm_head_single_turn_padding():
+    # Single-turn GRPO has no tool_mask, but completions are padded to the batch max -> the
+    # completion_mask carries trailing right-padding zeros. The patch must skip those too, still
+    # loss-preserving. Row0: 3 real + 3 pad, row1: 5 real + 1 pad -> T' = 5.
+    rec_full, rec_masked = {}, {}
+    kw = _inputs()
+    kw["attention_mask"] = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]])
+    loss_full, _ = _make_fake_loss(rec_full)(**kw)
+    trainer = _FakeTrainer()
+    trainer.liger_grpo_loss = _make_fake_loss(rec_masked)
+    patch_grpo_mask_aware_lm_head(trainer)
+    loss_masked, _ = trainer.liger_grpo_loss(**kw)
+    assert rec_masked["T"] == 5  # gathered to the deepest real length (skips padding)
+    assert torch.allclose(loss_full, loss_masked)  # exactly loss-preserving for single-turn padding
+
+
 def test_mask_aware_lm_head_returns_false_without_loss_object():
     assert patch_grpo_mask_aware_lm_head(_FakeTrainer()) is False

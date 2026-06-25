@@ -231,13 +231,15 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
 def patch_grpo_mask_aware_lm_head(trainer) -> bool:
     """Skip the 248k-vocab ``lm_head`` projection at MASKED completion positions in the GRPO loss.
 
-    In multi-turn GRPO the completion is the full interleaved transcript; ~half of it is
-    environment/tool tokens masked out of the loss (the rollout's ``env_mask`` -> TRL's
-    ``tool_mask``), plus right-padding. TRL 1.6's ``compute_liger_loss`` hands the FULL-length hidden
-    states to ``liger_grpo_loss``, and the Liger kernel runs the lm_head matmul + log-softmax for
-    EVERY position (in the forward AND the backward recompute). Masked positions contribute zero
+    Applies to ALL GRPO. In MULTI-TURN the masked set is the env/tool text (~half-to-most of the
+    transcript: the rollout's ``env_mask`` -> TRL's ``tool_mask``) plus right-padding; in SINGLE-TURN
+    it is the right-PADDING alone (GRPO samples variable-length completions, padded to the batch max,
+    so shorter ones carry masked padding). TRL 1.6's ``compute_liger_loss`` hands the FULL-length
+    hidden states to ``liger_grpo_loss``, and the Liger kernel runs the lm_head matmul + log-softmax
+    for EVERY position (in the forward AND the backward recompute). Masked positions contribute zero
     loss and zero gradient but still pay the full FLOPs of the single most expensive GRPO op (the
-    248k-vocab projection Liger exists to tame).
+    248k-vocab projection Liger exists to tame). The saving scales with the masked fraction (env mask
+    + padding for multi-turn; completion-length variance for single-turn).
 
     Wrap ``trainer.liger_grpo_loss`` to GATHER the unmasked positions — ONE shared index applied
     identically to every per-token tensor (``_input``, ``selected_token_ids``, ``attention_mask``,
