@@ -29,8 +29,8 @@ from flash._logging import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 from flash.providers._poll import (
-    SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
+    is_training_stage,
     make_say,
     surface_forced_heartbeat,
     surface_heartbeat,
@@ -78,12 +78,6 @@ TERMINAL_OK = {"COMPLETED"}
 # "FAILED" is the run dying on its own (real traceback) -> fails fast.
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
 TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
-
-# Cold-start (pre-first-training-step) heartbeat stages, incl. the *_initializing stages the worker
-# emits during model download + trainer/vLLM init; receiving one proves the worker is alive but NOT
-# that setup finished, so they must not flip stall detection to the tight training window. SHARED
-# single source of truth (flash.providers._poll) so RunPod / Lambda / Hyperstack can't drift apart.
-_SETUP_HEARTBEAT_STAGES = SETUP_HEARTBEAT_STAGES
 
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
@@ -580,7 +574,7 @@ def poll_job(
     """Poll a queue job to completion; resilient to transient API errors.
 
     Two stall windows: the cold-start phase (dep install, per-run env pip, model download,
-    vLLM init) is slow and only emits *setup* heartbeats (``_SETUP_HEARTBEAT_STAGES``).
+    vLLM init) is slow and only emits *setup* heartbeats (not ``is_training_stage``).
     Until a *training* heartbeat arrives we apply the larger ``setup_grace_s`` budget so a
     slow cold start isn't misread as a stall; after it we use the tight ``stall_after_s``.
     Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
@@ -753,8 +747,9 @@ def poll_job(
             last_hb_key = new_key
             last_progress = time.time()
             # Only a training-phase heartbeat means cold-start setup is done and we
-            # can switch to the tight window; setup heartbeats keep the grace budget.
-            if stage not in _SETUP_HEARTBEAT_STAGES:
+            # can switch to the tight window; setup heartbeats (and the worker's error_*
+            # crash stages, which are pre-training on an init failure) keep the grace budget.
+            if is_training_stage(stage):
                 seen_heartbeat = True
         # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
         # but only when a heartbeat_reader lets us tell setup from training; without one we

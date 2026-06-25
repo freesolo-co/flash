@@ -26,6 +26,7 @@ from flash.providers._poll import (
     SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
     heartbeat_progress_ts,
+    is_training_stage,
     make_say,
     preload_box_reap_due,
     surface_heartbeat,
@@ -410,7 +411,7 @@ def poll_hs_job(
         if not isinstance(hb, dict):
             return False
         stage = hb.get("stage")
-        if stage is None or stage in _SETUP_HEARTBEAT_STAGES:
+        if not is_training_stage(stage):  # setup/init or an error_* crash stage -> not training
             return False
         _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
@@ -595,13 +596,14 @@ def poll_hs_job(
             # attempt exists, so a present error file is unambiguously THIS attempt's crash and is
             # trusted even if the VM died before stamping its terminal heartbeat (a genuine setup-stage
             # crash must not be misread as stale). Mirrors the Lambda dead-host path exactly so the two
-            # instance substrates classify pre-training deaths identically.
-            from flash.providers.runpod.jobs import worker_flagged_retriable
-
+            # instance substrates classify pre-training deaths identically. Use fresh_retriable_hb()
+            # (launch-fresh), NOT bare worker_flagged_retriable(): the seed-scoped heartbeat lets a STALE
+            # prior-attempt retriable heartbeat otherwise suppress worker_crashed for THIS attempt's
+            # deterministic crash -> mis-quarantining a healthy region.
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
             worker_crashed = (
                 bool(err and err.strip())
-                and not worker_flagged_retriable(heartbeat_reader)
+                and not fresh_retriable_hb()
                 and not (handle.attempt > 0 and in_early_setup_now())
             )
             return PollResult(
@@ -657,7 +659,7 @@ def poll_hs_job(
             if fresh:
                 last_progress = hb_ts
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
-                if stage not in _SETUP_HEARTBEAT_STAGES:
+                if is_training_stage(stage):  # a real training step (NOT setup/init or an error_* crash)
                     seen_training_hb = True
         if became_active:
             # Fast failover for a VM that reached 'ACTIVE' but never started a worker (sick region /
@@ -692,6 +694,14 @@ def poll_hs_job(
                     # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
+                        # The boot-log uploader is best-effort and may never have worked even though the
+                        # worker itself ran and uploaded a terminal marker. This threshold (~3x15s=45s)
+                        # can trip before marker_reader()'s 60s non-forced re-read, so force-read the
+                        # terminal artifacts once first: a real DONE/marker must win over a liveness
+                        # stall (which would otherwise mask the worker's actual outcome and quarantine).
+                        terminal = terminal_artifact_result()
+                        if terminal is not None:
+                            return terminal
                         return PollResult(
                             False,
                             failure="stalled",

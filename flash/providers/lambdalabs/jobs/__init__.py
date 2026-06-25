@@ -31,6 +31,7 @@ from flash.providers._poll import (
     SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
     heartbeat_progress_ts,
+    is_training_stage,
     make_say,
     preload_box_reap_due,
     surface_heartbeat,
@@ -464,7 +465,7 @@ def poll_lambda_job(
         if not isinstance(hb, dict):
             return False
         stage = hb.get("stage")
-        if stage is None or stage in _SETUP_HEARTBEAT_STAGES:
+        if not is_training_stage(stage):  # setup/init or an error_* crash stage -> not training
             return False
         _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
@@ -659,12 +660,13 @@ def poll_lambda_job(
             # present error file is unambiguously THIS attempt's crash and is trusted even if the worker
             # died before stamping its terminal heartbeat (a genuine setup-stage crash must not be
             # misread as stale -> job_failed, not a wasteful job_preempted retry of a repeatable crash).
-            from flash.providers.runpod.jobs import worker_flagged_retriable
-
+            # Use fresh_retriable_hb() (launch-fresh), NOT bare worker_flagged_retriable(): the heartbeat
+            # is seed-scoped, so a STALE prior-attempt retriable heartbeat would otherwise suppress
+            # worker_crashed for THIS attempt's deterministic crash -> mis-quarantining a healthy region.
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
             worker_crashed = (
                 bool(err and err.strip())
-                and not worker_flagged_retriable(heartbeat_reader)
+                and not fresh_retriable_hb()
                 and not (handle.attempt > 0 and in_early_setup_now())
             )
             return PollResult(
@@ -719,7 +721,7 @@ def poll_lambda_job(
             if fresh:
                 last_progress = hb_ts
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
-                if stage not in _SETUP_HEARTBEAT_STAGES:
+                if is_training_stage(stage):  # a real training step (NOT setup/init or an error_* crash)
                     seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
@@ -756,6 +758,14 @@ def poll_lambda_job(
                     # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
+                        # The boot-log uploader is best-effort and may never have worked even though the
+                        # worker itself ran and uploaded a terminal marker. This threshold (~3x15s=45s)
+                        # can trip before marker_reader()'s 60s non-forced re-read, so force-read the
+                        # terminal artifacts once first: a real DONE/marker must win over a liveness
+                        # stall (which would otherwise mask the worker's actual outcome and quarantine).
+                        terminal = terminal_artifact_result()
+                        if terminal is not None:
+                            return terminal
                         return PollResult(
                             False,
                             failure="stalled",

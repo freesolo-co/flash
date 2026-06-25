@@ -729,10 +729,63 @@ def test_poll_dead_host_with_retriable_error_still_preempted(monkeypatch):
         error="Traceback ...\nRetriableInfraError: cuda device not ready",
     )
     res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {"retriable": True}
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        # FRESH retriable heartbeat (ts >= launch): this attempt's worker flagged the fault retriable.
+        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 10_000.0},
     )
     assert not res.ok
     assert res.failure == "job_preempted"
+    assert res.host_fault  # fresh retriable infra crash before training -> quarantine the region
+
+
+def test_poll_dead_host_stale_retriable_hb_does_not_mask_crash(monkeypatch):
+    """A STALE prior-attempt retriable heartbeat (ts < launch) must NOT suppress THIS attempt's
+    deterministic crash. The dead branch gates ``worker_crashed`` on fresh_retriable_hb() (launch-fresh),
+    NOT bare worker_flagged_retriable(), so a non-retriable error_<phase>.txt this attempt is classified
+    terminal job_failed and the healthy region is NOT quarantined -- even though a seed-scoped retriable
+    heartbeat lingers from a prior attempt."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback ...\nValueError: bad config",  # deterministic, non-retriable
+    )
+    res = jobs.poll_lambda_job(
+        _handle(),  # attempt 0
+        _spec(),
+        seed=0,
+        interval_s=0,
+        # retriable BUT stale (ts < launch 10_000): a prior attempt's lingering signal.
+        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 5_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"  # crash trusted, not masked by the stale retriable hb
+    assert not res.host_fault  # deterministic worker crash -> region stays healthy
+
+
+def test_poll_dead_host_error_stage_hb_quarantines_pretraining_fault(monkeypatch):
+    """An ``error_<phase>`` heartbeat stage is the worker's crash marker -- pre-training, NOT a training
+    step. is_training_stage() excludes error_* (and the *_initializing setup stages), so reached_training_now()
+    is False and a FRESH retriable infra fault during init still quarantines the region (host_fault). If
+    error_* were misread as a training stage the quarantine would be wrongly suppressed."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback ...\nRetriableInfraError: cuda device not ready",
+    )
+    res = jobs.poll_lambda_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        # fresh, retriable, crash-stage heartbeat -> pre-training infra fault.
+        heartbeat_reader=lambda force=False: {"stage": "error_sft", "retriable": True, "ts": 10_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # fresh retriable -> retry on a fresh host
+    assert res.host_fault  # error_* is pre-training -> quarantine the region
 
 
 def test_poll_dead_host_stale_error_with_fresh_boot_heartbeat_is_preempted(monkeypatch):
@@ -948,6 +1001,41 @@ def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypa
     assert res.failure == "stalled"
     assert "no worker liveness" in res.detail
     assert calls["n"] >= BOOT_LOG_ABSENT_POLLS  # required the absence to persist, not a lone None
+
+
+def test_poll_active_done_marker_wins_over_first_liveness_stall(monkeypatch):
+    """The boot.log uploader is best-effort and can silently never run even though the worker itself
+    ran and uploaded a terminal DONE. The boot.log-absence threshold (~45s) can trip before
+    marker_reader()'s NON-forced re-read surfaces the DONE, so before returning a 'stalled' (which would
+    mask the real outcome AND quarantine a region that actually completed the run) the poller FORCE-reads
+    the terminal artifacts. A fresh DONE must win -> success, not stalled."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(lambda_api, "get_instance", lambda instance_id: {"status": "active"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=10_000, step=100)
+    monkeypatch.setattr(jobs.time, "time", lambda: float(next(clock)))
+    metrics = json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0})
+
+    def factory(hf_repo, path, min_interval_s=45.0):
+        def read(force=False):
+            # DONE is rate-limited: the NON-forced loop read never surfaces it; only the FORCED
+            # terminal_artifact_result() read at the stall boundary does (mirrors the 45s vs 60s race).
+            if path.endswith("/DONE"):
+                return "10500.0" if force else None
+            if path.endswith("metrics.json"):
+                return metrics
+            return None  # no boot.log, no marker, no error file
+
+        return read
+
+    monkeypatch.setattr(jobs, "_make_hf_file_reader", factory)
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=50.0
+    )
+    assert res.ok  # forced DONE read before the stall -> terminal success, not a wrongful stall/quarantine
+    assert res.failure is None
 
 
 def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):

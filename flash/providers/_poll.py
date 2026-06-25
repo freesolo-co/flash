@@ -107,6 +107,19 @@ SETUP_HEARTBEAT_STAGES = frozenset(
 )
 
 
+def is_training_stage(stage) -> bool:
+    """True only if a heartbeat stage means the TRAINING loop actually began (a real step). NOT a
+    setup/cold-start stage, and NOT one of the worker's ``error_*`` crash stages.
+
+    The worker overwrites its latest heartbeat with ``error_<phase>`` (e.g. ``error_sft``) on ANY
+    raise -- including a pre-training ``RetriableInfraError`` during model load / trainer-vLLM init --
+    so an ``error_*`` stage is NOT evidence training was reached. Treating it as training would let a
+    pre-training GPU/driver crash masquerade as "training reached" and suppress the region quarantine
+    (and flip stall detection to the tight training window). Whether training was ACTUALLY reached is
+    tracked separately by the pollers' ``seen_training_hb`` latch over real training-step heartbeats."""
+    return bool(stage) and stage not in SETUP_HEARTBEAT_STAGES and not str(stage).startswith("error_")
+
+
 def make_say(log) -> Callable[[str], None]:
     """A timestamped line logger that no-ops when ``log`` is None."""
 
