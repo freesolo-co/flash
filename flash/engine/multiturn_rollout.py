@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict
 
 
@@ -345,8 +346,35 @@ def rollout_batch(
                 active_env=active_env, env_glue=env_glue, max_turns=max_turns,
             )
 
-    # Score with the ACTUAL accumulated rollout state (matches rollout_one).
-    return [r.result(float(active_env.reward("", r.example, r.state))) for r in rollouts]
+    # Score with the ACTUAL accumulated rollout state (matches rollout_one). The per-rollout reward is
+    # frequently an IO-bound call (an LLM-judge or tool round-trip), so score the batch CONCURRENTLY:
+    # the calls release the GIL on network/subprocess I/O and overlap, collapsing N serial GPU-idle
+    # round-trips into ~one. Results are reassembled in INPUT ORDER, so for a thread-safe reward (the
+    # verifiers convention — ``reward`` reads only its own example+state + immutable config) this is
+    # identical to the serial scoring; only wall time differs. Compute-bound rewards see no change.
+    def _score(r: _RolloutState) -> float:
+        return float(active_env.reward("", r.example, r.state))
+
+    # Serial for a single rollout, or when the env declares its reward NOT thread-safe (a scorer that
+    # keeps mutable state or a thread-bound client/connection — it worked serially and must not be
+    # raced). Envs opt out with ``reward_thread_safe = False``.
+    if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
+        return [r.result(_score(r)) for r in rollouts]
+    # Concurrent. On the first reward error: cancel every scorer that has NOT started
+    # (``cancel_futures``) so a failure launches no further judge/API calls, and DRAIN the few that
+    # are already in flight (``wait=True``) so none keep scoring in the background after we raise — a
+    # failed step must not spend calls or touch scorer state during the next one. Python can't kill a
+    # running thread, so draining (bounded by ``max_workers`` and each reward's own timeout) is the
+    # clean stop; the run errors out on a reward failure anyway.
+    pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
+    try:
+        futures = {pool.submit(_score, r): i for i, r in enumerate(rollouts)}
+        scores: list[float] = [0.0] * len(rollouts)
+        for fut in as_completed(futures):
+            scores[futures[fut]] = fut.result()  # re-raises the first failed scorer
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return [r.result(s) for r, s in zip(rollouts, scores, strict=True)]
 
 
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:
