@@ -273,6 +273,31 @@ def test_poll_client_deadline(monkeypatch):
     assert "deadline" in res.detail
 
 
+def test_poll_recovered_deadline_persists_done_written_during_outage(monkeypatch):
+    """A control-plane outage longer than the launch-anchored deadline must NOT discard a seed the
+    worker finished during the downtime: before returning the deadline `stalled`, poll_hs_job reads
+    terminal artifacts once and persists a fresh DONE."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}], done="10400.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}), step=10.0,
+    )
+    res = jobs.poll_hs_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
+    )
+    assert res.ok, res  # success persisted, NOT a stalled-retry
+    assert res.metrics["cost_usd"] > 0
+
+
+def test_poll_recovered_deadline_without_artifacts_still_stalls(monkeypatch):
+    jobs = _wire_poll(monkeypatch, vms=[{"status": "ACTIVE"}], step=10.0)
+    res = jobs.poll_hs_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "deadline" in res.detail
+
+
 def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
     """Reattach must pass the FULL launch-relative budget: poll_hs_job already anchors its deadline
     to handle.started_ts (= launch), so pre-subtracting elapsed too double-counts and deletes a

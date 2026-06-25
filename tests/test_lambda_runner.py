@@ -490,6 +490,37 @@ def test_poll_client_deadline(monkeypatch):
     assert "deadline" in res.detail
 
 
+def test_poll_recovered_deadline_persists_done_written_during_outage(monkeypatch):
+    """A control-plane outage longer than the launch-anchored deadline must NOT discard a seed the
+    worker actually finished during the downtime: before returning the deadline `stalled`, the poller
+    reads terminal artifacts once and persists a fresh DONE. (Clock starts 10_000; launch 5_000s ago,
+    so the very first deadline check fires; DONE=10_400 is fresh vs launch.)"""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        done="10400.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+        step=10.0,
+    )
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
+    )
+    assert res.ok, res  # success persisted, NOT a stalled-retry that throws away the finished seed
+    assert res.metrics["cost_usd"] > 0
+
+
+def test_poll_recovered_deadline_without_artifacts_still_stalls(monkeypatch):
+    """When the recovered deadline fires and there is NO terminal artifact, the poller still returns
+    `stalled` (the worker did not finish during the outage)."""
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "deadline" in res.detail
+
+
 def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
     """The reattach path must NOT pre-subtract elapsed-since-launch from the deadline: the poll loop
     already anchors its deadline check to handle.started_ts (= launch), so subtracting elapsed here

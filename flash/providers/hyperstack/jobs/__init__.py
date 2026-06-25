@@ -291,6 +291,24 @@ def poll_hs_job(
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker),
         )
 
+    def terminal_artifact_result() -> PollResult | None:
+        # One forced read of the worker's terminal HF artifacts (DONE / attempt ok-marker). Returns a
+        # terminal PollResult when the worker definitively finished or errored, else None. Used both
+        # when the host is dead AND before returning a recovered client-side-deadline `stalled`: a
+        # control-plane outage longer than max_wall+grace must not discard a seed the worker actually
+        # completed during the downtime (the deadline check would otherwise fire before any DONE read).
+        d = done_reader(force=True)
+        if d is not None and done_is_fresh(d):
+            return finish_ok(d)
+        raw = marker_reader(force=True)
+        if raw:
+            with contextlib.suppress(ValueError):
+                m = json.loads(raw)
+                if m.get("ok"):
+                    return finish_from_ok_marker()  # finished (stale DONE ok)
+                return fail_from_marker(m)
+        return None
+
     poll_errors = PollErrorTracker(say, interval_s)
     # Seed the load/stall clocks from the VM's LAUNCH (launch_ts), not this poll's start: on a
     # delayed reattach after a control-plane restart the box has been billing since launch, so a
@@ -306,6 +324,12 @@ def poll_hs_job(
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
+            # A recovered run can blow a launch-anchored deadline on the FIRST reattach tick (the
+            # outage lasted past max_wall+grace). Read terminal artifacts once before giving up: if
+            # the worker finished/errored during the downtime, persist that instead of retrying.
+            terminal = terminal_artifact_result()
+            if terminal is not None:
+                return terminal
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
         try:
             vm = hs_api.get_vm(handle.vm_id)
@@ -334,18 +358,9 @@ def poll_hs_job(
 
         dead = missing_streak >= 3 or status in _DEAD_STATES
         if dead:
-            done = done_reader(force=True)
-            if done is not None and done_is_fresh(done):
-                return finish_ok(done)
-            raw_marker = marker_reader(force=True)
-            marker = None
-            if raw_marker:
-                with contextlib.suppress(ValueError):
-                    marker = json.loads(raw_marker)
-            if marker is not None and marker.get("ok"):
-                return finish_from_ok_marker()  # finished right before teardown (stale DONE ok)
-            if marker is not None and not marker.get("ok"):
-                return fail_from_marker(marker)
+            terminal = terminal_artifact_result()
+            if terminal is not None:
+                return terminal
             return PollResult(
                 False,
                 failure="job_preempted",
