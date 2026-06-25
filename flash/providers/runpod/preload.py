@@ -132,6 +132,11 @@ def _preload_one_dc(
         # region. Surface those so the driver/CLI don't count a no-op (or partial) warm as success.
         if result.get("error"):
             return {"datacenter": dc_id, "status": "error", "error": result["error"], "result": result}
+        # Warmed this DC's volume -> record it so the LAZY training path attaches+uses it (operator
+        # preload is how a DC enters the used set without waiting for a cold run to land there first).
+        from flash.runner import record_weight_cache_dc
+
+        record_weight_cache_dc(dc_id)
         if result.get("failed"):
             return {"datacenter": dc_id, "status": "partial", "result": result}
         return {"datacenter": dc_id, "status": "ok", "result": result}

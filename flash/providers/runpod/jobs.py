@@ -63,6 +63,7 @@ __all__ = [
     "submit_run",
     "weight_cache_datacenters",
     "weight_cache_endpoint_kwargs",
+    "weight_cache_volume_datacenters",
     "weight_cache_volume_name",
     "weight_cache_volumes",
 ]
@@ -110,17 +111,29 @@ def stall_kwargs(on_last_gpu: bool = False) -> dict:
 
 
 def weight_cache_datacenters() -> list:
-    """The DataCenter set the weight-cache fleet spans — EVERY storage-capable RunPod DC.
-
-    Derived from ``DataCenter.all()`` (the SDK enum is documented as exactly the datacenters with
-    network-volume / S3 support), NOT a hardcoded subset — so a SDK upgrade that adds a storage
-    region is picked up automatically (no drift, no missed DCs). One ``flash-weights-<dc>`` volume
-    per entry; the endpoint is allowed across all of them, so a run lands wherever there is GPU
-    capacity — there is no single-DC pin. Fully managed: no env knob.
+    """EVERY storage-capable RunPod DC — the set the endpoint is ALLOWED across (so a run can land
+    wherever there's capacity). Derived from ``DataCenter.all()`` (the SDK enum is exactly the
+    network-volume / S3 datacenters), so a SDK upgrade that adds a region is picked up automatically.
+    NB: this is the ALLOWED set, not the set we attach VOLUMES in — that is the lazily-grown
+    ``weight_cache_volume_datacenters`` below.
     """
     from runpod_flash.core.resources.datacenter import DataCenter
 
     return list(DataCenter.all())
+
+
+def weight_cache_volume_datacenters() -> list:
+    """The DCs we actually ATTACH a volume in — LAZY: only the DCs runs have landed in so far
+    (runner.weight_cache_used_dcs), intersected with the SDK's known storage DCs. Empty until the
+    first run reports its DC, so the fleet is never pre-created across all regions. Grows over time
+    as workers self-report their landed DC (the endpoint stays allowed across ALL DCs regardless, so
+    a run can still land in — and then warm — a brand-new region)."""
+    from runpod_flash.core.resources.datacenter import DataCenter
+
+    from flash.runner import weight_cache_used_dcs
+
+    used = weight_cache_used_dcs()
+    return [dc for dc in DataCenter.all() if dc.value in used]
 
 
 def weight_cache_volume_name(base: str, dc) -> str:
@@ -138,24 +151,21 @@ def weight_cache_volume_name(base: str, dc) -> str:
 
 
 def weight_cache_volumes(spec) -> list:
-    """One ``NetworkVolume`` per cache datacenter (``[]`` if no cache).
+    """One ``NetworkVolume`` per LAZILY-USED cache datacenter (``[]`` if no cache / none used yet).
 
     Empty unless ``spec.gpu.network_volume`` is set (the runner assigns the logical base name for
-    eligible runs) and the DC set is non-empty. Each physical volume is ``<base>-<dc>`` (see
-    ``weight_cache_volume_name``), idempotent by (name, datacenter): runpod_flash reuses an existing
-    volume of that name/DC, so this is create-or-attach, not always-create.
+    eligible runs) AND at least one DC has been landed in (weight_cache_volume_datacenters). Each
+    physical volume is ``<base>-<dc>`` (see ``weight_cache_volume_name``), idempotent by (name,
+    datacenter): runpod_flash reuses an existing volume of that name/DC, so this is create-or-attach.
 
-    Multi-account pools: ``deploy_train_endpoint`` deploys volumes+endpoint together via the SDK's
-    ResourceManager, and on a quota failover it re-runs the WHOLE deploy on the next account — so the
-    volumes are re-created on whichever account ends up hosting the endpoint (they are account-scoped;
-    the endpoint never references volumes from a different account). Volumes created on the account it
-    failed over FROM are harmless orphans, reclaimed by ``preload --teardown`` (which sweeps every
-    pool account).
+    Multi-account pools: ``deploy_train_endpoint`` re-runs the WHOLE deploy on quota failover, so the
+    volumes are re-created on whichever account ends up hosting the endpoint (account-scoped). Orphans
+    on the failed-over-FROM account are reclaimed by ``preload --teardown`` (sweeps every pool account).
     """
     base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
     if not base:
         return []
-    dcs = weight_cache_datacenters()
+    dcs = weight_cache_volume_datacenters()  # LAZY: only DCs we've landed in
     if not dcs:
         return []
     from runpod_flash import NetworkVolume
@@ -168,23 +178,23 @@ def weight_cache_volumes(spec) -> list:
 
 
 def weight_cache_endpoint_kwargs(spec) -> dict:
-    """Endpoint kwargs that attach the multi-region weight cache, or ``{}`` (best-effort).
+    """Endpoint kwargs that attach the (lazy) weight cache, or ``{}`` (best-effort).
 
-    ``{"volume": [vol-per-dc...], "datacenter": [dc...]}`` — the two lists share the same DC set, so
-    the SDK's "every volume DC must be in the endpoint datacenter list" rule (superset) holds
-    trivially and the endpoint is allowed across exactly the DCs it has a cache volume in. The
-    endpoint can therefore schedule in ANY of those regions (no single-DC pin), and whichever it
-    lands in, that region's volume mounts at /runpod-volume.
+    ``{"volume": [vol per USED dc...], "datacenter": [ALL storage DCs]}`` — the endpoint is allowed
+    across ALL DCs (so it lands wherever there's capacity), but volumes are attached only in the DCs
+    runs have landed in. The SDK's "every volume DC must be in the endpoint datacenter list" rule is a
+    superset (used ⊆ all), verified offline. Whichever allowed DC it lands in: warm if we have a
+    volume there, cold otherwise (and the worker then self-reports that DC so it's warmed next time).
 
-    Best-effort by construction: ANY failure (SDK import, a bad DC token, validation) returns ``{}``
-    so the run deploys with NO volume (cold, cross-region) rather than failing. The lifecycle also
-    drops the volume on a no-capacity retry, so the cache can never wedge a run on a full region.
+    Returns ``{}`` when the cache is off OR no DC has been used yet (fully cold/lazy, no volumes).
+    Best-effort: ANY failure (SDK import, validation) -> ``{}`` so the run deploys with no volume
+    rather than failing; the lifecycle also drops the volume on a no-capacity retry.
     """
     try:
         vols = weight_cache_volumes(spec)
         if not vols:
-            return {}
-        return {"volume": vols, "datacenter": [v.dataCenterId for v in vols]}
+            return {}  # cache off, or no DC used yet -> cold (no volumes, RunPod picks any region)
+        return {"volume": vols, "datacenter": weight_cache_datacenters()}
     except Exception as exc:
         # Best-effort: never let the cache break a deploy — fall back to a no-volume run.
         logger.warning("weight cache disabled for this run (%s); deploying with no volume", exc)

@@ -265,6 +265,47 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 WEIGHT_CACHE_VOLUME_GB = 100
 
+# LAZY per-region: the cache fleet is NOT pre-created in every datacenter (that materialized ~1.1 TB
+# of standing storage on the very first run). Instead we persist the set of DCs a run has ACTUALLY
+# landed in, and attach a volume only in those — the endpoint is still allowed across all DCs (so it
+# lands wherever there's capacity), and the used set grows as the worker self-reports its DC. Cost
+# therefore tracks regions actually used, not the whole fleet. Stored next to the run state.
+_WEIGHT_CACHE_DC_FILE = os.path.join(_STATE_DIR, "weight_cache_dcs.json")
+
+
+def weight_cache_used_dcs() -> set[str]:
+    """The DCs a run has landed in (so the cache is attached there). Empty until the first run reports
+    one — fully lazy. Best-effort read; a missing/corrupt file is treated as empty."""
+    try:
+        with open(_WEIGHT_CACHE_DC_FILE) as f:
+            data = json.load(f)
+        return {str(d) for d in data} if isinstance(data, list) else set()
+    except (FileNotFoundError, ValueError, OSError):
+        return set()
+
+
+def record_weight_cache_dc(dc: str) -> None:
+    """Add a landed DC to the used set so the NEXT run in that region attaches+warms its volume.
+
+    Idempotent + tolerant: a blank value or an unwritable state dir is a no-op (the cache just stays
+    lazier), never an error on the run's hot path.
+    """
+    dc = (dc or "").strip()
+    if not dc:
+        return
+    try:
+        used = weight_cache_used_dcs()
+        if dc in used:
+            return
+        used.add(dc)
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        tmp = _WEIGHT_CACHE_DC_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(sorted(used), f)
+        os.replace(tmp, _WEIGHT_CACHE_DC_FILE)
+    except OSError:
+        pass
+
 
 def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
     """Attach the shared, platform-managed weight-cache volume to every run.
