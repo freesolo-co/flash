@@ -33,6 +33,7 @@ import contextlib
 import json
 import queue
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import TypedDict
 
@@ -66,6 +67,44 @@ def _prompt_key(prompt) -> str:
         return json.dumps(prompt, sort_keys=True, default=str)
     except (TypeError, ValueError):
         return str(prompt)
+
+
+class _LRUCache:
+    """Tiny bounded LRU cache (string key -> ``list[int]``) for the render / env_glue closures.
+
+    A plain ``len(d) < MAX`` guard FREEZES the cache once full: any new key after the cap is never
+    admitted, so later-repeated-but-diverse prompts/glue re-render forever and the cache stops paying
+    off over a long run. This evicts the least-recently-used entry on insert-when-full instead, so a
+    fixed-size window of recently-seen keys stays cached no matter how many distinct keys appear.
+    Recency is updated on every hit (``move_to_end``); not thread-safe (each cache is owned by a
+    single closure called from one thread).
+    """
+
+    __slots__ = ("_data", "maxsize")
+
+    def __init__(self, maxsize: int):
+        if maxsize <= 0:
+            raise ValueError("LRU cache maxsize must be positive")
+        self.maxsize = maxsize
+        self._data: OrderedDict[str, list[int]] = OrderedDict()
+
+    def get(self, key: str) -> list[int] | None:
+        """Return the cached value and mark it most-recently-used, or None on a miss."""
+        value = self._data.get(key)
+        if value is not None:
+            self._data.move_to_end(key)
+        return value
+
+    def put(self, key: str, value: list[int]) -> None:
+        """Insert/refresh ``key`` as most-recently-used, evicting the oldest entry if at capacity."""
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = value
+        if len(self._data) > self.maxsize:
+            self._data.popitem(last=False)  # drop the least-recently-used entry
+
+    def __len__(self) -> int:
+        return len(self._data)
 
 
 def build_examples_index(rows: list[dict], prompt_of: Callable[[dict], object]) -> dict:
@@ -537,23 +576,23 @@ def build_rollout_func(
     except Exception:
         _final_only_kind = None
 
-    _render_cache: dict[str, list[int]] = {}
-    _RENDER_CACHE_MAX = 8192
+    _render_cache = _LRUCache(8192)
 
     def render(messages: list, add_generation_prompt: bool) -> list[int]:
         # The initial-prompt render is identical for every rollout in a GRPO group (they share one
         # prompt), so cache it by content instead of re-rendering num_generations times per step.
+        # LRU-bounded: when full it EVICTS the least-recently-used entry rather than freezing, so a
+        # long run with many distinct prompts keeps caching the recently-seen ones (a freeze-when-full
+        # cache would stop admitting any new prompt after the cap and re-render them forever).
         cache_key = f"{add_generation_prompt}\x00{json.dumps(messages, sort_keys=True, default=str)}"
         cached = _render_cache.get(cache_key)
         if cached is not None:
             return cached
         ids = render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
-        if len(_render_cache) < _RENDER_CACHE_MAX:
-            _render_cache[cache_key] = ids
+        _render_cache.put(cache_key, ids)
         return ids
 
-    _glue_cache: dict[str, list[int]] = {}
-    _GLUE_CACHE_MAX = 8192
+    _glue_cache = _LRUCache(8192)
 
     def env_glue(env_messages: list) -> list[int]:
         # The inter-turn glue is a pure function of env_messages (+ this closure's tokenizer /
@@ -561,7 +600,8 @@ def build_rollout_func(
         # turns repeat env messages across rollouts and steps, so apply_chat_template would
         # otherwise re-render byte-identical glue dozens-to-hundreds of times — the dominant per-turn
         # CPU cost in the (otherwise overhead-bound) multi-turn rollout. Cache by env-message
-        # content; bounded so an env whose every reply is unique can't grow it without limit.
+        # content; LRU-bounded so an env whose every reply is unique can't grow it without limit and,
+        # unlike a freeze-when-full cache, recently-seen glue stays cached over a long diverse run.
         cache_key = json.dumps(env_messages, sort_keys=True, default=str)
         cached = _glue_cache.get(cache_key)
         if cached is not None:
@@ -594,8 +634,7 @@ def build_rollout_func(
             )
         glue_text = text[first + len(probe) :]
         glue = [int(t) for t in tok(glue_text, add_special_tokens=False).input_ids]
-        if len(_glue_cache) < _GLUE_CACHE_MAX:
-            _glue_cache[cache_key] = glue
+        _glue_cache.put(cache_key, glue)
         return glue
 
     def rollout_func(prompts, trainer):

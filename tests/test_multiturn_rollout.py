@@ -13,6 +13,7 @@ import types
 import pytest
 
 from flash.engine.multiturn_rollout import (
+    _LRUCache,
     build_examples_index,
     index_collisions,
     rollout_async,
@@ -620,6 +621,43 @@ def test_env_glue_render_is_cached_across_repeated_env_messages():
                [{"role": "user", "content": "c"}]]
     rf(prompts, _fake_trainer(engine, sleep_mode=False))
     assert tok.glue_renders == 1  # 3 rollouts' identical env-glue rendered once, not 3x
+
+
+def test_lru_cache_evicts_oldest_when_full_and_still_caches_new():
+    # Regression: the render/glue caches used to FREEZE when full (no new key admitted past the cap),
+    # so later-repeated diverse prompts never cached -> perf regressed over a long run. The LRU cache
+    # must instead EVICT the least-recently-used entry and keep admitting new keys.
+    c = _LRUCache(2)
+    c.put("a", [1])
+    c.put("b", [2])
+    assert c.get("a") == [1]  # both fit at capacity
+    assert c.get("b") == [2]
+    c.put("c", [3])  # over capacity -> evict the least-recently-used ("a")
+    assert len(c) == 2
+    assert c.get("a") is None  # oldest evicted, NOT frozen-out of the cache
+    assert c.get("b") == [2]  # survivor kept
+    assert c.get("c") == [3]  # new entry cached
+
+
+def test_lru_cache_hit_refreshes_recency():
+    # A get() must mark its key most-recently-used so an actively-reused key isn't evicted while a
+    # stale one lingers (the whole point of LRU over a freeze/FIFO cache).
+    c = _LRUCache(2)
+    c.put("a", [1])
+    c.put("b", [2])
+    assert c.get("a") == [1]  # touch "a" -> "b" is now the least-recently-used
+    c.put("c", [3])  # evicts "b", keeps the recently-used "a"
+    assert c.get("b") is None
+    assert c.get("a") == [1]  # recently-used survivor kept
+    assert c.get("c") == [3]
+
+
+def test_lru_cache_put_existing_key_updates_value_without_growing():
+    c = _LRUCache(2)
+    c.put("a", [1])
+    c.put("a", [9])  # refresh same key -> overwrite, no size growth
+    assert len(c) == 1
+    assert c.get("a") == [9]
 
 
 @pytest.mark.usefixtures("_stub_vllm")
