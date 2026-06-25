@@ -1370,6 +1370,49 @@ def test_mark_cancel_requested_sets_flag_without_regressing_state(monkeypatch):
         orch.mark_cancel_requested("does-not-exist")  # must not raise
 
 
+def test_is_cancel_intent_honors_state_and_flag():
+    """_is_cancel_intent treats BOTH the terminal `cancelled` state and the pre-terminal
+    `cancel_requested` intent (set by cancel_run before teardown finishes) as a cancellation, and
+    tolerates a status object missing the field."""
+    from flash.runner.lifecycle import _is_cancel_intent
+
+    def mk(state, cr=False):
+        return type("S", (), {"state": state, "cancel_requested": cr})()
+
+    assert _is_cancel_intent(mk("cancelled")) is True
+    assert _is_cancel_intent(mk("running", cr=True)) is True  # intent honored before terminal state
+    assert _is_cancel_intent(mk("running")) is False
+    assert _is_cancel_intent(type("S", (), {"state": "running"})()) is False  # missing attr -> False
+
+
+def test_seed_loop_bails_on_cancel_intent_before_provisioning(monkeypatch):
+    """A cancel landing while the run is between attempts records cancel_requested but leaves state
+    `running` until cancel_run finishes teardown. The seed loop's pre-provision guard must honor the
+    INTENT and raise _RunCancelled BEFORE allocating/submitting, so no fresh PAID worker is launched."""
+    import io
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        from flash.runner import _RunCancelled
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="ci1", state="running", spec=_spec("ci1").to_dict(), cancel_requested=True
+            )
+        )
+        submits = {"n": 0}
+
+        def fake_submit(*a, **k):
+            submits["n"] += 1
+            return jobs.PollResult(True, metrics={})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        with pytest.raises(_RunCancelled):
+            orch._run_seed_loop(_spec("ci1"), io.StringIO(), start_index=0, prior_cost=0.0)
+        assert submits["n"] == 0  # cancel-in-progress -> NO paid worker submitted/allocated
+
+
 def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
     # The resume delegates the genuine-vs-infra decision to the seed loop (unchanged): a run that
     # is truly broken reproduces the failure on the resumed attempt, the seed loop fails it, and

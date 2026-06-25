@@ -18,6 +18,14 @@ import time
 from flash.spec import JobSpec
 
 
+def _is_cancel_intent(status) -> bool:
+    """A user cancel is in effect — either already persisted as the terminal ``cancelled`` state, or a
+    durable INTENT recorded by cancel_run (``cancel_requested``) BEFORE it finishes tearing the box down
+    and persists that state. The pre-provision / retry guards honor the intent too, so a cancel landing
+    in cancel_run's teardown window never launches (or re-launches) a fresh PAID worker for the run."""
+    return status.state == "cancelled" or bool(getattr(status, "cancel_requested", False))
+
+
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
     from flash.providers.runpod.train import upload_code
@@ -272,7 +280,7 @@ def _submit_seed_supervised(
         # never launches a worker (the later checks only stop the final-state
         # overwrite, after the GPU has already run and billed).
         with contextlib.suppress(FileNotFoundError):
-            if get_status(spec.run_id).state == "cancelled":
+            if _is_cancel_intent(get_status(spec.run_id)):
                 raise _RunCancelled(f"run {spec.run_id} was cancelled")
         try:
             alloc = allocate(
@@ -295,7 +303,7 @@ def _submit_seed_supervised(
             # Re-check cancellation right before provisioning so a cancel during allocation
             # doesn't still launch a paid worker.
             with contextlib.suppress(FileNotFoundError):
-                if get_status(spec.run_id).state == "cancelled":
+                if _is_cancel_intent(get_status(spec.run_id)):
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
             # Pick this attempt's (provider, class) from the cross-provider ranked list: the first
             # attempt takes the cheapest; each retry that provisioned a class and lost it to an infra
@@ -368,7 +376,7 @@ def _submit_seed_supervised(
             # successfully after cancel_run() persisted `cancelled`. Don't let a late
             # worker success resurrect the run into running/done.
             try:
-                if get_status(spec.run_id).state == "cancelled":
+                if _is_cancel_intent(get_status(spec.run_id)):
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
             except FileNotFoundError:
                 # Status file not yet written (early race): treat as not-cancelled, proceed.
@@ -389,7 +397,7 @@ def _submit_seed_supervised(
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
         try:
-            if get_status(spec.run_id).state == "cancelled":
+            if _is_cancel_intent(get_status(spec.run_id)):
                 raise _RunCancelled(f"run {spec.run_id} was cancelled")
         except FileNotFoundError:
             # Status file not yet written (early race): treat as not-cancelled and proceed.
@@ -515,7 +523,8 @@ def _run_seed_loop(
         # already-terminal run. (The `running` _update below would be CAS-rejected anyway, but
         # the supervised submit would still have spent.) _RunCancelled is the loop's terminal
         # signal; its callers already swallow it / leave the existing terminal state intact.
-        if get_status(spec.run_id).state in TERMINAL_STATES:
+        status_now = get_status(spec.run_id)
+        if status_now.state in TERMINAL_STATES or _is_cancel_intent(status_now):
             raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting seed")
         _update(spec.run_id, "running")
         print(
@@ -530,7 +539,7 @@ def _run_seed_loop(
         # worker success doesn't resurrect a user-cancelled run via this "running"
         # update (or the final "done" below).
         with contextlib.suppress(FileNotFoundError):
-            if get_status(spec.run_id).state == "cancelled":
+            if _is_cancel_intent(get_status(spec.run_id)):
                 raise _RunCancelled(f"run {spec.run_id} was cancelled")
         # If more seeds follow, this seed's endpoint/instance is already torn down, so
         # clear the now-stale remote handle: a restart in the gap before the next
@@ -554,7 +563,7 @@ def _run_seed_loop(
     # Final guard: a cancel landing after the last seed's check must not be overwritten
     # by the terminal "done".
     with contextlib.suppress(FileNotFoundError):
-        if get_status(spec.run_id).state == "cancelled":
+        if _is_cancel_intent(get_status(spec.run_id)):
             raise _RunCancelled(f"run {spec.run_id} was cancelled")
     _update(
         spec.run_id,
