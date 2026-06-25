@@ -125,9 +125,34 @@ def create_reward_app(scorer: Scorer, *, reward_id: str = "default"):
     # param — so parse the body by hand (mirrors the router's endpoints).
     @app.post("/score")
     async def score(body: dict) -> dict:
-        completions = body.get("completions") or []
-        info = body.get("info") or [{} for _ in completions]
-        prompts = body.get("prompts") or ["" for _ in completions]
+        # Validate types/lengths up front: a non-list completions/prompts/info (e.g. a bare string)
+        # would be iterated char-by-char and a mismatched length would mis-pair prompt->completion,
+        # silently producing bad scores instead of a clear error. Reject with a 400.
+        def _as_list(name: str, value):
+            if value is None:
+                return None
+            if not isinstance(value, list):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{name} must be a list, got {type(value).__name__}",
+                )
+            return value
+
+        completions = _as_list("completions", body.get("completions")) or []
+        raw_info = _as_list("info", body.get("info"))
+        raw_prompts = _as_list("prompts", body.get("prompts"))
+        info = raw_info if raw_info is not None else [{} for _ in completions]
+        prompts = raw_prompts if raw_prompts is not None else ["" for _ in completions]
+        if raw_prompts is not None and len(prompts) != len(completions):
+            raise HTTPException(
+                status_code=400,
+                detail=f"prompts ({len(prompts)}) and completions ({len(completions)}) length mismatch",
+            )
+        if raw_info is not None and len(info) != len(completions):
+            raise HTTPException(
+                status_code=400,
+                detail=f"info ({len(info)}) and completions ({len(completions)}) length mismatch",
+            )
         try:
             scores = list(scorer(prompts, completions, info))
         except Exception as e:  # surface scorer bugs as a 400 (don't 500 the worker)

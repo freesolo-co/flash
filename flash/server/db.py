@@ -40,12 +40,22 @@ def _expanded_abs_path(path: str) -> str:
     return str(Path(path).expanduser().absolute())
 
 
+def _env_path(name: str, default: str) -> str:
+    """Env path override, falling back to ``default`` when unset OR blank.
+
+    A present-but-blank ``FLASH_*`` var resolves to the current working directory via
+    ``_expanded_abs_path("")``, which would put server.db somewhere other than the runner's
+    state root (the runner uses the same blank-as-unset rule), splitting run state from the DB."""
+    raw = os.environ.get(name)
+    return raw if raw and raw.strip() else default
+
+
 # Local control-plane ownership DB. Defaults to ~/.flash/server.db, with the same
 # FLASH_CONTROL_PLANE_STATE_DIR root as runner.RUNS_DIR/RESULTS_DIR for isolated
 # validation/staging servers. Tests can still point it elsewhere via monkeypatch.
 _DEFAULT_STATE_DIR = str(Path.home() / ".flash")
-_STATE_DIR = _expanded_abs_path(os.environ.get("FLASH_CONTROL_PLANE_STATE_DIR", _DEFAULT_STATE_DIR))
-DB_PATH = _expanded_abs_path(os.environ.get("FLASH_DB_PATH", str(Path(_STATE_DIR) / "server.db")))
+_STATE_DIR = _expanded_abs_path(_env_path("FLASH_CONTROL_PLANE_STATE_DIR", _DEFAULT_STATE_DIR))
+DB_PATH = _expanded_abs_path(_env_path("FLASH_DB_PATH", str(Path(_STATE_DIR) / "server.db")))
 
 
 def db_path() -> str:

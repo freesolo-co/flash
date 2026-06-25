@@ -20,15 +20,26 @@ def _expanded_abs_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def _env_path(name: str, default: str) -> str:
+    """Read a path override from the env, falling back to ``default`` when unset OR blank.
+
+    A present-but-empty/whitespace ``FLASH_*`` var (e.g. an unset shell var serialized as "") is
+    treated as set by ``os.environ.get``; passing "" to ``_expanded_abs_path`` resolves to the
+    current working directory, which would scatter run-state JSON / results / the DB into whatever
+    dir the control plane happens to start in. Treat blank as unset so the default root holds."""
+    raw = os.environ.get(name)
+    return raw if raw and raw.strip() else default
+
+
 # Local control-plane storage roots: run-state JSON + result artifacts, both under
 # the same state dir as server/db.py by default. Operators can point a validation
 # or staging control plane at its own directory so startup recovery/orphan cleanup
 # cannot see another server's live runs.
 _DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
-_STATE_DIR = _expanded_abs_path(os.environ.get("FLASH_CONTROL_PLANE_STATE_DIR", _DEFAULT_STATE_DIR))
-RUNS_DIR = _expanded_abs_path(os.environ.get("FLASH_RUNS_DIR", os.path.join(_STATE_DIR, "runs")))
+_STATE_DIR = _expanded_abs_path(_env_path("FLASH_CONTROL_PLANE_STATE_DIR", _DEFAULT_STATE_DIR))
+RUNS_DIR = _expanded_abs_path(_env_path("FLASH_RUNS_DIR", os.path.join(_STATE_DIR, "runs")))
 RESULTS_DIR = _expanded_abs_path(
-    os.environ.get("FLASH_RESULTS_DIR", os.path.join(_STATE_DIR, "results"))
+    _env_path("FLASH_RESULTS_DIR", os.path.join(_STATE_DIR, "results"))
 )
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
 # Terminal states a deploy must NOT overwrite. `done` is terminal but IS deployable

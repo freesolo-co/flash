@@ -145,6 +145,18 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
     reason to drop fla). This makes Hopper GDN training ~4-13x faster + ~2x less memory than the
     pure-PyTorch delta fallback.
     """
+    # Live-function RunPod installs resolve_worker_deps() BEFORE _train_body can fetch the run
+    # artifact. If a local chalk wheel is staged, chalk_extra_pip() installs that wheel after the
+    # fetch and before any model import, so do not also require PyPI to have the same chalk floor at
+    # boot time. This keeps validation of unpublished chalk wheels independent of PyPI release lag.
+    # Applied to BOTH the explicit (FLASH_WORKER_DEPS) and the pinned path: an explicit dep list that
+    # still names freesolo-chalk would otherwise install the PyPI chalk floor ahead of the staged
+    # wheel, defeating the unpublished-wheel validation the FLASH_CHALK_WHEEL stage is for.
+    def _strip_pypi_chalk_for_staged_wheel(d: list[str]) -> list[str]:
+        if os.environ.get("FLASH_CHALK_WHEEL"):
+            return [x for x in d if not x.startswith("freesolo-chalk")]
+        return d
+
     explicit = os.environ.get("FLASH_WORKER_DEPS")
     if explicit:
         # JSON list (use this for specs containing commas, e.g.
@@ -160,14 +172,9 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
 
             deps = [d for d in shlex.split(explicit) if d.strip()]
         if deps:
-            return deps
+            return _strip_pypi_chalk_for_staged_wheel(deps)
     deps = list(WORKER_DEPS)
-    # Live-function RunPod installs resolve_worker_deps() BEFORE _train_body can fetch the run
-    # artifact. If a local chalk wheel is staged, chalk_extra_pip() installs that wheel after the
-    # fetch and before any model import, so do not also require PyPI to have the same chalk floor at
-    # boot time. This keeps validation of unpublished chalk wheels independent of PyPI release lag.
-    if os.environ.get("FLASH_CHALK_WHEEL"):
-        deps = [d for d in deps if not d.startswith("freesolo-chalk")]
+    deps = _strip_pypi_chalk_for_staged_wheel(deps)
     # fla is kept on ALL arches (incl. Hopper sm90). On Hopper the correctness fix is fla's
     # tilelang backend (baked into WORKER_DEPS + ensured by _ensure_fla_fastpath_on_hopper), NOT
     # dropping fla — keeping it gives the ~4-13x faster / ~2x lighter GDN training the pure-PyTorch
@@ -495,6 +502,11 @@ def build_worker_env(
         "FLASH_EMBED_KERNEL",
         "FLASH_QKV_KERNEL",
         "FLASH_ROPE_KERNEL",
+        # GDN conv+scan epilogue and the trainable fused QK-norm/partial-RoPE attn epilogue are
+        # also default-on flags in chalk_kernels._KERNELS; forward them or a control-plane FLASH_*=0
+        # toggle (and remote A/B) silently no-ops on the worker like the rest of the chalk flags.
+        "FLASH_GDN_KERNEL",
+        "FLASH_TRAINABLE_QKV",
         # The chalk install spec itself — install_chalk_kernels warns pointing at it when a
         # FLASH_* flag is set but chalk is absent.
         "FLASH_CHALK_SPEC",

@@ -174,12 +174,15 @@ def build_payload(
         local_env_extra_pip,
     )
 
-    # Per-run additive pip specs for the BAKED-image path (the Vast default + the RunPod baked path):
+    # Per-run additive pip specs for the Vast BAKED-image path:
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS only reach the boot-install path, which Vast skips
     # because deps are baked into WORKER_IMAGE. FLASH_EXTRA_PIP (whitespace-separated, or a JSON list
     # for specs with commas) is the ONE knob that rides the always-installed `extra_pip` to a baked
     # run — used to A/B a wheel (e.g. causal-conv1d) on top of the published image without rebuilding
     # it. Resolved from the effective worker env (per-run [worker_env] over os.environ).
+    # NOTE: this is Vast-only — the RunPod baked submit (providers/runpod/jobs.build_function_input
+    # and train/__init__.submit_train) builds extra_pip from chalk_extra_pip + local_env_extra_pip
+    # and does NOT append FLASH_EXTRA_PIP. Keep that in mind before relying on it for a RunPod run.
     _eff = build_worker_env(spec, seed, runtime_secrets=runtime_secrets)
     _extra_raw = _eff.get("FLASH_EXTRA_PIP", "").strip()
     _extra_pip_user = _parse_extra_pip(_extra_raw)

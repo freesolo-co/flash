@@ -390,7 +390,7 @@ def _run_job_inner(
     try:
         # Ship the flash package to the run's HF repo (the per-run [train] hf_repo) so the GPU
         # worker — which fetches code/** from that same repo — can run it.
-        upload_code(spec.train.hf_repo)
+        upload_code(spec.train.hf_repo, spec)
         with open(log_path, "a") as log:
             _run_seed_loop(
                 spec,

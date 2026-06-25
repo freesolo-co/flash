@@ -208,6 +208,11 @@ class Router:
                     and _is_missing_adapter(e)
                     and reloads < max_reloads
                 ):
+                    # Adapter hot-swap / LRU eviction is normal pool churn, NOT a backend fault: the
+                    # backend is healthy and we reload+retry the SAME one. Counting it as a failure
+                    # would inflate Backend.total_failures during routine weight-sync/eviction and
+                    # mislead health/ops metrics, so release this slot cleanly (failed=False).
+                    release_failed = False
                     reloads += 1
                     async with self._lock:
                         self.state.mark_unloaded(be.id, adapter_name)
@@ -245,18 +250,24 @@ class Router:
                     last_err = e
                     break
                 self.rewards.acquire(w.id)
+            # Mirror generate(): the acquire above is paired by exactly ONE release in the finally on
+            # every exit — success, GatewayError, an unexpected exception, or CancelledError. Without
+            # the finally a cancelled/erroring post() would leak the inflight slot and the registry
+            # would think the worker is permanently busy. `failed` is only set on a real GatewayError.
+            release_failed = False
             try:
                 resp = await self.gateway.post(w.id, join(w.url, "/score"), body)
-                async with self._lock:
-                    self.rewards.release(w.id)
                 return resp, w.id
             except GatewayError as e:
                 last_err = e
+                release_failed = True
                 async with self._lock:
-                    self.rewards.release(w.id, failed=True)
                     self.rewards.set_health(w.id, False)
                 tried.add(w.id)
                 continue
+            finally:
+                async with self._lock:
+                    self.rewards.release(w.id, failed=release_failed)
         raise NoRewardCapacityError(f"all reward workers failed: {last_err}")
 
     # ---------- weight sync (per GRPO step) ----------

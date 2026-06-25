@@ -278,9 +278,11 @@ class RolloutPoolClient:
             # exception). Signal the producer, drain any pending item so a blocked _put can proceed,
             # then join so the thread (and its ThreadPoolExecutor) is torn down — no leak.
             stop.set()
-            with contextlib.suppress(queue.Empty):
-                while True:
+            while True:
+                try:
                     q.get_nowait()
+                except queue.Empty:
+                    break
             thread.join(timeout=30.0)
         if err_box:
             raise err_box[0]

@@ -961,7 +961,11 @@ def run_sft():
     # (the model is already materialized; passing model_init_kwargs with a model object errors in TRL).
     # Without this the SFT stage of a warm-start chain SILENTLY discarded init_from_adapter and trained
     # from scratch (loss restarted ~14 instead of continuing the prior stage).
-    _sft_init_model, _sft_init_peft = _init_adapter_model(model_id)
+    # When packing is on, the warm-start base MUST load with the same packing-aware (boundary-correct)
+    # attn impl as the fresh-LoRA path (mik["attn_implementation"]=_attn), or packed examples would
+    # cross-attend through SDPA. Only override when packing forced a non-default impl (_attn set).
+    _warm_attn = _attn if cfg_kwargs.get("packing") else None
+    _sft_init_model, _sft_init_peft = _init_adapter_model(model_id, attn_impl=_warm_attn)
     _sft_warm_started = _sft_init_peft is None  # _init_adapter_model loaded a real adapter
     if not _sft_warm_started:
         cfg_kwargs["model_init_kwargs"] = mik
@@ -1393,12 +1397,18 @@ def think_token_count(completion: str | None, tokenizer) -> int:
     return len(tokenizer(think_text, add_special_tokens=False)["input_ids"])
 
 
-def _init_adapter_model(model_id: str):
+def _init_adapter_model(model_id: str, attn_impl: str | None = None):
     """Base model + the ``train.init_from_adapter`` adapter loaded as a trainable
     PeftModel, or the plain ``model_id`` string + a fresh LoRA when it is unset.
 
     GRPO continuing an SFT adapter: TRL trains the LOADED adapter (peft_config=None)
-    instead of attaching a fresh one."""
+    instead of attaching a fresh one.
+
+    ``attn_impl`` overrides the default ``optimal_attn_impl()`` for the loaded base model. A
+    warm-start SFT run with BFD packing enabled MUST pass the packing-aware impl
+    (``flash_attention_2``/``flex_attention``) that ``run_sft`` selected: ``optimal_attn_impl()``
+    can return SDPA, which has no per-example boundary mask, so packed examples would cross-attend
+    and corrupt the continued SFT. (GRPO and unpacked SFT pass ``None`` and keep the default.)"""
     prefix = JOB_SPEC.train.init_from_adapter if JOB_SPEC else ""
     if not prefix:
         return model_id, make_lora(model_id)
@@ -1424,7 +1434,7 @@ def _init_adapter_model(model_id: str):
     # otherwise peft only WARNS about missing keys and silently trains a fresh LoRA, discarding the
     # SFT. No-op for non-VL checkpoints. See flash/engine/worker/lora.py.
     remap_vl_adapter_dir(adir, model_id)
-    _attn = optimal_attn_impl()
+    _attn = attn_impl or optimal_attn_impl()
     base = AutoModelForCausalLM.from_pretrained(
         model_id,
         dtype="bfloat16",

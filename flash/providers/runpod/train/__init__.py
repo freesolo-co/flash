@@ -55,7 +55,7 @@ from flash.providers.runpod.train.endpoints import (  # noqa: F401
 from flash.spec import JobSpec
 
 
-def upload_code(repo: str | None = None) -> str:
+def upload_code(repo: str | None = None, spec: JobSpec | None = None) -> str:
     """Upload the ``flash`` package to the run's HF artifact repo.
 
     ``repo`` is the per-run artifact repo (``spec.train.hf_repo``); the worker fetches
@@ -69,6 +69,13 @@ def upload_code(repo: str | None = None) -> str:
     Only the ``flash`` package is uploaded, NOT the client's project tree. Managed runs must
     reference a published Hub env by ``id`` (``flash env push`` to publish a local env first); the
     worker pip-installs the env wheel.
+
+    ``FLASH_CHALK_WHEEL`` is resolved against the SAME effective worker env (``os.environ`` overlaid
+    with ``spec.worker_env``) that ``chalk_extra_pip`` consumes to point the worker at the staged
+    wheel. Reading bare ``os.environ`` here would miss a wheel specified via the run's ``[worker_env]``
+    block — staging would skip it while the submit path still adds the worker-side path, so pip would
+    fail on the missing file. (``FLASH_ENV_WHEEL`` stays ``os.environ``-only to match its submit-side
+    reader ``local_env_extra_pip``.) ``spec=None`` collapses to plain ``os.environ``.
     """
     from pathlib import Path
 
@@ -104,10 +111,14 @@ def upload_code(repo: str | None = None) -> str:
         # scoped to code/flash (only orphans there are purged; unchanged files are kept).
         delete_patterns=["**"],
     )
+    # Resolve the staged-wheel knobs against the effective worker env (os.environ + spec.worker_env)
+    # so a wheel pointed to by the run's [worker_env] block is staged here — matching the source
+    # chalk_extra_pip()/local_env_extra_pip() read to add the worker-side path. (None -> os.environ.)
+    eff_env = _effective_worker_env(spec)
     # Private validation path for unpublished chalk builds: stage a local wheel into the same
     # run-private code artifact. chalk_extra_pip() points selected runs at the staged worker-side
     # /runcode/code/wheels/<wheel>.whl unless FLASH_CHALK_SPEC explicitly overrides it.
-    chalk_wheel = (os.environ.get("FLASH_CHALK_WHEEL") or "").strip()
+    chalk_wheel = (eff_env.get("FLASH_CHALK_WHEEL") or "").strip()
     if chalk_wheel:
         wheel_path = Path(chalk_wheel).expanduser()
         if not wheel_path.is_file():

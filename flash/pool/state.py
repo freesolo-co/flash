@@ -52,7 +52,6 @@ class Backend:
     adapter_clock: dict[str, int] = field(default_factory=dict)
     total_requests: int = 0
     total_failures: int = 0
-    last_health_ok: float = 0.0
     last_health_err: str = ""
 
     @property

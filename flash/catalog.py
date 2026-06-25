@@ -303,9 +303,11 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None, *, train=None
     # colocate verdict when inference_gpus==0 or the param count is unreadable.)
     _ig = 0
     if train is not None:
+        from flash.spec import strict_int
+
         _raw_ig = train.get("inference_gpus") if isinstance(train, dict) else getattr(train, "inference_gpus", 0)
         try:
-            _ig = int(_raw_ig or 0)
+            _ig = strict_int(_raw_ig or 0, name="train.inference_gpus", minimum=0)
         except (TypeError, ValueError):
             _ig = 0
     if est.verdict == "too_big" and _ig > 0 and est.est_gb:
