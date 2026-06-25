@@ -52,19 +52,20 @@ def grpo_sleep_mode(
     when the policy + colocated rollout engine + training peak all fit on ``card_vram_gb`` (the
     common case on an allocator-sized card), skip sleep mode entirely. Falls back to the
     size/context gate (``_memory_mode``) when the card VRAM is unknown."""
-    if not _memory_mode(model_id, max_length):
-        return False  # small / short-context -> never needed
+    from flash.engine.vram import grpo_fits_resident, grpo_rollout_seq_len
+
+    # Gate on the rollout length run_rl() ACTUALLY launches (max(1024, prompt+completion) when
+    # [train].max_length is unset -- 2368 default / 3584 thinking), NOT the raw max_length. With
+    # max_length unset (0) the size/context pre-filter would see a 0-length "short" run and early-
+    # exit for a sub-3B model, skipping the resident-fit check that a long max_tokens rollout needs.
+    seq_len = grpo_rollout_seq_len(max_length, max_tokens, thinking)
+    if not _memory_mode(model_id, seq_len):
+        return False  # small model AND genuinely short rollout -> never needed
     if card_vram_gb and card_vram_gb > 0:
         try:
-            from flash.engine.vram import grpo_fits_resident, grpo_rollout_seq_len
-
             if grpo_fits_resident(
                 model_id,
-                # Size the resident-fit check to the engine context run_rl() actually launches
-                # (max(1024, prompt+completion) when [train].max_length is unset, 2368 default / 3584
-                # thinking), NOT a flat 1024 -- otherwise a marginal card is wrongly told the run fits
-                # resident and sleep is disabled, risking an OOM on the real longer rollout.
-                seq_len=grpo_rollout_seq_len(max_length, max_tokens, thinking),
+                seq_len=seq_len,
                 max_tokens=max_tokens,
                 lora_rank=lora_rank,
                 group_size=group_size,

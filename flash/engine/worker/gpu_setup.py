@@ -67,13 +67,22 @@ def finalize_alloc_conf_for_sleep() -> None:
             import torch as _torch_card
 
             if _torch_card.cuda.is_available():
-                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+                # Binary GiB to match grpo_fits_resident (see run_rl); /1e9 over-reports ~7%.
+                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
         except Exception:
             card_gb = 0.0
+        # Resolve group_size EXACTLY as run_rl does (gcfg override, else the recipe default), not a
+        # flat 8: if the recipe's rl.group_size differs from 8 the alloc-conf sleep decision here
+        # would diverge from the trainer's, picking the wrong expandable/non-expandable conf.
+        from flash.engine.recipe import RECIPE as _RECIPE
+        from flash.engine.worker.grpo import grpo_overrides
+
+        _gcfg = grpo_overrides()
+        _group_size = int(_gcfg.get("group_size") or _RECIPE.rl.group_size)
         sleep_on = grpo_sleep_mode(
             model_id,
             max_length=ctx,
-            group_size=int(_t.group_size) if _t and _t.group_size else 8,
+            group_size=_group_size,
             max_tokens=(_t.max_tokens if _t else None),
             lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
             thinking=_w.THINKING,

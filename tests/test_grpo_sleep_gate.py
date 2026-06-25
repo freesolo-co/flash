@@ -77,3 +77,21 @@ def test_fits_resident_is_conservative_when_unknown():
     # sleep default (return False), never disable sleep on a guess.
     assert grpo_fits_resident("Qwen/Qwen3.5-4B", card_vram_gb=0) is False
     assert grpo_fits_resident("some/unlisted-model", card_vram_gb=80) is False
+
+
+def test_sleep_gate_resolves_unset_max_length_against_real_rollout_length():
+    # Cursor High / Codex P2: a sub-3B model with [train].max_length UNSET (0) but a real rollout
+    # (max_tokens) must NOT short-circuit the size/context pre-filter as a 0-length "short" run --
+    # the effective rollout (~2112 tokens here, >= the 2048 long-context threshold) makes the gate
+    # reach the resident-fit check. Before the fix `_memory_mode(model, 0)` was False for a sub-3B
+    # model, so grpo_sleep_mode returned False (sleep OFF) on EVERY card, even one too small to fit
+    # the run resident -> OOM risk on the real long rollout.
+    from flash.engine.worker.perf import grpo_sleep_mode
+
+    model = "Qwen/Qwen3.5-2B"  # sub-3B: the large-model Liger default does not mask the bug
+    # tight card: the run doesn't fit resident -> sleep ON (the regression the old gate missed)
+    assert grpo_sleep_mode(model, max_length=0, max_tokens=64, card_vram_gb=16) is True
+    # roomy card: fits resident -> sleep OFF (skip the slow/buggy sleep-wake cycle)
+    assert grpo_sleep_mode(model, max_length=0, max_tokens=64, card_vram_gb=80) is False
+    # unknown card VRAM -> fall back to the size/context gate, which now sees the real long rollout
+    assert grpo_sleep_mode(model, max_length=0, max_tokens=64, card_vram_gb=0) is True
