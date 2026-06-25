@@ -12,6 +12,7 @@ import base64
 import io
 import itertools
 import json
+import time
 
 import pytest
 
@@ -398,6 +399,26 @@ def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
     )
     res = jobs.poll_lambda_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
     assert res.ok, res  # not instantly stalled by an epoch-anchored deadline/load clock
+
+
+def test_heartbeat_progress_ts_unknown_launch_treats_heartbeats_as_fresh():
+    """When launch is UNKNOWN (launch_ts=0.0, from a recovered handle missing started_ts), the
+    clamp floor must drop to 0.0 so a normal heartbeat — timestamped before it is read, i.e. < now —
+    counts as FRESH and credits its own ts. Flooring to `now` would mark every such heartbeat stale
+    and stall a healthy recovered worker after SETUP_GRACE_S despite continuous heartbeats."""
+    from flash.providers._poll import heartbeat_progress_ts
+
+    hb_ts = time.time() - 30.0  # a normal recent heartbeat, slightly in the past
+    ts, fresh = heartbeat_progress_ts(("rl", 4, hb_ts), launch_ts=0.0)
+    assert fresh is True  # unknown launch -> not discarded
+    assert abs(ts - hb_ts) < 1.0  # credits the heartbeat's own ts (not clamped up to now)
+
+    # A real (non-zero) launch still discriminates prior-attempt leftovers (ts < launch).
+    launch = time.time() - 100.0
+    _, fresh_old = heartbeat_progress_ts(("rl", 1, launch - 50.0), launch_ts=launch)
+    assert fresh_old is False
+    _, fresh_new = heartbeat_progress_ts(("rl", 9, launch + 10.0), launch_ts=launch)
+    assert fresh_new is True
 
 
 def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):

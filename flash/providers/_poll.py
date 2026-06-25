@@ -248,16 +248,18 @@ def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tupl
     training-stage heartbeat would arm the tighter training stall window and fail a healthy new
     attempt mid-setup before it has overwritten the old file. ``launch_ts`` uses truthiness (not
     ``is not None``): the instance handles store started_ts as a non-Optional float coerced to 0.0
-    when missing, so 0.0 means "unknown launch" (a real launch is a large epoch ts) and we fall
-    back to ``now`` for the clamp floor — when launch is unknown every heartbeat counts as fresh
-    (the safe default: don't discard progress we can't date)."""
+    when missing, so 0.0 means "unknown launch" (a real launch is a large epoch ts). When launch is
+    UNKNOWN we cannot date heartbeats relative to it, so the clamp floor drops to 0.0 and every
+    heartbeat counts as fresh (the safe default: don't discard progress we can't date — clamping the
+    floor to ``now`` instead would mark every normal heartbeat, timestamped before it is read, stale
+    and stall a healthy recovered worker)."""
     now = time.time()
     ts = hb_key[2] if (isinstance(hb_key, tuple) and len(hb_key) >= 3) else None
     try:
         ts = float(ts)
     except (TypeError, ValueError):
         return now, False
-    lo = float(launch_ts) if launch_ts else now
+    lo = float(launch_ts) if launch_ts else 0.0  # unknown launch -> floor 0.0 (all heartbeats fresh)
     fresh = ts >= lo
     return min(now, max(lo, ts)), fresh
 
