@@ -72,3 +72,41 @@ def test_worker_skips_baked_cache_when_arch_mismatches(monkeypatch, tmp_path):
 
     assert worker._load_kernel_cache_if_present() is False
     assert loaded["called"] is False
+
+
+def test_worker_skips_baked_cache_when_arch_undetermined(monkeypatch, tmp_path):
+    import flash.engine.worker as worker
+
+    cache = tmp_path / "mega_cache.bin"
+    meta = tmp_path / "mega_cache.json"
+    cache.write_bytes(b"cache")
+    # metadata arch would match a real sm89 worker, but this worker can't determine its own arch
+    # (no CUDA) -> we must NOT load a blob we cannot verify; fall back to JIT.
+    meta.write_text(json.dumps({"sm": "sm89"}))
+    loaded = {"called": False}
+
+    class _NoCuda:
+        @staticmethod
+        def is_available():
+            return False
+
+        @staticmethod
+        def get_device_capability(index):
+            raise RuntimeError("no cuda")
+
+        @staticmethod
+        def get_device_name(index):
+            return "none"
+
+    fake_torch = types.SimpleNamespace(
+        cuda=_NoCuda(),
+        compiler=types.SimpleNamespace(
+            load_cache_artifacts=lambda blob: loaded.__setitem__("called", True)
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(worker, "_KERNEL_CACHE_FILE", str(cache))
+    monkeypatch.setattr(worker, "_KERNEL_CACHE_META_FILE", str(meta))
+
+    assert worker._load_kernel_cache_if_present() is False
+    assert loaded["called"] is False

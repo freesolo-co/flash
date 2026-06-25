@@ -2422,7 +2422,11 @@ def _load_kernel_cache_if_present() -> bool:
             print(f"[kernel-cache] metadata unreadable ({e}) -> first-run JIT fallback")
             return False
         cached_sm = str(meta.get("sm") or "")
-        if current_sm and cached_sm != current_sm:
+        if not current_sm:
+            # can't verify the worker's GPU arch -> don't risk loading a wrong-arch blob; JIT instead.
+            print("[kernel-cache] worker GPU arch undetermined -> first-run JIT fallback")
+            return False
+        if cached_sm != current_sm:
             print(
                 f"[kernel-cache] baked cache arch {cached_sm or 'unknown'} does not match "
                 f"worker arch {current_sm} -> first-run JIT fallback"
