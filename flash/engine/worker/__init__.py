@@ -1913,24 +1913,22 @@ def run_rl():
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
         # the model's FULL context and won't start on a consumer GPU).
-        # vllm_gpu_memory_utilization sizes vLLM's KV pool. When sleep_mode is ON (>=3B /
-        # long-ctx), vLLM offloads ALL GPU memory (model + KV) to CPU during the backward
-        # pass, so 0.45 is safe — the peak is max(rollout, train). When sleep_mode is OFF
-        # (small/fast models), the KV cache stays resident during training; on large cards
-        # (A100/H100) 0.45 x 80 GB = 36 GB KV that never frees, leaving too little room
-        # for activations and causing OOM. Cap the KV pool at ~8 GB (the estimator's
-        # _KV_CAP in flash.engine.vram) so the non-sleep training peak stays within budget.
-        if sleep_mode:
-            _vllm_gpu_mem_util = 0.45
-        else:
-            try:
-                import torch as _torch_vram
+        # vllm_gpu_memory_utilization sizes vLLM's KV pool. The blanket sleep-path 0.45 was a
+        # misjudgement: on an 80 GB A100 it reserves 0.45 x 80 = 36 GB of KV, but a GRPO rollout only
+        # holds ~num_generations x context tokens. MEASURED (Qwen3.5-4B colocate): that 36 GB
+        # reservation is the dominant resident allocation and sets the step peak (~46 GB) — exactly why
+        # trainer-side optimisations (mask-aware lm_head, fused layers) moved nothing. colocate_kv_util
+        # sizes both paths from flash's per-model KV estimate instead (vram.py); MEASURED 4B/80 GB peak
+        # 46 -> 26 GB, reward byte-identical, train_wall neutral.
+        try:
+            import torch as _torch_vram
 
-                _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
-                _kv_target_gb = 8.0  # matches estimator's _KV_CAP (flash.engine.vram)
-                _vllm_gpu_mem_util = min(0.45, _kv_target_gb / max(1.0, _total_vram_gb))
-            except Exception:
-                _vllm_gpu_mem_util = 0.10  # safe fallback: ~8 GB KV on worst-case 80 GB card
+            from flash.engine.vram import colocate_kv_util
+
+            _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
+            _vllm_gpu_mem_util = colocate_kv_util(_params_b, vllm_max_len, _total_vram_gb, sleep_mode)
+        except Exception:
+            _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10  # safe fallback to the old constants
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,

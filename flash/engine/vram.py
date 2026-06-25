@@ -95,6 +95,29 @@ def sft_realized_batch(
 # so it's capped (_KV_CAP) instead of growing without bound at long context.
 _KV_COEF = 2.0
 _KV_CAP = 8.0
+
+
+def colocate_kv_util(
+    params_b: float | None, vllm_max_len: int, total_vram_gb: float, sleep_mode: bool
+) -> float:
+    """``vllm_gpu_memory_utilization`` for the colocated GRPO rollout engine, sized to the ACTUAL KV
+    need rather than a blanket fraction of the card.
+
+    A GRPO rollout only holds ~num_generations x context tokens of KV. We estimate that need
+    (``_KV_COEF x seq x sqrt(params)``, capped at ``_KV_CAP``) and convert it to a utilization
+    fraction, capped at 0.45. The old blanket 0.45 reserved ~36 GB of KV on an 80 GB A100 — MEASURED
+    as the dominant resident allocation that set the GRPO step peak (~46 GB) — so deriving from need
+    frees ~20 GB at 4B (and ~40 GB at 35B/H200) while staying well above the rollout's real KV
+    footprint; a too-small pool only makes vLLM page/recompute, never OOM. The non-sleep path keeps
+    its existing 8 GB target (KV stays resident through the backward, so headroom matters); the sleep
+    path (which offloads under the backward) takes a generous 2.5x margin + a 12 GB floor. On small
+    cards the 0.45 cap binds and behaviour is unchanged."""
+    if not sleep_mode:
+        return min(0.45, 8.0 / max(1.0, total_vram_gb))  # unchanged: cap resident KV at _KV_CAP=8 GB
+    kv_width = (max(float(params_b), 0.1) ** 0.5) if params_b else 1.41
+    kv_est_gb = min(_KV_COEF * (max(1, vllm_max_len) / 1024.0) * kv_width, _KV_CAP)
+    kv_target_gb = max(12.0, 2.5 * kv_est_gb)
+    return min(0.45, kv_target_gb / max(1.0, total_vram_gb))
 # GRPO backward (activations + fp32 logits over the completion micro-batch) per unit
 # context x model width. Grad checkpointing makes this MILD in seq -- calibrated to
 # measured boundaries: 0.8B GRPO fits 24 GB up to seq 32k (seq ~free), while 4.7B GRPO
