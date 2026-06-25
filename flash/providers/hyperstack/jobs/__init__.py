@@ -160,6 +160,7 @@ def launch_and_submit(
     tried_regions: set[str] = set()
     candidates = list(instances)
     refreshed = False
+    relaxed_sick = False
     last_err: Exception | None = None
 
     def refresh_once(gpu: str) -> None:
@@ -171,21 +172,26 @@ def launch_and_submit(
         warmed (its cache actually still cold). A preload that can't run in its target region must
         FAIL that region (the walk exhausts -> raise), never silently warm another.
         """
-        nonlocal refreshed, candidates
+        nonlocal refreshed, relaxed_sick, candidates
         if mode == "preload":
             return
-        if not candidates and not refreshed:
-            refreshed = True
-            candidates = [
-                c
-                for c in usable_instances(gpu, force=True, ignore_sick=ignore_sick)
-                if c.region not in tried_regions
-            ]
-            if not candidates and not ignore_sick:
-                # Healthy regions exhausted mid-walk (stock vanished since the allocation fetch). Relax
-                # the quarantine as a TRUE last resort -- try a quarantined-but-in-stock region rather
-                # than fail the attempt while sick stock exists (matches allocate()'s bounded-demotion
-                # fallback; a still-sick region just host_faults + the run retries/escapes).
+        if not candidates:
+            if not refreshed:
+                refreshed = True
+                candidates = [
+                    c
+                    for c in usable_instances(gpu, force=True, ignore_sick=ignore_sick)
+                    if c.region not in tried_regions
+                ]
+            if not candidates and not ignore_sick and not relaxed_sick:
+                # Healthy regions exhausted -- EITHER the forced refresh came back empty, OR it returned
+                # regions that were then themselves tried and rejected (stale stock). Gated on its OWN
+                # flag (not ``refreshed``) so this relaxed pass still runs in that second case; otherwise
+                # quarantine becomes a HARD exclusion once the refresh has happened. Relax as a TRUE last
+                # resort -- try a quarantined-but-in-stock region rather than fail the attempt while sick
+                # stock exists (matches allocate()'s bounded-demotion fallback; a still-sick region just
+                # host_faults + the run retries/escapes).
+                relaxed_sick = True
                 candidates = [
                     c
                     for c in usable_instances(gpu, force=True, ignore_sick=True)
@@ -827,11 +833,26 @@ def poll_hs_job(
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 phase = "training" if seen_training_hb else "setup (pre-training)"
+                # A VM that reached active but produced NO liveness at all (no boot.log, no heartbeat)
+                # and then stalled out the full pre-training setup grace means the region never got a
+                # worker to boot -> host fault (quarantine), same as the first-liveness branch above.
+                # This catches the RECOVERY case where the observed-grace floor deferred that branch
+                # (active_obs_since only just started on the reattach) yet the VM has been silent since
+                # launch past setup_grace -- without it, a wedged region would retry forever-healthy and
+                # the next attempt could re-enter it. A VM that DID show liveness then stalled is
+                # ambiguous (the worker ran), so it is NOT quarantined; nor is our own user cancel.
+                no_liveness_host_fault = (
+                    not seen_training_hb
+                    and not seen_fresh_hb
+                    and not boot_log_seen
+                    and not run_cancelled()
+                )
                 return PollResult(
                     False,
                     failure="stalled",
                     detail=f"no worker progress for {int(time.time() - last_progress)}s "
                     f"during {phase} (vm status {status}, limit {int(limit)}s)",
+                    host_fault=no_liveness_host_fault,
                 )
         time.sleep(interval_s)
 

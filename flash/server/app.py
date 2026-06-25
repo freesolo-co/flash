@@ -378,6 +378,7 @@ def recover_runs() -> None:
         _run_job_background,
         _update,
         attach_run,
+        cancel_run,
         resume_run,
     )
 
@@ -391,6 +392,15 @@ def recover_runs() -> None:
         except FileNotFoundError:
             continue
         if status.state not in _RECOVERABLE:
+            continue
+        if getattr(status, "cancel_requested", False):
+            # A supervisor crash after cancel_run recorded the intent but before persisting the terminal
+            # `cancelled` state left a recoverable record with the flag set. Finish the cancel (teardown +
+            # terminal state) instead of recovering it down ANY of the paths below (reattach / resume /
+            # resubmit) — none of which would honor the user's cancel. Shielded from the orphan sweep so
+            # cancel_run owns the teardown without racing it.
+            active.add(status.run_id)
+            threading.Thread(target=lambda rid=row["run_id"]: cancel_run(rid), daemon=True).start()
             continue
         if status.remote:
             # Only handle-backed runs are kept by the sweep; a handle-less run is being

@@ -198,6 +198,7 @@ def launch_and_submit(
     tried_regions: set[str] = set()
     candidates = list(instances)
     refreshed = False
+    relaxed_sick = False
     last_err: Exception | None = None
     while candidates:
         inst = candidates.pop(0)
@@ -296,20 +297,25 @@ def launch_and_submit(
             # would warm region B while the caller reports the target region A as warmed (cache still
             # cold). A preload that can't run in its target region must FAIL it (walk exhausts ->
             # raise), never silently warm another.
-            if mode != "preload" and not candidates and not refreshed:
-                refreshed = True
-                # Force a fresh capacity fetch (the allocation cache is ~45s stale) so the refresh
-                # can discover regions that freed up since the walk started.
-                candidates = [
-                    c
-                    for c in usable_instances(inst.gpu, force=True, ignore_sick=ignore_sick)
-                    if c.region not in tried_regions
-                ]
-                if not candidates and not ignore_sick:
-                    # Healthy regions exhausted mid-walk (capacity vanished since the allocation fetch).
-                    # Relax the quarantine as a TRUE last resort -- try a quarantined-but-in-capacity
-                    # region rather than fail the attempt while sick capacity exists (matches allocate()'s
+            if mode != "preload" and not candidates:
+                if not refreshed:
+                    refreshed = True
+                    # Force a fresh capacity fetch (the allocation cache is ~45s stale) so the refresh
+                    # can discover regions that freed up since the walk started.
+                    candidates = [
+                        c
+                        for c in usable_instances(inst.gpu, force=True, ignore_sick=ignore_sick)
+                        if c.region not in tried_regions
+                    ]
+                if not candidates and not ignore_sick and not relaxed_sick:
+                    # Healthy regions exhausted -- EITHER the forced refresh came back empty, OR it
+                    # returned regions that were then themselves tried and rejected (stale capacity).
+                    # Gated on its OWN flag (not ``refreshed``) so this relaxed pass still runs in that
+                    # second case; otherwise quarantine becomes a HARD exclusion once the refresh has
+                    # happened. Relax as a TRUE last resort -- try a quarantined-but-in-capacity region
+                    # rather than fail the attempt while sick capacity exists (matches allocate()'s
                     # bounded-demotion fallback; a still-sick region just host_faults + the run retries).
+                    relaxed_sick = True
                     candidates = [
                         c
                         for c in usable_instances(inst.gpu, force=True, ignore_sick=True)
@@ -889,11 +895,26 @@ def poll_lambda_job(
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 phase = "training" if seen_training_hb else "setup (pre-training)"
+                # A box that reached active but produced NO liveness at all (no boot.log, no heartbeat)
+                # and then stalled out the full pre-training setup grace means the region never got a
+                # worker to boot -> host fault (quarantine), same as the first-liveness branch above.
+                # This catches the RECOVERY case where the observed-grace floor deferred that branch
+                # (active_obs_since only just started on the reattach) yet the box has been silent since
+                # launch past setup_grace -- without it, a wedged region would retry forever-healthy and
+                # the next attempt could re-enter it. A box that DID show liveness then stalled is
+                # ambiguous (the worker ran), so it is NOT quarantined; nor is our own user cancel.
+                no_liveness_host_fault = (
+                    not seen_training_hb
+                    and not seen_fresh_hb
+                    and not boot_log_seen
+                    and not run_cancelled()
+                )
                 return PollResult(
                     False,
                     failure="stalled",
                     detail=f"no worker progress for {int(time.time() - last_progress)}s "
                     f"during {phase} (instance status {status}, limit {int(limit)}s)",
+                    host_fault=no_liveness_host_fault,
                 )
         time.sleep(interval_s)
 

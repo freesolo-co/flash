@@ -156,6 +156,35 @@ def test_launch_relaxes_to_quarantined_region_when_healthy_exhausted(monkeypatch
     assert h.vm_id == "vm-99"
 
 
+def test_launch_relaxes_to_sick_after_refreshed_healthy_region_rejects(monkeypatch):
+    """The forced healthy refresh can RETURN a region that then itself rejects (stale stock). The relaxed
+    (ignore_sick) pass must still run after that -- gated on its OWN flag, not `refreshed` -- so
+    quarantine doesn't become a HARD exclusion once the refresh has already happened. Mirrors Lambda."""
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "flash-managed")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    attempts = []
+
+    def fake_launch(*, name, environment_name, image_name, flavor_name, key_name, user_data):
+        attempts.append(environment_name)
+        if environment_name != "default-SICK-1":
+            raise hs_api.HyperstackApiError("POST /core/virtual-machines -> HTTP 400: no stock")
+        return "vm-99"
+
+    def fake_usable(gpu, force=False, ignore_sick=False):
+        # Healthy refresh returns a DIFFERENT healthy region (US-2) that itself rejects; only the relaxed
+        # pass surfaces the quarantined-but-in-stock SICK-1.
+        return [_inst(region="SICK-1")] if ignore_sick else [_inst(region="US-2")]
+
+    monkeypatch.setattr(hs_api, "launch_vm", fake_launch)
+    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
+    h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="US-1")], attempt=0)
+    assert attempts == ["default-US-1", "default-US-2", "default-SICK-1"]
+    assert h.vm_id == "vm-99"
+
+
 def test_launch_raises_when_no_stock(monkeypatch):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs
@@ -803,6 +832,26 @@ def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"  # died inside the observed-grace window
     assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_reattach_setup_stall_no_liveness_quarantines(monkeypatch):
+    """On a reattach whose first poll already sees an active VM silent since launch PAST the setup grace,
+    the observed-grace floor defers the first-liveness branch -- but the VM produced NO liveness (no
+    boot.log, no heartbeat), so the pre-training setup STALL must still host_fault to quarantine the
+    wedged region (else the next attempt re-enters it). Pre-fix the setup-stall return had no host_fault."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}] * 3,
+        boot=None,  # no boot.log
+        step=0.1,  # observed-grace floor (120s) NOT reached -> first-liveness stays deferred
+    )
+    res = jobs.poll_hs_job(
+        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
+        first_liveness_s=10.0, setup_grace_s=10.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert res.host_fault  # active but never any liveness past setup grace on reattach -> quarantine
 
 
 def test_poll_dead_vm_without_marker_is_preempted(monkeypatch):

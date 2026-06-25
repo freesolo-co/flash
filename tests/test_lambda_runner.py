@@ -299,6 +299,34 @@ def test_launch_relaxes_to_quarantined_region_when_healthy_exhausted(monkeypatch
     assert h.instance_id == "i-9"
 
 
+def test_launch_relaxes_to_sick_after_refreshed_healthy_region_rejects(monkeypatch):
+    """The forced healthy refresh can RETURN a region that then itself rejects (stale capacity). The
+    relaxed (ignore_sick) pass must still run after that -- gated on its OWN flag, not `refreshed` -- so
+    quarantine doesn't become a HARD exclusion once the refresh has already happened."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    attempts = []
+
+    def fake_launch(*, region_name, **kw):
+        attempts.append(region_name)
+        if region_name != "sick-region-1":
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")
+        return "i-9"
+
+    def fake_usable(gpu, force=False, ignore_sick=False):
+        # Healthy refresh returns a DIFFERENT healthy region that itself rejects; only the relaxed pass
+        # surfaces the quarantined-but-in-capacity region.
+        return [_inst(region="sick-region-1")] if ignore_sick else [_inst(region="us-west-2")]
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
+    h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
+    assert attempts == ["us-east-1", "us-west-2", "sick-region-1"]
+    assert h.region == "sick-region-1"
+
+
 def test_launch_raises_when_no_capacity(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
@@ -938,6 +966,27 @@ def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"  # died inside the observed-grace window
     assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_reattach_setup_stall_no_liveness_quarantines(monkeypatch):
+    """On a reattach whose first poll already sees an active box silent since launch PAST the setup
+    grace, the observed-grace floor defers the first-liveness branch -- but the box produced NO liveness
+    (no boot.log, no heartbeat), so the pre-training setup STALL must still host_fault to quarantine the
+    wedged region (else the next attempt re-enters it). Pre-fix the setup-stall return had no host_fault."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}] * 3,
+        boot=None,  # no boot.log
+        step=0.1,  # observed-grace floor (120s) NOT reached -> first-liveness stays deferred
+    )
+    # Launch 9_000s ago (clock starts 10_000): silent since launch, setup grace (10s) already exceeded.
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
+        first_liveness_s=10.0, setup_grace_s=10.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert res.host_fault  # active but never any liveness past setup grace on reattach -> quarantine
 
 
 def test_poll_dead_host_without_marker_is_preempted(monkeypatch):

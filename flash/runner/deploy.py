@@ -218,6 +218,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
+    if getattr(status, "cancel_requested", False):
+        # A supervisor crash after cancel_run recorded the intent but before it persisted the terminal
+        # `cancelled` state left a non-terminal record with the flag set. Honor the user cancel — finish
+        # the teardown + mark cancelled — instead of reattaching to (and resuming/completing) a run the
+        # user already cancelled.
+        return cancel_run(run_id)
     if not status.remote:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
@@ -367,6 +373,10 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
+    if getattr(status, "cancel_requested", False):
+        # Crash after cancel_run recorded the intent but before persisting `cancelled` (see attach_run):
+        # finish the cancel instead of resuming a run the user already cancelled.
+        return cancel_run(run_id)
     if status.resume_seed_index is None:
         raise ValueError(f"run {run_id} has no resume_seed_index; cannot resume")
     spec = JobSpec.from_dict(status.spec)

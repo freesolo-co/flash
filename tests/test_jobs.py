@@ -1413,6 +1413,55 @@ def test_seed_loop_bails_on_cancel_intent_before_provisioning(monkeypatch):
         assert submits["n"] == 0  # cancel-in-progress -> NO paid worker submitted/allocated
 
 
+def test_attach_run_honors_cancel_requested_after_crash(monkeypatch):
+    """A supervisor crash after cancel_run recorded the intent but before persisting the terminal
+    'cancelled' state leaves a running record (with a handle) + cancel_requested. recover_runs/attach_run
+    must FINISH the cancel, not reattach and poll the run the user already cancelled."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="cr1", state="running", spec=_spec("cr1").to_dict(), cancel_requested=True,
+                remote={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "seed": 0},
+            )
+        )
+        polled = {"n": 0}
+
+        def fake_poll(*a, **k):
+            polled["n"] += 1
+            return jobs.PollResult(True, metrics={})
+
+        monkeypatch.setattr(jobs, "poll_job", fake_poll)
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        out = orch.attach_run("cr1", log_stream=sys.stderr)
+        assert out.state == "cancelled"  # cancel finished, not reattached/completed
+        assert polled["n"] == 0  # never polled a cancelled run
+
+
+def test_resume_run_honors_cancel_requested_after_crash(monkeypatch):
+    """Same crash-during-cancel case on the inter-seed resume path: resume_run must finish the cancel,
+    not run a fresh seed loop for a run the user already cancelled."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.train as flash_train
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="cr2", state="running", spec=_spec("cr2").to_dict(), cancel_requested=True,
+                resume_seed_index=0,
+            )
+        )
+        ran = {"loop": 0}
+        monkeypatch.setattr(orch, "_run_seed_loop", lambda *a, **k: ran.__setitem__("loop", 1))
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        out = orch.resume_run("cr2", log_stream=sys.stderr)
+        assert out.state == "cancelled"
+        assert ran["loop"] == 0  # never ran the seed loop for a cancelled run
+
+
 def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
     # The resume delegates the genuine-vs-infra decision to the seed loop (unchanged): a run that
     # is truly broken reproduces the failure on the resumed attempt, the seed loop fails it, and
