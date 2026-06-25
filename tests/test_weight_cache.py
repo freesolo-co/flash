@@ -559,6 +559,24 @@ def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
     assert "v4" in vols
 
 
+def test_teardown_weight_cache_no_runpod_key_is_noop(monkeypatch):
+    """No RUNPOD_API_KEY -> RunPod teardown is a best-effort no-op (log + []), never a raise.
+
+    A raise here would abort the chained `--teardown` before the Lambda/Hyperstack reclaim runs.
+    """
+    import runpod_flash.core.api.runpod as rp_api
+
+    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import preload
+
+    def _boom(*a, **k):
+        raise AssertionError("RunpodRestClient must not be constructed without a key")
+
+    monkeypatch.setattr(rp_keys, "keys", lambda: [])  # empty pool == RUNPOD_API_KEY unset
+    monkeypatch.setattr(rp_api, "RunpodRestClient", _boom)
+    assert preload.teardown_weight_cache(["US-CA-2"]) == []
+
+
 def test_teardown_weight_cache_sweeps_all_pool_accounts(monkeypatch):
     from flash.providers.runpod import preload
 
@@ -820,6 +838,22 @@ def test_provision_hyperstack_distinct_name_even_in_shared_env(monkeypatch):
     out = preload.provision_hyperstack_volumes()
     assert ensured == ["flash-weights-us-1", "flash-weights-us-2"]
     assert out == ["hyperstack:US-1", "hyperstack:US-2"]
+
+
+def test_provision_hyperstack_skips_region_with_no_volume_id(monkeypatch):
+    """A region whose ensure_volume returns a falsy id (no real volume) is NOT reported provisioned."""
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(hs_api, "_regions", lambda: ["GOOD-1", "BAD-1", "GOOD-2"])
+    monkeypatch.setattr(hs_api, "environment_for_region", lambda r: f"default-{r}")
+    # BAD-1 confirms/creates but the API yields no id -> must not count as provisioned
+    monkeypatch.setattr(
+        hs_api, "ensure_volume",
+        lambda name, env, gb: None if "bad" in name else 42,
+    )
+    out = preload.provision_hyperstack_volumes()
+    assert out == ["hyperstack:GOOD-1", "hyperstack:GOOD-2"]  # BAD-1 dropped, no false success
 
 
 def test_provision_cli_creates_instance_storage(monkeypatch):

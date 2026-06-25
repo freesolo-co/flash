@@ -221,11 +221,18 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     from flash.providers.runpod import keys as rp_keys
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
+    pool = rp_keys.keys()
+    if not pool:
+        # No RunPod key configured (e.g. an instance-only control plane): this is a best-effort
+        # no-op, NOT an error — RunpodRestClient() would raise on a missing key and (under a chained
+        # `--teardown`) could abort the Lambda/Hyperstack reclaim. Mirror the instance providers'
+        # missing-key behavior: log and return nothing reclaimed.
+        logger.info("teardown: RUNPOD_API_KEY not configured — skipping RunPod cache teardown")
+        return []
     dc_ids = datacenters or [dc.value for dc in weight_cache_datacenters()]
     targets = {
         weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, DataCenter.from_string(d)) for d in dc_ids
     }
-    pool = rp_keys.keys() or [None]  # [None] -> RunpodRestClient() resolves the key from the env
 
     async def _names(client) -> set:
         res = await client.list_network_volumes()
@@ -368,7 +375,15 @@ def provision_hyperstack_volumes(name: str | None = None, size_gb: int | None = 
         try:
             env = hs_api.environment_for_region(region)
             vol_name = hs_api.cache_volume_name(base, region)
-            hs_api.ensure_volume(vol_name, env, gb)
+            vol_id = hs_api.ensure_volume(vol_name, env, gb)
+            # ensure_volume returns the volume id; a falsy id means create-or-confirm did NOT yield a
+            # real volume (e.g. the API responded without an id). Don't record that region as
+            # provisioned — otherwise --provision reports success and the launch path treats a
+            # never-created region as warm.
+            if not vol_id:
+                logger.warning("provision: hyperstack ensure_volume(%s, %s) returned no id — region not "
+                               "provisioned", vol_name, region)
+                continue
             done.append(f"hyperstack:{region}")
         except Exception as exc:
             logger.warning("provision: hyperstack ensure_volume(%s, %s) failed: %s", base, region, exc)
