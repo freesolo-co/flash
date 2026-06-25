@@ -1171,8 +1171,10 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     # bytes is a valid path type and huggingface_hub could misread it as a (huge) filesystem path.
     assert isinstance(uploaded["fileobj"], io.BytesIO)
     assert uploaded["fileobj"].getvalue() == big.encode()
-    # user_data is tiny despite a 100KB spec, and the caller's payload is untouched.
-    assert len(ud) < 25_000
+    # user_data stays small despite a 100KB spec (the spec was spilled to HF, not embedded), and the
+    # caller's payload is untouched. The bound is well under the 100KB spec so it proves the spill; it
+    # tracks the embedded bootstrap source size (which grows as the bootstrap gains logic), not the spec.
+    assert len(ud) < 30_000
     assert payload["job_spec_json"] == big
     assert "job_spec_in_hf" not in payload
 

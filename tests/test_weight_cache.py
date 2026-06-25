@@ -1326,7 +1326,8 @@ def test_instance_preload_block_device_requires_mount_sentinel(tmp_path, monkeyp
     hub.snapshot_download = _boom
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     hf_home = str(tmp_path / "hf-cache")  # parent (the mount) exists but has no sentinel
-    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"], "cache_block_device": True})
+    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"],
+                       "cache_block_device": True, "cache_mount_marker": ".flash-cache-mounted"})
     assert r["preloaded"] == []
     assert "not mounted" in r["error"]
 
@@ -1350,7 +1351,8 @@ def test_instance_preload_block_device_warms_when_sentinel_present(tmp_path, mon
     mount = tmp_path
     (mount / ".flash-cache-mounted").write_text("")  # preamble's real-mount sentinel
     hf_home = str(mount / "hf-cache")
-    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"], "cache_block_device": True})
+    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"],
+                       "cache_block_device": True, "cache_mount_marker": ".flash-cache-mounted"})
     assert r["preloaded"] == ["a/b"]
     assert not r["failed"]
 
@@ -1365,6 +1367,93 @@ def test_block_device_preamble_writes_mount_sentinel():
     # sentinel is written inside the mount-success branch (after `mount ... &&`), not unconditionally
     assert "touch '/mnt/cache/.flash-cache-mounted'" in pre
     assert _instance.CACHE_MOUNT_MARKER == ".flash-cache-mounted"
+
+
+def test_nfs_mount_check_verifies_mountpoint_and_writes_sentinel():
+    """The NFS (Lambda) preamble drops the sentinel ONLY when the host path is a real mountpoint, so an
+    auto-created empty Docker-bind dir (failed/unready NFS) is detectable in-container."""
+    from flash.providers import _instance
+
+    pre = _instance._cache_nfs_mount_check(
+        {"cache_host_mount": "/lambda/nfs/flash-weights"}  # NFS: no cache_block_device
+    )
+    assert "mountpoint -q '/lambda/nfs/flash-weights'" in pre  # gates on a REAL mount
+    assert "touch '/lambda/nfs/flash-weights/.flash-cache-mounted'" in pre
+    # No-op for block-volume (handled by the block preamble) and for cold runs.
+    assert _instance._cache_nfs_mount_check(
+        {"cache_host_mount": "/mnt/cache", "cache_block_device": True}) == ""
+    assert _instance._cache_nfs_mount_check({}) == ""
+
+
+def test_instance_preload_nfs_requires_mount_sentinel(tmp_path, monkeypatch):
+    """A Lambda (NFS) preload whose mount dir exists but has NO sentinel must refuse — Docker's -v bind
+    auto-creates a missing host dir, so isdir(mount) alone can't prove the NFS actually mounted."""
+    import sys
+
+    from flash.providers import _instance_bootstrap as b
+
+    def _boom(**k):
+        raise AssertionError("must not download when the NFS cache isn't really mounted")
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = _boom
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    hf_home = str(tmp_path / "hf-cache")  # parent (the mount) exists but has no sentinel
+    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"],
+                       "cache_mount_marker": ".flash-cache-mounted"})  # NFS: no cache_block_device
+    assert r["preloaded"] == []
+    assert "not mounted" in r["error"]
+    assert "NFS" in r["error"]
+
+
+def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch):
+    """With the NFS preamble's real-mount sentinel present, a Lambda preload proceeds to download."""
+    import sys
+
+    from flash.providers import _instance_bootstrap as b
+
+    calls = []
+
+    def _snap(**k):
+        if k.get("local_files_only"):
+            raise FileNotFoundError("not cached")
+        calls.append(k)
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = _snap
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    (tmp_path / ".flash-cache-mounted").write_text("")
+    hf_home = str(tmp_path / "hf-cache")
+    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"],
+                       "cache_mount_marker": ".flash-cache-mounted"})
+    assert r["preloaded"] == ["a/b"]
+
+
+def test_build_payload_carries_mount_marker_for_nfs_cache():
+    """A cache-attached preload payload (even NFS) carries cache_mount_marker so the in-container check
+    can require the sentinel regardless of substrate."""
+    from flash.providers import _instance
+
+    p = _instance.build_payload(
+        _preload_spec(), 0, 0, arm="lambda",
+        cache_host_mount="/lambda/nfs/flash-weights", mode="preload", models=["a/b"],
+    )
+    assert p["cache_mount_marker"] == _instance.CACHE_MOUNT_MARKER
+    assert "cache_block_device" not in p  # NFS, not a block volume
+
+
+def test_preload_wall_cap_timer_armed_and_cancellable(monkeypatch):
+    """run_preload has no worker subprocess, so the preload branch arms a wall-cap watchdog timer that
+    hard-exits the box if a download hangs past max_wall_s. The timer is cancellable on a clean finish."""
+    from flash.providers import _instance_bootstrap as b
+
+    t = b._arm_preload_wall_cap({"max_wall_s": 999})
+    assert t is not None
+    assert t.is_alive()
+    t.cancel()
+    # No cap requested -> no timer (e.g. a 0/absent wall).
+    assert b._arm_preload_wall_cap({"max_wall_s": 0}) is None
+    assert b._arm_preload_wall_cap({}) is None
 
 
 def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
@@ -1519,6 +1608,43 @@ def test_warm_instance_terminates_on_launch_failure(monkeypatch):
     assert res[0]["status"] == "error"
     assert "no capacity" in res[0]["error"]
     assert len(terminated) == 1  # finally still tears down
+
+
+def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
+    """The box can die BEFORE run_preload uploads preload_result.json (docker/GPU never ready, image
+    pull fails, the bootstrap crashes early); it still writes the <arm>_attempt0.json failure marker.
+    The driver must watch that marker and free the paid box at once instead of polling the full budget."""
+    import types as _types
+
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    terminated = []
+    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
+
+    # Two distinct readers by path: the completion file never appears; the attempt-failure marker does.
+    def reader_factory(repo, path, min_interval_s=45.0):
+        if path.endswith("preload_result.json"):
+            return lambda force=False: None
+        return lambda force=False: '{"ok": false, "error": "image pull failed"}'
+
+    monkeypatch.setattr(preload, "make_hf_text_reader", reader_factory)
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(lj, "launch_and_submit", lambda *a, **k: None)
+    monkeypatch.setattr(lj, "terminate_run_instances", lambda rid: terminated.append(rid))
+    # Clock that ticks 1 virtual second per sleep — if the early-out works, the poll exits on the FIRST
+    # pass (well under the 60s floor), proving the box wasn't held to the full budget.
+    clock = {"t": 1000.0}
+    start = clock["t"]
+    monkeypatch.setattr(
+        preload, "time",
+        _types.SimpleNamespace(time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1)),
+    )
+    res = preload.warm_instances(models=["a/b"], providers=["lambda"], timeout_s=600, poll_interval_s=0.0)
+    assert res[0]["status"] == "error"
+    assert "image pull failed" in res[0]["error"]
+    assert clock["t"] - start < 5  # bailed immediately, did NOT poll the full 600s
+    assert len(terminated) == 1
 
 
 def test_warm_instances_no_capacity_returns_empty(monkeypatch):

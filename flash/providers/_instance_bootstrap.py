@@ -247,6 +247,36 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "") -> None:
     hf_upload(payload, p, f"{_arm(payload)}_attempt{marker['attempt']}.json")
 
 
+def _arm_preload_wall_cap(payload: dict) -> threading.Timer | None:
+    """Arm the preload path's wall-clock cap. The training path enforces ``max_wall_s`` by
+    ``run_mode`` killing the worker SUBPROCESS on its deadline, but ``run_preload`` runs
+    ``snapshot_download`` IN-PROCESS — a hung Hub download (or a stalled NIC) has no subprocess to
+    time out, so without this the paid Lambda/Hyperstack box can keep running long past ``timeout_s``
+    (the control-plane driver's ``terminate_run_instances`` only fires if that driver process is
+    still alive, and nothing on the box self-terminates). Mirror the deadline here: a daemon timer
+    writes a terminal failure marker (so the warm driver stops polling and the box can be reaped) and
+    HARD-exits the process — ``os._exit`` because a blocked C-level socket read in ``snapshot_download``
+    can't be unwound by a Python exception/signal. Returns the Timer so the caller can cancel it on a
+    clean finish (the ``finally`` marker upload then runs normally)."""
+    wall_s = float(payload.get("max_wall_s") or 0)
+    if wall_s <= 0:
+        return None
+
+    def _fire() -> None:
+        msg = f"preload exceeded the wall-clock cap ({int(wall_s)}s); self-terminating box"
+        print(f"FLASH: {msg}", flush=True)
+        # Best-effort terminal marker so the driver/sweeper sees a terminal failure instead of polling
+        # to its own timeout. Never block the hard exit on it.
+        with contextlib.suppress(Exception):
+            write_attempt_marker(payload, ok=False, error=msg)
+        os._exit(1)
+
+    timer = threading.Timer(wall_s, _fire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 def run_preload(payload: dict) -> dict:
     """Download-only warm: pull the requested models into the bind-mounted cache (HF_HOME) and exit.
 
@@ -266,19 +296,22 @@ def run_preload(payload: dict) -> dict:
     if not hf_home or not mount or not os.path.isdir(mount):
         return {"preloaded": [], "already_cached": [], "failed": {},
                 "error": f"weight-cache not mounted (HF_HOME={hf_home!r}); refusing to warm ephemeral disk"}
-    # Block-volume providers (Hyperstack) carry ``cache_block_device``: the cloud-init preamble drops a
-    # sentinel ONTO the mounted volume, so it's only visible here when the REAL volume is mounted. If the
-    # attach failed, Docker binds an EMPTY host dir -> the mount exists (isdir passes) but the sentinel
-    # is absent, which would otherwise warm ephemeral disk yet report success. Require it. (NFS/Lambda
-    # has no block device and no preamble; the platform genuinely auto-mounts, so isdir alone is sound.)
-    if payload.get("cache_block_device"):
-        # Marker filename flows in via the payload from _instance.CACHE_MOUNT_MARKER (ONE source of
-        # truth, written by the same constant in the cloud-init preamble); the literal is only a
-        # defensive fallback for an older payload that predates the field.
-        marker = os.path.join(mount, payload.get("cache_mount_marker") or ".flash-cache-mounted")
+    # Require the mount sentinel for BOTH substrates. The cloud-init preamble drops it ONLY onto a
+    # verified-real mount: block-volume (Hyperstack) writes it after the device mounts; NFS (Lambda)
+    # writes it after confirming ``mountpoint`` (the platform auto-mount actually took). It is therefore
+    # visible here only when the REAL cache is mounted. Without it, Docker's ``-v`` bind silently
+    # auto-creates an EMPTY host dir -> the mount exists (isdir passes) but the sentinel is absent, which
+    # would otherwise warm EPHEMERAL disk (discarded at teardown) yet report a successful warm. The
+    # marker filename flows in via the payload from _instance.CACHE_MOUNT_MARKER (ONE source of truth);
+    # the literal is only a defensive fallback for an older payload that predates the field. A
+    # cache-attached preload payload always carries cache_mount_marker, so absence of the field is
+    # treated as "no sentinel expected" only when no cache mount was requested at all.
+    if payload.get("cache_mount_marker"):
+        marker = os.path.join(mount, payload["cache_mount_marker"])
         if not os.path.exists(marker):
+            kind = "block volume" if payload.get("cache_block_device") else "NFS filesystem"
             return {"preloaded": [], "already_cached": [], "failed": {},
-                    "error": (f"weight-cache block volume not mounted (no sentinel at {marker}); "
+                    "error": (f"weight-cache {kind} not mounted (no sentinel at {marker}); "
                               "refusing to warm ephemeral disk")}
     from huggingface_hub import snapshot_download
 
@@ -331,7 +364,14 @@ def main() -> int:
         # polling the `<prefix>/preload_result.json` we upload just below (the attempt marker is still
         # written in the finally, but it is NOT the preload completion signal).
         if payload.get("mode") == "preload":
-            result = run_preload(payload)
+            # Enforce the wall cap on the in-process download (the training path enforces it on the
+            # worker subprocess via run_mode; preload has no subprocess, so arm a watchdog here).
+            wall_timer = _arm_preload_wall_cap(payload)
+            try:
+                result = run_preload(payload)
+            finally:
+                if wall_timer is not None:
+                    wall_timer.cancel()
             with open("/tmp/preload_result.json", "w") as f:
                 json.dump(result, f)
             hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")

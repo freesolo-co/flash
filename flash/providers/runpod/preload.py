@@ -434,6 +434,13 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
     prefix = f"{spec.phase}/{run_id}/seed0"
     reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
                                  min_interval_s=max(5.0, poll_interval_s))
+    # ALSO watch the attempt-failure marker (<arm>_attempt0.json): if the box dies BEFORE run_preload
+    # uploads preload_result.json (docker/GPU never ready, image pull fails, the bootstrap crashes
+    # early), the worker/host failmark uploader still writes this terminal ok=false marker. Without
+    # watching it the driver would poll to the full effective_s on an already-dead box, burning paid
+    # GPU. The completion file is authoritative when present (success or partial), so check it FIRST.
+    fail_reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/{provider}_attempt0.json",
+                                      min_interval_s=max(5.0, poll_interval_s))
     try:
         try:
             jobs_mod.launch_and_submit(spec, seed=0, instances=[candidate], attempt=0,
@@ -447,6 +454,17 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
             text = reader(force=True)
             if text:
                 break
+            # No completion file yet — a terminal failure marker means the box already died; stop
+            # polling and free it now instead of waiting out the full budget.
+            fail_text = fail_reader(force=True)
+            if fail_text:
+                try:
+                    fail = json.loads(fail_text)
+                except Exception:
+                    fail = {}
+                if not fail.get("ok", True):
+                    return {"provider": provider, "region": region, "status": "error",
+                            "error": f"box failed early: {fail.get('error') or 'see boot log'}"}
             time.sleep(max(5.0, poll_interval_s))
         if not text:
             return {"provider": provider, "region": region, "status": "timeout"}

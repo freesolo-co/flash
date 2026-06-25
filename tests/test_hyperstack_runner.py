@@ -333,6 +333,50 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     assert refresh_calls == []  # the stale-stock refresh was NOT consulted in preload mode
 
 
+def test_preload_mode_tears_down_when_attach_fails(monkeypatch):
+    """In preload mode a FAILED volume attach (vol busy on another VM / API error) must tear the just-
+    launched box down and walk on — not leave it billing while it waits for an absent device.
+
+    Regression: attach_volume() returns False on failure and the call ignored it, so a preload box
+    launched, couldn't warm (the sentinel check refuses ephemeral disk), and burned GPU to the wall cap.
+    A training run still tolerates a failed attach (degrades cold); only preload hard-fails the region.
+    """
+    import pytest
+
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: "vol-busy")
+    launched, terminated = [], []
+    monkeypatch.setattr(hs_api, "launch_vm", lambda **kw: launched.append(kw) or "vm-x")
+    monkeypatch.setattr(hs_api, "attach_volume", lambda vm, vol: False)  # attach FAILS
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda rid: terminated.append(rid))
+
+    with pytest.raises(hs_api.HyperstackApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=[_inst(region="CANADA-1")],
+            attempt=0, mode="preload", models=["a/b"],
+        )
+    assert len(launched) == 1  # the box DID launch (attach is post-launch)...
+    assert terminated  # ...and was torn down when the attach failed (not left billing)
+
+
+def test_training_mode_tolerates_failed_attach(monkeypatch):
+    """A TRAINING run survives a failed attach: the cloud-init preamble degrades to a cold run, so the
+    box keeps running (no teardown) — only preload is strict about the cache."""
+    hs_api, jobs, _launched = _wire_cache_launch(monkeypatch)
+    terminated = []
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: "vol-7")
+    monkeypatch.setattr(hs_api, "attach_volume", lambda vm, vol: False)  # attach fails
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda rid: terminated.append(rid))
+    # mode defaults to None (training) -> returns a handle, no teardown
+    h = jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+    assert h is not None
+    assert terminated == []
+
+
 # ---------------------------------------------------------------------------
 # poll_hs_job state machine
 # ---------------------------------------------------------------------------

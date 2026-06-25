@@ -242,8 +242,23 @@ def launch_and_submit(
         # degrades to a cold run if no device appears, e.g. attach failed or the volume is busy on
         # another VM — block volumes are single-attach).
         if vol_id is not None:
+            attached = False
             with contextlib.suppress(Exception):
-                hs_api.attach_volume(vm_id, vol_id)
+                attached = hs_api.attach_volume(vm_id, vol_id)
+            # A training run survives a failed attach (the preamble runs cold), but a PRELOAD box can't:
+            # with no device it would refuse to warm ephemeral disk (the sentinel check) and just burn
+            # paid GPU until the wall cap. Treat a failed preload attach as a launch failure — tear the
+            # VM down and walk to the next region (failing the warm if none can attach the cache).
+            if not attached and mode == "preload":
+                say(f"preload: cache attach failed in {inst.region} (vol busy/absent); "
+                    "terminating box and trying next region")
+                with contextlib.suppress(Exception):
+                    terminate_run_instances(spec.run_id)
+                last_err = hs_api.HyperstackApiError(
+                    f"preload: cache volume attach failed in {inst.region}"
+                )
+                refresh_once(inst.gpu)
+                continue
         say(
             f"launched hyperstack vm {vm_id}: {inst.gpu} {inst.flavor} "
             f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
