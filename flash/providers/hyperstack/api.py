@@ -18,6 +18,7 @@ retries, nothing persisted locally. Hyperstack specifics:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import tempfile
@@ -65,11 +66,29 @@ _FLAVORS_TTL_S = 45.0
 _flavors_cache: dict[str, Any] = {"ts": 0.0, "by_region": None}
 
 
+# Regions excluded from allocation + launch. CANADA-1's on-demand stock is a known-broken-driver
+# fleet: instances reach ACTIVE then die without a DONE sentinel (NVML init failure / cuda
+# unavailable), so launching there burns GPU budget on guaranteed-failed retries. Skip it by default
+# rather than waterfall through it. Override with HYPERSTACK_BLOCKED_REGIONS (comma-separated): unset
+# -> the default below; set (even to "") -> exactly that list, so operators can re-enable CANADA-1
+# (HYPERSTACK_BLOCKED_REGIONS="") or block others once capacity/driver health changes.
+_DEFAULT_BLOCKED_REGIONS = frozenset({"CANADA-1"})
+
+
+def _blocked_regions() -> set[str]:
+    env = os.environ.get("HYPERSTACK_BLOCKED_REGIONS")
+    if env is None:
+        return set(_DEFAULT_BLOCKED_REGIONS)
+    return {r.strip().upper() for r in env.split(",") if r.strip()}
+
+
 def _regions() -> list[str]:
     out = request_with_retries("/core/regions")
     regs = out.get("regions", []) if isinstance(out, dict) else []
     names = [r.get("name") for r in regs if r.get("name")]
-    return names or ["NORWAY-1", "CANADA-1", "US-1", "CANADA-2"]
+    names = names or ["NORWAY-1", "CANADA-1", "US-1", "CANADA-2"]
+    blocked = _blocked_regions()
+    return [n for n in names if n.upper() not in blocked]
 
 
 # Hyperstack regions that DON'T support block-volume operations. LIVE-FOUND: CANADA-2 returns HTTP 400

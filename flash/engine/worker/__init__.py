@@ -56,6 +56,7 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
+    disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
     lora_exclude_modules,
     model_quant,  # noqa: F401
@@ -2242,6 +2243,18 @@ def run_rl():
                     "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
                     "crash workaround; update vLLM to a TRL-supported version to re-enable)"
                 )
+                # vLLM 0.19.1 ALSO hits `RuntimeError: aot_compile is not supported by the
+                # current configuration` through its DEFAULT torch.compile path on some GPU
+                # arches (Ampere sm_86: A6000, A100) — it fires from vllm/compilation/wrapper.py
+                # when torch._dynamo.is_compiling() is False inside the CUDA-graph capture path.
+                # Skipping FULL_AND_PIECEWISE above is not enough (the vllm_compilation_config
+                # GRPOConfig field doesn't exist in this TRL, so that _set_vllm_field is a no-op).
+                # VLLM_TORCH_COMPILE_LEVEL=0 (NO_COMPILATION) forces vLLM to execute the model
+                # eagerly, preventing the AOT path entirely. Official vLLM env var (vllm/envs.py);
+                # a no-op on a vLLM that doesn't define it. Don't override an operator-set value.
+                if "VLLM_TORCH_COMPILE_LEVEL" not in os.environ:
+                    os.environ["VLLM_TORCH_COMPILE_LEVEL"] = "0"
+                    print("[rl][warn] VLLM_TORCH_COMPILE_LEVEL=0 (prevent aot_compile on vLLM 0.19.1)")
         except Exception:
             pass
         if _cudagraph_safe:
@@ -2417,6 +2430,15 @@ def run_rl():
         if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
             _liger_loss.chunk_size = _cs
             print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
+    # Run liger's fused GRPO loss EAGER: drop ONLY its torch.compile (BROKEN on torch 2.10 — its
+    # dynamo guard-gen trips a symbol_to_source IndexError that crashes the first GRPO step on every
+    # path), keep the chunked memory path that prevents the 248k-vocab fp32-logit OOM. Must run BEFORE
+    # the mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure. See the helper.
+    if disable_liger_grpo_torch_compile(trainer):
+        print(
+            "[rl] liger GRPO loss: torch.compile DISABLED (eager loss math; chunked memory path "
+            "retained) — dodges the torch 2.10 dynamo guard-gen crash (symbol_to_source IndexError)"
+        )
     # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
     # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
     # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
