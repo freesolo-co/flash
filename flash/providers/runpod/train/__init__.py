@@ -34,6 +34,7 @@ from flash.providers.runpod.train.deps import (  # noqa: F401
     chalk_extra_pip,
     logger,
     resolve_worker_deps,
+    strip_runpod_volume_env,
     worker_image_for_gpu,
 )
 from flash.providers.runpod.train.endpoints import (  # noqa: F401
