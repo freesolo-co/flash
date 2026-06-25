@@ -85,14 +85,34 @@ def _full_checkpoint(tmp_path, step):
     return ckpt
 
 
-def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, monkeypatch):
+@pytest.fixture
+def fake_transformers(monkeypatch):
+    """Inject a minimal ``transformers`` stub (just a ``TrainerCallback`` base) so the checkpoint-upload
+    regression tests RUN in offline CI — which lacks the GPU-only ``transformers`` extra — instead of
+    being ``importorskip``'d away (where they'd silently protect nothing). The upload callback only
+    subclasses ``TrainerCallback`` (imported lazily inside make_checkpoint_upload_callback) and all HF
+    I/O is stubbed via _RecordingHfApi, so a real transformers install is unnecessary; the stub keeps
+    the coverage deterministic everywhere. Mirrors the existing stub in test_worker_dryrun.py."""
+    import sys
+    import types
+
+    mod = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    mod.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", mod)
+    return mod
+
+
+def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, monkeypatch, fake_transformers):
     """on_save streams the resume checkpoint to <prefix>/checkpoint/checkpoint-<N>, pruned latest-only.
 
     This is the upload a preempted run resumes FROM, so it must (a) keep the trainer state
     (no ignore_patterns dropping optimizer.pt) and (b) prune older checkpoints in the same commit
     (delete_patterns) so hf_resume_checkpoint never has to disambiguate stale state.
     """
-    pytest.importorskip("transformers")  # the callback subclasses transformers.TrainerCallback
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
     _full_checkpoint(tmp_path, 60)
@@ -116,13 +136,12 @@ def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, mon
     assert "ignore_patterns" not in up
 
 
-def test_upload_callback_also_publishes_deployable_snapshot(tmp_path, monkeypatch):
+def test_upload_callback_also_publishes_deployable_snapshot(tmp_path, monkeypatch, fake_transformers):
     """Each save additionally mirrors an adapter-only, NON-pruned per-step deployable snapshot.
 
     The two paths are distinct: the resume stream (above) is full-state + latest-only; the
     deployable snapshot is adapter-only + accumulating. on_save drives both off one checkpoint.
     """
-    pytest.importorskip("transformers")
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
     _full_checkpoint(tmp_path, 60)
@@ -141,8 +160,7 @@ def test_upload_callback_also_publishes_deployable_snapshot(tmp_path, monkeypatc
     assert "delete_patterns" not in up
 
 
-def test_upload_callback_noop_without_repo(tmp_path, monkeypatch):
-    pytest.importorskip("transformers")
+def test_upload_callback_noop_without_repo(tmp_path, monkeypatch, fake_transformers):
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec, repo="")  # local/dev run, no artifact repo
     _full_checkpoint(tmp_path, 10)
@@ -155,9 +173,8 @@ def test_upload_callback_noop_without_repo(tmp_path, monkeypatch):
     assert rec.uploads == []
 
 
-def test_upload_callback_skips_when_checkpoint_dir_missing(tmp_path, monkeypatch):
+def test_upload_callback_skips_when_checkpoint_dir_missing(tmp_path, monkeypatch, fake_transformers):
     """A save event whose checkpoint folder isn't on disk yet must not push a phantom commit."""
-    pytest.importorskip("transformers")
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
     # No checkpoint-30 dir created under output_dir.
