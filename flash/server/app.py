@@ -661,9 +661,11 @@ def create_app():
             if platform_context:
                 submit_kwargs["platform_context"] = platform_context
             status = submit_job(spec, **submit_kwargs)
-            from flash.server.run_registry import record_training_run
-
-            record_training_run(status=status, key=key)
+            # submit_job already reports the freshly-created status to the backend via
+            # _report_status -> record_training_run, and the status carries platform_context
+            # (org_id/user_id/api_key_id derived from `key`), so a second explicit
+            # record_training_run(status, key) here would just re-POST the same creation record.
+            # Don't duplicate it.
             from flash.envs.adapter import is_managed_environment_slug
             from flash.server.environment_registry import record_environment_use
 
