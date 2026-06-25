@@ -25,8 +25,18 @@ def test_unknown_gpu_rejected():
 def test_providers_for():
     from flash.providers.base import providers_for
 
+    # Consumer cards are RunPod-only (datacenter clouds don't carry GeForce).
     assert providers_for("RTX 4090") == ("runpod",)
-    assert providers_for("RTX Pro 6000") == ("runpod",)
+    assert providers_for("RTX 5090") == ("runpod",)
+    assert providers_for("L4") == ("runpod",)
+    # Datacenter cards span the instance-based complements where the hardware exists.
+    assert providers_for("RTX A6000") == ("runpod", "lambda", "hyperstack")
+    assert providers_for("H100") == ("runpod", "lambda", "hyperstack")
+    assert providers_for("A100 PCIe") == ("runpod", "hyperstack")
+    assert providers_for("RTX Pro 6000") == ("runpod",)  # Hyperstack lacks a CUDA-13 image for Blackwell
+    # Provider-exclusive classes.
+    assert providers_for("A10") == ("lambda",)  # Lambda-only
+    assert providers_for("L40") == ("hyperstack",)  # Hyperstack-only
 
 
 def test_expanded_gpu_table():
@@ -34,7 +44,6 @@ def test_expanded_gpu_table():
 
     # Cheap-capacity classes the cheapest policy exists for are all mapped.
     assert canonical_gpu("A100") == "A100 PCIe"
-    assert canonical_gpu("NVIDIA GeForce RTX 3090") == "RTX 3090"
     assert canonical_gpu("h100") == "H100"
     assert get_gpu_info("A40").vram_gb == 48
     # endpoint-name tokens stay single-word safe
@@ -58,13 +67,13 @@ def test_cheapest_gpu_policy(monkeypatch):
     from flash.providers.runpod import pricing
 
     # Validated-only by default: the cheapest validated enum class that fits each VRAM tier
-    # wins on static rates. 24 GB is the floor now (sub-24 GB classes dropped), so anything that
-    # fits <=24 GB resolves to the cheapest validated 24 GB card, RTX 3090. A40 (48G) stays
-    # unvalidated (no RunPod capacity to smoke it in-window).
-    assert gpus.cheapest_gpu(16) == "RTX 3090"  # no sub-24 GB tier -> cheapest validated 24G ($0.46)
+    # wins on static rates. 24 GB is the floor now (sub-24 GB classes dropped), and the cheapest
+    # validated card is the 48 GB RTX A6000 ($0.49), so anything that fits <=48 GB resolves to it.
+    # A40 (48G) stays unvalidated (no RunPod capacity to smoke it in-window).
+    assert gpus.cheapest_gpu(16) == "RTX A6000"  # no sub-24 GB tier -> cheapest validated card ($0.49)
     # cheapest VALIDATED >=24G.
-    assert gpus.cheapest_gpu(24) == "RTX 3090"
-    assert gpus.cheapest_gpu(32) == "RTX A6000"  # 48G A6000 now validated, $0.49 < 5090 $0.99
+    assert gpus.cheapest_gpu(24) == "RTX A6000"
+    assert gpus.cheapest_gpu(32) == "RTX A6000"  # 48G A6000 validated, $0.49 < 5090 $0.99
     assert gpus.cheapest_gpu(48) == "RTX A6000"  # cheapest validated >=48G ($0.49, was A100 PCIe)
     # The error names the REAL constraint: this helper filters to validated RunPod classes,
     # so a fitting unvalidated class doesn't make the message a lie.
@@ -79,10 +88,10 @@ def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
     # GPU pinning is gone: provisional_gpu returns the cheapest fitting VALIDATED class for the
-    # model. 0.8B GRPO -> cheapest validated >=24G (RTX 3090). 9B is now bf16 (QLoRA dropped: the
+    # model. 0.8B GRPO -> cheapest validated >=24G (RTX A6000). 9B is now bf16 (QLoRA dropped: the
     # 4-bit vLLM-rollout merge broke GRPO learning), so colocated 9B GRPO needs an 80G-class card
     # -> the cheapest validated 80G class (A100 PCIe).
-    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX 3090"
+    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A6000"
     assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A100 PCIe"
 
 
@@ -98,14 +107,14 @@ def test_config_cheapest_policy_validated_pool(monkeypatch):
     }
     spec = spec_from_dict(raw, run_id="x")
     # Cheapest fitting VALIDATED class for a small model: 0.8B SFT needs ~12 GB, but 24 GB is the
-    # floor now (sub-24 GB classes dropped), so it resolves to the cheapest validated 24 GB card,
-    # RTX 3090 ($0.46).
-    assert spec.gpu.type == "RTX 3090"
+    # floor now (sub-24 GB classes dropped), so it resolves to the cheapest validated card,
+    # RTX A6000 ($0.49).
+    assert spec.gpu.type == "RTX A6000"
     # GPU pinning is gone: a config's gpu.type is IGNORED — the schema always resolves the
     # cheapest fitting VALIDATED class, no matter what class the config names.
     for klass in ("L4", "A100 SXM", "RTX 4090", "A40"):
         raw["gpu"] = {"type": klass}
-        assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 3090"
+        assert spec_from_dict(raw, run_id="x").gpu.type == "RTX A6000"
 
 
 def test_flash_gpu_enum_members():
