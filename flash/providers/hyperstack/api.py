@@ -24,10 +24,8 @@ import tempfile
 import time
 from typing import Any
 
-import urllib.error
-
 from flash._logging import get_logger
-from flash.providers._http import RestClient, is_not_found
+from flash.providers._http import RestClient, is_conflict, is_not_found
 
 logger = get_logger(__name__)
 
@@ -292,19 +290,6 @@ def list_vms() -> list[dict]:
     return insts if isinstance(insts, list) else []
 
 
-def _is_deletion_conflict(err: Exception) -> bool:
-    """True when Hyperstack rejects a DELETE because the VM is already being torn down (HTTP 409).
-
-    Mirrors ``flash.providers._http.is_not_found``: prefer the chained ``HTTPError`` status code;
-    fall back to a strict ``\\bHTTP 409\\b`` token only when no cause is present — never a bare
-    "409" substring that could appear in a VM id, GPU name like "4090", or an unrelated error."""
-    cause = getattr(err, "__cause__", None)
-    if isinstance(cause, urllib.error.HTTPError):
-        return cause.code == 409
-    import re
-    return bool(re.search(r"\bHTTP 409\b", str(err)))
-
-
 def delete_vm(vm_id: str) -> bool:
     """Delete (and stop billing for) a VM. Best-effort: never raises."""
     if not vm_id:
@@ -313,9 +298,12 @@ def delete_vm(vm_id: str) -> bool:
         request_with_retries(f"/core/virtual-machines/{vm_id}", method="DELETE", retries=2)
         return True
     except Exception as exc:
-        # Hyperstack returns 409 when a prior delete request is still in progress.
-        # The VM is already queued for teardown so billing will stop — treat as success.
-        if _is_deletion_conflict(exc):
+        # Hyperstack returns 409 when a prior delete request is still being processed: the VM is
+        # already queued for teardown so billing will stop — treat as success. Key off the chained
+        # HTTPError status (``is_conflict``), NOT a bare "409"/"conflict" substring — a non-409
+        # failure whose text merely contains "409" (e.g. a "4090" GPU name) must still surface, or a
+        # real delete failure would be silently dropped and the VM left billing.
+        if is_conflict(exc):
             return True
         logger.warning("hyperstack delete_vm(%s) failed: %s", vm_id, exc)
         return False
