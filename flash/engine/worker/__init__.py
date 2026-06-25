@@ -668,13 +668,21 @@ def finalize_alloc_conf_for_sleep() -> None:
             import torch as _torch_card
 
             if _torch_card.cuda.is_available():
-                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+                # Binary GiB to match grpo_fits_resident (see run_rl); /1e9 over-reports ~7%.
+                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
         except Exception:
             card_gb = 0.0
+        # Resolve group_size EXACTLY as run_rl does (gcfg override, else the recipe default), not a
+        # flat 8: if the recipe's rl.group_size differs from 8 the alloc-conf sleep decision here
+        # would diverge from the trainer's, picking the wrong expandable/non-expandable conf.
+        from flash.engine.recipe import RECIPE as _RECIPE
+
+        _gcfg = grpo_overrides()
+        _group_size = int(_gcfg.get("group_size") or _RECIPE.rl.group_size)
         sleep_on = grpo_sleep_mode(
             model_id,
             max_length=ctx,
-            group_size=int(_t.group_size) if _t and _t.group_size else 8,
+            group_size=_group_size,
             max_tokens=(_t.max_tokens if _t else None),
             lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
             thinking=THINKING,
@@ -1837,7 +1845,10 @@ def run_rl():
         import torch as _torch_card
 
         if _torch_card.cuda.is_available():
-            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+            # Binary GiB (/(1024**3)), NOT decimal GB (/1e9 over-reports ~7%): grpo_fits_resident's
+            # VRAM estimate is in GiB, so a decimal card size would make a marginal card look big
+            # enough to fit resident and wrongly disable sleep, risking OOM.
+            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
     except Exception as _e:
         print("[rl] card VRAM probe failed (sleep-mode gate falls back to size/context):", _e)
     _lora_rank = int(_t.lora_rank) if _t and _t.lora_rank else 32
