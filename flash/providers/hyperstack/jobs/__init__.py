@@ -20,6 +20,7 @@ from collections.abc import Callable
 
 from flash._logging import get_logger
 from flash.providers._poll import (
+    BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_S,
     PollErrorTracker,
     heartbeat_progress_ts,
@@ -437,6 +438,10 @@ def poll_hs_job(
     # Latched once the attempt's host boot.log is OBSERVED (even empty ""): its existence proves
     # cloud-init ran, so a later rate-limited reader None can't spuriously fail the VM over as stalled.
     boot_log_seen = False
+    # Consecutive forced boot.log reads that came back absent at/after the first-liveness deadline. A
+    # lone None can be a transient HF/Hub error, so we require the absence to persist (see
+    # BOOT_LOG_ABSENT_POLLS) before declaring the region sick.
+    boot_log_absent_polls = 0
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
@@ -540,20 +545,27 @@ def poll_hs_job(
                 and not boot_log_seen
                 and time.time() - active_since > first_liveness_s
             ):
-                # make_hf_text_reader returns None for BOTH a missing file AND a rate-limited read, so a
-                # bare ``not boot_log_reader()`` would spuriously stall a healthy VM on a throttled
-                # poll. force=True bypasses the rate-limit (accurate absent-vs-present); ``is None`` keeps
-                # an empty "" boot.log counting as liveness (the file existing proves cloud-init ran);
-                # the latch then stops re-reading once the VM has proven itself.
+                # make_hf_text_reader returns None for BOTH a missing file AND a rate-limited/errored
+                # read, so a bare ``not boot_log_reader()`` would spuriously stall a healthy VM on a
+                # throttled poll. force=True bypasses the rate-limit (accurate absent-vs-present);
+                # ``is None`` keeps an empty "" boot.log counting as liveness (the file existing proves
+                # cloud-init ran); the latch then stops re-reading once the VM has proven itself.
                 if boot_log_reader(force=True) is None:
-                    return PollResult(
-                        False,
-                        failure="stalled",
-                        detail=f"no worker liveness (boot.log/heartbeat) for "
-                        f"{int(time.time() - active_since)}s after vm became active "
-                        f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
-                    )
-                boot_log_seen = True
+                    # A lone None can also be a momentary HF/Hub network error (not a true absence), so
+                    # require the absence to PERSIST across consecutive polls before failing over — a
+                    # transient blip clears within a poll interval; a VM whose worker never started
+                    # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
+                    boot_log_absent_polls += 1
+                    if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
+                        return PollResult(
+                            False,
+                            failure="stalled",
+                            detail=f"no worker liveness (boot.log/heartbeat) for "
+                            f"{int(time.time() - active_since)}s after vm became active "
+                            f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
+                        )
+                else:
+                    boot_log_seen = True
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 phase = "training" if seen_training_hb else "setup (pre-training)"

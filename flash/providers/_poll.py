@@ -64,6 +64,16 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
 # Scaled x1.5 on the last GPU (nowhere left to escape), mirroring the setup-grace patience.
 FIRST_LIVENESS_S = 900.0
 
+# Consecutive forced boot.log reads that must come back absent before the first-liveness check
+# declares a region sick. ``make_hf_text_reader`` returns ``None`` for ANY read failure — a genuinely
+# missing artifact OR a momentary HF/Hub network hiccup — so a single ``None`` at the deadline can't
+# be trusted to mean "cloud-init never ran". A transient error clears within a poll interval, while a
+# box whose worker never started stays absent indefinitely; requiring the absence to PERSIST across
+# this many polls (each ~``interval_s`` apart) distinguishes the two and keeps a Hub blip from
+# spuriously failing a healthy box over to another provider. The added failover latency is a few poll
+# intervals on top of the ~15 min ``FIRST_LIVENESS_S`` — negligible.
+BOOT_LOG_ABSENT_POLLS = 3
+
 
 def make_say(log) -> Callable[[str], None]:
     """A timestamped line logger that no-ops when ``log`` is None."""

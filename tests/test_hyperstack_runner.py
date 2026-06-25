@@ -572,6 +572,49 @@ def test_poll_active_boot_log_seen_once_survives_rate_limited_none(monkeypatch):
     assert calls["n"] <= 2
 
 
+def test_poll_active_transient_boot_log_error_does_not_fail_over(monkeypatch):
+    """make_hf_text_reader returns None for a MISSING boot.log AND a momentary HF/Hub network error,
+    so a lone forced-read None at the first-liveness deadline must NOT immediately stall — a transient
+    blip clears on the next poll (the absence must persist BOOT_LOG_ABSENT_POLLS times to fail over).
+    Here the first forced read errors (None), the next returns the real boot.log -> latched, no
+    failover; the VM later dies -> job_preempted, NOT a spurious 'stalled' from the one transient
+    None."""
+    calls = {"n": 0}
+
+    def transient_then_present():
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "+ docker pull ..."  # transient error first, then readable
+
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot=transient_then_present,
+        step=100.0,
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"  # the single transient None did not trip a failover
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypatch):
+    """The genuine sick-region case: the boot.log is absent on EVERY forced read (cloud-init never
+    ran). After BOOT_LOG_ABSENT_POLLS consecutive absent reads the first-liveness check declares the
+    region 'stalled' (retriable, escaped cross-provider). Asserts the absence-count threshold is what
+    gates the failover, not a single read."""
+    from flash.providers._poll import BOOT_LOG_ABSENT_POLLS
+
+    calls = {"n": 0}
+
+    def always_absent():
+        calls["n"] += 1  # implicit None: every forced read comes back absent
+
+    jobs = _wire_poll(monkeypatch, vms=[{"status": "ACTIVE"}], boot=always_absent, step=100.0)
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+    assert calls["n"] >= BOOT_LOG_ABSENT_POLLS  # required the absence to persist, not a lone None
+
+
 def test_poll_loading_timeout(monkeypatch):
     jobs = _wire_poll(monkeypatch, vms=[{"status": "BUILD"}], step=100.0)
     monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", 300.0)

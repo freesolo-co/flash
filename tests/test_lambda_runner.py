@@ -732,6 +732,51 @@ def test_poll_active_boot_log_seen_once_survives_rate_limited_none(monkeypatch):
     assert calls["n"] <= 2
 
 
+def test_poll_active_transient_boot_log_error_does_not_fail_over(monkeypatch):
+    """make_hf_text_reader returns None for a MISSING boot.log AND a momentary HF/Hub network error,
+    so a lone forced-read None at the first-liveness deadline must NOT immediately stall — a transient
+    blip clears on the next poll (the absence must persist BOOT_LOG_ABSENT_POLLS times to fail over).
+    Here the first forced read errors (None), the next returns the real boot.log -> latched, no
+    failover; the box later dies -> job_preempted, NOT a spurious 'stalled' from the one transient
+    None."""
+    calls = {"n": 0}
+
+    def transient_then_present():
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "+ docker pull ..."  # transient error first, then readable
+
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        boot=transient_then_present,
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"  # the single transient None did not trip a failover
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypatch):
+    """The genuine sick-region case: the boot.log is absent on EVERY forced read (cloud-init never
+    ran). After BOOT_LOG_ABSENT_POLLS consecutive absent reads the first-liveness check declares the
+    region 'stalled' (retriable, escaped cross-provider). Asserts the absence-count threshold is what
+    gates the failover, not a single read."""
+    from flash.providers._poll import BOOT_LOG_ABSENT_POLLS
+
+    calls = {"n": 0}
+
+    def always_absent():
+        calls["n"] += 1  # implicit None: every forced read comes back absent
+
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], boot=always_absent, step=100.0
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+    assert calls["n"] >= BOOT_LOG_ABSENT_POLLS  # required the absence to persist, not a lone None
+
+
 def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
     """Any FRESH heartbeat (even the early 'boot' stage) proves the worker started, so the
     first-liveness deadline is satisfied and must not fire."""
@@ -773,14 +818,22 @@ def test_poll_reattach_already_active_anchors_liveness_to_launch(monkeypatch):
     """On a reattach after a control-plane restart, the FIRST status read is already ACTIVE
     (last_status starts None, so it is not a transition). active_since must stay anchored to LAUNCH,
     so a box silent since before the restart fails over on the first tick rather than getting a fresh
-    full first-liveness window. (Clock starts 10_000; launch was 5_000s earlier.)"""
+    full first-liveness window. (Clock starts 10_000; launch was 5_000s earlier.)
+
+    The box is silent for ~5_000s — already PAST the 3_000s setup grace — so the setup-grace stall
+    (which needs no boot.log read) fires immediately, before the first-liveness check accumulates its
+    BOOT_LOG_ABSENT_POLLS confirmations. Either way it's a retriable ``stalled`` and the reported
+    elapsed (~5_020s) is measured from LAUNCH, not the reattach (~0s) — which is what proves the
+    anchoring. A fresh launch (elapsed < setup grace) still fails over via the fast first-liveness
+    path well before the setup grace, so the FAST-failover guarantee is unaffected."""
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
     res = jobs.poll_lambda_job(
         _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=500.0
     )
     assert not res.ok
     assert res.failure == "stalled"
-    assert "no worker liveness" in res.detail
+    # Elapsed counts from LAUNCH (5_000s ago), not the reattach — proves active_since stayed anchored.
+    assert "5020s" in res.detail
 
 
 def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
