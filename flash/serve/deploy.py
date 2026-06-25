@@ -155,6 +155,7 @@ def deploy_adapter(
     gpu_name: str = "RTX 5090",
     dry_run: bool = False,
     thinking: bool = False,
+    org_id: str | None = None,
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app.
 
@@ -190,6 +191,11 @@ def deploy_adapter(
         "repoType": "dataset",
         "status": "ready",
     }
+    # Attribute the adapter to the deploying org so serving can authorize external chat by org:
+    # the backend maps adapterId -> org via hosted_lora_adapters.org_id, which serving persists
+    # from this field. Omitted when unknown (older callers) so the registration shape is unchanged.
+    if org_id:
+        body["orgId"] = org_id
     _post_adapter_or_raise(f"{base}/adapters", body)
     logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
@@ -258,7 +264,10 @@ def chat(
     # raises on the 303 and the chat fails mid cold-start. max_redirects is raised because a long
     # cold start polls across several redirect cycles before the result is ready.
     with httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client:
-        resp = client.post(f"{base}/v1/chat/completions", json=body)
+        # The control plane is a trusted server-to-server caller (it already authorized the user's
+        # key on the /v1/runs/{run_id}/chat route), so present the internal key to pass serving's
+        # external chat-auth gate. No-op when the gate is off or the key is unset.
+        resp = client.post(f"{base}/v1/chat/completions", json=body, headers=_internal_key_header())
     resp.raise_for_status()
     return resp.json()
 
@@ -299,7 +308,9 @@ def chat_stream(
     }
     with (
         httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client,
-        client.stream("POST", f"{base}/v1/chat/completions", json=body) as resp,
+        client.stream(
+            "POST", f"{base}/v1/chat/completions", json=body, headers=_internal_key_header()
+        ) as resp,
     ):
         resp.raise_for_status()
         if "application/json" in resp.headers.get("content-type", ""):

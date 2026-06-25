@@ -671,6 +671,9 @@ def create_app():
                     dry_run=dry_run,
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
+                    # attribute the adapter to the deploying org so serving can authorize
+                    # external chat by org (hosted_lora_adapters.org_id)
+                    org_id=str(key.get("org_id") or "").strip() or None,
                 )
             except ServingError as exc:
                 # The serving backend rejected the registration or was unreachable. This is an
