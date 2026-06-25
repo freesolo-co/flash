@@ -174,9 +174,16 @@ def launch_instance(
 # Persistent filesystems (the weight cache). Region-scoped, NFS, multi-attach; auto-mounted on the
 # host at /lambda/nfs/<name>. Created via the Cloud API, attached at launch via file_system_names.
 # ---------------------------------------------------------------------------
+# NB: Lambda's filesystem API paths are ASYMMETRIC and this is intentional/correct, not a typo —
+# verified LIVE against cloud.lambdalabs.com/api/v1 with a real create->ensure->delete probe (the FS
+# was created, reused idempotently, then confirmed deleted, no stranded resources). LIST is the
+# hyphenated GET /file-systems; CREATE/DELETE are the un-hyphenated POST /filesystems and
+# DELETE /filesystems/{id}. Lambda's own surface differs from its other (hyphenated) resources here,
+# so DO NOT "unify" these to /file-systems — that 404s the working create/delete endpoints and
+# silently disables the cache. (Reviewers keep flagging the inconsistency; it's the real API.)
 def list_filesystems() -> list[dict]:
     """All filesystems on the account: ``[{id, name, mount_point, region:{name}, is_in_use}, ...]``."""
-    out = _data(request_with_retries("/file-systems"))
+    out = _data(request_with_retries("/file-systems"))  # LIST: hyphenated (verified live)
     return out if isinstance(out, list) else []
 
 
@@ -184,6 +191,7 @@ def create_filesystem(name: str, region_name: str) -> dict:
     """Create filesystem ``name`` in ``region_name`` -> its object (incl. ``mount_point``)."""
     out = _data(
         request_with_retries(
+            # CREATE: un-hyphenated /filesystems (NOT /file-systems) — verified live; see note above.
             "/filesystems", method="POST", body={"name": name, "region": region_name}, retries=2
         )
     )
@@ -193,6 +201,7 @@ def create_filesystem(name: str, region_name: str) -> dict:
 def delete_filesystem(filesystem_id: str) -> bool:
     """Delete a filesystem by id (best-effort). Returns True if the request didn't raise."""
     try:
+        # DELETE: un-hyphenated /filesystems/{id} (NOT /file-systems/{id}) — verified live; see note.
         request_with_retries(f"/filesystems/{filesystem_id}", method="DELETE", retries=2)
         return True
     except Exception as exc:
