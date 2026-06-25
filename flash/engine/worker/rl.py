@@ -657,17 +657,25 @@ def run_rl():
     # Liger fused-loss chunk_size: TRL leaves it at the default 1, so the fused GRPO loss runs its
     # whole detach -> chunk_forward -> compiled-loss -> autograd.grad cycle ONCE PER SEQUENCE
     # (per_device_train_batch_size times) — Python/kernel-launch/compile-guard overhead that
-    # dominates at small-model scale where the GEMMs are tiny. Collapse it to ONE invocation over the
-    # whole per-device micro-batch. Numerically identical (every loss_type normalizes by the GLOBAL
-    # token count, not the chunk-local size, and chunk losses are summed). Must run BEFORE the
-    # mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure that has no
-    # chunk_size attribute.
+    # dominates at small-model scale where the GEMMs are tiny. Raise it toward the whole per-device
+    # micro-batch, but BOUND by the fp32-logits VRAM budget: a chunk materializes
+    # [chunk, completion, vocab] fp32 logits at once, so on a short-context run where per_device grew
+    # to 8/16 (see rl_per_device_comps) collapsing the WHOLE batch into one chunk would blow VRAM /
+    # OOM. liger_loss_chunk_size caps the chunk to the same 6 GB budget that bounds per_device.
+    # Numerically identical for any chunk_size (every loss_type normalizes by the GLOBAL token count,
+    # not the chunk-local size, and chunk losses are summed). Must run BEFORE the mask-aware wrap
+    # below, which replaces trainer.liger_grpo_loss with a closure that has no chunk_size attribute.
     _liger_loss = getattr(trainer, "liger_grpo_loss", None)
     if _liger_loss is not None and hasattr(_liger_loss, "chunk_size"):
-        _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
+        _pd = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
+        _cs = _w.liger_loss_chunk_size(_pd, _cap_completion_len, vocab_size_for(model_id))
         if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
             _liger_loss.chunk_size = _cs
-            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
+            _capped = " (logits-budget capped)" if _cs < _pd else ""
+            print(
+                f"[rl] liger fused-loss chunk_size -> {_cs} of per_device {_pd}{_capped} "
+                "(fewer invocations, bounded per-chunk logits VRAM)"
+            )
     # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
     # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
     # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is

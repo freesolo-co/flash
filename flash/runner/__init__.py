@@ -241,7 +241,12 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+def _run_job_background(
+    spec: JobSpec,
+    runtime_secrets: dict[str, str] | None = None,
+    *,
+    resolve_env_sha: bool = False,
+) -> None:
     """Daemon-thread entrypoint for background runs.
 
     ``_run_job`` -> ``_run_job_inner`` persists the terminal state (failed/cancelled) BEFORE the
@@ -253,10 +258,23 @@ def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = 
     terminal-sticky ``_update`` (covers a crash BEFORE ``_run_job_inner`` persisted anything, e.g. an
     import/model-resolve error), leaving the synchronous raise path untouched. Defined in this module
     (not lifecycle) so it dispatches through the package-level ``_run_job`` that tests monkeypatch.
+
+    ``resolve_env_sha`` defers the (network) env ref->sha pin to THIS background thread, off the
+    run-creation critical path: ``submit_job(background=True)`` (the managed API path) saves + reports
+    the run status FIRST and returns, so a slow/rate-limited GitHub commits API can never block or
+    delay run creation. The resolve is still best-effort (any failure leaves ``resolved_sha`` empty
+    and the worker resolves the ref itself); the pinned spec is handed to the fan-out below — it is
+    only a boot optimization, so it does not need to be re-persisted into the run status JSON.
     """
     import logging
 
     try:
+        if resolve_env_sha:
+            # Pin the env ref->sha HERE (in the background) instead of before status save, so a slow
+            # GitHub commits API can't delay run creation. Best-effort: on any failure the spec stays
+            # unpinned and each worker resolves the ref itself with its full retry budget.
+            with contextlib.suppress(Exception):
+                spec = _assign_resolved_env_sha(spec)
         if runtime_secrets:
             _run_job(spec, runtime_secrets=runtime_secrets)
         else:
@@ -293,11 +311,11 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
     spec = _assign_managed_hf_repo(spec)
-    if not dry_run:
-        # Resolve the env ref->sha ONCE before fan-out so workers boot from the pin and skip the
-        # GitHub commits API (defuses the cold-spawn rate-limit wave). Skipped on dry-run: no
-        # workers fan out, and it avoids a network call on a preview/test submission.
-        spec = _assign_resolved_env_sha(spec)
+    # NB: the env ref->sha pin (_assign_resolved_env_sha) makes a GitHub commits-API call, so it is
+    # deliberately NOT done here, on the run-creation critical path. The status is created + saved +
+    # reported FIRST (below) so creation never blocks/delays on a slow or rate-limited GitHub — the
+    # pin is deferred into the background run thread (background=True) or done just before the
+    # synchronous fan-out (background=False), both AFTER the run record exists.
     status = RunStatus(
         run_id=spec.run_id,
         state="queued",
@@ -314,12 +332,20 @@ def submit_job(
         _report_status(status)
         return status
     if background:
+        # Run creation is now done (status saved + reported); the GitHub env-sha pin happens INSIDE
+        # this thread (resolve_env_sha=True), so the API response is never blocked by GitHub retries.
         threading.Thread(
             target=_run_job_background,
             args=(spec, runtime_secrets or {}),
+            kwargs={"resolve_env_sha": True},
             daemon=True,
         ).start()
         return get_status(spec.run_id)
+    # Synchronous path: the status record already exists, so resolving the pin here no longer blocks
+    # the creation of the run record (only this in-process caller's own wait). Resolve once before
+    # the fan-out so workers boot from the pin and skip the GitHub commits API (cold-spawn rate-limit
+    # wave). Best-effort, as before.
+    spec = _assign_resolved_env_sha(spec)
     if runtime_secrets:
         _run_job(spec, runtime_secrets=runtime_secrets)
     else:

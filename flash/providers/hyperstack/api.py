@@ -178,17 +178,38 @@ def resolve_key_name(environment_name: str) -> str:
     name = f"{_MANAGED_KEYPAIR}-{environment_name}"
     if any(k.get("name") == name for k in existing):
         return name
-    request_with_retries(
-        "/core/keypairs",
-        method="POST",
-        body={
-            "name": name,
-            "environment_name": environment_name,
-            "public_key": _generate_throwaway_public_key(),
-        },
-        retries=0,
-    )
+    try:
+        request_with_retries(
+            "/core/keypairs",
+            method="POST",
+            body={
+                "name": name,
+                "environment_name": environment_name,
+                "public_key": _generate_throwaway_public_key(),
+            },
+            retries=0,
+        )
+    except HyperstackApiError as e:
+        # Create race: two concurrent launches into the same env both see no managed key and both
+        # POST. The loser gets an "already exists" rejection — that is SUCCESS, the env-scoped key now
+        # exists (the winner created it), so return the name. Re-list to confirm the key is really
+        # present before swallowing the error, so an UNRELATED 4xx (e.g. a bad public key / perms)
+        # still surfaces rather than being silently treated as a benign duplicate.
+        if _keypair_create_conflict(e) and any(
+            k.get("name") == name for k in list_keypairs()
+        ):
+            return name
+        raise
     return name
+
+
+def _keypair_create_conflict(err: Exception) -> bool:
+    """True when a keypair POST failed because the name already exists (a benign create race), not
+    for some other reason. Hyperstack returns 409/400 with an 'already exists'/'duplicate' body."""
+    s = str(err).lower()
+    if "-> http 409" in s:
+        return True
+    return ("-> http 4" in s) and ("already exist" in s or "duplicate" in s or "in use" in s)
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +305,55 @@ def get_vm(vm_id: str) -> dict | None:
     return inst if isinstance(inst, dict) else None
 
 
+# Hyperstack paginates ``/core/virtual-machines``: a single GET returns only the FIRST page, so an
+# account with more VMs than one page silently hides the rest. ``sweep_orphans`` lists every VM to
+# reap orphans, so a missed page = a leaked, still-billing box. Walk every page (bounded so a buggy
+# server that never shrinks the page can't loop forever) and concatenate.
+_VM_PAGE_SIZE = 100
+_VM_MAX_PAGES = 1000
+
+
 def list_vms() -> list[dict]:
-    out = request_with_retries("/core/virtual-machines")
-    insts = out.get("instances") if isinstance(out, dict) else None
-    return insts if isinstance(insts, list) else []
+    """Every Flash-listable VM across ALL pages (orphan-sweep + run-terminate read this).
+
+    Paginates ``/core/virtual-machines`` via ``page``/``per_page`` until a short/empty page is
+    reached. A page fetch that errors propagates AND a malformed page schema raises
+    ``HyperstackApiError`` — so a partial/incomplete list never masquerades as the authoritative
+    fleet and lets a sweep miss still-billing VMs (or reap survivors)."""
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    for page in range(1, _VM_MAX_PAGES + 1):
+        resp = request_with_retries(
+            f"/core/virtual-machines?page={page}&per_page={_VM_PAGE_SIZE}"
+        )
+        # Distinguish a malformed response from a valid empty page. An unexpected schema (resp not a
+        # dict, or "instances" not a list) means we CANNOT trust this as the authoritative fleet —
+        # returning the partial list gathered so far would let an orphan sweep miss still-billing VMs
+        # past this point, so RAISE instead. A valid empty list is the legitimate end-of-pagination.
+        if not isinstance(resp, dict) or not isinstance(resp.get("instances"), list):
+            raise HyperstackApiError(
+                f"unexpected /core/virtual-machines response on page {page} "
+                f"(no 'instances' list): {resp!r}"
+            )
+        insts = resp["instances"]
+        if not insts:
+            break  # valid empty page -> done paginating
+        added = 0
+        for v in insts:
+            # De-dupe across pages: an older API that ignores the ``page`` param would echo page 1
+            # forever, so we count only NEW ids and stop below when a full page adds none.
+            # Use ``is not None`` (not truthiness) so a legitimately falsy id like 0 still de-dupes.
+            vid = str(v["id"]) if isinstance(v, dict) and v.get("id") is not None else None
+            if vid is not None and vid in seen_ids:
+                continue
+            if vid is not None:
+                seen_ids.add(vid)
+            out.append(v)
+            added += 1
+        # Last page (short) OR a full page that added nothing new (server ignoring pagination): done.
+        if len(insts) < _VM_PAGE_SIZE or added == 0:
+            break
+    return out
 
 
 def delete_vm(vm_id: str) -> bool:

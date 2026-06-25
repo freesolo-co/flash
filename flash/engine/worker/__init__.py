@@ -68,11 +68,13 @@ from flash.engine.worker.gpu_setup import (
     force_vllm_backend_for_sm120,
 )
 from flash.engine.worker.grpo import (
+    _RL_LOGITS_BUDGET_BYTES,
     _grpo_is_no_op_failure,
     _grpo_resume_already_complete,
     build_grpo_prompt_dataset,
     compute_grpo_batching,
     grpo_overrides,
+    liger_loss_chunk_size,
     resolve_grpo_prompts_per_step,
     rl_per_device_comps,
 )
@@ -191,6 +193,14 @@ _HB_LAST_UPLOAD = 0.0
 # 128 commits/hour-per-repo limit when concurrent runs share one HF_REPO.
 _HB_MIN_INTERVAL_S = 60.0
 _HB_TERMINAL_ONLY = False
+
+# wandb_finish() join timeout (s). On SUCCESS wandb.finish() must flush the whole run (a slow
+# network / large run can exceed the old 5s and leave the run "crashed"), so give it a
+# generous-but-bounded window; on FAILURE abort fast (the run is failing regardless and the worker
+# is hard-exiting). wandb_finish (in wandb_log.py) reads these THROUGH the worker package (_w.<name>)
+# so a test's monkeypatch.setattr(worker, "_WANDB_FINISH_FAIL_WAIT_S", ...) is honored.
+_WANDB_FINISH_WAIT_S = 120.0
+_WANDB_FINISH_FAIL_WAIT_S = 5.0
 
 
 def _load_active_env():
@@ -468,9 +478,12 @@ __all__ = [
     "_HB_UPLOAD_LOCK",
     # leaf lora re-exports
     "_LM_SYNC_REMAP_ON",
+    "_RL_LOGITS_BUDGET_BYTES",
     "_SFT_HEARTBEAT_INTERVAL_S",
     "_STEP_GPU_DIAG_INTERVAL_S",
     "_VL_EXCLUDE_SEGMENTS",
+    "_WANDB_FINISH_FAIL_WAIT_S",
+    "_WANDB_FINISH_WAIT_S",
     # leaf perf re-exports
     "RetriableInfraError",
     "_GpuPeakSampler",
@@ -523,6 +536,7 @@ __all__ = [
     "hf_upload_file",
     "hf_upload_folder",
     "is_vl_checkpoint",
+    "liger_loss_chunk_size",
     "liger_on",
     "lora_exclude_modules",
     "loraplus_optimizer_cls",

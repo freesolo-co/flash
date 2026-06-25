@@ -273,6 +273,12 @@ class ApiClient:
         body: dict = {"dry_run": dry_run}
         if step is not None:
             # Deploy a specific intermediate checkpoint instead of the run's final adapter.
+            # Reject a bool explicitly: `int(True)`/`int(False)` would silently coerce to step
+            # 1/0, but the server guard (_resolve_deploy_step) treats a bool as an invalid step
+            # and 400s — so fail fast here with a clear client-side error instead of sending a
+            # bogus 0/1 that the server rejects (or, worse, that hits a real checkpoint 0/1).
+            if isinstance(step, bool):
+                raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
             body["step"] = int(step)
         return self._request(
             "POST",

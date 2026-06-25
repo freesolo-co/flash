@@ -34,10 +34,20 @@ async def _reconcile_cost_loop() -> None:
     interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
     while True:
         await asyncio.sleep(interval)
-        with contextlib.suppress(Exception):
+        # Handle cancellation EXPLICITLY (re-raise it) and swallow only real Exceptions, exactly
+        # like the sibling reaper loops in app.py (_reap_idle_endpoints_loop /
+        # _sweep_orphan_instances_loop). On the supported Pythons (>=3.11) asyncio.CancelledError
+        # already derives from BaseException, so the old `contextlib.suppress(Exception)` did not
+        # swallow a shutdown cancel arriving during the blocking sweep — but being explicit makes the
+        # cancel path obvious and uniform, and logs a failed sweep instead of silently dropping it.
+        try:
             reported = await asyncio.to_thread(reconcile_once)
             if reported:
                 _log.info("reconciled realized cost for %d run(s)", reported)
+        except asyncio.CancelledError:
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except Exception:
+            _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
 
 
 def _append_run_log(run_id: str, message: str) -> None:

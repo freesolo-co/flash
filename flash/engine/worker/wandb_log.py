@@ -96,8 +96,16 @@ def wandb_finish(exit_code: int = 0) -> None:
         return
     import importlib.util
 
-    if importlib.util.find_spec("wandb") is None:
-        return
+    # find_spec can RAISE (not just return None) when wandb is already in sys.modules with an
+    # absent/partial __spec__ (e.g. a namespace-package or a partially-initialized import) — that
+    # would propagate out of the shutdown path and skip the hard exit. Keep it best-effort: treat any
+    # probe failure as "wandb present enough to try", and let the import + finish below (already
+    # wrapped) decide. Only a definitive None (probe succeeded, module truly absent) returns early.
+    try:
+        if importlib.util.find_spec("wandb") is None:
+            return
+    except Exception:
+        pass  # ambiguous probe -> fall through and try to finish (still fully guarded below)
     try:
         import wandb
 
@@ -114,9 +122,15 @@ def wandb_finish(exit_code: int = 0) -> None:
 
         t = threading.Thread(target=_finish, daemon=True)
         t.start()
-        t.join(timeout=5)
+        # On SUCCESS (exit_code == 0) wandb.finish() must flush the full run; a slow network / large
+        # run can take well over 5s, and cutting it off there is what leaves the run dangling ->
+        # "crashed". Allow a longer, still-bounded wait on success; keep the short cut-off on the
+        # FAILURE path (exit_code != 0) where we want to abort fast and the run is failing anyway.
+        # Read THROUGH the worker package so a test's monkeypatch of the wait knobs is honored.
+        wait_s = _w._WANDB_FINISH_WAIT_S if exit_code == 0 else _w._WANDB_FINISH_FAIL_WAIT_S
+        t.join(timeout=wait_s)
         if t.is_alive():
-            print("[wandb] finish() timed out; continuing with hard exit")
+            print(f"[wandb] finish() did not complete within {wait_s}s; continuing with hard exit")
         elif errs:
             print(f"[wandb] finish() warning: {errs[0]}")
     except Exception as e:  # pragma: no cover - logging-only path
