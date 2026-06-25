@@ -268,6 +268,24 @@ def test_cache_ensures_filesystem_and_attaches_at_launch(monkeypatch):
     assert "-v '/lambda/nfs/flash-weights':/weight-cache" in calls[0]["user_data"]  # quoted host path
 
 
+def test_cache_bind_uses_returned_mount_point(monkeypatch):
+    """The bind-mount targets the FS's ACTUAL mount_point, not the hard-coded /lambda/nfs/<name>.
+
+    Regression: ensure_filesystem's returned mount_point was ignored, so a region where Lambda mounts
+    the FS at a non-default host path would bind the wrong path -> silently cold / failed preload mount.
+    """
+    jobs, lambda_api, calls = _wire_launch(monkeypatch)
+    # Lambda reports a NON-default host mount for this region's filesystem.
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: "/mnt/lambda-fs/flash-weights")
+
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+
+    assert calls[0]["fs"] == ["flash-weights"]
+    # the bind uses the REAL mount_point, and never the stale default
+    assert "-v '/mnt/lambda-fs/flash-weights':/weight-cache" in calls[0]["user_data"]
+    assert "/lambda/nfs/flash-weights" not in calls[0]["user_data"]
+
+
 def test_cache_payload_points_hf_home_at_the_bind(monkeypatch):
     """The base64 payload's worker env redirects HF_HOME onto the bind (so the model download persists)."""
     from flash.providers.lambdalabs.jobs import build_payload

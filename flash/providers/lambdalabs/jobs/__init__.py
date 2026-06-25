@@ -153,16 +153,22 @@ def launch_and_submit(
     # ensured in a region, fall back to the cold user_data there.
     cache_name = getattr(spec.gpu, "network_volume", None)
     cold_user_data = build_user_data(build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets))
-    cache_user_data = (
-        build_user_data(
+
+    def _cache_user_data_for(mount_point: str) -> str:
+        """Cache user_data whose bind-mount targets THIS region's actual NFS host path."""
+        return build_user_data(
             build_payload(
                 spec, seed, attempt, runtime_secrets=runtime_secrets,
-                cache_host_mount=f"/lambda/nfs/{cache_name}", mode=mode, models=models,
+                cache_host_mount=mount_point, mode=mode, models=models,
             )
         )
-        if cache_name
-        else None
-    )
+
+    # Prebuild the cache user_data for the DEFAULT mount path (/lambda/nfs/<name>) once — the common
+    # case, so the walk reuses it without re-rendering. A region whose ensure_filesystem returns a
+    # DIFFERENT mount_point rebuilds with that real path (see the walk below), so the bootstrap
+    # bind-mount never points at a stale host path.
+    default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
+    cache_user_data = _cache_user_data_for(default_cache_mount) if cache_name else None
     name = instance_label(spec.run_id, seed, attempt)
     ssh_keys = resolve_ssh_key_names()
 
@@ -180,8 +186,17 @@ def launch_and_submit(
         user_data, fs_names = cold_user_data, None
         if cache_name:
             try:
-                lambda_api.ensure_filesystem(cache_name, inst.region)
-                user_data, fs_names = cache_user_data, [cache_name]
+                mount_point = lambda_api.ensure_filesystem(cache_name, inst.region)
+                # Use the FS's ACTUAL mount_point: Lambda auto-mounts the NFS filesystem on the host
+                # there, and the bootstrap bind-mounts that exact path into the container. If it's the
+                # default /lambda/nfs/<name> (the usual case) reuse the prebuilt user_data; otherwise
+                # rebuild for this region so the bind-mount doesn't point at a stale/wrong host path
+                # (which would silently run cold / fail the preload mount check).
+                region_user_data = (
+                    cache_user_data if mount_point == default_cache_mount
+                    else _cache_user_data_for(mount_point)
+                )
+                user_data, fs_names = region_user_data, [cache_name]
             except Exception as e:
                 say(f"weight cache unavailable in {inst.region} ({e}); launching cold")
         try:
