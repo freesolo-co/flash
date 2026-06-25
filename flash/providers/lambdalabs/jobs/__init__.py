@@ -28,6 +28,7 @@ from flash.providers._poll import (
     PollErrorTracker,
     heartbeat_progress_ts,
     make_say,
+    preload_box_reap_due,
     surface_heartbeat,
 )
 from flash.providers.base import GPU_INFO, PollResult
@@ -136,20 +137,49 @@ def launch_and_submit(
     attempt: int = 0,
     log=None,
     runtime_secrets: dict | None = None,
+    mode: str | None = None,
+    models: list | None = None,
 ) -> LambdaJobHandle:
     """Launch the first region that accepts the job; walk regions on a capacity rejection.
 
     Capacity is a live market — between the allocator's capacity check and the launch the only
     region with capacity is often taken. We walk every advertised region, then refresh the capacity
     list once.
+
+    ``mode="preload"`` + ``models`` launches a download-only warm (the bootstrap pulls the models into
+    the mounted cache and exits — no worker); the cache user_data carries the preload payload.
     """
     say = make_say(log)
     if not instances:
         raise lambda_api.LambdaApiError(
             f"no Lambda capacity for {spec.gpu.type} (no region advertises the instance type)"
         )
-    payload = build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets)
-    user_data = build_user_data(payload, gpu=spec.gpu.type)
+    # Weight cache: when the run wants it (runner-assigned network_volume), HF_HOME points at the
+    # Lambda filesystem bind-mounted at /lambda/nfs/<name> (region-independent path -> one user_data
+    # serves every region; we just ensure the FS exists per region in the walk). If the FS can't be
+    # ensured in a region, fall back to the cold user_data there. ``gpu=`` selects the per-GPU worker
+    # image (dev: worker_image_for_gpu via lambda_image).
+    cache_name = getattr(spec.gpu, "network_volume", None)
+    cold_user_data = build_user_data(
+        build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets), gpu=spec.gpu.type
+    )
+
+    def _cache_user_data_for(mount_point: str) -> str:
+        """Cache user_data whose bind-mount targets THIS region's actual NFS host path."""
+        return build_user_data(
+            build_payload(
+                spec, seed, attempt, runtime_secrets=runtime_secrets,
+                cache_host_mount=mount_point, mode=mode, models=models,
+            ),
+            gpu=spec.gpu.type,
+        )
+
+    # Prebuild the cache user_data for the DEFAULT mount path (/lambda/nfs/<name>) once — the common
+    # case, so the walk reuses it without re-rendering. A region whose ensure_filesystem returns a
+    # DIFFERENT mount_point rebuilds with that real path (see the walk below), so the bootstrap
+    # bind-mount never points at a stale host path.
+    default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
+    cache_user_data = _cache_user_data_for(default_cache_mount) if cache_name else None
     name = instance_label(spec.run_id, seed, attempt)
     ssh_keys = resolve_ssh_key_names()
 
@@ -162,6 +192,32 @@ def launch_and_submit(
         if inst.region in tried_regions:
             continue
         tried_regions.add(inst.region)
+        # Ensure the cache filesystem exists in THIS region (create-if-absent) and attach it at
+        # launch; on any failure, launch cold here (best-effort cache, never blocks the run).
+        user_data, fs_names = cold_user_data, None
+        if cache_name:
+            try:
+                mount_point = lambda_api.ensure_filesystem(cache_name, inst.region)
+                # Use the FS's ACTUAL mount_point: Lambda auto-mounts the NFS filesystem on the host
+                # there, and the bootstrap bind-mounts that exact path into the container. If it's the
+                # default /lambda/nfs/<name> (the usual case) reuse the prebuilt user_data; otherwise
+                # rebuild for this region so the bind-mount doesn't point at a stale/wrong host path
+                # (which would silently run cold / fail the preload mount check).
+                region_user_data = (
+                    cache_user_data if mount_point == default_cache_mount
+                    else _cache_user_data_for(mount_point)
+                )
+                user_data, fs_names = region_user_data, [cache_name]
+            except Exception as e:
+                # A preload run's WHOLE purpose is to warm the cache; the cold user_data carries no
+                # mode/models, so a cold fallback would run a full training bootstrap (GPU billing,
+                # timeout) and warm nothing. SKIP this region instead — try the next one, and fail the
+                # walk if no region can host the cache. Normal runs still degrade to a cold run.
+                if mode == "preload":
+                    say(f"weight cache unavailable in {inst.region} ({e}); skipping (preload needs it)")
+                    last_err = e
+                    continue
+                say(f"weight cache unavailable in {inst.region} ({e}); launching cold")
         try:
             instance_id = lambda_api.launch_instance(
                 region_name=inst.region,
@@ -169,6 +225,7 @@ def launch_and_submit(
                 ssh_key_names=ssh_keys,
                 name=name,
                 user_data=user_data,
+                file_system_names=fs_names,
             )
         except lambda_api.LambdaApiError as e:
             last_err = e
@@ -185,7 +242,49 @@ def launch_and_submit(
                     f"ambiguous Lambda launch failure (possible phantom reaped): {e}"
                 ) from e
             say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {e}")
-            if not candidates and not refreshed:
+            # A CLEAN reject of a CACHE-backed launch whose error mentions the FILESYSTEM was likely
+            # caused by the attach itself (a just-created FS not yet attachable, an attach quota, an
+            # unsupported pairing) — not the GPU class. Best-effort cache must never make a region the
+            # cold path could have served fail outright, so retry THIS region once WITHOUT the cache
+            # before walking. Gated to filesystem-shaped errors so a plain capacity reject still walks
+            # (a cold retry there would just reject again). Skipped in preload mode (a cache-less
+            # preload warms nothing). The reject was clean -> no billed instance -> a 2nd launch is safe.
+            fs_attach_reject = fs_names and any(
+                tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
+            )
+            if mode != "preload" and fs_attach_reject:
+                say(f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)")
+                try:
+                    instance_id = lambda_api.launch_instance(
+                        region_name=inst.region, instance_type_name=inst.instance_type,
+                        ssh_key_names=ssh_keys, name=name, user_data=cold_user_data,
+                        file_system_names=None,
+                    )
+                except lambda_api.LambdaApiError as e2:
+                    last_err = e2
+                    if not _launch_rejection_is_clean(e2):
+                        with contextlib.suppress(Exception):
+                            terminate_run_instances(spec.run_id)
+                        raise lambda_api.LambdaApiError(
+                            f"ambiguous Lambda launch failure (possible phantom reaped): {e2}"
+                        ) from e2
+                    say(f"region {inst.region} also rejected cold: {e2}")
+                else:
+                    say(
+                        f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
+                        f"{inst.instance_type} in {inst.region} attempt={attempt} seed={seed}"
+                    )
+                    return LambdaJobHandle(
+                        instance_id=instance_id, instance_type=inst.instance_type, region=inst.region,
+                        name=name, gpu=inst.gpu, hourly_usd=inst.price_usd_hr, attempt=attempt,
+                        started_ts=time.time(),
+                    )
+            # NOT in preload mode: warm_instances pins each preload launch to ONE specific target
+            # region and reports that exact region as warmed. Refreshing to a DIFFERENT region here
+            # would warm region B while the caller reports the target region A as warmed (cache still
+            # cold). A preload that can't run in its target region must FAIL it (walk exhausts ->
+            # raise), never silently warm another.
+            if mode != "preload" and not candidates and not refreshed:
                 refreshed = True
                 # Force a fresh capacity fetch (the allocation cache is ~45s stale) so the refresh
                 # can discover regions that freed up since the walk started.
@@ -588,10 +687,28 @@ def sweep_orphans(
         logger.warning("lambda orphan sweep skipped: could not resolve active set: %s", exc)
         return []
     active = {run_label_prefix(a) for a in (labels or set())}
+    now = time.time()
     orphans: list[str] = []
     for inst in instances:
         name = str(inst.get("name") or "")
         if not name.startswith("flash-"):
+            continue
+        # Warm/preload boxes (``flash-preload-...``) are driver-owned: launched by
+        # preload.warm_instances (mode="preload"), NEVER persisted in the run DB (so never in
+        # ``active``), and self-terminated in _warm_one_instance's ``finally`` (and by startup
+        # recover_runs). A catalog warm can outlast this ~10-min sweep, so reaping them by the bare
+        # ``flash-`` prefix would kill an in-progress preload mid-download; normally exempt them.
+        # EXCEPTION: a box still alive past its embedded wall deadline + grace has lost its driver (the
+        # only thing that terminates instance providers — nothing on the box self-terminates the VM), so
+        # reap it to bound the leak rather than exempt it forever (see preload_box_reap_due).
+        if name.startswith("flash-preload-"):
+            if preload_box_reap_due(name, now):
+                iid = inst.get("id")
+                if iid:
+                    orphans.append(str(iid))
+                    logger.warning(
+                        "reaping orphaned lambda preload box %s (outlived its wall deadline + grace; "
+                        "driver lost)", name)
             continue
         # Match on the name boundary, not a raw string prefix: a live run's prefix must EQUAL the
         # name or be followed by the ``-s`` seed boundary, so ``flash-100`` can't shield
