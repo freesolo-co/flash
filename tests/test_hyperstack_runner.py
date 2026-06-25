@@ -412,7 +412,7 @@ def test_training_mode_tolerates_failed_attach(monkeypatch):
 # ---------------------------------------------------------------------------
 # poll_hs_job state machine
 # ---------------------------------------------------------------------------
-def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None, step=10.0):
+def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs
 
@@ -438,6 +438,8 @@ def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None
                 return metrics() if callable(metrics) else metrics
             if path.endswith("_boot.log"):  # attempt-scoped: hyperstack_attempt<N>_boot.log
                 return boot() if callable(boot) else boot
+            if "/error_" in path:  # worker crash traceback (error_<phase>.txt)
+                return error() if callable(error) else error
             return None
 
         return read
@@ -505,6 +507,43 @@ def test_poll_dead_vm_without_marker_is_preempted(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"
     assert "gpu never became ready" in res.detail
+
+
+def test_poll_dead_vm_with_error_file_is_job_failed_not_quarantined(monkeypatch):
+    """A worker that RAN and crashed early (left error_<phase>.txt) but died before writing the
+    attempt marker is a DETERMINISTIC worker-CODE error -> fail fast (job_failed), NOT a host loss.
+    Crucially it must NOT set host_fault: the region is healthy, so quarantining it (over-quarantine)
+    would needlessly evict a good region for a user-code bug. Mirrors the Lambda dead-host path."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
+        error="Traceback (most recent call last):\nFileNotFoundError: environment archive did not contain ...",
+    )
+    res = jobs.poll_hs_job(
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {}
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"  # deterministic worker error, fail fast
+    assert "environment archive" in res.detail
+    assert not res.host_fault  # worker-code crash != region fault -> region NOT quarantined
+
+
+def test_poll_dead_vm_with_retriable_error_still_preempted(monkeypatch):
+    """Even WITH an error_<phase>.txt, a crash the worker flagged retriable (RetriableInfraError,
+    stamped in the heartbeat) retries on a fresh host (job_preempted) and DOES quarantine the region
+    (a pre-training infra fault). Keeps a stale prior-attempt error file from flipping a genuine
+    preemption to job_failed. Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
+        error="Traceback ...\nRetriableInfraError: cuda device not ready",
+    )
+    res = jobs.poll_hs_job(
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {"retriable": True}
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"
+    assert res.host_fault  # infra crash before any training heartbeat -> quarantine the region
 
 
 def test_poll_active_no_liveness_fails_over_fast(monkeypatch):

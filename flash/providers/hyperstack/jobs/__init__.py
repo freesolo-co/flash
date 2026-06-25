@@ -494,13 +494,26 @@ def poll_hs_job(
             terminal = terminal_artifact_result()
             if terminal is not None:
                 return terminal
+            # Dead VM with no ok-marker/DONE. Distinguish a genuine host LOSS (retry on a fresh host)
+            # from a worker that actually RAN and CRASHED early -- before it could write the attempt
+            # marker terminal_artifact_result() reads -- but DID leave error_{phase}.txt (a bad env id,
+            # a config/code error, an OOM). That is a DETERMINISTIC worker error: fail FAST (job_failed
+            # burns no fresh GPUs re-running a crash that will just repeat) and do NOT quarantine the
+            # region, which is healthy. A crash the worker flagged retriable (RetriableInfraError,
+            # stamped in the heartbeat) still retries. Mirrors the Lambda dead-host path exactly so the
+            # two instance substrates classify pre-training deaths identically.
+            from flash.providers.runpod.jobs import worker_flagged_retriable
+
+            err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
+            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,
-                failure="job_preempted",
+                failure="job_failed" if worker_crashed else "job_preempted",
                 detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.attempt),
                 # A VM that died before any training heartbeat never got a worker productive in this
-                # region -> quarantine it; a loss after training is not a region fault.
-                host_fault=not seen_training_hb,
+                # region -> quarantine it; a worker-CODE crash (not infra) or a loss after training is
+                # NOT a region fault, so it must not quarantine an otherwise-healthy region.
+                host_fault=not worker_crashed and not seen_training_hb,
             )
 
         raw_marker = marker_reader()
