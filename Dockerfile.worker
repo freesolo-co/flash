@@ -100,6 +100,14 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
 # (the FA2 *source* path above already OOMs runners; arch-specific kernel compiles are worse).
 # So that ~10-15 min first-use compile (engine.worker; flash #163's init heartbeat keeps the
 # stall detector quiet through it) is a per-run RUNTIME cost on a cold worker.
+# When the shared weight-cache network volume is attached (flash runner._assign_weight_cache_volume),
+# the control plane points HF_HOME at the persistent /runpod-volume mount per-run
+# (providers/runpod/train/deps.weight_cache_env), so the model download is reused across runs that
+# land in the same region. ONLY HF_HOME (inert model blobs) is redirected — the executable kernel-JIT
+# caches above are deliberately NOT shared, since the volume is multi-tenant and a poisoned compiled
+# artifact could affect another tenant's run; so that first-use compile stays a per-cold-worker cost.
+# The redirect can't be a static image ENV here: RunPod mounts the volume at a fixed path only at
+# runtime and only when one is attached, so a baked ENV would break cache-less (no-volume) cold runs.
 
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/

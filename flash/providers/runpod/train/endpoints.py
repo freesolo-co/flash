@@ -227,6 +227,50 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
+    # Weight-cache PRELOAD mode: download-only, no code repo / no training subprocess. Runs on a
+    # worker whose `flash-weights` volume for ONE datacenter is mounted at /runpod-volume; with
+    # HF_HOME pointed there (passed in env), each snapshot_download warms that region's cache so the
+    # first real run in that region is a cache hit. Returns the repos it cached. Kept here (in the
+    # baked handler) so preload reuses the existing image/handler — no separate worker image.
+    if input_data.get("mode") == "preload":
+        overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+        os.environ.update(overrides)
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        tok = overrides.get("HF_TOKEN")
+        # CRITICAL: huggingface_hub froze HF_HUB_CACHE from HF_HOME at IMPORT time (the
+        # `from huggingface_hub import snapshot_download` above, before this branch), so the
+        # HF_HOME we just set in os.environ is ignored by snapshot_download. Pass cache_dir
+        # EXPLICITLY = <HF_HOME>/hub (HF's own layout) so the download lands on the mounted volume
+        # instead of the worker's ephemeral default cache. (The training path is immune: it spawns a
+        # subprocess that imports huggingface_hub fresh with HF_HOME already in its env.)
+        hf_home = overrides.get("HF_HOME")
+        cache_dir = os.path.join(hf_home, "hub") if hf_home else None
+        done, already, failed = [], [], {}
+        for repo_id in input_data.get("models") or []:
+            try:
+                # Idempotent: if the volume already has this snapshot, skip the download. The
+                # local_files_only probe is also the persistence signal the live test reads —
+                # ``already_cached`` proves the weights survived a previous, separate deployment.
+                try:
+                    snapshot_download(
+                        repo_id=repo_id, token=tok, cache_dir=cache_dir, local_files_only=True
+                    )
+                    already.append(repo_id)
+                    done.append(repo_id)
+                    continue
+                except Exception:
+                    pass
+                snapshot_download(repo_id=repo_id, token=tok, cache_dir=cache_dir)
+                done.append(repo_id)
+            except Exception as exc:  # one bad/gated repo must not abort warming the rest
+                failed[repo_id] = str(exc)[:300]
+        return {
+            "preloaded": done,
+            "already_cached": already,
+            "failed": failed,
+            "hf_home": os.environ.get("HF_HOME"),
+        }
+
     # NB: the Hopper fla fast-path setup lives in flash.engine.worker._ensure_fla_fastpath_on_hopper (runs
     # in the worker process AFTER all installs, before any model import) — doing it here would be
     # undone by a later extra_pip / `prime env install`, and depends on a handler redeploy.
@@ -255,6 +299,14 @@ def _train_body(input_data: dict) -> dict:
 
     env = dict(os.environ)
     env.update(overrides)
+    # If the weight-cache volume isn't actually mounted (cold/no-volume run, or the attach degraded
+    # to {}), don't leave HF_HOME pointing at a missing /runpod-volume path — fall back to the
+    # default ephemeral cache. INLINED (not a flash import): this handler is extracted standalone
+    # into the baked image's rp_handler (docker/make_rp_handler.py), where flash is NOT importable,
+    # so it must stay self-contained. Mirrors deps.drop_unmounted_cache_env (unit-tested there).
+    if not os.path.isdir("/runpod-volume"):
+        for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
+            env.pop(_k, None)
     # Always pass the spec via a file (FLASH_JOB_SPEC_PATH): a large inline spec can blow past the
     # ~128 KiB per-env-string exec limit ("Argument list too long"), and a file is ONE code path for
     # every size (cheap write). load_job_spec_from_env reads it.
@@ -522,6 +574,12 @@ def get_train_endpoint(
         else:
             kwargs["dependencies"] = resolve_worker_deps()
             kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+        # Parity with the baked-image deploy_train_endpoint path: attach the multi-region weight
+        # cache (best-effort {} on no-cache/error). Local import avoids a jobs<->endpoints import
+        # cycle (jobs imports this module at load), same as apply_disk_gb below.
+        from flash.providers.runpod.jobs import weight_cache_endpoint_kwargs
+
+        kwargs.update(weight_cache_endpoint_kwargs(spec))
         ep = Endpoint(**kwargs)
         handler = ep(_train_body)  # register the queue-based handler; returns the callable
         # The resource config is cached on the Endpoint, so raising the disk on it here

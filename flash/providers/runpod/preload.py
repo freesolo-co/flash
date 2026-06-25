@@ -1,0 +1,244 @@
+"""Preload (warm) the shared weight-cache volumes with the catalog's base-model weights.
+
+The weight cache (a same-named ``flash-weights`` network volume in every storage datacenter) is
+populated lazily by real runs: the first run to land in a region downloads the model onto that
+region's volume, and every later run there hits the cache. This module makes that first hit free by
+PRE-warming every region up front — an operator/setup action, not a user one (the cache is fully
+managed, so there is no user-facing knob).
+
+Mechanism: for each datacenter, deploy a short-lived worker with ONLY that region's volume attached
+(pinned to that single DC, so the worker provably lands there), run the baked handler in ``preload``
+mode (download-only, ``HF_HOME`` -> the mounted volume), then tear the endpoint down. Reuses the
+existing baked worker image + deploy/submit/quota machinery; the only new worker code is the
+``preload`` branch in ``train.endpoints._train_body``.
+
+COST / GC NOTE: the fleet is permanent, billed standing storage. A run (or a full preload) creates a
+``flash-weights-<dc>`` volume in EVERY storage datacenter (default 11 x 100 GB ~= 1.1 TB, ~$77/mo),
+and RunPod network volumes are NOT auto-deleted — there is no GC. Reclaim them with ``--teardown``
+(deletes every per-DC weight-cache volume via the RunPod REST API).
+
+Run it::
+
+    python -m flash.providers.runpod.preload                 # all catalog models, all DCs
+    python -m flash.providers.runpod.preload --datacenters US-CA-2,EU-RO-1 --models Qwen/Qwen3.5-4B
+    python -m flash.providers.runpod.preload --dry-run       # print the plan, provision nothing
+    python -m flash.providers.runpod.preload --teardown      # DELETE the cache volumes (reclaim $)
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from flash._logging import get_logger
+from flash.providers.runpod import api as runpod_api
+from flash.providers.runpod.jobs import (
+    build_function_input,
+    deploy_train_endpoint,
+    weight_cache_datacenters,
+    weight_cache_volume_name,
+)
+
+logger = get_logger(__name__)
+
+_HF_HOME = "/runpod-volume/hf-cache"
+# Cheapest broadly-available class; preload only downloads (no compute), so the GPU is incidental —
+# the job is short, so the cost is a few cents per region.
+_PRELOAD_GPU = "RTX 4090"
+_TERMINAL_OK = {"COMPLETED"}
+_TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
+
+
+def catalog_model_ids() -> list[str]:
+    """The public base models to warm: every curated catalog entry (the cache holds public weights).
+
+    Open-model-policy (``allow``) runs may use arbitrary/private models that aren't worth — or safe —
+    to pre-warm globally; those simply download cold on first use and then cache like any other.
+    """
+    from flash.catalog import MODELS
+
+    return list(MODELS)
+
+
+def _preload_one_dc(
+    dc_id: str,
+    models: list[str],
+    token: str | None,
+    gpu: str,
+    timeout_s: int,
+    poll_interval_s: float,
+) -> dict:
+    """Warm one datacenter's volume: deploy (pinned to that DC) -> preload job -> teardown."""
+    from runpod_flash import NetworkVolume
+    from runpod_flash.core.resources.datacenter import DataCenter
+
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+
+    dc = DataCenter.from_string(dc_id)
+    # SAME per-DC physical name the training path uses (weight_cache_volume_name), so preload warms
+    # exactly the volume a later run in this DC will mount.
+    vol_name = weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, dc)
+    vol = NetworkVolume(name=vol_name, size=WEIGHT_CACHE_VOLUME_GB, datacenter=dc)
+    endpoint_kwargs = {"volume": [vol], "datacenter": [dc]}
+    endpoint_id = None
+    try:
+        endpoint_id, _name = deploy_train_endpoint(
+            gpu,
+            execution_timeout_ms=timeout_s * 1000,
+            # Unique per invocation: RunPod reuses an endpoint by name, so a stable suffix could
+            # resolve a stale (deleted) endpoint id from a prior preload's persisted SDK state on a
+            # long-lived control plane. A fresh suffix each run sidesteps that.
+            name_suffix=f"preload-{dc_id.lower()}-{uuid.uuid4().hex[:6]}",
+            spec=None,
+            endpoint_kwargs=endpoint_kwargs,
+        )
+        payload = {
+            "mode": "preload",
+            "models": models,
+            "env": {
+                "HF_HOME": _HF_HOME,
+                "HF_HUB_ENABLE_HF_TRANSFER": "1",
+                **({"HF_TOKEN": token} if token else {}),
+            },
+        }
+        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
+        logger.info("preload %s: job %s submitted (%d models)", dc_id, job_id, len(models))
+        result = _poll_until_done(endpoint_id, job_id, timeout_s, poll_interval_s)
+        return {"datacenter": dc_id, "status": "ok", "result": result}
+    except Exception as exc:  # one region failing must not abort the others
+        logger.warning("preload %s FAILED: %s", dc_id, exc)
+        return {"datacenter": dc_id, "status": "error", "error": str(exc)}
+    finally:
+        if endpoint_id:
+            with contextlib.suppress(Exception):
+                runpod_api.delete_endpoint(endpoint_id)
+
+
+def _poll_until_done(
+    endpoint_id: str, job_id: str, timeout_s: int, poll_interval_s: float
+) -> dict:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        st = runpod_api.job_status(endpoint_id, job_id)
+        status = (st or {}).get("status")
+        if status in _TERMINAL_OK:
+            return (st or {}).get("output") or {}
+        if status in _TERMINAL_FAIL:
+            raise RuntimeError(f"preload job {job_id} ended {status}: {(st or {}).get('error')}")
+        time.sleep(poll_interval_s)
+    raise TimeoutError(f"preload job {job_id} did not finish within {timeout_s}s")
+
+
+def warm_weight_cache(
+    models: list[str] | None = None,
+    datacenters: list[str] | None = None,
+    gpu: str = _PRELOAD_GPU,
+    timeout_s: int = 1800,
+    max_workers: int = 8,
+    poll_interval_s: float = 10.0,
+    token: str | None = None,
+) -> list[dict]:
+    """Warm every (datacenter) volume with the given models. Returns one result dict per DC.
+
+    Datacenters are warmed concurrently (bounded by ``max_workers``). A region that errors is
+    reported in its result dict and does not abort the others.
+    """
+    models = models or catalog_model_ids()
+    dc_ids = datacenters or [dc.value for dc in weight_cache_datacenters()]
+    token = token or os.environ.get("HF_TOKEN")
+    logger.info("warming %d datacenter(s) with %d model(s)", len(dc_ids), len(models))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = {
+            pool.submit(_preload_one_dc, dc, models, token, gpu, timeout_s, poll_interval_s): dc
+            for dc in dc_ids
+        }
+        results: list[dict] = [fut.result() for fut in as_completed(futs)]
+    ok = sum(1 for r in results if r.get("status") == "ok")
+    logger.info("preload complete: %d/%d datacenters warmed", ok, len(results))
+    return results
+
+
+def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
+    """Delete the per-DC ``flash-weights-<dc>`` cache volumes to reclaim the standing storage.
+
+    RunPod network volumes are never auto-GC'd, so this is the only way to stop the monthly bill
+    short of the console. Returns the names deleted. Targets ONLY this fleet's per-DC names (built
+    from ``WEIGHT_CACHE_VOLUME_NAME``), never other volumes on the account.
+    """
+    import asyncio
+
+    from runpod_flash.core.api.runpod import RunpodRestClient
+    from runpod_flash.core.resources.datacenter import DataCenter
+    from runpod_flash.core.urls import RUNPOD_REST_API_URL
+
+    from flash.providers.runpod.auth import ensure_auth
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    ensure_auth()
+    dc_ids = datacenters or [dc.value for dc in weight_cache_datacenters()]
+    targets = {
+        weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, DataCenter.from_string(d)) for d in dc_ids
+    }
+
+    async def _go() -> list[str]:
+        client = RunpodRestClient()
+        res = await client.list_network_volumes()
+        vols = res if isinstance(res, list) else res.get("networkVolumes", [])
+        deleted: list[str] = []
+        for v in vols:
+            if v.get("name") in targets and v.get("id"):
+                await client._execute_rest(
+                    "DELETE", f"{RUNPOD_REST_API_URL}/networkvolumes/{v['id']}"
+                )
+                deleted.append(v["name"])
+        return deleted
+
+    return asyncio.run(_go())
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Preload the flash weight-cache volumes.")
+    ap.add_argument("--models", help="comma-separated HF model ids (default: whole catalog)")
+    ap.add_argument("--datacenters", help="comma-separated DC ids (default: all storage DCs)")
+    ap.add_argument("--gpu", default=_PRELOAD_GPU, help="GPU class for the preload worker")
+    ap.add_argument("--timeout-s", type=int, default=1800, help="per-DC job timeout")
+    ap.add_argument("--max-workers", type=int, default=8, help="datacenters warmed concurrently")
+    ap.add_argument("--dry-run", action="store_true", help="print the plan, provision nothing")
+    ap.add_argument(
+        "--teardown", action="store_true",
+        help="DELETE the per-DC weight-cache volumes (reclaim standing storage) and exit",
+    )
+    args = ap.parse_args(argv)
+
+    models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else catalog_model_ids()
+    dcs = (
+        [d.strip() for d in args.datacenters.split(",") if d.strip()]
+        if args.datacenters
+        else [dc.value for dc in weight_cache_datacenters()]
+    )
+    if args.teardown:
+        deleted = teardown_weight_cache(dcs)
+        print(f"deleted {len(deleted)} weight-cache volume(s): {', '.join(deleted) or '(none)'}")
+        return 0
+    if args.dry_run:
+        print(f"would warm {len(dcs)} datacenter(s): {', '.join(dcs)}")
+        print(f"with {len(models)} model(s): {', '.join(models)}")
+        return 0
+
+    results = warm_weight_cache(
+        models=models, datacenters=dcs, gpu=args.gpu,
+        timeout_s=args.timeout_s, max_workers=args.max_workers,
+    )
+    failed = [r for r in results if r.get("status") != "ok"]
+    for r in results:
+        print(f"  {r['datacenter']}: {r['status']}" + (f" ({r.get('error')})" if r.get("error") else ""))
+    print(f"{len(results) - len(failed)}/{len(results)} datacenters warmed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

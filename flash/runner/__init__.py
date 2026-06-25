@@ -235,6 +235,42 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+# Shared, platform-wide model-weight cache (NOT per-org). The cache holds downloaded base-model
+# weights — a run's trained adapters/checkpoints upload to the per-run managed HF repo
+# (_assign_managed_hf_repo), never here — so one global volume reused by every run is both safe and
+# the highest-hit-rate option: a popular base model (e.g. the 4B) is downloaded once per region,
+# ever, instead of once per run. The RunPod provider attaches a same-named volume in EVERY cache
+# datacenter and allows the endpoint across all of them, so there is NO single-DC pin (the failure
+# mode that sank the earlier per-org EU-RO-1 attempt — runs wedged IN_QUEUE on one full region).
+# Fully managed: a fixed name + size, no env knobs. 100 GB holds the whole curated catalog (the
+# largest, the 9B, is ~19 GB of weights) with ample headroom; the preload step warms it.
+# COST/GC: the provider realizes this as one ``flash-weights-<dc>`` volume PER storage datacenter
+# (see jobs.weight_cache_volumes), so the first run (or a full preload) provisions the whole fleet —
+# ~11 x 100 GB ~= 1.1 TB of PERMANENT billed storage (~$77/mo). RunPod never auto-deletes network
+# volumes; reclaim the fleet with ``python -m flash.providers.runpod.preload --teardown``.
+WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
+WEIGHT_CACHE_VOLUME_GB = 100
+
+
+def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
+    """Attach the shared, platform-managed weight-cache volume to every run.
+
+    Platform-managed (never user config), exactly like the managed HF repo: assigned here, not
+    surfaced in the config schema. The only no-op is when the spec already carries a volume (an
+    explicit/test assignment is never overridden). The provider builds the per-region volume fleet
+    + the cross-DC endpoint at deploy time (jobs.weight_cache_endpoint_kwargs) off this name.
+    """
+    if getattr(spec.gpu, "network_volume", None):
+        return spec
+    d = spec.to_dict()
+    d["gpu"] = {
+        **d["gpu"],
+        "network_volume": WEIGHT_CACHE_VOLUME_NAME,
+        "network_volume_gb": WEIGHT_CACHE_VOLUME_GB,
+    }
+    return JobSpec.from_dict(d)
+
+
 def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     """Daemon-thread entrypoint for background runs.
 
@@ -287,6 +323,10 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
     spec = _assign_managed_hf_repo(spec)
+    # Attach the shared model-weight cache (platform-managed). Before the RunStatus build so a
+    # dry-run spec carries it too (the dry-run short-circuits below) — keeps the assignment testable
+    # without a real provision and visible in `flash status`.
+    spec = _assign_weight_cache_volume(spec)
     if not dry_run:
         # Resolve the env ref->sha ONCE before fan-out so workers boot from the pin and skip the
         # GitHub commits API (defuses the cold-spawn rate-limit wave). Skipped on dry-run: no

@@ -57,6 +57,23 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+def _drop_weight_cache(spec: JobSpec) -> JobSpec:
+    """Spec with the weight-cache volume removed (run cold + fully cross-region).
+
+    Used after a no-capacity attempt: attaching the cache restricts the endpoint to the cache's
+    datacenter set, so if that whole set is momentarily starved the next attempt should fall back to
+    the unrestricted all-DC pool. Dropping ``network_volume`` makes weight_cache_endpoint_kwargs
+    return ``{}`` (no volume, no datacenter list) and turns off the worker's HF_HOME redirect — i.e.
+    exactly today's cold cross-region behavior. Worst case for the cache is one capacity-grace wait,
+    never a permanent IN_QUEUE block.
+    """
+    if not getattr(spec.gpu, "network_volume", None):
+        return spec
+    d = spec.to_dict()
+    d["gpu"] = {**d["gpu"], "network_volume": None}
+    return JobSpec.from_dict(d)
+
+
 def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
@@ -117,6 +134,9 @@ def _submit_seed_supervised(
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
     gpu_walk_offset = 0
+    # Sticky: once a no-capacity failure shows the weight-cache datacenter set is starved, drop the
+    # cache (volume) for every remaining attempt so they run on the unrestricted all-DC pool.
+    drop_weight_cache = False
     for attempt in range(max_retries + 1):
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
@@ -198,6 +218,11 @@ def _submit_seed_supervised(
                     flush=True,
                 )
             run_spec = _spec_with_gpu(spec, chosen.gpu)
+            # After a no-capacity attempt, fall back to a cache-less cross-region run (see
+            # drop_weight_cache below): the attached cache pins the endpoint to its DC set, so the
+            # fallback must run on the unrestricted pool.
+            if drop_weight_cache:
+                run_spec = _drop_weight_cache(run_spec)
             current_gpu["name"] = chosen.gpu
             provider = get_provider(chosen.provider)
             try:
@@ -257,10 +282,28 @@ def _submit_seed_supervised(
         )
         if not infra_shaped or attempt >= max_retries:
             break
-        # Step to the next-cheapest class only when THIS attempt actually provisioned one
-        # and it failed infra-shaped. An allocation/pricing failure (chosen is None) never
-        # tried a card, so the next attempt must retry from the cheapest, not walk past it.
-        if chosen is not None:
+        # Best-effort cache: if a VOLUME-BACKED attempt failed in a way the cache could have caused
+        # — no_capacity (the cache restricts the endpoint to its DC set) or a deploy/submit
+        # poll_error (e.g. the SDK failing to create/attach a volume) — drop the cache so the run
+        # degrades to a cold, unrestricted cross-region attempt instead of looping on the same
+        # volume-backed spec (the IN_QUEUE-forever / persistent-volume-failure block). Sticky: once
+        # dropped it stays dropped. A non-volume flake (stall/preempt) keeps the cache so the
+        # warm-weights benefit survives ordinary retries.
+        run_had_cache = bool(chosen is not None and getattr(run_spec.gpu, "network_volume", None))
+        first_cache_drop = (
+            run_had_cache
+            and not drop_weight_cache
+            and res.failure in ("no_capacity", "poll_error")
+        )
+        if first_cache_drop:
+            drop_weight_cache = True
+            # Do NOT advance the GPU walk on this transition: the next attempt should retry the SAME
+            # cheapest GPU without the volume on the wider all-DC pool first — the miss may have been
+            # the cache's datacenter set, not the GPU class globally. Only walk if THAT also fails.
+        elif chosen is not None:
+            # Step to the next-cheapest class only when THIS attempt actually provisioned one and it
+            # failed infra-shaped. An allocation/pricing failure (chosen is None) never tried a card,
+            # so the next attempt must retry from the cheapest, not walk past it.
             gpu_walk_offset += 1
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
