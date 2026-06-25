@@ -87,16 +87,18 @@ class HyperstackJobHandle:
         )
 
 
-def hyperstack_image() -> str:
+def hyperstack_image(gpu: str | None = None) -> str:
     """Docker image the cloud-init runs on the Hyperstack host: the prebuilt, PUBLIC ``WORKER_IMAGE``
-    (the byte-identical training stack RunPod bakes). ``FLASH_WORKER_IMAGE`` overrides it. NB: this
-    is the *container* image; the Hyperstack VM *boot* image (Docker-preinstalled Ubuntu/CUDA) is
-    chosen separately in ``api.docker_image_for_region``."""
-    import os
+    (the byte-identical training stack RunPod bakes). ``FLASH_WORKER_IMAGE`` overrides it; when the
+    operator opts into per-SM warmed images (``FLASH_WORKER_IMAGE_PER_SM`` /
+    ``FLASH_WORKER_IMAGE_TEMPLATE``), the GPU class selects the matching ``-smXX`` tag so the worker's
+    baked kernel cache matches the rented GPU's arch (the same selector RunPod uses). NB: this is the
+    *container* image; the Hyperstack VM *boot* image (Docker-preinstalled Ubuntu/CUDA) is chosen
+    separately in ``api.docker_image_for_region``."""
+    from flash.providers.runpod.train import WORKER_IMAGE, worker_image_for_gpu
 
-    from flash.providers.runpod.train import WORKER_IMAGE
-
-    return os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
+    # allow_default=True -> always a concrete image to docker-pull (override / per-sm tag / base).
+    return worker_image_for_gpu(gpu, allow_default=True) or WORKER_IMAGE
 
 
 def build_payload(spec, seed: int, attempt: int, runtime_secrets: dict | None = None) -> dict:
@@ -104,6 +106,6 @@ def build_payload(spec, seed: int, attempt: int, runtime_secrets: dict | None = 
     return _shared_build_payload(spec, seed, attempt, arm="hyperstack", runtime_secrets=runtime_secrets)
 
 
-def build_user_data(payload: dict) -> str:
+def build_user_data(payload: dict, *, gpu: str | None = None) -> str:
     """The Hyperstack cloud-init user_data (shared builder, runs the worker WORKER_IMAGE)."""
-    return _shared_build_user_data(payload, image=hyperstack_image())
+    return _shared_build_user_data(payload, image=hyperstack_image(gpu))
