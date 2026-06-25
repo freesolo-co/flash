@@ -156,7 +156,9 @@ COPY build/kernel_cache/ /opt/flash/kernelcache/
 RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.bin ]; then \
       echo "kernel-cache: baked from build/kernel_cache/ -> /opt/flash/kernelcache"; \
     else \
-      rm -f /opt/flash/kernelcache/mega_cache.bin /opt/flash/kernelcache/mega_cache.json; \
+      rm -rf /opt/flash/kernelcache/mega_cache.bin /opt/flash/kernelcache/mega_cache.json \
+        /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
+      mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
       echo "kernel-cache: not baked (BUILD_KERNEL_CACHE=${BUILD_KERNEL_CACHE}) -> first-run JIT fallback"; \
     fi
 
