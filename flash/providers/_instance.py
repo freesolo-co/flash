@@ -55,7 +55,11 @@ def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: d
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
     ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
     from flash.envs.registry import worker_pip_for_env
-    from flash.providers.runpod.train import build_worker_env, chalk_extra_pip
+    from flash.providers.runpod.train import (
+        build_worker_env,
+        chalk_extra_pip,
+        strip_runpod_volume_env,
+    )
 
     return {
         "hf_repo": spec.train.hf_repo,
@@ -63,7 +67,13 @@ def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: d
         "phase": spec.phase,
         "seed": int(seed),
         "flash_arm": arm,
-        "env": build_worker_env(spec, seed, runtime_secrets=runtime_secrets),
+        # build_worker_env redirects HF_HOME onto the RunPod /runpod-volume mount when the run carries
+        # a (platform-assigned) weight-cache volume. That mount is RunPod-only; instance providers
+        # don't mount it, so strip the redirect — otherwise the instance worker would point HF at a
+        # nonexistent /runpod-volume path. (RunPod's own submit path keeps the redirect.)
+        "env": strip_runpod_volume_env(
+            build_worker_env(spec, seed, runtime_secrets=runtime_secrets)
+        ),
         # The bootstrap pip-installs extra_pip for every job, so the per-run env wheel + the opt-in
         # chalk spec ride along here to reach default runs (mirrors runpod/jobs.submit_run).
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))

@@ -301,6 +301,32 @@ def test_drop_unmounted_cache_env_keeps_when_mounted(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# instance-provider integration (Lambda/Hyperstack reuse RunPod's build_worker_env)
+# ---------------------------------------------------------------------------
+def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
+    from flash.providers.runpod.train.deps import strip_runpod_volume_env
+
+    env = {"HF_HOME": "/runpod-volume/hf-cache", "X": "/runpod-volume/foo", "KEEP": "v", "HF_TOKEN": "t"}
+    out = strip_runpod_volume_env(env)
+    assert "HF_HOME" not in out
+    assert "X" not in out
+    assert out == {"KEEP": "v", "HF_TOKEN": "t"}  # non-/runpod-volume vars preserved
+
+
+def test_instance_payload_strips_runpod_volume_redirect():
+    # The RunPod weight-cache HF_HOME redirect must NOT leak into a Lambda/Hyperstack payload — those
+    # instances never mount /runpod-volume. (build_worker_env DOES set it; the instance path strips.)
+    from flash.providers import _instance
+    from flash.providers.runpod.train.deps import build_worker_env
+
+    spec = JobSpec.from_dict({**_vol_spec().to_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-0.8B"})
+    assert build_worker_env(spec, 0)["HF_HOME"].startswith("/runpod-volume")  # the leak source
+    for arm in ("lambda", "hyperstack"):
+        env = _instance.build_payload(spec, seed=0, attempt=0, arm=arm)["env"]
+        assert not env.get("HF_HOME", "").startswith("/runpod-volume"), arm
+
+
+# ---------------------------------------------------------------------------
 # runner._assign_weight_cache_volume — fully managed, attaches to EVERY run, no knobs/gating
 # ---------------------------------------------------------------------------
 def test_assign_weight_cache_attaches_to_catalog_run():
