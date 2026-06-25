@@ -22,8 +22,12 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from flash._logging import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 from flash.providers._poll import (
     PollErrorTracker,
     make_say,
@@ -62,6 +66,10 @@ __all__ = [
     "make_hf_text_reader",
     "poll_job",
     "submit_run",
+    "weight_cache_datacenters",
+    "weight_cache_endpoint_kwargs",
+    "weight_cache_volume_name",
+    "weight_cache_volumes",
 ]
 
 TERMINAL_OK = {"COMPLETED"}
@@ -110,6 +118,100 @@ def stall_kwargs(on_last_gpu: bool = False) -> dict:
         "queue_grace_s": grace,
         "throttled_grace_s": grace,
     }
+
+
+# RunPod DCs in the SDK's ``DataCenter.all()`` enum that do NOT support network volumes. LIVE-FOUND:
+# the SDK enum is NOT the network-volume DC set (that assumption was wrong) — creating a volume in one
+# of these 500s the WHOLE deploy ("data center ... does not support network volumes"), so eager runs
+# would always fall back to cold and the cache would never work. The SDK exposes no volume-capability
+# flag, so we maintain the exclusion here. (If RunPod drops volume support in another DC, that deploy
+# 500s -> the lifecycle no_capacity/poll_error cache-drop falls back to a cold cross-region run, so a
+# stale list degrades gracefully rather than wedging — but add the DC here to restore its cache.)
+_VOLUME_INCAPABLE_DATACENTERS = frozenset({"US-MO-1"})
+
+
+def weight_cache_datacenters() -> list:
+    """Every VOLUME-CAPABLE RunPod DC — both the set the endpoint is allowed across AND the set we
+    attach a per-DC volume in (eager: a volume in every region a run can land in, so any landing is
+    warm). ``DataCenter.all()`` minus ``_VOLUME_INCAPABLE_DATACENTERS`` (the enum includes DCs RunPod
+    no longer backs with network volumes — see that constant). A SDK upgrade that adds a storage region
+    is picked up automatically; one that adds a volume-less region must be excluded above.
+    """
+    from runpod_flash.core.resources.datacenter import DataCenter
+
+    return [dc for dc in DataCenter.all() if dc.value not in _VOLUME_INCAPABLE_DATACENTERS]
+
+
+def weight_cache_volume_name(base: str, dc) -> str:
+    """Physical volume name for ``base`` in datacenter ``dc`` — DISTINCT per DC.
+
+    The cache is one logical volume (``base`` == ``spec.gpu.network_volume``, e.g. ``flash-weights``)
+    realized as one physical volume per datacenter. The DC MUST be in the name: the runpod_flash SDK
+    keys its in-memory/persisted resource tracking on ``NetworkVolume:{name}`` WITHOUT the
+    datacenter (resources/base.py ``get_resource_key``), so N same-named volumes collide on one key
+    and deploying the 2nd triggers a replace -> the SDK's unimplemented ``NetworkVolume.undeploy`` ->
+    crash. A per-DC name gives each volume a unique key. The worker is unaffected — every volume
+    mounts at the same ``/runpod-volume`` regardless of name.
+    """
+    return f"{base}-{dc.value.lower()}"
+
+
+def weight_cache_volumes(spec) -> list:
+    """One ``NetworkVolume`` per storage datacenter — the EAGER fleet (``[]`` only if the cache is off).
+
+    Empty unless ``spec.gpu.network_volume`` is set (the runner assigns the logical base name for
+    eligible runs). Otherwise one physical volume per ``weight_cache_datacenters()`` entry — every
+    storage DC, so the cache exists in whichever region the endpoint lands in. Each physical volume is
+    ``<base>-<dc>`` (see ``weight_cache_volume_name``), idempotent by (name, datacenter): runpod_flash
+    reuses an existing volume of that name/DC, so this is create-or-attach (the first deploy provisions
+    the whole fleet; later deploys just re-attach).
+
+    Multi-account pools: ``deploy_train_endpoint`` re-runs the WHOLE deploy on quota failover, so the
+    volumes are re-created on whichever account ends up hosting the endpoint (account-scoped). Orphans
+    on the failed-over-FROM account are reclaimed by ``preload --teardown`` (sweeps every pool account).
+    """
+    base = getattr(spec.gpu, "network_volume", None) if spec is not None else None
+    if not base:
+        return []
+    dcs = weight_cache_datacenters()  # EAGER: a volume in every storage DC
+    if not dcs:
+        return []
+    from runpod_flash import NetworkVolume
+
+    from flash.spec import _volume_gb
+
+    # Reuse the spec's tolerant parser: a stale/hand-edited spec with a non-numeric, "0", or negative
+    # network_volume_gb defaults to 100 GB rather than raising (which best-effort would swallow into a
+    # no-cache deploy) or creating a nonsensical 0-GB volume — matches _volume_gb's contract/tests.
+    size = _volume_gb(getattr(spec.gpu, "network_volume_gb", 100))
+    return [
+        NetworkVolume(name=weight_cache_volume_name(str(base), dc), size=size, datacenter=dc)
+        for dc in dcs
+    ]
+
+
+def weight_cache_endpoint_kwargs(spec) -> dict:
+    """Endpoint kwargs that attach the eager weight-cache fleet, or ``{}`` (best-effort).
+
+    ``{"volume": [vol per storage dc...], "datacenter": [ALL storage DCs]}`` — the endpoint is allowed
+    across ALL DCs (so it lands wherever there's capacity) AND carries a volume in every one of them, so
+    whichever DC it lands in is warm. The SDK's "every volume DC must be in the endpoint datacenter
+    list" rule holds exactly (the two lists are the same storage-DC set). The first deploy
+    create-or-attaches the whole fleet; later deploys re-attach.
+
+    Returns ``{}`` only when the cache is off (no ``network_volume`` on the spec). Best-effort: ANY
+    failure (SDK import, validation) -> ``{}`` so the run deploys with no volume rather than failing;
+    the lifecycle still drops the volume on a no_capacity retry to widen onto the non-storage DC pool.
+    """
+    try:
+        vols = weight_cache_volumes(spec)
+        if not vols:
+            return {}  # cache off -> cold (no volumes, RunPod picks any region)
+        return {"volume": vols, "datacenter": weight_cache_datacenters()}
+    except Exception as exc:
+        # Best-effort: never let the cache break a deploy — fall back to a no-volume run.
+        logger.warning("weight cache disabled for this run (%s); deploying with no volume", exc)
+        return {}
 
 
 def apply_disk_gb(config, disk_gb: int | None) -> None:
@@ -262,6 +364,7 @@ def deploy_train_endpoint(
     name_suffix: str | None = None,
     disk_gb: int | None = None,
     spec=None,
+    endpoint_kwargs: dict | Callable[[], dict] | None = None,
 ) -> tuple[str, str]:
     """Deploy (or reuse) the run's uniquely-named worker endpoint; return (id, name).
 
@@ -270,6 +373,14 @@ def deploy_train_endpoint(
     account's quota stays exhausted after sweeping and ``RUNPOD_API_KEY`` configures more
     than one account, fails over to the next account (``keys.advance_key``) and deploys
     there. A single key => single account, no failover (unchanged behavior).
+
+    ``endpoint_kwargs`` overrides the volume/datacenter attachment (default: the full multi-DC
+    weight-cache fleet from ``weight_cache_endpoint_kwargs(spec)``). The preload driver passes a
+    SINGLE-DC volume+datacenter so the worker provably lands in that region and warms its volume. It
+    may be a dict OR a zero-arg FACTORY: under a multi-key pool the deploy retries on the next account
+    after a quota failover, and the SDK can stamp an account-scoped id onto a NetworkVolume object —
+    so a callable is re-invoked per account to build a FRESH volume (else the next account reuses the
+    first account's stale volume id and the single-DC preload fails).
     """
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
@@ -307,6 +418,13 @@ def deploy_train_endpoint(
             else:
                 kwargs["dependencies"] = resolve_worker_deps()
                 kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+            # Attach the multi-region weight cache (best-effort: {} when no cache / on any error).
+            # The endpoint is allowed across every cache DC, so it is NOT pinned to one region.
+            # A caller (preload) may override with a single-DC volume+datacenter.
+            # Resolve a factory FRESH on each account attempt (see docstring: avoids reusing a
+            # NetworkVolume the SDK stamped with the prior account's id across a quota failover).
+            override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
+            kwargs.update(override if override is not None else weight_cache_endpoint_kwargs(spec))
             ep = Endpoint(**kwargs)
             ep._qb_target = _train_body
             config = ep._build_resource_config()

@@ -92,6 +92,13 @@ def heartbeat(stage: str, **kw):
         "attempt": _w.ATTEMPT,
         **kw,
     }
+    # The datacenter the worker actually landed in (RunPod serverless sets RUNPOD_DC_ID) — a
+    # diagnostic so the control plane / logs show which region a run hit (the eager weight-cache fleet
+    # already has a volume in every storage DC). Empty/absent on non-RunPod (instance) workers and
+    # harmless; only emitted when present.
+    _dc = os.environ.get("RUNPOD_DC_ID") or ""
+    if _dc:
+        payload.setdefault("dc", _dc)
     os.makedirs("/tmp/hb", exist_ok=True)
     p = "/tmp/hb/heartbeat.json"
     # _HB_LOCK guards ONLY the fast local work (atomic write + _HB_LAST_UPLOAD + snapshot capture);

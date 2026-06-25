@@ -84,20 +84,136 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
     return f"{run_label_prefix(run_id)}-s{seed_s}-a{attempt_s}"
 
 
-def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: dict | None = None) -> dict:
+# The worker container path the per-region cache is bind-mounted at, and the HF cache under it. The
+# host mount differs per provider (Lambda NFS /lambda/nfs/<name>; Hyperstack block /mnt/flash-weights)
+# but the CONTAINER path is fixed, so HF_HOME is uniform regardless of substrate.
+CACHE_CONTAINER_MOUNT = "/weight-cache"
+CACHE_HF_HOME = f"{CACHE_CONTAINER_MOUNT}/hf-cache"
+# Sentinel file written onto a SUCCESSFULLY-mounted block-volume cache (by the cloud-init preamble),
+# so the in-container preload mount-check can tell a real mount from an empty Docker bind (a failed
+# attach). Lives on the device itself -> absent when the volume isn't actually mounted.
+CACHE_MOUNT_MARKER = ".flash-cache-mounted"
+
+
+def _cache_block_device_setup(payload: dict) -> str:
+    """Cloud-init preamble (block-volume providers, e.g. Hyperstack): wait for the attached volume's
+    block device, format it ONCE if it has no filesystem (NEVER reformat a populated cache — guarded
+    by ``blkid``), and mount it at the host ``cache_host_mount``. No-op for NFS providers (Lambda
+    auto-mounts) and for cold runs. Best-effort: if the device never appears / mount fails, the bind
+    falls back to an empty dir (a correct cold run), never a hard failure."""
+    if not payload.get("cache_block_device") or not payload.get("cache_host_mount"):
+        return ""
+    mount = payload["cache_host_mount"]
+    # The attached cache volume is provisioned at an EXACT known size, so pick the candidate disk by
+    # size (±20%) AND require that neither it nor any of its partitions is mounted. That excludes the
+    # boot disk (its partition is mounted at /) and any differently-sized ephemeral/local NVMe — so we
+    # never mkfs the wrong device. A warm cache disk (already ext4, unmounted) still matches, and the
+    # blkid guard keeps its data. If nothing matches, run cold (format nothing).
+    expect_bytes = int(payload.get("cache_size_gb") or 0) * 1000 * 1000 * 1000
+    marker = CACHE_MOUNT_MARKER
+    return f"""
+# --- weight-cache block volume: wait-for-device (size-matched, unmounted), format-if-new, mount ---
+echo "FLASH: waiting for the attached cache block device (~{payload.get('cache_size_gb')}GB)..."
+EXPECT_BYTES={expect_bytes}
+CACHE_DEV=""
+for i in $(seq 1 60); do
+  for d in $(lsblk -dpbn -o NAME,TYPE,SIZE | awk -v e="$EXPECT_BYTES" \
+      '$2=="disk" && e>0 {{lo=e*0.8; hi=e*1.2; if ($3+0>=lo && $3+0<=hi) print $1}}'); do
+    # Skip any disk with a mounted partition (boot/data disks in use) — only a free disk is ours.
+    if lsblk -pnr -o MOUNTPOINT "$d" | grep -q '[^[:space:]]'; then continue; fi
+    CACHE_DEV="$d"; break
+  done
+  [ -n "$CACHE_DEV" ] && break
+  sleep 5
+done
+if [ -n "$CACHE_DEV" ]; then
+  echo "FLASH: cache device $CACHE_DEV"
+  blkid "$CACHE_DEV" >/dev/null 2>&1 || mkfs.ext4 -q "$CACHE_DEV" || true   # format ONCE; never reformat a populated cache
+  mkdir -p '{mount}'
+  if mount "$CACHE_DEV" '{mount}' 2>/dev/null; then
+    # Sentinel written ONTO the mounted block device (not the underlying empty dir): it is only
+    # visible at the bind path inside the container when the REAL volume is mounted. The preload
+    # mount-check requires it, so a failed/absent attach (Docker binding an empty host dir) can't
+    # masquerade as a warm cache and silently warm ephemeral disk.
+    touch '{mount}/{marker}' 2>/dev/null || true
+  else
+    echo "FLASH: cache mount failed; running cold"
+  fi
+else
+  echo "FLASH: no matching cache block device appeared; running cold"
+fi
+"""
+
+
+def _cache_nfs_mount_check(payload: dict) -> str:
+    """Cloud-init preamble (NFS providers, e.g. Lambda): the platform auto-mounts the weight-cache
+    filesystem on the host at ``cache_host_mount`` — but ONLY if Lambda actually attached + readied it.
+    Docker's ``-v`` bind silently auto-CREATES a missing host dir, so a launch where the FS never
+    mounted would otherwise have the container warm an empty EPHEMERAL bind dir and report a false warm.
+    Verify the host path is a REAL mountpoint (an auto-created empty dir on the boot disk is not) and,
+    if so, drop the same sentinel the block-device path uses — ``run_preload`` requires it for the
+    cache, so a not-actually-mounted NFS fails the preload mount-check instead of warming throwaway
+    disk. No-op for block-volume providers (handled by ``_cache_block_device_setup``) and cold runs.
+    Best-effort: a training run still degrades to cold; only preload hard-requires the sentinel."""
+    if not payload.get("cache_host_mount") or payload.get("cache_block_device"):
+        return ""
+    mount = payload["cache_host_mount"]
+    marker = CACHE_MOUNT_MARKER
+    return f"""
+# --- weight-cache NFS mount: verify the platform actually mounted it, then drop the sentinel ---
+if mountpoint -q '{mount}'; then
+  echo "FLASH: weight-cache NFS mounted at {mount}"
+  touch '{mount}/{marker}' 2>/dev/null || true
+else
+  echo "FLASH: weight-cache NFS NOT mounted at {mount} (no sentinel; preload will refuse, train runs cold)"
+fi
+"""
+
+
+def build_payload(
+    spec,
+    seed: int,
+    attempt: int,
+    *,
+    arm: str,
+    runtime_secrets: dict | None = None,
+    cache_host_mount: str | None = None,
+    cache_block_device: bool = False,
+    mode: str | None = None,
+    models: list | None = None,
+) -> dict:
     """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
-    ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
-    from flash.envs.registry import worker_pip_for_env
-    from flash.providers.runpod.train import build_worker_env, chalk_extra_pip
+    ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name).
 
-    return {
+    ``cache_host_mount`` (set by the provider when it attaches a per-region weight cache) points
+    HF_HOME at the bind-mounted cache (``/weight-cache/hf-cache``) instead of stripping the
+    RunPod redirect; ``cache_block_device`` adds the format/mount preamble for block-volume providers.
+    """
+    from flash.envs.registry import worker_pip_for_env
+    from flash.providers.runpod.train import (
+        build_worker_env,
+        chalk_extra_pip,
+        strip_runpod_volume_env,
+    )
+
+    # Start from the shared env with the RunPod /runpod-volume redirect stripped (that mount is
+    # RunPod-only). If THIS provider attached a cache, point HF_HOME at the instance cache mount —
+    # but DON'T clobber a per-run [worker_env].HF_HOME the user set on purpose. build_worker_env
+    # merges [worker_env] LAST, so a user override survives the strip above (only /runpod-volume-
+    # rooted vars are stripped); on RunPod that override wins, so honor it here too for parity. We
+    # only install the cache path when HF_HOME is absent (i.e. the platform redirect was stripped and
+    # the user set nothing).
+    env = strip_runpod_volume_env(build_worker_env(spec, seed, runtime_secrets=runtime_secrets))
+    if cache_host_mount and not env.get("HF_HOME"):
+        env["HF_HOME"] = CACHE_HF_HOME
+    payload = {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
         "flash_arm": arm,
-        "env": build_worker_env(spec, seed, runtime_secrets=runtime_secrets),
+        "env": env,
         # The bootstrap pip-installs extra_pip for every job, so the per-run env wheel + the opt-in
         # chalk spec ride along here to reach default runs (mirrors runpod/jobs.submit_run).
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
@@ -106,6 +222,32 @@ def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: d
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
         "attempt": int(attempt),
     }
+    if cache_host_mount:
+        payload["cache_host_mount"] = cache_host_mount
+        # Carry the mount sentinel filename so the bootstrap's mount-check reads it from ONE source of
+        # truth (this constant) instead of re-hardcoding the literal — BOTH cloud-init preambles
+        # (_cache_block_device_setup for block volumes, _cache_nfs_mount_check for NFS) write the same
+        # CACHE_MOUNT_MARKER onto a verified-real mount, so the in-container preload check can tell a
+        # genuine mount from an empty Docker bind regardless of substrate.
+        payload["cache_mount_marker"] = CACHE_MOUNT_MARKER
+        if cache_block_device:
+            payload["cache_block_device"] = True
+            # The block-device preamble matches the attached volume by its EXACT provisioned size, so
+            # carry the runner-assigned size (falls back to the default cache size). Parse tolerantly
+            # via _volume_gb so a non-int / stale spec value ("0", "", "abc", bool) can't crash the
+            # instance bootstrap on this best-effort device-matching hint — it defaults instead.
+            from flash.runner import WEIGHT_CACHE_VOLUME_GB
+            from flash.spec import _volume_gb
+
+            payload["cache_size_gb"] = _volume_gb(
+                getattr(spec.gpu, "network_volume_gb", None), default=WEIGHT_CACHE_VOLUME_GB
+            )
+    # Preload (warm) mode: the bootstrap downloads ``models`` into the mounted cache and exits — no
+    # code fetch, no worker. Only meaningful with a cache attached (else there's nothing to warm).
+    if mode:
+        payload["mode"] = mode
+        payload["models"] = list(models or [])
+    return payload
 
 
 # Host helper: best-effort upload of the consolidated boot log to HF. Neither Lambda nor Hyperstack
@@ -227,6 +369,15 @@ def build_user_data(payload: dict, *, image: str) -> str:
     payload = _spill_large_spec_to_hf(payload)
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "_instance_bootstrap.py").read_text()
+    # Weight cache: the provider mounts its region-scoped persistent storage on the HOST at
+    # ``cache_host_mount`` (Lambda auto-mounts its NFS filesystem there; Hyperstack's preamble below
+    # formats+mounts the attached block device there). Bind it into the worker container at the FIXED
+    # ``/weight-cache`` so the worker's HF_HOME=/weight-cache/hf-cache (set in build_payload) persists
+    # the model download across runs in this region. Absent -> no bind (cold run).
+    cache_host_mount = payload.get("cache_host_mount")
+    # Single-quote the host path in the docker -v (defensive; the path is a controlled constant).
+    cache_bind = f"-v '{cache_host_mount}':{CACHE_CONTAINER_MOUNT} \\\n  " if cache_host_mount else ""
+    cache_setup = _cache_block_device_setup(payload) + _cache_nfs_mount_check(payload)
     return f"""#!/bin/bash
 # Flash instance worker (generated by flash.providers._instance.build_user_data; arm={payload.get('flash_arm')})
 set -x
@@ -256,6 +407,7 @@ for i in $(seq 1 100); do
 done
 docker info >/dev/null 2>&1 || fail "docker never became ready"
 nvidia-smi >/dev/null 2>&1 || fail "gpu never became ready"
+{cache_setup}
 # Pull with retries (the image is large; a transient registry blip must not fail the run). On total
 # failure, write a RETRYABLE marker and exit NOW instead of leaving a billed box idling the whole
 # setup grace with no DONE/marker.
@@ -265,7 +417,7 @@ for i in 1 2 3 4 5; do docker pull "$IMAGE" && {{ PULLED=1; break; }}; echo "FLA
 # Run the worker container detached so cloud-init completes promptly; completion is signaled via the
 # worker's HF artifacts (DONE/metrics.json/marker), never a return channel from the box.
 docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
-  -v /opt/flash:/root/flash -w /root/flash \\
+  -v /opt/flash:/root/flash {cache_bind}-w /root/flash \\
   "$IMAGE" python /root/flash/bootstrap.py || fail "docker run failed"
 sleep 5
 # The container must be running OR have already exited CLEANLY. The bootstrap returns 0 ONLY on
