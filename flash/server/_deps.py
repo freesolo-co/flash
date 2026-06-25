@@ -45,7 +45,15 @@ def owned_run(run_id: str, key: dict):
 
 def _parse_spec(payload: dict, run_id: str) -> JobSpec:
     spec_raw = payload.get("spec") or {}
+    # A non-object JSON value for `spec` (list/string/number) has no `.get`, so guard before
+    # touching it — a bad payload is a 400 request-validation error, not an unhandled 500.
+    if not isinstance(spec_raw, dict):
+        raise HTTPException(status_code=400, detail="spec must be a JSON object")
     env_raw = spec_raw.get("environment") or {}
+    if not isinstance(env_raw, dict):
+        raise HTTPException(
+            status_code=400, detail="spec.environment must be a JSON object"
+        )
     if env_raw.get("path"):
         raise HTTPException(
             status_code=400,
