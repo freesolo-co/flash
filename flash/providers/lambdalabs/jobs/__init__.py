@@ -679,6 +679,14 @@ def sweep_orphans(
         name = str(inst.get("name") or "")
         if not name.startswith("flash-"):
             continue
+        # Warm/preload boxes (``flash-preload-...``) are driver-owned: launched by
+        # preload.warm_instances (mode="preload"), NEVER persisted in the run DB (so never in
+        # ``active``), and self-terminated in _warm_one_instance's ``finally`` (and by startup
+        # recover_runs). A catalog warm can outlast this ~10-min sweep, so reaping them by the bare
+        # ``flash-`` prefix would kill an in-progress preload mid-download; exempt them. Billing stays
+        # bounded by their own teardown.
+        if name.startswith("flash-preload-"):
+            continue
         # Match on the name boundary, not a raw string prefix: a live run's prefix must EQUAL the
         # name or be followed by the ``-s`` seed boundary, so ``flash-100`` can't shield
         # ``flash-1000-...`` (or vice versa).

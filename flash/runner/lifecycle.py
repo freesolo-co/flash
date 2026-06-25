@@ -185,6 +185,17 @@ def _submit_seed_supervised(
     # Sticky: once a no-capacity failure shows the weight-cache datacenter set is starved, drop the
     # cache (volume) for every remaining attempt so they run on the unrestricted all-DC pool.
     drop_weight_cache = False
+    # The platform auto-attaches the SHARED weight cache (runner._assign_weight_cache_volume), so its
+    # endpoint-pinning DC-set restriction must not cost the USER a GPU-walk retry. Grant ONE extra,
+    # cache-less fallback attempt — consumed ONLY by the cache-drop transition below (the stop check
+    # gates the bonus on ``first_cache_drop``, never on a plain GPU walk) — so a no_capacity/poll_error
+    # the cache's datacenter set could have caused always earns one unrestricted cross-region retry,
+    # even at ``max_retries == 0`` (where the auto-cache would otherwise fail a run a cache-less launch
+    # could have won). A non-shared per-org/custom volume is the user's own choice and earns no bonus.
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    started_with_shared_cache = getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
+    cache_fallback_attempts = 1 if started_with_shared_cache else 0
     # Cross-provider retry memory. ``failed_providers`` are the providers that consumed an
     # infra-shaped attempt; ``tried_classes`` the exact (provider, gpu) pairs already attempted.
     # Both grow only when an attempt that ACTUALLY provisioned a class lost it to an infra failure
@@ -193,7 +204,7 @@ def _submit_seed_supervised(
     # retry before walking classes within it.
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
-    for attempt in range(max_retries + 1):
+    for attempt in range(max_retries + 1 + cache_fallback_attempts):
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
@@ -359,8 +370,6 @@ def _submit_seed_supervised(
             file=log,
             flush=True,
         )
-        if not infra_shaped or attempt >= max_retries:
-            break
         # Best-effort cache: if a VOLUME-BACKED attempt failed in a way the cache could have caused
         # — no_capacity (the cache restricts the endpoint to its DC set) or a deploy/submit
         # poll_error (e.g. the SDK failing to create/attach a volume) — drop the cache so the run
@@ -376,8 +385,8 @@ def _submit_seed_supervised(
         # Only the SHARED platform cache triggers the cache-drop retry; a non-shared per-org/custom
         # volume is the intended escape-hatch isolation (runner._assign_weight_cache_volume) and must
         # NOT be stripped on no_capacity — gate on the exact shared name, not any truthy volume.
-        from flash.runner import WEIGHT_CACHE_VOLUME_NAME
-
+        # Computed BEFORE the budget stop below so the cache-drop fallback can claim its reserved
+        # bonus attempt even when ``attempt >= max_retries`` (see cache_fallback_attempts above).
         run_had_cache = bool(
             chosen is not None
             and chosen.provider == "runpod"
@@ -388,6 +397,14 @@ def _submit_seed_supervised(
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
         )
+        if not infra_shaped:
+            break
+        # Stop when the GPU-walk retry budget is exhausted — UNLESS a cache-drop fallback is still
+        # available. The bonus attempt granted above is reserved for exactly this transition; once the
+        # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
+        # and the loop cannot spin past its one extra cache-less attempt.
+        if attempt >= max_retries and not first_cache_drop:
+            break
         if first_cache_drop:
             drop_weight_cache = True
             # Do NOT advance the GPU walk on this transition: the next attempt should retry the SAME

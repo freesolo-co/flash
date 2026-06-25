@@ -984,6 +984,29 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
     assert out == ["i-2"]
 
 
+def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
+    """Warm/preload boxes (``flash-preload-...``) are driver-owned: launched by
+    preload.warm_instances, never persisted in the run DB (so never in the active set), and
+    self-terminated by the warm driver. The periodic sweep must NOT reap them by the bare
+    ``flash-`` prefix — a catalog warm can outlast the ~10-min sweep and would be killed mid-download.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    instances = [
+        {"id": "i-1", "name": "flash-preload-lambda-us-east-1-abcdef-s0-a0"},  # warm box -> KEEP
+        {"id": "i-2", "name": "flash-1700-cccc-s0-a0"},  # genuine orphan -> terminate
+    ]
+    terminated = []
+    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+    )
+    out = jobs.sweep_orphans(active_labels=set())  # neither is a tracked active run
+    assert out == ["i-2"]
+    assert terminated == ["i-2"]
+
+
 # ---------------------------------------------------------------------------
 # provider object dispatch + capacity-aware allocation
 # ---------------------------------------------------------------------------

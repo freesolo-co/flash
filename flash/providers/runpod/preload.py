@@ -41,6 +41,7 @@ from flash._logging import get_logger
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.jobs import (
     build_function_input,
+    decode_output,
     deploy_train_endpoint,
     make_hf_text_reader,
     weight_cache_datacenters,
@@ -165,7 +166,11 @@ def _poll_until_done(
         st = runpod_api.job_status(endpoint_id, job_id)
         status = (st or {}).get("status")
         if status in _TERMINAL_OK:
-            return (st or {}).get("output") or {}
+            # RunPod may surface a completed job's ``output`` as a JSON STRING (not a dict); decode it
+            # to the handler's metrics dict (the same helper the normal poller uses) so the caller's
+            # ``result.get(...)`` never crashes on a str and mis-reports a warmed region as failed.
+            output = (st or {}).get("output")
+            return (decode_output(output) or {}) if output else {}
         if status in _TERMINAL_FAIL:
             raise RuntimeError(f"preload job {job_id} ended {status}: {(st or {}).get('error')}")
         time.sleep(poll_interval_s)
@@ -221,10 +226,6 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     silently nuking every cache there would be a destructive footgun.
     """
 
-    from runpod_flash.core.api.runpod import RunpodRestClient
-    from runpod_flash.core.resources.datacenter import DataCenter
-    from runpod_flash.core.urls import RUNPOD_REST_API_URL
-
     from flash.providers.runpod import keys as rp_keys
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
@@ -240,6 +241,13 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
         # missing-key behavior: log and return nothing reclaimed.
         logger.info("teardown: RUNPOD_API_KEY not configured — skipping RunPod cache teardown")
         return []
+    # Import the runpod_flash SDK only AFTER the empty-scope / no-key early returns: on an
+    # instance-only control plane the SDK may be unavailable, and importing it at the top would defeat
+    # the intended best-effort no-op (a missing-key teardown must not raise on an absent SDK).
+    from runpod_flash.core.api.runpod import RunpodRestClient
+    from runpod_flash.core.resources.datacenter import DataCenter
+    from runpod_flash.core.urls import RUNPOD_REST_API_URL
+
     dc_ids = datacenters if datacenters else [dc.value for dc in weight_cache_datacenters()]
     targets = {
         weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, DataCenter.from_string(d)) for d in dc_ids
@@ -463,6 +471,16 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
                 except Exception:
                     fail = {}
                 if not fail.get("ok", True):
+                    # The completion file (preload_result.json) is authoritative when present: a
+                    # partial/failed-download run uploads it AND THEN writes the ok=false fail marker,
+                    # so the marker can be visible an iteration before the completion file. Re-check
+                    # the completion file ONE more time; if it's now there, fall through to the normal
+                    # completion handling (-> "partial"/"ok") instead of mislabeling a completed
+                    # (partial) preload as an early box death. Only the genuinely-still-absent case
+                    # returns the early-death error.
+                    text = reader(force=True)
+                    if text:
+                        break
                     return {"provider": provider, "region": region, "status": "error",
                             "error": f"box failed early: {fail.get('error') or 'see boot log'}"}
             time.sleep(max(5.0, poll_interval_s))
@@ -506,10 +524,17 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             "with write access before warming (refusing to launch paid GPUs that can't report)."
         ) from exc
 
+    from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs as hs_jobs
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
     mods = {"lambda": lambda_jobs, "hyperstack": hs_jobs}
+    # Per-provider "can this region host the cache?" predicate. Skipping a cache-incapable region (e.g.
+    # Hyperstack CANADA-2, excluded from cache_regions()) BEFORE launching avoids burning a paid GPU
+    # whose preload just reports "weight cache not supported in region" — which main() then counts as a
+    # failed warm, so the default --warm-instances would fail even when every cache-capable region
+    # succeeded. Lambda exposes no such filter (every region hosts filesystems), so it stays unfiltered.
+    region_ok = {"hyperstack": hs_api.region_supports_cache}
     # One launch per region (dedupe so two candidates in a region don't double-launch — block volumes
     # are single-attach anyway). Each entry carries its provider's resolved GPU (an explicit override
     # applies to all; otherwise the per-provider default — so A10 doesn't silently skip Hyperstack).
@@ -519,6 +544,7 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
         if jobs_mod is None:
             continue
         provider_gpu = gpu or _PRELOAD_GPU_BY_PROVIDER.get(provider, _PRELOAD_INSTANCE_GPU)
+        cache_capable = region_ok.get(provider)
         seen_regions: set = set()
         try:
             candidates = jobs_mod.usable_instances(provider_gpu)
@@ -527,6 +553,12 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             continue
         for c in candidates:
             if c.region in seen_regions:
+                continue
+            # Skip regions that can't host the cache for this provider — the preload would just report
+            # "weight cache not supported in region" and be counted as a failed warm.
+            if cache_capable is not None and not cache_capable(c.region):
+                logger.info("warm %s: skipping cache-incapable region %s", provider, c.region)
+                seen_regions.add(c.region)
                 continue
             seen_regions.add(c.region)
             targets.append((provider, jobs_mod, c, provider_gpu))
