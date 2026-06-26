@@ -178,6 +178,16 @@ def prefetch_model(model_id: str) -> float:
 
     def _prefetch_heartbeat() -> None:
         while not _prefetch_done.wait(30.0):
+            # Re-check after wait() returns: if the download finished in the gap between wait()
+            # returning False and here, do NOT emit. A model_prefetching that STARTS after
+            # _prefetch_done is set could otherwise land after the terminal model_prefetched (a stale
+            # stage the control plane would briefly see post-download). With this guard the only
+            # prefetching that can still be in flight when model_prefetched is emitted is one that
+            # was already past this point — and heartbeat()'s _HB_UPLOAD_LOCK serializes uploads, so
+            # that in-flight upload is ordered strictly BEFORE model_prefetched's. That keeps
+            # model_prefetched the last prefetch stage WITHOUT an unbounded join below.
+            if _prefetch_done.is_set():
+                return
             # nvidia-smi-only (include_torch=False): the GPU isn't in use yet and torch telemetry
             # could block; this just needs to prove the worker is alive and re-arm the watchdog.
             _w.heartbeat(
@@ -200,14 +210,16 @@ def prefetch_model(model_id: str) -> float:
         # the normal from_pretrained path the trainer uses next.
         print("prefetch_model warn:", e)
     finally:
-        # Join with NO timeout so the side thread is provably done before we emit model_prefetched:
-        # a bounded join could return while it's still inside heartbeat("model_prefetching"), letting
-        # that stale stage overwrite heartbeat.json / land its HF upload AFTER model_prefetched (the
-        # control plane would then see "prefetching" again post-download). After _prefetch_done.set()
-        # the loop exits within at most one more heartbeat (wait() returns True on the next check), so
-        # this blocks only briefly — and model_prefetched is guaranteed the strictly-later stage.
+        # BOUNDED join: stage ordering is enforced by the is_set() guard above + heartbeat()'s
+        # _HB_UPLOAD_LOCK (which serializes any already-in-flight model_prefetching upload before
+        # model_prefetched's), NOT by waiting here, so this join only needs to reap the daemon
+        # thread — it must NOT be unbounded. An unbounded join would wedge the worker indefinitely
+        # if the side thread were stuck inside heartbeat()'s HF upload (hf_upload_file has no hard
+        # timeout): the model download would have completed yet the worker would hang in join().
+        # The timeout caps that to a brief reap; in the (rare) case it expires mid-upload, the side
+        # thread holds _HB_UPLOAD_LOCK so model_prefetched's upload still lands strictly after it.
         _prefetch_done.set()
-        _prefetch_hb.join()
+        _prefetch_hb.join(timeout=10.0)
     secs = round(time.time() - t0, 1)
     _w.heartbeat(
         "model_prefetched",

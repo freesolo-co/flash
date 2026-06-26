@@ -184,11 +184,16 @@ def test_prefetch_model_heartbeats_during_download():
     assert "model_prefetching" in stages, f"expected a model_prefetching heartbeat, got {stages}"
 
 
-def test_prefetch_model_joins_heartbeat_without_timeout():
-    """The prefetch heartbeat thread must be joined with NO timeout before emitting model_prefetched.
-    A bounded join could return while the side thread is still inside heartbeat('model_prefetching'),
-    letting that stale stage overwrite heartbeat.json / land its upload AFTER model_prefetched (the
-    control plane would then see 'prefetching' again post-download)."""
+def test_prefetch_model_joins_heartbeat_with_a_bounded_timeout():
+    """The prefetch heartbeat thread must be joined with a BOUNDED timeout, never unbounded.
+
+    An unbounded ``join()`` would wedge the worker indefinitely if the side thread were stuck inside
+    ``heartbeat()``'s HF upload (``hf_upload_file`` -> ``huggingface_hub.upload_file`` has no hard
+    timeout): the model download would have completed, yet the main thread would hang here forever.
+    Ordering of ``model_prefetched`` after the last ``model_prefetching`` does NOT depend on this
+    join — it is guaranteed by the ``is_set()`` guard in the loop (asserted below) plus heartbeat()'s
+    ``_HB_UPLOAD_LOCK`` (which serializes any in-flight upload before ``model_prefetched``'s) — so the
+    join only reaps the daemon thread and must stay bounded."""
     from flash.engine.worker import hf
 
     tree = ast.parse(inspect.getsource(hf.prefetch_model))
@@ -199,13 +204,40 @@ def test_prefetch_model_joins_heartbeat_without_timeout():
         and isinstance(n.func, ast.Attribute)
         and n.func.attr == "join"
     ]
-    assert joins, "prefetch_model no longer joins its heartbeat thread before model_prefetched"
+    assert joins, "prefetch_model no longer joins its heartbeat thread"
     for call in joins:
-        assert not call.args, "prefetch_model heartbeat join must not pass a positional timeout"
-        assert not any(kw.arg == "timeout" for kw in call.keywords), (
-            "prefetch_model must join() the heartbeat thread WITHOUT a timeout, else a stale "
-            "model_prefetching heartbeat can race past model_prefetched"
+        # A bounded join is expressed as a positional timeout (join(10.0)) or join(timeout=...).
+        positional = call.args and isinstance(call.args[0], ast.Constant)
+        keyworded = any(kw.arg == "timeout" for kw in call.keywords)
+        assert positional or keyworded, (
+            "prefetch_model must join() its heartbeat thread with a BOUNDED timeout — an unbounded "
+            "join can wedge the worker if the side thread is stuck inside an HF upload"
         )
+
+
+def test_prefetch_heartbeat_skips_emit_once_done_is_set():
+    """The ordering guarantee that replaces the (removed) unbounded join: the side thread must
+    re-check ``_prefetch_done`` after its wait and RETURN without emitting once the download is done,
+    so no ``model_prefetching`` can START after ``model_prefetched`` and overtake it on HF."""
+    from flash.engine.worker import hf
+
+    node = _inner_func_node(hf.prefetch_model, "_prefetch_heartbeat")
+    assert node is not None, "prefetch_model no longer defines _prefetch_heartbeat"
+
+    # Find the loop body and assert it guards on _prefetch_done.is_set() BEFORE the heartbeat call.
+    guards = [
+        n
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "is_set"
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "_prefetch_done"
+    ]
+    assert guards, (
+        "_prefetch_heartbeat must re-check _prefetch_done.is_set() after waking, then return without "
+        "emitting model_prefetching — otherwise a stale stage can race past model_prefetched"
+    )
 
 
 # --------------------------------------------------------------------------------------------
