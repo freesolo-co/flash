@@ -443,6 +443,66 @@ def test_record_billing_state_preserves_legacy_terminal_timestamp(monkeypatch, t
     assert st.billing_state == "failed"
 
 
+def test_record_billing_state_preserves_legacy_deployed_timestamp(monkeypatch, tmp_path):
+    """codex P2: `deployed` is non-terminal but reconcile treats it as reconcilable
+    (reconcile._RECONCILABLE_STATES = TERMINAL_STATES | {deployed}), and _terminal_ts falls back to
+    updated_at when finished_at is None. So a legacy `deployed` run with finished_at=None must ALSO
+    have its teardown time preserved when a billing retry writes its fields -- otherwise the retry
+    time becomes the effective run end, delaying reconciliation and inflating flat-rate cost."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    teardown_ts = 2_000_000.0  # training teardown, frozen in updated_at before the deploy/retry
+    runner._save_status(
+        runner.RunStatus(
+            run_id="legacy-dep",
+            state="deployed",
+            spec=_spec().to_dict(),
+            cost_usd=1.0,
+            updated_at=teardown_ts,
+            finished_at=None,  # legacy: never stamped, and `deployed` isn't in TERMINAL_STATES
+            billing_context={"org_id": "org-A"},
+            billing_state="failed",
+        )
+    )
+
+    runner.record_billing_state("legacy-dep", billing_state="charged", billing_charge={"a": 1})
+    st = runner.get_status("legacy-dep")
+    assert st.state == "deployed"  # state untouched
+    assert st.finished_at == teardown_ts  # teardown preserved, not advanced to the retry time
+    assert st.updated_at > teardown_ts
+    assert st.billing_state == "charged"
+
+
+def test_record_billing_state_skips_backfill_once_reconciled(monkeypatch, tmp_path):
+    """A run already reconciled has updated_at == reconcile time (not teardown), so backfilling
+    finished_at from it would freeze a wrong, later run end. Match mark_deployed: skip the backfill
+    once reconciled_at is set (a reconciled run is never re-billed, so leaving finished_at None is
+    harmless)."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    reconcile_ts = 3_000_000.0  # updated_at was moved here by record_realized_cost, NOT teardown
+    runner._save_status(
+        runner.RunStatus(
+            run_id="reconciled",
+            state="done",
+            spec=_spec().to_dict(),
+            cost_usd=1.0,
+            updated_at=reconcile_ts,
+            finished_at=None,
+            reconciled_at=reconcile_ts,
+            billing_context={"org_id": "org-A"},
+            billing_state="pending",
+        )
+    )
+
+    runner.record_billing_state("reconciled", billing_state="failed", billing_error="blip")
+    st = runner.get_status("reconciled")
+    assert st.finished_at is None  # NOT backfilled from the reconcile-time updated_at
+    assert st.billing_state == "failed"
+
+
 def test_record_billing_state_never_downgrades_charged(monkeypatch, tmp_path):
     """codex P2: a racing duplicate attempt that times out / hits a transient BillingError AFTER
     another attempt already landed `charged` must NOT flip the local state back to `failed`/`charging`

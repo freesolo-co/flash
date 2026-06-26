@@ -640,6 +640,15 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
 # Billing fields that are field-only metadata, never a run-state transition.
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
 
+# States whose `finished_at` (training-teardown time) must be preserved across a later field-only
+# write that bumps `updated_at`. This is exactly the set reconciliation costs by run end: the terminal
+# states PLUS `deployed` -- a deployed run is non-terminal but its training is finished and its cost is
+# final, so reconcile treats it as reconcilable and falls back to `updated_at` when `finished_at` is
+# missing (flash/server/reconcile.py: _RECONCILABLE_STATES / _terminal_ts). `dry_run` is terminal but
+# free, so preserving its timestamp is harmless and keeps this aligned with TERMINAL_STATES. Mirrored
+# here (not imported) because reconcile imports runner, not the reverse.
+_FINISHED_AT_PRESERVED_STATES = TERMINAL_STATES | {"deployed"}
+
 
 def record_billing_state(run_id: str, **fields) -> None:
     """Persist the customer-billing fields (billing_state/billing_error/billing_charge) WITHOUT
@@ -656,11 +665,14 @@ def record_billing_state(run_id: str, **fields) -> None:
       transient BillingError after another attempt already landed the charge), the whole write is a
       no-op. The backend is idempotent by runId, so the charge stands; the local state must not be
       flipped back to ``failed``/``charging`` and re-retried.
-    - PRESERVE the terminal timestamp: a legacy ALREADY-terminal run with ``finished_at is None`` must
-      backfill it from the PRE-update ``updated_at`` (the prior persisted terminal/teardown time)
-      before this write bumps ``updated_at``, exactly like ``_update`` does (see its same-terminal
-      backfill). Otherwise reconcile._terminal_ts (which falls back to updated_at when finished_at is
-      missing) would treat this billing-retry time as the run end and over-bill flat-rate remotes."""
+    - PRESERVE the teardown timestamp: a legacy run in a RECONCILED state with ``finished_at is None``
+      must backfill it from the PRE-update ``updated_at`` (the prior persisted teardown time) before
+      this write bumps ``updated_at``. This covers the terminal states AND ``deployed`` (non-terminal
+      but reconciled -- see _FINISHED_AT_PRESERVED_STATES). Otherwise reconcile._terminal_ts (which
+      falls back to updated_at when finished_at is missing) would treat this billing-retry time as the
+      run end, delaying/windowing reconciliation and over-billing flat-rate remotes. Skipped once
+      ``reconciled_at`` is set (matching mark_deployed): by then ``updated_at`` is the reconcile time,
+      not teardown, so freezing it would be wrong -- and a reconciled run is never re-billed anyway."""
     bad = set(fields) - _BILLING_FIELDS
     if bad:
         raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
@@ -677,9 +689,15 @@ def record_billing_state(run_id: str, **fields) -> None:
             and new_billing_state != "charged"
         ):
             return
-        # Mirror _update's same-terminal finished_at backfill: freeze the prior terminal time before
-        # this field-only write advances updated_at, so a billing retry never shifts the run end.
-        if status.state in TERMINAL_STATES and status.finished_at is None:
+        # Freeze the prior teardown time before this field-only write advances updated_at, so a
+        # billing retry never shifts the run end reconcile reads. Covers terminal states AND the
+        # reconciled-but-non-terminal `deployed` (see _FINISHED_AT_PRESERVED_STATES); skipped once
+        # reconciled (updated_at is then the reconcile time, not teardown).
+        if (
+            status.state in _FINISHED_AT_PRESERVED_STATES
+            and status.finished_at is None
+            and not status.reconciled_at
+        ):
             status.finished_at = status.updated_at
         for key, value in fields.items():
             setattr(status, key, value)
