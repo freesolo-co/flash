@@ -655,6 +655,7 @@ def poll_job(
     start = time.time()
     last_status = None
     last_hb_key = None
+    last_hb_ts = 0.0  # the worker-ts of the last heartbeat we COUNTED as progress (monotonic gate)
     last_progress = time.time()
     seen_heartbeat = False
     last_health_probe = 0.0
@@ -792,11 +793,21 @@ def poll_job(
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
-            last_progress = time.time()
-            # Only a training-phase heartbeat means cold-start setup is done and we
-            # can switch to the tight window; setup heartbeats keep the grace budget.
-            if stage not in SETUP_HEARTBEAT_STAGES:
-                seen_heartbeat = True
+            # Gate progress on the heartbeat's OWN ts (key = (stage, step, ts, attempt)) ADVANCING: a
+            # stale heartbeat that lands late — a newer one skipped by the bounded _HB_UPLOAD_LOCK
+            # while an older slow upload finishes — carries an OLDER ts and must NOT buy a fresh stall
+            # window for a genuinely stuck worker. Unlike Lambda/Hyperstack we keep crediting the
+            # control-plane poll time to last_progress (RunPod's stall math stays in one clock, no
+            # worker/control-plane skew); only the DECISION to count it as progress is ts-monotonic.
+            hb_ts = new_key[2] if new_key else None
+            if hb_ts is None or hb_ts > last_hb_ts:
+                if hb_ts is not None:
+                    last_hb_ts = hb_ts
+                last_progress = time.time()
+                # Only a training-phase heartbeat means cold-start setup is done and we
+                # can switch to the tight window; setup heartbeats keep the grace budget.
+                if stage not in SETUP_HEARTBEAT_STAGES:
+                    seen_heartbeat = True
         # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
         # but only when a heartbeat_reader lets us tell setup from training; without one we
         # can't, so stay on stall_after_s (no regression).

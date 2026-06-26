@@ -545,6 +545,50 @@ def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
     assert "limit 5000s" in res.detail
 
 
+def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
+    # A newer heartbeat can be skipped (bounded _HB_UPLOAD_LOCK) while an OLDER one lands late,
+    # changing heartbeat.json content but carrying an OLDER ts. That stale heartbeat must NOT buy a
+    # fresh stall window for a genuinely stuck worker — progress is gated on the heartbeat ts
+    # ADVANCING, not on the content merely changing. Proven by ABSOLUTE simulated stall time: a run
+    # whose 2nd heartbeat is STALE stalls at the SAME time as a run with no 2nd heartbeat (stale ==
+    # no-op), while a run whose 2nd heartbeat is FRESH stalls strictly LATER (it reset progress).
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    def _stall_abs_time(second_hb):
+        state = {"t": 0.0}
+
+        def _time():
+            state["t"] += 100.0
+            return state["t"]
+
+        monkeypatch.setattr(jobs.time, "time", _time)
+        seq = [{"stage": "train", "step": 5, "ts": 1000}]
+        if second_hb is not None:
+            seq.append(second_hb)
+        hbs = iter(seq)
+        res = jobs.poll_job(
+            jobs.JobHandle("ep", "name", "job"),
+            interval_s=0,
+            heartbeat_reader=lambda: next(hbs, None),
+            stall_after_s=150.0,
+            setup_grace_s=5000.0,
+        )
+        assert res.failure == "stalled"
+        assert "during training" in res.detail  # the fresh ts=1000 hb tightened the window
+        return state["t"]  # absolute simulated time when it stalled
+
+    none_run = _stall_abs_time(None)
+    stale_run = _stall_abs_time({"stage": "train", "step": 4, "ts": 500})  # OLDER ts -> stale
+    fresh_run = _stall_abs_time({"stage": "train", "step": 6, "ts": 2000})  # newer ts -> real progress
+
+    assert stale_run == none_run, "a stale late heartbeat must be a no-op for progress"
+    assert fresh_run > none_run, "a genuinely newer heartbeat does reset progress (stalls later)"
+
+
 def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
     # A worker stuck UNHEALTHY while IN_QUEUE (e.g. a mutable image tag republished mid-pull) won't
     # self-recover, so poll_job must fail fast on unhealthy_grace_s and NOT burn the full
