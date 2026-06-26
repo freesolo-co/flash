@@ -36,6 +36,11 @@ def test_think_token_count_counts_the_think_span() -> None:
     assert w.think_token_count("pre <think>a b c d", tok) == 4
     assert w.think_token_count(None, tok) == 0
     assert w.think_token_count("<think></think>x", tok) == 0
+    # prompt-opened hybrid thinking: the chat template appended <think> to the PROMPT, so the
+    # completion starts mid-reasoning with only the closing </think>. The reasoning is everything
+    # before that close (without this the penalty no-ops on the common enable_thinking=true path).
+    assert w.think_token_count("a b c d</think>{\"x\": 1}", tok) == 4
+    assert w.think_token_count("</think>just the answer", tok) == 0
 
 
 def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:

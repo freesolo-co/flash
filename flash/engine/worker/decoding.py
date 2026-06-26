@@ -49,15 +49,29 @@ def graded_text(completion: str | None) -> str | None:
 
 
 def think_token_count(completion: str | None, tokenizer) -> int:
-    """Number of tokens inside the completion's <think>...</think> span (0 if none).
+    """Number of reasoning tokens in the completion (0 if none).
 
     Used for the thinking-length reward deduction: long reasoning is penalized in
     proportion to the tokens it spent, mirroring the SDK's thinking_length_penalty_coef.
+
+    Handles BOTH ways a hybrid-thinking model surfaces its reasoning:
+      1. Self-contained block — the completion holds the whole ``<think>...</think>`` span
+         (the model opened and closed the tag itself).
+      2. Prompt-opened block — the chat template appended ``<think>\\n`` to the *prompt*
+         (Qwen3.5 / MiniCPM hybrid thinking with ``enable_thinking=true``), so the
+         completion starts mid-reasoning and only carries the closing ``</think>``. The
+         reasoning is then everything before the first ``</think>``.
+    Without case 2 the penalty silently no-ops for the common enable_thinking=true path.
     """
-    if not completion or "<think>" not in completion:
+    if not completion:
         return 0
-    after = completion.split("<think>", 1)[1]
-    think_text = after.split("</think>", 1)[0] if "</think>" in after else after
+    if "<think>" in completion:  # case 1: model emitted the opening tag
+        after = completion.split("<think>", 1)[1]
+        think_text = after.split("</think>", 1)[0] if "</think>" in after else after
+    elif "</think>" in completion:  # case 2: prompt opened <think>; count up to the close
+        think_text = completion.split("</think>", 1)[0]
+    else:
+        return 0
     if not think_text:
         return 0
     return len(tokenizer(think_text, add_special_tokens=False)["input_ids"])
