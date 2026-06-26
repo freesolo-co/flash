@@ -702,8 +702,8 @@ def run_rl():
     # nvidia-smi-only path (include_torch=False): it runs out-of-process with an 8s timeout and
     # releases the GIL during the subprocess wait, so it keeps ticking through a CUDA-busy init. The
     # torch memory numbers are meaningless here anyway (the model isn't built yet). If even THIS
-    # stops ticking, the main thread is holding the GIL in a C extension (a true wedge) -> that is
-    # what the stall watchdog (heartbeat.py) is for.
+    # stops ticking, the main thread is holding the GIL in a C extension (a true wedge) -> no heartbeat
+    # lands at all and the provider's stall detection catches it (init_liveness_heartbeat, heartbeat.py).
     with init_liveness_heartbeat("rl_initializing"):
         trainer = GRPOTrainer(
             model=init_model,

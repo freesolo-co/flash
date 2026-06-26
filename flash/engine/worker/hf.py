@@ -232,12 +232,12 @@ def _link_base_model_into_ephemeral_cache(model_id: str, shared_hub: str) -> Non
 
 
 # No new download bytes for this long => snapshot_download is WEDGED (not slow): the prefetch liveness
-# stops pinging so the stall watchdog / provider setup-stall fire instead of masking a stuck transfer
+# stops pinging (dumping stacks) so the provider setup-stall fires instead of masking a stuck transfer
 # to the job wall-clock. Generous — a live transfer moves SOME bytes well within this even on a slow
 # link. Needed because a NON-raising wedge (a stuck cache filelock, an NFS/bind-mount I/O stall on the
 # shared weight mount, an endless retry) never returns from snapshot_download, so the plain liveness
-# ping would re-arm BOTH the watchdog and (model_prefetching ∈ SETUP_HEARTBEAT_STAGES) the provider
-# setup-grace forever — there is no other backstop short of the wall-clock timeout.
+# ping would refresh the provider setup-grace (model_prefetching ∈ SETUP_HEARTBEAT_STAGES) forever —
+# there is no other backstop short of the wall-clock timeout.
 _MAX_PREFETCH_SILENCE_S = 600.0
 
 
@@ -290,7 +290,7 @@ def prefetch_model(model_id: str) -> float:
     shared_hub = _shared_weight_cache_dir()
     t0 = time.time()
     # snapshot_download blocks with NO heartbeat until it returns, but a cold cache can pull tens of GB
-    # over many minutes — longer than the stall watchdog AND the provider setup grace — so a silent
+    # over many minutes — longer than the provider setup grace — so a silent
     # download would look like a hang and self-kill a HEALTHY cold start. Keep a model_prefetching
     # heartbeat alive, gated on downloaded-byte GROWTH (in the dir the download actually writes to, so a
     # genuinely WEDGED transfer still yields to the stall path). See heartbeat.liveness_heartbeat.

@@ -234,11 +234,11 @@ def make_sft_heartbeat_callback():
 # Liveness heartbeat for a long blocking call on the MAIN thread. A slow-but-LIVE phase — cold vLLM
 # build / *Trainer.__init__, a multi-GB model prefetch, the first GRPO step (vLLM rollout warmup +
 # backward, ~17 min observed) — emits no heartbeat while it runs and would look like a hang to the
-# default-on stall watchdog and the provider setup grace. ``liveness_heartbeat`` runs a daemon next
-# to the call that pings ``stage`` to prove the worker is alive.
+# provider's stall detection. ``liveness_heartbeat`` runs a daemon next to the call that pings
+# ``stage`` to prove the worker is alive.
 #
-# A liveness ping re-arms the watchdog and refreshes the provider timestamp, so emitting
-# unconditionally would also mask a GENUINELY stuck call forever. When the phase exposes a monotonic
+# A liveness ping refreshes the provider's heartbeat timestamp, so emitting unconditionally would
+# mask a GENUINELY stuck call forever. When the phase exposes a monotonic
 # progress counter (downloaded bytes, optimizer ``global_step``), pass ``progress`` + ``max_silence_s``
 # and the daemon STOPS pinging once it hasn't advanced for that long, handing a real wedge back to the
 # stall path. ``quiet_gate_s`` makes it a pure gap-filler (ping only when nothing else committed for
@@ -271,8 +271,8 @@ def liveness_heartbeat(
       (a ``None`` return — unmeasurable — never counts as advancement).
     - ``max_duration_s``: hard cap on TOTAL ping lifetime, independent of progress — for a phase with
       no incremental progress counter (cold ``*Trainer.__init__``). Past the cap the daemon stops
-      pinging and hands off to the stall path, so a stuck-but-GIL-releasing init (nvidia-smi still
-      answers, so the ping would otherwise re-arm the watchdog forever) can't mask the hang.
+      pinging and hands off to the provider stall path, so a stuck-but-GIL-releasing init (nvidia-smi
+      still answers, so the ping would otherwise refresh the provider timestamp forever) can't mask it.
     - ``quiet_gate_s``: if set, ping only when no heartbeat has been uploaded for that long (gap-fill
       a phase another heartbeat — e.g. ``rl_step`` — already covers in the normal case).
     - ``fields``: optional ``dict`` or ``() -> dict`` merged into each heartbeat (e.g. step / model).
@@ -323,7 +323,7 @@ def liveness_heartbeat(
             # Compute the merged fields defensively: ``fields`` may be a callback that re-reads live
             # state (train_liveness_heartbeat's lambda calls get_step()), and an exception there must
             # NOT kill this daemon for the rest of the wrapped block — same reason progress() above is
-            # suppressed. Fall back to no extra fields; the bare heartbeat still re-arms the watchdog.
+            # suppressed. Fall back to no extra fields; the bare heartbeat still proves liveness.
             extra = fields if isinstance(fields, dict) else {}
             if callable(fields):
                 with contextlib.suppress(Exception):
@@ -358,7 +358,7 @@ def init_liveness_heartbeat(stage):
     by ``max_duration_s=_INIT_LIVENESS_MAX_S`` instead: a legitimate cold init (vLLM build + weight
     load + CUDA-graph capture) finishes well within the cap, but a genuinely stuck init that still
     releases the GIL — a vLLM/CUDA/socket wait where nvidia-smi keeps answering, so the ping would
-    otherwise re-arm the watchdog AND (init is a setup stage) the provider setup-grace forever — stops
-    pinging past the cap, handing the hang to the provider setup-stall / faulthandler instead of
-    masking it to the wall-clock timeout. Shared by run_rl and run_sft."""
+    otherwise refresh the provider setup-grace forever (init is a setup stage) — stops pinging past the
+    cap, dumping stacks and handing the hang to the provider setup-stall instead of masking it to the
+    wall-clock timeout. Shared by run_rl and run_sft."""
     return liveness_heartbeat(stage, max_duration_s=_INIT_LIVENESS_MAX_S)
