@@ -184,6 +184,30 @@ def test_prefetch_model_heartbeats_during_download():
     assert "model_prefetching" in stages, f"expected a model_prefetching heartbeat, got {stages}"
 
 
+def test_prefetch_model_joins_heartbeat_without_timeout():
+    """The prefetch heartbeat thread must be joined with NO timeout before emitting model_prefetched.
+    A bounded join could return while the side thread is still inside heartbeat('model_prefetching'),
+    letting that stale stage overwrite heartbeat.json / land its upload AFTER model_prefetched (the
+    control plane would then see 'prefetching' again post-download)."""
+    from flash.engine.worker import hf
+
+    tree = ast.parse(inspect.getsource(hf.prefetch_model))
+    joins = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "join"
+    ]
+    assert joins, "prefetch_model no longer joins its heartbeat thread before model_prefetched"
+    for call in joins:
+        assert not call.args, "prefetch_model heartbeat join must not pass a positional timeout"
+        assert not any(kw.arg == "timeout" for kw in call.keywords), (
+            "prefetch_model must join() the heartbeat thread WITHOUT a timeout, else a stale "
+            "model_prefetching heartbeat can race past model_prefetched"
+        )
+
+
 # --------------------------------------------------------------------------------------------
 # Stall watchdog default. A true hang (no heartbeat for the window) must self-dump every thread's
 # stack and fail the run instead of wedging silently until the control-plane kill (the

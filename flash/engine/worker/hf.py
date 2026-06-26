@@ -200,8 +200,14 @@ def prefetch_model(model_id: str) -> float:
         # the normal from_pretrained path the trainer uses next.
         print("prefetch_model warn:", e)
     finally:
+        # Join with NO timeout so the side thread is provably done before we emit model_prefetched:
+        # a bounded join could return while it's still inside heartbeat("model_prefetching"), letting
+        # that stale stage overwrite heartbeat.json / land its HF upload AFTER model_prefetched (the
+        # control plane would then see "prefetching" again post-download). After _prefetch_done.set()
+        # the loop exits within at most one more heartbeat (wait() returns True on the next check), so
+        # this blocks only briefly — and model_prefetched is guaranteed the strictly-later stage.
         _prefetch_done.set()
-        _prefetch_hb.join(timeout=5.0)
+        _prefetch_hb.join()
     secs = round(time.time() - t0, 1)
     _w.heartbeat(
         "model_prefetched",
