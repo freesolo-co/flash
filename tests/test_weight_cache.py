@@ -258,13 +258,15 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
 # ---------------------------------------------------------------------------
 # deps.weight_cache_env / build_worker_env redirect
 # ---------------------------------------------------------------------------
-def test_weight_cache_env_is_hf_only():
+def test_weight_cache_env_is_base_model_scoped():
     from flash.providers.runpod.train.deps import weight_cache_env
 
     env = weight_cache_env("/runpod-volume")
-    # ONLY HF_HOME (inert model blobs). The executable kernel-JIT caches must NOT be redirected onto
-    # the shared multi-tenant volume — a poisoned compiled artifact could affect another tenant.
-    assert env == {"HF_HOME": "/runpod-volume/hf-cache"}
+    # BASE-MODEL-SCOPED: FLASH_WEIGHT_CACHE_DIR points the base-model prefetch at the mount's HF hub
+    # layout. It must NOT set a process-global HF_HOME (that leaked env/reward downloads onto the
+    # shared multi-tenant mount — issue #252). The executable kernel-JIT caches are also never on it.
+    assert env == {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
+    assert "HF_HOME" not in env
     for k in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "TILELANG_CACHE_DIR", "TORCH_EXTENSIONS_DIR"):
         assert k not in env
 
@@ -272,21 +274,24 @@ def test_weight_cache_env_is_hf_only():
 def test_weight_cache_env_custom_mount():
     from flash.providers.runpod.train.deps import weight_cache_env
 
-    assert weight_cache_env("/workspace")["HF_HOME"] == "/workspace/hf-cache"
+    assert weight_cache_env("/workspace")["FLASH_WEIGHT_CACHE_DIR"] == "/workspace/hf-cache/hub"
 
 
-def test_build_worker_env_redirects_hf_home_with_volume():
+def test_build_worker_env_sets_base_model_cache_with_volume():
     from flash.providers.runpod.train.deps import build_worker_env
 
     env = build_worker_env(_vol_spec(), 0)
-    assert env["HF_HOME"] == "/runpod-volume/hf-cache"
+    assert env["FLASH_WEIGHT_CACHE_DIR"] == "/runpod-volume/hf-cache/hub"
+    # The leak fix: no process-global HF_HOME redirect, so env/reward downloads use the ephemeral cache.
+    assert "HF_HOME" not in env
 
 
-def test_build_worker_env_no_redirect_without_volume():
+def test_build_worker_env_no_cache_without_volume():
     from flash.providers.runpod.train.deps import build_worker_env
 
     env = build_worker_env(JobSpec(model="m"), 0)
-    # Without a volume HF_HOME must NOT be set (pointing at a missing mount).
+    # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
+    assert "FLASH_WEIGHT_CACHE_DIR" not in env
     assert "HF_HOME" not in env
 
 
@@ -294,19 +299,19 @@ def test_build_worker_env_per_run_override_wins():
     from flash.providers.runpod.train.deps import build_worker_env
 
     spec = _vol_spec()
-    spec = JobSpec.from_dict({**spec.to_dict(), "worker_env": {"HF_HOME": "/custom/hf"}})
+    spec = JobSpec.from_dict({**spec.to_dict(), "worker_env": {"FLASH_WEIGHT_CACHE_DIR": "/custom/hub"}})
     # a per-run [worker_env] override is merged last and must win over the cache redirect.
-    assert build_worker_env(spec, 0)["HF_HOME"] == "/custom/hf"
+    assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"] == "/custom/hub"
 
 
 def test_drop_unmounted_cache_env_strips_when_unmounted(monkeypatch):
     import flash.providers.runpod.train.deps as deps
 
-    # volume NOT mounted -> the /runpod-volume HF_HOME is stripped (cold fallback), others kept.
+    # volume NOT mounted -> the /runpod-volume cache var is stripped (cold fallback), others kept.
     monkeypatch.setattr(deps.os.path, "isdir", lambda p: False)
-    env = {"HF_HOME": "/runpod-volume/hf-cache", "OTHER": "x"}
+    env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub", "OTHER": "x"}
     out = deps.drop_unmounted_cache_env(env)
-    assert "HF_HOME" not in out
+    assert "FLASH_WEIGHT_CACHE_DIR" not in out
     assert out["OTHER"] == "x"
 
 
@@ -314,8 +319,109 @@ def test_drop_unmounted_cache_env_keeps_when_mounted(monkeypatch):
     import flash.providers.runpod.train.deps as deps
 
     monkeypatch.setattr(deps.os.path, "isdir", lambda p: True)
-    env = {"HF_HOME": "/runpod-volume/hf-cache"}
-    assert deps.drop_unmounted_cache_env(env) == {"HF_HOME": "/runpod-volume/hf-cache"}
+    env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
+    assert deps.drop_unmounted_cache_env(env) == {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
+
+
+# ---------------------------------------------------------------------------
+# worker engine.worker.hf.prefetch_model — base-model-scoped caching (issue #252)
+# The shared mount holds ONLY the trusted public base model; the run's env/reward HF downloads use the
+# per-worker ephemeral cache and never touch the shared multi-tenant mount.
+# ---------------------------------------------------------------------------
+def _patch_prefetch_io(monkeypatch, ephemeral_hub):
+    """Stub the side effects of prefetch_model: a fake snapshot_download that records its call and
+    materializes a repo dir under cache_dir, the heartbeat/gpu probes, and the ephemeral hub cache."""
+    import huggingface_hub
+    import huggingface_hub.constants
+
+    import flash.engine.worker.hf as hf
+
+    calls = []
+
+    def _fake_snapshot(repo_id, cache_dir=None, ignore_patterns=None, **kw):
+        calls.append({"repo_id": repo_id, "cache_dir": cache_dir, "ignore_patterns": ignore_patterns})
+        if cache_dir:  # simulate a real download landing on the (mount) cache: create the repo folder
+            folder = "models--" + repo_id.replace("/", "--")
+            os.makedirs(os.path.join(cache_dir, folder, "snapshots"), exist_ok=True)
+        return cache_dir or "/ephemeral"
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(ephemeral_hub))
+    monkeypatch.setattr(hf, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(hf._w, "heartbeat", lambda *a, **k: None)
+    return hf, calls
+
+
+def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatch):
+    """With the shared cache attached, the base model is downloaded ONTO the mount (explicit cache_dir)
+    and symlinked into the per-worker ephemeral hub cache so the trainer/vLLM hit it without re-download."""
+    import os as _os
+
+    mount = tmp_path / "runpod-volume"  # the shared multi-tenant mount (must exist)
+    mount.mkdir()
+    shared_hub = str(mount / "hf-cache" / "hub")
+    ephemeral_hub = tmp_path / "ephemeral" / "hub"
+    monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", shared_hub)
+    hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
+
+    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+
+    # downloaded straight onto the shared mount, NOT the ephemeral default
+    assert calls == [{
+        "repo_id": "Qwen/Qwen3.5-0.8B", "cache_dir": shared_hub,
+        "ignore_patterns": ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+    }]
+    folder = "models--Qwen--Qwen3.5-0.8B"
+    dst = ephemeral_hub / folder
+    # the base model is now visible in the ephemeral cache as a SYMLINK pointing back to the mount
+    assert _os.path.islink(dst)
+    assert _os.path.realpath(dst) == _os.path.realpath(_os.path.join(shared_hub, folder))
+    # and ONLY the base model is linked — env/reward repos would resolve in (and be written to) the
+    # ephemeral cache, never the shared mount.
+    assert [p.name for p in ephemeral_hub.iterdir()] == [folder]
+
+
+def test_prefetch_model_uses_ephemeral_default_without_shared_cache(tmp_path, monkeypatch):
+    """No shared cache attached -> cache_dir=None (the worker's ephemeral default) and no symlink."""
+    monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
+    ephemeral_hub = tmp_path / "ephemeral" / "hub"
+    hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
+
+    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+
+    assert calls[0]["cache_dir"] is None  # ephemeral default cache, a correct cold run
+    assert not ephemeral_hub.exists()  # nothing linked
+
+
+def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monkeypatch):
+    """FLASH_WEIGHT_CACHE_DIR set but the mount isn't present (failed/absent attach) -> ephemeral cache,
+    no write under the missing mount. Defense-in-depth re-check on the worker itself."""
+    missing_hub = str(tmp_path / "runpod-volume" / "hf-cache" / "hub")  # parent mount NOT created
+    monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", missing_hub)
+    ephemeral_hub = tmp_path / "ephemeral" / "hub"
+    hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
+
+    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+
+    assert calls[0]["cache_dir"] is None  # mount absent -> ephemeral, never the missing /runpod-volume path
+
+
+def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, monkeypatch):
+    """_shared_weight_cache_dir derives the mount as two levels up from the cache dir (works for the
+    RunPod /runpod-volume and instance /weight-cache mounts alike) and requires it to exist."""
+    import flash.engine.worker.hf as hf
+
+    monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
+    assert hf._shared_weight_cache_dir() is None  # unset
+
+    mount = tmp_path / "weight-cache"
+    mount.mkdir()
+    hub = str(mount / "hf-cache" / "hub")
+    monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", hub)
+    assert hf._shared_weight_cache_dir() == hub  # mount present
+
+    monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", str(tmp_path / "absent" / "hf-cache" / "hub"))
+    assert hf._shared_weight_cache_dir() is None  # mount absent -> ephemeral fallback
 
 
 # ---------------------------------------------------------------------------
@@ -324,24 +430,24 @@ def test_drop_unmounted_cache_env_keeps_when_mounted(monkeypatch):
 def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
     from flash.providers.runpod.train.deps import strip_runpod_volume_env
 
-    env = {"HF_HOME": "/runpod-volume/hf-cache", "X": "/runpod-volume/foo", "KEEP": "v", "HF_TOKEN": "t"}
+    env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub", "X": "/runpod-volume/foo", "KEEP": "v", "HF_TOKEN": "t"}
     out = strip_runpod_volume_env(env)
-    assert "HF_HOME" not in out
+    assert "FLASH_WEIGHT_CACHE_DIR" not in out
     assert "X" not in out
     assert out == {"KEEP": "v", "HF_TOKEN": "t"}  # non-/runpod-volume vars preserved
 
 
 def test_instance_payload_strips_runpod_volume_redirect():
-    # The RunPod weight-cache HF_HOME redirect must NOT leak into a Lambda/Hyperstack payload — those
-    # instances never mount /runpod-volume. (build_worker_env DOES set it; the instance path strips.)
+    # The RunPod weight-cache base-model redirect must NOT leak into a Lambda/Hyperstack payload —
+    # those instances never mount /runpod-volume. (build_worker_env DOES set it; the instance strips.)
     from flash.providers import _instance
     from flash.providers.runpod.train.deps import build_worker_env
 
     spec = JobSpec.from_dict({**_vol_spec().to_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-0.8B"})
-    assert build_worker_env(spec, 0)["HF_HOME"].startswith("/runpod-volume")  # the leak source
+    assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith("/runpod-volume")  # leak source
     for arm in ("lambda", "hyperstack"):
         env = _instance.build_payload(spec, seed=0, attempt=0, arm=arm)["env"]
-        assert not env.get("HF_HOME", "").startswith("/runpod-volume"), arm
+        assert not env.get("FLASH_WEIGHT_CACHE_DIR", "").startswith("/runpod-volume"), arm
 
 
 # ---------------------------------------------------------------------------
@@ -1247,8 +1353,11 @@ def test_instance_build_payload_preload_mode():
     )
     assert p["mode"] == "preload"
     assert p["models"] == ["a/b", "c/d"]
-    # HF_HOME points at the bind-mounted cache so the download persists across runs in the region
-    assert p["env"]["HF_HOME"] == _instance.CACHE_HF_HOME
+    # The base-model prefetch (FLASH_WEIGHT_CACHE_DIR) points at the bind-mounted cache so the download
+    # persists across runs in the region. It is NOT a process-global HF_HOME (issue #252): env/reward
+    # downloads stay on ephemeral disk, off the shared per-region cache.
+    assert p["env"]["FLASH_WEIGHT_CACHE_DIR"] == f"{_instance.CACHE_HF_HOME}/hub"
+    assert "HF_HOME" not in p["env"]
 
 
 def test_instance_build_payload_no_mode_by_default():
@@ -1262,7 +1371,7 @@ def test_instance_build_payload_no_mode_by_default():
 
 def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
     """A per-run [worker_env].HF_HOME override is NOT clobbered by the instance cache path (parity
-    with RunPod, where the worker_env override wins)."""
+    with RunPod, where the worker_env override wins), and disables the platform cache redirect."""
     from flash.providers import _instance
 
     spec = JobSpec.from_dict({
@@ -1272,15 +1381,16 @@ def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
         "worker_env": {"HF_HOME": "/custom/hf"},  # user-set override
     })
     p = _instance.build_payload(spec, 0, 0, arm="lambda", cache_host_mount="/lambda/nfs/flash-weights")
-    # the user's HF_HOME survives — the instance cache path is only installed when HF_HOME is absent
+    # the user's HF_HOME survives, and the platform cache redirect is NOT installed on top of it.
     assert p["env"]["HF_HOME"] == "/custom/hf"
+    assert "FLASH_WEIGHT_CACHE_DIR" not in p["env"]
 
 
 def test_instance_preload_requires_mounted_cache():
     from flash.providers import _instance_bootstrap as b
 
-    # HF_HOME rooted at an UNMOUNTED cache path -> refuse (would warm ephemeral disk), no download
-    r = b.run_preload({"env": {"HF_HOME": "/weight-cache/hf-cache"}, "models": ["x/y"]})
+    # FLASH_WEIGHT_CACHE_DIR rooted at an UNMOUNTED cache -> refuse (would warm ephemeral disk), no download
+    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": "/weight-cache/hf-cache/hub"}, "models": ["x/y"]})
     assert r["preloaded"] == []
     assert r["failed"] == {}
     assert "not mounted" in r["error"]
@@ -1303,8 +1413,8 @@ def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
     hub = types.ModuleType("huggingface_hub")
     hub.snapshot_download = _snap
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    hf_home = str(tmp_path / "hf-cache")
-    r = b.run_preload({"env": {"HF_HOME": hf_home, "HF_TOKEN": "t"}, "models": ["a/b"]})
+    cache_dir_env = str(tmp_path / "hf-cache" / "hub")
+    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env, "HF_TOKEN": "t"}, "models": ["a/b"]})
     assert r["preloaded"] == ["a/b"]
     assert not r["failed"]
     assert calls[0]["cache_dir"] == str(tmp_path / "hf-cache" / "hub")  # straight into the mount
@@ -1330,8 +1440,8 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
     hub = types.ModuleType("huggingface_hub")
     hub.snapshot_download = _snap
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    hf_home = str(tmp_path / "hf-cache")
-    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"]})
+    cache_dir_env = str(tmp_path / "hf-cache" / "hub")
+    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"]})
     assert r["already_cached"] == ["a/b"]
     assert r["preloaded"] == []
     assert real_downloads == []  # no network re-download for a cache hit
@@ -1354,8 +1464,8 @@ def test_instance_preload_block_device_requires_mount_sentinel(tmp_path, monkeyp
     hub = types.ModuleType("huggingface_hub")
     hub.snapshot_download = _boom
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    hf_home = str(tmp_path / "hf-cache")  # parent (the mount) exists but has no sentinel
-    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"],
+    cache_dir_env = str(tmp_path / "hf-cache" / "hub")  # grandparent (the mount) exists but has no sentinel
+    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"],
                        "cache_block_device": True, "cache_mount_marker": ".flash-cache-mounted"})
     assert r["preloaded"] == []
     assert "not mounted" in r["error"]
@@ -1379,8 +1489,8 @@ def test_instance_preload_block_device_warms_when_sentinel_present(tmp_path, mon
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     mount = tmp_path
     (mount / ".flash-cache-mounted").write_text("")  # preamble's real-mount sentinel
-    hf_home = str(mount / "hf-cache")
-    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"],
+    cache_dir_env = str(mount / "hf-cache" / "hub")
+    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"],
                        "cache_block_device": True, "cache_mount_marker": ".flash-cache-mounted"})
     assert r["preloaded"] == ["a/b"]
     assert not r["failed"]
@@ -1427,8 +1537,8 @@ def test_instance_preload_nfs_requires_mount_sentinel(tmp_path, monkeypatch):
     hub = types.ModuleType("huggingface_hub")
     hub.snapshot_download = _boom
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    hf_home = str(tmp_path / "hf-cache")  # parent (the mount) exists but has no sentinel
-    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"],
+    cache_dir_env = str(tmp_path / "hf-cache" / "hub")  # grandparent (the mount) exists but has no sentinel
+    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"],
                        "cache_mount_marker": ".flash-cache-mounted"})  # NFS: no cache_block_device
     assert r["preloaded"] == []
     assert "not mounted" in r["error"]
@@ -1452,8 +1562,8 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
     hub.snapshot_download = _snap
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     (tmp_path / ".flash-cache-mounted").write_text("")
-    hf_home = str(tmp_path / "hf-cache")
-    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"],
+    cache_dir_env = str(tmp_path / "hf-cache" / "hub")
+    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"],
                        "cache_mount_marker": ".flash-cache-mounted"})
     assert r["preloaded"] == ["a/b"]
 
