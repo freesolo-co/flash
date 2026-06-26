@@ -121,6 +121,117 @@ def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------------------------
+# Worker: make_checkpoint_upload_callback — durable flush of the final deployable checkpoint
+# --------------------------------------------------------------------------------------------
+def _make_ckpt_dir(parent, step):
+    ckpt = parent / f"checkpoint-{step}"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
+    (ckpt / "optimizer.pt").write_bytes(b"opt")
+    return ckpt
+
+
+@pytest.fixture
+def fake_trainer_callback(monkeypatch):
+    """make_checkpoint_upload_callback does ``from transformers import TrainerCallback`` at call
+    time; the offline CI env has no transformers, so stub a minimal base class (we invoke our
+    own on_save/on_train_end overrides directly, so the base is just a placeholder)."""
+    import sys
+    import types
+
+    mod = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    mod.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", mod)
+    return mod
+
+
+def test_latest_checkpoint_dir_picks_highest_step(tmp_path):
+    import flash.engine.worker as worker
+
+    _make_ckpt_dir(tmp_path, 4)
+    _make_ckpt_dir(tmp_path, 12)
+    _make_ckpt_dir(tmp_path, 8)
+    (tmp_path / "checkpoint-notanumber").mkdir()  # ignored
+    (tmp_path / "checkpoint-99").write_text("a file, not a dir")  # ignored
+    step, path = worker._latest_checkpoint_dir(str(tmp_path))
+    assert step == 12
+    assert path.endswith("checkpoint-12")
+    assert worker._latest_checkpoint_dir(str(tmp_path / "missing")) is None
+
+
+def test_on_train_end_flushes_final_deployable_checkpoint(tmp_path, monkeypatch, fake_trainer_callback):
+    """A fast RL run can exit before its last save's async (daemon) upload finishes, so
+    on_train_end must SYNCHRONOUSLY publish the latest on-disk checkpoint as a deployable
+    snapshot — otherwise `flash checkpoints` is empty even though the run trained fine."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 8)  # last save the trainer wrote locally; its async upload was "lost"
+    cb = worker.make_checkpoint_upload_callback()
+
+    # No on_save uploads recorded (simulating their daemon threads being killed at exit).
+    cb.on_train_end(SimpleNamespace(output_dir=str(out)), None, None)
+
+    deployable = [u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-8/adapter")]
+    assert len(deployable) == 1, "on_train_end must publish the final deployable checkpoint"
+    assert "optimizer.pt" in deployable[0]["ignore_patterns"]
+
+
+def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch, fake_trainer_callback):
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    out = tmp_path / "out"
+    out.mkdir()
+    worker.make_checkpoint_upload_callback().on_train_end(
+        SimpleNamespace(output_dir=str(out)), None, None
+    )
+    assert rec.uploads == []
+
+
+def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_trainer_callback):
+    """The durable, accumulating deployable adapter must be uploaded BEFORE the larger
+    latest-only resume checkpoint, so it lands first if the worker is torn down mid-upload."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+
+    class _SyncThread:  # run the upload body inline so the unit test is deterministic
+        def __init__(self, target=None, daemon=None, **kw):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr(worker.threading, "Thread", _SyncThread)
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)
+    cb = worker.make_checkpoint_upload_callback()
+    cb.on_save(
+        SimpleNamespace(output_dir=str(out)),
+        SimpleNamespace(global_step=4),
+        None,
+    )
+    paths = [u["path_in_repo"] for u in rec.uploads]
+    assert paths == [
+        "rl/flash-ckpt-1/seed0/checkpoints/step-4/adapter",  # deployable first
+        "rl/flash-ckpt-1/seed0/checkpoint/checkpoint-4",  # resume second
+    ]
+
+
+# --------------------------------------------------------------------------------------------
 # Control plane: list_checkpoints
 # --------------------------------------------------------------------------------------------
 class _FakeHfApiFiles:
