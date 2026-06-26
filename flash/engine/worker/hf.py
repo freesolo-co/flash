@@ -170,14 +170,24 @@ def _hf_cache_bytes(model_id: str) -> int:
     ``blobs/`` files (the actual data, incl. the ``.incomplete`` partials an in-flight download is
     growing). Scans ONLY ``blobs/`` — snapshots/ are just symlinks to blobs and refs/metadata are
     tiny, so this matches "bytes downloaded" and stays cheap on a large cache. ``blobs/`` is flat, so
-    a single listdir suffices. Returns -1 if it can't be determined (cache dir not created yet, or any
-    error), so callers fail SAFE (assume progress, never false-stop a real download)."""
+    a single listdir suffices.
+
+    Returns:
+      * the blob byte total once the repo cache dir exists (``0`` if no blobs written YET — a real
+        "0 bytes downloaded" measurement, so a download that creates the repo dir but never writes a
+        blob still trips the silence timer rather than being treated as perpetual progress);
+      * ``-1`` only when the repo cache dir does not exist yet, or on any error — so callers fail SAFE
+        (treat as progress) in the brief pre-structure window where we genuinely cannot measure.
+    """
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
 
-        blobs = os.path.join(HF_HUB_CACHE, "models--" + model_id.replace("/", "--"), "blobs")
+        repo = os.path.join(HF_HUB_CACHE, "models--" + model_id.replace("/", "--"))
+        if not os.path.isdir(repo):
+            return -1  # cache structure not created yet -> can't measure, assume progress
+        blobs = os.path.join(repo, "blobs")
         if not os.path.isdir(blobs):
-            return -1
+            return 0  # repo dir exists but no blobs written yet -> 0 bytes downloaded (measurable)
         total = 0
         for fn in os.listdir(blobs):
             fp = os.path.join(blobs, fn)

@@ -261,10 +261,15 @@ def test_hf_cache_bytes_counts_blobs_and_fails_safe(tmp_path, monkeypatch):
     from flash.engine.worker import hf
 
     monkeypatch.setattr(hconst, "HF_HUB_CACHE", str(tmp_path))
-    # Nothing downloaded yet -> -1, so the caller assumes progress (never false-stops a real fetch).
+    # No repo cache dir yet -> -1 (can't measure), so the caller assumes progress (no false-stop).
     assert hf._hf_cache_bytes("org/model") == -1
-    blobs = tmp_path / "models--org--model" / "blobs"
-    blobs.mkdir(parents=True)
+    repo = tmp_path / "models--org--model"
+    repo.mkdir(parents=True)
+    # Repo dir exists but blobs/ not written yet -> 0 (a real "0 bytes" measurement), NOT -1: a
+    # download wedged before writing any blob must still let the silence timer trip.
+    assert hf._hf_cache_bytes("org/model") == 0
+    blobs = repo / "blobs"
+    blobs.mkdir()
     (blobs / "complete").write_bytes(b"x" * 100)
     (blobs / "partial.incomplete").write_bytes(b"y" * 50)  # an in-flight download's growing partial
     assert hf._hf_cache_bytes("org/model") == 150
