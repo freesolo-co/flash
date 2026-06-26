@@ -172,13 +172,38 @@ def verify_gpu(requested_gpu: str | None) -> None:
         )
 
 
+def _nvml_alive() -> bool:
+    """True if the host's NVML/driver layer initializes. A merely BUSY GPU still has live NVML; a
+    BROKEN host (driver crashed / GPU off the PCIe bus -> ``Failed to initialize NVML`` /
+    ``cudaErrorDevicesUnavailable``) fails NVML init entirely and won't recover in the readiness
+    window, so ``wait_for_gpu`` fails over FAST on it instead of waiting out the full patient loop a
+    transient 'device busy' deserves. Best-effort (pynvml, then ``nvidia-smi -L`` exit code)."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        with contextlib.suppress(Exception):
+            pynvml.nvmlShutdown()
+        return True
+    except Exception:
+        pass
+    try:
+        import subprocess
+
+        return subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=20).returncode == 0
+    except Exception:
+        return False
+
+
 def wait_for_gpu(requested_gpu: str | None = None):
     """Rented nodes sometimes report 'CUDA device not ready' transiently at startup.
     Poll a trivial CUDA op until it succeeds before doing real work; raise if never ready.
 
     Also fails fast (retriable) if the assigned GPU is a MIG slice — a partitioned GPU crashes the
     CUDA allocator, so we re-provision on a fresh FULL GPU instead of dying mid-setup. Once CUDA is
-    live, ``verify_gpu(requested_gpu)`` asserts the box is the RIGHT GPU (model + driver-CUDA floor)."""
+    live, ``verify_gpu(requested_gpu)`` asserts the box is the RIGHT GPU (model + driver-CUDA floor).
+    A HARD host fault (NVML can't init) fails over FAST (~30s) rather than burning the full patient
+    loop, which is reserved for a transient busy/not-ready GPU."""
     import time as _t
 
     mig = detect_mig_slice()
@@ -203,6 +228,13 @@ def wait_for_gpu(requested_gpu: str | None = None):
             raise  # a GPU/identity mismatch must propagate (fail over), not be masked as "never ready"
         except Exception as e:
             last = str(e)[:160]
+            # A persistent NVML-init failure (driver crashed / GPU off the bus) won't recover; after
+            # ~30s ruling out a transient blip, fail over FAST instead of the full ~120s. A BUSY device
+            # keeps NVML alive, so it stays in the patient loop below.
+            if i >= 2 and not _nvml_alive():
+                raise RetriableInfraError(
+                    f"GPU host NVML init failed (driver/host fault, won't recover): {last}; failing over"
+                ) from e
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
         _t.sleep(10)
     # Infra-shaped: a host whose GPU never comes up is dead, not a code bug -> retry on a fresh one.

@@ -228,3 +228,41 @@ def test_wait_for_gpu_propagates_verify_mismatch(monkeypatch):
         wait_for_gpu("H100")
     assert "WRONG GPU substituted" in str(exc.value)
     assert "never became ready" not in str(exc.value)
+
+
+def test_wait_for_gpu_fast_fails_on_dead_nvml(monkeypatch):
+    """A persistent NVML-init failure (broken host / GPU off the bus) fails over FAST (after ~30s of
+    ruling out a transient), NOT after the full 12-try patient loop — emits the NVML-fault message."""
+    torch = pytest.importorskip("torch")
+
+    def boom(*a, **k):
+        raise RuntimeError("CUDA error: cudaErrorDevicesUnavailable")
+
+    monkeypatch.setattr(lifecycle, "detect_mig_slice", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True, raising=False)
+    monkeypatch.setattr(torch, "zeros", boom, raising=False)
+    monkeypatch.setattr("time.sleep", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "_nvml_alive", lambda: False)  # broken host: NVML can't init
+    with pytest.raises(RetriableInfraError) as exc:
+        wait_for_gpu()
+    assert "NVML init failed" in str(exc.value)
+    assert "never became ready" not in str(exc.value)  # fast-failed, didn't exhaust the patient loop
+
+
+def test_wait_for_gpu_stays_patient_when_nvml_alive(monkeypatch):
+    """A merely BUSY device (NVML still alive) keeps the patient loop — it must NOT be treated as a
+    dead host; it only gives up with 'never became ready' after the full window."""
+    torch = pytest.importorskip("torch")
+
+    def boom(*a, **k):
+        raise RuntimeError("CUDA device busy")
+
+    monkeypatch.setattr(lifecycle, "detect_mig_slice", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True, raising=False)
+    monkeypatch.setattr(torch, "zeros", boom, raising=False)
+    monkeypatch.setattr("time.sleep", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "_nvml_alive", lambda: True)  # busy but NVML alive -> stay patient
+    with pytest.raises(RetriableInfraError) as exc:
+        wait_for_gpu()
+    assert "never became ready" in str(exc.value)
+    assert "NVML init failed" not in str(exc.value)
