@@ -232,7 +232,9 @@ def _verify(out: str, sm: str) -> int:
         wl = os.path.join(out, "warmup.log")
         if os.path.isfile(wl):
             log("   --- warmup.log tail ---")
-            for line in open(wl, errors="replace").read().splitlines()[-40:]:
+            with open(wl, errors="replace") as wlf:
+                tail = wlf.read().splitlines()[-40:]
+            for line in tail:
                 log(f"   | {line}")
         return 1
     try:
