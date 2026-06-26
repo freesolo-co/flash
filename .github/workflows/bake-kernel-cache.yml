@@ -56,11 +56,14 @@ jobs:
               gpu_type_id: "NVIDIA H100 80GB HBM3",
               allowed_cuda: "",
             }
-          # Blackwell needs CUDA-13 hosts to JIT its PTX (matches min_cuda_for in the provider).
+          # Blackwell needs CUDA-13 hosts to JIT its PTX (matches min_cuda_for in the provider). Bake
+          # sm120 on the RTX Pro 6000 (Server Edition): it's the same sm120 (cache is sm-keyed, so it's
+          # valid for RTX 5090 too) but has far better secure-cloud on-demand capacity -- the RTX 5090
+          # pool repeatedly returned "machine does not have the resources" at create_pod.
           - {
               sm: sm120,
               arch: "12.0",
-              gpu_type_id: "NVIDIA GeForce RTX 5090",
+              gpu_type_id: "NVIDIA RTX PRO 6000 Blackwell Server Edition",
               allowed_cuda: "13.0",
             }
     steps:
