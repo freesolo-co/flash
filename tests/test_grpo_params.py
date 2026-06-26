@@ -657,15 +657,24 @@ def test_run_rl_wires_mask_truncated_completions_to_the_gating_helper() -> None:
     import flash.engine.worker as w
 
     tree = ast.parse(inspect.getsource(w.run_rl))
+
+    # Accept plain OR annotated assignment (`grpo_kwargs = {...}` / `grpo_kwargs: dict = {...}`) so
+    # the test stays focused on the wiring invariant, not the exact assignment node type.
+    def _grpo_dict(node):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            return None
+        if isinstance(value, ast.Dict) and any(
+            isinstance(t, ast.Name) and t.id == "grpo_kwargs" for t in targets
+        ):
+            return value
+        return None
+
     grpo_dict = next(
-        (
-            node.value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Dict)
-            and any(isinstance(t, ast.Name) and t.id == "grpo_kwargs" for t in node.targets)
-        ),
-        None,
+        (d for node in ast.walk(tree) if (d := _grpo_dict(node)) is not None), None
     )
     assert grpo_dict is not None, "run_rl no longer builds a grpo_kwargs dict literal"
 
@@ -682,9 +691,17 @@ def test_run_rl_wires_mask_truncated_completions_to_the_gating_helper() -> None:
         "revert to TRL's footgun default (False) and train on truncated rollouts"
     )
     # Must be wired to the helper (so stop_sequences gating applies), not a bare True/False literal.
+    # Accept a bare name OR a qualified call (`grpo_mask_truncated_completions(...)` /
+    # `worker.grpo_mask_truncated_completions(...)`) — only the called name is the invariant.
     func = value.func if isinstance(value, ast.Call) else None
-    is_helper_call = isinstance(func, ast.Name) and func.id == "grpo_mask_truncated_completions"
-    assert is_helper_call, (
+    called = (
+        func.id
+        if isinstance(func, ast.Name)
+        else func.attr
+        if isinstance(func, ast.Attribute)
+        else None
+    )
+    assert called == "grpo_mask_truncated_completions", (
         "mask_truncated_completions must be wired to grpo_mask_truncated_completions(...) so the "
         "stop_sequences gating is honored"
     )
