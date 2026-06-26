@@ -87,7 +87,7 @@ Homepage = "https://github.com/freesolo-co/flash"
 Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
-flash = "flash.cli.main:main"
+flash = "flash.cli:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
 flash-server = "flash.server.__main__:main"

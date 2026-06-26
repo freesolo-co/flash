@@ -46,7 +46,6 @@ def spec_steps(spec) -> int:
         if t.steps is not None:
             return max(1, int(t.steps))
         return RECIPE.rl.num_steps
-    # --- SFT ---
     cap = int(t.max_steps) if t.max_steps else 0  # SFT-only optimizer-step cap (0 = uncapped)
     epochs = int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
     requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch

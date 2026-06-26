@@ -28,7 +28,7 @@ def _check_login(monkeypatch):
         import flash.client.config as client_config
 
         importlib.reload(client_config)
-        import flash.cli.main as cli
+        import flash.cli as cli
 
         # Login verifies the freesolo key against the freesolo backend, then stores it. Stub
         # the network verify so the test stays offline; an invalid key would raise instead.
@@ -79,7 +79,7 @@ def test_login_warns_when_env_key_will_override_saved_key(monkeypatch, tmp_path,
     import flash.client.config as client_config
 
     importlib.reload(client_config)
-    import flash.cli.main as cli
+    import flash.cli as cli
 
     monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda api_key, base_url=None: None)
     args = types.SimpleNamespace(api_key="fs-secret-arg", api_url=None, freesolo_url=None)

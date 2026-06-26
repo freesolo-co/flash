@@ -157,7 +157,7 @@ _TRAIN_KEYS = frozenset(
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Reject unknown config SECTIONS (table-valued top-level keys) — the footgun is a `[grpo]`
     # table holding rollout knobs that actually belong under `[train]`, silently dropped + run at
-    # 16x-cost defaults. We only flag tables, not scalars: callers (e.g. the MCP handler) pass
+    # 16x-cost defaults. We only flag tables, not scalars: callers (e.g. the CLI) pass
     # through harmless scalar control flags like `dry_run`/`background` alongside the spec.
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
     if unknown:
@@ -264,8 +264,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"disabled; set thinking = true"
         )
     if thinking and info.thinking == "unknown":
-        # stderr, not stdout: spec_from_dict runs inside flash/mcp/server.py, which speaks a
-        # one-JSON-object-per-line protocol on stdout — a warning line there corrupts the stream.
+        # stderr, not stdout: keep stdout clean for callers that parse machine-readable
+        # output, so this advisory warning never corrupts a structured stream.
         print(
             f"warning: open-model policy: cannot verify that {model}'s chat template "
             f"supports thinking mode; the run proceeds with enable_thinking=true",
