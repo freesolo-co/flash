@@ -21,9 +21,7 @@ if TYPE_CHECKING:
     from flash.spec import JobSpec
 
 
-# ---------------------------------------------------------------------------
 # GPU class registry (provider-agnostic identity)
-# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class GpuClass:
     """One managed RunPod GPU class: a friendly name + RunPod Flash identity/metadata."""
@@ -77,7 +75,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         min_cuda_modern="13.0",
         validated=True,
     ),
-    # ---- Ampere/Ada workstation + datacenter cards (cheap capacity pools) ----
+    # Ampere/Ada workstation + datacenter cards (cheap capacity pools)
     # 24 GB is the floor: the sub-24 GB tiers (16 GB RTX A4000 / RTX 2000 Ada, 20 GB RTX A4500 /
     # RTX 4000 Ada) were dropped — the 24 GB classes below are the smallest managed cards.
     # (RTX 3090 was removed from the catalog — see git history.)
@@ -111,7 +109,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     GpuClass(
         "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99, lambda_name="gpu_1x_a100_sxm4"
     ),
-    # ---- big-VRAM tier (9B bf16 GRPO, future >9B bf16) ----
+    # big-VRAM tier (9B bf16 GRPO, future >9B bf16)
     # Validated 2026-06-11: 0.6B SFT smoke (phase6).
     GpuClass(
         "A100 PCIe",
@@ -283,7 +281,7 @@ def provisional_gpu(
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
-    # Honor FLASH_VRAM_HEADROOM so parse-time sizing matches the submit-time allocator exactly.
+    # Use the shared vram_headroom() so parse-time sizing matches the submit-time allocator exactly.
     min_vram = model_required_vram_gb(
         model_id,
         algorithm,
@@ -294,9 +292,7 @@ def provisional_gpu(
     return cheapest_gpu(min_vram)
 
 
-# ---------------------------------------------------------------------------
 # Handles + poll outcomes (round-tripped through any provider)
-# ---------------------------------------------------------------------------
 @dataclass
 class JobHandle:
     """Provider-tagged, persisted handle: enough to reattach/cancel from any process.
@@ -334,9 +330,6 @@ class PollResult:
     detail: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Allocation result
-# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Candidate:
     provider: str
@@ -354,9 +347,7 @@ class Allocation:
     candidates: tuple[Candidate, ...]  # full ranked list (retry walks this)
 
 
-# ---------------------------------------------------------------------------
 # The provider interface (FIXED method set both providers implement)
-# ---------------------------------------------------------------------------
 @runtime_checkable
 class Provider(Protocol):
     """The GPU-substrate interface implemented by ``providers/runpod``."""

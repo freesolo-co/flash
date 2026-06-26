@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from flash.cli.main.commands import cmd_train
+from flash.cli.commands import cmd_train
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.engine.recipe import RECIPE

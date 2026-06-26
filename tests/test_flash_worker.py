@@ -185,6 +185,51 @@ def test_chalk_extra_pip_per_run_worker_env_spec_override(monkeypatch):
     assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
 
 
+def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
+    """A per-run [worker_env] block can NOT re-inject the optimization toggles removed in PR #175
+    (flash is deterministic + fully managed). The dangerous case: a recipe pinning
+    PYTORCH_ALLOC_CONF=expandable_segments:True would crash GRPO vLLM sleep mode — it must be
+    dropped, and flash's computed sleep-safe RL conf must survive. Non-removed keys still merge."""
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    spec = _spec_worker_env(
+        {
+            # Removed optimization toggles — must all be stripped.
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "VLLM_ATTENTION_BACKEND": "FLASHINFER",
+            "VLLM_FLASH_ATTN_VERSION": "2",
+            "TORCHDYNAMO_DISABLE": "1",
+            "FLASH_DISABLE_FA2": "1",
+            "RL_VLLM_SLEEP": "0",
+            "FLASH_ROPE_KERNEL": "0",
+            "FLASH_WORKER_DEPS": "evil==9",
+            # Case-insensitive match: a lower-cased re-injection is also stripped.
+            "pytorch_alloc_conf": "expandable_segments:True",
+            # A legitimate, non-removed per-run override still wins.
+            "MY_ENV_FLAG": "keep-me",
+        }
+    )
+    env = build_worker_env(spec, 0)  # grpo -> sleep-safe non-expandable alloc conf
+    # The unsafe alloc conf was NOT injected; flash's computed RL conf stands.
+    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
+    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
+    for stripped in (
+        "VLLM_ATTENTION_BACKEND",
+        "VLLM_FLASH_ATTN_VERSION",
+        "TORCHDYNAMO_DISABLE",
+        "FLASH_DISABLE_FA2",
+        "RL_VLLM_SLEEP",
+        "FLASH_ROPE_KERNEL",
+        "FLASH_WORKER_DEPS",
+    ):
+        assert stripped not in env, f"{stripped} should have been filtered from worker_env"
+    # A non-removed per-run key is honored — the filter is targeted, not a blanket block.
+    assert env["MY_ENV_FLAG"] == "keep-me"
+
+
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
