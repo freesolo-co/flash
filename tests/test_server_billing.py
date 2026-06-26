@@ -231,10 +231,14 @@ def api(tmp_path, monkeypatch):
     # (or wait out its 10s timeout). These billing tests assert on the API response, not on reporting,
     # so stub both to keep startup + submit hermetic (CPU-only, no network).
     import flash.providers as providers_mod
+    import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    # FREESOLO_INTERNAL_KEY also makes create_app() startup run the RunPod slot-store reconcile
+    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
+    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)

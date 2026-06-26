@@ -89,6 +89,7 @@ def api(tmp_path, monkeypatch):
     # call sites do a function-local `from flash.providers import configured_providers`, so patching
     # the package attribute covers them.)
     import flash.providers as providers_mod
+    import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
@@ -97,6 +98,9 @@ def api(tmp_path, monkeypatch):
     # run_registry._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
     # single network choke-point so these offline tests stay hermetic (same as the billing fixture).
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    # ...and that same key makes create_app() startup run the RunPod slot-store reconcile
+    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
+    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
