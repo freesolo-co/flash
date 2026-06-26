@@ -584,8 +584,8 @@ def cmd_export(args) -> int:
     hf_token = resolve_hf_token(args.api_key)
     if not hf_token:
         raise ClientError(
-            "no HuggingFace token: pass `--api-key <hf_...>`, or set HF_TOKEN "
-            "(export it in your shell or put it in a local .env)"
+            "no HuggingFace token: pass `--api-key <hf_...>`, or set HF_TOKEN / "
+            "HUGGING_FACE_HUB_TOKEN / HUGGINGFACE_TOKEN (in your shell or a local .env / .env.local)"
         )
     client = client_from_config()
     where = f" (step {args.step})" if args.step is not None else ""

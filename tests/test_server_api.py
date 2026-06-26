@@ -1514,13 +1514,16 @@ def test_export_validates_repository_and_token(api):
     )
     assert missing_token.status_code == 400
     assert "hf_token" in missing_token.json()["detail"]
-    malformed = api.post(
-        f"/v1/runs/{run_id}/export",
-        json={"repository": "noslash", "hf_token": "hf"},
-        headers=_bearer(key),
-    )
-    assert malformed.status_code == 400
-    assert "owner/name" in malformed.json()["detail"]
+    # Reject every shape that isn't exactly two non-empty, whitespace-free parts — these would
+    # otherwise pass a bare "/"-present check and only fail later in the HF upload.
+    for bad in ("noslash", "owner/name/extra", "owner//name", "/name", "owner/", "owner/ name"):
+        malformed = api.post(
+            f"/v1/runs/{run_id}/export",
+            json={"repository": bad, "hf_token": "hf"},
+            headers=_bearer(key),
+        )
+        assert malformed.status_code == 400, bad
+        assert "owner/name" in malformed.json()["detail"], bad
 
 
 def test_export_unfinished_run_is_409(api, monkeypatch):
