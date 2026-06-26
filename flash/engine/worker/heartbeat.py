@@ -52,60 +52,31 @@ _HB_LOCK = threading.Lock()
 # threads can upload heartbeat.json concurrently: a slower upload could land AFTER a newer
 # one on HF (reorder), so this lock makes uploads strictly ordered.
 _HB_UPLOAD_LOCK = threading.Lock()
-# But acquire it with a BOUND: huggingface_hub's upload has no hard per-call timeout, so a wedged
-# upload could hold the lock indefinitely and block the NEXT heartbeat — including an unthrottled
-# milestone like model_prefetched that sits on the worker's critical path right before trainer
-# construction. Past this bound we skip the (best-effort) commit rather than wedge; the local write
-# already landed and the next heartbeat re-commits a fresher snapshot. Generous so a healthy-but-slow
-# upload is never skipped — only a genuinely stuck one trips it.
+# Acquire the upload lock with a BOUND: hf upload has no hard timeout, so a wedged upload could hold
+# the lock and block the next heartbeat. Past the bound we skip the best-effort commit (the local
+# write already landed; the next heartbeat re-commits). Terminal/error_* commits are CRITICAL — no
+# later heartbeat repairs them — so they wait much longer before giving up, but still bounded.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
-# Terminal (done/already_done) and error_* commits are CRITICAL — the control plane has no later
-# heartbeat to repair a skipped terminal commit, and error_* carries the `retriable` flag that
-# worker_flagged_retriable() reads. So those wait MUCH longer for the upload lock before giving up
-# (a slow progress upload ahead of them resolves well within this), at the cost of a bounded delay to
-# the worker's exit. Still bounded (not unbounded) so a truly-wedged upload can't hang exit forever.
 _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
 
-# Stall diagnostics: when FLASH_STALL_FAULTHANDLER_S > 0, arm a faulthandler watchdog that dumps
-# every thread's Python stack (then exits, so the run FAILS instead of hanging until the
-# control-plane stall watchdog kills it ~25 min later, and the dump is uploaded with
-# console_<phase>.txt). The timer is re-armed on every heartbeat, so it only fires when NO progress
-# heartbeat lands for the whole window -- i.e. a real hang. Used to localize the GRPO sleep-mode
-# rollout hang and the consumer-GPU warm-start init hang.
-#
-# DEFAULT-ON (2400s / 40 min). This is the STEADY-STATE (training) window; the whole cold start runs
-# under the wider _STALL_STARTUP_GRACE_S below until the first rl_step/sft_step. It is SAFE — and
-# strictly better than the old silent wedge — because every heartbeat re-arms the timer: a slow-but-
-# LIVE cold init pings ``rl_initializing``/``sft_initializing`` every 30s (and those now use the
-# GIL-friendly nvidia-smi-only diagnostics, so they keep ticking through a CUDA-busy init), so the
-# watchdog only fires on a TRUE hang where NO heartbeat lands for the whole window. The training
-# window is WELL above the longest observed HEALTHY per-step gap, so it adds a stack dump for a TRUE
-# training hang without false-killing a healthy step. When it fires it dumps every thread's stack
-# (C-level faulthandler -> fires even if the main thread holds the GIL) and fails the run, turning
-# the previously undiagnosable "process wedged, no console upload" hang into an uploaded stack trace.
-# Set FLASH_STALL_FAULTHANDLER_S=0 in [worker_env] to disable; lower it to localize a known hang.
+# Stall watchdog: a faulthandler that dumps every thread's stack and exits when NO heartbeat lands
+# for the window (re-armed on every heartbeat, so it only fires on a true hang) — turning a silent
+# wedge into an uploaded stack trace. DEFAULT-ON; this is the steady-state (training) window, with
+# the wider _STALL_STARTUP_GRACE_S used through cold start. Safe because every long phase keeps
+# heartbeating (init/prefetch/step liveness). Set FLASH_STALL_FAULTHANDLER_S=0 in [worker_env] to
+# disable, or lower it to localize a known hang.
 _STALL_FAULTHANDLER_S = 2400
 with contextlib.suppress(Exception):
     _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "2400") or 2400)
 
-# Startup/setup grace: the ENTIRE cold start — model prefetch, weight load, vLLM build,
-# *Trainer.__init__, and the (often silent) full-dataset render/tokenize — can legitimately run for
-# many minutes with only coarse 30s setup pings, or, inside dataset tokenization, none at all. A
-# tight FLASH_STALL_FAULTHANDLER_S window would false-kill such a HEALTHY-but-slow setup, so until
-# the first per-step TRAINING heartbeat (rl_step/sft_step) lands, the watchdog uses this WIDER
-# window for EVERY arm (not just the first one). Default 3600s -- deliberately STRICTLY LONGER than
-# the providers' SETUP_GRACE_S (3000s) so a genuinely-stuck setup trips the provider's RETRIABLE
-# setup-stall path FIRST; if this faulthandler (exit=True) fired first, the worker would exit and the
-# provider's poll loop would see a terminal FAILED and hard-fail a stall that should have been
-# retried. Only once real training steps flow do we tighten to FLASH_STALL_FAULTHANDLER_S, where a
-# fast in-process stack dump is the point. Reads its OWN env var (independent of
-# FLASH_STALL_FAULTHANDLER_S); never consulted when the watchdog is disabled (early return below).
+# Cold start (prefetch, weight load, vLLM/trainer build, the silent full-dataset tokenize) can run
+# many minutes with only coarse pings, so until the first training step the watchdog uses this wider
+# window for every arm. Kept STRICTLY LONGER than the providers' SETUP_GRACE_S (3000s) so a stuck
+# setup trips the provider's RETRIABLE path before this (exit=True) hard-fails it (asserted in tests).
 _STALL_STARTUP_GRACE_S = 3600
-with contextlib.suppress(Exception):
-    _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "3600") or 3600)
 # Stages that mean real TRAINING has begun (vs. a cold-start/setup ping). The first one tightens the
 # watchdog from the wide setup grace to the steady-state window. Mirrors the providers'
 # SETUP_HEARTBEAT_STAGES boundary: the cold-start stages there are setup, sft_step/rl_step are not.

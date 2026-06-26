@@ -257,30 +257,6 @@ def test_liveness_heartbeat_survives_raising_fields_callback(monkeypatch):
 
 
 # --------------------------------------------------------------------------------------------
-# _hf_cache_bytes feeds the prefetch progress gate: bytes downloaded, or None when the cache dir
-# doesn't exist yet (unmeasurable). liveness_heartbeat treats None as "no advancement", so the
-# unmeasurable pre-structure window is itself bounded by max_silence_s.
-def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, monkeypatch):
-    import huggingface_hub.constants as hconst
-
-    from flash.engine.worker import hf
-
-    monkeypatch.setattr(hconst, "HF_HUB_CACHE", str(tmp_path))
-    # No repo cache dir yet -> None (can't measure) -> never counts as progress (bounded by silence).
-    assert hf._hf_cache_bytes("org/model") is None
-    repo = tmp_path / "models--org--model"
-    repo.mkdir(parents=True)
-    # Repo dir exists but blobs/ not written yet -> 0 (a real "0 bytes" measurement), NOT None: a
-    # download wedged before writing any blob must still let the silence timer trip.
-    assert hf._hf_cache_bytes("org/model") == 0
-    blobs = repo / "blobs"
-    blobs.mkdir()
-    (blobs / "complete").write_bytes(b"x" * 100)
-    (blobs / "partial.incomplete").write_bytes(b"y" * 50)  # an in-flight download's growing partial
-    assert hf._hf_cache_bytes("org/model") == 150
-
-
-# --------------------------------------------------------------------------------------------
 # Wiring: every long blocking phase must run under the shared liveness_heartbeat helper with the
 # right stage / progress gate. (Behaviour is covered above; these pin the call sites so the coverage
 # can't silently regress.)
@@ -313,17 +289,12 @@ def test_train_phase_wraps_train_in_train_liveness_heartbeat(modname, outer, sta
     assert f'"{stage}"' in src, f"{outer} must pass stage {stage!r}"
 
 
-def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
+def test_prefetch_wraps_download_in_liveness_heartbeat():
     from flash.engine.worker import hf
 
     src = inspect.getsource(hf.prefetch_model)
     assert "liveness_heartbeat(" in src
     assert '"model_prefetching"' in src
-    assert "_hf_cache_bytes" in src, "prefetch liveness must gate on real download progress"
-    assert "_MAX_PREFETCH_SILENCE_S" in src, (
-        "prefetch liveness must stop after _MAX_PREFETCH_SILENCE_S of no byte growth so a wedged "
-        "download trips the stall path instead of being masked to the job timeout"
-    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -334,12 +305,8 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
 
 
 @pytest.mark.skipif(
-    bool(
-        {"FLASH_STALL_FAULTHANDLER_S", "FLASH_STALL_FAULTHANDLER_STARTUP_S"}
-        & set(__import__("os").environ)
-    ),
-    # Both knobs are asserted below; either one set in the env overrides the defaults under test.
-    reason="env overrides the watchdog default(s) under test",
+    "FLASH_STALL_FAULTHANDLER_S" in __import__("os").environ,
+    reason="env overrides the watchdog default under test",
 )
 def test_stall_watchdog_enabled_by_default():
     import importlib
@@ -380,10 +347,7 @@ def test_stall_watchdog_disabled_via_worker_env(monkeypatch):
 
 
 @pytest.mark.skipif(
-    bool(
-        {"FLASH_STALL_FAULTHANDLER_S", "FLASH_STALL_FAULTHANDLER_STARTUP_S"}
-        & set(__import__("os").environ)
-    ),
+    "FLASH_STALL_FAULTHANDLER_S" in __import__("os").environ,
     reason="env overrides the watchdog windows under test",
 )
 def test_stall_watchdog_stays_wide_until_first_training_step(monkeypatch):

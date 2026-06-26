@@ -9,7 +9,6 @@ CALL time, so tests that ``monkeypatch.setattr(worker, "<name>", ...)`` then cal
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import threading
@@ -231,43 +230,6 @@ def _link_base_model_into_ephemeral_cache(model_id: str, shared_hub: str) -> Non
         print("prefetch_model link warn:", e)
 
 
-# No new download bytes for this long => snapshot_download is WEDGED (not slow): the prefetch liveness
-# stops pinging so the stall watchdog / provider setup-stall fire instead of masking a stuck transfer
-# to the job timeout. Generous — a live transfer moves SOME bytes well within this even on a slow link.
-_MAX_PREFETCH_SILENCE_S = 600.0
-
-
-def _hf_cache_bytes(model_id: str, cache_dir: str | None = None) -> int | None:
-    """Downloaded-byte total for ``model_id`` under ``cache_dir`` (or the default HF hub cache): the
-    sum of the repo's ``blobs/`` files (the data, incl. the ``.incomplete`` partials an in-flight
-    download grows). Scans ONLY ``blobs/`` (snapshots/ are symlinks; refs/metadata are tiny), so it
-    matches "bytes downloaded" and stays cheap. ``cache_dir`` must be the dir snapshot_download writes
-    to (the shared weight-cache mount when set, else the ephemeral default) or growth is invisible.
-
-    Returns the blob byte total (``0`` if the repo dir exists but no blob is written yet — a real
-    "0 bytes" measurement that still lets the silence timer trip), or ``None`` when the repo cache dir
-    does not exist yet / on any error — the unmeasurable window ``liveness_heartbeat`` treats as
-    "no advancement".
-    """
-    try:
-        from huggingface_hub.constants import HF_HUB_CACHE
-
-        repo = os.path.join(cache_dir or HF_HUB_CACHE, _repo_folder_name(model_id))
-        if not os.path.isdir(repo):
-            return None  # cache structure not created yet -> can't measure
-        blobs = os.path.join(repo, "blobs")
-        if not os.path.isdir(blobs):
-            return 0  # repo dir exists but no blobs written yet -> 0 bytes downloaded (measurable)
-        total = 0
-        for fn in os.listdir(blobs):
-            fp = os.path.join(blobs, fn)
-            with contextlib.suppress(OSError):
-                if os.path.isfile(fp):
-                    total += os.path.getsize(fp)
-        return total
-    except Exception:
-        return None
-
 
 def prefetch_model(model_id: str) -> float:
     """Pull the base-model weights into the HF cache up front; return seconds spent.
@@ -285,17 +247,12 @@ def prefetch_model(model_id: str) -> float:
 
     shared_hub = _shared_weight_cache_dir()
     t0 = time.time()
-    # snapshot_download blocks with NO heartbeat until it returns, but a cold cache can pull tens of GB
-    # over many minutes — longer than the stall watchdog AND the provider setup grace — so a silent
-    # download would look like a hang and self-kill a HEALTHY cold start. Keep a model_prefetching
-    # heartbeat alive, gated on downloaded-byte GROWTH (in the dir the download actually writes to, so a
-    # genuinely WEDGED transfer still yields to the stall path). See heartbeat.liveness_heartbeat.
+    # A cold snapshot_download can pull tens of GB with no heartbeat; keep a model_prefetching ping
+    # alive so a slow-but-live download isn't mistaken for a hang. See heartbeat.liveness_heartbeat.
     from flash.engine.worker.heartbeat import liveness_heartbeat
 
     with liveness_heartbeat(
         "model_prefetching",
-        progress=lambda: _hf_cache_bytes(model_id, shared_hub),
-        max_silence_s=_MAX_PREFETCH_SILENCE_S,
         fields=lambda: {"model": model_id, "elapsed_seconds": round(time.time() - t0, 1)},
     ):
         try:
