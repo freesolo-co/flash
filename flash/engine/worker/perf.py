@@ -902,11 +902,9 @@ def _gpu_mismatch_reason(
 
 def verify_gpu(requested_gpu: str | None) -> None:
     """Assert the LIVE GPU matches the REQUESTED class (model + CUDA floor), or raise retriable.
-
-    No-op when ``requested_gpu`` is falsy/unknown. Runs on every provider's box, so it standardizes the
-    per-class CUDA floor (only Hyperstack/RunPod enforce it pre-launch, Lambda not at all) and adds a
-    GPU-model substitution check no provider does; a mismatch is ``RetriableInfraError`` (fail over to a
-    fresh box) instead of an opaque mid-setup crash. Best-effort reads, strict compare."""
+    No-op for a falsy/unknown class. Runs on every provider (standardizes the per-class CUDA floor that
+    only Hyperstack/RunPod enforce pre-launch + a GPU-model check no provider does); a mismatch raises
+    ``RetriableInfraError`` (fail over) instead of an opaque mid-setup crash. Best-effort reads."""
     if not requested_gpu:
         return
     import torch
