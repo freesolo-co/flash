@@ -241,10 +241,39 @@ def test_prefetch_heartbeat_skips_emit_once_done_is_set():
 
 
 # --------------------------------------------------------------------------------------------
+# Training-phase gap-filler. The per-step rl_step heartbeat fires on on_log AFTER a step, so the
+# FIRST GRPO step (cold vLLM rollout warmup + backward — measured ~17 min on a consumer GPU) emits
+# NO heartbeat while it runs. That stale-heartbeat window was the actual escalation symptom (and a
+# slow-enough step would trip the stall watchdog). run_rl must run a liveness daemon around
+# trainer.train() that fills the gap.
+def test_train_phase_has_liveness_heartbeat():
+    from flash.engine.worker import rl
+
+    node = _inner_func_node(rl.run_rl, "_train_liveness_heartbeat")
+    assert node is not None, (
+        "run_rl no longer runs a liveness heartbeat around trainer.train() — the cold first-step "
+        "rollout would emit no heartbeat and look like a hang (the original escalation)"
+    )
+    # nvidia-smi only: the trainer thread owns the CUDA/allocator locks during a step.
+    _assert_gpu_diag_disables_torch(node, "run_rl._train_liveness_heartbeat")
+    # ...and it must emit a progress heartbeat (rl_step) to refresh the channel + re-arm the watchdog.
+    stages = [
+        n.args[0].value
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "heartbeat"
+        and n.args
+        and isinstance(n.args[0], ast.Constant)
+    ]
+    assert "rl_step" in stages, f"expected an rl_step liveness heartbeat, got {stages}"
+
+
+# --------------------------------------------------------------------------------------------
 # Stall watchdog default. A true hang (no heartbeat for the window) must self-dump every thread's
 # stack and fail the run instead of wedging silently until the control-plane kill (the
 # "process wedged, no console upload" gap). This is safe-by-default because every heartbeat re-arms
-# the timer and the init heartbeats above now keep ticking through a slow-but-live cold init.
+# the timer and the init/training heartbeats now keep ticking through slow-but-live phases.
 
 
 @pytest.mark.skipif(

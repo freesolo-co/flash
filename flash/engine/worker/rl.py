@@ -776,8 +776,36 @@ def run_rl():
     _reset_peak_gpu()  # peak_gpu_gb reflects the train loop (verifies the micro-batch headroom)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. vLLM colocate + bnb pages
     t_train = time.time()
-    with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
-        trainer.train(resume_from_checkpoint=resume_ckpt)
+    # GAP-FILLER liveness heartbeat for the training phase. The per-step rl_step heartbeat only
+    # fires on on_log AFTER a step finishes, so the FIRST step — cold vLLM rollout (cudagraph/
+    # compile warmup) + forward + backward — emits NO heartbeat while it runs. On a consumer GPU that
+    # first step can take 10-17 min (measured: an RTX 4090 0.8B warm-start GRPO had a ~17-min gap
+    # between the last rl_initializing heartbeat and rl_step=1 — the run was alive in the first step's
+    # backward the whole time, but the stale heartbeat made it look hung -> the false escalation; and
+    # with the stall watchdog on, a slow-enough step would self-kill). This daemon emits a liveness
+    # heartbeat whenever the channel has gone quiet (no upload for >=90s), covering the first step and
+    # any unusually slow later step. It no-ops during normal fast stepping (rl_step keeps the channel
+    # fresh within _HB_MIN_INTERVAL_S=60s) so it adds no commit spam. nvidia-smi-only diagnostics: the
+    # trainer thread owns the CUDA/allocator locks during a step, so torch.cuda telemetry would block.
+    _train_done = threading.Event()
+
+    def _train_liveness_heartbeat() -> None:
+        while not _train_done.wait(30.0):
+            try:
+                quiet_for = time.time() - float(getattr(_w, "_HB_LAST_UPLOAD", 0.0) or 0.0)
+            except Exception:
+                quiet_for = 1e9
+            if quiet_for >= 90.0:
+                step = int(getattr(getattr(trainer, "state", None), "global_step", 0) or 0)
+                _w.heartbeat("rl_step", step=step, gpu=gpu_diagnostics(include_torch=False))
+
+    _train_hb = threading.Thread(target=_train_liveness_heartbeat, daemon=True)
+    _train_hb.start()
+    try:
+        with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+            trainer.train(resume_from_checkpoint=resume_ckpt)
+    finally:
+        _train_done.set()
     train_wall = time.time() - t_train
     rl_peak_gpu_gb = _peak_gpu_gb()
     rl_device_peak_gpu_gb = _gpu_sampler.stop_gb()
