@@ -166,20 +166,24 @@ _MAX_PREFETCH_SILENCE_S = 600.0
 
 
 def _hf_cache_bytes(model_id: str) -> int:
-    """Best-effort total bytes in the HF hub cache for ``model_id`` (blob sizes, incl. ``.incomplete``
-    partials an in-flight download is growing). Returns -1 if it can't be determined, so callers fail
-    SAFE (assume progress, never false-stop a real download)."""
+    """Best-effort downloaded-byte total for ``model_id`` in the HF hub cache: the sum of the
+    ``blobs/`` files (the actual data, incl. the ``.incomplete`` partials an in-flight download is
+    growing). Scans ONLY ``blobs/`` — snapshots/ are just symlinks to blobs and refs/metadata are
+    tiny, so this matches "bytes downloaded" and stays cheap on a large cache. ``blobs/`` is flat, so
+    a single listdir suffices. Returns -1 if it can't be determined (cache dir not created yet, or any
+    error), so callers fail SAFE (assume progress, never false-stop a real download)."""
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
 
-        d = os.path.join(HF_HUB_CACHE, "models--" + model_id.replace("/", "--"))
-        if not os.path.isdir(d):
+        blobs = os.path.join(HF_HUB_CACHE, "models--" + model_id.replace("/", "--"), "blobs")
+        if not os.path.isdir(blobs):
             return -1
         total = 0
-        for root, _dirs, files in os.walk(d):
-            for fn in files:
-                with contextlib.suppress(OSError):
-                    total += os.path.getsize(os.path.join(root, fn))
+        for fn in os.listdir(blobs):
+            fp = os.path.join(blobs, fn)
+            with contextlib.suppress(OSError):
+                if os.path.isfile(fp):
+                    total += os.path.getsize(fp)
         return total
     except Exception:
         return -1
