@@ -59,7 +59,7 @@ def run_sft():
     # transcript (proper multi-turn SFT, handled below); rows with a single-turn target completion
     # collapse to one assistant turn. Warn only for the collapsing case (computed during the
     # dataset build below), not unconditionally.
-    wait_for_gpu()
+    wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     download_seconds = _w.prefetch_model(model_id)
