@@ -78,6 +78,7 @@ from flash.engine.worker.grpo import (
     _grpo_resume_already_complete,
     build_grpo_prompt_dataset,
     compute_grpo_batching,
+    grpo_mask_truncated_completions,
     grpo_overrides,
     resolve_grpo_prompts_per_step,
     rl_per_device_comps,
@@ -531,6 +532,7 @@ __all__ = [
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "graded_text",
+    "grpo_mask_truncated_completions",
     "grpo_overrides",
     "grpo_sleep_mode",
     # heartbeat

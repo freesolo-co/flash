@@ -279,3 +279,19 @@ def _grpo_is_no_op_failure(reward_history, resume_ckpt, target_steps: int, steps
     if reward_history:
         return False
     return not _grpo_resume_already_complete(resume_ckpt, target_steps, steps_run)
+
+
+def grpo_mask_truncated_completions(train) -> bool:
+    """Whether GRPO should drop TRUNCATED (non-EOS) completions from the loss.
+
+    Default True (TRL's footgun is off-by-default): a completion cut at
+    max_completion_length without an EOS is not a real sample from the policy's
+    distribution over finished sequences, so training on it biases the policy
+    gradient and — on envs that frequently hit the budget — can degrade the model
+    below its SFT start. GATED OFF when ``stop_sequences`` is set, because TRL flags
+    truncation by "last token != EOS/PAD" and a stop-string rollout terminates on the
+    stop *string* (stripped from the output, so the last token is not EOS); masking
+    would then wrongly drop every normally-terminated completion and the run would
+    learn nothing. ``stop_sequences`` defaults to () (the common case → on).
+    """
+    return not (train and train.stop_sequences)

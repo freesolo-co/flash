@@ -428,6 +428,20 @@ def run_rl():
         "beta": _kl_beta,
         "scale_rewards": "none",
         "loss_type": "dr_grpo",
+        # Exclude TRUNCATED completions (ran to max_completion_length without an EOS) from the
+        # loss. TRL's default is False, which trains on these incomplete rollouts — and because a
+        # truncated completion is not a real sample from the policy's distribution over FINISHED
+        # sequences, including it gives a biased policy gradient (TRL/DAPO: truncated completions
+        # are "incorrectly penalized and introduce noise during training"). On long-completion or
+        # multi-turn envs that frequently hit the budget this destabilizes GRPO and can DEGRADE the
+        # model below its SFT start (observed: runs with clipped_ratio 0.6-0.99 stalled at ~0 reward
+        # while the vLLM-vs-trainer sampling_logp_difference exploded). dr_grpo normalizes by the
+        # constant batch*max_completion_length (not mask.sum()), so masking every completion in a
+        # batch yields a 0 loss / 0 gradient — safe, never a divide-by-zero. TRL>=1.6 also applies
+        # this mask to the multi-turn tool/env mask, so the rollout_func path is covered too.
+        # GATED OFF when stop_sequences is set (see grpo_mask_truncated_completions): TRL flags
+        # truncation by "last token != EOS/PAD", but a stop-string rollout's last token is not EOS.
+        "mask_truncated_completions": _w.grpo_mask_truncated_completions(_t),
         # Optimizer: 8-bit paged AdamW (int8 state paged to host RAM -> fits a smaller GPU);
         # colocated GRPO (trainer + vLLM on one GPU) is memory-tight, so this is the right default.
         "optim": fused_optim_name(),
