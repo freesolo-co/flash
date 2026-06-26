@@ -49,7 +49,11 @@ def main() -> int:
     if arch:
         cmd += ["--arch", arch]
     print(f"[bake] running: {' '.join(cmd)}", flush=True)
-    rc = subprocess.call(cmd, env=env)
+    # capture the warmup output into /out so it ships back with the cache -- lets the CI helper show
+    # WHICH warm steps compiled and what save_cache_artifacts returned when no mega_cache.bin lands.
+    os.makedirs("/out", exist_ok=True)
+    with open("/out/warmup.log", "wb") as lf:
+        rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
     print(f"[bake] kernel_warmup rc={rc}", flush=True)
 
     # ship the whole cache tree back (mega blob + metadata + raw triton/inductor dirs).
