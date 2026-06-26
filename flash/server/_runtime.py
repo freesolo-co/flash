@@ -50,6 +50,30 @@ async def _reconcile_cost_loop() -> None:
             _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
 
 
+async def _charge_retry_loop() -> None:
+    """Background loop: periodically re-charge completed runs whose customer charge was left
+    pending/charging/failed by a transient backend blip (or a crash between the ``done`` write and
+    the charge), so a finished-but-uncharged run never leaks revenue. The backend charge is
+    idempotent by runId, so every retry is safe. Each sweep is offloaded to a thread (the charge is
+    blocking urllib); failures are swallowed and retried next cycle. The interval IS the bounded
+    backoff. Off entirely when FREESOLO_INTERNAL_KEY is unset (see charge_retry_enabled)."""
+    from flash.server.billing_retry import retry_completion_charges_once
+
+    interval = 300.0  # retry pending/failed customer charges every 5 min
+    while True:
+        await asyncio.sleep(interval)
+        # Mirror the sibling reaper/reconcile loops: re-raise CancelledError so the lifespan's
+        # task.cancel() stops it at shutdown, and swallow only real Exceptions to keep sweeping.
+        try:
+            charged = await asyncio.to_thread(retry_completion_charges_once)
+            if charged:
+                _log.info("recovered %d pending completion charge(s) on retry", charged)
+        except asyncio.CancelledError:
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except Exception:
+            _log.debug("completion-charge retry sweep failed; retrying next cycle", exc_info=True)
+
+
 def _append_run_log(run_id: str, message: str) -> None:
     """Append a timestamped note to a run's log so it surfaces in `flash status --logs`."""
     import time

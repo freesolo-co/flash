@@ -34,7 +34,13 @@ from flash.serve.deploy import deploy_adapter, undeploy_adapter
 
 from . import db
 from ._locks import _DEPLOY_LOCKS, _deploy_lock
-from ._runtime import _RECOVERABLE, _reconcile_cost_loop, _worker_artifacts, recover_runs
+from ._runtime import (
+    _RECOVERABLE,
+    _charge_retry_loop,
+    _reconcile_cost_loop,
+    _worker_artifacts,
+    recover_runs,
+)
 
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
@@ -52,6 +58,7 @@ _log = logging.getLogger("flash.server")
 __all__ = [
     "_DEPLOY_LOCKS",
     "_RECOVERABLE",
+    "_charge_retry_loop",
     "_deploy_lock",
     "_reconcile_cost_loop",
     "_worker_artifacts",
@@ -243,10 +250,19 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         from flash.providers.preflight import check_run_preflight
+        from flash.server.billing_retry import charge_retry_enabled, retry_completion_charges_once
         from flash.server.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
+        # Recover completion-time customer charges left pending/failed by a transient blip or a
+        # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
+        # `done`, so those would otherwise leak revenue; this startup sweep catches them promptly.
+        # Idempotent by runId on the backend, so it can't double-charge. Best-effort.
+        with contextlib.suppress(Exception):
+            recovered = retry_completion_charges_once()
+            if recovered:
+                _log.info("recovered %d pending completion charge(s) at startup", recovered)
         # Reconcile the shared RunPod endpoint-slot quota against the live endpoint list so a
         # crash can't leak slots permanently (no-op without an internal key). Best-effort.
         with contextlib.suppress(Exception):
@@ -256,6 +272,11 @@ def create_app():
         # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
         # internal key is configured.
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
+        # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
+        # so it can't leak revenue. Same internal-key gate as the charge itself.
+        charge_task = (
+            asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
+        )
         # Periodic idle-endpoint reaper: proactively delete RunPod training endpoints doing
         # nothing (orphans from finished/crashed runs) so workers don't linger holding quota.
         # Only when this plane manages RunPod (its API key is configured).
@@ -275,7 +296,7 @@ def create_app():
         try:
             yield
         finally:
-            for task in (cost_task, reap_task, sweep_task):
+            for task in (cost_task, charge_task, reap_task, sweep_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
