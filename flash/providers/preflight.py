@@ -1,9 +1,11 @@
 """Control-plane startup preflight.
 
 ``check_run_preflight`` aggregates every missing piece of REQUIRED operator configuration — the
-RunPod multi-account pool, the Lambda + Hyperstack provider keys, the shared HF/GitHub tokens, and
-the Freesolo backend internal key — into one startup error, so a half-configured plane fails fast
-at deploy instead of degrading silently in production.
+RunPod multi-account pool, the Lambda + Hyperstack provider keys, the Freesolo backend internal key,
+and (when ``require_hf``, the default) the shared GitHub + HF tokens — into one startup error, so a
+half-configured plane fails fast at deploy instead of degrading silently in production. A
+``require_hf=False`` caller skips only the HF/GitHub tokens (e.g. a context that uploads no run
+artifacts); every other credential is always required.
 """
 
 from __future__ import annotations
