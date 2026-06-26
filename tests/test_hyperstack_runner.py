@@ -143,9 +143,11 @@ def test_launch_raises_when_no_stock(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=[], attempt=0)
 
 
-def test_regions_excludes_canada1_by_default(monkeypatch):
-    """CANADA-1 (known broken-driver on-demand fleet) is dropped from the region list by default, so
-    the allocator + launcher never offer or boot there. The API still returns it; flash filters it."""
+def test_regions_no_static_block_by_default(monkeypatch):
+    """No region is statically dropped by default. CANADA-1 used to be hard-banned here for a
+    broken-driver L40 fleet; it was re-verified healthy on 2026-06-26 and un-banned, so every
+    API-returned region now passes through — a region that goes bad is caught by fast-failover, not a
+    hand-maintained denylist."""
     from flash.providers.hyperstack import api as hs_api
 
     monkeypatch.setattr(
@@ -155,8 +157,8 @@ def test_regions_excludes_canada1_by_default(monkeypatch):
     )
     monkeypatch.delenv("HYPERSTACK_BLOCKED_REGIONS", raising=False)
     regions = hs_api._regions()
-    assert "CANADA-1" not in regions
-    assert regions == ["NORWAY-1", "US-1"]
+    assert "CANADA-1" in regions
+    assert regions == ["NORWAY-1", "CANADA-1", "US-1"]
 
 
 def test_regions_blocklist_is_env_overridable(monkeypatch):
@@ -432,11 +434,11 @@ def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None
         def read(force=False):
             if path.endswith("/DONE"):
                 return done() if callable(done) else done
-            if "hyperstack_attempt" in path:
+            if "hyperstack_attempt" in path and path.endswith(".json"):  # not the _boot.log
                 return marker() if callable(marker) else marker
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
-            if path.endswith("hyperstack_boot.log"):
+            if path.endswith("_boot.log"):  # attempt-scoped: hyperstack_attempt<N>_boot.log
                 return boot() if callable(boot) else boot
             return None
 
@@ -507,6 +509,114 @@ def test_poll_dead_vm_without_marker_is_preempted(monkeypatch):
     assert "gpu never became ready" in res.detail
 
 
+def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
+    """Hyperstack CANADA-1 (or any HS region) equivalent of the Lambda sick-region case: a VM that
+    reaches ACTIVE but never starts a worker (no boot.log/heartbeat/marker) fails over fast as a
+    retriable 'stalled' instead of burning the full ~50 min setup grace."""
+    jobs = _wire_poll(monkeypatch, vms=[{"status": "ACTIVE"}], step=100.0)
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=500.0)
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+
+
+def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
+    """A healthy VM still pulling the image emits the boot.log but no heartbeat yet — the
+    first-liveness deadline must NOT fire."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot="+ docker pull ... (still pulling)",
+        step=100.0,
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):
+    """An empty ("") boot.log still proves cloud-init ran — its EXISTENCE is liveness. A bare
+    ``not boot_log_reader()`` would treat "" as absent and spuriously fail the VM over; the fix uses
+    ``is None``. VM later dies -> job_preempted, NOT the 'no worker liveness' stall."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot="",
+        step=100.0,
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_boot_log_seen_once_survives_rate_limited_none(monkeypatch):
+    """Regression: make_hf_text_reader returns None for BOTH a missing boot.log AND a rate-limited
+    read, so a bare ``not boot_log_reader()`` re-checked each poll would spuriously stall a HEALTHY VM
+    on the first throttled read after the log was already seen. The boot.log is read with force=True and
+    latched once observed, so a later None can't re-trigger failover."""
+    calls = {"n": 0}
+
+    def boot_then_rate_limited():
+        calls["n"] += 1
+        return "+ docker pull ..." if calls["n"] == 1 else None  # seen once, then "rate-limited"
+
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot=boot_then_rate_limited,
+        step=100.0,
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"  # NOT a spurious 'stalled' from the throttled None
+    assert "no worker liveness" not in (res.detail or "")
+    # Latched after the first observation: the liveness check reads the boot.log once (not once per
+    # poll); the only other read is the terminal-failure-detail surfacer when the VM dies.
+    assert calls["n"] <= 2
+
+
+def test_poll_active_transient_boot_log_error_does_not_fail_over(monkeypatch):
+    """make_hf_text_reader returns None for a MISSING boot.log AND a momentary HF/Hub network error,
+    so a lone forced-read None at the first-liveness deadline must NOT immediately stall — a transient
+    blip clears on the next poll (the absence must persist BOOT_LOG_ABSENT_POLLS times to fail over).
+    Here the first forced read errors (None), the next returns the real boot.log -> latched, no
+    failover; the VM later dies -> job_preempted, NOT a spurious 'stalled' from the one transient
+    None."""
+    calls = {"n": 0}
+
+    def transient_then_present():
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "+ docker pull ..."  # transient error first, then readable
+
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot=transient_then_present,
+        step=100.0,
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"  # the single transient None did not trip a failover
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypatch):
+    """The genuine sick-region case: the boot.log is absent on EVERY forced read (cloud-init never
+    ran). After BOOT_LOG_ABSENT_POLLS consecutive absent reads the first-liveness check declares the
+    region 'stalled' (retriable, escaped cross-provider). Asserts the absence-count threshold is what
+    gates the failover, not a single read."""
+    from flash.providers._poll import BOOT_LOG_ABSENT_POLLS
+
+    calls = {"n": 0}
+
+    def always_absent():
+        calls["n"] += 1  # implicit None: every forced read comes back absent
+
+    jobs = _wire_poll(monkeypatch, vms=[{"status": "ACTIVE"}], boot=always_absent, step=100.0)
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+    assert calls["n"] >= BOOT_LOG_ABSENT_POLLS  # required the absence to persist, not a lone None
+
+
 def test_poll_loading_timeout(monkeypatch):
     jobs = _wire_poll(monkeypatch, vms=[{"status": "BUILD"}], step=100.0)
     monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", 300.0)
@@ -559,7 +669,8 @@ def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
 
     captured = {}
 
-    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None):
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None,
+                  first_liveness_s=None, setup_grace_s=None):
         captured["deadline_s"] = deadline_s
         return PollResult(True)
 
@@ -569,6 +680,35 @@ def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
     handle = JobHandle.from_dict({"provider": "hyperstack", **_handle(started_ts=1.0).to_dict()})
     HyperstackProvider().poll(handle, spec, seed=0)
     assert captured["deadline_s"] == max(60.0, 3600 + PROVISION_GRACE_S)
+
+
+def test_provider_poll_uses_uniform_wait_ignoring_on_last_gpu(monkeypatch):
+    """The instance recovery poll uses a UNIFORM per-GPU wait: a persisted on_last_gpu does NOT scale
+    first_liveness / setup grace — the poll relies on its unscaled defaults, matching the submit path.
+    (on_last_gpu stays a Provider-interface param for RunPod; the instance providers ignore it.)"""
+    from flash.providers.base import JobHandle, PollResult
+    from flash.providers.hyperstack import HyperstackProvider
+
+    captured = {}
+
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None,
+                  first_liveness_s=None, setup_grace_s=None):
+        captured["first_liveness_s"] = first_liveness_s
+        captured["setup_grace_s"] = setup_grace_s
+        return PollResult(True)
+
+    monkeypatch.setattr("flash.providers.hyperstack.jobs.poll_hs_job", fake_poll)
+    monkeypatch.setattr("flash.providers.hyperstack.api.delete_vm", lambda vid: None)
+    spec = _spec()
+    handle = JobHandle.from_dict({**_handle().to_dict(), "provider": "hyperstack", "on_last_gpu": True})
+    HyperstackProvider().poll(handle, spec, seed=0)
+    assert captured["first_liveness_s"] is None  # not overridden -> poll uses its uniform default
+    assert captured["setup_grace_s"] is None
+    captured.clear()
+    handle2 = JobHandle.from_dict({**_handle().to_dict(), "provider": "hyperstack"})
+    HyperstackProvider().poll(handle2, spec, seed=0)
+    assert captured["first_liveness_s"] is None
+    assert captured["setup_grace_s"] is None
 
 
 def test_poll_surfaces_worker_progress(monkeypatch):
@@ -807,14 +947,23 @@ def test_allocator_capacity_aware(monkeypatch):
     monkeypatch.setenv("HYPERSTACK_API_KEY", "hk")
 
     def fake_usable(gpu):
-        if gpu == "L40":
+        if gpu == "RTX A6000":
+            return [
+                HyperstackInstance("RTX A6000", "n3-RTX-A6000x1", "NORWAY-1", "default-NORWAY-1", 48, 0.49)
+            ]
+        if gpu == "L40":  # in stock; allocatable again (CANADA-1 fleet re-verified healthy)
             return [HyperstackInstance("L40", "n3-L40x1", "CANADA-1", "default-CANADA-1", 48, 1.00)]
         return []  # other hyperstack classes out of stock
 
     monkeypatch.setattr("flash.providers.hyperstack.jobs.usable_instances", fake_usable)
     a = allocator.allocate("Qwen/Qwen3.5-4B", "sft", train={"max_length": 4096, "lora_rank": 16})
     hs = {c.gpu for c in a.candidates if c.provider == "hyperstack"}
-    assert hs == {"L40"}  # only the in-stock class
+    # Capacity-aware filtering keeps only the in-stock classes (drops the out-of-stock ones). Both the
+    # A6000 and L40 are in stock, so both are candidates; A6000 outranks L40 on price ($0.49 < $1.00).
+    assert hs == {"RTX A6000", "L40"}
+    a6000 = next(c for c in a.candidates if c.gpu == "RTX A6000")
+    l40 = next(c for c in a.candidates if c.gpu == "L40")
+    assert a.candidates.index(a6000) < a.candidates.index(l40)  # cheaper A6000 ranked ahead of L40
 
 
 # --- review-fix regressions ---
