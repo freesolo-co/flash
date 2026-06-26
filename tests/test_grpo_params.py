@@ -644,7 +644,53 @@ def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
     assert w.grpo_mask_truncated_completions(spec.train) is False
 
 
-def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override() -> None:
+def test_run_rl_wires_mask_truncated_completions_to_the_gating_helper() -> None:
+    """run_rl's grpo_kwargs literal must pin mask_truncated_completions to the
+    grpo_mask_truncated_completions(...) helper. The helper's True/False logic is covered above, but
+    nothing else guarantees run_rl actually USES it: drop that dict entry and the helper tests still
+    pass while GRPO silently reverts to TRL's footgun default (False). Assert the wiring on run_rl's
+    AST (not a source substring) so it survives reformatting/quote changes — mirrors
+    tests/test_flash_worker.py's _train_body AST checks."""
+    import ast
+    import inspect
+
+    import flash.engine.worker as w
+
+    tree = ast.parse(inspect.getsource(w.run_rl))
+    grpo_dict = next(
+        (
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Dict)
+            and any(isinstance(t, ast.Name) and t.id == "grpo_kwargs" for t in node.targets)
+        ),
+        None,
+    )
+    assert grpo_dict is not None, "run_rl no longer builds a grpo_kwargs dict literal"
+
+    value = next(
+        (
+            v
+            for k, v in zip(grpo_dict.keys, grpo_dict.values, strict=True)
+            if isinstance(k, ast.Constant) and k.value == "mask_truncated_completions"
+        ),
+        None,
+    )
+    assert value is not None, (
+        "run_rl's grpo_kwargs no longer pins mask_truncated_completions -> GRPO would silently "
+        "revert to TRL's footgun default (False) and train on truncated rollouts"
+    )
+    # Must be wired to the helper (so stop_sequences gating applies), not a bare True/False literal.
+    func = value.func if isinstance(value, ast.Call) else None
+    is_helper_call = isinstance(func, ast.Name) and func.id == "grpo_mask_truncated_completions"
+    assert is_helper_call, (
+        "mask_truncated_completions must be wired to grpo_mask_truncated_completions(...) so the "
+        "stop_sequences gating is honored"
+    )
+
+
+def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:
     """Document the TRL contract the recipe depends on: the field exists and TRL defaults it OFF,
     so the explicit True in run_rl is load-bearing. A TRL rename would silently drop our override,
     so fail loudly here if the field disappears."""
@@ -657,9 +703,10 @@ def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override() -> None:
     )
     assert fields["mask_truncated_completions"].default is False
     # The flag composes with the recipe's loss_type without GRPOConfig rejecting the combo
-    # (use_cpu/bf16=False so the config validates on a CPU-only CI host).
+    # (use_cpu/bf16=False so the config validates on a CPU-only CI host). tmp_path gives a unique,
+    # writable output_dir (no /tmp collisions between parallel test runs).
     cfg = GRPOConfig(
-        output_dir="/tmp/_grpo_trunc_test",
+        output_dir=str(tmp_path),
         loss_type="dr_grpo",
         mask_truncated_completions=True,
         report_to=[],
