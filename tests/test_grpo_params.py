@@ -602,6 +602,51 @@ def test_build_grpo_prompt_dataset_keeps_columns_arrow_safe() -> None:
     assert [e["metadata"]["param"] for e in mapped] == [12, 8, "gentle", 8]
 
 
+def test_grpo_recipe_masks_truncated_completions() -> None:
+    """run_rl pins mask_truncated_completions=True so GRPO never trains on the loss of a
+    completion that ran to max_completion_length without an EOS.
+
+    TRL's GRPOConfig default is False (it WOULD train on truncated rollouts); a truncated
+    completion is not a real sample from the policy's distribution over finished sequences, so
+    including it biases the policy gradient and — on long-completion / multi-turn envs that
+    frequently hit the budget — can degrade the model below its SFT start. This is a stable
+    recipe constant (not a per-run knob), so guard it at the source.
+    """
+    import inspect
+
+    import flash.engine.worker as w
+
+    src = inspect.getsource(w.run_rl)
+    assert '"mask_truncated_completions": True' in src, (
+        "run_rl must pin mask_truncated_completions=True in the GRPO recipe"
+    )
+
+
+def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override() -> None:
+    """Document the TRL contract the recipe depends on: the field exists and TRL defaults it OFF,
+    so the explicit True in run_rl is load-bearing. A TRL rename would silently drop our override,
+    so fail loudly here if the field disappears."""
+    import dataclasses as dc
+
+    GRPOConfig = pytest.importorskip("trl").GRPOConfig
+    fields = {f.name: f for f in dc.fields(GRPOConfig)}
+    assert "mask_truncated_completions" in fields, (
+        "TRL renamed/removed mask_truncated_completions — update the GRPO recipe in run_rl"
+    )
+    assert fields["mask_truncated_completions"].default is False
+    # The flag composes with the recipe's loss_type without GRPOConfig rejecting the combo
+    # (use_cpu/bf16=False so the config validates on a CPU-only CI host).
+    cfg = GRPOConfig(
+        output_dir="/tmp/_grpo_trunc_test",
+        loss_type="dr_grpo",
+        mask_truncated_completions=True,
+        report_to=[],
+        bf16=False,
+        use_cpu=True,
+    )
+    assert cfg.mask_truncated_completions is True
+
+
 def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
     # The actual failure point: Dataset.from_list over the rich records raises ArrowInvalid on the
     # mixed-type column, while the index-based rows construct cleanly.
