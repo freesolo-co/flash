@@ -206,7 +206,6 @@ def test_http_error_detail_falls_back_to_reason():
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
     monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
-    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
@@ -229,8 +228,8 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
-    # The Lambda/Hyperstack keys above (required by the startup preflight) make configured_providers()
-    # treat both as live, so startup recover_runs() would dispatch real sweep_orphans() list calls.
+    # The Lambda key above (required by the startup preflight) makes configured_providers()
+    # treat it as live, so startup recover_runs() would dispatch real sweep_orphans() list calls.
     # And the dummy FREESOLO_INTERNAL_KEY enables the best-effort backend reporting path: every
     # /v1/runs submit -> _report_status() -> run_registry._post() would urllib-POST the real backend
     # (or wait out its 10s timeout). These billing tests assert on the API response, not on reporting,
