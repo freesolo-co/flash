@@ -89,8 +89,14 @@ def api(tmp_path, monkeypatch):
     # call sites do a function-local `from flash.providers import configured_providers`, so patching
     # the package attribute covers them.)
     import flash.providers as providers_mod
+    import flash.server.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    # The dummy FREESOLO_INTERNAL_KEY also enables the best-effort backend reporting path: a dry-run
+    # /v1/runs submit carries an org_id, so runner.submit_job() -> _report_status() ->
+    # run_registry._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
+    # single network choke-point so these offline tests stay hermetic (same as the billing fixture).
+    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
