@@ -1,27 +1,15 @@
 """Dynamic per-region health for the instance providers (Lambda / Hyperstack).
 
-A region that just proved SICK — an instance reached OS-level ``active`` but the worker never reached
-a *training* heartbeat (cloud-init/boot never came up, or the GPU/driver never initialized) — is
-QUARANTINED for a TTL so both the allocator's capacity view AND the launch-time region walk avoid it,
-instead of re-rolling the same broken region on every retry. This GENERALIZES the hand-curated static
-``HYPERSTACK_BLOCKED_REGIONS`` denylist to ANY region on ANY instance provider, learned at runtime:
-the two observed failures — a wedged Lambda ``us-east-1`` (cloud-init never ran) and the broken-driver
-Hyperstack ``CANADA-1`` L40 fleet (NVML init fail) — are exactly "active but never trained", so a run
-that hits one quarantines that region and the next attempt lands elsewhere.
+A region that proved SICK (instance reached ``active`` but the worker never reached a *training*
+heartbeat — boot/cloud-init never came up or the GPU never initialized) is QUARANTINED for a TTL so
+the allocator's capacity view and the launch-time region walk both avoid it instead of re-rolling the
+same broken region. Runtime-learned generalization of the static ``HYPERSTACK_BLOCKED_REGIONS``.
 
-TTL-based so a TRANSIENT regional blip self-heals without a human editing a denylist; in-process only
-(resets on control-plane restart) and strictly best-effort: it can only DEMOTE a region for a bounded
-window, never hard-fail a run. The demotion is a strict RANKING preference, not a hard exclusion — a
-healthy candidate always outranks a quarantined one, but if a class's only capacity is in quarantined
-regions the allocator and the launch-time region walk still REACH it via a last-resort ``ignore_sick``
-pass rather than hard-failing, so the run launches there anyway (and simply re-quarantines + escapes
-cross-provider if it is still broken). The TTL also lapses and the region is tried fresh.
-
-The quarantine fires only on a HOST-fault signal (``PollResult.host_fault``), which the instance
-pollers set just for failures that prove the region/host never got a worker to training — NOT for a
-mid-training stall (the region was working), nor ``no_capacity`` (the region is fine, just full), nor
-a genuine worker/code error. A healthy box reaches a heartbeat in well under the deadlines, so a
-single host-fault signal is trustworthy enough to demote the region for the TTL.
+Bounded DEMOTION, never a hard fail: a healthy candidate always outranks a quarantined one, but if a
+class's only capacity is quarantined the allocator/walk still reach it via a last-resort ``ignore_sick``
+pass (it just re-quarantines + escapes cross-provider if still broken). TTL self-heals a transient blip;
+in-process only. Fires only on ``PollResult.host_fault`` (region never got a worker to training) — not a
+mid-training stall, ``no_capacity``, or a worker/code error.
 """
 
 from __future__ import annotations
@@ -30,11 +18,8 @@ import os
 import threading
 import time
 
-# How long a region stays quarantined after a host-fault failure. Long enough to ride out a regional
-# outage / a bad fleet image, short enough that a recovered region returns on its own within an hour.
-# Override with FLASH_REGION_SICK_TTL_S (seconds); 0 disables the dynamic quarantine entirely (a
-# non-positive TTL makes mark_region_sick a no-op). An UNPARSEABLE value is ignored and falls back to
-# this default (quarantine stays ENABLED) rather than silently disabling it on a typo.
+# Quarantine window after a host fault. Override with FLASH_REGION_SICK_TTL_S (seconds); 0/non-positive
+# disables (mark_region_sick becomes a no-op); an unparseable value falls back here (stays ENABLED).
 _DEFAULT_SICK_TTL_S = 1800.0
 
 

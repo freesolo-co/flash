@@ -175,14 +175,9 @@ def allocate(
         candidates += _lambda_candidates(need)
     if "hyperstack" in available:
         candidates += _hyperstack_candidates(need)
-    # Quarantine's contract is bounded DEMOTION, never removal: an instance-provider class whose
-    # capacity exists ONLY in currently-quarantined regions is kept as a LAST-RESORT candidate,
-    # appended AFTER every healthy candidate so it is only ever reached once healthy capacity is
-    # exhausted. Without this, RunPod's always-present static candidates keep the global list non-empty,
-    # so a run that has burned every RunPod class on retries would hard-fail rather than walk to the
-    # quarantined instance capacity that still exists (a "relax only when the list is globally empty"
-    # fallback never fires while RunPod offers a class). A still-sick region just host_faults again
-    # (re-quarantine + cross-provider escape); the run is never killed while ANY capacity remains.
+    # Bounded DEMOTION, never removal: a class whose capacity is ONLY in quarantined regions is kept as
+    # a last-resort candidate (ranked after all healthy ones), so the run reaches it rather than hard-
+    # failing once healthy capacity is exhausted -- it just re-quarantines + escapes if still sick.
     healthy_keys = {(c.provider, c.gpu) for c in candidates}
     sick: list[Candidate] = []
     if "lambda" in available:

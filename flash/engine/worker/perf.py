@@ -873,17 +873,11 @@ def _gpu_mismatch_reason(
 ) -> str | None:
     """Return a human reason the LIVE GPU can't satisfy the REQUESTED class, else None.
 
-    PURE (no CUDA/NVML calls) so it is unit-testable with synthetic live values. A ``None`` live
-    input skips that dimension (best-effort). Three checks, each independently a failover trigger:
-
-    * host driver CUDA >= the class's floor (``min_cuda_modern``: Blackwell sm120 needs 13.0 to JIT
-      the wheels' PTX, else 12.8) — catches the opaque "PTX compiled with an unsupported toolchain"
-      crash up front instead of mid-setup;
-    * VRAM >= ~90% of the class spec — catches a provider substituting a SMALLER card (the run was
-      sized for the requested VRAM; a smaller card OOMs at model load);
-    * compute-capability MAJOR not below the class — catches a generational DOWNGRADE (e.g. an H100
-      sm90 request handed an sm80 card). Major only: the minor digit is NOT capability-ordered
-      (A100 sm80 < A6000 sm86 yet is the stronger datacenter card), so VRAM guards within a major.
+    PURE (no CUDA/NVML) so it is unit-testable; a ``None`` live input skips that dimension. Three
+    independent failover triggers: driver CUDA below the class floor (``min_cuda_modern``: Blackwell
+    sm120 needs 13.0 to JIT the wheels' PTX, else 12.8); VRAM < ~90% of spec (a smaller substituted
+    card OOMs); compute-capability MAJOR below the class (generational downgrade — major only, since
+    the minor digit isn't capability-ordered: A100 sm80 < A6000 sm86, so VRAM guards within a major).
     """
     try:
         from flash.providers.base import get_gpu_info, min_cuda_modern
@@ -910,15 +904,12 @@ def _gpu_mismatch_reason(
 
 
 def verify_gpu(requested_gpu: str | None) -> None:
-    """Assert the LIVE GPU actually matches the REQUESTED class (model + CUDA), or raise retriable.
+    """Assert the LIVE GPU matches the REQUESTED class (model + CUDA floor), or raise retriable.
 
-    A no-op when ``requested_gpu`` is falsy/unknown. Standardizes — across ALL providers, on the one
-    code path that runs on every rented box — the per-class CUDA floor that otherwise only Hyperstack
-    (image fail-fast) and RunPod (SDK ``min_cuda_version``) enforce pre-launch and Lambda not at all,
-    PLUS a GPU-model substitution check that no provider does. A mismatch raises ``RetriableInfraError``
-    so the runner fails over to a fresh, correctly-provisioned GPU instead of crashing mid-setup with
-    an opaque "no kernel image" / "PTX unsupported toolchain" / OOM. Best-effort on the reads (a
-    dimension it can't measure is skipped), strict on the compare."""
+    No-op when ``requested_gpu`` is falsy/unknown. Runs on every provider's box, so it standardizes the
+    per-class CUDA floor (only Hyperstack/RunPod enforce it pre-launch, Lambda not at all) and adds a
+    GPU-model substitution check no provider does; a mismatch is ``RetriableInfraError`` (fail over to a
+    fresh box) instead of an opaque mid-setup crash. Best-effort reads, strict compare."""
     if not requested_gpu:
         return
     import torch

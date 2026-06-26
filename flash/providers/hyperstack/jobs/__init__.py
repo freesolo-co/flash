@@ -507,13 +507,9 @@ def poll_hs_job(
         return fresh
 
     def fresh_trained_hb() -> bool:
-        """True if THIS attempt's worker REACHED end-of-training before failing (it stamps ``trained``
-        on the error heartbeat once /tmp/train_reached is set — right before the first required
-        post-training upload). A retriable failure on that upload (adapter/DONE/metrics) is a completion
-        retry on a HEALTHY productive region, NOT a pre-training host fault, so it must not quarantine.
-        This is the heartbeat-level equivalent of the marker's ``trained`` flag, for the dead-VM path
-        that has no marker (its upload was lost / the VM vanished). Launch-fresh so a stale prior-attempt
-        heartbeat can't suppress a genuine THIS-attempt pre-training host fault."""
+        """True if THIS attempt's worker reached end-of-training before failing (stamps ``trained`` on
+        the error hb). A retriable post-training upload failure is a completion retry on a HEALTHY region,
+        not a host fault. Launch-fresh so a stale prior-attempt hb can't suppress a real pre-training fault."""
         if heartbeat_reader is None:
             return False
         try:
@@ -526,13 +522,10 @@ def poll_hs_job(
         return fresh
 
     def run_cancelled() -> bool:
-        """True if the run was deliberately cancelled (or a cancel is IN PROGRESS). A user cancel during
-        setup deletes the VM, which the poller then sees as a dead host with no training heartbeat ->
-        host_fault; but WE killed it, so the region is healthy and must NOT be quarantined. cancel_run
-        deletes the VM BEFORE it persists the terminal ``cancelled`` state, so also honor the
-        ``cancel_requested`` intent it sets first -- else a poll landing in that teardown window would
-        quarantine a healthy region. Best-effort: a status-read error defaults to 'not cancelled'
-        (preserve the quarantine); a cancel that lands after this read is handled by the runner itself."""
+        """True if the run was cancelled or a cancel is IN PROGRESS. Our own teardown deletes the VM,
+        which the poller would otherwise read as a dead host -> host_fault; suppress that. Honor the
+        ``cancel_requested`` intent too (set before the terminal state persists). Best-effort (read error
+        -> not cancelled)."""
         try:
             from flash.runner import get_status
 
@@ -551,30 +544,16 @@ def poll_hs_job(
             False,
             failure="job_preempted" if retriable else "job_failed",
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.attempt),
-            # A retriable failure BEFORE any training heartbeat is a host/GPU fault (broken driver,
-            # docker/GPU never ready) -> the region is sick (this is the CANADA-1 case). A retriable
-            # crash after training started is NOT a region fault. Use reached_training_now (not the bare
-            # loop flag): this branch runs before surface_heartbeat() this iteration, so a worker that
-            # trained then failed within one poll interval would otherwise look pre-training. The
-            # quarantine signal uses only a FRESH retriable (this attempt's marker, or a launch-fresh
-            # heartbeat) so a stale prior-attempt retriable heartbeat can't quarantine a healthy region
-            # for THIS attempt's non-retriable error. A marker flagged ``trained`` (the worker reached
-            # end-of-training; only the adapter/DONE/metrics UPLOAD failed -> retriable) is a
-            # post-training completion retry on a HEALTHY region, NOT a pre-training host fault. And a
-            # marker flagged ``host_neutral`` is a bootstrap-raised region-independent HF-delivery
-            # failure (the spilled-spec fetch / a required-artifact upload) -> not a sick region; only
-            # the HOST cloud-init failmark (docker/GPU never ready), which omits the flag, quarantines.
-            # fresh_host_neutral_hb() is the heartbeat-level equivalent: a region-independent retriable
-            # worker fault (GitHubRateLimitError) must retry but never quarantine the region.
+            # Quarantine only a FRESH retriable, PRE-training, non-neutral, non-cancelled failure = a
+            # genuine host/GPU fault (the CANADA-1 case). Excluded: post-training-reached (trained),
+            # region-independent HF delivery (host_neutral hb/marker), our own cancel teardown, and a
+            # stale prior-attempt hb (reached_training_now/fresh_* force-read this attempt; this runs
+            # before surface_heartbeat).
             host_fault=(marker_retriable or fresh_retriable_hb())
             and not reached_training_now()
             and not bool(marker and marker.get("trained"))
             and not bool(marker and marker.get("host_neutral"))
             and not fresh_host_neutral_hb()
-            # A cancel-in-progress (VM deleted by cancel_run before the terminal `cancelled` state is
-            # persisted) can land here via a just-written / stale attempt marker; WE killed the VM, so
-            # the region is healthy -> never quarantine for our own teardown (mirrors the dead-VM and
-            # first-liveness paths).
             and not run_cancelled(),
         )
 
@@ -699,22 +678,11 @@ def poll_hs_job(
                 False,
                 failure="job_failed" if worker_crashed else "job_preempted",
                 detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.attempt),
-                # A VM that died before any training heartbeat never got a worker productive in this
-                # region -> quarantine it; a worker-CODE crash (not infra) or a loss after training is
-                # NOT a region fault, so it must not quarantine an otherwise-healthy region.
-                # reached_training_now (not the bare loop flag) covers a worker that trained then died
-                # within one poll interval, before surface_heartbeat() ran this iteration. Nor is it a
-                # region fault if WE killed the box: a user cancel during setup deletes the VM, which
-                # lands here with no training heartbeat -> run_cancelled() suppresses the quarantine.
-                # Nor is a region-independent retriable worker fault: a pre-training GitHubRateLimitError
-                # stamps a fresh host_neutral retriable heartbeat (and retries via job_preempted above),
-                # but if its attempt marker is missing (upload failed / VM lost before it wrote) we land
-                # here instead of fail_from_marker; mirror that path's fresh_host_neutral_hb() guard so a
-                # global GitHub/control-plane rate limit doesn't quarantine an otherwise-healthy region.
-                # fresh_trained_hb() is the same idea for a POST-training upload retry: training reached
-                # end (the worker stamps ``trained`` on the error hb) on a healthy productive region, but
-                # the bootstrap's ``trained`` marker is unavailable on this no-marker path, so read it
-                # from the heartbeat to avoid quarantining a region that just finished training.
+                # Quarantine only a PRE-training host loss (region never got a worker productive).
+                # Excluded, mirroring fail_from_marker: a deterministic worker crash (job_failed), a
+                # training-reached death (reached_training_now/fresh_trained_hb), our own cancel teardown,
+                # and a region-independent fault (fresh_host_neutral_hb, e.g. GitHubRateLimit) whose marker
+                # was lost so it lands here instead of fail_from_marker.
                 host_fault=not worker_crashed
                 and not reached_training_now()
                 and not run_cancelled()
@@ -765,51 +733,29 @@ def poll_hs_job(
                     seen_training_hb = True
         if became_active:
             # Fast failover for a VM that reached 'ACTIVE' but never started a worker (sick region /
-            # wedged cloud-init): no fresh heartbeat AND no attempt-scoped host boot.log. A healthy
-            # box — even one still pulling the multi-GB image — emits its boot.log within ~2 min, so
-            # the log's ABSENCE past first_liveness_s means cloud-init/the worker never ran. 'stalled'
-            # is infra-shaped, so the runner escapes it cross-provider (PR #241) instead of burning
-            # the full setup grace (~50 min). The boot.log is read only AFTER the timer AND only until
-            # it's seen once (short-circuit + latch), so the normal cold-start path makes at most one
-            # extra HF read.
+            # wedged cloud-init): a healthy box emits its boot.log within ~2 min, so its ABSENCE past
+            # first_liveness_s means the worker never ran. 'stalled' escapes cross-provider (PR #241)
+            # instead of burning the full ~50 min setup grace. Read only after the timer + latched once.
             if (
                 not seen_fresh_hb
                 and not boot_log_seen
                 and time.time() - active_since > first_liveness_s
-                # AND we've actually watched it active for the uploader's publication window. On the
-                # normal path active_obs_since ~= active_since so this is already satisfied when the
-                # launch-anchored deadline trips (no slowdown); on a reattach that first saw it already
-                # active it floors the stall so a just-became-active VM isn't failed over before its
-                # boot.log could publish (a silent-since-restart VM is still caught by the setup grace).
+                # active_obs_since floors the window on a reattach that first saw it already active (so a
+                # just-became-active VM isn't failed over before its boot.log can publish); ~= active_since
+                # on the normal path. Silent-since-restart VM still caught by the setup grace.
                 and active_obs_since is not None
                 and time.time() - active_obs_since >= FIRST_LIVENESS_OBSERVED_GRACE_S
             ):
-                # make_hf_text_reader returns None for BOTH a missing file AND a rate-limited/errored
-                # read, so a bare ``not boot_log_reader()`` would spuriously stall a healthy VM on a
-                # throttled poll. force=True bypasses the rate-limit (accurate absent-vs-present);
-                # ``is None`` keeps an empty "" boot.log counting as liveness (the file existing proves
-                # cloud-init ran); the latch then stops re-reading once the VM has proven itself.
+                # force=True bypasses rate-limiting (make_hf_text_reader returns None for both missing AND
+                # throttled); ``is None`` keeps an empty "" boot.log as liveness; legacy path covers a
+                # pre-attempt-scoping (mixed-version) VM, consulted on any attempt (attach recovery purges
+                # a stale legacy log, and a same-process retry never has one).
                 if boot_log_reader(force=True) is None and legacy_boot_log_reader(force=True) is None:
-                    # A lone None can also be a momentary HF/Hub network error (not a true absence), so
-                    # require the absence to PERSIST across consecutive polls before failing over — a
-                    # transient blip clears within a poll interval; a VM whose worker never started
-                    # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
-                    # Both the attempt-scoped AND the legacy boot.log must be absent (the legacy read is
-                    # short-circuited away unless the attempt-scoped one is missing). The legacy fallback
-                    # is consulted on ANY attempt: ``attempt`` was persisted BEFORE this PR's attempt-
-                    # scoped boot-log change, so a mixed-version reattach can be polling a pre-upgrade
-                    # attempt 1+ VM whose old user-data wrote only the legacy path — gating on the attempt
-                    # number would falsely quarantine that healthy old retry. A stale prior-attempt legacy
-                    # log can't mask a relaunched VM instead: the only path that relaunches a new attempt
-                    # under this prefix is attach recovery, which PURGES the legacy boot.log first
-                    # (_purge_stale_seed_artifacts); a same-process #260 retry never has a legacy log.
+                    # Require the absence to PERSIST across polls (a lone None can be a transient HF blip).
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
-                        # The boot-log uploader is best-effort and may never have worked even though the
-                        # worker itself ran and uploaded a terminal marker. This threshold (~3x15s=45s)
-                        # can trip before marker_reader()'s 60s non-forced re-read, so force-read the
-                        # terminal artifacts once first: a real DONE/marker must win over a liveness
-                        # stall (which would otherwise mask the worker's actual outcome and quarantine).
+                        # Force-read terminal artifacts first: a real DONE/marker must win over the stall
+                        # (the ~45s threshold can trip before marker_reader's 60s non-forced re-read).
                         terminal = terminal_artifact_result()
                         if terminal is not None:
                             return terminal
@@ -820,12 +766,8 @@ def poll_hs_job(
                             f"{int(time.time() - active_since)}s since the active/launch anchor "
                             f"(active_since is launch-anchored on a reattach that first saw it active; "
                             f"cloud-init/worker never started; limit {int(first_liveness_s)}s)",
-                            # A box that reached ACTIVE but produced NO liveness means the region never
-                            # got a worker to boot -> quarantine it. EXCEPT when WE tore it down: a user
-                            # cancel during this active-but-silent window deletes the VM, and this
-                            # threshold can fire before the runner observes the cancellation, so
-                            # run_cancelled() suppresses the quarantine (mirrors the dead-VM branch) --
-                            # a deliberate teardown must not make a healthy region sick.
+                            # Active but no liveness = region never got a worker -> quarantine, UNLESS we
+                            # tore it down (a cancel in this window; mirrors the dead-VM branch).
                             host_fault=not run_cancelled(),
                         )
                 else:
@@ -833,38 +775,23 @@ def poll_hs_job(
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 phase = "training" if seen_training_hb else "setup (pre-training)"
-                # A real DONE / error-marker must win over a 'stalled' classification: a worker can
-                # finish (or error out) right at the stall boundary and have its terminal HF artifact
-                # delayed by Hub rate-limiting, so the non-forced 60s marker re-read may not have seen
-                # it yet. Force-read terminal artifacts ONCE before returning -- exactly as the
-                # first-liveness branch above does -- so a completed seed is not discarded and, when the
-                # stall would otherwise quarantine (no_liveness_host_fault below), a finished/errored
-                # region is not wrongly marked sick on a missed marker.
+                # Force-read terminal artifacts before the stall (as the first-liveness branch does): a
+                # worker that finished/errored at the boundary may have its DONE/marker rate-limited.
                 terminal = terminal_artifact_result()
                 if terminal is not None:
                     return terminal
-                # boot_log_seen is latched ONLY inside the first-liveness block above -- which is
-                # DEFERRED on a reattach until the observed-grace floor (active_obs_since only just
-                # started), so this setup-stall can fire FIRST with boot_log_seen still False even
-                # though the VM already published a boot.log (cloud-init ran, worker just booting
-                # slowly). Force-read the boot.log here before the no-liveness predicate so a healthy
-                # boot-log-only VM is NOT quarantined -- matching the normal (non-deferred) path where
-                # the latch suppresses host_fault. ``is not None`` keeps an empty "" boot.log counting
-                # as liveness (the file existing proves cloud-init ran); both the attempt-scoped and the
-                # legacy path are consulted (a mixed-version pre-upgrade box wrote only the legacy one).
+                # boot_log_seen is latched only in the first-liveness branch, which the observed-grace
+                # floor DEFERS on a reattach -> this setup-stall can fire first with it still False; force-
+                # read the boot.log here so a healthy slow-booting VM (cloud-init ran) isn't quarantined.
                 if not boot_log_seen and (
                     boot_log_reader(force=True) is not None
                     or legacy_boot_log_reader(force=True) is not None
                 ):
                     boot_log_seen = True
-                # A VM that reached active but produced NO liveness at all (no boot.log, no heartbeat)
-                # and then stalled out the full pre-training setup grace means the region never got a
-                # worker to boot -> host fault (quarantine), same as the first-liveness branch above.
-                # This catches the RECOVERY case where the observed-grace floor deferred that branch
-                # (active_obs_since only just started on the reattach) yet the VM has been silent since
-                # launch past setup_grace -- without it, a wedged region would retry forever-healthy and
-                # the next attempt could re-enter it. A VM that DID show liveness then stalled is
-                # ambiguous (the worker ran), so it is NOT quarantined; nor is our own user cancel.
+                # Active but NO liveness ever (no boot.log/heartbeat) then stalled past setup grace =
+                # region never booted a worker -> host fault. Catches the recovery case the observed-grace
+                # floor deferred above. A VM that showed liveness then stalled is ambiguous (not faulted);
+                # nor is our own cancel.
                 no_liveness_host_fault = (
                     not seen_training_hb
                     and not seen_fresh_hb
