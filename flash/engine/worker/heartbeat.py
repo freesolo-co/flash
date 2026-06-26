@@ -1,7 +1,7 @@
 """Worker heartbeat channel: stream stage/progress to the HF artifact repo + TRL callbacks.
 
-Each ``heartbeat()`` writes ``/tmp/hb/heartbeat.json`` locally (always) and commits it to the run's
-HF artifact repo (throttled). The control plane reads that file to track the run and detect stalls.
+Each ``heartbeat()`` commits ``heartbeat.json`` to the run's HF artifact repo (throttled). The
+control plane reads that file from HF to track the run and detect stalls.
 
 Monkeypatch contract: ``heartbeat`` reads the run-scoped state (``RUN_ID``/``RUN_MODE``/``SEED``/
 ``ATTEMPT``) and the THREE patchable throttle knobs (``_HB_MIN_INTERVAL_S``/``_HB_LAST_UPLOAD``/
@@ -23,15 +23,14 @@ import time
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
 
-# High-frequency stages whose HF UPLOAD is throttled to _HB_MIN_INTERVAL_S (the local write +
-# watchdog re-arm still happen every call). Two kinds are high-frequency:
+# High-frequency stages whose HF UPLOAD is throttled to _HB_MIN_INTERVAL_S. Two kinds are
+# high-frequency:
 #   - "rl_step": the per-step training heartbeat (reward callback fires every optimizer step).
 #   - the periodic setup pings ("model_prefetching", "sft_initializing", "rl_initializing"): each
 #     runs on a side thread every 30s through a long phase (a cold snapshot_download can pull tens
 #     of GB for ~40 min => ~80 commits, and disaggregated workers share one HF_REPO), so committing
-#     every 30s risks the repo commit cap _HB_MIN_INTERVAL_S exists to avoid. Throttling the UPLOAD
-#     (not the emit) keeps the local watchdog re-armed every 30s while holding commits well under the
-#     128/hr cap. Terminal transitions are never throttled (always committed).
+#     every 30s risks the repo commit cap _HB_MIN_INTERVAL_S exists to avoid, so we throttle the
+#     UPLOAD to hold commits well under the 128/hr cap. Terminal transitions are never throttled.
 _HB_THROTTLED_STAGES = frozenset(
     {"rl_step", "model_prefetching", "sft_initializing", "rl_initializing"}
 )
@@ -62,17 +61,15 @@ _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
 
-# Stall watchdog: arm a faulthandler that dumps every thread's stack and exits when NO heartbeat
-# lands for the window (re-armed on every heartbeat, so it only fires on a true hang). Always on.
-# Kept longer than the providers' setup grace (3000s) so a stuck SETUP trips the provider's RETRIABLE
-# path before this exit=True watchdog hard-fails the run (asserted in tests).
-_STALL_WATCHDOG_S = 3600.0
-
-
-def _rearm_stall_faulthandler() -> None:
+# When a liveness daemon concludes its phase is wedged (progress stalled past its bound), dump every
+# thread's stack for a root-cause trace, then stop pinging and let the PROVIDER's stall detection (it
+# reads the HF heartbeats; their absence trips it) do the kill + retry. The dump goes to stderr, which
+# the parent tees into console_<phase>.txt and the platform captures in the pod log. No separate
+# re-armed watchdog: the dump fires on EVIDENCE of a stall, not a fixed timer.
+def _dump_thread_stacks(reason: str) -> None:
     with contextlib.suppress(Exception):
-        faulthandler.cancel_dump_traceback_later()
-        faulthandler.dump_traceback_later(_STALL_WATCHDOG_S, exit=True)
+        print(f"[stall] {reason}: dumping all thread stacks, then yielding to the provider", flush=True)
+        faulthandler.dump_traceback(all_threads=True)
 
 
 def heartbeat(stage: str, **kw):
@@ -92,18 +89,12 @@ def heartbeat(stage: str, **kw):
     _dc = os.environ.get("RUNPOD_DC_ID") or ""
     if _dc:
         payload.setdefault("dc", _dc)
-    os.makedirs("/tmp/hb", exist_ok=True)
-    p = "/tmp/hb/heartbeat.json"
-    # _HB_LOCK guards ONLY the fast local work (atomic write + _HB_LAST_UPLOAD + snapshot capture);
-    # the slow HF commit runs OUTSIDE it so the trainer's per-step reward callback never blocks on
-    # the network behind the checkpoint daemon's commit (a GRPO perf regression).
+    snapshot = json.dumps(payload)
+    # The control plane reads heartbeat.json from HF, so the (throttled) upload below is the only
+    # durable record — there is no worker-local copy to keep. _HB_LOCK guards just the throttle
+    # bookkeeping (_HB_LAST_UPLOAD); the slow HF commit runs OUTSIDE it so the trainer's per-step
+    # reward callback never blocks on the network behind the checkpoint daemon's commit.
     with _HB_LOCK:
-        # Atomic write: temp file + os.replace() so a concurrent reader never sees a partial file.
-        tmp = p + f".{os.getpid()}.{threading.get_ident()}.tmp"
-        snapshot = json.dumps(payload)
-        with open(tmp, "w") as f:
-            f.write(snapshot)
-        os.replace(tmp, p)
         now = time.time()
         if stage in _HB_TERMINAL_STAGES or stage.startswith("error_"):
             upload_due = True  # never miss a terminal transition
@@ -121,10 +112,6 @@ def heartbeat(stage: str, **kw):
         prev_last_upload = _w._HB_LAST_UPLOAD
         if upload_due:
             _w._HB_LAST_UPLOAD = now  # claim the slot under the lock (throttle stays atomic)
-    # Re-arm the stall watchdog off the LOCAL write that just landed (not the optional HF commit
-    # below) — a stalled best-effort upload must not run out the timer on a worker that already
-    # produced a live heartbeat.
-    _rearm_stall_faulthandler()
     if upload_due:
         # Serialize the network commit under a SEPARATE lock so uploads can't reorder, and upload the
         # captured snapshot (via a private temp file, since hf_upload_file takes a path) rather than
@@ -138,7 +125,7 @@ def heartbeat(stage: str, **kw):
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
         if _HB_UPLOAD_LOCK.acquire(timeout=lock_timeout):
             try:
-                up = p + f".{os.getpid()}.{threading.get_ident()}.upload.tmp"
+                up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
                 with open(up, "w") as f:
                     f.write(snapshot)
                 try:
@@ -167,7 +154,7 @@ def heartbeat(stage: str, **kw):
                 if now == _w._HB_LAST_UPLOAD:
                     _w._HB_LAST_UPLOAD = prev_last_upload
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    print("HEARTBEAT", json.dumps(payload))
+    print("HEARTBEAT", snapshot)
 
 
 def make_reward_heartbeat_callback():
@@ -304,13 +291,13 @@ def liveness_heartbeat(
         last_val = None
         # Measure intervals with the MONOTONIC clock: a wall-clock jump (NTP step, VM suspend/resume)
         # must not make max_silence_s / max_duration_s trip early/late — they decide when liveness
-        # STOPS and hands off to the stall watchdog, so a spurious early stop would false-fail a
-        # healthy run.
+        # STOPS (dumps stacks + hands off to the provider stall path), so a spurious early stop
+        # would false-fail a healthy run.
         started_at = time.monotonic()
         advanced_at = time.monotonic()
         while not done.wait(_LIVENESS_TICK_S):
             if max_duration_s and (time.monotonic() - started_at) > max_duration_s:
-                print(f"liveness[{stage}]: exceeded max_duration {max_duration_s:.0f}s; stopping")
+                _dump_thread_stacks(f"{stage}: exceeded max_duration {max_duration_s:.0f}s")
                 return
             if progress is not None:
                 val = None
@@ -320,7 +307,7 @@ def liveness_heartbeat(
                 if val is not None and (last_val is None or val > last_val):
                     last_val, advanced_at = val, time.monotonic()
                 if max_silence_s and (time.monotonic() - advanced_at) > max_silence_s:
-                    print(f"liveness[{stage}]: no progress for >{max_silence_s:.0f}s; stopping")
+                    _dump_thread_stacks(f"{stage}: no progress for >{max_silence_s:.0f}s")
                     return
             if quiet_gate_s is not None:
                 # Wall-clock here on purpose: this compares against _HB_LAST_UPLOAD, a time.time()

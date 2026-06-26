@@ -109,24 +109,31 @@ def test_reward_heartbeat_callback_accumulates_history():
             sys.modules["transformers"] = saved
 
 
-def test_heartbeat_concurrent_writes_stay_atomic(monkeypatch):
-    """Regression: heartbeat() is called concurrently from the trainer reward callback and
-    the checkpoint-upload daemon during GRPO. It must serialize + write heartbeat.json
-    atomically (temp file + os.replace under a lock) so a reader never sees a truncated or
-    interleaved file, and no leftover .tmp files accumulate."""
+def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
+    """Regression: heartbeat() is called concurrently from the trainer reward callback and the
+    checkpoint-upload daemon during GRPO. There is no worker-local heartbeat file (the control plane
+    reads the HF copy), so each call must hand its HF upload a COMPLETE, valid JSON snapshot (never a
+    truncated/interleaved one) and leave no upload temp files behind."""
     import glob
     import json
     import threading as _threading
 
     import flash.engine.worker as ne
 
-    os.environ["HF_REPO"] = ""  # keep heartbeat local
-    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: None)
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)  # force every call through the upload path
 
-    hb_dir = "/tmp/hb"
-    p = os.path.join(hb_dir, "heartbeat.json")
-    for stale in glob.glob(os.path.join(hb_dir, "heartbeat.json.*.tmp")):
-        os.unlink(stale)
+    bad: list[Exception] = []
+
+    def fake_upload(local_path, repo_subpath, required=False):
+        # The bytes handed to the upload must be the caller's own complete snapshot.
+        try:
+            with open(local_path) as f:
+                obj = json.load(f)
+            assert obj["stage"] in ("rl_step", "checkpoint_uploaded")
+        except Exception as e:  # truncated/garbled/missing -> a concurrency bug
+            bad.append(e)
+
+    monkeypatch.setattr(ne, "hf_upload_file", fake_upload)
 
     errors: list[Exception] = []
     barrier = _threading.Barrier(8)
@@ -138,10 +145,6 @@ def test_heartbeat_concurrent_writes_stay_atomic(monkeypatch):
                 # vary stage so both the throttled and unthrottled branches run
                 stage = "rl_step" if (i + j) % 2 else "checkpoint_uploaded"
                 ne.heartbeat(stage, step=i * 1000 + j, payload="x" * 200)
-                # the file must always parse as complete JSON (never truncated/garbled)
-                with open(p) as f:
-                    obj = json.load(f)
-                assert obj["stage"] in ("rl_step", "checkpoint_uploaded")
         except Exception as e:
             errors.append(e)
 
@@ -152,10 +155,8 @@ def test_heartbeat_concurrent_writes_stay_atomic(monkeypatch):
         t.join()
 
     assert not errors, errors
-    # final file is valid JSON and no temp files were left behind
-    with open(p) as f:
-        json.load(f)
-    assert not glob.glob(os.path.join(hb_dir, "heartbeat.json.*.tmp"))
+    assert not bad, bad
+    assert not glob.glob("/tmp/.hb-upload-*"), "upload temp files must be cleaned up"
 
 
 def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
@@ -173,10 +174,6 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     import flash.engine.worker as ne
 
     os.environ["HF_REPO"] = ""
-
-    hb_dir = "/tmp/hb"
-    for stale in glob.glob(os.path.join(hb_dir, "heartbeat.json.*.tmp")):
-        os.unlink(stale)
 
     inflight = 0
     max_inflight = 0
@@ -230,4 +227,4 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     # every claimed slot uploaded a distinct, valid snapshot (120 calls, no throttle)
     assert len(seen_steps) == 6 * 20
     # the captured-snapshot temp files are cleaned up
-    assert not glob.glob(os.path.join(hb_dir, "*.upload.tmp"))
+    assert not glob.glob("/tmp/.hb-upload-*"), "upload temp files must be cleaned up"

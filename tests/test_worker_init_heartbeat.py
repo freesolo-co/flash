@@ -129,6 +129,7 @@ def _liveness_env(monkeypatch, *, tick=0.01):
     monkeypatch.setattr(
         hb, "gpu_diagnostics", lambda include_torch=True: (diag.append(include_torch), {})[1]
     )
+    monkeypatch.setattr(hb, "_dump_thread_stacks", lambda reason: None)  # don't dump real stacks
     return hb, w, diag
 
 
@@ -188,8 +189,8 @@ def test_liveness_heartbeat_quiet_gate_fills_when_channel_stale(monkeypatch):
 
 
 def test_liveness_heartbeat_stops_when_progress_stalls(monkeypatch):
-    """progress + max_silence_s: a liveness ping re-arms the watchdog, so it must STOP once the
-    progress counter stalls — handing a genuinely wedged call back to the stall path (anti-mask)."""
+    """progress + max_silence_s: a liveness ping keeps the provider stall path quiet, so it must STOP
+    once the progress counter stalls — handing a genuinely wedged call back to that path (anti-mask)."""
     hb, w, _ = _liveness_env(monkeypatch)
     emitted: list = []
     monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(time.time()))
@@ -202,9 +203,9 @@ def test_liveness_heartbeat_stops_when_progress_stalls(monkeypatch):
 
 
 def test_liveness_heartbeat_stops_after_max_duration(monkeypatch):
-    """max_duration_s (no progress counter, e.g. cold *Trainer.__init__): the ping re-arms the watchdog
-    AND the provider setup-grace, so a stuck-but-GIL-releasing init would mask the hang forever. The
-    daemon must STOP pinging once total lifetime exceeds the cap, handing off to the stall path."""
+    """max_duration_s (no progress counter, e.g. cold *Trainer.__init__): the ping keeps the provider
+    setup-grace quiet, so a stuck-but-GIL-releasing init would mask the hang forever. The daemon must
+    STOP pinging once total lifetime exceeds the cap, handing off to the provider stall path."""
     hb, w, _ = _liveness_env(monkeypatch)
     emitted: list = []
     monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(time.time()))
@@ -388,26 +389,25 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
 # the timer and the init/training heartbeats now keep ticking through slow-but-live phases.
 
 
-def test_stall_watchdog_always_on_and_outlasts_provider_grace():
+def test_liveness_give_up_dumps_thread_stacks(monkeypatch):
+    """When a liveness daemon gives up (progress stalled past its bound) it must dump every thread's
+    stack before stopping, so the hang leaves a root-cause trace; then it stops pinging and the
+    PROVIDER's stall detection (absent heartbeats) does the kill + retry."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: None)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    dumped: list = []
+    monkeypatch.setattr(hb, "_dump_thread_stacks", lambda reason: dumped.append(reason))
+    with hb.liveness_heartbeat("rl_step", progress=lambda: 5, max_silence_s=0.05):
+        time.sleep(0.3)
+    assert dumped, "give-up must dump thread stacks"
+
+
+def test_no_worker_side_stall_watchdog():
+    """The worker has no separate stall watchdog: the provider owns kill+retry, and the dump fires on
+    liveness give-up. Guard against re-adding the env-tunable faulthandler timer."""
     import importlib
 
     hb = importlib.import_module("flash.engine.worker.heartbeat")
-    assert hb._STALL_WATCHDOG_S > 0, "stall watchdog is always on (no env, no disable)"
-    # Longer than the providers' setup grace so a stuck SETUP trips the provider's RETRIABLE path
-    # before this exit=True watchdog hard-fails the run. Compare to the canonical provider value.
-    from flash.providers.runpod import jobs as runpod_jobs
-
-    assert runpod_jobs.stall_kwargs()["setup_grace_s"] < hb._STALL_WATCHDOG_S
-
-
-def test_rearm_arms_the_single_window(monkeypatch):
-    import importlib
-
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    windows: list = []
-    monkeypatch.setattr(
-        hb.faulthandler, "dump_traceback_later", lambda w, exit=False: windows.append(w)
-    )
-    monkeypatch.setattr(hb.faulthandler, "cancel_dump_traceback_later", lambda: None)
-    hb._rearm_stall_faulthandler()
-    assert windows == [hb._STALL_WATCHDOG_S], "every arm uses the single always-on window"
+    assert not hasattr(hb, "_rearm_stall_faulthandler")
+    assert not hasattr(hb, "_STALL_WATCHDOG_S")

@@ -309,34 +309,6 @@ def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     assert lock_free_during_upload == [True], "hf_upload_file must run with _HB_LOCK released"
 
 
-def test_heartbeat_rearms_watchdog_before_optional_upload(monkeypatch):
-    """The stall watchdog must re-arm off the LOCAL write, BEFORE the best-effort HF upload. If it
-    re-armed only after the upload, a stalled best-effort upload would run out the timer and
-    faulthandler-kill a worker that had already produced a live local heartbeat."""
-    import importlib
-
-    # NB: ``import flash.engine.worker.heartbeat`` binds the re-exported heartbeat() FUNCTION, not
-    # the submodule — resolve the module path explicitly.
-    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
-
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    order = []
-    monkeypatch.setattr(
-        hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: order.append("rearm")
-    )
-    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
-    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: order.append("upload"))
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-
-    w.heartbeat("rl_initializing")
-    assert order == ["rearm", "upload"], f"watchdog must re-arm before the upload, got {order}"
-
-
 def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
     """A wedged upload holding _HB_UPLOAD_LOCK must not block the NEXT heartbeat. A milestone like
     model_prefetched (unthrottled, on the worker's critical path right before trainer construction)
@@ -353,8 +325,6 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
     import flash.engine.worker as w
 
     monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: None)
-    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
     uploads = []
     monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: uploads.append(a))
     monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
@@ -393,8 +363,6 @@ def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
-    monkeypatch.setattr(hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: None)
-    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
     monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
     sentinel_last_upload = 123.0  # a prior successful-commit timestamp the failed retry must restore
     monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
@@ -424,8 +392,6 @@ def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
-    monkeypatch.setattr(hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: None)
-    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
     monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
     monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: True)
@@ -453,8 +419,6 @@ def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
 
     monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
     monkeypatch.setattr(hbmod, "_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S", 0.4)
-    monkeypatch.setattr(hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: None)
-    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
     monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: None)
     monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
