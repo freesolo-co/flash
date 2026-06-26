@@ -177,7 +177,7 @@ def _active_run_ids() -> set[str]:
 
 
 def _sweep_orphan_instances_once() -> int:
-    """One run-aware sweep of orphaned instance-provider workers — Lambda/Hyperstack VMs whose run
+    """One run-aware sweep of orphaned instance-provider workers — Lambda instances whose run
     finished or crashed without the per-run ``finally`` tearing them down. Returns the count torn
     down. Dispatched to every configured provider; RunPod's ``sweep_orphans`` is a no-op (its
     serverless endpoints carry no standing per-run billing and are handled by the idle reaper).
@@ -211,7 +211,7 @@ def _sweep_orphan_instances_once() -> int:
 
 
 async def _sweep_orphan_instances_loop() -> None:
-    """Background loop: proactively tear down orphaned Lambda/Hyperstack instances (billed VMs left
+    """Background loop: proactively tear down orphaned Lambda instances (billed instances left
     by finished/crashed runs that the per-run ``finally`` teardown missed) so they stop billing
     without waiting for the next control-plane restart. This is the in-lifetime counterpart of the
     instance providers' startup ``sweep_orphans`` (``recover_runs``) — the instance analogue of
@@ -231,12 +231,12 @@ async def _sweep_orphan_instances_loop() -> None:
 
 
 def _instance_providers_configured() -> bool:
-    """True when an instance-based provider (Lambda / Hyperstack) is configured on this plane, so the
+    """True when an instance-based provider (Lambda) is configured on this plane, so the
     periodic instance orphan sweep is worth running. RunPod-only planes skip it — RunPod has no
     standing per-run billing to reap between restarts (its idle reaper covers warm endpoints)."""
     from flash.providers import available_providers
 
-    return any(name in ("lambda", "hyperstack") for name in available_providers())
+    return any(name in ("lambda",) for name in available_providers())
 
 
 def create_app():
@@ -272,7 +272,7 @@ def create_app():
             if os.environ.get("RUNPOD_API_KEY")
             else None
         )
-        # Periodic instance orphan sweep: proactively tear down Lambda/Hyperstack VMs left billing by
+        # Periodic instance orphan sweep: proactively tear down Lambda instances left billing by
         # finished/crashed runs (the in-lifetime counterpart of their startup sweep_orphans). Only
         # when an instance provider is configured — RunPod-only planes have nothing standing to reap.
         sweep_task = (

@@ -1,7 +1,7 @@
 """Control-plane startup preflight.
 
 ``check_run_preflight`` aggregates every missing piece of REQUIRED operator configuration — the
-RunPod multi-account pool, the Lambda + Hyperstack provider keys, the Freesolo backend internal key,
+RunPod multi-account pool, the Lambda provider key, the Freesolo backend internal key,
 and the shared GitHub + HF tokens — into one startup error, so a half-configured plane fails fast at
 deploy instead of degrading silently in production.
 """
@@ -17,8 +17,8 @@ __all__ = [
     "check_run_preflight",
 ]
 
-# A managed control plane provisions across ALL THREE GPU substrates (RunPod multi-account pool +
-# Lambda + Hyperstack) and authenticates to the Freesolo backend, so a complete operator config is
+# A managed control plane provisions across BOTH GPU substrates (RunPod multi-account pool +
+# Lambda) and authenticates to the Freesolo backend, so a complete operator config is
 # mandatory. Requiring >= 2 RunPod account keys guards the leak that motivated this gate: a pool
 # launched with a SINGLE key never reaps (or fails over) across the second account, so that
 # account's idle endpoints pile up unseen.
@@ -38,8 +38,8 @@ def _present(var: str) -> bool:
 def check_run_preflight() -> None:
     """Validate the FULL operator config for a managed control-plane deployment; raise on missing.
 
-    One self-contained check: a RunPod pool of >= 2 account keys, the Lambda + Hyperstack provider
-    keys, the Freesolo backend internal key, and the shared GitHub + HF tokens. Every missing piece
+    One self-contained check: a RunPod pool of >= 2 account keys, the Lambda provider
+    key, the Freesolo backend internal key, and the shared GitHub + HF tokens. Every missing piece
     is aggregated into a single, actionable startup error.
     """
     from flash.providers.runpod import keys as runpod_keys
@@ -65,11 +65,9 @@ def check_run_preflight() -> None:
             f"single-account pool can't reap or fail over across accounts"
         )
 
-    # The other two GPU substrates and the control-plane <-> backend auth key.
+    # The other GPU substrate and the control-plane <-> backend auth key.
     if not _present("LAMBDA_API_KEY"):
         problems.append("  - LAMBDA_API_KEY: the operator's Lambda Cloud API key")
-    if not _present("HYPERSTACK_API_KEY"):
-        problems.append("  - HYPERSTACK_API_KEY: the operator's Hyperstack API key")
     if not _present("FREESOLO_INTERNAL_KEY"):
         problems.append(
             "  - FREESOLO_INTERNAL_KEY: the control-plane <-> Freesolo backend internal auth key"
