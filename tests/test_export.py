@@ -50,6 +50,9 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
                 "exist_ok": exist_ok,
             }
 
+        def list_repo_files(self, *, repo_id, repo_type):
+            return []  # brand-new repo -> no orphans to clean
+
         def update_repo_settings(self, *, repo_id, repo_type, private):
             calls["update_settings"] = {
                 "repo_id": repo_id,
@@ -102,13 +105,60 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
         "repo_type": "model",
         "private": True,
     }
-    # Stale adapter weights from a prior export are cleared (delete_patterns) so a re-export can't
-    # serve a mix of old + new files — but scoped to the ADAPTER's own filenames, never broad globs
-    # that could delete unrelated base-model weights in a reused destination repo.
-    patterns = calls["upload"]["delete_patterns"]
-    assert "adapter_model.*" in patterns
-    assert "adapter_config.json" in patterns
-    assert not any(p in patterns for p in ("*.safetensors", "*.bin", "*.pt"))
+    # Brand-new repo -> nothing orphaned to delete.
+    assert calls["upload"]["delete_patterns"] == []
+
+
+def test_export_deletes_orphaned_files_from_a_prior_export(monkeypatch):
+    """A re-export into a repo holding a previous, differently-serialized adapter clears every leftover
+    file (so a stale ``.bin`` can't be loaded next to the new ``.safetensors``) but keeps repo
+    furniture like the model card."""
+    calls: dict = {}
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"new-weights")
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def list_repo_files(self, *, repo_id, repo_type):
+            # Left behind by a prior export of a DIFFERENT adapter (bin format) + a leftover data file,
+            # plus repo furniture that must be preserved.
+            return [
+                "adapter_config.json",
+                "adapter_model.bin",
+                "extra_weights.pt",
+                "README.md",
+                ".gitattributes",
+            ]
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def upload_folder(self, *, folder_path, delete_patterns, **kw):
+            calls["files"] = sorted(p.name for p in Path(folder_path).iterdir())
+            calls["delete_patterns"] = delete_patterns
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+    )
+    # Every file NOT in the new upload is deleted (orphans), regardless of extension; the re-uploaded
+    # adapter_config.json is not an orphan, and README/.gitattributes are preserved.
+    assert calls["delete_patterns"] == ["adapter_model.bin", "extra_weights.pt"]
 
 
 def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
@@ -199,6 +249,13 @@ def test_resolve_hf_token_priority_explicit_then_env_then_dotenv(tmp_path, monke
 
     # Nothing set anywhere -> None.
     assert resolve_hf_token(None) is None
+
+    # The huggingface_hub aliases are deliberately NOT accepted: only HF_TOKEN is.
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_alias")
+    monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_alias2")
+    assert resolve_hf_token(None) is None
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_TOKEN", raising=False)
 
     # A local .env supplies the token when the env doesn't.
     (tmp_path / ".env").write_text('HF_TOKEN="hf_from_dotenv"\n')

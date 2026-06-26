@@ -211,8 +211,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     export.add_argument(
         "--api-key",
-        help="HuggingFace token with write access to --repository (default: HF_TOKEN / "
-        "HUGGING_FACE_HUB_TOKEN from your shell or a local .env)",
+        help="HuggingFace token with write access to --repository "
+        "(default: HF_TOKEN from your shell or a local .env)",
     )
     export.add_argument(
         "--step",
