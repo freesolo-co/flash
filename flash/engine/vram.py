@@ -183,7 +183,7 @@ _VOCAB_DEFAULT = 248_320
 # (rl_per_device_comps spills the rest into grad-accum), so the estimator never reserves above it.
 _LOGITS_BUDGET_GB = 6.0
 
-# ---- SFT big-vocab logits: the SFT analog of the GRPO fp32-logits term above ----
+# SFT big-vocab logits: the SFT analog of the GRPO fp32-logits term above
 # When the worker's fused cross-entropy (Liger) is OFF, an SFT forward materializes the FULL-sequence
 # [per_device, seq_len, vocab] logits AND keeps their gradient live through the backward. At
 # Qwen3.5's ~248k vocab this is the documented big-vocab SFT OOM driver (a 0.8B SFT OOM'd a 24 GB

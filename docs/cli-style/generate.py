@@ -22,8 +22,8 @@ import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from flash.cli import main as cli
-from flash.cli.main import render
+import flash.cli as cli
+from flash.cli import render
 
 
 class _Utf8(io.StringIO):
@@ -185,7 +185,7 @@ def _capture_argv(argv, *, styled, theme="dark", cwd=None, with_stderr=False) ->
     ``with_stderr`` is set, the stderr note (e.g. `flash train`'s hand-off line) is shown first,
     as it appears in a real terminal before the streamed logs."""
     _set_style(styled, theme)
-    commands = sys.modules["flash.cli.main.commands"]
+    commands = sys.modules["flash.cli.commands"]
     saved = commands.client_from_config
     commands.client_from_config = lambda *a, **k: FAKE
     out, err = _Utf8(), _Utf8()
@@ -476,7 +476,7 @@ def main():
     out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "index.html"
     # Deterministic preview: pin the dry-run id (cmd_train calls new_run_id() every time) so the
     # committed gallery doesn't churn on every regeneration.
-    sys.modules["flash.cli.main.commands"].new_run_id = lambda: "flash-1718900000-d0cf00ed"
+    sys.modules["flash.cli.commands"].new_run_id = lambda: "flash-1718900000-d0cf00ed"
     with tempfile.TemporaryDirectory() as td:
         # Point the installed-env registry at an empty temp manifest so `flash env list` never
         # leaks a developer's real installed env slugs (~/.flash/envs.json) into the preview.

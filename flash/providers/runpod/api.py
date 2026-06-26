@@ -52,9 +52,6 @@ def request_with_retries(
     )
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 def list_endpoints() -> list[dict]:
     # ``RUNPOD_API_KEY`` may be a comma-separated pool of per-account keys. RunPod
     # endpoints are account-scoped: a plain request_with_retries() call stops at the
@@ -125,9 +122,6 @@ def endpoint_health(endpoint_id: str) -> dict:
     return request_with_retries(f"{QUEUE_BASE}/{endpoint_id}/health")
 
 
-# ---------------------------------------------------------------------------
-# Queue jobs
-# ---------------------------------------------------------------------------
 def submit_job(endpoint_id: str, input_payload: dict) -> str:
     """POST /run -> job id (async queue submission)."""
     out = request_with_retries(
@@ -150,9 +144,7 @@ def cancel_job(endpoint_id: str, job_id: str) -> dict:
     )
 
 
-# ---------------------------------------------------------------------------
 # Realized billing (COGS) -- what RunPod actually charged, for estimator accuracy.
-# ---------------------------------------------------------------------------
 def billing_endpoints(
     *,
     start_time: str,

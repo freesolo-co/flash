@@ -10,8 +10,8 @@ from pathlib import Path
 
 def test_env_install_slug(monkeypatch, capsys):
     with tempfile.TemporaryDirectory() as tmp:
+        import flash.cli as cli
         import flash.envs.registry as registry
-        from flash.cli import main as cli
 
         manifest_path = Path(tmp) / "envs.json"
         monkeypatch.setattr(registry, "INSTALLED_MANIFEST", manifest_path)
@@ -31,7 +31,7 @@ def test_env_install_slug(monkeypatch, capsys):
 
 
 def test_env_install_rejects_bad_id(monkeypatch, capsys):
-    from flash.cli import main as cli
+    import flash.cli as cli
 
     called = {"n": 0}
     monkeypatch.setattr("subprocess.run", lambda *a, **k: called.__setitem__("n", called["n"] + 1))

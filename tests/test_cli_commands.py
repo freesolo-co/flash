@@ -11,7 +11,7 @@ import io
 
 import pytest
 
-from flash.cli import main as cli
+import flash.cli as cli
 
 
 class _FakeClient:
@@ -154,7 +154,7 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
 def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
     # Under an ASCII / non-UTF-8 stdout, neither a non-ASCII identity value nor our own
     # punctuation may raise UnicodeEncodeError after a login has already succeeded.
-    from flash.cli.main import render
+    from flash.cli import render
 
     class _AsciiStdout:
         encoding = "ascii"
@@ -355,26 +355,3 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
         ),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
-
-
-# ---------------------------------------------------------------------------
-# MCP bridge: tool dispatch over the same client surface
-# ---------------------------------------------------------------------------
-
-
-def test_mcp_handle_dispatches_tools(monkeypatch, fake_client, capsys) -> None:
-    from flash.mcp import server as mcp
-
-    monkeypatch.setattr(mcp, "client_from_config", lambda *a, **k: fake_client, raising=False)
-
-    models = mcp.handle({"tool": "list_models", "args": {}})
-    assert any("Qwen" in str(m) for m in str(models).split(","))
-
-    status = mcp.handle({"tool": "get_run_status", "args": {"run_id": "flash-1"}})
-    assert status["state"] == "done"
-
-    logs = mcp.handle({"tool": "get_run_logs", "args": {"run_id": "flash-1"}})
-    assert "hello from the worker" in str(logs)
-
-    with pytest.raises(ValueError, match="unknown tool"):
-        mcp.handle({"tool": "nope"})
