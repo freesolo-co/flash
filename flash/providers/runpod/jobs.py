@@ -261,16 +261,19 @@ def _is_workers_quota_error(exc: Exception) -> bool:
     return "max workers across all endpoints" in msg
 
 
-# Per-endpoint "first observed idle" timestamps, so a candidate must STAY idle across sweeps for
-# ``min_idle_s`` before deletion (a cold-starting / between-jobs endpoint reports a transient zero
-# we must not act on). Pruned each sweep to the still-idle set, so it can't grow unbounded.
+# Per-endpoint grace state: ``{endpoint_id: (first_observed_idle_ts, owning_key_fingerprint)}``, so a
+# candidate must STAY idle across sweeps for ``min_idle_s`` before deletion (a cold-starting /
+# between-jobs endpoint reports a transient zero we must not act on). The owning account's
+# (non-secret) fingerprint is stored alongside the timestamp so the prune can drop a stale timer as
+# soon as THAT account responds again — even while OTHER accounts are failing to list — without it
+# growing unbounded during a partial outage.
 #
 # Two threads can run a sweep at once — the periodic control-plane reaper (via asyncio.to_thread)
 # and a deploy-time quota sweep — so every read/write of ``_idle_since`` is serialized by this lock
 # (a dedicated lock, NOT FLASH_SDK_LOCK, since the sweep uses the REST API, not the Flash SDK).
 # Holding it across the sweep also prevents a concurrent sweep's prune from disturbing this one's
 # grace timers; contention is negligible (the reaper runs every 10 min, deploy sweeps are rare).
-_idle_since: dict[str, float] = {}
+_idle_since: dict[str, tuple[float, str]] = {}
 _idle_since_lock = threading.Lock()
 
 
@@ -311,46 +314,46 @@ def _sweep_idle_flash_endpoints(
     """
     deleted = 0
     try:
-        by_key, failed_keys = runpod_api.list_endpoints_by_key()
+        by_fp, failed_fps = runpod_api.list_endpoints_by_key()
     except Exception:
         # Only reached when the pool itself is unusable (no key configured) — a per-account
-        # failure is captured in failed_keys, not raised. WARN (not DEBUG): a reaper that can't
+        # failure is captured in failed_fps, not raised. WARN (not DEBUG): a reaper that can't
         # list anything is exactly the silent stall we want visible in the logs.
         logger.warning("idle-sweep: could not list any RunPod pool account; skipping sweep", exc_info=True)
         return 0
-    if failed_keys:
+    if failed_fps:
         # A flaky/expired account must NOT silently no-op cleanup of the others (the orphan-pile-up
         # bug). Surface it loudly and carry on with whatever accounts responded.
         logger.warning(
             "idle-sweep: %d of %d RunPod pool account(s) failed to list this cycle; reaping the %d "
             "that responded and retrying the rest next sweep",
-            len(failed_keys),
-            len(by_key) + len(failed_keys),
-            len(by_key),
+            len(failed_fps),
+            len(by_fp) + len(failed_fps),
+            len(by_fp),
         )
+    # The (non-secret) fingerprints of the accounts that DID list this cycle. A grace timer is only
+    # safe to prune once its OWNING account responded — then we know its endpoint's true state (still
+    # idle, or genuinely gone). Timers owned by an account that failed this cycle are left untouched.
+    responded_fps = set(by_fp)
     now = time.time()
     still_idle: set[str] = set()
-    # Every flash endpoint id we successfully listed this cycle (across all responding accounts).
-    # The prune below only drops grace timers for ids in here, so an account we COULDN'T list keeps
-    # its in-flight idle grace instead of being reset to zero by a transient outage.
-    listed_ids: set[str] = set()
     # Serialize all _idle_since access (see the lock's definition): a concurrent sweep must not
     # mutate the dict mid-iteration (the prune below would raise) or disturb these grace timers.
     with _idle_since_lock:
-        for key, endpoints in by_key.items():
+        for fp, endpoints in by_fp.items():
             for ep in endpoints:
                 ep_name = ep.get("name") or ""
                 eid = ep.get("id")
                 if not (eid and _is_flash_endpoint(ep_name)):
                     continue
-                listed_ids.add(eid)
                 # Protect the run's endpoint in either registered form.
                 if ep_name in protected or ep_name.removeprefix("live-") in protected:
                     continue
                 try:
-                    # Account-scoped: we know which pool key owns this endpoint, so query/delete
-                    # with that exact key (no 404-failover waterfall across the other accounts).
-                    health = runpod_api.endpoint_health_for_key(eid, key) or {}
+                    # Account-scoped: we know which pool account owns this endpoint (its non-secret
+                    # fingerprint), so query/delete with that exact key (resolved inside runpod_api,
+                    # no 404-failover waterfall across the other accounts).
+                    health = runpod_api.endpoint_health_for_fingerprint(eid, fp) or {}
                     workers = health.get("workers")
                     jobs_info = health.get("jobs")
                     # Require non-empty dicts: a missing/empty workers section means the health
@@ -369,10 +372,10 @@ def _sweep_idle_flash_endpoints(
                         _idle_since.pop(eid, None)  # busy again -> reset the grace timer
                         continue
                     still_idle.add(eid)
-                    first_idle = _idle_since.setdefault(eid, now)
+                    first_idle, _owner = _idle_since.setdefault(eid, (now, fp))
                     if now - first_idle < min_idle_s:
                         continue  # idle, but not for long enough yet — wait for the next sweep
-                    if runpod_api.delete_endpoint_for_key(eid, key):
+                    if runpod_api.delete_endpoint_for_fingerprint(eid, fp):
                         deleted += 1
                         _idle_since.pop(eid, None)
                         logger.info("idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
@@ -381,12 +384,17 @@ def _sweep_idle_flash_endpoints(
                         "idle-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True
                     )
                     continue
-        # Drop grace timers for endpoints no longer idle/present. With a FULL fleet view (no failed
-        # account) prune everything not still-idle, as before. With a DEGRADED view, prune only ids
-        # we actually observed this cycle — an unlisted account's timers must survive (we can't tell
-        # if its endpoints went busy or vanished, so resetting them would restart the 15-min grace
-        # every time that account flakes, and the orphan would never age out).
-        prunable = set(_idle_since) if not failed_keys else (set(_idle_since) & listed_ids)
+        # Drop grace timers for endpoints no longer idle/present, but ONLY for timers whose owning
+        # account responded this cycle. For those accounts we have an authoritative view: an endpoint
+        # that's still listed-and-idle is in ``still_idle``; one that's gone (busy again, or deleted)
+        # is not, so its timer is stale and safe to drop. A timer owned by an account that FAILED to
+        # list this cycle is left untouched — we can't tell if its endpoint went busy or vanished, so
+        # resetting it would restart the grace every time that account flakes and the orphan would
+        # never age out. (Full view => every owner responded => every non-still-idle timer is pruned,
+        # the original behavior; this only changes the partial-outage case, where keying the prune on
+        # the owning account — not on "ids seen this cycle" — lets a vanished endpoint from a HEALTHY
+        # account age out instead of leaking its timer until the unrelated failing account recovers.)
+        prunable = {eid for eid, (_ts, owner_fp) in _idle_since.items() if owner_fp in responded_fps}
         for stale in prunable - still_idle:
             _idle_since.pop(stale, None)
     return deleted

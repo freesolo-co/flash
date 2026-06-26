@@ -1676,8 +1676,8 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
         return True
 
     monkeypatch.setattr(runpod_api, "list_endpoints_by_key", fake_list_by_key)
-    monkeypatch.setattr(runpod_api, "endpoint_health_for_key", fake_health)
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", fake_delete)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", fake_health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", fake_delete)
     jobs._idle_since.clear()
 
     count = jobs._sweep_idle_flash_endpoints(
@@ -1710,8 +1710,8 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
 
     deleted = []
     monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda: ({"k": endpoints}, []))
-    monkeypatch.setattr(runpod_api, "endpoint_health_for_key", health)
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", lambda eid, key: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
 
     # Deploy-path mode: warm endpoint is treated as busy and kept; only scaled-to-zero is reaped.
     jobs._idle_since.clear()
@@ -1738,12 +1738,12 @@ def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
     )
     monkeypatch.setattr(
         runpod_api,
-        "endpoint_health_for_key",
+        "endpoint_health_for_fingerprint",
         lambda eid, key: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
                           "jobs": {"inQueue": 0, "inProgress": 0}},
     )
     deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", lambda eid, key: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
     jobs._idle_since.clear()
 
     clock = {"t": 1000.0}
@@ -1783,9 +1783,9 @@ def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
         j = {"inQueue": 0, "inProgress": 1 if state["busy"] else 0}
         return {"workers": w, "jobs": j}
 
-    monkeypatch.setattr(runpod_api, "endpoint_health_for_key", health)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
     deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", lambda eid, key: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
     jobs._idle_since.clear()
     clock = {"t": 1000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -1820,11 +1820,11 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
     )
     monkeypatch.setattr(
         runpod_api,
-        "endpoint_health_for_key",
+        "endpoint_health_for_fingerprint",
         lambda eid, key: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
                           "jobs": {"inQueue": 0, "inProgress": 0}},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", lambda eid, key: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: True)
     jobs._idle_since.clear()
 
     done = threading.Event()
