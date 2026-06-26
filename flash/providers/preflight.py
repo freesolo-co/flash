@@ -2,10 +2,8 @@
 
 ``check_run_preflight`` aggregates every missing piece of REQUIRED operator configuration — the
 RunPod multi-account pool, the Lambda + Hyperstack provider keys, the Freesolo backend internal key,
-and (when ``require_hf``, the default) the shared GitHub + HF tokens — into one startup error, so a
-half-configured plane fails fast at deploy instead of degrading silently in production. A
-``require_hf=False`` caller skips only the HF/GitHub tokens (e.g. a context that uploads no run
-artifacts); every other credential is always required.
+and the shared GitHub + HF tokens — into one startup error, so a half-configured plane fails fast at
+deploy instead of degrading silently in production.
 """
 
 from __future__ import annotations
@@ -37,12 +35,12 @@ def _present(var: str) -> bool:
     return bool((os.environ.get(var) or "").strip())
 
 
-def check_run_preflight(require_hf: bool = True) -> None:
+def check_run_preflight() -> None:
     """Validate the FULL operator config for a managed control-plane deployment; raise on missing.
 
     One self-contained check: a RunPod pool of >= 2 account keys, the Lambda + Hyperstack provider
-    keys, the Freesolo backend internal key, and (when ``require_hf``) the shared GitHub + HF tokens.
-    Every missing piece is aggregated into a single, actionable startup error.
+    keys, the Freesolo backend internal key, and the shared GitHub + HF tokens. Every missing piece
+    is aggregated into a single, actionable startup error.
     """
     from flash.providers.runpod import keys as runpod_keys
 
@@ -78,16 +76,15 @@ def check_run_preflight(require_hf: bool = True) -> None:
         )
 
     # Shared run infra (the HF dataset repo itself is per-run, ``[train] hf_repo``, not checked here).
-    if require_hf:
-        if not _present("GITHUB_TOKEN"):
-            problems.append(
-                "  - GITHUB_TOKEN: server token with access to managed Freesolo environments"
-            )
-        if not _present("HF_TOKEN"):
-            problems.append(
-                "  - HF_TOKEN: a token with write access to each run's "
-                "`[train] hf_repo`, e.g. `export HF_TOKEN=hf_...`"
-            )
+    if not _present("GITHUB_TOKEN"):
+        problems.append(
+            "  - GITHUB_TOKEN: server token with access to managed Freesolo environments"
+        )
+    if not _present("HF_TOKEN"):
+        problems.append(
+            "  - HF_TOKEN: a token with write access to each run's "
+            "`[train] hf_repo`, e.g. `export HF_TOKEN=hf_...`"
+        )
 
     if problems:
         raise PreflightError(

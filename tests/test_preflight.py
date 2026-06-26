@@ -123,16 +123,16 @@ def test_preflight_requires_each_provider_and_internal_key(clean_env, monkeypatc
         assert missing in str(excinfo.value)
 
 
-def test_preflight_require_hf_false_still_needs_provider_keys(clean_env, monkeypatch):
-    # Everything but the HF token: require_hf=False passes, require_hf=True flags the missing HF.
-    _set_runpod(monkeypatch, "rp-a,rp-b")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam")
-    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fsk")
-    pf.check_run_preflight(require_hf=False)
-    with pytest.raises(pf.PreflightError):
-        pf.check_run_preflight(require_hf=True)
+def test_preflight_requires_hf_unconditionally(clean_env, monkeypatch):
+    # HF is always required (no require_hf escape hatch): a config complete except HF_TOKEN fails,
+    # and only HF is flagged (GitHub is present).
+    _full_config(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    with pytest.raises(pf.PreflightError) as excinfo:
+        pf.check_run_preflight()
+    msg = str(excinfo.value)
+    assert "HF_TOKEN" in msg
+    assert "GITHUB_TOKEN" not in msg
 
 
 def test_runpod_key_is_env_only(clean_env):
