@@ -301,6 +301,15 @@ def surface_heartbeat(
     return key, stage
 
 
+def _attempt_int(value: Any) -> int | None:
+    """Coerce an attempt number (worker stamps it as a str env var, default ""; poller passes an int)
+    to int, or None when empty/absent/unparseable (can't be used to date a heartbeat)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def heartbeat_progress_ts(
     hb_key: tuple | None, launch_ts: float | None, current_attempt: int | None = None
 ) -> tuple[float, bool]:
@@ -338,10 +347,13 @@ def heartbeat_progress_ts(
     # down can upload a heartbeat with ts > this attempt's launch — fresh by timestamp, but belonging
     # to a DIFFERENT attempt. It must NOT satisfy this attempt's first-liveness (else a silent active-
     # but-never-booted replacement box waits the full setup grace instead of fast-failing). Reject on
-    # an EXPLICIT attempt mismatch only: a heartbeat without an attempt field (key < 4 or None) can't
-    # be dated this way, so keep the ts-based decision (back-compat with workers that don't stamp it).
-    hb_attempt = hb_key[3] if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
-    if fresh and current_attempt is not None and hb_attempt is not None and hb_attempt != current_attempt:
+    # an EXPLICIT attempt mismatch only. The worker stamps ``attempt`` from an env var — a STRING,
+    # default "" — while the poller passes an int handle.attempt, so coerce BOTH to int before
+    # comparing (else "0" != 0 would reject every live heartbeat). An empty/unparseable attempt
+    # (older/unset worker) yields None and can't be dated, so keep the ts-based decision (back-compat).
+    hb_attempt = _attempt_int(hb_key[3]) if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
+    cur_attempt = _attempt_int(current_attempt)
+    if fresh and cur_attempt is not None and hb_attempt is not None and hb_attempt != cur_attempt:
         fresh = False
     return min(now, max(lo, ts)), fresh
 
