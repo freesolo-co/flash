@@ -105,7 +105,8 @@ def build_payload(
     mode: str | None = None, models: list | None = None,
 ) -> dict:
     """The Lambda bootstrap payload (shared builder, arm='lambda'). ``cache_host_mount`` (the host
-    NFS mount of the attached weight-cache filesystem, /lambda/nfs/<name>) points HF_HOME at it.
+    NFS mount of the attached weight-cache filesystem, /lambda/nfs/<name>) points the base-model
+    prefetch (FLASH_WEIGHT_CACHE_DIR) at it.
     ``mode='preload'`` + ``models`` makes it a download-only warm payload (no worker)."""
     return _shared_build_payload(
         spec, seed, attempt, arm="lambda", runtime_secrets=runtime_secrets,
