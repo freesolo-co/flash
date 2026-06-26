@@ -1651,10 +1651,10 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
         {"id": "ep-other",     "name": "other-ep"},              # not flash-* → skip
     ]
 
-    def fake_list_endpoints():
-        return endpoints
+    def fake_list_by_key():
+        return {"k": endpoints}, []
 
-    def fake_health(eid):
+    def fake_health(eid, key):
         if eid in ("ep-live-idle", "ep-bare-idle"):
             return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
                     "jobs": {"inQueue": 0, "inProgress": 0}}
@@ -1671,13 +1671,13 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
 
     deleted = []
 
-    def fake_delete(eid):
+    def fake_delete(eid, key):
         deleted.append(eid)
         return True
 
-    monkeypatch.setattr(runpod_api, "list_endpoints", fake_list_endpoints)
-    monkeypatch.setattr(runpod_api, "endpoint_health", fake_health)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", fake_delete)
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", fake_list_by_key)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_key", fake_health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", fake_delete)
     jobs._idle_since.clear()
 
     count = jobs._sweep_idle_flash_endpoints(
@@ -1701,7 +1701,7 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
         {"id": "ep-zero", "name": "flash-a100-zero"},       # fully scaled to zero
     ]
 
-    def health(eid):
+    def health(eid, key):
         if eid == "ep-warm":
             return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
                     "jobs": {"inQueue": 0, "inProgress": 0}}
@@ -1709,9 +1709,9 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
                 "jobs": {"inQueue": 0, "inProgress": 0}}
 
     deleted = []
-    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: endpoints)
-    monkeypatch.setattr(runpod_api, "endpoint_health", health)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda: ({"k": endpoints}, []))
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_key", health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", lambda eid, key: deleted.append(eid) or True)
 
     # Deploy-path mode: warm endpoint is treated as busy and kept; only scaled-to-zero is reaped.
     jobs._idle_since.clear()
@@ -1732,16 +1732,18 @@ def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
     import flash.providers.runpod.jobs as jobs
 
     monkeypatch.setattr(
-        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"k": [{"id": "ep-x", "name": "flash-a100-x"}]}, []),
     )
     monkeypatch.setattr(
         runpod_api,
-        "endpoint_health",
-        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-                     "jobs": {"inQueue": 0, "inProgress": 0}},
+        "endpoint_health_for_key",
+        lambda eid, key: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                          "jobs": {"inQueue": 0, "inProgress": 0}},
     )
     deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", lambda eid, key: deleted.append(eid) or True)
     jobs._idle_since.clear()
 
     clock = {"t": 1000.0}
@@ -1771,17 +1773,19 @@ def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
 
     state = {"busy": False}
     monkeypatch.setattr(
-        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"k": [{"id": "ep-x", "name": "flash-a100-x"}]}, []),
     )
 
-    def health(eid):
+    def health(eid, key):
         w = {"running": 1 if state["busy"] else 0, "ready": 0, "idle": 0, "initializing": 0}
         j = {"inQueue": 0, "inProgress": 1 if state["busy"] else 0}
         return {"workers": w, "jobs": j}
 
-    monkeypatch.setattr(runpod_api, "endpoint_health", health)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_key", health)
     deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", lambda eid, key: deleted.append(eid) or True)
     jobs._idle_since.clear()
     clock = {"t": 1000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -1809,14 +1813,18 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
     import flash.providers.runpod.api as runpod_api
     import flash.providers.runpod.jobs as jobs
 
-    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [{"id": "e", "name": "flash-a100-x"}])
     monkeypatch.setattr(
         runpod_api,
-        "endpoint_health",
-        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-                     "jobs": {"inQueue": 0, "inProgress": 0}},
+        "list_endpoints_by_key",
+        lambda: ({"k": [{"id": "e", "name": "flash-a100-x"}]}, []),
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: True)
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_key",
+        lambda eid, key: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                          "jobs": {"inQueue": 0, "inProgress": 0}},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_key", lambda eid, key: True)
     jobs._idle_since.clear()
 
     done = threading.Event()

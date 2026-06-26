@@ -86,6 +86,46 @@ def list_endpoints() -> list[dict]:
     return all_endpoints
 
 
+def list_endpoints_by_key() -> tuple[dict[str, list[dict]], list[str]]:
+    """Best-effort per-account endpoint listing for the idle reaper.
+
+    Unlike ``list_endpoints()`` — which is all-or-nothing: one pool key's failure aborts
+    the whole call so teardown / slot-reconcile never act on a partial fleet — this returns
+    ``({key: [endpoints]}, [failed_keys])``: the endpoints for every pool account that DID
+    respond, plus the keys whose ``/endpoints`` call failed this cycle.
+
+    The reaper reaps the accounts it can see and leaves the rest for the next sweep, so one
+    flaky/expired key can't starve cleanup of every OTHER account. (``list_endpoints``'s
+    abort-on-any-failure was exactly that footgun: a single rejected or rate-limited pool
+    key silently no-op'd the whole sweep, and idle orphans on healthy accounts piled up.)
+
+    Tagging each endpoint with its owning key also lets callers issue account-scoped
+    health/delete (``endpoint_health_for_key`` / ``delete_endpoint_for_key``) instead of
+    relying on the pool's 404-failover waterfall.
+    """
+    pool = _keys.keys()
+    if not pool:
+        raise RunpodApiError(
+            "RUNPOD_API_KEY is not set; refusing to report an empty endpoint fleet"
+        )
+    by_key: dict[str, list[dict]] = {}
+    failed: list[str] = []
+    for key in pool:
+        try:
+            out = _CLIENT.request_with_retries_for_key(key, f"{REST_BASE}/endpoints", retries=2)
+        except RunpodApiError:
+            # This account is unreachable this cycle (rejected key, credit/quota, or a
+            # transient blip that outlasted the per-key retries). Record it so the caller can
+            # WARN and preserve its in-flight idle grace, and move on to the other accounts.
+            failed.append(key)
+            continue
+        if not isinstance(out, list):
+            failed.append(key)
+            continue
+        by_key[key] = out
+    return by_key, failed
+
+
 def find_endpoints_by_name(substr: str) -> list[dict]:
     return [e for e in list_endpoints() if substr in (e.get("name") or "")]
 
@@ -99,6 +139,22 @@ def delete_endpoint(endpoint_id: str) -> bool:
         # saying the endpoint "does not exist") means the desired end state — no such
         # endpoint — already holds. Reporting False here makes undeploy_adapter surface a
         # misleading "may still be running" 502 for something that's provably gone.
+        return _is_not_found(e)
+
+
+def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
+    """Delete an endpoint using a SPECIFIC pool account's key (no failover waterfall).
+
+    The idle reaper already knows which account owns each endpoint (it listed per key), so
+    it deletes with that exact key — cheaper than the pool failover, and it avoids the
+    waterfall masking a real failure as a 404 'already gone' on the wrong account.
+    """
+    try:
+        _CLIENT.request_with_retries_for_key(
+            key, f"{REST_BASE}/endpoints/{endpoint_id}", method="DELETE", retries=2
+        )
+        return True
+    except RunpodApiError as e:
         return _is_not_found(e)
 
 
@@ -120,6 +176,12 @@ def _is_not_found(err: RunpodApiError) -> bool:
 
 def endpoint_health(endpoint_id: str) -> dict:
     return request_with_retries(f"{QUEUE_BASE}/{endpoint_id}/health")
+
+
+def endpoint_health_for_key(endpoint_id: str, key: str) -> dict:
+    """Endpoint health via a SPECIFIC pool account's key (no failover waterfall) — the
+    reaper's account-scoped counterpart of ``endpoint_health``."""
+    return _CLIENT.request_with_retries_for_key(key, f"{QUEUE_BASE}/{endpoint_id}/health")
 
 
 def submit_job(endpoint_id: str, input_payload: dict) -> str:

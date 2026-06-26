@@ -283,3 +283,77 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
 
     assert out == []  # skipped, did NOT raise
     assert terminated == []  # and crucially did NOT reap the live instance
+
+
+# --- the RunPod idle sweep across a multi-account key pool --------------------------------------
+# Regression cover for the orphan pile-up: the sweep used the all-or-nothing ``list_endpoints``, so
+# one unhealthy pool key (rejected/expired/rate-limited) aborted the WHOLE sweep and idle orphans on
+# every OTHER account survived indefinitely. The sweep now lists per account and reaps what responds.
+
+
+def _idle_health():
+    """A warm-idle endpoint with no work — reapable under reap_warm=True."""
+    return {"workers": {"ready": 1, "idle": 1}, "jobs": {"inQueue": 0, "inProgress": 0}}
+
+
+def test_sweep_reaps_responsive_account_when_one_pool_key_fails(monkeypatch):
+    """One pool key fails to list this cycle; the responding account's idle orphan is still reaped,
+    using that account's OWN key — and the failure is surfaced at WARNING (not a silent DEBUG)."""
+    jobs._idle_since.clear()
+    orphan = {"id": "ep-b1", "name": "live-flash-5090-orphan"}
+    # keyA failed to list; keyB returned the orphan.
+    monkeypatch.setattr(
+        jobs.runpod_api, "list_endpoints_by_key", lambda: ({"keyB": [orphan]}, ["keyA"])
+    )
+    health_calls = []
+
+    def health(eid, key):
+        health_calls.append((eid, key))
+        return _idle_health()
+
+    deletes = []
+    monkeypatch.setattr(jobs.runpod_api, "endpoint_health_for_key", health)
+    monkeypatch.setattr(
+        jobs.runpod_api, "delete_endpoint_for_key", lambda eid, key: deletes.append((eid, key)) or True
+    )
+    warnings = []
+    monkeypatch.setattr(jobs.logger, "warning", lambda *a, **k: warnings.append(a))
+
+    # min_idle_s=0 -> a first idle observation is immediately reapable.
+    deleted = jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=0.0)
+
+    assert deleted == 1
+    assert health_calls == [("ep-b1", "keyB")]  # account-scoped: queried with the OWNING key
+    assert deletes == [("ep-b1", "keyB")]  # ...and deleted with it, no failover waterfall
+    assert warnings, "a failed pool account must be surfaced at WARNING, not swallowed at DEBUG"
+
+
+def test_sweep_preserves_grace_for_unlisted_account(monkeypatch):
+    """A partial outage must not reset the idle-grace clock for the account it couldn't list — else
+    a flaky account's orphan restarts its 15-min grace every sweep and never ages out."""
+    jobs._idle_since.clear()
+    jobs._idle_since["ep-a1"] = 1.0  # orphan on account A, observed idle long ago
+    # This cycle account A fails to list; account B responds with nothing.
+    monkeypatch.setattr(jobs.runpod_api, "list_endpoints_by_key", lambda: ({"keyB": []}, ["keyA"]))
+    monkeypatch.setattr(jobs.runpod_api, "endpoint_health_for_key", lambda eid, key: _idle_health())
+    monkeypatch.setattr(jobs.runpod_api, "delete_endpoint_for_key", lambda eid, key: True)
+    monkeypatch.setattr(jobs.logger, "warning", lambda *a, **k: None)
+
+    deleted = jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=900.0)
+
+    assert deleted == 0
+    assert jobs._idle_since.get("ep-a1") == 1.0  # grace timer SURVIVED the partial outage
+
+
+def test_sweep_full_view_prunes_vanished_grace_timer(monkeypatch):
+    """With a complete fleet view (no failed account), a grace timer for an endpoint that is no
+    longer present is pruned — the original behavior, unchanged."""
+    jobs._idle_since.clear()
+    jobs._idle_since["ghost"] = 1.0  # endpoint that has since vanished
+    monkeypatch.setattr(jobs.runpod_api, "list_endpoints_by_key", lambda: ({"keyA": []}, []))
+    monkeypatch.setattr(jobs.logger, "warning", lambda *a, **k: None)
+
+    deleted = jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=900.0)
+
+    assert deleted == 0
+    assert "ghost" not in jobs._idle_since  # full view -> stale timer pruned
