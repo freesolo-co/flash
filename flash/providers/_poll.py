@@ -268,6 +268,34 @@ def _record_heartbeat(hb: dict) -> None:
         pass
 
 
+# Heartbeat stages the worker emits DURING cold start, BEFORE the training loop begins. Receiving
+# one proves the worker is alive but NOT that the slow setup finished, so a poller must NOT let them
+# flip its stall detection from the wide setup grace to the tight training-stall window. The setup
+# timeline is:
+#   boot -> sft_start/rl_start -> model_prefetching/model_prefetched (snapshot_download, can pull
+#   tens of GB) -> sft_model_load/rl_train_start -> sft_initializing/rl_initializing (vLLM build +
+#   *Trainer.__init__) -> [dataset render/tokenize over the full -- possibly uncapped -- dataset,
+#   silent] -> first sft_step/rl_step (training has actually begun).
+# Every stage EXCEPT the per-step sft_step/rl_step is setup. The prefetch + init pings were added so
+# a long-but-LIVE cold start keeps re-arming liveness, but they are still setup: omitting them here
+# would latch the poller into the training stall the moment the first one lands, then false-kill a
+# healthy run whose silent dataset tokenization outlives that tighter window. Canonical here so all
+# three providers (runpod / lambdalabs / hyperstack) share ONE definition.
+SETUP_HEARTBEAT_STAGES = frozenset(
+    {
+        "boot",
+        "sft_start",
+        "rl_start",
+        "model_prefetching",
+        "model_prefetched",
+        "sft_model_load",
+        "rl_train_start",
+        "sft_initializing",
+        "rl_initializing",
+    }
+)
+
+
 def surface_heartbeat(
     heartbeat_reader: Callable[[], Any] | None,
     last_hb_key: tuple | None,

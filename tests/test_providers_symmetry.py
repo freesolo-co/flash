@@ -74,6 +74,28 @@ def test_method_signatures_match_runpod(provider):
         assert rs == os_, f"{meth} param mismatch: runpod={rs} {provider}={os_}"
 
 
+@pytest.mark.parametrize("provider", ["runpod", "lambda", "hyperstack"])
+def test_setup_heartbeat_stages_are_the_one_canonical_set(provider):
+    """All three poll loops must draw the setup-vs-training stall boundary from the SAME canonical
+    SETUP_HEARTBEAT_STAGES in _poll (so a stage added in one place can't drift the others). It must
+    treat the cold-start pings — including model_prefetching / *_initializing — as SETUP (else the
+    poller latches into the tight training stall the moment one lands and false-kills a healthy run
+    whose silent dataset tokenization outlives it), while the per-step rl_step/sft_step are NOT
+    setup (they're what flips it to training)."""
+    from flash.providers._poll import SETUP_HEARTBEAT_STAGES
+
+    jobs = importlib.import_module(f"flash.providers.{_PKG[provider]}.jobs")
+    # The provider must reference the shared object, not a private copy that can drift.
+    assert jobs.SETUP_HEARTBEAT_STAGES is SETUP_HEARTBEAT_STAGES
+
+    # The slow cold-start pings must count as setup (kept under the wide setup grace).
+    for stage in ("model_prefetching", "model_prefetched", "sft_initializing", "rl_initializing"):
+        assert stage in SETUP_HEARTBEAT_STAGES, f"{stage} must be treated as setup, not training"
+    # Per-step training heartbeats must NOT be setup — they flip the poller to the tight window.
+    assert "rl_step" not in SETUP_HEARTBEAT_STAGES
+    assert "sft_step" not in SETUP_HEARTBEAT_STAGES
+
+
 def test_runpod_provider_implements_the_interface():
     from flash.providers import get_provider
     from flash.providers.base import Provider

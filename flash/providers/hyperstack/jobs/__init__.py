@@ -23,6 +23,7 @@ from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
     FIRST_LIVENESS_S,
+    SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
     heartbeat_progress_ts,
     make_say,
@@ -50,10 +51,6 @@ LOAD_TIMEOUT_S = 900.0
 SETUP_GRACE_S = 3000.0
 STALL_AFTER_S = 1500.0
 PROVISION_GRACE_S = 3000.0
-
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
 
 # Hyperstack VM statuses that mean "the box is gone / will not progress".
 _DEAD_STATES = {"ERROR", "FAILED", "DELETING", "DELETED", "TERMINATED"}
@@ -539,7 +536,7 @@ def poll_hs_job(
             if fresh:
                 last_progress = hb_ts
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
-                if stage not in _SETUP_HEARTBEAT_STAGES:
+                if stage not in SETUP_HEARTBEAT_STAGES:
                     seen_training_hb = True
         if became_active:
             # Fast-failover: a VM that reached 'ACTIVE' but never started a worker (no fresh hb AND no

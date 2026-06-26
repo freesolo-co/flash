@@ -29,6 +29,7 @@ from flash._logging import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 from flash.providers._poll import (
+    SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
     make_say,
     surface_forced_heartbeat,
@@ -77,15 +78,6 @@ TERMINAL_OK = {"COMPLETED"}
 # "FAILED" is the run dying on its own (real traceback) -> fails fast.
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
 TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
-
-# Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
-# training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
-# Receiving one proves the worker is alive but NOT that the slow setup (model download +
-# vLLM init) finished, so they must not flip stall detection to the tight training window.
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
-
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
@@ -587,7 +579,7 @@ def poll_job(
     """Poll a queue job to completion; resilient to transient API errors.
 
     Two stall windows: the cold-start phase (dep install, per-run env pip, model download,
-    vLLM init) is slow and only emits *setup* heartbeats (``_SETUP_HEARTBEAT_STAGES``).
+    vLLM init) is slow and only emits *setup* heartbeats (``SETUP_HEARTBEAT_STAGES``).
     Until a *training* heartbeat arrives we apply the larger ``setup_grace_s`` budget so a
     slow cold start isn't misread as a stall; after it we use the tight ``stall_after_s``.
     Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
@@ -761,7 +753,7 @@ def poll_job(
             last_progress = time.time()
             # Only a training-phase heartbeat means cold-start setup is done and we
             # can switch to the tight window; setup heartbeats keep the grace budget.
-            if stage not in _SETUP_HEARTBEAT_STAGES:
+            if stage not in SETUP_HEARTBEAT_STAGES:
                 seen_heartbeat = True
         # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
         # but only when a heartbeat_reader lets us tell setup from training; without one we

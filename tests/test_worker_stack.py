@@ -261,6 +261,29 @@ def test_heartbeat_commit_is_throttled(monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("stage", ["model_prefetching", "sft_initializing", "rl_initializing"])
+def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
+    """The periodic setup pings run on a side thread every 30s through a long phase (a cold
+    snapshot_download can pull tens of GB for ~40 min, and disaggregated workers share one HF_REPO),
+    so their HF UPLOAD must be throttled like rl_step or they blow HF's 128/hour repo commit cap. The
+    local write + watchdog re-arm still happen every call (not asserted here — see the watchdog
+    tests); this only pins that the repeated stage does NOT commit on every call."""
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    calls = []
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: calls.append(a[1]))
+    # Large interval -> only the FIRST emit of the stage commits; the rest are upload-throttled.
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 9999.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    w.heartbeat(stage, elapsed_seconds=1)
+    w.heartbeat(stage, elapsed_seconds=31)
+    w.heartbeat(stage, elapsed_seconds=61)
+    assert calls.count("heartbeat.json") == 1, f"{stage} must be upload-throttled, got {calls}"
+
+
 def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     """Perf regression guard: the synchronous hf_upload_file network call must run OUTSIDE
     _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward

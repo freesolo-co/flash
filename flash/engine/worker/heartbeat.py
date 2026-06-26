@@ -23,9 +23,18 @@ import time
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
 
-# The rl_step heartbeat-upload throttle stages + terminal stages. Only the per-step "rl_step"
-# stage is high-frequency, so throttle JUST that one; terminal transitions always commit.
-_HB_THROTTLED_STAGES = frozenset({"rl_step"})
+# High-frequency stages whose HF UPLOAD is throttled to _HB_MIN_INTERVAL_S (the local write +
+# watchdog re-arm still happen every call). Two kinds are high-frequency:
+#   - "rl_step": the per-step training heartbeat (reward callback fires every optimizer step).
+#   - the periodic setup pings ("model_prefetching", "sft_initializing", "rl_initializing"): each
+#     runs on a side thread every 30s through a long phase (a cold snapshot_download can pull tens
+#     of GB for ~40 min => ~80 commits, and disaggregated workers share one HF_REPO), so committing
+#     every 30s risks the repo commit cap _HB_MIN_INTERVAL_S exists to avoid. Throttling the UPLOAD
+#     (not the emit) keeps the local watchdog re-armed every 30s while holding commits well under the
+#     128/hr cap. Terminal transitions are never throttled (always committed).
+_HB_THROTTLED_STAGES = frozenset(
+    {"rl_step", "model_prefetching", "sft_initializing", "rl_initializing"}
+)
 # Terminal transitions the control plane must never miss — always committed.
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # Even in terminal-only mode, emit a SLOW heartbeat at this cadence so the control plane's stall
@@ -54,47 +63,56 @@ _SFT_HEARTBEAT_INTERVAL_S = 60.0
 # heartbeat lands for the whole window -- i.e. a real hang. Used to localize the GRPO sleep-mode
 # rollout hang and the consumer-GPU warm-start init hang.
 #
-# DEFAULT-ON (2400s / 40 min). This is SAFE — and strictly better than the old silent wedge —
-# because every heartbeat re-arms the timer: a slow-but-LIVE cold init pings
-# ``rl_initializing``/``sft_initializing`` every 30s (and those now use the GIL-friendly
-# nvidia-smi-only diagnostics, so they keep ticking through a CUDA-busy init), so the watchdog only
-# fires on a TRUE hang where NO heartbeat lands for the whole window. The window is set WELL above
-# the longest observed HEALTHY cold-init gap (a real 0.8B warm-start GRPO on an RTX 4090 had a
-# ~17-min init with the old frozen-heartbeat bug — the very thing this file fixes) and below the
-# control-plane setup grace (~50 min), so it adds a stack dump for a TRUE hang without ever
-# false-killing a healthy-but-slow init. When it fires it dumps every thread's stack (C-level
-# faulthandler -> fires even if the main thread holds the GIL) and fails the run, turning the
-# previously undiagnosable "process wedged, no console upload" hang into an uploaded stack trace.
+# DEFAULT-ON (2400s / 40 min). This is the STEADY-STATE (training) window; the whole cold start runs
+# under the wider _STALL_STARTUP_GRACE_S below until the first rl_step/sft_step. It is SAFE — and
+# strictly better than the old silent wedge — because every heartbeat re-arms the timer: a slow-but-
+# LIVE cold init pings ``rl_initializing``/``sft_initializing`` every 30s (and those now use the
+# GIL-friendly nvidia-smi-only diagnostics, so they keep ticking through a CUDA-busy init), so the
+# watchdog only fires on a TRUE hang where NO heartbeat lands for the whole window. The training
+# window is WELL above the longest observed HEALTHY per-step gap, so it adds a stack dump for a TRUE
+# training hang without false-killing a healthy step. When it fires it dumps every thread's stack
+# (C-level faulthandler -> fires even if the main thread holds the GIL) and fails the run, turning
+# the previously undiagnosable "process wedged, no console upload" hang into an uploaded stack trace.
 # Set FLASH_STALL_FAULTHANDLER_S=0 in [worker_env] to disable; lower it to localize a known hang.
 _STALL_FAULTHANDLER_S = 2400
 with contextlib.suppress(Exception):
     _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "2400") or 2400)
 
-# Startup grace: model/vLLM/GRPO init can legitimately run for many minutes between the FIRST
-# heartbeat and the first per-step one, exceeding a tight FLASH_STALL_FAULTHANDLER_S window and
-# tripping the watchdog on a HEALTHY run. So the very first arm uses a wider window (at least
-# FLASH_STALL_FAULTHANDLER_STARTUP_S, default 2400s) and only once real progress has re-armed it do
-# we tighten to the configured interval. This always reads its OWN env var (independent of
-# FLASH_STALL_FAULTHANDLER_S); it is simply never consulted when the watchdog is disabled
-# (_STALL_FAULTHANDLER_S <= 0 -> _rearm_stall_faulthandler returns before arming).
-_STALL_STARTUP_GRACE_S = 2400
+# Startup/setup grace: the ENTIRE cold start — model prefetch, weight load, vLLM build,
+# *Trainer.__init__, and the (often silent) full-dataset render/tokenize — can legitimately run for
+# many minutes with only coarse 30s setup pings, or, inside dataset tokenization, none at all. A
+# tight FLASH_STALL_FAULTHANDLER_S window would false-kill such a HEALTHY-but-slow setup, so until
+# the first per-step TRAINING heartbeat (rl_step/sft_step) lands, the watchdog uses this WIDER
+# window for EVERY arm (not just the first one). Default 3000s == the providers' SETUP_GRACE_S so
+# the provider's own (retriable) setup grace governs a genuinely-stuck setup; only once real
+# training steps flow do we tighten to FLASH_STALL_FAULTHANDLER_S, where a fast in-process stack
+# dump is the point. Reads its OWN env var (independent of FLASH_STALL_FAULTHANDLER_S); never
+# consulted when the watchdog is disabled (_STALL_FAULTHANDLER_S <= 0 -> early return below).
+_STALL_STARTUP_GRACE_S = 3000
 with contextlib.suppress(Exception):
-    _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "2400") or 2400)
-# False until the watchdog has been armed at least once; the first arm gets the startup grace.
-_STALL_ARMED = False
+    _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "3000") or 3000)
+# Stages that mean real TRAINING has begun (vs. a setup ping). The first one tightens the watchdog
+# from the wide setup grace to the steady-state window. Mirrors the providers' SETUP_HEARTBEAT_STAGES
+# setup-vs-training boundary (everything except rl_step/sft_step is setup).
+_STEP_STAGES = frozenset({"rl_step", "sft_step"})
+# False until the first per-step training heartbeat; until then every arm gets the startup grace.
+_SAW_STEP_HEARTBEAT = False
 
 
-def _rearm_stall_faulthandler() -> None:
-    global _STALL_ARMED
+def _rearm_stall_faulthandler(stage: str = "") -> None:
+    global _SAW_STEP_HEARTBEAT
     if _STALL_FAULTHANDLER_S <= 0:
         return
-    # First arm: widen to the startup grace so a slow init (no per-step heartbeat yet) can't
-    # trip a healthy run. Subsequent re-arms (real progress landed) use the configured interval.
-    window = _STALL_FAULTHANDLER_S if _STALL_ARMED else max(_STALL_FAULTHANDLER_S, _STALL_STARTUP_GRACE_S)
+    if stage in _STEP_STAGES:
+        _SAW_STEP_HEARTBEAT = True
+    # Until the first per-step training heartbeat the run is still in setup (prefetch, weight load,
+    # vLLM/trainer build, full-dataset render/tokenize) — phases that can run many minutes with only
+    # coarse (or no) progress pings — so widen to the startup grace so a healthy-but-slow setup
+    # can't trip the watchdog. Once training steps are flowing, tighten to the configured interval.
+    window = _STALL_FAULTHANDLER_S if _SAW_STEP_HEARTBEAT else max(_STALL_FAULTHANDLER_S, _STALL_STARTUP_GRACE_S)
     with contextlib.suppress(Exception):
         faulthandler.cancel_dump_traceback_later()
         faulthandler.dump_traceback_later(window, exit=True)
-        _STALL_ARMED = True
 
 
 def heartbeat(stage: str, **kw):
@@ -156,8 +174,9 @@ def heartbeat(stage: str, **kw):
             finally:
                 with contextlib.suppress(OSError):
                     os.remove(up)
-    # Re-arm the stall watchdog: progress landed, so reset the no-heartbeat timer.
-    _rearm_stall_faulthandler()
+    # Re-arm the stall watchdog: progress landed, so reset the no-heartbeat timer. Pass the stage so
+    # it keeps the wide setup grace until the first rl_step/sft_step, then tightens for training.
+    _rearm_stall_faulthandler(stage)
     print("HEARTBEAT", json.dumps(payload))
 
 

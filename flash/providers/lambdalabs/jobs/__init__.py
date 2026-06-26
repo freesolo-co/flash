@@ -28,6 +28,7 @@ from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
     FIRST_LIVENESS_S,
+    SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
     heartbeat_progress_ts,
     make_say,
@@ -60,12 +61,6 @@ STALL_AFTER_S = 1500.0
 # (Lambda has no server-side execution timeout, so the client deadline + the bootstrap's own cap
 # bound spend). Larger than RunPod's because of the on-host Docker pull.
 PROVISION_GRACE_S = 3000.0
-
-# Heartbeat stages emitted DURING cold start, before the training loop begins. Receiving one proves
-# the worker is alive but NOT that setup finished, so they keep the larger setup grace (cf. RunPod).
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
 
 # Lambda instance statuses that mean "the box is gone / will not progress".
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
@@ -613,7 +608,7 @@ def poll_lambda_job(
             if fresh:
                 last_progress = hb_ts
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
-                if stage not in _SETUP_HEARTBEAT_STAGES:
+                if stage not in SETUP_HEARTBEAT_STAGES:
                     seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
