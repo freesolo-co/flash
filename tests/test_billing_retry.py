@@ -412,6 +412,59 @@ def test_sweep_charge_does_not_downgrade_deployed_state(monkeypatch, tmp_path):
     assert st.state == "deployed"  # charge never downgraded the live deployment
 
 
+def test_record_billing_state_preserves_legacy_terminal_timestamp(monkeypatch, tmp_path):
+    """cursor Medium / codex P2: a legacy ALREADY-terminal run with finished_at=None must keep its
+    prior terminal time when a billing retry writes its fields. record_billing_state backfills
+    finished_at from the PRE-update updated_at (the persisted teardown time) before bumping
+    updated_at, mirroring _update -- otherwise reconcile._terminal_ts (which falls back to updated_at)
+    would treat the retry time as the run end and over-bill flat-rate remotes."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    teardown_ts = 1_000_000.0  # the real terminal/teardown time, frozen in updated_at
+    runner._save_status(
+        runner.RunStatus(
+            run_id="legacy",
+            state="done",
+            spec=_spec().to_dict(),
+            cost_usd=1.0,
+            updated_at=teardown_ts,
+            finished_at=None,  # legacy run: never stamped
+            billing_context={"org_id": "org-A"},
+            billing_state="pending",
+        )
+    )
+
+    runner.record_billing_state("legacy", billing_state="failed", billing_error="blip")
+    st = runner.get_status("legacy")
+    # finished_at backfilled from the prior teardown time, NOT the (now-advanced) updated_at
+    assert st.finished_at == teardown_ts
+    assert st.updated_at > teardown_ts  # the write did advance updated_at
+    assert st.billing_state == "failed"
+
+
+def test_record_billing_state_never_downgrades_charged(monkeypatch, tmp_path):
+    """codex P2: a racing duplicate attempt that times out / hits a transient BillingError AFTER
+    another attempt already landed `charged` must NOT flip the local state back to `failed`/`charging`
+    (which would re-retry an already-charged run). record_billing_state no-ops any non-`charged` write
+    once the run is `charged`."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_run(runner, tmp_path, state="done", billing_state="charged")
+    runner.record_billing_state("run-1", billing_charge={"amountCents": 42})  # establish the charge
+
+    # a late failure write from a racing attempt -> must be ignored, charge stands
+    runner.record_billing_state("run-1", billing_state="failed", billing_error="late blip")
+    assert runner.get_status("run-1").billing_state == "charged"
+    # a late charging write (racing re-entry) is likewise ignored
+    runner.record_billing_state("run-1", billing_state="charging")
+    assert runner.get_status("run-1").billing_state == "charged"
+    # re-writing `charged` itself is still allowed (idempotent)
+    runner.record_billing_state("run-1", billing_state="charged", billing_charge={"amountCents": 42})
+    assert runner.get_status("run-1").billing_state == "charged"
+
+
 # --------------------------------------------------------------------------- background loop
 # Same contract as the sibling reconcile loop: re-raise CancelledError (so shutdown's task.cancel()
 # stops it), swallow a real Exception and continue to the next cycle.

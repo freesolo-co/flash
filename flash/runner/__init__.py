@@ -648,8 +648,19 @@ def record_billing_state(run_id: str, **fields) -> None:
     concurrent ``mark_deployed``) keeps its current state. The completion-charge hook must use this
     rather than ``_update(run_id, get_status(run_id).state, ...)``: that read-state-then-write pattern
     samples the state OUTSIDE the lock, so a deploy landing between the read and ``_update`` taking the
-    lock would let the stale state clobber ``deployed``. No-ops if the run vanished. Always allowed:
-    these are field-only updates on any state (incl. terminal)."""
+    lock would let the stale state clobber ``deployed``. No-ops if the run vanished.
+
+    Two race-correctness guards, both decided under the lock:
+    - NEVER downgrade an already-``charged`` run: if the persisted billing_state is ``charged`` and
+      this write would set it to anything else (a racing duplicate attempt that timed out / hit a
+      transient BillingError after another attempt already landed the charge), the whole write is a
+      no-op. The backend is idempotent by runId, so the charge stands; the local state must not be
+      flipped back to ``failed``/``charging`` and re-retried.
+    - PRESERVE the terminal timestamp: a legacy ALREADY-terminal run with ``finished_at is None`` must
+      backfill it from the PRE-update ``updated_at`` (the prior persisted terminal/teardown time)
+      before this write bumps ``updated_at``, exactly like ``_update`` does (see its same-terminal
+      backfill). Otherwise reconcile._terminal_ts (which falls back to updated_at when finished_at is
+      missing) would treat this billing-retry time as the run end and over-bill flat-rate remotes."""
     bad = set(fields) - _BILLING_FIELDS
     if bad:
         raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
@@ -658,6 +669,18 @@ def record_billing_state(run_id: str, **fields) -> None:
             status = get_status(run_id)
         except FileNotFoundError:
             return
+        # Don't let a racing failed/charging write downgrade a charge another attempt already landed.
+        new_billing_state = fields.get("billing_state")
+        if (
+            status.billing_state == "charged"
+            and "billing_state" in fields
+            and new_billing_state != "charged"
+        ):
+            return
+        # Mirror _update's same-terminal finished_at backfill: freeze the prior terminal time before
+        # this field-only write advances updated_at, so a billing retry never shifts the run end.
+        if status.state in TERMINAL_STATES and status.finished_at is None:
+            status.finished_at = status.updated_at
         for key, value in fields.items():
             setattr(status, key, value)
         status.updated_at = time.time()
