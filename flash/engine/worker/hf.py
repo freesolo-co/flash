@@ -165,7 +165,7 @@ def hf_resume_checkpoint() -> str | None:
 _MAX_PREFETCH_SILENCE_S = 600.0
 
 
-def _hf_cache_bytes(model_id: str) -> int:
+def _hf_cache_bytes(model_id: str) -> int | None:
     """Best-effort downloaded-byte total for ``model_id`` in the HF hub cache: the sum of the
     ``blobs/`` files (the actual data, incl. the ``.incomplete`` partials an in-flight download is
     growing). Scans ONLY ``blobs/`` — snapshots/ are just symlinks to blobs and refs/metadata are
@@ -176,15 +176,15 @@ def _hf_cache_bytes(model_id: str) -> int:
       * the blob byte total once the repo cache dir exists (``0`` if no blobs written YET — a real
         "0 bytes downloaded" measurement, so a download that creates the repo dir but never writes a
         blob still trips the silence timer rather than being treated as perpetual progress);
-      * ``-1`` only when the repo cache dir does not exist yet, or on any error — so callers fail SAFE
-        (treat as progress) in the brief pre-structure window where we genuinely cannot measure.
+      * ``None`` only when the repo cache dir does not exist yet, or on any error — the unmeasurable
+        pre-structure window (``liveness_heartbeat`` treats ``None`` as "no advancement").
     """
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
 
         repo = os.path.join(HF_HUB_CACHE, "models--" + model_id.replace("/", "--"))
         if not os.path.isdir(repo):
-            return -1  # cache structure not created yet -> can't measure, assume progress
+            return None  # cache structure not created yet -> can't measure
         blobs = os.path.join(repo, "blobs")
         if not os.path.isdir(blobs):
             return 0  # repo dir exists but no blobs written yet -> 0 bytes downloaded (measurable)
@@ -196,7 +196,7 @@ def _hf_cache_bytes(model_id: str) -> int:
                     total += os.path.getsize(fp)
         return total
     except Exception:
-        return -1
+        return None
 
 
 def prefetch_model(model_id: str) -> float:
@@ -211,84 +211,28 @@ def prefetch_model(model_id: str) -> float:
 
     t0 = time.time()
     # snapshot_download blocks with NO heartbeat until it returns, but a cold cache can pull tens of
-    # GB over many minutes — longer than the stall-faulthandler window (heartbeat.py) AND the
-    # provider setup grace. The preceding ``rl_start``/``sft_start`` heartbeat already armed the
-    # watchdog, so a silent long download would look like a hang and self-kill a HEALTHY cold start.
-    # Ping a progress heartbeat on a side thread so the download counts as real progress: it re-arms
-    # the watchdog and keeps the control plane / provider setup grace seeing liveness throughout.
-    _prefetch_done = threading.Event()
+    # GB over many minutes — longer than the stall watchdog AND the provider setup grace, so a silent
+    # download would look like a hang and self-kill a HEALTHY cold start. Keep a model_prefetching
+    # heartbeat alive, gated on downloaded-byte GROWTH (so a genuinely WEDGED transfer with no bytes
+    # still yields to the stall path), with model/elapsed in each ping. See heartbeat.liveness_heartbeat.
+    from flash.engine.worker.heartbeat import liveness_heartbeat
 
-    def _prefetch_heartbeat() -> None:
-        last_bytes = -1
-        progress_since = time.time()
-        while not _prefetch_done.wait(30.0):
-            # Re-check after wait() returns: if the download finished in the gap between wait()
-            # returning False and here, do NOT emit. A model_prefetching that STARTS after
-            # _prefetch_done is set could otherwise land after the terminal model_prefetched (a stale
-            # stage the control plane would briefly see post-download). With this guard the only
-            # prefetching that can still be in flight when model_prefetched is emitted is one that
-            # was already past this point — and heartbeat()'s _HB_UPLOAD_LOCK serializes uploads, so
-            # that in-flight upload is ordered strictly BEFORE model_prefetched's. That keeps
-            # model_prefetched the last prefetch stage WITHOUT an unbounded join below.
-            if _prefetch_done.is_set():
-                return
-            # Gate liveness on REAL download progress: a synthetic model_prefetching re-arms the
-            # watchdog and refreshes the provider timestamp, so emitting while snapshot_download is
-            # WEDGED (no bytes) would mask a stuck transfer until the outer job timeout. Reset the
-            # silence timer ONLY on measured byte GROWTH (cur >= 0 and rising). A measurement failure
-            # (-1 — repo cache dir not created yet, i.e. the pre-structure Hub-metadata phase, or a
-            # transient scan error) does NOT reset it: otherwise a download wedged before it ever
-            # writes a blob would emit forever. So the unmeasurable window is itself bounded — the
-            # timer runs from loop start, giving the pre-structure phase the same _MAX_PREFETCH_
-            # SILENCE_S grace before yielding to the stall path.
-            cur = _hf_cache_bytes(model_id)
-            if cur >= 0 and cur > last_bytes:
-                last_bytes = cur
-                progress_since = time.time()
-            if (time.time() - progress_since) > _MAX_PREFETCH_SILENCE_S:
-                print(
-                    f"prefetch_model: no download progress for >{_MAX_PREFETCH_SILENCE_S}s; "
-                    "stopping liveness so the stall path can fire"
-                )
-                return
-            # nvidia-smi-only (include_torch=False): the GPU isn't in use yet and torch telemetry
-            # could block; this just needs to prove the worker is alive and re-arm the watchdog.
-            gpu = gpu_diagnostics(include_torch=False)
-            # gpu_diagnostics shells out to nvidia-smi (up to several seconds on its subprocess
-            # timeout); the download can finish DURING it. Re-check before emitting so a stale
-            # model_prefetching can't be produced after the terminal model_prefetched.
-            if _prefetch_done.is_set():
-                return
-            _w.heartbeat(
-                "model_prefetching",
-                model=model_id,
-                elapsed_seconds=round(time.time() - t0, 1),
-                gpu=gpu,
+    with liveness_heartbeat(
+        "model_prefetching",
+        progress=lambda: _hf_cache_bytes(model_id),
+        max_silence_s=_MAX_PREFETCH_SILENCE_S,
+        fields=lambda: {"model": model_id, "elapsed_seconds": round(time.time() - t0, 1)},
+    ):
+        try:
+            snapshot_download(
+                repo_id=model_id,
+                # weights + tokenizer/config only (same exclusions as the image bake)
+                ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
             )
-
-    _prefetch_hb = threading.Thread(target=_prefetch_heartbeat, daemon=True)
-    _prefetch_hb.start()
-    try:
-        snapshot_download(
-            repo_id=model_id,
-            # weights + tokenizer/config only (same exclusions as the image bake)
-            ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
-        )
-    except Exception as e:
-        # Surface but don't fail here: gated/local-only models still load fine through
-        # the normal from_pretrained path the trainer uses next.
-        print("prefetch_model warn:", e)
-    finally:
-        # BOUNDED join: stage ordering is enforced by the is_set() guard above + heartbeat()'s
-        # _HB_UPLOAD_LOCK (which serializes any already-in-flight model_prefetching upload before
-        # model_prefetched's), NOT by waiting here, so this join only needs to reap the daemon
-        # thread — it must NOT be unbounded. An unbounded join would wedge the worker indefinitely
-        # if the side thread were stuck inside heartbeat()'s HF upload (hf_upload_file has no hard
-        # timeout): the model download would have completed yet the worker would hang in join().
-        # The timeout caps that to a brief reap; in the (rare) case it expires mid-upload, the side
-        # thread holds _HB_UPLOAD_LOCK so model_prefetched's upload still lands strictly after it.
-        _prefetch_done.set()
-        _prefetch_hb.join(timeout=10.0)
+        except Exception as e:
+            # Surface but don't fail here: gated/local-only models still load fine through
+            # the normal from_pretrained path the trainer uses next.
+            print("prefetch_model warn:", e)
     secs = round(time.time() - t0, 1)
     _w.heartbeat(
         "model_prefetched",

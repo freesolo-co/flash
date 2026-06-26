@@ -11,13 +11,12 @@ from __future__ import annotations
 
 import os
 import random
-import threading
 import time
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import train_liveness_loop
+from flash.engine.worker.heartbeat import liveness_heartbeat, train_liveness_heartbeat
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     disable_liger_grpo_torch_compile,
@@ -705,23 +704,7 @@ def run_rl():
     # torch memory numbers are meaningless here anyway (the model isn't built yet). If even THIS
     # stops ticking, the main thread is holding the GIL in a C extension (a true wedge) -> that is
     # what the FLASH_STALL_FAULTHANDLER_S watchdog (heartbeat.py) is for.
-    _rl_init_done = threading.Event()
-
-    def _rl_init_heartbeat() -> None:
-        while not _rl_init_done.wait(30.0):
-            # Same guards as prefetch_model: don't emit once init is done. Re-check after wait()
-            # returns (done may be set in the gap) AND after gpu_diagnostics (nvidia-smi can take
-            # seconds) so no stale rl_initializing lands after init completes / a later stage.
-            if _rl_init_done.is_set():
-                return
-            gpu = gpu_diagnostics(include_torch=False)
-            if _rl_init_done.is_set():
-                return
-            _w.heartbeat("rl_initializing", gpu=gpu)
-
-    _rl_init_hb = threading.Thread(target=_rl_init_heartbeat, daemon=True)
-    _rl_init_hb.start()
-    try:
+    with liveness_heartbeat("rl_initializing"):
         trainer = GRPOTrainer(
             model=init_model,
             args=cfg,
@@ -732,8 +715,6 @@ def run_rl():
             callbacks=[hb_cb, _w.make_checkpoint_upload_callback()],
             **extra_trainer_kwargs,
         )
-    finally:
-        _rl_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
     # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
@@ -785,32 +766,14 @@ def run_rl():
     _reset_peak_gpu()  # peak_gpu_gb reflects the train loop (verifies the micro-batch headroom)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. vLLM colocate + bnb pages
     t_train = time.time()
-    # GAP-FILLER liveness heartbeat for the training phase. The per-step rl_step heartbeat only
-    # fires on on_log AFTER a step finishes, so the FIRST step — cold vLLM rollout (cudagraph/
-    # compile warmup) + forward + backward — emits NO heartbeat while it runs. On a consumer GPU that
-    # first step can take 10-17 min (measured: an RTX 4090 0.8B warm-start GRPO had a ~17-min gap
-    # between the last rl_initializing heartbeat and rl_step=1 — the run was alive in the first step's
-    # backward the whole time, but the stale heartbeat made it look hung -> the false escalation; and
-    # with the stall watchdog on, a slow-enough step would self-kill). This daemon emits a liveness
-    # heartbeat whenever the channel has gone quiet (no upload for >=90s), covering the first step and
-    # any unusually slow later step. It no-ops during normal fast stepping (rl_step keeps the channel
-    # fresh within _HB_MIN_INTERVAL_S=60s) so it adds no commit spam. nvidia-smi-only diagnostics: the
-    # trainer thread owns the CUDA/allocator locks during a step, so torch.cuda telemetry would block.
-    # Shared gap-filler (heartbeat.train_liveness_loop): emits rl_step when the channel goes quiet,
-    # but STOPS once a step has made no global_step progress for _TRAIN_LIVENESS_MAX_STEP_S, so a
-    # genuinely stuck train() trips the stall watchdog/provider instead of being masked forever.
-    _train_done = threading.Event()
-    _train_hb = threading.Thread(
-        target=train_liveness_loop,
-        args=(_train_done, lambda: getattr(getattr(trainer, "state", None), "global_step", 0), "rl_step"),
-        daemon=True,
-    )
-    _train_hb.start()
-    try:
-        with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
-            trainer.train(resume_from_checkpoint=resume_ckpt)
-    finally:
-        _train_done.set()
+    # Gap-filler liveness around the train loop: the cold FIRST GRPO step (vLLM rollout warmup +
+    # backward, ~17 min observed on a consumer GPU) emits no rl_step until it completes and would look
+    # like a hang. train_liveness_heartbeat fills the gap, gated on global_step so a genuinely stuck
+    # train() still trips the stall path. See heartbeat.liveness_heartbeat.
+    with train_liveness_heartbeat(
+        "rl_step", lambda: getattr(getattr(trainer, "state", None), "global_step", 0)
+    ), _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+        trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     rl_peak_gpu_gb = _peak_gpu_gb()
     rl_device_peak_gpu_gb = _gpu_sampler.stop_gb()

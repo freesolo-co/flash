@@ -11,13 +11,12 @@ from __future__ import annotations
 import math
 import os
 import random
-import threading
 import time
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import train_liveness_loop
+from flash.engine.worker.heartbeat import liveness_heartbeat, train_liveness_heartbeat
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
     gdn_packing_available,
@@ -486,23 +485,7 @@ def run_sft():
     # serializes on the CUDA driver / allocator locks held by the init thread and can freeze the
     # heartbeat for the whole init -> false hang. The nvidia-smi-only path (out-of-process, 8s
     # timeout, GIL released during the wait) keeps ticking. Mirrors run_rl's rl_initializing fix.
-    _sft_init_done = threading.Event()
-
-    def _sft_init_heartbeat() -> None:
-        while not _sft_init_done.wait(30.0):
-            # Same guards as prefetch_model: don't emit once init is done. Re-check after wait()
-            # returns (done may be set in the gap) AND after gpu_diagnostics (nvidia-smi can take
-            # seconds) so no stale sft_initializing lands after init completes / a later stage.
-            if _sft_init_done.is_set():
-                return
-            gpu = gpu_diagnostics(include_torch=False)
-            if _sft_init_done.is_set():
-                return
-            _w.heartbeat("sft_initializing", gpu=gpu)
-
-    _sft_init_hb = threading.Thread(target=_sft_init_heartbeat, daemon=True)
-    _sft_init_hb.start()
-    try:
+    with liveness_heartbeat("sft_initializing"):
         trainer = _SFT(
             model=model_id,
             args=cfg,
@@ -513,8 +496,6 @@ def run_sft():
             data_collator=_collator,
             callbacks=[_w.make_sft_heartbeat_callback(), _w.make_checkpoint_upload_callback()],
         )
-    finally:
-        _sft_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
     # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
     # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
@@ -524,23 +505,14 @@ def run_sft():
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
     t_train = time.time()
-    # Gap-filler liveness: make_sft_heartbeat_callback only emits on on_log, and this SFT config logs
-    # every N steps, so the first batch of steps (cold first step especially) can outlast the setup
-    # grace with NO sft_step — looking like a hang to the default-on watchdog/provider. Same shared
-    # loop as RL (emits sft_step when the channel is quiet; stops if a step makes no progress for
-    # _TRAIN_LIVENESS_MAX_STEP_S so a genuinely stuck train() still trips the stall path).
-    _train_done = threading.Event()
-    _train_hb = threading.Thread(
-        target=train_liveness_loop,
-        args=(_train_done, lambda: getattr(getattr(trainer, "state", None), "global_step", 0), "sft_step"),
-        daemon=True,
-    )
-    _train_hb.start()
-    try:
-        with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
-            trainer.train(resume_from_checkpoint=resume_ckpt)
-    finally:
-        _train_done.set()
+    # Gap-filler liveness around the train loop: make_sft_heartbeat_callback only emits on on_log
+    # (every N steps), so the cold first steps can outlast the setup grace with no sft_step and look
+    # hung. Same shared helper as RL, gated on global_step so a genuinely stuck train() still trips the
+    # stall path. See heartbeat.liveness_heartbeat.
+    with train_liveness_heartbeat(
+        "sft_step", lambda: getattr(getattr(trainer, "state", None), "global_step", 0)
+    ), _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+        trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     sft_peak_gpu_gb = _peak_gpu_gb()
     sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()

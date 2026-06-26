@@ -375,7 +375,7 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
     assert elapsed < 5.0, f"heartbeat wedged on the held upload lock ({elapsed:.2f}s)"
     assert uploads == [], "the best-effort commit must be skipped while the lock is stuck"
     # The skipped upload must ROLL BACK its optimistic slot claim — otherwise the throttle defers the
-    # next real commit and _train_liveness_heartbeat's quiet_for treats a stale channel as fresh.
+    # next real commit and liveness_heartbeat's quiet_gate treats a stale channel as fresh.
     assert sentinel_last_upload == w._HB_LAST_UPLOAD, (
         f"a skipped commit must not advance _HB_LAST_UPLOAD (got {w._HB_LAST_UPLOAD})"
     )
