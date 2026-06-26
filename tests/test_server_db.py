@@ -216,6 +216,7 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
 
     import flash.providers as providers_mod
+    import flash.providers.runpod.train.endpoints as rp_endpoints
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
@@ -224,6 +225,11 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     # list calls at startup. This test only checks /v1/me, so stub the provider set to empty to keep it
     # hermetic. (Pre-PR this fixture set only RUNPOD_API_KEY, whose sweep is a no-op.)
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    # FREESOLO_INTERNAL_KEY also enables startup slot-store reconcile (urllib POST). No-op it so this
+    # fixture's urlopen stub stays focused on /api/auth/verify.
+    monkeypatch.setattr(
+        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
+    )
     with TestClient(app_mod.create_app()) as client:
         res = client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
 
