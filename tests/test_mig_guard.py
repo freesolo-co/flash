@@ -171,7 +171,7 @@ def test_verify_gpu_noop_when_unset():
 
 
 def test_verify_gpu_raises_retriable_on_mismatch(monkeypatch):
-    import torch
+    torch = pytest.importorskip("torch")  # offline CI has no torch -> skip the live-read tests
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0), raising=False)
     monkeypatch.setattr(
@@ -190,7 +190,7 @@ def test_verify_gpu_raises_retriable_on_mismatch(monkeypatch):
 
 
 def test_verify_gpu_passes_on_correct_gpu(monkeypatch):
-    import torch
+    torch = pytest.importorskip("torch")  # offline CI has no torch -> skip the live-read tests
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 9), raising=False)
     monkeypatch.setattr(
@@ -207,7 +207,7 @@ def test_wait_for_gpu_propagates_verify_mismatch(monkeypatch):
     # A verify mismatch must FAIL OVER, not be swallowed by the readiness retry loop and masked as
     # "never became ready". Drive past MIG + the CUDA-live probe, then have verify_gpu reject.
     monkeypatch.setattr("subprocess.run", _fake_run({"-L": _FULL_A100, "mig.mode": "Disabled"}))
-    import torch
+    torch = pytest.importorskip("torch")  # offline CI has no torch -> skip the live-read tests
 
     class _Live:  # the result of torch.zeros(...) must support `+ 1`
         def __add__(self, other):
