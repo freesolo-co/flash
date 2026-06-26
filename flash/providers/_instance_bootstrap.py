@@ -336,24 +336,25 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
 
 
 def run_preload(payload: dict) -> dict:
-    """Download-only warm: pull the requested models into the bind-mounted cache (HF_HOME) and exit.
+    """Download-only warm: pull the requested models into the bind-mounted cache and exit.
 
     The instance-provider mirror of runpod/train/endpoints._train_body's ``preload`` branch. NO
     training, NO env code, NO worker subprocess — just ``snapshot_download`` straight into the cache so
-    the very first real run in this region is warm. HF_HOME (from the payload env) is rooted at the
-    per-region bind-mounted cache mount; we pass ``cache_dir`` EXPLICITLY (huggingface_hub freezes
-    HF_HUB_CACHE at import, so setting the env var here would be too late) and FAIL if the cache isn't
-    mounted (otherwise we'd warm ephemeral local disk that vanishes with the box).
+    the very first real run in this region is warm. ``FLASH_WEIGHT_CACHE_DIR`` (from the payload env)
+    is the HF hub dir under the per-region bind-mounted cache mount; we pass it as ``cache_dir``
+    EXPLICITLY (and FAIL if the cache isn't mounted — otherwise we'd warm ephemeral local disk that
+    vanishes with the box). Same var the training path uses (the base-model prefetch), so a warmed
+    snapshot is exactly what a later run resolves.
     """
     env = payload.get("env") or {}
-    hf_home = env.get("HF_HOME") or ""
+    cache_dir = env.get("FLASH_WEIGHT_CACHE_DIR") or ""
     token = env.get("HF_TOKEN")
-    # The cache bind-mount must be present; HF_HOME is <mount>/hf-cache, so its parent is the mount.
+    # cache_dir is <mount>/hf-cache/hub, so the mount is two levels up; the bind-mount must be present.
     # Checked BEFORE importing huggingface_hub so a missing mount fails fast (and stays testable).
-    mount = os.path.dirname(hf_home.rstrip("/")) if hf_home else ""
-    if not hf_home or not mount or not os.path.isdir(mount):
+    mount = os.path.dirname(os.path.dirname(cache_dir.rstrip("/"))) if cache_dir else ""
+    if not cache_dir or not mount or not os.path.isdir(mount):
         return {"preloaded": [], "already_cached": [], "failed": {},
-                "error": f"weight-cache not mounted (HF_HOME={hf_home!r}); refusing to warm ephemeral disk"}
+                "error": f"weight-cache not mounted (FLASH_WEIGHT_CACHE_DIR={cache_dir!r}); refusing to warm ephemeral disk"}
     # Require the mount sentinel for BOTH substrates. The cloud-init preamble drops it ONLY onto a
     # verified-real mount: block-volume (Hyperstack) writes it after the device mounts; NFS (Lambda)
     # writes it after confirming ``mountpoint`` (the platform auto-mount actually took). It is therefore
@@ -373,7 +374,7 @@ def run_preload(payload: dict) -> dict:
                               "refusing to warm ephemeral disk")}
     from huggingface_hub import snapshot_download
 
-    cache_dir = os.path.join(hf_home, "hub")
+    # cache_dir (= FLASH_WEIGHT_CACHE_DIR) is already the HF hub dir under the mount; download straight in.
     # weights + tokenizer/config only (same exclusions as prefetch_model / the image bake / the RunPod
     # preload branch) so the warmed cache matches exactly what workers later fetch.
     ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]

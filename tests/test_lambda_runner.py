@@ -321,12 +321,14 @@ def test_cache_bind_uses_returned_mount_point(monkeypatch):
     assert "/lambda/nfs/flash-weights" not in calls[0]["user_data"]
 
 
-def test_cache_payload_points_hf_home_at_the_bind(monkeypatch):
-    """The base64 payload's worker env redirects HF_HOME onto the bind (so the model download persists)."""
+def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
+    """The base64 payload points the base-model prefetch (FLASH_WEIGHT_CACHE_DIR) at the bind so the
+    model download persists — NOT a process-global HF_HOME, so env/reward downloads stay ephemeral (#252)."""
     from flash.providers.lambdalabs.jobs import build_payload
 
     payload = build_payload(_spec(network_volume="flash-weights"), 0, 0, cache_host_mount="/lambda/nfs/flash-weights")
-    assert payload["env"]["HF_HOME"] == "/weight-cache/hf-cache"
+    assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
+    assert "HF_HOME" not in payload["env"]
     assert payload["cache_host_mount"] == "/lambda/nfs/flash-weights"
     assert "cache_block_device" not in payload  # NFS: no format/mount preamble
 
