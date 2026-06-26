@@ -66,16 +66,15 @@ _FLAVORS_TTL_S = 45.0
 _flavors_cache: dict[str, Any] = {"ts": 0.0, "by_region": None}
 
 
-# Regions statically excluded from allocation + launch. EMPTY by default: a region that goes bad is
-# now learned at runtime and demoted by the dynamic per-region quarantine (flash.providers._health,
-# host_fault -> mark_region_sick), so a one-off regional/driver outage self-heals on its TTL instead
-# of needing a hand-edited denylist. CANADA-1 USED to be hard-banned here for a known-broken-driver
-# L40 fleet (instances reached ACTIVE then died with an NVML init failure / cuda unavailable); a live
-# re-probe on 2026-06-26 confirmed that fleet recovered (L40, driver 570.195.03, nvidia-smi clean), so
-# the static ban is lifted and the dynamic quarantine governs CANADA-1 like every other region.
-# Override with HYPERSTACK_BLOCKED_REGIONS (comma-separated) to hard-block a region the moment its
-# driver/capacity health regresses again, without a code change: unset -> the default below (none);
-# set (even to "") -> exactly that list.
+# Regions statically excluded from allocation + launch. EMPTY by default: a one-off regional/driver
+# outage is handled by fast-failover (a stuck instance trips FIRST_LIVENESS_S -> stalled -> the
+# cross-provider GPU walk moves on) rather than a hand-edited denylist. CANADA-1 USED to be hard-banned
+# here for a known-broken-driver L40 fleet (instances reached ACTIVE then died with an NVML init
+# failure / cuda unavailable); a live re-probe on 2026-06-26 confirmed that fleet recovered (L40,
+# driver 570.195.03, nvidia-smi clean), so the static ban is lifted. Override with
+# HYPERSTACK_BLOCKED_REGIONS (comma-separated) to hard-block a region the moment its driver/capacity
+# health regresses again, without a code change: unset -> the default below (none); set (even to "")
+# -> exactly that list.
 _DEFAULT_BLOCKED_REGIONS: frozenset[str] = frozenset()
 
 

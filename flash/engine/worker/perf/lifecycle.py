@@ -156,6 +156,10 @@ def verify_gpu(requested_gpu: str | None) -> None:
     with contextlib.suppress(Exception):
         live_cap = torch.cuda.get_device_capability(0)
     with contextlib.suppress(Exception):
+        # Decimal GB (/1e9), NOT binary GiB: the catalog `vram_gb` and all of flash.engine.vram
+        # (estimate_vram_gb, grpo_fits_resident) are decimal, so the `info.vram_gb * 0.9` comparison
+        # in _gpu_mismatch_reason must read live VRAM the same way. (The classes — 40/48/80 GB — are
+        # far enough apart that the unit doesn't flip any real check; this keeps the convention.)
         live_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     reason = _gpu_mismatch_reason(requested_gpu, live_cap, live_vram_gb, _host_driver_cuda())
     if reason:
