@@ -234,10 +234,15 @@ def prefetch_model(model_id: str) -> float:
                 return
             # Gate liveness on REAL download progress: a synthetic model_prefetching re-arms the
             # watchdog and refreshes the provider timestamp, so emitting while snapshot_download is
-            # WEDGED (no bytes) would mask a stuck transfer until the outer job timeout. Track cache
-            # bytes; a measurement failure (-1) fails SAFE (treated as progress, never false-stops).
+            # WEDGED (no bytes) would mask a stuck transfer until the outer job timeout. Reset the
+            # silence timer ONLY on measured byte GROWTH (cur >= 0 and rising). A measurement failure
+            # (-1 — repo cache dir not created yet, i.e. the pre-structure Hub-metadata phase, or a
+            # transient scan error) does NOT reset it: otherwise a download wedged before it ever
+            # writes a blob would emit forever. So the unmeasurable window is itself bounded — the
+            # timer runs from loop start, giving the pre-structure phase the same _MAX_PREFETCH_
+            # SILENCE_S grace before yielding to the stall path.
             cur = _hf_cache_bytes(model_id)
-            if cur < 0 or cur > last_bytes:
+            if cur >= 0 and cur > last_bytes:
                 last_bytes = cur
                 progress_since = time.time()
             if (time.time() - progress_since) > _MAX_PREFETCH_SILENCE_S:

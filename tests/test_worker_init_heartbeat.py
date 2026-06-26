@@ -291,6 +291,14 @@ def test_prefetch_heartbeat_gates_on_download_progress():
         "prefetch liveness must STOP after _MAX_PREFETCH_SILENCE_S of no byte progress so a wedged "
         "download trips the stall path instead of being masked to the job timeout"
     )
+    # The silence timer must reset ONLY on measured byte GROWTH, never on an unmeasurable -1: else a
+    # download wedged before it ever creates the cache dir (pre-structure Hub-metadata phase) would
+    # reset the timer every tick and emit forever. So the unmeasurable window is itself bounded.
+    src = inspect.getsource(hf.prefetch_model)
+    assert "cur >= 0 and cur > last_bytes" in src, (
+        "prefetch silence must reset only on measured growth (cur >= 0 and cur > last_bytes)"
+    )
+    assert "cur < 0" not in src, "an unmeasurable -1 must NOT reset the prefetch silence timer"
 
 
 # --------------------------------------------------------------------------------------------
