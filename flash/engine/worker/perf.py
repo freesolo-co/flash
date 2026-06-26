@@ -819,10 +819,8 @@ def detect_mig_slice() -> str | None:
 
 
 def _sm_major(sm: str | None) -> int | None:
-    """Major compute-capability from a class ``sm`` token ('sm89' -> 8, 'sm120' -> 12), or None.
-
-    The encoding is compute-capability digits with a single minor digit: 'sm80'->8.0, 'sm89'->8.9,
-    'sm90'->9.0, 'sm120'->12.0 — so major = all-but-last-digit."""
+    """Major compute-capability from a class ``sm`` token ('sm89'->8, 'sm120'->12), or None.
+    (sm digits = compute capability with a single minor digit, so major = all-but-last-digit.)"""
     import re
 
     m = re.fullmatch(r"sm(\d+)", (sm or "").strip().lower())
@@ -833,9 +831,8 @@ def _sm_major(sm: str | None) -> int | None:
 
 
 def _host_driver_cuda() -> float | None:
-    """The HOST DRIVER's max supported CUDA (e.g. 12.8) — the PTX-JIT ceiling, NOT ``torch.version.cuda``
-    (the wheel's BUILD CUDA). pynvml first, ``nvidia-smi`` header fallback, None if neither works (the
-    driver-floor check is then skipped — best-effort, never a false fail)."""
+    """Host driver's max supported CUDA — the PTX-JIT ceiling, NOT ``torch.version.cuda`` (build CUDA).
+    pynvml then ``nvidia-smi`` header; None if neither works (driver-floor check skipped, best-effort)."""
     try:
         import pynvml
 
