@@ -264,15 +264,14 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # ``_assign_weight_cache_volume`` attaches the cache only for ``model_policy == "catalog"`` runs
 # (always public; resolve_model validates catalog membership) and leaves open-model ("allow") runs
 # cache-less, so a spec that NAMES a private/gated model never persists it onto the shared mount.
-# CONFIDENTIALITY CAVEAT (not fully closed): the redirect is process-global (``weight_cache_env`` sets
-# ``HF_HOME`` onto the mount), so it scopes the SPEC model but NOT additional HF repos the run's
-# environment/reward code may fetch at execution time with the forwarded platform HF_TOKEN — those
-# would also land on the shared mount and be readable by a later tenant in the region. The residual is
-# bounded by (a) the catalog gate on the base model, (b) the scope of the platform HF_TOKEN, and (c)
-# flash environments being published/reviewed Hub/GitHub artifacts (not anonymous code) — but it is a
-# real limitation. The proper hardening (scope the mount to the trusted base-model prefetch via an
-# explicit ``cache_dir`` while env/reward code uses an ephemeral HF cache, or a READ-ONLY mount
-# populated only by preload) is worker-side and tracked as a follow-up.
+# CONFIDENTIALITY (issue #252, closed): the redirect is BASE-MODEL-SCOPED, not a process-global
+# HF_HOME. ``weight_cache_env`` exports ``FLASH_WEIGHT_CACHE_DIR`` (not HF_HOME), and the worker
+# (engine.worker.hf.prefetch_model) downloads ONLY the trusted public base model onto the shared mount
+# via an explicit ``cache_dir`` and symlinks it into the per-worker EPHEMERAL cache for the trainer/
+# vLLM. Every OTHER HF repo the run's environment/reward code fetches at execution time with the
+# forwarded platform HF_TOKEN lands in that ephemeral cache, NOT the shared multi-tenant mount, so it
+# is not readable by a later tenant in the region. (The catalog gate below still confines the cache to
+# PUBLIC base models, so even the one repo written to the mount is never private/gated.)
 # A second residual is INTEGRITY: the mount is read-WRITE on every run and a run executes
 # its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a cached
 # public model's content-addressed blobs and poison a later run loading that same model in the region.
@@ -293,11 +292,12 @@ def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
     Platform-managed (never user config), exactly like the managed HF repo: assigned here, not
     surfaced in the config schema. The provider builds the per-region volume fleet + the cross-DC
     endpoint at deploy time (jobs.weight_cache_endpoint_kwargs) off this name, and the worker env
-    redirects HF_HOME onto the mount whenever the volume is attached.
+    points the base-model prefetch (FLASH_WEIGHT_CACHE_DIR) at the mount whenever the volume is attached.
 
-    CONFIDENTIALITY GATE: the cache is SHARED cross-tenant, and attaching it redirects HF_HOME onto
-    the shared mount, so a model's downloaded weights persist there for every later run in the region.
-    That is only safe for PUBLIC weights. Managed config runs are always catalog-only (the schema
+    CONFIDENTIALITY GATE: the cache is SHARED cross-tenant, and attaching it persists the run's
+    base-model weights onto the shared mount for every later run in the region (env/reward downloads
+    stay off the mount — see the module TRUST MODEL note / issue #252). That is only safe for PUBLIC
+    weights. Managed config runs are always catalog-only (the schema
     hardcodes model_policy="catalog"), and ``submit_job`` runs ``resolve_model`` BEFORE this — so a
     ``catalog``-policy spec is already guaranteed to be a curated PUBLIC catalog model (resolve_model
     raises otherwise). The ONLY way to reach a non-catalog, possibly PRIVATE/GATED HF repo is

@@ -20,7 +20,9 @@ from flash.spec import JobSpec
 # Floor on the GPU-walk budget for INFRA-shaped failures (broken/busy GPU, stall, preemption,
 # no-capacity) when the user left retries enabled. A broken/busy rented GPU (NVML-init fail /
 # cudaErrorDevicesUnavailable) is pure infra bad-luck and cheap to walk past, so a healthy host
-# should be found rather than a streak of bad ones killing the run on the default ``max_retries`` (2).
+# should be found rather than a streak of bad ones killing the run. Matches the default
+# ``max_retries`` (5, see spec.GpuSpec); the floor still lifts an explicitly-LOWERED budget (e.g.
+# ``max_retries=1``) so infra bad-luck never kills a run that left retries enabled.
 # Genuine training errors are NON-infra and still fail fast (no retry). An explicit ``max_retries==0``
 # (single-shot, no retries) is respected — the floor only applies when retries are enabled.
 INFRA_RETRY_FLOOR = 5

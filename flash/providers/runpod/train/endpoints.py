@@ -336,8 +336,8 @@ def _train_body(input_data: dict) -> dict:
     env = dict(os.environ)
     env.update(overrides)
     # If the weight-cache volume isn't actually mounted (cold/no-volume run, or the attach degraded
-    # to {}), don't leave HF_HOME pointing at a missing /runpod-volume path — fall back to the
-    # default ephemeral cache. INLINED (not a flash import): this handler is extracted standalone
+    # to {}), don't leave FLASH_WEIGHT_CACHE_DIR pointing at a missing /runpod-volume path — fall back
+    # to the default ephemeral cache. INLINED (not a flash import): this handler is extracted standalone
     # into the baked image's rp_handler (docker/make_rp_handler.py), where flash is NOT importable,
     # so it must stay self-contained. Mirrors deps.drop_unmounted_cache_env (unit-tested there).
     if not os.path.isdir("/runpod-volume"):
