@@ -224,6 +224,17 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
+    # The Lambda/Hyperstack keys above (required by the startup preflight) make configured_providers()
+    # treat both as live, so startup recover_runs() would dispatch real sweep_orphans() list calls.
+    # And the dummy FREESOLO_INTERNAL_KEY enables the best-effort backend reporting path: every
+    # /v1/runs submit -> _report_status() -> run_registry._post() would urllib-POST the real backend
+    # (or wait out its 10s timeout). These billing tests assert on the API response, not on reporting,
+    # so stub both to keep startup + submit hermetic (CPU-only, no network).
+    import flash.providers as providers_mod
+    import flash.server.run_registry as run_registry
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)

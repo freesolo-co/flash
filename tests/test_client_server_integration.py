@@ -111,6 +111,13 @@ def make_client(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
+    # The Lambda/Hyperstack keys above (required by the startup preflight) also make
+    # configured_providers() treat both as live, so create_app()'s lifespan recover_runs() would
+    # dispatch real sweep_orphans() list calls — and the urllib->TestClient shim below isn't installed
+    # until AFTER create_app() runs. Stub the provider set to empty so startup stays hermetic.
+    import flash.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
