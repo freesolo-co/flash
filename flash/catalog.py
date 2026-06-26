@@ -177,9 +177,12 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.6-35B-A3B",
         display_name="Qwen3.6 35B-A3B (MoE)",
         params="35B total / ~3B active (MoE)",
-        # TOTAL parameters (billions). For an MoE checkpoint the size term is the TOTAL count, not the
-        # ~3B active: download/VRAM/disk size the FULL checkpoint that lands on the GPU (all experts
-        # are materialized). Matches the dense siblings' convention (params "4.7B" -> params_b=4.7).
+        # TOTAL parameters (billions) the SFT VRAM equation + cost projection read. For an MoE
+        # checkpoint the size term is the TOTAL count, not the ~3B active: download/VRAM/disk size the
+        # FULL checkpoint that lands on the GPU (all experts are materialized). 35.0 is the CALIBRATED
+        # total: the live-validated single-B200 SFT fit depends on it — the honest-peak equation lands
+        # at the 180 GB B200's usable budget, and the marketing "~35.95B" figure tips it over (186 GB,
+        # see test_sft_equation_covers_honest_peak_across_seq_boundary). Keep 35.0.
         params_b=35.0,
         vocab_size=248_320,
         algos=("sft",),
