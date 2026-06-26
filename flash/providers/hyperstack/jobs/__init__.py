@@ -576,7 +576,6 @@ def submit_run_hyperstack(
     on_handle=None,
     attempt: int = 0,
     runtime_secrets: dict | None = None,
-    on_last_gpu: bool = False,
 ) -> PollResult:
     """Hyperstack equivalent of ``runpod.jobs.submit_run``: launch, persist, poll, delete.
 
@@ -596,13 +595,10 @@ def submit_run_hyperstack(
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
-        last_gpu_mult = 1.5 if on_last_gpu else 1.0
-        setup_grace = SETUP_GRACE_S * last_gpu_mult
-        first_liveness = FIRST_LIVENESS_S * last_gpu_mult
+        # Uniform per-GPU wait: poll_hs_job uses its default FIRST_LIVENESS_S / SETUP_GRACE_S.
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
         return poll_hs_job(
-            handle, spec, seed, log=log, heartbeat_reader=reader,
-            setup_grace_s=setup_grace, first_liveness_s=first_liveness, deadline_s=deadline,
+            handle, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline,
         )
     finally:
         hs_api.delete_vm(handle.vm_id)

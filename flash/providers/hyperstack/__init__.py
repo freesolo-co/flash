@@ -55,13 +55,13 @@ class HyperstackProvider:
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
     ) -> PollResult:
-        # ``on_last_gpu`` stretches the setup/no-capacity grace when no further GPU attempt will be
-        # made after this one — either the candidate list is exhausted or the retry budget is exhausted.
+        # ``on_last_gpu`` is accepted for the shared Provider interface (RunPod stretches its grace on
+        # the last GPU); the instance providers use a UNIFORM per-GPU wait, so it is intentionally unused.
         from flash.providers.hyperstack.jobs import submit_run_hyperstack
 
         return submit_run_hyperstack(
             spec, seed, log=log, on_handle=on_handle, attempt=attempt,
-            runtime_secrets=runtime_secrets, on_last_gpu=on_last_gpu,
+            runtime_secrets=runtime_secrets,
         )
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
@@ -69,9 +69,7 @@ class HyperstackProvider:
 
         from flash.providers.hyperstack import api as hs_api
         from flash.providers.hyperstack.jobs import (
-            FIRST_LIVENESS_S,
             PROVISION_GRACE_S,
-            SETUP_GRACE_S,
             HyperstackJobHandle,
             poll_hs_job,
         )
@@ -89,13 +87,9 @@ class HyperstackProvider:
         # pre-subtracting elapsed too would double-count and delete a still-valid VM the moment a
         # recovered run is past half its window.
         deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S)
-        # Reproduce the submit path's last-GPU stall tuning on recovery: the runner persists
-        # ``on_last_gpu`` in the handle/status (lifecycle on_handle), so a reattach must apply the SAME
-        # 1.5x first-liveness / setup grace rather than reverting to the un-scaled default. Otherwise a
-        # control-plane restart on the LAST candidate could fail an in-flight, still-cold-starting VM
-        # early — terminal there, since there's no GPU left to walk to. Mirrors RunPodProvider.
-        last_gpu_mult = 1.5 if bool(handle.to_dict().get("on_last_gpu", False)) else 1.0
         try:
+            # Uniform per-GPU wait: poll_hs_job uses its default FIRST_LIVENESS_S / SETUP_GRACE_S
+            # (no last-GPU scaling), matching the submit path.
             return poll_hs_job(
                 hh,
                 spec,
@@ -103,8 +97,6 @@ class HyperstackProvider:
                 log=log,
                 heartbeat_reader=reader,
                 deadline_s=deadline,
-                first_liveness_s=FIRST_LIVENESS_S * last_gpu_mult,
-                setup_grace_s=SETUP_GRACE_S * last_gpu_mult,
             )
         finally:
             # Recovery has no submit_run_hyperstack teardown ``finally``; delete the reattached VM

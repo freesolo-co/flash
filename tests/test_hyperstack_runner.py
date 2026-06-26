@@ -682,14 +682,12 @@ def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
     assert captured["deadline_s"] == max(60.0, 3600 + PROVISION_GRACE_S)
 
 
-def test_provider_poll_reuses_on_last_gpu_first_liveness_scaling(monkeypatch):
-    """On recovery the reattach must reproduce the SUBMIT path's last-GPU stall tuning: a handle with
-    persisted on_last_gpu=True (written by the runner's on_handle) gets the 1.5x-scaled first_liveness /
-    setup grace, else a control-plane restart on the LAST candidate would delete an in-flight,
-    cold-starting VM early — terminal there, with no GPU left to walk to. Mirrors RunPodProvider."""
+def test_provider_poll_uses_uniform_wait_ignoring_on_last_gpu(monkeypatch):
+    """The instance recovery poll uses a UNIFORM per-GPU wait: a persisted on_last_gpu does NOT scale
+    first_liveness / setup grace — the poll relies on its unscaled defaults, matching the submit path.
+    (on_last_gpu stays a Provider-interface param for RunPod; the instance providers ignore it.)"""
     from flash.providers.base import JobHandle, PollResult
     from flash.providers.hyperstack import HyperstackProvider
-    from flash.providers.hyperstack.jobs import FIRST_LIVENESS_S, SETUP_GRACE_S
 
     captured = {}
 
@@ -704,13 +702,13 @@ def test_provider_poll_reuses_on_last_gpu_first_liveness_scaling(monkeypatch):
     spec = _spec()
     handle = JobHandle.from_dict({**_handle().to_dict(), "provider": "hyperstack", "on_last_gpu": True})
     HyperstackProvider().poll(handle, spec, seed=0)
-    assert captured["first_liveness_s"] == FIRST_LIVENESS_S * 1.5
-    assert captured["setup_grace_s"] == SETUP_GRACE_S * 1.5
+    assert captured["first_liveness_s"] is None  # not overridden -> poll uses its uniform default
+    assert captured["setup_grace_s"] is None
     captured.clear()
     handle2 = JobHandle.from_dict({**_handle().to_dict(), "provider": "hyperstack"})
     HyperstackProvider().poll(handle2, spec, seed=0)
-    assert captured["first_liveness_s"] == FIRST_LIVENESS_S
-    assert captured["setup_grace_s"] == SETUP_GRACE_S
+    assert captured["first_liveness_s"] is None
+    assert captured["setup_grace_s"] is None
 
 
 def test_poll_surfaces_worker_progress(monkeypatch):
