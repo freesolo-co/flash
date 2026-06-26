@@ -257,6 +257,30 @@ def test_liveness_heartbeat_survives_raising_fields_callback(monkeypatch):
 
 
 # --------------------------------------------------------------------------------------------
+# _hf_cache_bytes feeds the prefetch progress gate: bytes downloaded, or None when the cache dir
+# doesn't exist yet (unmeasurable). liveness_heartbeat treats None as "no advancement", so the
+# unmeasurable pre-structure window is itself bounded by max_silence_s.
+def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, monkeypatch):
+    import huggingface_hub.constants as hconst
+
+    from flash.engine.worker import hf
+
+    monkeypatch.setattr(hconst, "HF_HUB_CACHE", str(tmp_path))
+    # No repo cache dir yet -> None (can't measure) -> never counts as progress (bounded by silence).
+    assert hf._hf_cache_bytes("org/model") is None
+    repo = tmp_path / "models--org--model"
+    repo.mkdir(parents=True)
+    # Repo dir exists but blobs/ not written yet -> 0 (a real "0 bytes" measurement), NOT None: a
+    # download wedged before writing any blob must still let the silence timer trip.
+    assert hf._hf_cache_bytes("org/model") == 0
+    blobs = repo / "blobs"
+    blobs.mkdir()
+    (blobs / "complete").write_bytes(b"x" * 100)
+    (blobs / "partial.incomplete").write_bytes(b"y" * 50)  # an in-flight download's growing partial
+    assert hf._hf_cache_bytes("org/model") == 150
+
+
+# --------------------------------------------------------------------------------------------
 # Wiring: every long blocking phase must run under the shared liveness_heartbeat helper with the
 # right stage / progress gate. (Behaviour is covered above; these pin the call sites so the coverage
 # can't silently regress.)
@@ -289,12 +313,19 @@ def test_train_phase_wraps_train_in_train_liveness_heartbeat(modname, outer, sta
     assert f'"{stage}"' in src, f"{outer} must pass stage {stage!r}"
 
 
-def test_prefetch_wraps_download_in_liveness_heartbeat():
+def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
     from flash.engine.worker import hf
 
     src = inspect.getsource(hf.prefetch_model)
     assert "liveness_heartbeat(" in src
     assert '"model_prefetching"' in src
+    # The ping MUST be gated on downloaded-byte growth + a silence bound. Without these a NON-raising
+    # wedge (stuck cache filelock / NFS I/O stall on the shared mount / endless retry) never returns
+    # from snapshot_download, so the ping would re-arm the watchdog AND — model_prefetching is a setup
+    # stage — the provider setup-grace forever, masking the stall until the wall-clock timeout.
+    assert "progress=" in src, "prefetch ping must gate on a progress counter"
+    assert "_hf_cache_bytes(" in src, "prefetch ping must gate on downloaded-byte growth"
+    assert "max_silence_s=" in src, "prefetch ping must stop after a wedge silence bound"
 
 
 # --------------------------------------------------------------------------------------------
