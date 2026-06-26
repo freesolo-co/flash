@@ -52,6 +52,13 @@ _HB_LOCK = threading.Lock()
 # threads can upload heartbeat.json concurrently: a slower upload could land AFTER a newer
 # one on HF (reorder), so this lock makes uploads strictly ordered.
 _HB_UPLOAD_LOCK = threading.Lock()
+# But acquire it with a BOUND: huggingface_hub's upload has no hard per-call timeout, so a wedged
+# upload could hold the lock indefinitely and block the NEXT heartbeat — including an unthrottled
+# milestone like model_prefetched that sits on the worker's critical path right before trainer
+# construction. Past this bound we skip the (best-effort) commit rather than wedge; the local write
+# already landed and the next heartbeat re-commits a fresher snapshot. Generous so a healthy-but-slow
+# upload is never skipped — only a genuinely stuck one trips it.
+_HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
@@ -160,23 +167,33 @@ def heartbeat(stage: str, **kw):
             upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= _w._HB_MIN_INTERVAL_S
         if upload_due:
             _w._HB_LAST_UPLOAD = now  # claim the slot under the lock (throttle stays atomic)
-    if upload_due:
-        # Serialize the network commit under a SEPARATE lock so uploads can't reorder, and
-        # upload the captured snapshot (via a private temp file, since hf_upload_file takes
-        # a path) rather than re-reading p — which a newer heartbeat may already have
-        # overwritten between our slot-claim and this upload.
-        with _HB_UPLOAD_LOCK:
-            up = p + f".{os.getpid()}.{threading.get_ident()}.upload.tmp"
-            with open(up, "w") as f:
-                f.write(snapshot)
-            try:
-                _w.hf_upload_file(up, "heartbeat.json")
-            finally:
-                with contextlib.suppress(OSError):
-                    os.remove(up)
-    # Re-arm the stall watchdog: progress landed, so reset the no-heartbeat timer. Pass the stage so
-    # it keeps the wide setup grace until the first rl_step/sft_step, then tightens for training.
+    # Re-arm the stall watchdog NOW, off the LOCAL write that just landed — the live-progress signal
+    # is the local heartbeat, NOT the optional HF commit below. Re-arming after the upload (as before)
+    # let a stalled best-effort upload run out the timer and faulthandler-kill a worker that had
+    # already produced a live heartbeat. Pass the stage so the watchdog keeps the wide setup grace
+    # until the first rl_step/sft_step, then tightens for training.
     _rearm_stall_faulthandler(stage)
+    if upload_due:
+        # Serialize the network commit under a SEPARATE lock so uploads can't reorder, and upload the
+        # captured snapshot (via a private temp file, since hf_upload_file takes a path) rather than
+        # re-reading p — which a newer heartbeat may already have overwritten between our slot-claim
+        # and this upload. Acquire the lock with a BOUND (see _HB_UPLOAD_LOCK_TIMEOUT_S) so a wedged
+        # upload holding the lock can't block this heartbeat indefinitely; on timeout skip the
+        # best-effort commit (local write already landed; next heartbeat re-commits fresher state).
+        if _HB_UPLOAD_LOCK.acquire(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S):
+            try:
+                up = p + f".{os.getpid()}.{threading.get_ident()}.upload.tmp"
+                with open(up, "w") as f:
+                    f.write(snapshot)
+                try:
+                    _w.hf_upload_file(up, "heartbeat.json")
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.remove(up)
+            finally:
+                _HB_UPLOAD_LOCK.release()
+        else:
+            print(f"HEARTBEAT upload-lock busy >{_HB_UPLOAD_LOCK_TIMEOUT_S}s; skipping commit for {stage}")
     print("HEARTBEAT", json.dumps(payload))
 
 

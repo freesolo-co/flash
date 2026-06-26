@@ -190,11 +190,17 @@ def prefetch_model(model_id: str) -> float:
                 return
             # nvidia-smi-only (include_torch=False): the GPU isn't in use yet and torch telemetry
             # could block; this just needs to prove the worker is alive and re-arm the watchdog.
+            gpu = gpu_diagnostics(include_torch=False)
+            # gpu_diagnostics shells out to nvidia-smi (up to several seconds on its subprocess
+            # timeout); the download can finish DURING it. Re-check before emitting so a stale
+            # model_prefetching can't be produced after the terminal model_prefetched.
+            if _prefetch_done.is_set():
+                return
             _w.heartbeat(
                 "model_prefetching",
                 model=model_id,
                 elapsed_seconds=round(time.time() - t0, 1),
-                gpu=gpu_diagnostics(include_torch=False),
+                gpu=gpu,
             )
 
     _prefetch_hb = threading.Thread(target=_prefetch_heartbeat, daemon=True)

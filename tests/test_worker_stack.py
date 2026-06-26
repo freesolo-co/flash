@@ -309,6 +309,72 @@ def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     assert lock_free_during_upload == [True], "hf_upload_file must run with _HB_LOCK released"
 
 
+def test_heartbeat_rearms_watchdog_before_optional_upload(monkeypatch):
+    """The stall watchdog must re-arm off the LOCAL write, BEFORE the best-effort HF upload. If it
+    re-armed only after the upload, a stalled best-effort upload would run out the timer and
+    faulthandler-kill a worker that had already produced a live local heartbeat."""
+    import importlib
+
+    # NB: ``import flash.engine.worker.heartbeat`` binds the re-exported heartbeat() FUNCTION, not
+    # the submodule — resolve the module path explicitly.
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    if hbmod._STALL_FAULTHANDLER_S <= 0:
+        pytest.skip("stall watchdog disabled in this env")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    order = []
+    monkeypatch.setattr(
+        hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: order.append("rearm")
+    )
+    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: order.append("upload"))
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+
+    w.heartbeat("rl_initializing")
+    assert order == ["rearm", "upload"], f"watchdog must re-arm before the upload, got {order}"
+
+
+def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
+    """A wedged upload holding _HB_UPLOAD_LOCK must not block the NEXT heartbeat. A milestone like
+    model_prefetched (unthrottled, on the worker's critical path right before trainer construction)
+    must skip its best-effort commit after a bounded wait rather than wedge the worker."""
+    import importlib
+    import time as _time
+
+    # NB: resolve the submodule explicitly (the package re-exports the heartbeat() function).
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: None)
+    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
+    uploads = []
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: uploads.append(a))
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+
+    assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
+    try:
+        t0 = _time.monotonic()
+        w.heartbeat("model_prefetched")  # must NOT block on the held lock
+        elapsed = _time.monotonic() - t0
+    finally:
+        hbmod._HB_UPLOAD_LOCK.release()
+
+    assert elapsed < 5.0, f"heartbeat wedged on the held upload lock ({elapsed:.2f}s)"
+    assert uploads == [], "the best-effort commit must be skipped while the lock is stuck"
+
+
 def test_heartbeat_terminal_only_mode(monkeypatch):
     """TERMINAL_ONLY mode throttles every non-terminal stage (not just rl_step) so a fan-out of
     runs sharing one HF_REPO stays under the 128-commits/hour cap; terminal done/error_* still
