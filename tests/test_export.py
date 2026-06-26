@@ -267,3 +267,27 @@ def test_resolve_hf_token_priority_explicit_then_env_then_dotenv(tmp_path, monke
 
     # An explicit value (the --api-key flag) wins over everything.
     assert resolve_hf_token("hf_explicit") == "hf_explicit"
+
+
+def test_hf_api_missing_extra_raises_runtime_error_not_serving_error(monkeypatch):
+    # A missing huggingface_hub extra is an internal misconfiguration (-> 500), NOT an upstream
+    # gateway/transport failure (ServingError -> 502). _hf_api must raise a plain RuntimeError so the
+    # route lets it surface as a 500 rather than a misleading 502.
+    import builtins
+
+    from flash.serve import export
+    from flash.serve.deploy import ServingError
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "huggingface_hub":
+            raise ModuleNotFoundError("No module named 'huggingface_hub'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(RuntimeError) as ei:
+        export._hf_api()
+    assert not isinstance(ei.value, ServingError)  # NOT the 502 path
+    assert "huggingface_hub" in str(ei.value)

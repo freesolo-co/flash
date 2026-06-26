@@ -56,7 +56,10 @@ def _hf_api():
     try:
         from huggingface_hub import HfApi, snapshot_download
     except ModuleNotFoundError as exc:  # pragma: no cover - the server always has the extra
-        raise ServingError(
+        # A missing server extra is an internal MISCONFIGURATION, not an upstream gateway/transport
+        # failure — raise a plain RuntimeError (NOT ServingError, which the route maps to 502) so it
+        # surfaces as a 500. ServingError is reserved for real HF download/upload failures.
+        raise RuntimeError(
             "huggingface_hub is required to export adapters; install the server extras "
             "(pip install 'flash[server]')"
         ) from exc
