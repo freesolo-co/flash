@@ -247,6 +247,41 @@ def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
         return None
 
 
+# How long ``on_train_end`` waits to flush the final deployable checkpoint before the worker
+# moves on to publish the run's final adapter and exit. The per-save uploads run in DAEMON
+# threads, which the interpreter kills the instant the worker process exits — so a fast RL run
+# can finish (and tear down) before its last save's deployable snapshot finishes uploading,
+# leaving ``flash checkpoints`` empty even though training succeeded. The flush blocks (inside
+# ``trainer.train()``) up to this long so the last good step is reliably deployable.
+_CKPT_FLUSH_TIMEOUT_S = 300.0
+
+
+def _latest_checkpoint_dir(output_dir: str) -> tuple[int, str] | None:
+    """The highest-step ``checkpoint-<n>`` directory the trainer has written under
+    ``output_dir`` (its most recent save), as ``(step, path)`` — or ``None`` if none exist.
+
+    The trainer writes the checkpoint folder to local disk synchronously at each save, so this
+    sees the latest save even when its async HF upload was still in flight (or got dropped by
+    the busy-lock skip). ``on_train_end`` uses it to guarantee a deployable final snapshot.
+    """
+    best: tuple[int, str] | None = None
+    try:
+        entries = os.listdir(output_dir)
+    except OSError:
+        return None
+    for name in entries:
+        if not name.startswith("checkpoint-"):
+            continue
+        suffix = name[len("checkpoint-") :]
+        path = os.path.join(output_dir, name)
+        if not suffix.isdigit() or not os.path.isdir(path):
+            continue
+        step = int(suffix)
+        if best is None or step > best[0]:
+            best = (step, path)
+    return best
+
+
 def make_checkpoint_upload_callback():
     """Stream each trainer save to HF so preemption loses <= one save interval.
 
@@ -255,7 +290,12 @@ def make_checkpoint_upload_callback():
     when the next save fires, the new save is skipped (the following one catches up).
 
     Each save also publishes a deployable per-step adapter snapshot (``publish_deployable_
-    checkpoint``) so a run cancelled mid-RL can still be deployed from its latest step.
+    checkpoint``) so a run cancelled mid-RL can still be deployed from its latest step. The
+    deployable snapshot is published FIRST (it's a few-MB adapter, durable and accumulating)
+    and the larger latest-only resume checkpoint second, so the artifact that survives a
+    teardown lands soonest. ``on_train_end`` then flushes the final snapshot synchronously,
+    because the per-save uploads run in daemon threads that the worker would otherwise kill on
+    exit before a fast run's last deployable checkpoint finishes uploading.
     """
     from transformers import TrainerCallback
 
@@ -275,6 +315,10 @@ def make_checkpoint_upload_callback():
 
             def _upload():
                 try:
+                    # Deployable per-step adapter FIRST: it's small, kept-forever, and the only
+                    # artifact that makes a cancelled/preempted run deployable from this step, so
+                    # it must land before the larger resume checkpoint (best-effort, latest-only).
+                    publish_deployable_checkpoint(ckpt_dir, step)
                     _w.hf_api().upload_folder(
                         folder_path=ckpt_dir,
                         path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
@@ -283,14 +327,35 @@ def make_checkpoint_upload_callback():
                         delete_patterns=[f"{hf_prefix()}/checkpoint/**"],
                     )
                     _w.heartbeat("checkpoint_uploaded", step=step)
-                    # Mirror this step's adapter to its own kept-forever path so the run
-                    # stays deployable even if it never reaches "done".
-                    publish_deployable_checkpoint(ckpt_dir, step)
                 except Exception as e:
                     print("ckpt upload warn:", e)
                 finally:
                     lock.release()
 
             threading.Thread(target=_upload, daemon=True).start()
+
+        def on_train_end(self, args, state, control, **kwargs):
+            # The per-save uploads run in DAEMON threads, killed the instant the worker exits at
+            # run end. A fast RL run can reach "done" (and tear down) before its last save's
+            # deployable per-step checkpoint finishes uploading — leaving `flash checkpoints`
+            # empty and `flash deploy --step` impossible even though training succeeded. Flush
+            # here, INSIDE trainer.train() (before the worker publishes the final adapter and
+            # exits), so the latest on-disk checkpoint is reliably published as a deployable
+            # snapshot. Acquiring the upload lock first waits out any in-flight on_save upload;
+            # publish_deployable_checkpoint is idempotent (same content-addressed path), so
+            # re-publishing a step the async upload already handled is a cheap no-op.
+            if not _w.HF_REPO:
+                return
+            latest = _latest_checkpoint_dir(args.output_dir)
+            if latest is None:
+                return
+            step, ckpt_dir = latest
+            if lock.acquire(timeout=_CKPT_FLUSH_TIMEOUT_S):
+                try:
+                    publish_deployable_checkpoint(ckpt_dir, step)
+                finally:
+                    lock.release()
+            else:
+                print(f"[ckpt] flush timed out waiting for upload lock at final step {step}")
 
     return _CheckpointUpload()

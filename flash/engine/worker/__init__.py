@@ -97,6 +97,7 @@ from flash.engine.worker.heartbeat import (
 )
 from flash.engine.worker.hf import (
     _hf_upload,
+    _latest_checkpoint_dir,
     error_artifact_name,
     hf_api,
     hf_prefix,
@@ -502,6 +503,7 @@ __all__ = [
     "_grpo_resume_already_complete",
     "_hf_upload",
     "_init_adapter_model",
+    "_latest_checkpoint_dir",
     "_liger_default_for_model",
     # env + entry + finalize (defined here)
     "_load_active_env",
