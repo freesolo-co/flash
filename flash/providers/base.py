@@ -50,10 +50,6 @@ class GpuClass:
     # ``lambda_name`` is provisionable on Lambda (capacity permitting), priced from Lambda's own
     # live ``/instance-types`` rate (NOT the RunPod ``hourly_usd`` snapshot above).
     lambda_name: str | None = None
-    # Hyperstack single-GPU flavor name for this class (e.g. "n3-L40x1"); None -> not on Hyperstack.
-    # Same instance-based model as Lambda (cloud-init -> Docker); a class with a ``hyperstack_name``
-    # is provisionable on Hyperstack when its flavor has stock, priced from Hyperstack's static map.
-    hyperstack_name: str | None = None
 
 
 # Static hourly rates are RunPod secure-cloud on-demand snapshots.
@@ -92,7 +88,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
         validated=True,
         lambda_name="gpu_1x_a6000",
-        hyperstack_name="n3-RTX-A6000x1",
     ),
     GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44),
     GpuClass(
@@ -103,9 +98,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.77,
     ),
-    # L40 48 GB (Ada, sm89): datacenter card on Hyperstack (+ Nebius/DO/Vultr/Scaleway), NOT on
-    # RunPod or Lambda. Hyperstack-only here. hourly_usd is the Hyperstack list price.
-    GpuClass("L40", None, 48, "l40", "sm89", 1.00, hyperstack_name="n3-L40x1"),
     # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
     # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
     GpuClass(
@@ -121,7 +113,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm80",
         1.39,
         validated=True,
-        hyperstack_name="n3-A100x1",
     ),
     # Live-validated 2026-06-22: Qwen3.5 0.8B/MiniCPM/2B/9B SFT+GRPO train smokes (RunPod).
     GpuClass(
@@ -133,7 +124,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29,
         validated=True,
         lambda_name="gpu_1x_h100_pcie",
-        hyperstack_name="n3-H100x1",
     ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
@@ -145,9 +135,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         2.09,
         min_cuda_modern="13.0",
         validated=True,
-        # NOT mapped to Hyperstack: this Blackwell class needs a CUDA-13 host driver, but Hyperstack
-        # only ships up to CUDA-12.8 (R570) images — it would boot then fail at worker setup. Re-add
-        # ``hyperstack_name="n3-RTX-PRO6000-SEx1"`` once a CUDA-13 Hyperstack image is available.
     ),
 )
 
@@ -229,8 +216,6 @@ def providers_for(name: str) -> tuple[str, ...]:
         out.append("runpod")
     if info.lambda_name:
         out.append("lambda")
-    if info.hyperstack_name:
-        out.append("hyperstack")
     return tuple(out)
 
 

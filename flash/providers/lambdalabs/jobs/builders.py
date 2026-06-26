@@ -2,8 +2,8 @@
 
 The Lambda-specific leaf of ``flash.providers.lambdalabs.jobs``: the normalized dataclasses
 (``LambdaInstance``, ``LambdaJobHandle``) and the image accessor. The cross-provider pieces — the
-run-derived sweep label, the bootstrap payload, and the cloud-init ``user_data`` — are shared with
-Hyperstack in ``flash.providers._instance`` and re-exported here so the import path is unchanged.
+run-derived sweep label, the bootstrap payload, and the cloud-init ``user_data`` — live in the
+shared ``flash.providers._instance`` and are re-exported here so the import path is unchanged.
 
 This module MUST NOT import the ``jobs`` package ``__init__`` (it is imported BY it).
 """

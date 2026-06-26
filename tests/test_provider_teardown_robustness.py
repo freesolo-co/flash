@@ -4,7 +4,6 @@
 - is_not_found keys off the HTTP status CODE, not a bare "404" substring (a transient 5xx on a
   resource whose id contains "404" must NOT be read as "gone").
 - Lambda terminate_instances is PER-ID isolated: one bad/stale id can't abort teardown of the rest.
-- Hyperstack delete_vms returns only the ids ACTUALLY deleted (truthful teardown accounting).
 """
 
 from __future__ import annotations
@@ -58,36 +57,6 @@ def test_is_conflict_keys_off_status_code_not_bare_409():
     assert is_conflict(RuntimeError("DELETE /x -> HTTP 409")) is True  # trailing token at end-of-string
 
 
-def test_hyperstack_delete_vm_treats_409_as_success_but_not_substring(monkeypatch):
-    """A genuine 409 (in-flight teardown) -> idempotent success; a non-409 error whose message merely
-    contains "409"/"conflict" must STILL fail (return False), so a real delete failure is never
-    silently dropped (which would leave the VM billing)."""
-    from flash.providers.hyperstack import api as hs_api
-
-    def fail_with(exc):
-        def _req(*a, **k):
-            raise exc
-
-        return _req
-
-    # genuine 409 chained from the urllib HTTPError -> success
-    monkeypatch.setattr(
-        hs_api,
-        "request_with_retries",
-        fail_with(_chained(409, "DELETE /core/virtual-machines/7 -> HTTP 409: Conflict")),
-    )
-    assert hs_api.delete_vm("7") is True
-
-    # a non-409 failure whose text merely contains "409"/"conflict" (e.g. a "4090"-named flavor) ->
-    # NOT swallowed as success: delete_vm reports the real failure so the VM isn't left billing
-    monkeypatch.setattr(
-        hs_api,
-        "request_with_retries",
-        fail_with(_chained(500, "delete RTX 4090 vm failed: HTTP 500 conflict")),
-    )
-    assert hs_api.delete_vm("8") is False
-
-
 def test_lambda_terminate_is_per_id_isolated(monkeypatch):
     """One bad id must NOT abort teardown of the others (the crash-backstop sweep passes many)."""
     from flash.providers.lambdalabs import api as la_api
@@ -107,30 +76,7 @@ def test_lambda_terminate_is_per_id_isolated(monkeypatch):
     assert calls == ["i-1", "bad", "i-3"]  # each tried independently (per-id POST)
 
 
-def test_hyperstack_delete_vms_returns_only_actually_deleted(monkeypatch):
-    from flash.providers.hyperstack import api as hs_api
-
-    monkeypatch.setattr(hs_api, "delete_vm", lambda vid: vid != "bad")  # "bad" fails to delete
-    assert hs_api.delete_vms(["vm-1", "bad", "vm-3"]) == ["vm-1", "vm-3"]
-
-
-def test_hyperstack_sweep_reports_only_truly_reaped(monkeypatch):
-    """sweep_orphans must log/return only the VMs that ACTUALLY deleted — never a still-billing VM."""
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs
-
-    vms = [
-        {"id": "vm-a", "name": "flash-1700-aaaa-s0-a0"},
-        {"id": "vm-b", "name": "flash-1700-bbbb-s0-a0"},
-    ]
-    monkeypatch.setattr(hs_api, "list_vms", lambda: vms)
-    monkeypatch.setattr(hs_api, "delete_vm", lambda vid: vid == "vm-a")  # vm-b delete fails
-    monkeypatch.setattr(hs_api, "delete_vms", lambda ids: [i for i in ids if hs_api.delete_vm(i)])
-    out = jobs.sweep_orphans(active_labels=set())
-    assert out == ["vm-a"]  # vm-b still billing -> NOT reported as reaped
-
-
-# --- review-fix regressions (bounded label, provider rates, cuda image, fail-fast user_data) ---
+# --- review-fix regressions (bounded label, provider rates, fail-fast user_data) ---
 def test_label_bounded_and_sweep_matches_for_long_run_id():
     """A run id long enough to overflow the provider name cap is shortened DETERMINISTICALLY, and the
     same bounded prefix is used by launch AND sweep matching (so a live run can't be mis-swept)."""
@@ -154,20 +100,10 @@ def test_provider_cost_uses_provider_rate():
 
     runpod = gpu_hourly_usd("RTX A6000")  # nominal RunPod snapshot
     lam = gpu_hourly_usd("RTX A6000", provider="lambda")  # Lambda static fallback (no key in tests)
-    hs = gpu_hourly_usd("RTX A6000", provider="hyperstack")
     assert runpod == 0.49
     assert lam == 1.09  # Lambda A6000
-    assert hs == 0.50  # Hyperstack A6000
     # unknown-on-provider class falls back to nominal (e.g. a RunPod-only consumer card on lambda)
     assert gpu_hourly_usd("RTX 4090", provider="lambda") == gpu_hourly_usd("RTX 4090")
-
-
-def test_hyperstack_image_cuda_parse_and_floor():
-    """docker_image_for_region must pick an image whose CUDA covers the GPU floor (Blackwell=13)."""
-    from flash.providers.hyperstack import api as hs
-
-    assert hs._image_cuda("Ubuntu Server 24.04 LTS R570 CUDA 12.8 with Docker") == 12.8
-    assert hs._image_cuda("plain ubuntu") == 0.0
 
 
 def test_user_data_fails_fast_and_throttles_bootlog():
@@ -195,7 +131,7 @@ def test_user_data_fails_fast_and_throttles_bootlog():
 
 
 def test_instance_realized_cost_is_wall_times_rate():
-    """Lambda/Hyperstack have no billing API; realized COGS = wall(launch->run_end) x flat $/hr."""
+    """Lambda has no billing API; realized COGS = wall(launch->run_end) x flat $/hr."""
     from flash.providers.realized import realized_cost_for_remote
 
     remote = {"provider": "lambda", "instance_id": "i-9", "hourly_usd": 1.20, "started_ts": 1000.0}
@@ -206,7 +142,7 @@ def test_instance_realized_cost_is_wall_times_rate():
     assert rc.wall_seconds == 3600.0
     assert rc.by_resource == {"gpu": 1.20}
     # no rate, or no auditable resource id -> unattributable (stays unreconciled, never books cost)
-    assert realized_cost_for_remote({"provider": "hyperstack", "vm_id": "v"}, start=0, end=10) is None
+    assert realized_cost_for_remote({"provider": "lambda", "instance_id": "i-9"}, start=0, end=10) is None
     assert realized_cost_for_remote({"provider": "lambda", "hourly_usd": 1.0}, start=0, end=10) is None
 
 
@@ -215,7 +151,7 @@ def test_instance_realized_cost_uses_run_end_not_settle_padded_end():
     billing-query ``end`` — otherwise reconciliation over-bills by the settle hour (up to 1h x rate)."""
     from flash.providers.realized import realized_cost_for_remote
 
-    remote = {"provider": "hyperstack", "vm_id": "v-1", "hourly_usd": 2.0, "started_ts": 0.0}
+    remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 2.0, "started_ts": 0.0}
     # end is padded +3600 for the RunPod billing query; run_end is the real teardown at 1800s (0.5h).
     rc = realized_cost_for_remote(remote, start=0.0, end=1800.0 + 3600.0, run_end=1800.0)
     assert rc is not None

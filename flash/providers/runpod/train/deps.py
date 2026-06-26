@@ -273,7 +273,7 @@ def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dic
 def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
     """Remove the RunPod weight-cache redirect from an env bound for a NON-RunPod worker (mutates).
 
-    Instance providers (Lambda/Hyperstack) reuse this module's shared ``build_worker_env``, which
+    Instance providers (Lambda) reuse this module's shared ``build_worker_env``, which
     redirects ``HF_HOME`` onto the RunPod network-volume mount (``/runpod-volume``) whenever the run
     carries a weight-cache volume. That mount exists ONLY on RunPod serverless — on a rented instance
     it is a nonexistent path with no cross-run persistence — so the instance submit path strips any

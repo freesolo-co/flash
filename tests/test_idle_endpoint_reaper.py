@@ -77,7 +77,7 @@ def test_protected_names_skip_unreadable_run(monkeypatch):
     assert _derived("A100", "live") in names
 
 
-# --- the in-lifetime instance orphan sweep (Lambda/Hyperstack) ---------------------------------
+# --- the in-lifetime instance orphan sweep (Lambda) --------------------------------------------
 
 
 class _FakeProvider:
@@ -136,24 +136,22 @@ def test_active_run_ids_skips_unreadable_run(monkeypatch):
 def test_sweep_instances_dispatches_active_set_and_sums(monkeypatch):
     monkeypatch.setattr(app_mod, "_active_run_ids", lambda: {"flash-live"})
     lam = _FakeProvider("lambda", torn=["i-1", "i-2"])
-    hyp = _FakeProvider("hyperstack", torn=["vm-9"])
     rp = _FakeProvider("runpod", torn=[])  # no-op for RunPod, still dispatched
     monkeypatch.setattr(
-        "flash.providers.configured_providers", lambda: [rp, lam, hyp], raising=False
+        "flash.providers.configured_providers", lambda: [rp, lam], raising=False
     )
 
-    # 2 lambda + 1 hyperstack + 0 runpod torn down.
-    assert app_mod._sweep_orphan_instances_once() == 3
+    # 2 lambda + 0 runpod torn down.
+    assert app_mod._sweep_orphan_instances_once() == 2
     # Every provider got the SAME live-run protection set.
     assert lam.seen_active == {"flash-live"}
-    assert hyp.seen_active == {"flash-live"}
     assert rp.seen_active == {"flash-live"}
 
 
 def test_sweep_instances_one_provider_blip_does_not_skip_others(monkeypatch):
     monkeypatch.setattr(app_mod, "_active_run_ids", lambda: set())
     boom = _FakeProvider("lambda", raises=True)
-    ok = _FakeProvider("hyperstack", torn=["vm-1", "vm-2"])
+    ok = _FakeProvider("runpod", torn=["e-1", "e-2"])
     monkeypatch.setattr(
         "flash.providers.configured_providers", lambda: [boom, ok], raising=False
     )
@@ -174,33 +172,31 @@ def test_instance_providers_configured_gating(monkeypatch):
     assert app_mod._instance_providers_configured() is True
 
     monkeypatch.setattr(
-        "flash.providers.available_providers", lambda: ("hyperstack",), raising=False
+        "flash.providers.available_providers", lambda: ("lambda",), raising=False
     )
     assert app_mod._instance_providers_configured() is True
 
 
 def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
-    """End-to-end through the REAL Lambda + Hyperstack ``sweep_orphans`` (only the provider REST
-    layer is faked): a periodic sweep tears down each provider's leaked instance while the live
-    run's instance — named from the SAME run id the server reports as active — is protected.
+    """End-to-end through the REAL Lambda ``sweep_orphans`` (only the provider REST layer is faked):
+    a periodic sweep tears down the provider's leaked instance while the live run's instance — named
+    from the SAME run id the server reports as active — is protected.
 
     Exercises the full path the lifespan loop runs: ``_sweep_orphan_instances_once`` ->
-    ``configured_providers`` -> ``LambdaProvider/HyperstackProvider.sweep_orphans`` -> the real
-    name<->run matching -> the (faked) terminate call. No ``sweep_orphans`` mock anywhere."""
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs as hs_jobs
+    ``configured_providers`` -> ``LambdaProvider.sweep_orphans`` -> the real name<->run matching ->
+    the (faked) terminate call. No ``sweep_orphans`` mock anywhere."""
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs as lambda_jobs
     from flash.runner import RunStatus
 
-    # One live run; its instance on each provider is named from this exact run id.
+    # One live run; its instance is named from this exact run id.
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "flash-live"}])
     monkeypatch.setattr(
         app_mod, "get_status", lambda rid: RunStatus(run_id="flash-live", state="running", spec={})
     )
-    # Make both instance providers "configured" so the real ones are dispatched (RunPod absent here).
+    # Make the instance provider "configured" so the real one is dispatched (RunPod absent here).
     monkeypatch.setattr(
-        "flash.providers.available_providers", lambda: ("lambda", "hyperstack"), raising=False
+        "flash.providers.available_providers", lambda: ("lambda",), raising=False
     )
 
     lam_instances = [
@@ -208,23 +204,16 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
         {"id": "i-orphan", "name": lambda_jobs.instance_label("flash-dead", 0, 0)},  # leaked -> kill
         {"id": "i-foreign", "name": "not-ours"},  # never touch
     ]
-    hs_vms = [
-        {"id": "vm-live", "name": hs_jobs.instance_label("flash-live", 0, 0)},  # live -> KEEP
-        {"id": "vm-orphan", "name": hs_jobs.instance_label("flash-gone", 0, 0)},  # leaked -> kill
-    ]
-    terminated, deleted = [], []
+    terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
-    monkeypatch.setattr(hs_api, "list_vms", lambda: hs_vms)
-    monkeypatch.setattr(hs_api, "delete_vms", lambda ids: deleted.extend(ids) or list(ids))
 
     torn = app_mod._sweep_orphan_instances_once()
 
-    assert torn == 2  # one Lambda instance + one Hyperstack VM
+    assert torn == 1  # one Lambda instance
     assert terminated == ["i-orphan"]  # leaked reaped, live + foreign untouched
-    assert deleted == ["vm-orphan"]
 
 
 def test_sweep_resolves_active_labels_after_listing(monkeypatch):

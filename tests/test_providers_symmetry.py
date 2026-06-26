@@ -1,8 +1,8 @@
 """Provider registry + ``base.Provider`` interface coverage (CPU-only, offline).
 
-RunPod (always on) and the instance-based complements — Lambda (opt-in via LAMBDA_API_KEY) and
-Hyperstack (opt-in via HYPERSTACK_API_KEY) — all implement the SAME ``base.Provider`` interface
-behind the SAME module layout, so the orchestrator/allocator treat them interchangeably."""
+RunPod (always on) and the instance-based complement — Lambda (opt-in via LAMBDA_API_KEY) —
+implement the SAME ``base.Provider`` interface behind the SAME module layout, so the
+orchestrator/allocator treat them interchangeably."""
 
 from __future__ import annotations
 
@@ -25,21 +25,22 @@ PROVIDER_METHODS = (
 )
 
 
-_PKG = {"runpod": "runpod", "lambda": "lambdalabs", "hyperstack": "hyperstack"}
+_PKG = {"runpod": "runpod", "lambda": "lambdalabs"}
 
 
 def test_registry_lists_all_providers():
     from flash.providers import PROVIDER_NAMES, get_provider
 
-    assert PROVIDER_NAMES == ("runpod", "lambda", "hyperstack")
+    assert PROVIDER_NAMES == ("runpod", "lambda")
     assert get_provider("RunPod ").name == "runpod"
     assert get_provider(" Lambda ").name == "lambda"  # case/space-insensitive
-    assert get_provider("HYPERSTACK").name == "hyperstack"
     with pytest.raises(KeyError):
         get_provider("vast")  # removed; not registered
+    with pytest.raises(KeyError):
+        get_provider("hyperstack")  # removed; not registered
 
 
-@pytest.mark.parametrize("provider", ["runpod", "lambda", "hyperstack"])
+@pytest.mark.parametrize("provider", ["runpod", "lambda"])
 def test_provider_implements_the_interface(provider):
     from flash.providers import get_provider
     from flash.providers.base import Provider
@@ -50,7 +51,7 @@ def test_provider_implements_the_interface(provider):
         assert callable(getattr(prov, meth)), f"{provider} missing {meth}"
 
 
-@pytest.mark.parametrize("provider", ["runpod", "lambda", "hyperstack"])
+@pytest.mark.parametrize("provider", ["runpod", "lambda"])
 def test_module_layout(provider):
     """Every provider subpackage exposes the SAME public module set (the symmetry contract)."""
     for mod in PROVIDER_MODULES:
@@ -59,7 +60,7 @@ def test_module_layout(provider):
     assert hasattr(pkg, "PROVIDER")
 
 
-@pytest.mark.parametrize("provider", ["lambda", "hyperstack"])
+@pytest.mark.parametrize("provider", ["lambda"])
 def test_method_signatures_match_runpod(provider):
     """The interface methods take the same parameters on every provider (swappable)."""
     import inspect

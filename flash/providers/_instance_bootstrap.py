@@ -1,6 +1,6 @@
-"""Self-contained bootstrap shared by the instance-based providers (Lambda, Hyperstack).
+"""Self-contained bootstrap shared by the instance-based providers (currently Lambda).
 
-Runs INSIDE the worker container on a rented GPU instance. Both providers' cloud-init ``user_data``
+Runs INSIDE the worker container on a rented GPU instance. The provider's cloud-init ``user_data``
 runs the prebuilt, PUBLIC ``WORKER_IMAGE`` via Docker on the host, and this module is the
 container's command: install the run's extra pip deps, fetch the flash package from the HF dataset
 repo, then run the substrate-neutral worker (``flash.engine.worker``) to train, uploading the
@@ -8,7 +8,7 @@ console tail to HF.
 
 There is NO return channel from the instance: the worker's HF artifacts
 (DONE/metrics.json/heartbeat.json) are the success signal, and the attempt-scoped
-``<arm>_attempt<N>.json`` marker (``arm`` = the substrate, e.g. ``lambda``/``hyperstack``) is the
+``<arm>_attempt<N>.json`` marker (``arm`` = the substrate, e.g. ``lambda``) is the
 terminal marker the control plane keys failures on. The full training stack is BAKED into the
 image, so there is no base-stack install here — only the per-run ``extra_pip``.
 
@@ -292,7 +292,7 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
     """Arm the preload path's wall-clock cap. The training path enforces ``max_wall_s`` by
     ``run_mode`` killing the worker SUBPROCESS on its deadline, but ``run_preload`` runs
     ``snapshot_download`` IN-PROCESS — a hung Hub download (or a stalled NIC) has no subprocess to
-    time out, so without this the paid Lambda/Hyperstack box can keep running long past ``timeout_s``
+    time out, so without this the paid Lambda box can keep running long past ``timeout_s``
     (the control-plane driver's ``terminate_run_instances`` only fires if that driver process is
     still alive, and nothing on the box self-terminates). Mirror the deadline here: a daemon timer
     writes a terminal failure marker (so the warm driver stops polling and the box can be reaped) and
@@ -355,7 +355,7 @@ def run_preload(payload: dict) -> dict:
         return {"preloaded": [], "already_cached": [], "failed": {},
                 "error": f"weight-cache not mounted (HF_HOME={hf_home!r}); refusing to warm ephemeral disk"}
     # Require the mount sentinel for BOTH substrates. The cloud-init preamble drops it ONLY onto a
-    # verified-real mount: block-volume (Hyperstack) writes it after the device mounts; NFS (Lambda)
+    # verified-real mount: a block-volume provider writes it after the device mounts; NFS (Lambda)
     # writes it after confirming ``mountpoint`` (the platform auto-mount actually took). It is therefore
     # visible here only when the REAL cache is mounted. Without it, Docker's ``-v`` bind silently
     # auto-creates an EMPTY host dir -> the mount exists (isdir passes) but the sentinel is absent, which

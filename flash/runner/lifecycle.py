@@ -89,10 +89,10 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     failed substrate *cross-provider* before walking classes within it:
 
       * a congested provider (RunPod queue timeout / no warm workers) is left for a DIFFERENT
-        provider (Hyperstack / Lambda) on retry instead of hopping to its next-cheapest class —
-        which, when the whole provider is busy, is just as likely to time out (issue: A6000 queue
-        timeout retried onto another RunPod class while Hyperstack A6000 sat available); and
-      * a provider handing out a broken GPU (a Hyperstack VM whose CUDA never comes up ->
+        provider (Lambda) on retry instead of hopping to its next-cheapest class — which, when the
+        whole provider is busy, is just as likely to time out (issue: A6000 queue timeout retried
+        onto another RunPod class while a Lambda A6000 sat available); and
+      * a provider handing out a broken GPU (an instance whose CUDA never comes up ->
         ``job_preempted``) is likewise escaped to another provider rather than re-rolling the same
         broken region.
 
@@ -122,14 +122,14 @@ def _submit_seed_supervised(
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
     Each attempt first ALLOCATES the GPU: the cheapest fitting class across every active provider
-    (RunPod's validated pool + any Lambda/Hyperstack class with live capacity), price-ranked. There
-    is no GPU pin — the cheapest fitting class wins the first attempt.
+    (RunPod's validated pool + any Lambda class with live capacity), price-ranked. There is no GPU
+    pin — the cheapest fitting class wins the first attempt.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF checkpoint) when the
     failure looks infra-shaped: a stall (heartbeat frozen), no capacity, a client polling breakdown,
     or a platform TIMED_OUT/preemption/worker-loss. Each infra retry ESCAPES the provider that just
     failed cross-provider before walking classes within it (see ``_select_candidate``), so a
-    congested provider (RunPod queue timeout) or one handing out a broken GPU (a Hyperstack VM whose
+    congested provider (RunPod queue timeout) or one handing out a broken GPU (an instance whose
     CUDA never inits) is left for a healthy substrate rather than re-rolling the same failure.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately.
@@ -231,18 +231,18 @@ def _submit_seed_supervised(
                 except Exception:
                     # Logging the host-escape note is cosmetic; never let it abort the retry.
                     pass
-            elif last_handle.get("provider") in ("lambda", "hyperstack"):
+            elif last_handle.get("provider") == "lambda":
                 # An instance-based provider bills until terminated: tear the previous attempt's
                 # instance down so the retry lands on a fresh host (and we stop paying for the sick
                 # one). Dispatched generically through the handle's provider (destroy() knows the
-                # provider's own id field — instance_id for Lambda, vm_id for Hyperstack).
+                # provider's own id field — instance_id for Lambda).
                 with contextlib.suppress(Exception):
                     from flash.providers import get_provider
                     from flash.providers.base import JobHandle
 
                     _prov = last_handle["provider"]
                     get_provider(_prov).destroy(JobHandle.from_dict(last_handle))
-                    _iid = last_handle.get("instance_id") or last_handle.get("vm_id")
+                    _iid = last_handle.get("instance_id")
                     print(
                         f"retry {attempt}: terminated {_prov} instance {_iid} (escaping sick host)",
                         file=log,
@@ -393,8 +393,8 @@ def _submit_seed_supervised(
         # cross-region attempt instead of looping on the same volume-backed spec (the IN_QUEUE-forever /
         # persistent-volume-failure block). Sticky: once dropped it stays dropped. A non-volume flake
         # (stall/preempt) keeps the cache so the warm-weights benefit survives ordinary retries.
-        # Gate to RunPod: instance providers (Lambda/Hyperstack) already fall back to a cold run
-        # per-region INSIDE the launch walk, so their no_capacity isn't cache-caused. Only the SHARED
+        # Gate to RunPod: the instance provider (Lambda) already falls back to a cold run
+        # per-region INSIDE the launch walk, so its no_capacity isn't cache-caused. Only the SHARED
         # platform cache triggers it (gate on the exact name); a non-shared per-org/custom volume is the
         # intended escape-hatch isolation (runner._assign_weight_cache_volume) and must NOT be stripped.
         run_had_cache = bool(
@@ -660,13 +660,13 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
-    # Instance-based providers (Lambda, Hyperstack) bill until terminated: the runner's per-attempt
+    # Instance-based providers (Lambda) bill until terminated: the runner's per-attempt
     # `finally` already tears them down, but a crashed supervisor thread can leave one behind. Reap
     # any instance still named for this run via each configured provider's gc (best-effort).
     from flash.providers import available_providers, get_provider
 
     _avail = available_providers()
-    for _prov in ("lambda", "hyperstack"):
+    for _prov in ("lambda",):
         if _prov in _avail:
             with contextlib.suppress(Exception):
                 get_provider(_prov).gc(spec)
