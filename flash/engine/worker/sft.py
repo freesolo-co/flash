@@ -16,7 +16,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import liveness_heartbeat, train_liveness_heartbeat
+from flash.engine.worker.heartbeat import init_liveness_heartbeat, train_liveness_heartbeat
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
     gdn_packing_available,
@@ -485,7 +485,7 @@ def run_sft():
     # serializes on the CUDA driver / allocator locks held by the init thread and can freeze the
     # heartbeat for the whole init -> false hang. The nvidia-smi-only path (out-of-process, 8s
     # timeout, GIL released during the wait) keeps ticking. Mirrors run_rl's rl_initializing fix.
-    with liveness_heartbeat("sft_initializing"):
+    with init_liveness_heartbeat("sft_initializing"):
         trainer = _SFT(
             model=model_id,
             args=cfg,

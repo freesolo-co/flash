@@ -287,17 +287,33 @@ def make_sft_heartbeat_callback():
 _LIVENESS_TICK_S = 30.0
 _TRAIN_LIVENESS_QUIET_S = 90.0
 _TRAIN_LIVENESS_MAX_STEP_S = 1800.0
+# Cold *Trainer.__init__ (vLLM colocate build + weight load + CUDA-graph capture) exposes NO
+# incremental progress counter, so its liveness is bounded by a generous MAX DURATION instead of a
+# progress gate: any legitimate cold init finishes well within this, but a genuinely stuck init stops
+# pinging past it and hands off to the stall path (see init_liveness_heartbeat).
+_INIT_LIVENESS_MAX_S = 1800.0
 
 
 @contextlib.contextmanager
 def liveness_heartbeat(
-    stage, *, progress=None, max_silence_s=None, quiet_gate_s=None, fields=None, join_timeout=10.0
+    stage,
+    *,
+    progress=None,
+    max_silence_s=None,
+    max_duration_s=None,
+    quiet_gate_s=None,
+    fields=None,
+    join_timeout=10.0,
 ):
     """Keep a ``stage`` heartbeat alive while the wrapped block runs on the main thread.
 
     - ``progress``: optional ``() -> float | None`` monotonic counter. With ``max_silence_s`` the
       daemon STOPS pinging once it hasn't advanced for that long, so liveness can't mask a real wedge
       (a ``None`` return — unmeasurable — never counts as advancement).
+    - ``max_duration_s``: hard cap on TOTAL ping lifetime, independent of progress — for a phase with
+      no incremental progress counter (cold ``*Trainer.__init__``). Past the cap the daemon stops
+      pinging and hands off to the stall path, so a stuck-but-GIL-releasing init (nvidia-smi still
+      answers, so the ping would otherwise re-arm the watchdog forever) can't mask the hang.
     - ``quiet_gate_s``: if set, ping only when no heartbeat has been uploaded for that long (gap-fill
       a phase another heartbeat — e.g. ``rl_step`` — already covers in the normal case).
     - ``fields``: optional ``dict`` or ``() -> dict`` merged into each heartbeat (e.g. step / model).
@@ -310,11 +326,16 @@ def liveness_heartbeat(
 
     def _loop() -> None:
         last_val = None
-        # Measure the no-progress silence with the MONOTONIC clock: a wall-clock jump (NTP step, VM
-        # suspend/resume) must not make max_silence_s trip early/late — it decides when liveness STOPS
-        # and hands off to the stall watchdog, so a spurious early stop would false-fail a healthy run.
+        # Measure intervals with the MONOTONIC clock: a wall-clock jump (NTP step, VM suspend/resume)
+        # must not make max_silence_s / max_duration_s trip early/late — they decide when liveness
+        # STOPS and hands off to the stall watchdog, so a spurious early stop would false-fail a
+        # healthy run.
+        started_at = time.monotonic()
         advanced_at = time.monotonic()
         while not done.wait(_LIVENESS_TICK_S):
+            if max_duration_s and (time.monotonic() - started_at) > max_duration_s:
+                print(f"liveness[{stage}]: exceeded max_duration {max_duration_s:.0f}s; stopping")
+                return
             if progress is not None:
                 val = None
                 with contextlib.suppress(Exception):
@@ -366,3 +387,15 @@ def train_liveness_heartbeat(stage, get_step):
         quiet_gate_s=_TRAIN_LIVENESS_QUIET_S,
         fields=lambda: {"step": int(get_step() or 0)},
     )
+
+
+def init_liveness_heartbeat(stage):
+    """``liveness_heartbeat`` configured for the cold ``*Trainer.__init__`` phase (rl_initializing /
+    sft_initializing). Trainer construction exposes no incremental progress counter, so it is bounded
+    by ``max_duration_s=_INIT_LIVENESS_MAX_S`` instead: a legitimate cold init (vLLM build + weight
+    load + CUDA-graph capture) finishes well within the cap, but a genuinely stuck init that still
+    releases the GIL — a vLLM/CUDA/socket wait where nvidia-smi keeps answering, so the ping would
+    otherwise re-arm the watchdog AND (init is a setup stage) the provider setup-grace forever — stops
+    pinging past the cap, handing the hang to the provider setup-stall / faulthandler instead of
+    masking it to the wall-clock timeout. Shared by run_rl and run_sft."""
+    return liveness_heartbeat(stage, max_duration_s=_INIT_LIVENESS_MAX_S)

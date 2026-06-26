@@ -189,6 +189,20 @@ def test_liveness_heartbeat_stops_when_progress_stalls(monkeypatch):
     assert max(emitted) - t0 < 0.6, "must STOP emitting after max_silence (not run to block end)"
 
 
+def test_liveness_heartbeat_stops_after_max_duration(monkeypatch):
+    """max_duration_s (no progress counter, e.g. cold *Trainer.__init__): the ping re-arms the watchdog
+    AND the provider setup-grace, so a stuck-but-GIL-releasing init would mask the hang forever. The
+    daemon must STOP pinging once total lifetime exceeds the cap, handing off to the stall path."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    emitted: list = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(time.time()))
+    t0 = time.time()
+    with hb.liveness_heartbeat("rl_initializing", max_duration_s=0.15):
+        time.sleep(0.8)
+    assert emitted, "should cover the init briefly before giving up"
+    assert max(emitted) - t0 < 0.6, "must STOP emitting after max_duration (not run to block end)"
+
+
 def test_liveness_heartbeat_keeps_covering_while_progress_advances(monkeypatch):
     hb, w, _ = _liveness_env(monkeypatch)
     emitted: list = []
@@ -300,16 +314,27 @@ def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, 
 # Wiring: every long blocking phase must run under the shared liveness_heartbeat helper with the
 # right stage / progress gate. (Behaviour is covered above; these pin the call sites so the coverage
 # can't silently regress.)
-def test_rl_init_wraps_trainer_build_in_liveness_heartbeat():
+def test_rl_init_wraps_trainer_build_in_init_liveness_heartbeat():
     from flash.engine.worker import rl
 
-    assert 'liveness_heartbeat("rl_initializing")' in inspect.getsource(rl.run_rl)
+    # init_liveness_heartbeat (NOT the bare liveness_heartbeat) so the cold init ping is bounded by
+    # max_duration and can't mask a stuck-but-GIL-releasing init to the wall-clock timeout.
+    assert 'init_liveness_heartbeat("rl_initializing")' in inspect.getsource(rl.run_rl)
 
 
-def test_sft_init_wraps_trainer_build_in_liveness_heartbeat():
+def test_sft_init_wraps_trainer_build_in_init_liveness_heartbeat():
     from flash.engine.worker import sft
 
-    assert 'liveness_heartbeat("sft_initializing")' in inspect.getsource(sft.run_sft)
+    assert 'init_liveness_heartbeat("sft_initializing")' in inspect.getsource(sft.run_sft)
+
+
+def test_init_liveness_heartbeat_is_bounded_by_max_duration():
+    """init_liveness_heartbeat must pass max_duration_s (init has no incremental progress counter, so
+    the bound is a duration cap) — pins the anti-mask wiring so it can't silently regress."""
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    src = inspect.getsource(hb.init_liveness_heartbeat)
+    assert "max_duration_s=" in src, "init liveness must be bounded by a max_duration cap"
+    assert hb._INIT_LIVENESS_MAX_S > 0
 
 
 @pytest.mark.parametrize(

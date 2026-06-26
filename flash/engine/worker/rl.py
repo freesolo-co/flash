@@ -16,7 +16,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import liveness_heartbeat, train_liveness_heartbeat
+from flash.engine.worker.heartbeat import init_liveness_heartbeat, train_liveness_heartbeat
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     disable_liger_grpo_torch_compile,
@@ -704,7 +704,7 @@ def run_rl():
     # torch memory numbers are meaningless here anyway (the model isn't built yet). If even THIS
     # stops ticking, the main thread is holding the GIL in a C extension (a true wedge) -> that is
     # what the FLASH_STALL_FAULTHANDLER_S watchdog (heartbeat.py) is for.
-    with liveness_heartbeat("rl_initializing"):
+    with init_liveness_heartbeat("rl_initializing"):
         trainer = GRPOTrainer(
             model=init_model,
             args=cfg,
