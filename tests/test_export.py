@@ -102,10 +102,13 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
         "repo_type": "model",
         "private": True,
     }
-    # Stale adapter weights/metadata from a prior export are cleared (delete_patterns), so a re-export
-    # can't serve a mix of old + new files.
-    assert "*.safetensors" in calls["upload"]["delete_patterns"]
-    assert "adapter_model.*" in calls["upload"]["delete_patterns"]
+    # Stale adapter weights from a prior export are cleared (delete_patterns) so a re-export can't
+    # serve a mix of old + new files — but scoped to the ADAPTER's own filenames, never broad globs
+    # that could delete unrelated base-model weights in a reused destination repo.
+    patterns = calls["upload"]["delete_patterns"]
+    assert "adapter_model.*" in patterns
+    assert "adapter_config.json" in patterns
+    assert not any(p in patterns for p in ("*.safetensors", "*.bin", "*.pt"))
 
 
 def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):

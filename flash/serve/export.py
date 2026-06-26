@@ -25,18 +25,15 @@ from flash.serve.deploy import ServingError
 logger = get_logger(__name__)
 
 # Stale-artifact patterns cleared on (re-)export so a previous, DIFFERENT adapter in the destination
-# repo can't leave weights/metadata behind: upload_folder only overwrites matching paths, so an old
+# repo can't leave weights behind: upload_folder only overwrites matching paths, so an old
 # ``adapter_model.safetensors`` could otherwise survive next to a freshly-exported bin-only adapter and
-# be loaded as stale weights. Scoped to adapter weight + metadata files — README/.gitattributes are
-# left alone so re-exporting mirrors just the adapter, not the whole repo.
+# be loaded as stale weights. SCOPED to the LoRA adapter's own filenames (``adapter_model.*`` covers
+# the .safetensors/.bin weight files; ``adapter_config.json`` is its config) — deliberately NOT broad
+# globs like ``*.safetensors`` / ``*.bin``, which in a reused destination repo could delete unrelated
+# base-model weights (``model.safetensors`` / ``pytorch_model.bin``) or other user files.
 _STALE_ADAPTER_PATTERNS = [
-    "*.safetensors",
-    "*.bin",
-    "*.pt",
-    "*.gguf",
-    "*.h5",
-    "adapter_config.json",
     "adapter_model.*",
+    "adapter_config.json",
 ]
 
 
