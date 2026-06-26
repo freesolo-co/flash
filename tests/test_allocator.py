@@ -318,8 +318,19 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
                     tr = {"max_length": seq, "batch_size": bs, "lora_rank": rank}
                     need = required_vram_gb(mid, "sft", train=tr)
                     peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs) * 1.1)
+                    # The conservative estimate must always cover the honest peak (universal).
                     assert need >= peak, (mid, seq, bs, rank, need, peak)
-                    assert any(gb >= need for gb in validated), (mid, seq, bs, rank, need)
+                    if any(gb >= need for gb in validated):
+                        continue
+                    # Too big for ANY single validated card. Only the 35B-A3B MoE hits this, and
+                    # only at the extreme 32k context (its 70 GB frozen base + 32k activations
+                    # exceed the 180 GB B200). The allocator must REJECT it cleanly at submit
+                    # (cheapest_gpu raises), never silently mis-place onto a too-small card.
+                    from flash.providers.base import UnsupportedGpuError, cheapest_gpu
+
+                    assert mid == "Qwen/Qwen3.6-35B-A3B", (mid, seq, bs, rank, need)
+                    with pytest.raises(UnsupportedGpuError):
+                        cheapest_gpu(need)
 
 
 # ---------------------------------------------------------------------------

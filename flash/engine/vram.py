@@ -511,6 +511,11 @@ def model_required_vram_gb(
         floor = 0
         if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
             floor = int(info.grpo_min_vram_gb)
+        # SFT analog: a curated SFT floor pins a very large checkpoint to a bigger card than its raw
+        # param estimate would pick (e.g. the 35B MoE's ~89 GB est would otherwise down-route to a
+        # 96 GB card with a thin margin over its 70 GB frozen weights -> floor it to the 180 GB B200).
+        if not is_grpo and getattr(info, "sft_min_vram_gb", 0):
+            floor = max(floor, int(info.sft_min_vram_gb))
         # Big-model GRPO is TIGHT at its floor (2 weight copies + KV pool), so long context
         # overflows it -> escalate to a bigger tier. See grpo_seq_escalation_gb.
         if is_grpo and floor:

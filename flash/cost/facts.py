@@ -17,6 +17,10 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "A100 SXM": 312.0,
     "H100": 990.0,
     "RTX Pro 6000": 250.0,
+    # B200 (Blackwell datacenter, sm100): NVIDIA spec 2.25 PFLOPS bf16 dense tensor (no sparsity),
+    # listed like H100's 990 dense number so the cost estimator doesn't fall back to the 100-TFLOPS
+    # default and wildly over-estimate the 35B's train time.
+    "B200": 2250.0,
 }
 _DEFAULT_TFLOPS = 100.0
 

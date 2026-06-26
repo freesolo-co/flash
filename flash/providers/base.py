@@ -147,6 +147,25 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         # only ships up to CUDA-12.8 (R570) images — it would boot then fail at worker setup. Re-add
         # ``hyperstack_name="n3-RTX-PRO6000-SEx1"`` once a CUDA-13 Hyperstack image is available.
     ),
+    # Datacenter Blackwell (sm100, 180 GB HBM3e usable per SXM6 board — NVIDIA advertises 192 GB,
+    # but RunPod and Lambda both list 180 GB usable, so we size to the SAFE 180). The only managed
+    # class big enough for the Qwen3.6 35B-A3B MoE (~70 GB bf16 weights): SFT fits one card and
+    # colocated GRPO (two bf16 copies + KV + 248k-vocab fp32 logits) needs the full 180 GB. Like the
+    # other Blackwell cards it needs a CUDA-13 host driver to JIT the wheels' PTX.
+    # Offered as a SINGLE B200 by RunPod (serverless ``NVIDIA_B200``) and Lambda
+    # (``gpu_1x_b200_sxm6``). NOT on Hyperstack: its only B200 flavor is the 8-GPU node
+    # ``n3-B200-SXM6x8`` (no 1x flavor), so it can't back a single-GPU class.
+    GpuClass(
+        "B200",
+        "NVIDIA_B200",
+        180,
+        "b200",
+        "sm100",
+        5.89,
+        min_cuda_modern="13.0",
+        validated=True,
+        lambda_name="gpu_1x_b200_sxm6",
+    ),
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
@@ -197,6 +216,10 @@ _ALIASES.update(
         "h100 80gb hbm3": "H100",
         "rtx pro 6000 blackwell": "RTX Pro 6000",
         "nvidia rtx pro 6000 blackwell server edition": "RTX Pro 6000",
+        "nvidia b200": "B200",
+        "b200 sxm6": "B200",
+        "nvidia b200 180gb": "B200",
+        "nvidia b200 sxm6": "B200",
     }
 )
 
