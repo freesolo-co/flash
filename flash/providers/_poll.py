@@ -52,65 +52,27 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
     return float(m.group(1)) + grace_s < now
 
 
-# First-liveness deadline (Lambda / Hyperstack). A healthy active box pushes its boot.log to HF within
-# ~2 min (uploader runs BEFORE the image pull) and soon heartbeats; active this long with NO boot.log,
-# fresh heartbeat, or marker means cloud-init/the worker never started (sick region) -> fail over FAST
-# (retriable ``stalled`` -> cross-provider escape) instead of burning the ~50 min ``SETUP_GRACE_S``.
-# Generous over the ~2 min boot.log window to absorb HF lag; boot.log presence (not this raw timer) is
-# what protects a slow large-image-pull box. Scaled x1.5 on the last GPU (nowhere left to escape).
+# First-liveness deadline for the instance providers (Lambda / Hyperstack). Once an instance reaches
+# OS-level ``active`` a healthy box that actually ran cloud-init pushes its ``<arm>_attempt<N>_boot.log``
+# to HF within ~2 min (the uploader starts BEFORE the image pull) and a live worker soon heartbeats.
+# So if a box is active for this long with NO attempt-scoped boot.log AND no fresh heartbeat AND no
+# marker, cloud-init/the worker never started (a sick region / wedged host) — fail it over FAST
+# (retriable ``stalled`` that the runner escapes cross-provider) instead of burning the full
+# ``SETUP_GRACE_S`` (~50 min). Generous over the ~2 min boot.log-appears time to absorb HF
+# upload/propagation lag and a slow host huggingface_hub install; the boot.log presence — not this
+# raw timer — is what protects a healthy-but-slow (large-image-pull) box from a false failover.
+# Scaled x1.5 on the last GPU (nowhere left to escape), mirroring the setup-grace patience.
 FIRST_LIVENESS_S = 900.0
 
-# Consecutive forced boot.log reads that must be absent before first-liveness declares a region sick.
-# ``make_hf_text_reader`` returns ``None`` for a missing artifact OR a transient HF hiccup, so one
-# ``None`` can't be trusted; a real never-started box stays absent indefinitely while a blip clears
-# within a poll, so requiring N consecutive absences distinguishes them (cost: a few poll intervals).
+# Consecutive forced boot.log reads that must come back absent before the first-liveness check
+# declares a region sick. ``make_hf_text_reader`` returns ``None`` for ANY read failure — a genuinely
+# missing artifact OR a momentary HF/Hub network hiccup — so a single ``None`` at the deadline can't
+# be trusted to mean "cloud-init never ran". A transient error clears within a poll interval, while a
+# box whose worker never started stays absent indefinitely; requiring the absence to PERSIST across
+# this many polls (each ~``interval_s`` apart) distinguishes the two and keeps a Hub blip from
+# spuriously failing a healthy box over to another provider. The added failover latency is a few poll
+# intervals on top of the ~15 min ``FIRST_LIVENESS_S`` — negligible.
 BOOT_LOG_ABSENT_POLLS = 3
-
-# On a reattach whose first poll already sees the box ACTIVE, the inactive->active transition was never
-# observed so ``active_since`` stays launch-anchored and the launch-relative deadline can already be
-# blown on reattach -> a box that just became active would fail over before its boot.log could publish.
-# So also require it to have been OBSERVED active this long (≈ the uploader's window) before a stall.
-# Small vs FIRST_LIVENESS_S (doesn't slow normal fast failover); a box silent since before the restart
-# is still caught by the setup grace.
-FIRST_LIVENESS_OBSERVED_GRACE_S = 120.0
-
-# Heartbeat stages the worker emits during cold start, BEFORE the first training step. One proves the
-# worker is alive but NOT that setup (model download + trainer/vLLM init) finished, so they keep the
-# larger setup grace AND must NOT count as "training reached" (an infra/GPU fault during init IS a
-# sick-region signal). Cold-start order:
-#   sft_start -> model_prefetched -> sft_model_load -> sft_initializing -> sft_step
-#   rl_start  -> model_prefetched -> rl_train_start  -> rl_initializing  -> rl_step
-# SHARED single source of truth so the three pollers (RunPod / Lambda / Hyperstack) can't drift apart.
-SETUP_HEARTBEAT_STAGES = frozenset(
-    {
-        "boot",
-        "sft_start",
-        "rl_start",
-        "model_prefetched",
-        "sft_model_load",
-        "rl_train_start",
-        "sft_initializing",
-        "rl_initializing",
-    }
-)
-
-
-def is_training_stage(stage) -> bool:
-    """True if a heartbeat stage means training has been REACHED (training-or-later), i.e. the worker
-    is at/past the first training step. Deliberately broad: any stage that is NOT a setup/cold-start
-    stage AND NOT an ``error_*`` crash stage -- so it covers the training steps (``sft_step``/
-    ``rl_step``) AND every post-training stage the worker emits afterward (``sft_trained``/``rl_trained``/
-    ``checkpoint_uploaded``/``checkpoint_deployable``/``done``/``already_done``). All of those mean the
-    worker became productive, which is exactly what the callers need: a host loss AFTER training is not
-    a sick-region fault, and the stall window can tighten. It is NOT a precise "current step" predicate.
-
-    The exclusions are what matter for correctness: a setup stage (still cold-starting) or an
-    ``error_<phase>`` stage (the worker overwrites its heartbeat with ``error_<phase>`` on ANY raise,
-    incl. a pre-training ``RetriableInfraError`` during model load / trainer-vLLM init) must NOT count as
-    training-reached -- else a pre-training crash masquerades as "training reached", suppressing the
-    region quarantine and flipping stall detection to the tight window. Whether the FIRST step was
-    actually reached this attempt is latched separately by the pollers' ``seen_training_hb``."""
-    return bool(stage) and stage not in SETUP_HEARTBEAT_STAGES and not str(stage).startswith("error_")
 
 
 def make_say(log) -> Callable[[str], None]:

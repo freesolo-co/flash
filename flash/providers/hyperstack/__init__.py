@@ -96,7 +96,7 @@ class HyperstackProvider:
         # early — terminal there, since there's no GPU left to walk to. Mirrors RunPodProvider.
         last_gpu_mult = 1.5 if bool(handle.to_dict().get("on_last_gpu", False)) else 1.0
         try:
-            res = poll_hs_job(
+            return poll_hs_job(
                 hh,
                 spec,
                 seed,
@@ -106,13 +106,6 @@ class HyperstackProvider:
                 first_liveness_s=FIRST_LIVENESS_S * last_gpu_mult,
                 setup_grace_s=SETUP_GRACE_S * last_gpu_mult,
             )
-            if res.host_fault and hh.region:
-                # Same region quarantine as the submit path: a host fault detected on a reattach
-                # marks the region sick so subsequent allocation/launch avoids it (TTL self-heals).
-                from flash.providers._health import mark_region_sick
-
-                mark_region_sick("hyperstack", hh.region)
-            return res
         finally:
             # Recovery has no submit_run_hyperstack teardown ``finally``; delete the reattached VM
             # here so a finished/abandoned recovered seed stops billing immediately.

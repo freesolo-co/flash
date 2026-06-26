@@ -103,11 +103,8 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.77,
     ),
-    # L40 48 GB (Ada, sm89): Hyperstack-only (no RunPod/Lambda L40). Defined so the name resolves +
-    # tests work, but DROPPED FROM AUTO-ALLOCATION in ``allocator._POOL_EXCLUDED`` purely on PRICE —
-    # strictly dominated by RTX A6000 (same 48 GB, $0.49 vs $1.00 everywhere), so never worth picking.
-    # (Its only stock, CANADA-1, once had a broken driver but was re-verified healthy 2026-06-26 + is no
-    # longer banned; the price domination is the standing reason.) hourly_usd kept for reference.
+    # L40 48 GB (Ada, sm89): datacenter card on Hyperstack (+ Nebius/DO/Vultr/Scaleway), NOT on
+    # RunPod or Lambda. Hyperstack-only here. hourly_usd is the Hyperstack list price.
     GpuClass("L40", None, 48, "l40", "sm89", 1.00, hyperstack_name="n3-L40x1"),
     # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
     # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
@@ -335,13 +332,6 @@ class PollResult:
     # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
     failure: str | None = None
     detail: str | None = None
-    # Set by the instance pollers (Lambda/Hyperstack) when the failure proves the REGION/HOST never
-    # got a worker to training — the instance reached 'active' but cloud-init/the worker never booted
-    # (first-liveness 'stalled'), or the GPU/driver never initialized before any training heartbeat
-    # (pre-training 'job_preempted'). The provider then quarantines that region (flash.providers.
-    # _health) so the allocator + the retry's region walk avoid it for a TTL, instead of re-rolling
-    # the same sick region. NOT set for a mid-training stall, no_capacity, or a genuine worker error.
-    host_fault: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -353,10 +343,6 @@ class Candidate:
     gpu: str
     hourly_usd: float
     vram_gb: int
-    # True when this (provider, class) only has capacity in a currently-QUARANTINED region
-    # (flash.providers._health). A LAST-RESORT candidate: ranked strictly after every healthy one and
-    # demoted in the runner's per-attempt selection, so quarantine can only demote, never win the pick.
-    sick: bool = False
 
 
 @dataclass(frozen=True)

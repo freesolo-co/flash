@@ -23,8 +23,6 @@ RunPod-static provisional for validation/dry-run display.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from flash._logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
@@ -34,14 +32,6 @@ from flash.providers.base import (
 )
 
 logger = get_logger(__name__)
-
-# Classes that stay in the catalog (the name resolves; provider runner machinery/tests use them) but
-# are NEVER auto-allocated. L40 is here on PRICE alone: it is strictly dominated by RTX A6000 (same
-# 48 GB, half the price, on all three providers), so the cheapest-fitting walk should never pick it.
-# (Its only stock is Hyperstack's CANADA-1 fleet, once hard-banned for a broken driver but re-verified
-# healthy and un-banned on 2026-06-26; the price domination is independent of that and stands.) See
-# base.py's L40 row.
-_POOL_EXCLUDED = frozenset({"L40"})
 
 # "Comfortably" = the open-model VRAM estimate plus headroom, so a full SFT+GRPO run
 # never lands in check_fit's "tight" band by construction. Curated catalog entries
@@ -91,20 +81,18 @@ def _runpod_candidates(need: int) -> list[Candidate]:
     return [
         Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb)
         for g in provider.gpu_classes()
-        if g.vram_gb >= need and g.validated and g.name not in _POOL_EXCLUDED
+        if g.vram_gb >= need and g.validated
     ]
 
 
-def _lambda_candidates(need: int, ignore_sick: bool = False) -> list[Candidate]:
+def _lambda_candidates(need: int) -> list[Candidate]:
     """Lambda's fitting classes that currently have LIVE capacity, priced live.
 
     Capacity-aware by design: a Lambda class with no region advertising capacity is EXCLUDED, so
     the allocator never hands the runner a Lambda class that would immediately fail to launch (and
     burn a retry) — directly the "GPU allocation is good, doesn't randomly die" property. A Lambda
     capacity-lookup failure (no key / network blip) degrades to the other providers: it is
-    non-fatal as long as another provider can supply a fitting class. ``ignore_sick`` is the
-    last-resort pass: it keeps quarantined regions in so a region quarantine never zeroes out the
-    only capacity (see ``allocate``).
+    non-fatal as long as another provider can supply a fitting class.
     """
     from flash.providers.lambdalabs.jobs import usable_instances
 
@@ -112,10 +100,10 @@ def _lambda_candidates(need: int, ignore_sick: bool = False) -> list[Candidate]:
     out: list[Candidate] = []
     try:
         for g in provider.gpu_classes():
-            if g.vram_gb < need or g.name in _POOL_EXCLUDED:
+            if g.vram_gb < need:
                 continue
             # usable_instances reads the cached /instance-types, so only the first call hits the API.
-            if usable_instances(g.name, ignore_sick=ignore_sick):
+            if usable_instances(g.name):
                 out.append(Candidate("lambda", g.name, provider.hourly_rate(g.name), g.vram_gb))
     except Exception as exc:
         logger.warning("lambda capacity lookup failed (%s); allocating without lambda", exc)
@@ -123,13 +111,12 @@ def _lambda_candidates(need: int, ignore_sick: bool = False) -> list[Candidate]:
     return out
 
 
-def _hyperstack_candidates(need: int, ignore_sick: bool = False) -> list[Candidate]:
+def _hyperstack_candidates(need: int) -> list[Candidate]:
     """Hyperstack's fitting classes that currently have flavor STOCK, priced statically.
 
     Capacity-aware, exactly like Lambda: a class with no in-stock flavor is excluded so the runner
     never walks onto a class that would immediately fail to launch. A capacity-lookup failure
-    degrades to the other providers. ``ignore_sick`` is the last-resort pass: it keeps quarantined
-    regions in so a region quarantine never zeroes out the only capacity (see ``allocate``).
+    degrades to the other providers.
     """
     from flash.providers.hyperstack.jobs import usable_instances
 
@@ -137,10 +124,10 @@ def _hyperstack_candidates(need: int, ignore_sick: bool = False) -> list[Candida
     out: list[Candidate] = []
     try:
         for g in provider.gpu_classes():
-            if g.vram_gb < need or g.name in _POOL_EXCLUDED:
+            if g.vram_gb < need:
                 continue
             # usable_instances reads the cached /core/flavors, so only the first call hits the API.
-            if usable_instances(g.name, ignore_sick=ignore_sick):
+            if usable_instances(g.name):
                 out.append(Candidate("hyperstack", g.name, provider.hourly_rate(g.name), g.vram_gb))
     except Exception as exc:
         logger.warning("hyperstack capacity lookup failed (%s); allocating without hyperstack", exc)
@@ -175,35 +162,15 @@ def allocate(
         candidates += _lambda_candidates(need)
     if "hyperstack" in available:
         candidates += _hyperstack_candidates(need)
-    # Bounded DEMOTION, never removal: a class whose capacity is ONLY in quarantined regions is kept as
-    # a last-resort candidate (ranked after all healthy ones), so the run reaches it rather than hard-
-    # failing once healthy capacity is exhausted -- it just re-quarantines + escapes if still sick.
-    healthy_keys = {(c.provider, c.gpu) for c in candidates}
-    sick: list[Candidate] = []
-    if "lambda" in available:
-        sick += [replace(c, sick=True) for c in _lambda_candidates(need, ignore_sick=True) if (c.provider, c.gpu) not in healthy_keys]
-    if "hyperstack" in available:
-        sick += [replace(c, sick=True) for c in _hyperstack_candidates(need, ignore_sick=True) if (c.provider, c.gpu) not in healthy_keys]
-    if not candidates and not sick:
+    if not candidates:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
             f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
         )
-    if not candidates:
-        logger.warning(
-            "every fitting instance-provider region is quarantined (sick); allocating into a "
-            "quarantined region rather than hard-failing the run (quarantine is bounded-demotion)"
-        )
-    # Healthy candidates first (a SICK quarantine-only candidate is never preferred over a healthy one,
-    # even when cheaper); within each tier cheapest first, equal rates prefer less VRAM (don't burn a big
-    # card on a small job), then registry order. The runner's _select_candidate applies the SAME sick-last
-    # tie-break per attempt, so the demotion survives its per-attempt min()-by-price re-selection.
+    # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small job),
+    # then registry order.
     order = {n: i for i, n in enumerate(PROVIDER_NAMES)}
-
-    def rank_key(c: Candidate) -> tuple:
-        return (c.sick, c.hourly_usd, c.vram_gb, order.get(c.provider, 99))
-
-    ranked = sorted(candidates + sick, key=rank_key)
+    ranked = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, order.get(c.provider, 99)))
     best = ranked[0]
     return Allocation(
         provider=best.provider,

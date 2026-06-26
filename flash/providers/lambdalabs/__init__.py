@@ -103,7 +103,7 @@ class LambdaProvider:
         # instance early — terminal there, since there's no GPU left to walk to. Mirrors RunPodProvider.
         last_gpu_mult = 1.5 if bool(handle.to_dict().get("on_last_gpu", False)) else 1.0
         try:
-            res = poll_lambda_job(
+            return poll_lambda_job(
                 lh,
                 spec,
                 seed,
@@ -113,13 +113,6 @@ class LambdaProvider:
                 first_liveness_s=FIRST_LIVENESS_S * last_gpu_mult,
                 setup_grace_s=SETUP_GRACE_S * last_gpu_mult,
             )
-            if res.host_fault and lh.region:
-                # Same region quarantine as the submit path: a host fault detected on a reattach
-                # marks the region sick so subsequent allocation/launch avoids it (TTL self-heals).
-                from flash.providers._health import mark_region_sick
-
-                mark_region_sick("lambda", lh.region)
-            return res
         finally:
             # Recovery (attach_run) has no submit_run_lambda teardown ``finally``; terminate the
             # reattached instance here so a finished/abandoned recovered seed stops billing

@@ -87,10 +87,6 @@ class RunStatus:
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
     # after an inter-seed restart instead of failing the run (losing completed work).
     resume_seed_index: int | None = None
-    # Set TRUE by cancel_run BEFORE it tears the box down, so the poll loop can see a cancel-IN-PROGRESS
-    # while terminal ``cancelled`` is still being persisted — else box-vanished detection would fire
-    # host_fault and quarantine a healthy region for our own teardown.
-    cancel_requested: bool = False
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
     # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
     # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the wall x $/hr
@@ -636,26 +632,6 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
             return
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
-        status.updated_at = time.time()
-        _save_status(status)
-    _report_status(status)
-
-
-def mark_cancel_requested(run_id: str) -> None:
-    """Record a cancel INTENT (``cancel_requested=True``) WITHOUT touching the run's state. Like
-    ``record_realized_cost`` (and UNLIKE ``_update``, which sets ``state`` from its caller), this
-    re-reads the current status under the lock and writes only the one flag, so it can neither REGRESS
-    a concurrently-advanced state (cancel_run captured the entry state, which may be stale by now) nor
-    be silently dropped by ``_update``'s terminal CAS. ``cancel_run`` calls this BEFORE remote teardown
-    so the run's poll loop (run_cancelled()) can suppress a host_fault quarantine in the window before
-    the terminal ``cancelled`` state is persisted. No-ops if the run vanished; a field-only update is
-    always allowed on any state (a completed/terminal run isn't being polled, so the flag is harmless)."""
-    with _STATUS_LOCK:
-        try:
-            status = get_status(run_id)
-        except FileNotFoundError:
-            return
-        status.cancel_requested = True
         status.updated_at = time.time()
         _save_status(status)
     _report_status(status)

@@ -35,12 +35,12 @@ def _inst(gpu="L40", region="CANADA-1", flavor="n3-L40x1", price=1.00):
     )
 
 
-def _handle(started_ts=10_000.0, rate=1.00, attempt=0):
+def _handle(started_ts=10_000.0, rate=1.00):
     from flash.providers.hyperstack.jobs.builders import HyperstackJobHandle
 
     return HyperstackJobHandle(
         vm_id="vm-9999", flavor="n3-L40x1", region="CANADA-1", name="flash-x-s0-a0",
-        gpu="L40", hourly_usd=rate, attempt=attempt, started_ts=started_ts,
+        gpu="L40", hourly_usd=rate, attempt=0, started_ts=started_ts,
     )
 
 
@@ -127,64 +127,6 @@ def test_launch_walks_regions_on_rejection(monkeypatch):
     assert h.name == "flash-1700000000-abcd1234-s0-a2"
 
 
-def test_launch_relaxes_to_quarantined_region_when_healthy_exhausted(monkeypatch):
-    """If the initial healthy region rejects and the forced refresh finds NO healthy stock, the walk
-    relaxes the quarantine (ignore_sick) and launches into a quarantined-but-in-stock region rather than
-    failing the attempt while sick stock exists -- relax after the healthy walk is exhausted, not only on
-    an initially-empty healthy list. Mirrors Lambda."""
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs
-
-    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "flash-managed")
-    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "Ubuntu Docker CUDA 12.8")
-    created = []
-
-    def fake_launch(*, name, environment_name, image_name, flavor_name, key_name, user_data):
-        if environment_name != "default-SICK-1":
-            raise hs_api.HyperstackApiError("POST /core/virtual-machines -> HTTP 400: no stock")
-        created.append(environment_name)
-        return "vm-99"
-
-    def fake_usable(gpu, force=False, ignore_sick=False):
-        # Healthy refresh empty; only the relaxed (quarantine-ignoring) refresh finds stock.
-        return [_inst(region="SICK-1")] if ignore_sick else []
-
-    monkeypatch.setattr(hs_api, "launch_vm", fake_launch)
-    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
-    h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="US-1")], attempt=0)
-    assert created == ["default-SICK-1"]
-    assert h.vm_id == "vm-99"
-
-
-def test_launch_relaxes_to_sick_after_refreshed_healthy_region_rejects(monkeypatch):
-    """The forced healthy refresh can RETURN a region that then itself rejects (stale stock). The relaxed
-    (ignore_sick) pass must still run after that -- gated on its OWN flag, not `refreshed` -- so
-    quarantine doesn't become a HARD exclusion once the refresh has already happened. Mirrors Lambda."""
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs
-
-    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "flash-managed")
-    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
-    attempts = []
-
-    def fake_launch(*, name, environment_name, image_name, flavor_name, key_name, user_data):
-        attempts.append(environment_name)
-        if environment_name != "default-SICK-1":
-            raise hs_api.HyperstackApiError("POST /core/virtual-machines -> HTTP 400: no stock")
-        return "vm-99"
-
-    def fake_usable(gpu, force=False, ignore_sick=False):
-        # Healthy refresh returns a DIFFERENT healthy region (US-2) that itself rejects; only the relaxed
-        # pass surfaces the quarantined-but-in-stock SICK-1.
-        return [_inst(region="SICK-1")] if ignore_sick else [_inst(region="US-2")]
-
-    monkeypatch.setattr(hs_api, "launch_vm", fake_launch)
-    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
-    h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="US-1")], attempt=0)
-    assert attempts == ["default-US-1", "default-US-2", "default-SICK-1"]
-    assert h.vm_id == "vm-99"
-
-
 def test_launch_raises_when_no_stock(monkeypatch):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs
@@ -194,7 +136,7 @@ def test_launch_raises_when_no_stock(monkeypatch):
     monkeypatch.setattr(
         hs_api, "launch_vm", lambda **k: (_ for _ in ()).throw(hs_api.HyperstackApiError("POST /core/virtual-machines -> HTTP 400: no stock"))
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [])
     with pytest.raises(hs_api.HyperstackApiError, match="no stock"):
         jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)
     with pytest.raises(hs_api.HyperstackApiError, match="no Hyperstack stock"):
@@ -202,10 +144,10 @@ def test_launch_raises_when_no_stock(monkeypatch):
 
 
 def test_regions_no_static_block_by_default(monkeypatch):
-    """No region is statically dropped by default — a region that goes bad is now learned + demoted at
-    runtime by the dynamic quarantine (flash.providers._health), not hand-banned here. CANADA-1 used to
-    be the lone default-banned region (broken-driver L40 fleet); it was re-verified healthy on
-    2026-06-26 and un-banned, so every API-returned region now passes through."""
+    """No region is statically dropped by default. CANADA-1 used to be hard-banned here for a
+    broken-driver L40 fleet; it was re-verified healthy on 2026-06-26 and un-banned, so every
+    API-returned region now passes through — a region that goes bad is caught by fast-failover, not a
+    hand-maintained denylist."""
     from flash.providers.hyperstack import api as hs_api
 
     monkeypatch.setattr(
@@ -220,8 +162,8 @@ def test_regions_no_static_block_by_default(monkeypatch):
 
 
 def test_regions_blocklist_is_env_overridable(monkeypatch):
-    """HYPERSTACK_BLOCKED_REGIONS overrides the empty default: an operator can hard-block a region the
-    moment its driver/capacity health regresses, without a code change; set to "" blocks nothing."""
+    """HYPERSTACK_BLOCKED_REGIONS overrides the default: set to "" re-enables CANADA-1 (operator
+    opt-in once the fleet recovers); set to another region blocks that instead."""
     from flash.providers.hyperstack import api as hs_api
 
     monkeypatch.setattr(
@@ -413,7 +355,7 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     refresh_calls = []
     monkeypatch.setattr(
         jobs, "usable_instances",
-        lambda gpu, force=False, ignore_sick=False: refresh_calls.append(force) or [_inst(region="ELSEWHERE-9")],
+        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="ELSEWHERE-9")],
     )
 
     with pytest.raises(hs_api.HyperstackApiError):
@@ -472,7 +414,7 @@ def test_training_mode_tolerates_failed_attach(monkeypatch):
 # ---------------------------------------------------------------------------
 # poll_hs_job state machine
 # ---------------------------------------------------------------------------
-def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0, legacy_boot=None):
+def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None, step=10.0):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs
 
@@ -496,12 +438,8 @@ def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None
                 return marker() if callable(marker) else marker
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
-            if path.endswith("_boot.log"):
-                if "attempt" in path:  # attempt-scoped: hyperstack_attempt<N>_boot.log
-                    return boot() if callable(boot) else boot
-                return legacy_boot() if callable(legacy_boot) else legacy_boot  # legacy hyperstack_boot.log
-            if "/error_" in path:  # worker crash traceback (error_<phase>.txt)
-                return error() if callable(error) else error
+            if path.endswith("_boot.log"):  # attempt-scoped: hyperstack_attempt<N>_boot.log
+                return boot() if callable(boot) else boot
             return None
 
         return read
@@ -554,364 +492,10 @@ def test_poll_retriable_marker_is_job_preempted(monkeypatch):
         marker=json.dumps({"ok": False, "attempt": 0, "error": "transient"}),
     )
     res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 10_000.0},  # fresh (ts >= launch)
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {"retriable": True}
     )
     assert not res.ok
     assert res.failure == "job_preempted"
-    assert res.host_fault  # fresh retriable crash before any training heartbeat -> sick region
-
-
-def test_poll_marker_stale_retriable_heartbeat_does_not_quarantine(monkeypatch):
-    """On a RETRY, worker_flagged_retriable() can read a PRIOR attempt's RetriableInfraError heartbeat
-    (seed-scoped, ts < this attempt's launch). THIS attempt's non-retriable setup failure then still
-    retries but must NOT quarantine the healthy region: fresh_retriable_hb() rejects the stale heartbeat
-    for the host_fault signal. Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps({"ok": False, "attempt": 1, "error": "bootstrap pip failed"}),  # non-retriable
-    )
-    res = jobs.poll_hs_job(
-        _handle(started_ts=10_000.0, attempt=1), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 5_000.0},  # STALE: ts < launch 10_000
-    )
-    assert not res.ok
-    assert not res.host_fault  # stale prior-attempt retriable heartbeat did not quarantine the region
-
-
-def test_poll_dead_vm_cancelled_run_not_quarantined(monkeypatch):
-    """A user cancel during setup deletes the VM; the poller sees a dead host with no training
-    heartbeat. run_cancelled() suppresses host_fault so a HEALTHY region is not quarantined for a
-    deliberate teardown. Mirrors the Lambda path."""
-    import flash.runner
-
-    monkeypatch.setattr(
-        flash.runner, "get_status", lambda run_id: type("S", (), {"state": "cancelled"})()
-    )
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        boot="+ docker pull ... (still in setup when cancelled)",
-    )
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert not res.host_fault  # cancelled -> region NOT quarantined
-
-
-def test_poll_init_stage_heartbeat_quarantines_on_retriable(monkeypatch):
-    """rl_initializing/sft_initializing are PRE-training (trainer/vLLM init), so a retriable infra
-    fault during init must STILL quarantine the region: reached_training_now() must treat the init
-    heartbeat as setup, not training. Regression for the *_initializing stages missing from
-    _SETUP_HEARTBEAT_STAGES. Mirrors the Lambda path (uses the rl_ init stage here)."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: vLLM init OOM", "retriable": True}),
-    )
-    res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"stage": "rl_initializing", "step": 0, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert res.host_fault  # init-time infra fault is pre-training -> region quarantined
-
-
-def test_poll_model_prefetched_heartbeat_quarantines_on_retriable(monkeypatch):
-    """``model_prefetched`` is emitted by prefetch_model() right after sft_start/rl_start while pulling
-    weights -- pre-training cold start, NOT a training step. A retriable infra/GPU fault after prefetch
-    but before the first step must STILL quarantine the region: reached_training_now() must treat it as
-    setup. Regression: model_prefetched was missing from SETUP_HEARTBEAT_STAGES, so is_training_stage()
-    returned True and host_fault was wrongly suppressed. Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: cuda init failed", "retriable": True}),
-    )
-    res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"stage": "model_prefetched", "step": 0, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert res.host_fault  # prefetch is pre-training -> region quarantined
-
-
-def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
-    """A retriable failure marker can land in the SAME poll iteration the worker first reaches training
-    -- the marker branch decides host_fault BEFORE surface_heartbeat() advances seen_training_hb.
-    reached_training_now() force-reads the heartbeat and sees the training stage, so a mid-training
-    RetriableInfraError retries (job_preempted) WITHOUT quarantining the healthy region."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: gpu fell off the bus", "retriable": True}),
-    )
-    res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        # sft_step is the worker's real training-step stage -> is_training_stage() True only because
-        # it is a genuine step (not just any non-setup string), so this actually guards the classification.
-        heartbeat_reader=lambda force=False: {"stage": "sft_step", "step": 7, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert not res.host_fault  # training already reached -> region healthy, do NOT quarantine
-
-
-def test_poll_trained_completion_upload_retry_not_quarantined(monkeypatch):
-    """A retriable marker flagged ``trained`` (the worker REACHED end-of-training but the required
-    DONE/metrics UPLOAD failed) is a post-training completion retry on a HEALTHY region. It must retry
-    (job_preempted) WITHOUT quarantining the region even on a fast run where no fresh training heartbeat
-    was latched and the latest forced hb is the worker's error_* stage. Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": True, "trained": True, "error": "DONE upload failed"}
-        ),
-    )
-    res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"stage": "error_sft", "ts": 10_000.0},  # no training hb latched
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable upload failure -> retry on a fresh host
-    assert not res.host_fault  # trained: post-training completion retry on a healthy region -> NO quarantine
-
-
-def test_poll_host_neutral_marker_not_quarantined(monkeypatch):
-    """A bootstrap-raised retriable marker flagged ``host_neutral`` (the pre-worker spilled-spec HF
-    fetch) is a region-INDEPENDENT delivery failure, so it retries (job_preempted) WITHOUT quarantining
-    the region even pre-training (no fresh heartbeat). Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": True, "host_neutral": True,
-             "error": "failed to fetch the spilled job spec from HF"}
-        ),
-    )
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable -> retry on a fresh host
-    assert not res.host_fault  # host_neutral: HF-delivery failure, not a sick region -> NO quarantine
-
-
-def test_poll_host_failmark_still_quarantines(monkeypatch):
-    """The HOST cloud-init failmark (docker/GPU never ready) sets retriable=True but OMITS host_neutral
-    (it is written by the host, not the in-container bootstrap), so it must STILL quarantine the region
-    -- guarding the host_neutral suppression from disabling real broken-region failover (the CANADA-1
-    case). Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": True, "error": "host: docker run failed"}
-        ),
-    )
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable host fault -> retry on a fresh host
-    assert res.host_fault  # docker/GPU never ready, no host_neutral -> region quarantined
-
-
-def test_poll_marker_path_cancel_requested_not_quarantined(monkeypatch):
-    """fail_from_marker must ALSO honor run_cancelled(): a cancel-in-progress (state still 'running',
-    cancel_requested true) that lands via a just-written / stale attempt failure marker must NOT
-    quarantine a healthy region for our own teardown -- mirroring the dead-VM and first-liveness paths."""
-    import flash.runner
-
-    monkeypatch.setattr(
-        flash.runner, "get_status",
-        lambda run_id: type("S", (), {"state": "running", "cancel_requested": True})(),
-    )
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": True, "error": "host: docker run failed"}
-        ),
-    )
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable marker -> retry
-    assert not res.host_fault  # cancel-in-progress -> NOT quarantined even via the marker path
-
-
-def test_poll_github_ratelimit_heartbeat_not_quarantined(monkeypatch):
-    """A pre-training GitHubRateLimitError makes the worker stamp a FRESH error heartbeat flagged
-    retriable + host_neutral; the region-independent fault must retry (job_preempted) WITHOUT
-    quarantining a healthy region (fresh_host_neutral_hb suppresses host_fault). Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": False, "error": "no /tmp/metrics.json (crashed)"}
-        ),
-    )
-    res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {
-            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "host_neutral": True
-        },
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable hb -> retry on a fresh host
-    assert not res.host_fault  # host_neutral hb: global rate limit, not a sick region -> NO quarantine
-
-
-def test_poll_dead_vm_neutral_heartbeat_without_marker_not_quarantined(monkeypatch):
-    """Same region-INDEPENDENT GitHubRateLimitError, but the attempt marker never landed (its upload
-    failed, or the VM was lost before write) so we hit the DEAD-VM branch instead of fail_from_marker.
-    That branch must apply the same fresh_host_neutral_hb() guard the marker path does: retry the global
-    rate limit (job_preempted via the retriable hb) WITHOUT quarantining an otherwise-healthy region.
-    Pre-fix this branch set host_fault unconditionally on a pre-training loss -> false quarantine."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        # NO marker -> falls through terminal_artifact_result() to the dead-VM branch
-    )
-    res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {
-            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "host_neutral": True
-        },
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable hb -> retry on a fresh host
-    assert not res.host_fault  # host_neutral hb on the dead-VM path: NO quarantine of a healthy region
-
-
-def test_poll_dead_vm_cancel_requested_not_quarantined(monkeypatch):
-    """cancel_run sets cancel_requested=True BEFORE it deletes the VM and persists the terminal
-    'cancelled' state. A poll landing in that teardown window (state still 'running') must honor the
-    intent and NOT quarantine a healthy region for our own cancellation."""
-    import flash.runner
-
-    monkeypatch.setattr(
-        flash.runner, "get_status",
-        lambda run_id: type("S", (), {"state": "running", "cancel_requested": True})(),
-    )
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        boot="+ docker pull ... (cancel in progress)",
-    )
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert not res.host_fault  # cancel-in-progress -> region NOT quarantined
-
-
-def test_poll_dead_vm_trained_heartbeat_without_marker_not_quarantined(monkeypatch):
-    """A post-training required upload fails retriably and BOTH the worker's attempt marker and the VM
-    are lost, leaving only a fresh error_* heartbeat flagged trained=True. The dead-VM path must read
-    that heartbeat 'trained' flag (the marker is unavailable here) and NOT quarantine a HEALTHY region
-    that actually finished training -- mirroring the marker.trained guard."""
-    jobs = _wire_poll(
-        monkeypatch, vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-    )
-    res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {
-            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "trained": True
-        },
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable hb -> retry
-    assert not res.host_fault  # trained hb: finished training on a healthy region -> NO quarantine
-
-
-def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
-    """On a reattach whose first poll already sees the VM active, active_since is launch-anchored, so
-    the launch-relative first_liveness deadline is already blown. The observed-grace floor stops a VM
-    that only JUST became active (after a long provision the control plane missed) from being failed
-    over before its boot-log uploader's publication window: even with the boot.log absent past
-    BOOT_LOG_ABSENT_POLLS and the deadline exceeded, no 'no worker liveness' stall fires until we've
-    watched it active for FIRST_LIVENESS_OBSERVED_GRACE_S. Here the VM dies (host loss) inside that
-    window -> job_preempted, not the premature liveness stall (which the pre-fix code would return)."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}] * 4 + [{"status": "ERROR"}],
-        boot=None,  # uploader has not published yet
-        step=0.1,  # tiny steps so the 120s observed-grace floor is NOT reached in these few polls
-    )
-    # Launch 1_000s ago (clock starts 10_000): the first_liveness deadline (10s) is blown, but the
-    # 3_000s setup grace is NOT (else its launch-anchored stall would fire first and mask the floor).
-    res = jobs.poll_hs_job(
-        _handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=10.0
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # died inside the observed-grace window
-    assert "no worker liveness" not in (res.detail or "")
-
-
-def test_poll_reattach_setup_stall_no_liveness_quarantines(monkeypatch):
-    """On a reattach whose first poll already sees an active VM silent since launch PAST the setup grace,
-    the observed-grace floor defers the first-liveness branch -- but the VM produced NO liveness (no
-    boot.log, no heartbeat), so the pre-training setup STALL must still host_fault to quarantine the
-    wedged region (else the next attempt re-enters it). Pre-fix the setup-stall return had no host_fault."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}] * 3,
-        boot=None,  # no boot.log
-        step=0.1,  # observed-grace floor (120s) NOT reached -> first-liveness stays deferred
-    )
-    res = jobs.poll_hs_job(
-        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
-        first_liveness_s=10.0, setup_grace_s=10.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert res.host_fault  # active but never any liveness past setup grace on reattach -> quarantine
-
-
-def test_poll_reattach_setup_stall_boot_log_present_not_quarantined(monkeypatch):
-    """SAME reattach window as above, but the VM DID publish a boot.log (cloud-init ran, worker booting
-    slowly). The first-liveness branch -- which normally latches boot_log_seen -- is deferred by the
-    observed-grace floor, so the setup-stall fires first with boot_log_seen still False. It must FORCE-read
-    the boot.log before the no-liveness predicate: a boot-log-only stall is ambiguous (the worker ran), so
-    it stays a (retriable) stall but must NOT host_fault/quarantine a healthy region. Mirrors Lambda."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}] * 3,
-        boot="+ docker pull ...\n",  # boot.log present -> cloud-init ran -> NOT a no-liveness region
-        step=0.1,  # observed-grace floor (120s) NOT reached -> first-liveness latch stays deferred
-    )
-    res = jobs.poll_hs_job(
-        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
-        first_liveness_s=10.0, setup_grace_s=10.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert not res.host_fault  # boot.log present (force-read latch) -> ambiguous stall, region NOT sick
-
-
-def test_poll_setup_stall_done_marker_wins_over_quarantine(monkeypatch):
-    """The pre-training setup-stall path force-reads terminal artifacts before returning, exactly as the
-    first-liveness branch does. A worker can finish right at the stall boundary and have its DONE delayed
-    by Hub rate-limiting (the NON-forced loop read misses it); the FORCED terminal read at the stall must
-    surface that DONE so a completed run is reported as success, NOT a wrongful stall that quarantines a
-    region which actually finished. Pre-fix the setup-stall return host_fault'd without reading. Mirrors Lambda."""
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs
-
-    monkeypatch.setattr(hs_api, "get_vm", lambda vm_id: {"status": "ACTIVE"})
-    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
-    # step=0.1 keeps the observed-grace floor (120s) unreached -> first-liveness branch stays deferred, so
-    # the SETUP-STALL branch (launch already past setup_grace) is the one that trips first.
-    clock = itertools.count(start=10_000, step=0.1)
-    monkeypatch.setattr(jobs.time, "time", lambda: float(next(clock)))
-    metrics = json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0})
-
-    def factory(hf_repo, path, min_interval_s=45.0):
-        def read(force=False):
-            if path.endswith("/DONE"):
-                return "10500.0" if force else None  # rate-limited: only the forced stall read surfaces it
-            if path.endswith("metrics.json"):
-                return metrics
-            return None  # no boot.log, no marker -> would otherwise be a no-liveness quarantine
-
-        return read
-
-    monkeypatch.setattr(jobs, "_make_hf_file_reader", factory)
-    # Launched 9_000s ago (clock starts 10_000): silent since launch, setup grace already exceeded on iter 1.
-    res = jobs.poll_hs_job(
-        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
-        first_liveness_s=10.0, setup_grace_s=10.0,
-    )
-    assert res.ok  # forced DONE read before the setup-stall return -> success, not stall/quarantine
-    assert res.failure is None
 
 
 def test_poll_dead_vm_without_marker_is_preempted(monkeypatch):
@@ -925,152 +509,6 @@ def test_poll_dead_vm_without_marker_is_preempted(monkeypatch):
     assert "gpu never became ready" in res.detail
 
 
-def test_poll_dead_vm_with_error_file_is_job_failed_not_quarantined(monkeypatch):
-    """A worker that RAN and crashed early (left error_<phase>.txt) but died before writing the
-    attempt marker is a DETERMINISTIC worker-CODE error -> fail fast (job_failed), NOT a host loss.
-    Crucially it must NOT set host_fault: the region is healthy, so quarantining it (over-quarantine)
-    would needlessly evict a good region for a user-code bug. Mirrors the Lambda dead-host path."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        error="Traceback (most recent call last):\nFileNotFoundError: environment archive did not contain ...",
-    )
-    res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {}
-    )
-    assert not res.ok
-    assert res.failure == "job_failed"  # deterministic worker error, fail fast
-    assert "environment archive" in res.detail
-    assert not res.host_fault  # worker-code crash != region fault -> region NOT quarantined
-
-
-def test_poll_dead_vm_with_retriable_error_still_preempted(monkeypatch):
-    """Even WITH an error_<phase>.txt, a crash the worker flagged retriable (RetriableInfraError,
-    stamped in the heartbeat) retries on a fresh host (job_preempted) and DOES quarantine the region
-    (a pre-training infra fault). Keeps a stale prior-attempt error file from flipping a genuine
-    preemption to job_failed. Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        error="Traceback ...\nRetriableInfraError: cuda device not ready",
-    )
-    res = jobs.poll_hs_job(
-        _handle(),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        # FRESH retriable heartbeat (ts >= launch): this attempt's worker flagged the fault retriable.
-        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert res.host_fault  # fresh retriable infra crash before any training heartbeat -> quarantine
-
-
-def test_poll_dead_vm_stale_retriable_hb_does_not_mask_crash(monkeypatch):
-    """A STALE prior-attempt retriable heartbeat (ts < launch) must NOT suppress THIS attempt's
-    deterministic crash. The dead branch gates ``worker_crashed`` on fresh_retriable_hb() (launch-fresh),
-    NOT bare worker_flagged_retriable(), so a non-retriable error_<phase>.txt this attempt is classified
-    terminal job_failed and the healthy region is NOT quarantined. Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        error="Traceback ...\nValueError: bad config",  # deterministic, non-retriable
-    )
-    res = jobs.poll_hs_job(
-        _handle(),  # attempt 0
-        _spec(),
-        seed=0,
-        interval_s=0,
-        # retriable BUT stale (ts < launch 10_000): a prior attempt's lingering signal.
-        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 5_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_failed"  # crash trusted, not masked by the stale retriable hb
-    assert not res.host_fault  # deterministic worker crash -> region stays healthy
-
-
-def test_poll_dead_vm_error_stage_hb_quarantines_pretraining_fault(monkeypatch):
-    """An ``error_<phase>`` heartbeat stage is the worker's crash marker -- pre-training, NOT a training
-    step. is_training_stage() excludes error_* (and the *_initializing setup stages), so reached_training_now()
-    is False and a FRESH retriable infra fault during init still quarantines the region (host_fault). If
-    error_* were misread as a training stage the quarantine would be wrongly suppressed. Mirrors Lambda."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        error="Traceback ...\nRetriableInfraError: cuda device not ready",
-    )
-    res = jobs.poll_hs_job(
-        _handle(),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        # fresh, retriable, crash-stage heartbeat -> pre-training infra fault.
-        heartbeat_reader=lambda force=False: {"stage": "error_sft", "retriable": True, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # fresh retriable -> retry on a fresh host
-    assert res.host_fault  # error_* is pre-training -> quarantine the region
-
-
-def test_poll_dead_vm_stale_error_with_fresh_boot_heartbeat_is_preempted(monkeypatch):
-    """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. On
-    a RETRY (attempt > 0) that posts a boot heartbeat (THIS attempt is still booting) then loses the VM,
-    the loss must NOT be classified terminal job_failed off the stale file: fresh_error_heartbeat() is
-    false for a setup-stage heartbeat, so without positive current-crash evidence the loss stays
-    retriable (job_preempted). Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a retriable prior attempt
-    )
-    res = jobs.poll_hs_job(
-        _handle(attempt=1), _spec(), seed=0, interval_s=0,  # a RETRY: a stale prior-attempt file is possible
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # stale error file did not flip a host loss to terminal
-
-
-def test_poll_dead_vm_first_attempt_error_with_setup_heartbeat_is_job_failed(monkeypatch):
-    """The inverse guard: on the FIRST attempt (attempt 0) no prior attempt exists, so a present
-    error_<phase>.txt is unambiguously THIS attempt's crash. A worker that wrote the error file then
-    died in setup BEFORE stamping its terminal error heartbeat (last heartbeat still a setup stage)
-    must still fail fast as job_failed -- the stale-file guard must not misread a genuine current crash
-    as retriable. Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        error="Traceback ...\nValueError: bad config -> deterministic crash this attempt",
-    )
-    res = jobs.poll_hs_job(
-        _handle(attempt=0), _spec(), seed=0, interval_s=0,  # FIRST attempt: error file can't be stale
-        heartbeat_reader=lambda force=False: {"stage": "sft_model_load", "step": 0, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_failed"  # current-attempt crash trusted despite the setup-stage heartbeat
-
-
-def test_poll_dead_vm_retry_stale_error_no_current_liveness_is_preempted(monkeypatch):
-    """On a RETRY (attempt > 0) the seed-scoped error_<phase>.txt may be a PRIOR attempt's, and THIS
-    attempt's VM can be lost before producing ANY fresh heartbeat. With no current-attempt liveness,
-    there is no proof the worker crashed this attempt, so the loss is a HOST LOSS -> job_preempted, NOT
-    a wrongful terminal job_failed off the stale file (over-retry is the documented safe bias on
-    retries). Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
-        error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a prior attempt
-    )
-    res = jobs.poll_hs_job(
-        _handle(attempt=1), _spec(), seed=0, interval_s=0,  # a RETRY
-        heartbeat_reader=lambda force=False: {},  # NO fresh heartbeat this attempt (cold VM loss)
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # host loss, not the stale file's deterministic crash
-    assert res.host_fault  # pre-training host loss with no cancel -> region quarantined
-
-
 def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
     """Hyperstack CANADA-1 (or any HS region) equivalent of the Lambda sick-region case: a VM that
     reaches ACTIVE but never starts a worker (no boot.log/heartbeat/marker) fails over fast as a
@@ -1080,7 +518,6 @@ def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
     assert not res.ok
     assert res.failure == "stalled"
     assert "no worker liveness" in res.detail
-    assert res.host_fault  # region quarantined by submit_run_hyperstack on this result
 
 
 def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
@@ -1095,41 +532,6 @@ def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
     res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
     assert res.failure == "job_preempted"
     assert "no worker liveness" not in (res.detail or "")
-
-
-def test_poll_legacy_boot_log_satisfies_first_liveness_on_reattach(monkeypatch):
-    """Mixed-version reattach: a VM launched by the PREVIOUS user-data wrote the legacy non-attempt-
-    scoped hyperstack_boot.log while the attempt-scoped path is absent. The first-liveness gate must
-    accept the legacy log as liveness and NOT fast-fail/quarantine a healthy, still-booting old VM
-    during the upgrade drain window. Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
-        boot=None,  # attempt-scoped boot.log absent
-        legacy_boot="+ docker pull ... (old-CP VM, legacy boot.log)",  # legacy path present
-        step=100.0,
-    )
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
-    assert "no worker liveness" not in (res.detail or "")  # legacy boot.log satisfied first-liveness
-
-
-def test_poll_legacy_boot_log_honored_on_attempt1_reattach(monkeypatch):
-    """A mixed-version reattach can be polling a PRE-upgrade attempt 1+ VM whose old user-data wrote only
-    the legacy boot.log. The legacy fallback must be honored on ANY attempt (gating it to attempt 0 would
-    falsely quarantine the healthy old retry); a stale prior-attempt legacy log can't mask a relaunch
-    because recovery purges it. Mirrors the Lambda path."""
-    jobs = _wire_poll(
-        monkeypatch,
-        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
-        boot=None,  # attempt-scoped boot.log absent (old VM wrote only the legacy path)
-        legacy_boot="+ docker pull ... (old-CP attempt-1 VM, legacy boot.log)",
-        step=100.0,
-    )
-    res = jobs.poll_hs_job(_handle(attempt=1), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
-    assert "no worker liveness" not in (res.detail or "")  # legacy boot.log honored on attempt 1
 
 
 def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):
@@ -1213,58 +615,6 @@ def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypa
     assert res.failure == "stalled"
     assert "no worker liveness" in res.detail
     assert calls["n"] >= BOOT_LOG_ABSENT_POLLS  # required the absence to persist, not a lone None
-
-
-def test_poll_active_done_marker_wins_over_first_liveness_stall(monkeypatch):
-    """The boot.log uploader is best-effort and can silently never run even though the worker itself
-    ran and uploaded a terminal DONE. The boot.log-absence threshold (~45s) can trip before
-    marker_reader()'s NON-forced re-read surfaces the DONE, so before returning a 'stalled' (which would
-    mask the real outcome AND quarantine a region that actually completed the run) the poller FORCE-reads
-    the terminal artifacts. A fresh DONE must win -> success, not stalled. Mirrors the Lambda path."""
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs
-
-    monkeypatch.setattr(hs_api, "get_vm", lambda vm_id: {"status": "ACTIVE"})
-    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
-    clock = itertools.count(start=10_000, step=100)
-    monkeypatch.setattr(jobs.time, "time", lambda: float(next(clock)))
-    metrics = json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0})
-
-    def factory(hf_repo, path, min_interval_s=45.0):
-        def read(force=False):
-            # DONE is rate-limited: the NON-forced loop read never surfaces it; only the FORCED
-            # terminal_artifact_result() read at the stall boundary does (mirrors the 45s vs 60s race).
-            if path.endswith("/DONE"):
-                return "10500.0" if force else None
-            if path.endswith("metrics.json"):
-                return metrics
-            return None  # no boot.log, no marker, no error file
-
-        return read
-
-    monkeypatch.setattr(jobs, "_make_hf_file_reader", factory)
-    res = jobs.poll_hs_job(
-        _handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=50.0
-    )
-    assert res.ok  # forced DONE read before the stall -> terminal success, not a wrongful stall/quarantine
-    assert res.failure is None
-
-
-def test_poll_first_liveness_stall_cancelled_run_not_quarantined(monkeypatch):
-    """A user cancel can land while the VM is still ACTIVE-but-silent (no boot.log/heartbeat), and the
-    first-liveness threshold can fire before the runner observes the cancellation. run_cancelled()
-    suppresses host_fault so a deliberate teardown does NOT quarantine a healthy region -- mirrors the
-    dead-VM branch's cancel guard, which this liveness-stall path previously lacked. Mirrors Lambda."""
-    import flash.runner
-
-    monkeypatch.setattr(
-        flash.runner, "get_status", lambda run_id: type("S", (), {"state": "cancelled"})()
-    )
-    jobs = _wire_poll(monkeypatch, vms=[{"status": "ACTIVE"}], boot=None, step=100.0)
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert res.failure == "stalled"
-    assert "no worker liveness" in res.detail
-    assert not res.host_fault  # cancelled -> region NOT quarantined despite the liveness stall
 
 
 def test_poll_loading_timeout(monkeypatch):
@@ -1388,7 +738,7 @@ def _wire_runner(monkeypatch, poll_outcome):
 
     deleted = []
     monkeypatch.setattr(hs_api, "delete_vm", lambda vid: deleted.append(vid) or True)
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: _handle())
 
     def fake_poll(*a, **k):
@@ -1435,45 +785,6 @@ def test_runner_deletes_when_handle_persist_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="status store unreachable"):
         jobs.submit_run_hyperstack(_spec(), seed=0, on_handle=boom)
     assert deleted == ["vm-9999"]
-
-
-def test_submit_falls_back_to_quarantined_region_when_healthy_empty(monkeypatch):
-    """allocate() can pick a class whose every fitting region is quarantined; submit must mirror that
-    last-resort relaxation rather than re-fetching a healthy-only (empty) region list and hard-failing
-    at launch -- which would turn the bounded-demotion quarantine into a submit-time kill switch. When
-    the healthy usable_instances() is empty, submit re-fetches with ignore_sick=True and passes it
-    through to launch_and_submit so the in-launch region walk stays consistent."""
-    from flash.providers.base import PollResult
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs
-
-    monkeypatch.setattr(hs_api, "delete_vm", lambda vid: True)
-
-    seen_calls = []  # (force, ignore_sick) per usable_instances() call
-
-    def fake_usable(gpu, force=False, ignore_sick=False):
-        seen_calls.append((force, ignore_sick))
-        # healthy view empty; the relaxed fallback recovers the region ONLY when it bypasses the cache
-        # (force=True) -- a non-forced relaxed re-fetch would return the same stale-empty view.
-        return [_inst()] if (ignore_sick and force) else []
-
-    captured = {}
-
-    def fake_launch(spec, seed, instances, **k):
-        captured["instances"] = instances
-        captured["ignore_sick"] = k.get("ignore_sick")
-        return _handle()
-
-    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
-    monkeypatch.setattr(jobs, "launch_and_submit", fake_launch)
-    monkeypatch.setattr(jobs, "poll_hs_job", lambda *a, **k: PollResult(True, metrics={"a": 1}))
-
-    res = jobs.submit_run_hyperstack(_spec(), seed=0)
-    assert res.ok
-    assert [c[1] for c in seen_calls] == [False, True]  # healthy pass first (empty), then relaxed fallback
-    assert seen_calls[1][0] is True  # relaxed fallback bypasses the cache (force=True) to find live stock
-    assert captured["instances"]  # launch got the recovered quarantined candidate, not an empty list
-    assert captured["ignore_sick"] is True  # propagated so the in-launch walk relaxes too
 
 
 def test_submit_rejects_policy_word_gpu():
@@ -1637,21 +948,24 @@ def test_allocator_capacity_aware(monkeypatch):
 
     monkeypatch.setenv("HYPERSTACK_API_KEY", "hk")
 
-    def fake_usable(gpu, force=False, ignore_sick=False):
+    def fake_usable(gpu):
         if gpu == "RTX A6000":
             return [
                 HyperstackInstance("RTX A6000", "n3-RTX-A6000x1", "NORWAY-1", "default-NORWAY-1", 48, 0.49)
             ]
-        if gpu == "L40":  # in stock, but L40 is DROPPED from auto-allocation (broken-fleet only home)
+        if gpu == "L40":  # in stock; allocatable again (CANADA-1 fleet re-verified healthy)
             return [HyperstackInstance("L40", "n3-L40x1", "CANADA-1", "default-CANADA-1", 48, 1.00)]
         return []  # other hyperstack classes out of stock
 
     monkeypatch.setattr("flash.providers.hyperstack.jobs.usable_instances", fake_usable)
     a = allocator.allocate("Qwen/Qwen3.5-4B", "sft", train={"max_length": 4096, "lora_rank": 16})
     hs = {c.gpu for c in a.candidates if c.provider == "hyperstack"}
-    # Only the in-stock, non-excluded class: capacity-aware filtering drops the out-of-stock classes,
-    # and L40 is excluded even though it HAS stock (its sole home is the broken CANADA-1 fleet).
-    assert hs == {"RTX A6000"}
+    # Capacity-aware filtering keeps only the in-stock classes (drops the out-of-stock ones). Both the
+    # A6000 and L40 are in stock, so both are candidates; A6000 outranks L40 on price ($0.49 < $1.00).
+    assert hs == {"RTX A6000", "L40"}
+    a6000 = next(c for c in a.candidates if c.gpu == "RTX A6000")
+    l40 = next(c for c in a.candidates if c.gpu == "L40")
+    assert a.candidates.index(a6000) < a.candidates.index(l40)  # cheaper A6000 ranked ahead of L40
 
 
 # --- review-fix regressions ---

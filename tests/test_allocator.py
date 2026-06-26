@@ -27,20 +27,6 @@ def test_required_vram_catalog_and_open(monkeypatch):
     assert all(c.vram_gb >= 35 for c in a.candidates)
 
 
-def test_l40_dropped_from_auto_allocation():
-    """L40 is excluded from auto-allocation on PRICE: it is strictly dominated by RTX A6000 (same 48 GB,
-    half the price, on all three providers), so the cheapest-fitting walk should never pick it. (Its only
-    Flash home is Hyperstack's on-demand L40 stock; that CANADA-1 fleet was once broken-driver but is
-    healthy + un-banned now — the price domination is what keeps L40 excluded.) The catalog row is KEPT
-    (the name still resolves and the Hyperstack runner machinery/tests use it) — only the allocator
-    candidate seam drops it."""
-    from flash.providers import allocator
-    from flash.providers.base import GPU_INFO
-
-    assert "L40" in allocator._POOL_EXCLUDED
-    assert "L40" in GPU_INFO  # still catalogued (name resolves; not a hard removal)
-
-
 def test_allocation_restricted_to_validated_pool(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import VALIDATED
@@ -129,59 +115,6 @@ def test_nothing_fits_names_constraint(monkeypatch):
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
     with pytest.raises(UnsupportedGpuError, match="4096 GB"):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-
-
-def test_quarantine_hiding_last_capacity_falls_back_not_hard_fail(monkeypatch):
-    """Region quarantine is bounded DEMOTION, never a hard-fail. When the only available provider's
-    fitting class has all its capacity-having regions quarantined, the normal (healthy) view is empty
-    -- but allocate() must NOT raise the config-shaped UnsupportedGpuError that _run_seed_loop treats
-    as terminal. Its last-resort pass relaxes the quarantine (ignore_sick) and still returns a
-    candidate, so the run launches into a possibly-sick region (which just host_faults + escapes if
-    still broken) instead of being killed at submit by our own quarantine."""
-    from flash.providers import allocator
-    from flash.providers.lambdalabs import jobs as lambda_jobs
-
-    monkeypatch.setattr(allocator, "available_providers", lambda: ["lambda"])
-
-    seen = {"healthy": 0, "relaxed": 0}
-
-    def fake_usable(gpu_class, force=False, ignore_sick=False):
-        # Healthy view: every fitting region is quarantined -> empty. Last-resort view: recovered.
-        if ignore_sick:
-            seen["relaxed"] += 1
-            return [object()]
-        seen["healthy"] += 1
-        return []
-
-    monkeypatch.setattr(lambda_jobs, "usable_instances", fake_usable)
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    assert a.provider == "lambda"  # recovered via the ignore_sick last-resort pass, not hard-failed
-    assert seen["healthy"] > 0  # the healthy pass ran first (and came back empty)
-    assert seen["relaxed"] > 0  # then the last-resort fallback recovered the quarantined candidate
-
-
-def test_quarantine_demotes_sick_candidate_strictly_below_healthy(monkeypatch):
-    """A class whose capacity is ONLY in a quarantined region is kept as a demoted last-resort
-    candidate -- ranked strictly AFTER every healthy candidate even when it is CHEAPER -- so quarantine
-    never lets a sick region WIN the pick, only serve as a fallback once healthy capacity is exhausted
-    (which the runner reaches by walking the ranked list across retries)."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
-
-    monkeypatch.setattr(allocator, "available_providers", lambda: ["lambda"])
-    healthy = Candidate("lambda", "A100 SXM 40GB", 1.79, 40)
-    sick_only = Candidate("lambda", "A10", 0.75, 24)  # CHEAPER, but capacity only in a quarantined region
-
-    def fake_lambda(need, ignore_sick=False):
-        # healthy view: only the A100; relaxed view additionally surfaces the sick-only A10.
-        return [healthy, sick_only] if ignore_sick else [healthy]
-
-    monkeypatch.setattr(allocator, "_lambda_candidates", fake_lambda)
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    assert a.provider == "lambda"
-    assert a.gpu == "A100 SXM 40GB"  # healthy wins despite the sick A10 being cheaper
-    # the sick candidate is still PRESENT (reachable as a last resort) but demoted strictly last.
-    assert [c.gpu for c in a.candidates] == ["A100 SXM 40GB", "A10"]
 
 
 def test_estimator_matches_measured_seq_boundaries():

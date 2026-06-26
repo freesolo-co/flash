@@ -18,14 +18,6 @@ import time
 from flash.spec import JobSpec
 
 
-def _is_cancel_intent(status) -> bool:
-    """A user cancel is in effect — either already persisted as the terminal ``cancelled`` state, or a
-    durable INTENT recorded by cancel_run (``cancel_requested``) BEFORE it finishes tearing the box down
-    and persists that state. The pre-provision / retry guards honor the intent too, so a cancel landing
-    in cancel_run's teardown window never launches (or re-launches) a fresh PAID worker for the run."""
-    return status.state == "cancelled" or bool(getattr(status, "cancel_requested", False))
-
-
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
     from flash.providers.runpod.train import upload_code
@@ -109,22 +101,14 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
 
     Keyed on (provider, gpu) IDENTITY, never a list index, so it stays correct even though each
     attempt re-allocates and the live-capacity ordering can shift between attempts.
-
-    A SICK candidate (a class whose capacity is only in a quarantined region) is demoted by ``c.sick``
-    ranked ABOVE the failed-provider escape AND price, so EVERY healthy candidate is preferred over any
-    sick one -- even a healthy class whose provider just failed (escaping to a known-sick region before
-    healthy capacity is exhausted would violate bounded demotion). ``c.sick`` sits AFTER ``class_tried``
-    so the walk still REACHES a sick class once the healthy classes are all tried (an untried sick beats
-    a tried healthy); within the healthy tier the cross-provider escape and price ordering are unchanged.
     """
     return min(
         candidates,
         key=lambda c: (
-            (c.provider, c.gpu) in tried_classes,  # 1) prefer a class not yet tried this run
-            getattr(c, "sick", False),  # 2) then prefer ANY healthy class over a quarantine-only one
-            c.provider in failed_providers,  # 3) then escape providers that already failed (healthy tier)
-            c.hourly_usd,  # 4) then cheapest
-            c.vram_gb,  # 5) then the smaller card (don't burn a big GPU on a small job)
+            c.provider in failed_providers,  # 1) escape providers that already failed this run
+            (c.provider, c.gpu) in tried_classes,  # 2) then prefer a class not yet tried
+            c.hourly_usd,  # 3) then cheapest
+            c.vram_gb,  # 4) then the smaller card (don't burn a big GPU on a small job)
         ),
     )
 
@@ -280,7 +264,7 @@ def _submit_seed_supervised(
         # never launches a worker (the later checks only stop the final-state
         # overwrite, after the GPU has already run and billed).
         with contextlib.suppress(FileNotFoundError):
-            if _is_cancel_intent(get_status(spec.run_id)):
+            if get_status(spec.run_id).state == "cancelled":
                 raise _RunCancelled(f"run {spec.run_id} was cancelled")
         try:
             alloc = allocate(
@@ -303,7 +287,7 @@ def _submit_seed_supervised(
             # Re-check cancellation right before provisioning so a cancel during allocation
             # doesn't still launch a paid worker.
             with contextlib.suppress(FileNotFoundError):
-                if _is_cancel_intent(get_status(spec.run_id)):
+                if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
             # Pick this attempt's (provider, class) from the cross-provider ranked list: the first
             # attempt takes the cheapest; each retry that provisioned a class and lost it to an infra
@@ -376,7 +360,7 @@ def _submit_seed_supervised(
             # successfully after cancel_run() persisted `cancelled`. Don't let a late
             # worker success resurrect the run into running/done.
             try:
-                if _is_cancel_intent(get_status(spec.run_id)):
+                if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
             except FileNotFoundError:
                 # Status file not yet written (early race): treat as not-cancelled, proceed.
@@ -397,7 +381,7 @@ def _submit_seed_supervised(
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
         try:
-            if _is_cancel_intent(get_status(spec.run_id)):
+            if get_status(spec.run_id).state == "cancelled":
                 raise _RunCancelled(f"run {spec.run_id} was cancelled")
         except FileNotFoundError:
             # Status file not yet written (early race): treat as not-cancelled and proceed.
@@ -523,8 +507,7 @@ def _run_seed_loop(
         # already-terminal run. (The `running` _update below would be CAS-rejected anyway, but
         # the supervised submit would still have spent.) _RunCancelled is the loop's terminal
         # signal; its callers already swallow it / leave the existing terminal state intact.
-        status_now = get_status(spec.run_id)
-        if status_now.state in TERMINAL_STATES or _is_cancel_intent(status_now):
+        if get_status(spec.run_id).state in TERMINAL_STATES:
             raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting seed")
         _update(spec.run_id, "running")
         print(
@@ -539,7 +522,7 @@ def _run_seed_loop(
         # worker success doesn't resurrect a user-cancelled run via this "running"
         # update (or the final "done" below).
         with contextlib.suppress(FileNotFoundError):
-            if _is_cancel_intent(get_status(spec.run_id)):
+            if get_status(spec.run_id).state == "cancelled":
                 raise _RunCancelled(f"run {spec.run_id} was cancelled")
         # If more seeds follow, this seed's endpoint/instance is already torn down, so
         # clear the now-stale remote handle: a restart in the gap before the next
@@ -563,7 +546,7 @@ def _run_seed_loop(
     # Final guard: a cancel landing after the last seed's check must not be overwritten
     # by the terminal "done".
     with contextlib.suppress(FileNotFoundError):
-        if _is_cancel_intent(get_status(spec.run_id)):
+        if get_status(spec.run_id).state == "cancelled":
             raise _RunCancelled(f"run {spec.run_id} was cancelled")
     _update(
         spec.run_id,

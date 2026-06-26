@@ -36,7 +36,6 @@ def cancel_run(run_id: str) -> RunStatus:
         _gc_run_endpoints,
         _update,
         get_status,
-        mark_cancel_requested,
         mark_deployment_undeployed,
     )
 
@@ -52,12 +51,6 @@ def cancel_run(run_id: str) -> RunStatus:
     entered_deployed = status.state == "deployed"
     spec = JobSpec.from_dict(status.spec)
     remote = status.remote or {}
-    # Record the cancel INTENT before any remote teardown: the poll loop keys host_fault on
-    # run_cancelled(), and the terminal `cancelled` state isn't persisted until this function ends
-    # (after destroy + GC), so without the flag a poll seeing the box vanish mid-teardown would
-    # quarantine a healthy region for our own cancel. mark_cancel_requested re-reads under the lock
-    # and writes ONLY the flag (can't regress state nor be dropped by _update's terminal CAS).
-    mark_cancel_requested(run_id)
     # A deployed run also owns a serving registration with the freesolo serving
     # app that the training-endpoint GC below does not touch; deregister it too so
     # a cancelled run can't leave a deployment registered as active.
@@ -132,66 +125,6 @@ def cancel_run(run_id: str) -> RunStatus:
     return get_status(run_id)
 
 
-def _purge_stale_seed_artifacts(spec: JobSpec, seed: int, log) -> None:
-    """Best-effort: delete a seed's per-attempt LIVENESS artifacts before a recovery RELAUNCH of it.
-
-    Recovery (``attach_run``'s not-ok branch) restarts the seed's attempt loop at attempt 0 under the
-    SAME HF prefix, so a pre-recovery attempt's SEED-scoped files linger and can mislead the fresh
-    post-recovery box (whose attempt counter restarts at 0). Two such files matter to the instance
-    providers' poll classification:
-
-    - ``<arm>_attempt<N>_boot.log`` / the legacy ``<arm>_boot.log`` — fast first-liveness keys on a
-      boot.log's presence to tell a box that ran cloud-init from a silently dead one. A leftover would
-      FALSELY prove liveness for a silently-dead replacement, making it wait out the full setup grace
-      (~50 min) instead of failing over fast.
-    - ``error_<phase>.txt`` — the dead-host branch trusts this seed-scoped traceback as THIS attempt's
-      deterministic crash on attempt 0 (no prior attempt assumed). A leftover would make a fresh
-      attempt-0 box that's LOST before producing any signal be mis-classified terminal ``job_failed``
-      instead of retrying the recoverable host loss.
-    - ``<arm>_attempt<N>.json`` — the attempt-failure marker (``fail_from_marker``). The relaunch
-      restarts at attempt 0, so a leftover ``<arm>_attempt0.json`` from the abandoned attempt is read by
-      the fresh attempt-0 box's poller BEFORE it writes its own -> it immediately returns the stale
-      ``job_preempted`` / ``job_failed`` (or, for a retriable pre-training marker, quarantines the new
-      region) without the new worker ever running.
-
-    Clearing all three lets the relaunch start from a clean slate (a healthy new box rewrites its own; a
-    dead one leaves none -> correct fast failover / retry). Only these liveness artifacts are removed
-    (the worker owns/needs DONE/metrics/adapter/checkpoints). Best-effort, never raises into recovery.
-    For RunPod it only ever clears a stale ``error_<phase>.txt`` (RunPod writes no host boot.logs and no
-    ``<arm>_attempt<N>.json`` markers — those are instance-provider only), which is the same clean-slate
-    recovery semantics, just a narrower set."""
-    import os
-
-    repo = spec.train.hf_repo
-    if not repo:
-        return
-    prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
-
-    def _is_liveness_artifact(path: str) -> bool:
-        if not path.startswith(prefix + "/"):
-            return False
-        name = path.rsplit("/", 1)[-1]
-        return (
-            name.endswith("_boot.log")
-            or (name.startswith("error_") and name.endswith(".txt"))
-            # attempt-failure marker <arm>_attempt<N>.json (metrics.json / job_spec.json lack "_attempt")
-            or (name.endswith(".json") and "_attempt" in name)
-        )
-
-    try:
-        from huggingface_hub import HfApi
-
-        api = HfApi(token=os.environ.get("HF_TOKEN"))
-        stale = [f for f in api.list_repo_files(repo, repo_type="dataset") if _is_liveness_artifact(f)]
-        for f in stale:
-            with contextlib.suppress(Exception):
-                api.delete_file(path_in_repo=f, repo_id=repo, repo_type="dataset")
-        if stale:
-            print(f"attach: purged {len(stale)} stale liveness artifact(s) under {prefix}", file=log)
-    except Exception as exc:  # listing/auth is best-effort; never block recovery
-        print(f"attach: liveness-artifact purge warn for {spec.run_id}: {exc}", file=log)
-
-
 def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from ANY process (after a client crash/restart).
 
@@ -212,15 +145,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         artifacts_dir,
         get_status,
     )
-    from flash.runner.lifecycle import _is_cancel_intent
 
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
-    if getattr(status, "cancel_requested", False):
-        # Cancel intent set but terminal `cancelled` never persisted (cancel_run crashed mid-teardown):
-        # finish the cancel instead of reattaching to a run the user already cancelled.
-        return cancel_run(run_id)
     if not status.remote:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
@@ -242,12 +170,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
     res = get_provider(handle.provider).poll(handle, spec, seed, log=log)
     try:
-        # Re-read state after the long poll, and honor the cancel INTENT (not just persisted
-        # `cancelled`): a cancel landing during the poll must not let the not-ok resume branch relaunch
-        # paid work. FINISH via cancel_run (idempotent) so a cancel_run that died after recording intent
-        # still converges to terminal instead of dangling until the next recovery sweep.
-        if _is_cancel_intent(get_status(run_id)):
-            return cancel_run(run_id)
+        # A best-effort cancel deletes the job/instance, which the poller reports as a
+        # failure (or a late worker may still succeed) — either way, re-read the state
+        # first so a recovery thread can't overwrite the user's terminal `cancelled`.
+        if get_status(run_id).state == "cancelled":
+            return get_status(run_id)
         if not res.ok:
             # Job ended not-ok — usually because it was abandoned during the redeploy. Resume the
             # in-flight seed from its last HF checkpoint instead of failing; the seed loop
@@ -264,12 +191,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             # restart mid-allocation resumes the right one.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
-            # The relaunch restarts at attempt 0 under this same prefix; clear the abandoned box's
-            # seed-scoped artifacts (boot logs / error_<phase>.txt / attempt markers) so a stale one
-            # can't falsely satisfy the fresh box's first-liveness, look like its crash, or be read as
-            # its marker. Purge BEFORE the _update that clears the handle — a kill after remote=None is
-            # persisted routes the restart to resume_run (which also purges) not back here. Best-effort.
-            _purge_stale_seed_artifacts(spec, seed, log)
             # Bail if the run was raced to terminal during the long poll above: _update's CAS
             # returns False, and resuming would submit paid work for a dead run.
             if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
@@ -286,10 +207,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # Earlier seeds of a multi-seed run already persisted their cost into
         # status.cost_usd; add this seed's so recovery doesn't underreport spend.
         total = float(status.cost_usd or 0.0) + _persist_metrics(spec, seed, res.metrics)
-        # A cancel can land while this thread persists metrics; re-read before the post-seed writes so
-        # the "running"/"done" updates can't resurrect a cancelled run. Honor the INTENT too, so an
-        # in-progress cancel whose `cancelled` write hasn't landed still wins (_RunCancelled caught below).
-        if _is_cancel_intent(get_status(run_id)):
+        # A cancel can land while this thread persists the recovered seed's metrics
+        # (after the late-cancel check above). Re-read before the post-seed writes so
+        # the "running" update and the terminal "done" below can't resurrect a
+        # user-cancelled run (mirrors the fresh seed loop). _RunCancelled is caught
+        # below, leaving the cancellation intact.
+        if get_status(run_id).state == "cancelled":
             raise _RunCancelled(f"run {run_id} was cancelled")
         # The remote handle only identifies the seed that was in flight. For a
         # multi-seed run, resume the remaining seeds instead of terminally
@@ -331,16 +254,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         else:
             _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
     except _RunCancelled:
-        # Cancel detected mid-flight (pre-done re-check or _run_seed_loop raised) -> finish via
-        # cancel_run (idempotent) so it converges to terminal even if the original cancel_run died.
-        return cancel_run(run_id)
+        # Intentional: cancel_run already wrote the terminal `cancelled` state; leave it.
+        pass
     except Exception as exc:
-        # Don't stamp `failed` over an in-progress cancel: its sticky CAS would reject cancel_run's
-        # later `cancelled` and lose the intent. On cancel intent FINISH the cancel; else record the
-        # genuine failure.
-        if _is_cancel_intent(get_status(run_id)):
-            return cancel_run(run_id)
-        _update(run_id, "failed", error=str(exc))
+        if get_status(run_id).state != "cancelled":
+            _update(run_id, "failed", error=str(exc))
     finally:
         _gc_run_endpoints(spec)
     return get_status(run_id)
@@ -367,26 +285,15 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
         _update,
         get_status,
     )
-    from flash.runner.lifecycle import _is_cancel_intent
 
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
-    if getattr(status, "cancel_requested", False):
-        # Intent set but `cancelled` never persisted (cancel_run crashed): finish it, don't resume.
-        return cancel_run(run_id)
     if status.resume_seed_index is None:
         raise ValueError(f"run {run_id} has no resume_seed_index; cannot resume")
     spec = JobSpec.from_dict(status.spec)
     log = log_stream or sys.stderr
     print(f"resuming {run_id}: remaining seeds from index {status.resume_seed_index}", file=log)
-    # Resume restarts the seed at attempt 0 under the same prefix. If this is the durable continuation
-    # of an attach_run recovery (killed after remote=None persisted but before its in-process purge),
-    # clear that seed's stale artifacts here too so a leftover boot.log/error/marker can't mislead the
-    # fresh box. No-op for the normal inter-seed gap. Best-effort.
-    _seeds = list(spec.train.seeds)
-    if 0 <= status.resume_seed_index < len(_seeds):
-        _purge_stale_seed_artifacts(spec, _seeds[status.resume_seed_index], log)
     try:
         _run_seed_loop(
             spec,
@@ -395,15 +302,10 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
             prior_cost=float(status.cost_usd or 0.0),
         )
     except _RunCancelled:
-        # Converge to terminal via cancel_run (idempotent) rather than leaving non-terminal if the
-        # original cancel_run died after recording intent.
-        return cancel_run(run_id)
+        pass  # cancel_run already set the terminal state
     except Exception as exc:
-        # As in attach_run: don't let `failed` clobber an in-progress cancel (sticky CAS would reject
-        # cancel_run's `cancelled`). On cancel intent FINISH the cancel; else record the failure.
-        if _is_cancel_intent(get_status(run_id)):
-            return cancel_run(run_id)
-        _update(run_id, "failed", error=str(exc))
+        if get_status(run_id).state != "cancelled":
+            _update(run_id, "failed", error=str(exc))
     finally:
         # Mirror _run_job: GC any endpoint a transient destroy left behind rather than
         # leaking a billable RunPod endpoint.

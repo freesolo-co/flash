@@ -1309,9 +1309,6 @@ def run_sft():
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
-    # Training is fully done; record it locally BEFORE the first required upload so the bootstrap
-    # doesn't quarantine a healthy region if this adapter upload (which precedes metrics.json) fails.
-    mark_train_reached()
     hf_upload_folder(adapter_dir, "adapter", required=True)
     heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
@@ -1780,6 +1777,22 @@ def _grpo_is_no_op_failure(reward_history, resume_ckpt, target_steps: int, steps
     return not _grpo_resume_already_complete(resume_ckpt, target_steps, steps_run)
 
 
+def grpo_mask_truncated_completions(train) -> bool:
+    """Whether GRPO should drop TRUNCATED (non-EOS) completions from the loss.
+
+    Default True (TRL's footgun is off-by-default): a completion cut at
+    max_completion_length without an EOS is not a real sample from the policy's
+    distribution over finished sequences, so training on it biases the policy
+    gradient and — on envs that frequently hit the budget — can degrade the model
+    below its SFT start. GATED OFF when ``stop_sequences`` is set, because TRL flags
+    truncation by "last token != EOS/PAD" and a stop-string rollout terminates on the
+    stop *string* (stripped from the output, so the last token is not EOS); masking
+    would then wrongly drop every normally-terminated completion and the run would
+    learn nothing. ``stop_sequences`` defaults to () (the common case → on).
+    """
+    return not (train and train.stop_sequences)
+
+
 def run_rl():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -2162,6 +2175,20 @@ def run_rl():
         "beta": _kl_beta,
         "scale_rewards": "none",
         "loss_type": "dr_grpo",
+        # Exclude TRUNCATED completions (ran to max_completion_length without an EOS) from the
+        # loss. TRL's default is False, which trains on these incomplete rollouts — and because a
+        # truncated completion is not a real sample from the policy's distribution over FINISHED
+        # sequences, including it gives a biased policy gradient (TRL/DAPO: truncated completions
+        # are "incorrectly penalized and introduce noise during training"). On long-completion or
+        # multi-turn envs that frequently hit the budget this destabilizes GRPO and can DEGRADE the
+        # model below its SFT start (observed: runs with clipped_ratio 0.6-0.99 stalled at ~0 reward
+        # while the vLLM-vs-trainer sampling_logp_difference exploded). dr_grpo normalizes by the
+        # constant batch*max_completion_length (not mask.sum()), so masking every completion in a
+        # batch yields a 0 loss / 0 gradient — safe, never a divide-by-zero. TRL>=1.6 also applies
+        # this mask to the multi-turn tool/env mask, so the rollout_func path is covered too.
+        # GATED OFF when stop_sequences is set (see grpo_mask_truncated_completions): TRL flags
+        # truncation by "last token != EOS/PAD", but a stop-string rollout's last token is not EOS.
+        "mask_truncated_completions": grpo_mask_truncated_completions(_t),
         # Optimizer: 8-bit paged AdamW (int8 state paged to host RAM -> fits a smaller GPU);
         # colocated GRPO (trainer + vLLM on one GPU) is memory-tight, so this is the right default.
         "optim": fused_optim_name(),
@@ -2525,10 +2552,6 @@ def run_rl():
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
-    # Training is fully done (the no-reward guards above passed); record it locally BEFORE the first
-    # required upload so the bootstrap doesn't quarantine a healthy region if this adapter upload
-    # (which precedes metrics.json) fails.
-    mark_train_reached()
     hf_upload_folder(adapter_dir, "adapter", required=True)
     heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
@@ -2587,22 +2610,6 @@ def run_rl():
 # ---------------------------------------------------------------------------
 # Completion: train phase writes metrics.json + the DONE sentinel (see _finalize).
 # ---------------------------------------------------------------------------
-
-# Local sentinel that this attempt finished training (``trainer.train()`` returned), written BEFORE
-# the first REQUIRED upload (the trained adapter). The instance bootstrap reads it to tell a
-# post-training upload failure (the adapter/metrics/DONE never landed -> retriable, but the region
-# was healthy and productive) from a pre-training host fault. ``/tmp/metrics.json`` is written only
-# AFTER the adapter upload (see the SFT/RL paths), so on its own it can't cover a failure of that
-# adapter upload itself; this sentinel closes that gap. /tmp is shared with the bootstrap parent
-# process (same container), so a literal path (not an import) is the contract — keep it in sync with
-# _instance_bootstrap.py's reader.
-TRAIN_REACHED_SENTINEL = "/tmp/train_reached"
-
-
-def mark_train_reached() -> None:
-    """Stamp the post-training sentinel right before the first required upload (best-effort)."""
-    with contextlib.suppress(OSError), open(TRAIN_REACHED_SENTINEL, "w") as f:
-        f.write("1")
 
 
 def write_train_meta(
@@ -2931,12 +2938,6 @@ def main():
         # resolution runs lazily inside this try (require_active_env, called by the handlers above),
         # never at import, so a rate-limit raise reaches here and is classified correctly.
         retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
-        # GitHubRateLimitError (env ref resolution hit a global GitHub/control-plane rate limit) is
-        # retriable but REGION-INDEPENDENT — it follows the job to any host — so flag the heartbeat
-        # host_neutral so the pollers retry (job_preempted) WITHOUT quarantining a healthy region for a
-        # global dependency. A RetriableInfraError (broken GPU/driver, NVML, required upload) is NOT
-        # host_neutral: it can be a sick region, so it still drives the quarantine.
-        host_neutral = isinstance(e, GitHubRateLimitError)
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
@@ -2947,18 +2948,7 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        # ``trained``: training REACHED end-of-training (the /tmp/train_reached sentinel is stamped
-        # right before the first REQUIRED post-training upload). A retriable failure on that upload
-        # (adapter/DONE/metrics) overwrites the last heartbeat with this error_* stage, so the dead-host
-        # poll path (which can't see the bootstrap's ``trained`` MARKER when the marker upload is also
-        # lost / the box vanished) would otherwise read error_* as pre-training and quarantine a HEALTHY
-        # productive region for a post-training upload retry. Carrying it on the heartbeat lets that path
-        # suppress the quarantine too (fresh_trained_hb), mirroring the marker's ``trained`` flag.
-        hb_flags = {
-            "retriable": retriable,
-            "host_neutral": host_neutral,
-            "trained": os.path.exists(TRAIN_REACHED_SENTINEL),
-        }
+        hb_flags = {"retriable": retriable}
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:

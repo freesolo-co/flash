@@ -26,12 +26,9 @@ from collections.abc import Callable
 from flash._logging import get_logger
 from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
-    FIRST_LIVENESS_OBSERVED_GRACE_S,
     FIRST_LIVENESS_S,
-    SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
     heartbeat_progress_ts,
-    is_training_stage,
     make_say,
     preload_box_reap_due,
     surface_heartbeat,
@@ -63,9 +60,11 @@ STALL_AFTER_S = 1500.0
 # bound spend). Larger than RunPod's because of the on-host Docker pull.
 PROVISION_GRACE_S = 3000.0
 
-# Cold-start (pre-first-training-step) heartbeat stages, incl. the *_initializing stages. SHARED
-# single source of truth (flash.providers._poll) so RunPod / Lambda / Hyperstack can't drift apart.
-_SETUP_HEARTBEAT_STAGES = SETUP_HEARTBEAT_STAGES
+# Heartbeat stages emitted DURING cold start, before the training loop begins. Receiving one proves
+# the worker is alive but NOT that setup finished, so they keep the larger setup grace (cf. RunPod).
+_SETUP_HEARTBEAT_STAGES = frozenset(
+    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
+)
 
 # Lambda instance statuses that mean "the box is gone / will not progress".
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
@@ -94,7 +93,7 @@ def resolve_ssh_key_names() -> list[str]:
     return [names[0]]
 
 
-def usable_instances(gpu_class: str, force: bool = False, ignore_sick: bool = False) -> list[LambdaInstance]:
+def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance]:
     """Launchable (region) candidates for a managed GPU class, only where capacity exists now.
 
     Lambda prices per instance type (not per region), so every candidate for a class carries the
@@ -102,22 +101,14 @@ def usable_instances(gpu_class: str, force: bool = False, ignore_sick: bool = Fa
     has no Lambda capacity right now (the allocator skips it; a mid-run vanish is handled by the
     region walk + the runner's retry). ``force`` bypasses the ``/instance-types`` cache — used by the
     in-launch refresh so it can actually discover newly-freed regions rather than re-reading the
-    just-populated allocation cache. ``ignore_sick`` keeps quarantined regions in (the allocator's
-    last-resort pass) so a region quarantine can never zero out the only capacity and hard-fail a run.
+    just-populated allocation cache.
     """
-    from flash.providers._health import healthy_regions
     from flash.providers.lambdalabs.gpus import instance_type_for
     from flash.providers.lambdalabs.pricing import hourly_rate
 
     info = GPU_INFO[gpu_class]
     itype = instance_type_for(gpu_class)
     rate = hourly_rate(gpu_class)
-    # Drop regions under a dynamic health quarantine (a region that recently failed a worker before
-    # training — see flash.providers._health). Both the allocator's capacity view and the launch
-    # region walk read this, so a sick region is avoided everywhere until its TTL self-heals.
-    regions = healthy_regions(
-        "lambda", lambda_api.regions_with_capacity(itype, force=force), ignore_sick=ignore_sick
-    )
     return [
         LambdaInstance(
             gpu=gpu_class,
@@ -126,7 +117,7 @@ def usable_instances(gpu_class: str, force: bool = False, ignore_sick: bool = Fa
             vram_gb=info.vram_gb,
             price_usd_hr=rate,
         )
-        for region in regions
+        for region in lambda_api.regions_with_capacity(itype, force=force)
     ]
 
 
@@ -150,7 +141,6 @@ def launch_and_submit(
     runtime_secrets: dict | None = None,
     mode: str | None = None,
     models: list | None = None,
-    ignore_sick: bool = False,
 ) -> LambdaJobHandle:
     """Launch the first region that accepts the job; walk regions on a capacity rejection.
 
@@ -198,7 +188,6 @@ def launch_and_submit(
     tried_regions: set[str] = set()
     candidates = list(instances)
     refreshed = False
-    relaxed_sick = False
     last_err: Exception | None = None
     while candidates:
         inst = candidates.pop(0)
@@ -297,30 +286,13 @@ def launch_and_submit(
             # would warm region B while the caller reports the target region A as warmed (cache still
             # cold). A preload that can't run in its target region must FAIL it (walk exhausts ->
             # raise), never silently warm another.
-            if mode != "preload" and not candidates:
-                if not refreshed:
-                    refreshed = True
-                    # Force a fresh capacity fetch (the allocation cache is ~45s stale) so the refresh
-                    # can discover regions that freed up since the walk started.
-                    candidates = [
-                        c
-                        for c in usable_instances(inst.gpu, force=True, ignore_sick=ignore_sick)
-                        if c.region not in tried_regions
-                    ]
-                if not candidates and not ignore_sick and not relaxed_sick:
-                    # Healthy regions exhausted -- EITHER the forced refresh came back empty, OR it
-                    # returned regions that were then themselves tried and rejected (stale capacity).
-                    # Gated on its OWN flag (not ``refreshed``) so this relaxed pass still runs in that
-                    # second case; otherwise quarantine becomes a HARD exclusion once the refresh has
-                    # happened. Relax as a TRUE last resort -- try a quarantined-but-in-capacity region
-                    # rather than fail the attempt while sick capacity exists (matches allocate()'s
-                    # bounded-demotion fallback; a still-sick region just host_faults + the run retries).
-                    relaxed_sick = True
-                    candidates = [
-                        c
-                        for c in usable_instances(inst.gpu, force=True, ignore_sick=True)
-                        if c.region not in tried_regions
-                    ]
+            if mode != "preload" and not candidates and not refreshed:
+                refreshed = True
+                # Force a fresh capacity fetch (the allocation cache is ~45s stale) so the refresh
+                # can discover regions that freed up since the walk started.
+                candidates = [
+                    c for c in usable_instances(inst.gpu, force=True) if c.region not in tried_regions
+                ]
             continue
         say(
             f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
@@ -419,17 +391,6 @@ def poll_lambda_job(
     boot_log_reader = _make_hf_file_reader(
         hf_repo, f"{prefix}/lambda_attempt{handle.attempt}_boot.log", min_interval_s=60.0
     )
-    # Legacy fallback for a MIXED-VERSION reattach: a control plane upgraded to this PR while a Lambda
-    # instance launched by the PREVIOUS user-data is still pre-heartbeat wrote its host log to the
-    # NON-attempt-scoped <prefix>/lambda_boot.log (production's path before attempt-scoping). The new
-    # first-liveness gate reads only the attempt-scoped path, so without this fallback a healthy old box
-    # still pulling Docker would look boot-log-absent and get quarantined. Only pre-upgrade boxes ever
-    # write this path (the current uploader is attempt-scoped), so it can never carry a stale CURRENT-run
-    # retry's log; it just drains as old in-flight instances finish. Consulted ONLY when the attempt-
-    # scoped log is absent (the failover-deciding slow path), so it adds no hot-path read.
-    legacy_boot_log_reader = _make_hf_file_reader(
-        hf_repo, f"{prefix}/lambda_boot.log", min_interval_s=60.0
-    )
 
     def finish_ok(done_content: str | None = None) -> PollResult:
         raw = metrics_reader(force=True)
@@ -479,136 +440,17 @@ def poll_lambda_job(
         d = done_reader(force=True)
         return finish_ok(d if (d is not None and done_is_fresh(d)) else None)
 
-    def reached_training_now() -> bool:
-        """True if a FRESH training-stage heartbeat exists right now (not just one the poll loop has
-        already surfaced). The terminal marker/dead branches decide ``host_fault`` BEFORE
-        ``surface_heartbeat()`` advances ``seen_training_hb`` this iteration, so a worker that started
-        training and then failed within a single poll interval would otherwise look pre-training and
-        wrongly quarantine a HEALTHY region for the TTL. Force-reads past the rate limit and rejects a
-        stale prior-attempt heartbeat (ts < launch) with the SAME freshness gate as the loop, so a
-        leftover training heartbeat can't suppress a genuine region fault either."""
-        if seen_training_hb:
-            return True
-        if heartbeat_reader is None:
-            return False
-        try:
-            hb = heartbeat_reader(force=True)
-        except Exception:
-            return False
-        if not isinstance(hb, dict):
-            return False
-        stage = hb.get("stage")
-        if not is_training_stage(stage):  # setup/init or an error_* crash stage -> not training
-            return False
-        _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
-        return fresh
-
-    def fresh_error_heartbeat() -> bool:
-        """True if THIS attempt's worker stamped a FRESH ``error_<phase>`` crash heartbeat -- the last
-        signal it writes on ANY raise (after uploading ``error_<phase>.txt``). ``error_<phase>.txt`` is
-        SEED-scoped (shared across attempts), so on a RETRY a stale traceback from a prior attempt could
-        flip a current host loss to a terminal job_failed. A fresh error heartbeat is positive proof the
-        worker actually crashed THIS attempt (trust the file); its ABSENCE -- a fresh setup heartbeat
-        (still booting) or no fresh heartbeat at all (the box was lost before producing anything this
-        attempt) -- means the file is stale and the loss is a host loss, so retry rather than fail."""
-        if heartbeat_reader is None:
-            return False
-        try:
-            hb = heartbeat_reader(force=True)
-        except Exception:
-            return False
-        if not isinstance(hb, dict):
-            return False
-        stage = hb.get("stage")
-        if not (stage and str(stage).startswith("error_")):
-            return False
-        _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
-        return fresh
-
-    def fresh_retriable_hb() -> bool:
-        """True if THIS attempt's worker flagged a retriable infra fault in a FRESH heartbeat. The
-        heartbeat is seed-scoped, so ``worker_flagged_retriable()`` alone can read a PRIOR attempt's
-        RetriableInfraError heartbeat; gating on launch freshness keeps that stale signal from
-        quarantining the current (healthy) region for THIS attempt's non-retriable setup/worker error
-        (e.g. a bootstrap/extra_pip failure that wrote a non-retriable marker before any fresh hb)."""
-        if heartbeat_reader is None:
-            return False
-        try:
-            hb = heartbeat_reader(force=True)
-        except Exception:
-            return False
-        if not isinstance(hb, dict) or not hb.get("retriable"):
-            return False
-        _, fresh = heartbeat_progress_ts((hb.get("stage"), hb.get("step"), hb.get("ts")), launch_ts)
-        return fresh
-
-    def fresh_host_neutral_hb() -> bool:
-        """True if THIS attempt's worker flagged a FRESH region-INDEPENDENT retriable fault (the worker
-        sets ``host_neutral`` on the error heartbeat for a GitHubRateLimitError — a global GitHub/
-        control-plane rate limit hit during env resolution, which would follow the job to any region).
-        Such a fault must retry (job_preempted) but must NOT quarantine the region. Launch-fresh so a
-        stale prior-attempt heartbeat can't suppress a genuine THIS-attempt host fault."""
-        if heartbeat_reader is None:
-            return False
-        try:
-            hb = heartbeat_reader(force=True)
-        except Exception:
-            return False
-        if not isinstance(hb, dict) or not hb.get("host_neutral"):
-            return False
-        _, fresh = heartbeat_progress_ts((hb.get("stage"), hb.get("step"), hb.get("ts")), launch_ts)
-        return fresh
-
-    def fresh_trained_hb() -> bool:
-        """True if THIS attempt's worker reached end-of-training before failing (stamps ``trained`` on
-        the error hb). A retriable post-training upload failure is a completion retry on a HEALTHY region,
-        not a host fault. Launch-fresh so a stale prior-attempt hb can't suppress a real pre-training fault."""
-        if heartbeat_reader is None:
-            return False
-        try:
-            hb = heartbeat_reader(force=True)
-        except Exception:
-            return False
-        if not isinstance(hb, dict) or not hb.get("trained"):
-            return False
-        _, fresh = heartbeat_progress_ts((hb.get("stage"), hb.get("step"), hb.get("ts")), launch_ts)
-        return fresh
-
-    def run_cancelled() -> bool:
-        """True if the run was cancelled or a cancel is IN PROGRESS. Our own teardown terminates the box,
-        which the poller would otherwise read as a dead host -> host_fault; suppress that. Honor the
-        ``cancel_requested`` intent too (set before the terminal state persists). Best-effort (read error
-        -> not cancelled)."""
-        try:
-            from flash.runner import get_status
-
-            st = get_status(spec.run_id)
-            return st.state == "cancelled" or bool(getattr(st, "cancel_requested", False))
-        except Exception:
-            return False
-
     def fail_from_marker(marker: dict | None) -> PollResult:
         # A real worker error fails fast UNLESS it is flagged retriable — the host failure marker
         # (docker/GPU never ready) sets retriable=True, and the worker stamps it in heartbeat for a
         # RetriableInfraError; either retries on a fresh host like a platform termination.
         from flash.providers.runpod.jobs import worker_flagged_retriable
 
-        marker_retriable = bool(marker and marker.get("retriable"))
-        retriable = marker_retriable or worker_flagged_retriable(heartbeat_reader)
+        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(heartbeat_reader)
         return PollResult(
             False,
             failure="job_preempted" if retriable else "job_failed",
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.attempt),
-            # Quarantine only a FRESH retriable, PRE-training, non-neutral, non-cancelled failure = a
-            # genuine host/GPU fault. Excluded: post-training-reached (trained), region-independent HF
-            # delivery (host_neutral hb/marker), our own cancel teardown, and a stale prior-attempt hb
-            # (reached_training_now/fresh_* force-read this attempt; this runs before surface_heartbeat).
-            host_fault=(marker_retriable or fresh_retriable_hb())
-            and not reached_training_now()
-            and not bool(marker and marker.get("trained"))
-            and not bool(marker and marker.get("host_neutral"))
-            and not fresh_host_neutral_hb()
-            and not run_cancelled(),
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -645,11 +487,6 @@ def poll_lambda_job(
     # does NOT hand a box that has been silent since before a control-plane restart a fresh window.
     # Advanced to now only on a genuine inactive->active transition observed in this poll session.
     active_since = start
-    # Wall time we FIRST OBSERVED the box active (vs active_since, which is launch-anchored on a
-    # reattach). Used only to floor the first-liveness stall by FIRST_LIVENESS_OBSERVED_GRACE_S so a
-    # box that just became active (after a long provision the control plane missed) gets its boot-log
-    # uploader's publication window before being failed over -- without handing it a full fresh window.
-    active_obs_since: float | None = None
     seen_training_hb = False
     # Any FRESH heartbeat from THIS attempt (boot stage included) proves the worker started — clears
     # the first-liveness deadline. Distinct from seen_training_hb (which gates only the tighter
@@ -695,8 +532,6 @@ def poll_lambda_job(
             last_status = status
         if status == "active":
             became_active = True
-            if active_obs_since is None:
-                active_obs_since = time.time()  # first time WE saw it active (reattach-safe floor)
 
         done = done_reader()
         if done is not None and done_is_fresh(done):
@@ -715,38 +550,18 @@ def poll_lambda_job(
             # (a bad env id, a config/code error, an OOM). That is a DETERMINISTIC worker error, so
             # fail FAST: classifying it job_preempted burns fresh GPUs re-running a crash that will
             # repeat. A crash the worker flagged retriable (RetriableInfraError, stamped in the
-            # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is SEED-scoped
-            # (NOT attempt-scoped), so on a RETRY a PRIOR attempt's traceback can linger while THIS
-            # attempt's box is lost before producing anything. Trust the file as a current crash only
-            # with positive THIS-attempt evidence: fresh_error_heartbeat() (the worker stamps a fresh
-            # error_<phase> hb on any raise). Without it -- a fresh setup hb (still booting) OR no fresh
-            # hb at all (host lost before producing anything) -- the file is stale and the loss is a host
-            # loss -> job_preempted (over-retry, not a wrongful terminal job_failed). attempt == 0 has no
-            # prior attempt, so a present error file is unambiguously this attempt's crash (trusted even
-            # if the worker died before its hb -> job_failed, not a wasteful retry of a repeatable crash).
-            # Use fresh_retriable_hb() (launch-fresh), NOT bare worker_flagged_retriable(): the heartbeat
-            # is seed-scoped, so a STALE prior-attempt retriable heartbeat would otherwise suppress
-            # worker_crashed for THIS attempt's deterministic crash -> mis-quarantining a healthy region.
+            # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is not
+            # attempt-scoped, but this can't flip a genuine preemption to job_failed: a prior
+            # attempt's NON-retriable crash already ended the run via this same branch, and a prior
+            # retriable crash leaves a retriable heartbeat that keeps this path on job_preempted.
+            from flash.providers.runpod.jobs import worker_flagged_retriable
+
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
-            worker_crashed = (
-                bool(err and err.strip())
-                and not fresh_retriable_hb()
-                and (handle.attempt == 0 or fresh_error_heartbeat())
-            )
+            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,
                 failure="job_failed" if worker_crashed else "job_preempted",
                 detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.attempt),
-                # Quarantine only a PRE-training host loss (region never got a worker productive).
-                # Excluded, mirroring fail_from_marker: a deterministic worker crash (job_failed), a
-                # training-reached death (reached_training_now/fresh_trained_hb), our own cancel teardown,
-                # and a region-independent fault (fresh_host_neutral_hb, e.g. GitHubRateLimit) whose marker
-                # was lost so it lands here instead of fail_from_marker.
-                host_fault=not worker_crashed
-                and not reached_training_now()
-                and not run_cancelled()
-                and not fresh_host_neutral_hb()
-                and not fresh_trained_hb(),
             )
 
         raw_marker = marker_reader()
@@ -788,83 +603,53 @@ def poll_lambda_job(
             if fresh:
                 last_progress = hb_ts
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
-                if is_training_stage(stage):  # a real training step (NOT setup/init or an error_* crash)
+                if stage not in _SETUP_HEARTBEAT_STAGES:
                     seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
         if became_active:
-            # Fast failover for a box that reached 'active' but never started a worker (sick region /
-            # wedged cloud-init): a healthy box emits its boot.log within ~2 min, so its ABSENCE past
-            # first_liveness_s means the worker never ran. 'stalled' escapes cross-provider (PR #241)
-            # instead of burning the full ~50 min setup grace. Read only after the timer + latched once.
+            # Fast failover for a box that reached OS 'active' but never started a worker (sick
+            # region / wedged cloud-init): no fresh heartbeat AND no attempt-scoped host boot.log. A
+            # healthy box — even one still pulling the multi-GB image — emits its boot.log within
+            # ~2 min, so the log's ABSENCE past first_liveness_s means cloud-init/the worker never
+            # ran. 'stalled' is infra-shaped, so the runner escapes it cross-provider (PR #241)
+            # instead of burning the full setup grace (~50 min). The boot.log is read only AFTER the
+            # timer AND only until it's seen once (short-circuit + latch), so the normal cold-start
+            # path makes at most one extra HF read.
             if (
                 not seen_fresh_hb
                 and not boot_log_seen
                 and time.time() - active_since > first_liveness_s
-                # active_obs_since floors the window on a reattach that first saw it already active (so a
-                # just-became-active box isn't failed over before its boot.log can publish); ~= active_since
-                # on the normal path (no slowdown). Silent-since-restart box still caught by the setup grace.
-                and active_obs_since is not None
-                and time.time() - active_obs_since >= FIRST_LIVENESS_OBSERVED_GRACE_S
             ):
-                # force=True bypasses rate-limiting (make_hf_text_reader returns None for both missing AND
-                # throttled); ``is None`` keeps an empty "" boot.log as liveness; legacy path covers a
-                # pre-attempt-scoping (mixed-version) box, consulted on any attempt (attach recovery purges
-                # a stale legacy log, and a same-process retry never has one).
-                if boot_log_reader(force=True) is None and legacy_boot_log_reader(force=True) is None:
-                    # Require the absence to PERSIST across polls (a lone None can be a transient HF blip).
+                # make_hf_text_reader returns None for BOTH a missing file AND a rate-limited/errored
+                # read, so a bare ``not boot_log_reader()`` would spuriously stall a healthy box on a
+                # throttled poll. force=True bypasses the rate-limit (accurate absent-vs-present);
+                # ``is None`` keeps an empty "" boot.log counting as liveness (the file existing proves
+                # cloud-init ran); the latch then stops re-reading once the box has proven itself.
+                if boot_log_reader(force=True) is None:
+                    # A lone None can also be a momentary HF/Hub network error (not a true absence), so
+                    # require the absence to PERSIST across consecutive polls before failing over — a
+                    # transient blip clears within a poll interval; a box whose worker never started
+                    # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
-                        # Force-read terminal artifacts first: a real DONE/marker must win over the stall
-                        # (the ~45s threshold can trip before marker_reader's 60s non-forced re-read).
-                        terminal = terminal_artifact_result()
-                        if terminal is not None:
-                            return terminal
                         return PollResult(
                             False,
                             failure="stalled",
                             detail=f"no worker liveness (boot.log/heartbeat) for "
-                            f"{int(time.time() - active_since)}s since the active/launch anchor "
-                            f"(active_since is launch-anchored on a reattach that first saw it active; "
-                            f"cloud-init/worker never started; limit {int(first_liveness_s)}s)",
-                            # Active but no liveness = region never got a worker -> quarantine, UNLESS we
-                            # tore it down (a cancel in this window; mirrors the dead-host branch).
-                            host_fault=not run_cancelled(),
+                            f"{int(time.time() - active_since)}s after instance became active "
+                            f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
                         )
                 else:
                     boot_log_seen = True
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 phase = "training" if seen_training_hb else "setup (pre-training)"
-                # Force-read terminal artifacts before the stall (as the first-liveness branch does): a
-                # worker that finished/errored at the boundary may have its DONE/marker rate-limited.
-                terminal = terminal_artifact_result()
-                if terminal is not None:
-                    return terminal
-                # boot_log_seen is latched only in the first-liveness branch, which the observed-grace
-                # floor DEFERS on a reattach -> this setup-stall can fire first with it still False; force-
-                # read the boot.log here so a healthy slow-booting box (cloud-init ran) isn't quarantined.
-                if not boot_log_seen and (
-                    boot_log_reader(force=True) is not None
-                    or legacy_boot_log_reader(force=True) is not None
-                ):
-                    boot_log_seen = True
-                # Active but NO liveness ever (no boot.log/heartbeat) then stalled past setup grace =
-                # region never booted a worker -> host fault. Catches the recovery case the observed-grace
-                # floor deferred above. A box that showed liveness then stalled is ambiguous (not faulted);
-                # nor is our own cancel.
-                no_liveness_host_fault = (
-                    not seen_training_hb
-                    and not seen_fresh_hb
-                    and not boot_log_seen
-                    and not run_cancelled()
-                )
                 return PollResult(
                     False,
                     failure="stalled",
                     detail=f"no worker progress for {int(time.time() - last_progress)}s "
                     f"during {phase} (instance status {status}, limit {int(limit)}s)",
-                    host_fault=no_liveness_host_fault,
                 )
         time.sleep(interval_s)
 
@@ -888,22 +673,8 @@ def submit_run_lambda(
             f"submit_run_lambda needs a concrete gpu class, got {spec.gpu.type!r}"
         )
     instances = usable_instances(spec.gpu.type)
-    # Mirror allocate()'s last-resort relaxation at the LAUNCH boundary: allocate() may have picked
-    # this class with every fitting region merely quarantined (not out of capacity), so a healthy-only
-    # fetch here would be empty and hard-fail the run at submit -- turning the bounded-demotion
-    # quarantine into a kill switch. Fall back to the quarantined regions (a still-sick region just
-    # host_faults + the run retries/escapes) and keep the in-launch region walk consistent (ignore_sick).
-    relaxed = not instances
-    if relaxed:
-        # force=True on this last-resort fetch: the in-launch region walk's force=True refresh only runs
-        # once there is >=1 instance to iterate, so if launch_and_submit receives an empty list it raises
-        # WITHOUT ever refreshing -- a stale (cached) capacity view showing no regions would then hard-fail
-        # the attempt even though capacity actually exists now. Bypass the cache here so the relaxed pass
-        # discovers any currently-available region (healthy or quarantined) before we give up.
-        instances = usable_instances(spec.gpu.type, force=True, ignore_sick=True)
     handle = launch_and_submit(
-        spec, seed, instances, attempt=attempt, log=log,
-        runtime_secrets=runtime_secrets, ignore_sick=relaxed,
+        spec, seed, instances, attempt=attempt, log=log, runtime_secrets=runtime_secrets
     )
     # The instance is billing the MOMENT launch_and_submit returns; the teardown ``finally`` must
     # guard EVERYTHING after that point — including ``on_handle`` (persisting the handle can itself
@@ -919,7 +690,7 @@ def submit_run_lambda(
         setup_grace = SETUP_GRACE_S * last_gpu_mult
         first_liveness = FIRST_LIVENESS_S * last_gpu_mult
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
-        res = poll_lambda_job(
+        return poll_lambda_job(
             handle,
             spec,
             seed,
@@ -929,14 +700,6 @@ def submit_run_lambda(
             first_liveness_s=first_liveness,
             deadline_s=deadline,
         )
-        if res.host_fault and handle.region:
-            # The region proved sick (worker never reached training). Quarantine it so this run's
-            # retry AND other runs avoid it until the TTL self-heals, instead of re-rolling it.
-            from flash.providers._health import mark_region_sick
-
-            mark_region_sick("lambda", handle.region)
-            make_say(log)(f"region {handle.region} quarantined (host fault: {res.detail})")
-        return res
     finally:
         lambda_api.terminate_instances([handle.instance_id])
 

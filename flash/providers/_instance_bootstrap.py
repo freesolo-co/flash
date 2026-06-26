@@ -267,43 +267,19 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     return proc.returncode
 
 
-def write_attempt_marker(
-    payload: dict,
-    ok: bool,
-    error: str = "",
-    retriable: bool = False,
-    trained: bool = False,
-    host_neutral: bool = False,
-) -> None:
+def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bool = False) -> None:
     """Attempt-scoped terminal marker (``<arm>_attempt<N>.json``): how the control plane
     distinguishes THIS attempt's failure from a prior attempt's leftovers under the same prefix.
 
     ``retriable`` stamps the same flag the host failmark and the worker heartbeat use: the pollers
     read ``marker.get("retriable")`` and classify a flagged failure as ``job_preempted`` (retried on
     a fresh host within the HF infra budget) instead of ``job_failed`` (fails fast). Set it for
-    infra-shaped bootstrap failures (HF fetch/upload) so an HF outage doesn't burn the run.
-
-    ``trained`` records that the worker REACHED THE END OF TRAINING this attempt (the local
-    ``/tmp/train_reached`` sentinel — written before the first required upload — or ``/tmp/metrics.json``
-    exists) before the failure. A retriable completion-UPLOAD failure (training finished, the
-    adapter/DONE/metrics never landed on HF) is then NOT a pre-training host fault: the pollers read
-    ``marker.get("trained")`` to suppress the region quarantine for it (the region was healthy and
-    productive) while a genuine pre-training retriable fault (no training) still quarantines.
-
-    ``host_neutral`` records that a *retriable* failure originated IN THE CONTAINER from a
-    region-independent HF-delivery problem (the spilled-spec fetch or a required-artifact upload),
-    NOT from the host/region. The pollers suppress the quarantine for it. This is the discriminator
-    between a bootstrap-raised retriable marker (region-neutral) and the HOST cloud-init failmark
-    (docker/GPU never ready -> genuinely sick region), which omits this flag and so still quarantines.
-    It is independent of ``trained``: the pre-training spilled-spec fetch is host-neutral yet has no
-    training."""
+    infra-shaped bootstrap failures (HF fetch/upload) so an HF outage doesn't burn the run."""
     marker = {
         "ok": bool(ok),
         "ts": time.time(),
         "attempt": int(payload.get("attempt") or 0),
         "retriable": bool(retriable),
-        "trained": bool(trained),
-        "host_neutral": bool(host_neutral),
         "error": error[:2000],
     }
     p = "/tmp/attempt_marker.json"
@@ -492,7 +468,7 @@ def main() -> int:
         env = build_worker_env(payload)
         deadline = time.time() + float(payload.get("max_wall_s") or 24 * 3600)
         phase = payload["phase"]
-        for stale in ("/tmp/train_meta.json", "/tmp/metrics.json", "/tmp/train_reached"):
+        for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
         # Train. A non-zero rc is tolerated ONLY when the run genuinely finished: RL's colocated
@@ -504,17 +480,6 @@ def main() -> int:
         # of stamping a false ok=true.
         rc = run_mode(payload, env, phase, deadline)
         if not os.path.exists("/tmp/metrics.json"):
-            if os.path.exists("/tmp/train_reached"):
-                # train_reached but no metrics.json -> the REQUIRED adapter upload (which precedes
-                # metrics.json) failed infra-shaped: a post-training UPLOAD failure, not a crash. Raise
-                # RetriableBootstrapError so the poller retries instead of hard-failing a COMPLETED
-                # attempt when the worker's own retriable hb is also lost; host_neutral keeps it from
-                # quarantining the healthy region for a global upload failure.
-                raise RetriableBootstrapError(
-                    f"train phase '{phase}' reached end-of-training but produced no /tmp/metrics.json "
-                    f"— the required adapter upload (which precedes metrics.json) failed infra-shaped; "
-                    f"retry the missing upload on a fresh host. See error_{phase}.txt / console_{phase}.txt."
-                )
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF dataset repo"
@@ -544,18 +509,7 @@ def main() -> int:
         retriable = isinstance(exc, RetriableBootstrapError)
         print(f"bootstrap failed: {error}", flush=True)
     finally:
-        # Training reached if the worker stamped /tmp/train_reached (right BEFORE the first required
-        # upload) or /tmp/metrics.json (after it). The sentinel is what catches a failed REQUIRED
-        # adapter upload — it precedes metrics.json, so metrics.json alone would miss it and quarantine
-        # a healthy productive region for a post-training upload failure.
-        trained = os.path.exists("/tmp/train_reached") or os.path.exists("/tmp/metrics.json")
-        # A bootstrap-RAISED retriable failure (spilled-spec fetch / required-artifact upload) is
-        # region-independent HF delivery -> host_neutral so the poller doesn't quarantine. Exactly the
-        # retriable set: a non-retriable marker (real worker error) is NOT neutral; the HOST failmark
-        # (docker/GPU never ready) omits the flag, so a genuinely sick region still quarantines.
-        write_attempt_marker(
-            payload, ok, error, retriable=retriable, trained=trained, host_neutral=retriable
-        )
+        write_attempt_marker(payload, ok, error, retriable=retriable)
     return 0 if ok else 1
 
 

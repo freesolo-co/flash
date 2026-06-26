@@ -38,7 +38,7 @@ def _inst(gpu="A10", region="us-east-1", itype="gpu_1x_a10", price=1.29):
     return LambdaInstance(gpu=gpu, instance_type=itype, region=region, vram_gb=24, price_usd_hr=price)
 
 
-def _handle(started_ts=10_000.0, rate=1.29, attempt=0):
+def _handle(started_ts=10_000.0, rate=1.29):
     from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
 
     return LambdaJobHandle(
@@ -48,7 +48,7 @@ def _handle(started_ts=10_000.0, rate=1.29, attempt=0):
         name="flash-x-s0-a0",
         gpu="A10",
         hourly_usd=rate,
-        attempt=attempt,
+        attempt=0,
         started_ts=started_ts,
     )
 
@@ -131,11 +131,11 @@ def test_image_per_sm_opt_in_selects_arch_tag(monkeypatch):
     assert builders.lambda_image("H100") == "ghcr.io/freesolo-co/flash-worker:hotfix"
 
 
-def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True, train_reached=False):
+def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     from flash.providers import _instance_bootstrap as lb
 
     calls: list[str] = []
-    markers: list[tuple[bool, str, bool, bool, bool]] = []
+    markers: list[tuple[bool, str, bool]] = []
     monkeypatch.setattr(
         lb,
         "load_payload",
@@ -157,19 +157,9 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True, train_reached=F
     monkeypatch.setattr(
         lb,
         "write_attempt_marker",
-        lambda p, ok, error="", retriable=False, trained=False, host_neutral=False: markers.append(
-            (ok, error, retriable, trained, host_neutral)
-        ),
+        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
     )
-
-    def _exists(p):
-        if "train_reached" in p:
-            return train_reached
-        if "metrics.json" in p:
-            return metrics
-        return False
-
-    monkeypatch.setattr(lb.os.path, "exists", _exists)
+    monkeypatch.setattr(lb.os.path, "exists", lambda p: metrics if "metrics.json" in p else False)
     return lb, calls, markers
 
 
@@ -177,39 +167,18 @@ def test_bootstrap_train_success(monkeypatch):
     lb, calls, markers = _bootstrap_env(monkeypatch)
     assert lb.main() == 0
     assert calls == ["sft"]  # one fresh worker process
-    # success marker, not retriable; trained=True (local metrics.json exists); host_neutral=False.
-    assert markers == [(True, "", False, True, False)]
+    assert markers == [(True, "", False)]  # success marker, not retriable
 
 
 def test_bootstrap_fails_without_metrics(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
     assert lb.main() == 1
-    ok, error, retriable, trained, host_neutral = markers[0]
+    ok, error, retriable = markers[0]
     assert not ok
     assert "metrics.json" in error
     # A genuine no-metrics crash (the worker never produced metrics) is a REAL failure, not infra:
     # it must NOT be flagged retriable (that would loop a deterministically-broken run).
     assert retriable is False
-    assert trained is False  # no sentinel and no local metrics -> training was NOT reached
-    assert host_neutral is False  # non-retriable -> never host_neutral (worker-hb drives any quarantine)
-
-
-def test_bootstrap_marks_trained_when_adapter_upload_fails_before_metrics(monkeypatch):
-    """The REQUIRED adapter upload runs AFTER trainer.train() but BEFORE /tmp/metrics.json. If it fails
-    (RetriableInfraError), the worker exits non-zero with no metrics.json. The /tmp/train_reached sentinel
-    (stamped right before the upload) means training WAS reached, so the bootstrap raises a
-    RetriableBootstrapError (not a plain no-metrics RuntimeError): the run did not finish but the missing
-    adapter upload is infra-shaped, so the marker is RETRIABLE (job_preempted retry — not a hard
-    job_failed, which would otherwise strand a completed training attempt when the worker's own retriable
-    heartbeat is also lost in the same HF outage) and host_neutral (don't quarantine a healthy region)."""
-    lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=False, train_reached=True)
-    assert lb.main() == 1
-    ok, error, retriable, trained, host_neutral = markers[0]
-    assert not ok
-    assert "metrics.json" in error  # the run did NOT finish -> still fails/retries
-    assert trained is True  # sentinel proves training was reached -> poller does not quarantine
-    assert retriable is True  # post-training upload failure is infra-shaped -> job_preempted, not job_failed
-    assert host_neutral is True  # region-independent upload failure -> don't quarantine the region
 
 
 def test_bootstrap_sets_lambda_arm():
@@ -264,67 +233,10 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
         return "i-7"
 
     monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [_inst(region="us-fresh-1")])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst(region="us-fresh-1")])
     h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
     assert created == ["us-fresh-1"]
     assert h.instance_id == "i-7"
-
-
-def test_launch_relaxes_to_quarantined_region_when_healthy_exhausted(monkeypatch):
-    """If the initial healthy region rejects and the forced refresh finds NO healthy regions, the walk
-    relaxes the quarantine (ignore_sick) as a true last resort and launches into a quarantined-but-in-
-    capacity region rather than failing the attempt while sick capacity exists -- relax after the
-    healthy walk is exhausted, not only on an initially-empty healthy list."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
-
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
-    created = []
-
-    def fake_launch(*, region_name, **kw):
-        if region_name != "sick-region-1":
-            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")
-        created.append(region_name)
-        return "i-9"
-
-    def fake_usable(gpu, force=False, ignore_sick=False):
-        # Healthy refresh empty; only the relaxed (quarantine-ignoring) refresh finds capacity.
-        return [_inst(region="sick-region-1")] if ignore_sick else []
-
-    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
-    # Start on a healthy region that rejects -> healthy refresh empty -> relax to the quarantined region.
-    h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
-    assert created == ["sick-region-1"]
-    assert h.instance_id == "i-9"
-
-
-def test_launch_relaxes_to_sick_after_refreshed_healthy_region_rejects(monkeypatch):
-    """The forced healthy refresh can RETURN a region that then itself rejects (stale capacity). The
-    relaxed (ignore_sick) pass must still run after that -- gated on its OWN flag, not `refreshed` -- so
-    quarantine doesn't become a HARD exclusion once the refresh has already happened."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
-
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
-    attempts = []
-
-    def fake_launch(*, region_name, **kw):
-        attempts.append(region_name)
-        if region_name != "sick-region-1":
-            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")
-        return "i-9"
-
-    def fake_usable(gpu, force=False, ignore_sick=False):
-        # Healthy refresh returns a DIFFERENT healthy region that itself rejects; only the relaxed pass
-        # surfaces the quarantined-but-in-capacity region.
-        return [_inst(region="sick-region-1")] if ignore_sick else [_inst(region="us-west-2")]
-
-    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
-    h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
-    assert attempts == ["us-east-1", "us-west-2", "sick-region-1"]
-    assert h.region == "sick-region-1"
 
 
 def test_launch_raises_when_no_capacity(monkeypatch):
@@ -337,7 +249,7 @@ def test_launch_raises_when_no_capacity(monkeypatch):
         "launch_instance",
         lambda **k: (_ for _ in ()).throw(lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")),
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [])
     with pytest.raises(lambda_api.LambdaApiError, match="no capacity"):
         jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)
     with pytest.raises(lambda_api.LambdaApiError, match="no Lambda capacity"):
@@ -529,7 +441,7 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     refresh_calls = []
     monkeypatch.setattr(
         jobs, "usable_instances",
-        lambda gpu, force=False, ignore_sick=False: refresh_calls.append(force) or [_inst(region="us-fresh-9")],
+        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="us-fresh-9")],
     )
 
     with pytest.raises(lambda_api.LambdaApiError):
@@ -580,7 +492,7 @@ def test_cache_ensured_per_region_in_the_walk(monkeypatch):
 # ---------------------------------------------------------------------------
 # poll_lambda_job state machine
 # ---------------------------------------------------------------------------
-def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0, legacy_boot=None):
+def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
 
@@ -604,10 +516,8 @@ def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boo
                 return marker() if callable(marker) else marker
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
-            if path.endswith("_boot.log"):
-                if "attempt" in path:  # attempt-scoped: lambda_attempt<N>_boot.log
-                    return boot() if callable(boot) else boot
-                return legacy_boot() if callable(legacy_boot) else legacy_boot  # legacy lambda_boot.log
+            if path.endswith("_boot.log"):  # attempt-scoped: lambda_attempt<N>_boot.log
+                return boot() if callable(boot) else boot
             if "/error_" in path:
                 return error() if callable(error) else error
             return None
@@ -661,390 +571,17 @@ def test_poll_marker_failure_is_job_failed(monkeypatch):
 
 
 def test_poll_retriable_marker_is_job_preempted(monkeypatch):
-    """A worker-flagged retriable failure retries on a fresh host (job_preempted), not job_failed.
-    With a FRESH retriable heartbeat and NO training heartbeat, it is a pre-training infra fault -> the
-    region is quarantined (host_fault)."""
+    """A worker-flagged retriable failure retries on a fresh host (job_preempted), not job_failed."""
     jobs = _wire_poll(
         monkeypatch,
         instances=[{"status": "active"}],
         marker=json.dumps({"ok": False, "attempt": 0, "error": "transient"}),
     )
     res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 10_000.0},  # fresh (ts >= launch)
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {"retriable": True}
     )
     assert not res.ok
     assert res.failure == "job_preempted"
-    assert res.host_fault  # fresh retriable crash before any training heartbeat -> sick region
-
-
-def test_poll_marker_stale_retriable_heartbeat_does_not_quarantine(monkeypatch):
-    """On a RETRY, worker_flagged_retriable() can read a PRIOR attempt's RetriableInfraError heartbeat
-    (seed-scoped, ts < this attempt's launch). THIS attempt's non-retriable setup failure then still
-    retries (the lenient classification honors the stale bit) but must NOT quarantine the healthy
-    region: fresh_retriable_hb() rejects the stale heartbeat for the host_fault signal."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=json.dumps({"ok": False, "attempt": 1, "error": "bootstrap pip failed"}),  # non-retriable
-    )
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=10_000.0, attempt=1), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 5_000.0},  # STALE: ts < launch 10_000
-    )
-    assert not res.ok
-    assert not res.host_fault  # stale prior-attempt retriable heartbeat did not quarantine the region
-
-
-def test_poll_dead_host_cancelled_run_not_quarantined(monkeypatch):
-    """A user cancel during setup terminates the box; the poller sees a dead host with no training
-    heartbeat. run_cancelled() suppresses host_fault so a HEALTHY region is not quarantined for a
-    deliberate teardown."""
-    import flash.runner
-
-    monkeypatch.setattr(
-        flash.runner, "get_status", lambda run_id: type("S", (), {"state": "cancelled"})()
-    )
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminated"}],
-        boot="+ docker pull ... (still in setup when cancelled)",
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert not res.host_fault  # cancelled -> region NOT quarantined
-
-
-def test_poll_init_stage_heartbeat_quarantines_on_retriable(monkeypatch):
-    """sft_initializing/rl_initializing are PRE-training (trainer/vLLM init), so a retriable infra
-    fault during init must STILL quarantine the region: reached_training_now() must treat the init
-    heartbeat as setup, not training. Regression: the *_initializing stages were missing from
-    _SETUP_HEARTBEAT_STAGES, so an init heartbeat looked like training and suppressed host_fault for
-    exactly the init-time GPU/host faults the quarantine targets."""
-    jobs = _wire_poll(
-        monkeypatch, instances=[{"status": "active"}],
-        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: vLLM init OOM", "retriable": True}),
-    )
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"stage": "sft_initializing", "step": 0, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert res.host_fault  # init-time infra fault is pre-training -> region quarantined
-
-
-def test_poll_model_prefetched_heartbeat_quarantines_on_retriable(monkeypatch):
-    """``model_prefetched`` is emitted by prefetch_model() right after sft_start/rl_start while pulling
-    weights -- pre-training cold start, NOT a training step. A retriable infra/GPU fault after prefetch
-    but before the first step must STILL quarantine the region: reached_training_now() must treat it as
-    setup. Regression: model_prefetched was missing from SETUP_HEARTBEAT_STAGES, so is_training_stage()
-    returned True and host_fault was wrongly suppressed for exactly the pre-training faults it targets."""
-    jobs = _wire_poll(
-        monkeypatch, instances=[{"status": "active"}],
-        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: cuda init failed", "retriable": True}),
-    )
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"stage": "model_prefetched", "step": 0, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert res.host_fault  # prefetch is pre-training -> region quarantined
-
-
-def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
-    """A retriable failure marker can land in the SAME poll iteration the worker first reaches training
-    -- the marker branch decides host_fault BEFORE surface_heartbeat() advances seen_training_hb.
-    reached_training_now() force-reads the heartbeat and sees the training stage, so a mid-training
-    RetriableInfraError retries (job_preempted) WITHOUT quarantining the healthy region."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: gpu fell off the bus", "retriable": True}),
-    )
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        # sft_step is the worker's real training-step stage -> is_training_stage() True only because
-        # it is a genuine step (not just any non-setup string), so this actually guards the classification.
-        heartbeat_reader=lambda force=False: {"stage": "sft_step", "step": 7, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert not res.host_fault  # training already reached -> region healthy, do NOT quarantine
-
-
-def test_poll_trained_completion_upload_retry_not_quarantined(monkeypatch):
-    """A retriable marker flagged ``trained`` (the worker REACHED end-of-training -- local metrics.json
-    existed -- but the required DONE/metrics UPLOAD failed) is a post-training completion retry on a
-    HEALTHY region. It must retry (job_preempted) WITHOUT quarantining the region even on a fast run
-    where no fresh training heartbeat was latched and the latest forced hb is the worker's error_* stage
-    (so reached_training_now() is False) -- the marker's ``trained`` flag carries the post-training signal."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": True, "trained": True, "error": "DONE upload failed"}
-        ),
-    )
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"stage": "error_sft", "ts": 10_000.0},  # no training hb latched
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable upload failure -> retry on a fresh host
-    assert not res.host_fault  # trained: post-training completion retry on a healthy region -> NO quarantine
-
-
-def test_poll_host_neutral_marker_not_quarantined(monkeypatch):
-    """A bootstrap-raised retriable marker flagged ``host_neutral`` (the pre-worker spilled-spec HF
-    fetch) is a region-INDEPENDENT delivery failure -- it would fail identically in any region -- so it
-    retries (job_preempted) WITHOUT quarantining the region, even pre-training (no fresh heartbeat)."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": True, "host_neutral": True,
-             "error": "failed to fetch the spilled job spec from HF"}
-        ),
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable -> retry on a fresh host
-    assert not res.host_fault  # host_neutral: HF-delivery failure, not a sick region -> NO quarantine
-
-
-def test_poll_host_failmark_still_quarantines(monkeypatch):
-    """The HOST cloud-init failmark (docker/GPU never ready) is a GENUINELY sick region: it sets
-    retriable=True but OMITS host_neutral (it is written by the host, not the in-container bootstrap),
-    so -- unlike a host_neutral bootstrap marker -- it must STILL quarantine the region. Guards the
-    host_neutral suppression from silently disabling real broken-region failover."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": True, "error": "host: docker run failed"}
-        ),
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable host fault -> retry on a fresh host
-    assert res.host_fault  # docker/GPU never ready, no host_neutral -> region quarantined
-
-
-def test_poll_marker_path_cancel_requested_not_quarantined(monkeypatch):
-    """fail_from_marker must ALSO honor run_cancelled(): a cancel-in-progress (state still 'running',
-    cancel_requested true) that lands via a just-written / stale attempt failure marker must NOT
-    quarantine a healthy region for our own teardown -- mirroring the dead-host and first-liveness
-    paths. (Same marker that quarantines a non-cancelled run above.)"""
-    import flash.runner
-
-    monkeypatch.setattr(
-        flash.runner, "get_status",
-        lambda run_id: type("S", (), {"state": "running", "cancel_requested": True})(),
-    )
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": True, "error": "host: docker run failed"}
-        ),
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable marker -> retry
-    assert not res.host_fault  # cancel-in-progress -> NOT quarantined even via the marker path
-
-
-def test_poll_github_ratelimit_heartbeat_not_quarantined(monkeypatch):
-    """A pre-training GitHubRateLimitError (env resolution hit a GLOBAL GitHub/control-plane rate limit)
-    makes the worker stamp a FRESH error heartbeat flagged retriable + host_neutral, while the bootstrap
-    marker is a plain no-metrics failure (non-retriable, non-neutral). The region-INDEPENDENT fault must
-    retry (job_preempted via the retriable hb) WITHOUT quarantining a healthy region — it would hit the
-    same rate limit in any region — so fresh_host_neutral_hb() suppresses host_fault."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=json.dumps(
-            {"ok": False, "attempt": 0, "retriable": False, "error": "no /tmp/metrics.json (crashed)"}
-        ),
-    )
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {
-            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "host_neutral": True
-        },
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable hb -> retry on a fresh host
-    assert not res.host_fault  # host_neutral hb: global rate limit, not a sick region -> NO quarantine
-
-
-def test_poll_dead_host_neutral_heartbeat_without_marker_not_quarantined(monkeypatch):
-    """Same region-INDEPENDENT GitHubRateLimitError, but the attempt marker never landed (its upload
-    failed, or the box was lost before write) so we hit the DEAD-host branch instead of fail_from_marker.
-    That branch must apply the same fresh_host_neutral_hb() guard the marker path does: retry the global
-    rate limit (job_preempted via the retriable hb) WITHOUT quarantining an otherwise-healthy region.
-    Pre-fix this branch set host_fault unconditionally on a pre-training loss -> false quarantine."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminated"}],
-        # NO marker -> falls through terminal_artifact_result() to the dead-host branch
-    )
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {
-            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "host_neutral": True
-        },
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable hb -> retry on a fresh host
-    assert not res.host_fault  # host_neutral hb on the dead-host path: NO quarantine of a healthy region
-
-
-def test_poll_dead_host_cancel_requested_not_quarantined(monkeypatch):
-    """cancel_run sets cancel_requested=True BEFORE it tears the box down and persists the terminal
-    'cancelled' state. A poll landing in that teardown window (state still 'running') must honor the
-    intent and NOT quarantine a healthy region for our own cancellation."""
-    import flash.runner
-
-    monkeypatch.setattr(
-        flash.runner, "get_status",
-        lambda run_id: type("S", (), {"state": "running", "cancel_requested": True})(),
-    )
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminated"}],
-        boot="+ docker pull ... (cancel in progress)",
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert not res.host_fault  # cancel-in-progress -> region NOT quarantined
-
-
-def test_poll_dead_host_trained_heartbeat_without_marker_not_quarantined(monkeypatch):
-    """A post-training required upload (adapter/DONE/metrics) fails retriably and BOTH the worker's
-    attempt marker and the box are lost, leaving only a fresh error_* heartbeat flagged trained=True.
-    The dead-host path must read that heartbeat 'trained' flag (the marker is unavailable here) and NOT
-    quarantine a HEALTHY region that actually finished training -- mirroring the marker.trained guard."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminated"}],
-        # no marker -> dead-host branch; the only signal is the trained error heartbeat below
-    )
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {
-            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "trained": True
-        },
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # retriable hb -> retry
-    assert not res.host_fault  # trained hb: finished training on a healthy region -> NO quarantine
-
-
-def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
-    """On a reattach whose first poll already sees the box active, active_since is launch-anchored, so
-    the launch-relative first_liveness deadline is already blown. The observed-grace floor stops a box
-    that only JUST became active (after a long provision the control plane missed) from being failed
-    over before its boot-log uploader's publication window: even with the boot.log absent past
-    BOOT_LOG_ABSENT_POLLS and the deadline exceeded, no 'no worker liveness' stall fires until we've
-    watched it active for FIRST_LIVENESS_OBSERVED_GRACE_S. Here the box dies (host loss) inside that
-    window -> job_preempted, not the premature liveness stall (which the pre-fix code would return)."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}] * 4 + [{"status": "terminated"}],
-        boot=None,  # uploader has not published yet
-        step=0.1,  # tiny steps so the 120s observed-grace floor is NOT reached in these few polls
-    )
-    # Launch 1_000s ago (clock starts 10_000): the first_liveness deadline (10s) is blown, but the
-    # 3_000s setup grace is NOT (else its launch-anchored stall would fire first and mask the floor).
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=10.0
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # died inside the observed-grace window
-    assert "no worker liveness" not in (res.detail or "")
-
-
-def test_poll_reattach_setup_stall_no_liveness_quarantines(monkeypatch):
-    """On a reattach whose first poll already sees an active box silent since launch PAST the setup
-    grace, the observed-grace floor defers the first-liveness branch -- but the box produced NO liveness
-    (no boot.log, no heartbeat), so the pre-training setup STALL must still host_fault to quarantine the
-    wedged region (else the next attempt re-enters it). Pre-fix the setup-stall return had no host_fault."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}] * 3,
-        boot=None,  # no boot.log
-        step=0.1,  # observed-grace floor (120s) NOT reached -> first-liveness stays deferred
-    )
-    # Launch 9_000s ago (clock starts 10_000): silent since launch, setup grace (10s) already exceeded.
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
-        first_liveness_s=10.0, setup_grace_s=10.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert res.host_fault  # active but never any liveness past setup grace on reattach -> quarantine
-
-
-def test_poll_reattach_setup_stall_boot_log_present_not_quarantined(monkeypatch):
-    """SAME reattach window as above, but the box DID publish a boot.log (cloud-init ran, worker booting
-    slowly). The first-liveness branch -- which normally latches boot_log_seen -- is deferred by the
-    observed-grace floor, so the setup-stall fires first with boot_log_seen still False. It must FORCE-read
-    the boot.log before the no-liveness predicate: a boot-log-only stall is ambiguous (the worker ran), so
-    it stays a (retriable) stall but must NOT host_fault/quarantine a healthy region."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}] * 3,
-        boot="+ docker pull ...\n",  # boot.log present -> cloud-init ran -> NOT a no-liveness region
-        step=0.1,  # observed-grace floor (120s) NOT reached -> first-liveness latch stays deferred
-    )
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
-        first_liveness_s=10.0, setup_grace_s=10.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert not res.host_fault  # boot.log present (force-read latch) -> ambiguous stall, region NOT sick
-
-
-def test_poll_setup_stall_done_marker_wins_over_quarantine(monkeypatch):
-    """The pre-training setup-stall path force-reads terminal artifacts before returning, exactly as the
-    first-liveness branch does. A worker can finish right at the stall boundary and have its DONE delayed
-    by Hub rate-limiting (the NON-forced loop read misses it); the FORCED terminal read at the stall must
-    surface that DONE so a completed run is reported as success, NOT a wrongful stall that quarantines a
-    region which actually finished. Pre-fix the setup-stall return host_fault'd without reading."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
-
-    monkeypatch.setattr(lambda_api, "get_instance", lambda instance_id: {"status": "active"})
-    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
-    # step=0.1 keeps the observed-grace floor (120s) unreached -> first-liveness branch stays deferred, so
-    # the SETUP-STALL branch (launch already past setup_grace) is the one that trips first.
-    clock = itertools.count(start=10_000, step=0.1)
-    monkeypatch.setattr(jobs.time, "time", lambda: float(next(clock)))
-    metrics = json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0})
-
-    def factory(hf_repo, path, min_interval_s=45.0):
-        def read(force=False):
-            if path.endswith("/DONE"):
-                return "10500.0" if force else None  # rate-limited: only the forced stall read surfaces it
-            if path.endswith("metrics.json"):
-                return metrics
-            return None  # no boot.log, no marker -> would otherwise be a no-liveness quarantine
-
-        return read
-
-    monkeypatch.setattr(jobs, "_make_hf_file_reader", factory)
-    # Launched 9_000s ago (clock starts 10_000): silent since launch, setup grace already exceeded on iter 1.
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
-        first_liveness_s=10.0, setup_grace_s=10.0,
-    )
-    assert res.ok  # forced DONE read before the setup-stall return -> success, not stall/quarantine
-    assert res.failure is None
 
 
 def test_poll_dead_host_without_marker_is_preempted(monkeypatch):
@@ -1088,122 +625,10 @@ def test_poll_dead_host_with_retriable_error_still_preempted(monkeypatch):
         error="Traceback ...\nRetriableInfraError: cuda device not ready",
     )
     res = jobs.poll_lambda_job(
-        _handle(),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        # FRESH retriable heartbeat (ts >= launch): this attempt's worker flagged the fault retriable.
-        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 10_000.0},
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {"retriable": True}
     )
     assert not res.ok
     assert res.failure == "job_preempted"
-    assert res.host_fault  # fresh retriable infra crash before training -> quarantine the region
-
-
-def test_poll_dead_host_stale_retriable_hb_does_not_mask_crash(monkeypatch):
-    """A STALE prior-attempt retriable heartbeat (ts < launch) must NOT suppress THIS attempt's
-    deterministic crash. The dead branch gates ``worker_crashed`` on fresh_retriable_hb() (launch-fresh),
-    NOT bare worker_flagged_retriable(), so a non-retriable error_<phase>.txt this attempt is classified
-    terminal job_failed and the healthy region is NOT quarantined -- even though a seed-scoped retriable
-    heartbeat lingers from a prior attempt."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminating"}],
-        error="Traceback ...\nValueError: bad config",  # deterministic, non-retriable
-    )
-    res = jobs.poll_lambda_job(
-        _handle(),  # attempt 0
-        _spec(),
-        seed=0,
-        interval_s=0,
-        # retriable BUT stale (ts < launch 10_000): a prior attempt's lingering signal.
-        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 5_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_failed"  # crash trusted, not masked by the stale retriable hb
-    assert not res.host_fault  # deterministic worker crash -> region stays healthy
-
-
-def test_poll_dead_host_error_stage_hb_quarantines_pretraining_fault(monkeypatch):
-    """An ``error_<phase>`` heartbeat stage is the worker's crash marker -- pre-training, NOT a training
-    step. is_training_stage() excludes error_* (and the *_initializing setup stages), so reached_training_now()
-    is False and a FRESH retriable infra fault during init still quarantines the region (host_fault). If
-    error_* were misread as a training stage the quarantine would be wrongly suppressed."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminating"}],
-        error="Traceback ...\nRetriableInfraError: cuda device not ready",
-    )
-    res = jobs.poll_lambda_job(
-        _handle(),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        # fresh, retriable, crash-stage heartbeat -> pre-training infra fault.
-        heartbeat_reader=lambda force=False: {"stage": "error_sft", "retriable": True, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # fresh retriable -> retry on a fresh host
-    assert res.host_fault  # error_* is pre-training -> quarantine the region
-
-
-def test_poll_dead_host_stale_error_with_fresh_boot_heartbeat_is_preempted(monkeypatch):
-    """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. On
-    a RETRY (attempt > 0) that posts a boot heartbeat (THIS attempt overwrote the prior retriable one
-    and is still booting) then loses the host, the loss must NOT be classified terminal job_failed off
-    the stale file: fresh_error_heartbeat() is false for a setup-stage heartbeat, so without positive
-    current-crash evidence the loss stays retriable (job_preempted). (The pre-fix code, keyed only on
-    the seed-scoped file + heartbeat retriable bit, returned job_failed here.)"""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminating"}],
-        error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a retriable prior attempt
-    )
-    res = jobs.poll_lambda_job(
-        _handle(attempt=1), _spec(), seed=0, interval_s=0,  # a RETRY: a stale prior-attempt file is possible
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # stale error file did not flip a host loss to terminal
-
-
-def test_poll_dead_host_first_attempt_error_with_setup_heartbeat_is_job_failed(monkeypatch):
-    """The inverse guard: on the FIRST attempt (attempt 0) no prior attempt exists, so a present
-    error_<phase>.txt is unambiguously THIS attempt's crash. A worker that wrote the error file then
-    died in setup BEFORE stamping its terminal error heartbeat (last heartbeat still a setup stage)
-    must still fail fast as job_failed -- the stale-file guard must not misread a genuine current crash
-    as retriable and burn the retry budget re-running a deterministic failure."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminating"}],
-        error="Traceback ...\nValueError: bad config -> deterministic crash this attempt",
-    )
-    res = jobs.poll_lambda_job(
-        _handle(attempt=0), _spec(), seed=0, interval_s=0,  # FIRST attempt: error file can't be stale
-        heartbeat_reader=lambda force=False: {"stage": "sft_model_load", "step": 0, "ts": 10_000.0},
-    )
-    assert not res.ok
-    assert res.failure == "job_failed"  # current-attempt crash trusted despite the setup-stage heartbeat
-
-
-def test_poll_dead_host_retry_stale_error_no_current_liveness_is_preempted(monkeypatch):
-    """On a RETRY (attempt > 0) the seed-scoped error_<phase>.txt may be a PRIOR attempt's, and THIS
-    attempt's host can be lost before producing ANY fresh heartbeat. With no current-attempt liveness
-    (no fresh heartbeat at all), there is no proof the worker crashed this attempt, so the loss is a
-    HOST LOSS -> job_preempted (retry), NOT a wrongful terminal job_failed off the stale file. (Trusting
-    the file here would strand a recoverable run; over-retry is the documented safe bias on retries.)"""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminating"}],
-        error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a prior attempt
-    )
-    res = jobs.poll_lambda_job(
-        _handle(attempt=1), _spec(), seed=0, interval_s=0,  # a RETRY
-        heartbeat_reader=lambda force=False: {},  # NO fresh heartbeat this attempt (cold host loss)
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"  # host loss, not the stale file's deterministic crash
-    assert res.host_fault  # pre-training host loss with no cancel -> region quarantined
 
 
 def test_poll_loading_timeout(monkeypatch):
@@ -1220,7 +645,7 @@ def test_poll_heartbeat_stall(monkeypatch):
     # A FRESH training heartbeat (ts >= launch 10_000) that then FROZE: it proves liveness (so the
     # fast first-liveness failover is satisfied) AND arms the tight training stall window, so the
     # subsequent no-progress gap past stall_after_s is the stall actually under test here.
-    frozen = {"stage": "rl_step", "step": 3, "ts": 10_000.0}  # real training-step stage
+    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0}
     res = jobs.poll_lambda_job(
         _handle(),
         _spec(),
@@ -1232,33 +657,6 @@ def test_poll_heartbeat_stall(monkeypatch):
     assert not res.ok
     assert res.failure == "stalled"
     assert "no worker progress" in res.detail
-    # a mid-TRAINING stall is NOT a region fault (the region was working) -> no quarantine
-    assert not res.host_fault
-
-
-def test_submit_quarantines_region_on_host_fault(monkeypatch):
-    """When the poll returns a host fault (worker never reached training in this region),
-    submit_run_lambda quarantines the region so the next allocation/launch avoids it."""
-    import flash.providers._health as health
-    from flash.providers.base import PollResult
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
-
-    health.clear()
-    handle = _handle()  # region us-east-1
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [_inst()])
-    monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: handle)
-    monkeypatch.setattr(
-        jobs,
-        "poll_lambda_job",
-        lambda *a, **k: PollResult(False, failure="stalled", detail="no worker liveness", host_fault=True),
-    )
-    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: None)
-
-    assert not health.region_is_sick("lambda", "us-east-1")
-    res = jobs.submit_run_lambda(_spec(), seed=0)
-    assert res.host_fault
-    assert health.region_is_sick("lambda", "us-east-1")  # region now quarantined
 
 
 def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
@@ -1272,7 +670,6 @@ def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
     assert res.failure == "stalled"  # infra-shaped -> retried + escaped cross-provider (PR #241)
     assert "no worker liveness" in res.detail
     assert "limit 500s" in res.detail
-    assert res.host_fault  # the region never booted a worker -> submit_run quarantines it
 
 
 def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
@@ -1290,47 +687,6 @@ def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
     assert "no worker liveness" not in (res.detail or "")
-    # died before any training heartbeat -> still a host fault (region quarantined)
-    assert res.host_fault
-
-
-def test_poll_legacy_boot_log_satisfies_first_liveness_on_reattach(monkeypatch):
-    """Mixed-version reattach: a control plane upgraded to this PR while a box launched by the PREVIOUS
-    user-data is still pre-heartbeat. That old box wrote the legacy NON-attempt-scoped lambda_boot.log,
-    while the attempt-scoped lambda_attempt<N>_boot.log (the new path) is absent. The first-liveness
-    gate must accept the legacy log as liveness and NOT fast-fail/quarantine a healthy, still-booting
-    old box during the upgrade drain window. Box later dies -> job_preempted, NOT 'no worker liveness'."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
-        boot=None,  # attempt-scoped boot.log absent (new path the old box never wrote)
-        legacy_boot="+ docker pull ... (old-CP box, legacy boot.log)",  # legacy path present
-        step=100.0,
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
-    assert "no worker liveness" not in (res.detail or "")  # legacy boot.log satisfied first-liveness
-
-
-def test_poll_legacy_boot_log_honored_on_attempt1_reattach(monkeypatch):
-    """A mixed-version reattach can be polling a PRE-upgrade attempt 1+ box whose old user-data wrote
-    only the legacy <arm>_boot.log (``attempt`` was persisted before the attempt-scoped change). The
-    legacy fallback must be honored on ANY attempt — gating it to attempt 0 would falsely quarantine
-    that healthy old retry. Box later dies -> job_preempted, NOT a 'no worker liveness' stall. (A stale
-    prior-attempt legacy log can't mask a relaunch instead: the only relaunch path under this prefix is
-    attach recovery, which purges it via _purge_stale_seed_artifacts.)"""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
-        boot=None,  # attempt-scoped boot.log absent (old box wrote only the legacy path)
-        legacy_boot="+ docker pull ... (old-CP attempt-1 box, legacy boot.log)",
-        step=100.0,
-    )
-    res = jobs.poll_lambda_job(_handle(attempt=1), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert not res.ok
-    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
-    assert "no worker liveness" not in (res.detail or "")  # legacy boot.log honored on attempt 1
 
 
 def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):
@@ -1421,58 +777,6 @@ def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypa
     assert calls["n"] >= BOOT_LOG_ABSENT_POLLS  # required the absence to persist, not a lone None
 
 
-def test_poll_active_done_marker_wins_over_first_liveness_stall(monkeypatch):
-    """The boot.log uploader is best-effort and can silently never run even though the worker itself
-    ran and uploaded a terminal DONE. The boot.log-absence threshold (~45s) can trip before
-    marker_reader()'s NON-forced re-read surfaces the DONE, so before returning a 'stalled' (which would
-    mask the real outcome AND quarantine a region that actually completed the run) the poller FORCE-reads
-    the terminal artifacts. A fresh DONE must win -> success, not stalled."""
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
-
-    monkeypatch.setattr(lambda_api, "get_instance", lambda instance_id: {"status": "active"})
-    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
-    clock = itertools.count(start=10_000, step=100)
-    monkeypatch.setattr(jobs.time, "time", lambda: float(next(clock)))
-    metrics = json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0})
-
-    def factory(hf_repo, path, min_interval_s=45.0):
-        def read(force=False):
-            # DONE is rate-limited: the NON-forced loop read never surfaces it; only the FORCED
-            # terminal_artifact_result() read at the stall boundary does (mirrors the 45s vs 60s race).
-            if path.endswith("/DONE"):
-                return "10500.0" if force else None
-            if path.endswith("metrics.json"):
-                return metrics
-            return None  # no boot.log, no marker, no error file
-
-        return read
-
-    monkeypatch.setattr(jobs, "_make_hf_file_reader", factory)
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=50.0
-    )
-    assert res.ok  # forced DONE read before the stall -> terminal success, not a wrongful stall/quarantine
-    assert res.failure is None
-
-
-def test_poll_first_liveness_stall_cancelled_run_not_quarantined(monkeypatch):
-    """A user cancel can land while the box is still active-but-silent (no boot.log/heartbeat), and the
-    first-liveness threshold can fire before the runner observes the cancellation. run_cancelled()
-    suppresses host_fault so a deliberate teardown does NOT quarantine a healthy region -- mirrors the
-    dead-host branch's cancel guard, which this liveness-stall path previously lacked."""
-    import flash.runner
-
-    monkeypatch.setattr(
-        flash.runner, "get_status", lambda run_id: type("S", (), {"state": "cancelled"})()
-    )
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], boot=None, step=100.0)
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert res.failure == "stalled"
-    assert "no worker liveness" in res.detail
-    assert not res.host_fault  # cancelled -> region NOT quarantined despite the liveness stall
-
-
 def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
     """Any FRESH heartbeat (even the early 'boot' stage) proves the worker started, so the
     first-liveness deadline is satisfied and must not fire."""
@@ -1528,12 +832,8 @@ def test_poll_reattach_already_active_anchors_liveness_to_launch(monkeypatch):
     )
     assert not res.ok
     assert res.failure == "stalled"
-    # Elapsed counts from LAUNCH (~5_000s ago), not the reattach (~0s) — proves active_since stayed
-    # anchored. Parse the reported elapsed rather than hard-coding it (clock-call count is incidental).
-    import re
-
-    elapsed = int(re.search(r"for (\d+)s", res.detail).group(1))
-    assert elapsed >= 5_000  # launch-anchored, not reattach-anchored
+    # Elapsed counts from LAUNCH (5_000s ago), not the reattach — proves active_since stayed anchored.
+    assert "5020s" in res.detail
 
 
 def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
@@ -1620,7 +920,7 @@ def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     import re
 
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
-    hb = {"stage": "rl_step", "step": 7, "ts": 8500.0}  # real training-step stage
+    hb = {"stage": "rl", "step": 7, "ts": 8500.0}
     res = jobs.poll_lambda_job(
         _handle(started_ts=8_000.0),
         _spec(),
@@ -1654,7 +954,7 @@ def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
     jobs = _wire_poll(
         monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
     )
-    stale = {"stage": "rl_step", "step": 2, "ts": 8000.0}  # real training stage, but predates this launch
+    stale = {"stage": "rl", "step": 2, "ts": 8000.0}  # training stage, but predates this launch
     res = jobs.poll_lambda_job(
         _handle(started_ts=9_000.0),
         _spec(),
@@ -1806,7 +1106,7 @@ def _wire_runner(monkeypatch, poll_outcome):
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.append(list(ids)) or True
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: _handle())
 
     def fake_poll(*a, **k):
@@ -1856,45 +1156,6 @@ def test_runner_terminates_when_handle_persist_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="status store unreachable"):
         jobs.submit_run_lambda(_spec(), seed=0, on_handle=boom)
     assert terminated == [["i-9999"]]
-
-
-def test_submit_falls_back_to_quarantined_region_when_healthy_empty(monkeypatch):
-    """allocate() can pick a class whose every fitting region is quarantined; submit must mirror that
-    last-resort relaxation rather than re-fetching a healthy-only (empty) region list and hard-failing
-    at launch -- which would turn the bounded-demotion quarantine into a submit-time kill switch. When
-    the healthy usable_instances() is empty, submit re-fetches with ignore_sick=True and passes it
-    through to launch_and_submit so the in-launch region walk stays consistent."""
-    from flash.providers.base import PollResult
-    from flash.providers.lambdalabs import api as lambda_api
-    from flash.providers.lambdalabs import jobs
-
-    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: True)
-
-    seen_calls = []  # (force, ignore_sick) per usable_instances() call
-
-    def fake_usable(gpu, force=False, ignore_sick=False):
-        seen_calls.append((force, ignore_sick))
-        # healthy view empty; the relaxed fallback recovers the region ONLY when it bypasses the cache
-        # (force=True) -- a non-forced relaxed re-fetch would return the same stale-empty view.
-        return [_inst()] if (ignore_sick and force) else []
-
-    captured = {}
-
-    def fake_launch(spec, seed, instances, **k):
-        captured["instances"] = instances
-        captured["ignore_sick"] = k.get("ignore_sick")
-        return _handle()
-
-    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
-    monkeypatch.setattr(jobs, "launch_and_submit", fake_launch)
-    monkeypatch.setattr(jobs, "poll_lambda_job", lambda *a, **k: PollResult(True, metrics={"a": 1}))
-
-    res = jobs.submit_run_lambda(_spec(), seed=0)
-    assert res.ok
-    assert [c[1] for c in seen_calls] == [False, True]  # healthy pass first (empty), then relaxed fallback
-    assert seen_calls[1][0] is True  # relaxed fallback bypasses the cache (force=True) to find live capacity
-    assert captured["instances"]  # launch got the recovered quarantined candidate, not an empty list
-    assert captured["ignore_sick"] is True  # propagated so the in-launch walk relaxes too
 
 
 def test_submit_rejects_policy_word_gpu():
@@ -2096,7 +1357,7 @@ def test_allocator_capacity_aware(monkeypatch):
 
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")  # make lambda "available"
 
-    def fake_usable(gpu, force=False, ignore_sick=False):
+    def fake_usable(gpu):
         # A10 has capacity; A100 SXM 40GB does not (excluded from candidates).
         if gpu == "A10":
             return [LambdaInstance("A10", "gpu_1x_a10", "us-east-1", 24, 1.29)]
@@ -2163,16 +1424,10 @@ def test_bootstrap_honors_nonzero_exit_without_remote_artifacts(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
     assert lb.main() == 1
-    ok, error, retriable, trained, host_neutral = markers[0]
+    ok, error, retriable = markers[0]
     assert not ok
     assert "non-zero" in error  # propagated as a real (retriable) failure, not a false ok=true
     assert retriable is True  # infra/upload failure -> retried, not job_failed
-    # The worker REACHED end-of-training (local metrics.json exists); only the upload failed. trained=True
-    # tells the poller this is a post-training completion retry on a HEALTHY region -> do NOT quarantine.
-    assert trained is True
-    # A bootstrap-RAISED retriable failure (the required upload) is region-independent HF delivery, so it
-    # is host_neutral -> the poller never quarantines on it (defense-in-depth alongside trained).
-    assert host_neutral is True
 
 
 def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
@@ -2182,8 +1437,7 @@ def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
     assert lb.main() == 0
-    # ok, no error, not retriable, trained (metrics exist), not host_neutral (success).
-    assert markers[0] == (True, "", False, True, False)
+    assert markers[0] == (True, "", False)
 
 
 def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
@@ -2255,7 +1509,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""
     from flash.providers import _instance_bootstrap as lb
 
-    markers: list[tuple[bool, str, bool, bool, bool]] = []
+    markers: list[tuple[bool, str, bool]] = []
     monkeypatch.setattr(
         lb,
         "load_payload",
@@ -2267,22 +1521,15 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
     monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503")))
-    monkeypatch.setattr(lb.os.path, "exists", lambda p: False)  # no sentinel/metrics (fails before training)
     monkeypatch.setattr(
         lb, "write_attempt_marker",
-        lambda p, ok, error="", retriable=False, trained=False, host_neutral=False: markers.append(
-            (ok, error, retriable, trained, host_neutral)
-        ),
+        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
     )
     assert lb.main() == 1
-    ok, error, retriable, trained, host_neutral = markers[0]
+    ok, error, retriable = markers[0]
     assert not ok
     assert "spilled job spec" in error
     assert retriable is True
-    assert trained is False  # the spilled-spec fetch fails BEFORE training -> pre-training
-    # ...but it is a region-INDEPENDENT HF read failure, so host_neutral=True keeps the poller from
-    # quarantining the (healthy) region for it -- it would fail identically in any region.
-    assert host_neutral is True
 
 
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
