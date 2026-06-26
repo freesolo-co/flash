@@ -80,6 +80,11 @@ jobs:
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
         uses: astral-sh/setup-uv@v5
+        with:
+          # no cache: the post-run cache-prune calls `uv`, but the "Free disk space" step deletes
+          # /opt/hostedtoolcache (where setup-uv put uv), so the post step fails ("uv not found") and
+          # marks the whole job red even though the bake + push already succeeded.
+          enable-cache: false
 
       - name: Sync deps (flash + runpod + hf)
         if: steps.gate.outputs.run == 'true'
