@@ -71,8 +71,14 @@ class ModelInfo:
     # completion cap. Curated per model below; defaults to the open-model fallback.
     vocab_size: int = _DEFAULT_VOCAB_SIZE
     # Total parameters in billions — the numeric model size the cost estimator reads directly
-    # (no parsing of the ``params`` display string). Curated per catalog model below.
+    # (no parsing of the ``params`` display string). Drives the memory/size terms (VRAM, disk,
+    # download), which always size the FULL checkpoint. Curated per catalog model below.
     params_b: float = 0.0
+    # Parameters ACTIVE per token in billions — only meaningful for an MoE, where a token routes
+    # through a small subset of experts. The cost estimator's per-token FLOPs/step-time term reads
+    # this (a token exercises only the active params), while VRAM/disk/download keep using the total
+    # ``params_b``. 0.0 (the dense default) means "same as params_b" — every token hits every param.
+    active_params_b: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -184,6 +190,10 @@ MODELS: dict[str, ModelInfo] = {
         # at the 180 GB B200's usable budget, and the marketing "~35.95B" figure tips it over (186 GB,
         # see test_sft_equation_covers_honest_peak_across_seq_boundary). Keep 35.0.
         params_b=35.0,
+        # ~3B ACTIVE per token (the "A3B" in the name): a token routes through a small subset of
+        # experts, so cost/step-time FLOPs scale with ~3B, not the 35B total. Without this the
+        # estimator would price SFT as if every token exercised all 35B params — ~10x too slow/costly.
+        active_params_b=3.0,
         vocab_size=248_320,
         algos=("sft",),
         min_vram_gb=180,

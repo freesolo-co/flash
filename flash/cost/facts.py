@@ -93,6 +93,22 @@ def total_params_b(model_id: str) -> float:
     return info.params_b
 
 
+def active_params_b(model_id: str) -> float:
+    """Parameters ACTIVE per token (billions) — the per-token FLOPs/step-time size.
+
+    For an MoE this is the curated ``active_params_b`` (a token routes through only a subset of
+    experts); for a dense model (``active_params_b`` unset / 0) it falls back to the total
+    ``params_b``. Use this for compute (FLOPs) terms; use ``total_params_b`` for memory/size terms
+    (VRAM, disk, download), which always size the full checkpoint."""
+    info = MODELS.get(model_id)
+    if info is None:
+        raise ValueError(
+            f"unknown model {model_id!r}; cost estimation supports catalog models only "
+            f"({', '.join(MODELS)})"
+        )
+    return info.active_params_b or info.params_b
+
+
 def model_quant(model_id: str) -> str:
     """Quantization of the catalog entry; ``"bf16"`` for the whole catalog today (bf16 default)."""
     info = MODELS.get(model_id)
