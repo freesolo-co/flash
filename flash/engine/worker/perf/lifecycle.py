@@ -228,13 +228,15 @@ def wait_for_gpu(requested_gpu: str | None = None):
             raise  # a GPU/identity mismatch must propagate (fail over), not be masked as "never ready"
         except Exception as e:
             last = str(e)[:160]
-            # A persistent NVML-init failure (driver crashed / GPU off the bus) won't recover; after
-            # ~30s ruling out a transient blip, fail over FAST instead of the full ~120s. A BUSY device
-            # keeps NVML alive, so it stays in the patient loop below.
-            if i >= 2 and not _nvml_alive():
-                raise RetriableInfraError(
-                    f"GPU host NVML init failed (driver/host fault, won't recover): {last}; failing over"
-                ) from e
+        # GPU not ready this iteration — CUDA threw OR ``is_available()`` returned False (a dead
+        # driver / GPU off the bus reports unavailable WITHOUT raising). A persistent NVML-init failure
+        # won't recover; after ~30s ruling out a transient blip, fail over FAST instead of the full
+        # ~120s. A BUSY device keeps NVML alive, so it stays in the patient loop. This check lives
+        # OUTSIDE the except so the no-exception ``is_available()``-False path fast-fails too.
+        if i >= 2 and not _nvml_alive():
+            raise RetriableInfraError(
+                f"GPU host NVML init failed (driver/host fault, won't recover): {last}; failing over"
+            )
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
         _t.sleep(10)
     # Infra-shaped: a host whose GPU never comes up is dead, not a code bug -> retry on a fresh one.

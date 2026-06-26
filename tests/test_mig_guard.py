@@ -249,6 +249,22 @@ def test_wait_for_gpu_fast_fails_on_dead_nvml(monkeypatch):
     assert "never became ready" not in str(exc.value)  # fast-failed, didn't exhaust the patient loop
 
 
+def test_wait_for_gpu_fast_fails_on_dead_nvml_when_cuda_unavailable(monkeypatch):
+    """Regression: a dead driver / GPU off the bus makes ``torch.cuda.is_available()`` return False
+    WITHOUT raising, so the NVML fast-fail must also run on that no-exception path — otherwise the
+    broken host burns the full ~120s patient loop instead of failing over fast (~30s)."""
+    torch = pytest.importorskip("torch")
+
+    monkeypatch.setattr(lifecycle, "detect_mig_slice", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)  # no exception
+    monkeypatch.setattr("time.sleep", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "_nvml_alive", lambda: False)  # broken host: NVML can't init
+    with pytest.raises(RetriableInfraError) as exc:
+        wait_for_gpu()
+    assert "NVML init failed" in str(exc.value)
+    assert "never became ready" not in str(exc.value)  # fast-failed, didn't exhaust the patient loop
+
+
 def test_wait_for_gpu_stays_patient_when_nvml_alive(monkeypatch):
     """A merely BUSY device (NVML still alive) keeps the patient loop — it must NOT be treated as a
     dead host; it only gives up with 'never became ready' after the full window."""
