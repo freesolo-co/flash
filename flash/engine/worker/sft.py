@@ -519,6 +519,17 @@ def run_sft():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+    # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
+    # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
+    # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
+    # doesn't land on one would have NO `flash deploy --step` entry even though it IS the served
+    # default adapter. Publish the just-saved final adapter here, keyed by the true final
+    # global_step: same bytes as `<prefix>/adapter`, so `--step <final>` always resolves to exactly
+    # the deployed default. Idempotent (content-addressed path) when the step already aligned, and
+    # best-effort (never fails a paid run).
+    _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
+    if _final_step:
+        _w.publish_deployable_checkpoint(adapter_dir, _final_step)
     _w.heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     train_tokens = int(sum(len(tok(t["text"])["input_ids"]) for t in texts) * epochs)

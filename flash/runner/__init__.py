@@ -257,8 +257,8 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # fleet: (#storage DCs) x 100 GB of PERMANENT billed storage (~11 x 100 GB ~= 1.1 TB ~= $77/mo today;
 # grows by one volume if the SDK adds a storage region). RunPod never auto-deletes network volumes;
 # reclaim the fleet with ``python -m flash.providers.runpod.preload --teardown`` (also reclaims the
-# Lambda/Hyperstack caches). Lambda filesystems + Hyperstack volumes are likewise pre-created in every
-# region/environment by ``preload --provision`` (pure control-plane API, no GPU).
+# Lambda caches). Lambda filesystems are likewise pre-created in every
+# region by ``preload --provision`` (pure control-plane API, no GPU).
 #
 # TRUST MODEL (shared multi-tenant cache). The catalog gate makes the run's SPEC model public:
 # ``_assign_weight_cache_volume`` attaches the cache only for ``model_policy == "catalog"`` runs

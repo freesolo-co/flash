@@ -77,7 +77,7 @@ def test_protected_names_skip_unreadable_run(monkeypatch):
     assert _derived("A100", "live") in names
 
 
-# --- the in-lifetime instance orphan sweep (Lambda/Hyperstack) ---------------------------------
+# --- the in-lifetime instance orphan sweep (Lambda) ---------------------------------
 
 
 class _FakeProvider:
@@ -136,24 +136,22 @@ def test_active_run_ids_skips_unreadable_run(monkeypatch):
 def test_sweep_instances_dispatches_active_set_and_sums(monkeypatch):
     monkeypatch.setattr(app_mod, "_active_run_ids", lambda: {"flash-live"})
     lam = _FakeProvider("lambda", torn=["i-1", "i-2"])
-    hyp = _FakeProvider("hyperstack", torn=["vm-9"])
     rp = _FakeProvider("runpod", torn=[])  # no-op for RunPod, still dispatched
     monkeypatch.setattr(
-        "flash.providers.configured_providers", lambda: [rp, lam, hyp], raising=False
+        "flash.providers.configured_providers", lambda: [rp, lam], raising=False
     )
 
-    # 2 lambda + 1 hyperstack + 0 runpod torn down.
-    assert app_mod._sweep_orphan_instances_once() == 3
+    # 2 lambda + 0 runpod torn down.
+    assert app_mod._sweep_orphan_instances_once() == 2
     # Every provider got the SAME live-run protection set.
     assert lam.seen_active == {"flash-live"}
-    assert hyp.seen_active == {"flash-live"}
     assert rp.seen_active == {"flash-live"}
 
 
 def test_sweep_instances_one_provider_blip_does_not_skip_others(monkeypatch):
     monkeypatch.setattr(app_mod, "_active_run_ids", lambda: set())
     boom = _FakeProvider("lambda", raises=True)
-    ok = _FakeProvider("hyperstack", torn=["vm-1", "vm-2"])
+    ok = _FakeProvider("runpod", torn=["vm-1", "vm-2"])
     monkeypatch.setattr(
         "flash.providers.configured_providers", lambda: [boom, ok], raising=False
     )
@@ -174,33 +172,31 @@ def test_instance_providers_configured_gating(monkeypatch):
     assert app_mod._instance_providers_configured() is True
 
     monkeypatch.setattr(
-        "flash.providers.available_providers", lambda: ("hyperstack",), raising=False
+        "flash.providers.available_providers", lambda: ("lambda",), raising=False
     )
     assert app_mod._instance_providers_configured() is True
 
 
 def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
-    """End-to-end through the REAL Lambda + Hyperstack ``sweep_orphans`` (only the provider REST
-    layer is faked): a periodic sweep tears down each provider's leaked instance while the live
+    """End-to-end through the REAL Lambda ``sweep_orphans`` (only the provider REST
+    layer is faked): a periodic sweep tears down the provider's leaked instance while the live
     run's instance — named from the SAME run id the server reports as active — is protected.
 
     Exercises the full path the lifespan loop runs: ``_sweep_orphan_instances_once`` ->
-    ``configured_providers`` -> ``LambdaProvider/HyperstackProvider.sweep_orphans`` -> the real
+    ``configured_providers`` -> ``LambdaProvider.sweep_orphans`` -> the real
     name<->run matching -> the (faked) terminate call. No ``sweep_orphans`` mock anywhere."""
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs as hs_jobs
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs as lambda_jobs
     from flash.runner import RunStatus
 
-    # One live run; its instance on each provider is named from this exact run id.
+    # One live run; its instance is named from this exact run id.
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "flash-live"}])
     monkeypatch.setattr(
         app_mod, "get_status", lambda rid: RunStatus(run_id="flash-live", state="running", spec={})
     )
-    # Make both instance providers "configured" so the real ones are dispatched (RunPod absent here).
+    # Make the instance provider "configured" so the real one is dispatched (RunPod absent here).
     monkeypatch.setattr(
-        "flash.providers.available_providers", lambda: ("lambda", "hyperstack"), raising=False
+        "flash.providers.available_providers", lambda: ("lambda",), raising=False
     )
 
     lam_instances = [
@@ -208,23 +204,16 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
         {"id": "i-orphan", "name": lambda_jobs.instance_label("flash-dead", 0, 0)},  # leaked -> kill
         {"id": "i-foreign", "name": "not-ours"},  # never touch
     ]
-    hs_vms = [
-        {"id": "vm-live", "name": hs_jobs.instance_label("flash-live", 0, 0)},  # live -> KEEP
-        {"id": "vm-orphan", "name": hs_jobs.instance_label("flash-gone", 0, 0)},  # leaked -> kill
-    ]
-    terminated, deleted = [], []
+    terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
-    monkeypatch.setattr(hs_api, "list_vms", lambda: hs_vms)
-    monkeypatch.setattr(hs_api, "delete_vms", lambda ids: deleted.extend(ids) or list(ids))
 
     torn = app_mod._sweep_orphan_instances_once()
 
-    assert torn == 2  # one Lambda instance + one Hyperstack VM
+    assert torn == 1  # one leaked Lambda instance
     assert terminated == ["i-orphan"]  # leaked reaped, live + foreign untouched
-    assert deleted == ["vm-orphan"]
 
 
 def test_sweep_resolves_active_labels_after_listing(monkeypatch):
@@ -283,3 +272,102 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
 
     assert out == []  # skipped, did NOT raise
     assert terminated == []  # and crucially did NOT reap the live instance
+
+
+# --- the RunPod idle sweep across a multi-account key pool --------------------------------------
+# Regression cover for the orphan pile-up: the sweep used the all-or-nothing ``list_endpoints``, so
+# one unhealthy pool key (rejected/expired/rate-limited) aborted the WHOLE sweep and idle orphans on
+# every OTHER account survived indefinitely. The sweep now lists per account and reaps what responds.
+
+
+def _idle_health():
+    """A warm-idle endpoint with no work — reapable under reap_warm=True."""
+    return {"workers": {"ready": 1, "idle": 1}, "jobs": {"inQueue": 0, "inProgress": 0}}
+
+
+def test_sweep_reaps_responsive_account_when_one_pool_key_fails(monkeypatch):
+    """One pool key fails to list this cycle; the responding account's idle orphan is still reaped,
+    using that account's OWN key — and the failure is surfaced at WARNING (not a silent DEBUG)."""
+    jobs._idle_since.clear()
+    orphan = {"id": "ep-b1", "name": "live-flash-5090-orphan"}
+    # fpA failed to list; fpB returned the orphan. (Accounts are identified by non-secret
+    # fingerprints, never the raw key.)
+    monkeypatch.setattr(
+        jobs.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": [orphan]}, ["fpA"])
+    )
+    health_calls = []
+
+    def health(eid, fp):
+        health_calls.append((eid, fp))
+        return _idle_health()
+
+    deletes = []
+    monkeypatch.setattr(jobs.runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda eid, fp: deletes.append((eid, fp)) or True,
+    )
+    warnings = []
+    monkeypatch.setattr(jobs.logger, "warning", lambda *a, **k: warnings.append(a))
+
+    # min_idle_s=0 -> a first idle observation is immediately reapable.
+    deleted = jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=0.0)
+
+    assert deleted == 1
+    assert health_calls == [("ep-b1", "fpB")]  # account-scoped: queried with the OWNING fingerprint
+    assert deletes == [("ep-b1", "fpB")]  # ...and deleted with it, no failover waterfall
+    assert warnings, "a failed pool account must be surfaced at WARNING, not swallowed at DEBUG"
+
+
+def test_sweep_preserves_grace_for_unlisted_account(monkeypatch):
+    """A partial outage must not reset the idle-grace clock for the account it couldn't list — else
+    a flaky account's orphan restarts its 15-min grace every sweep and never ages out."""
+    jobs._idle_since.clear()
+    jobs._idle_since["ep-a1"] = (1.0, "fpA")  # orphan on account A, observed idle long ago
+    # This cycle account A fails to list; account B responds with nothing.
+    monkeypatch.setattr(jobs.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": []}, ["fpA"]))
+    monkeypatch.setattr(
+        jobs.runpod_api, "endpoint_health_for_fingerprint", lambda eid, fp: _idle_health()
+    )
+    monkeypatch.setattr(jobs.runpod_api, "delete_endpoint_for_fingerprint", lambda eid, fp: True)
+    monkeypatch.setattr(jobs.logger, "warning", lambda *a, **k: None)
+
+    deleted = jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=900.0)
+
+    assert deleted == 0
+    # grace timer (owned by the FAILED account) SURVIVED the partial outage
+    assert jobs._idle_since.get("ep-a1") == (1.0, "fpA")
+
+
+def test_sweep_partial_view_prunes_vanished_timer_for_responsive_account(monkeypatch):
+    """During a partial outage, a stale grace timer whose OWNING account responded this cycle must
+    still be pruned — the endpoint genuinely vanished from a healthy account. (The earlier
+    listed-ids-only prune leaked it: any one failing account kept every responsive account's vanished
+    timers alive forever.) A timer owned by the FAILED account is still preserved."""
+    jobs._idle_since.clear()
+    jobs._idle_since["gone-b"] = (1.0, "fpB")  # vanished from account B, which responds this cycle
+    jobs._idle_since["stay-a"] = (1.0, "fpA")  # owned by account A, which fails this cycle
+    # B responds (no longer lists gone-b); A fails.
+    monkeypatch.setattr(jobs.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": []}, ["fpA"]))
+    monkeypatch.setattr(jobs.logger, "warning", lambda *a, **k: None)
+
+    deleted = jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=900.0)
+
+    assert deleted == 0
+    assert "gone-b" not in jobs._idle_since  # responsive account's vanished timer pruned (the fix)
+    assert jobs._idle_since.get("stay-a") == (1.0, "fpA")  # failed account's timer preserved
+
+
+def test_sweep_full_view_prunes_vanished_grace_timer(monkeypatch):
+    """With a complete fleet view (no failed account), a grace timer for an endpoint that is no
+    longer present is pruned — the original behavior, unchanged."""
+    jobs._idle_since.clear()
+    jobs._idle_since["ghost"] = (1.0, "fpA")  # endpoint that has since vanished
+    monkeypatch.setattr(jobs.runpod_api, "list_endpoints_by_key", lambda: ({"fpA": []}, []))
+    monkeypatch.setattr(jobs.logger, "warning", lambda *a, **k: None)
+
+    deleted = jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=900.0)
+
+    assert deleted == 0
+    assert "ghost" not in jobs._idle_since  # full view -> stale timer pruned

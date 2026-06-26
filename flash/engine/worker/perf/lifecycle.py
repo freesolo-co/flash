@@ -145,7 +145,7 @@ def _gpu_mismatch_reason(
 def verify_gpu(requested_gpu: str | None) -> None:
     """Assert the LIVE GPU matches the REQUESTED class (model + CUDA floor), or raise retriable.
     No-op for a falsy/unknown class. Runs on every provider (standardizes the per-class CUDA floor that
-    only Hyperstack/RunPod enforce pre-launch + a GPU-model check no provider does); a mismatch raises
+    only RunPod enforces pre-launch + a GPU-model check no provider does); a mismatch raises
     ``RetriableInfraError`` (fail over) instead of an opaque mid-setup crash. Best-effort reads."""
     if not requested_gpu:
         return
