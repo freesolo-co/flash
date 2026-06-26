@@ -224,7 +224,16 @@ def _verify(out: str, sm: str) -> int:
     blob = os.path.join(out, "mega_cache.bin")
     meta = os.path.join(out, "mega_cache.json")
     if not os.path.isfile(blob):
-        log(f"FAIL: no mega_cache.bin in {out}")
+        log(f"FAIL: no mega_cache.bin in {out}; what the warmup actually produced:")
+        for root, _, files in os.walk(out):
+            for f in sorted(files):
+                p = os.path.join(root, f)
+                log(f"   present: {os.path.relpath(p, out)} ({os.path.getsize(p)} b)")
+        wl = os.path.join(out, "warmup.log")
+        if os.path.isfile(wl):
+            log("   --- warmup.log tail ---")
+            for line in open(wl, errors="replace").read().splitlines()[-40:]:
+                log(f"   | {line}")
         return 1
     try:
         with open(meta) as f:
