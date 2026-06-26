@@ -186,9 +186,10 @@ def build_payload(
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
     ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name).
 
-    ``cache_host_mount`` (set by the provider when it attaches a per-region weight cache) points
-    HF_HOME at the bind-mounted cache (``/weight-cache/hf-cache``) instead of stripping the
-    RunPod redirect; ``cache_block_device`` adds the format/mount preamble for block-volume providers.
+    ``cache_host_mount`` (set by the provider when it attaches a per-region weight cache) points the
+    BASE-MODEL prefetch (``FLASH_WEIGHT_CACHE_DIR``) at the bind-mounted cache
+    (``/weight-cache/hf-cache/hub``) instead of stripping the RunPod redirect; ``cache_block_device``
+    adds the format/mount preamble for block-volume providers.
     """
     from flash.envs.registry import worker_pip_for_env
     from flash.providers.runpod.train import (
@@ -198,15 +199,17 @@ def build_payload(
     )
 
     # Start from the shared env with the RunPod /runpod-volume redirect stripped (that mount is
-    # RunPod-only). If THIS provider attached a cache, point HF_HOME at the instance cache mount —
-    # but DON'T clobber a per-run [worker_env].HF_HOME the user set on purpose. build_worker_env
-    # merges [worker_env] LAST, so a user override survives the strip above (only /runpod-volume-
-    # rooted vars are stripped); on RunPod that override wins, so honor it here too for parity. We
-    # only install the cache path when HF_HOME is absent (i.e. the platform redirect was stripped and
-    # the user set nothing).
+    # RunPod-only). If THIS provider attached a cache, point the base-model prefetch
+    # (FLASH_WEIGHT_CACHE_DIR) at the instance cache mount — but DON'T clobber a per-run [worker_env]
+    # override the user set on purpose. build_worker_env merges [worker_env] LAST, so a user override
+    # survives the strip above (only /runpod-volume-rooted vars are stripped); on RunPod that override
+    # wins, so honor it here too for parity. We only install the cache path when the user set neither a
+    # FLASH_WEIGHT_CACHE_DIR nor an HF_HOME of their own. BASE-MODEL-SCOPED, not a global HF_HOME: the
+    # worker downloads only the trusted public base model onto the shared per-region cache and keeps
+    # the run's env/reward HF downloads on ephemeral disk (issue #252), same as the RunPod path.
     env = strip_runpod_volume_env(build_worker_env(spec, seed, runtime_secrets=runtime_secrets))
-    if cache_host_mount and not env.get("HF_HOME"):
-        env["HF_HOME"] = CACHE_HF_HOME
+    if cache_host_mount and not env.get("FLASH_WEIGHT_CACHE_DIR") and not env.get("HF_HOME"):
+        env["FLASH_WEIGHT_CACHE_DIR"] = f"{CACHE_HF_HOME}/hub"
     payload = {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
@@ -378,8 +381,9 @@ def build_user_data(payload: dict, *, image: str) -> str:
     # Weight cache: the provider mounts its region-scoped persistent storage on the HOST at
     # ``cache_host_mount`` (Lambda auto-mounts its NFS filesystem there; Hyperstack's preamble below
     # formats+mounts the attached block device there). Bind it into the worker container at the FIXED
-    # ``/weight-cache`` so the worker's HF_HOME=/weight-cache/hf-cache (set in build_payload) persists
-    # the model download across runs in this region. Absent -> no bind (cold run).
+    # ``/weight-cache`` so the worker's base-model prefetch (FLASH_WEIGHT_CACHE_DIR=/weight-cache/
+    # hf-cache/hub, set in build_payload) persists the model download across runs in this region.
+    # Absent -> no bind (cold run).
     cache_host_mount = payload.get("cache_host_mount")
     # Single-quote the host path in the docker -v (defensive; the path is a controlled constant).
     cache_bind = f"-v '{cache_host_mount}':{CACHE_CONTAINER_MOUNT} \\\n  " if cache_host_mount else ""
