@@ -31,7 +31,7 @@ def preload_instance_run_id(provider: str, region: str, reap_deadline_epoch: int
 
     The epoch is placed RIGHT AFTER ``flash-preload-`` (before provider/region) on purpose: the launched
     instance NAME is bounded to the provider name budget by ``run_label_prefix``, which truncates the
-    TAIL and appends a hash. A long provider+region (e.g. hyperstack + a long region) would otherwise
+    TAIL and appends a hash. A long provider+region (e.g. a provider name + a long region) would otherwise
     push the deadline token past the cut and the reap parser would never see it — front-loading keeps
     ``-d<epoch>-`` inside the surviving prefix."""
     return f"flash-preload-d{int(reap_deadline_epoch)}-{provider}-{region.lower()}-{suffix}"
@@ -41,7 +41,7 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
     """True when a ``flash-preload-*`` instance name carries an embedded reap deadline (``-d<epoch>-``,
     written by ``preload_instance_run_id``) that elapsed more than ``grace_s`` ago.
 
-    Used by the Lambda/Hyperstack orphan sweeps: warm boxes are normally driver-owned and exempt, but a
+    Used by the Lambda orphan sweep: warm boxes are normally driver-owned and exempt, but a
     driver that died before its ``terminate_run_instances`` finally would leave one billing forever.
     Reaping past deadline+grace bounds that leak. Names WITHOUT a parseable deadline (legacy launches)
     return False — the unconditional driver-owned exemption still applies to them. The 10+ digit guard
@@ -52,7 +52,7 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
     return float(m.group(1)) + grace_s < now
 
 
-# First-liveness deadline for the instance providers (Lambda / Hyperstack). Once an instance reaches
+# First-liveness deadline for the instance providers (e.g. Lambda). Once an instance reaches
 # OS-level ``active`` a healthy box that actually ran cloud-init pushes its ``<arm>_attempt<N>_boot.log``
 # to HF within ~2 min (the uploader starts BEFORE the image pull) and a live worker soon heartbeats.
 # So if a box is active for this long with NO attempt-scoped boot.log AND no fresh heartbeat, cloud-

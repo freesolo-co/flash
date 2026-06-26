@@ -816,6 +816,16 @@ def run_rl():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+    # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
+    # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
+    # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
+    # doesn't land on one would have NO `flash deploy --step` entry even though it IS the served
+    # default adapter. Publish the just-saved final adapter here, keyed by the true final
+    # global_step: same bytes as `<prefix>/adapter`, so `--step <final>` always resolves to exactly
+    # the deployed default. Idempotent (content-addressed path) when the step already aligned, and
+    # best-effort (never fails a paid run).
+    if _steps_run:
+        _w.publish_deployable_checkpoint(adapter_dir, _steps_run)
     _w.heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens: completions actually optimized (the intended
