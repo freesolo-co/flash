@@ -49,19 +49,21 @@ def graded_text(completion: str | None) -> str | None:
 
 
 def think_token_count(completion: str | None, tokenizer) -> int:
-    """Number of reasoning tokens in the completion (0 if none).
+    """Number of reasoning tokens in the completion's FIRST reasoning span (0 if none).
 
     Used for the thinking-length reward deduction: long reasoning is penalized in
     proportion to the tokens it spent, mirroring the SDK's thinking_length_penalty_coef.
 
-    Handles BOTH ways a hybrid-thinking model surfaces its reasoning:
+    Counts the FIRST reasoning span only — which is the whole reasoning for a hybrid-thinking
+    model (it reasons once, then answers). Handles BOTH ways such a model surfaces that span:
       1. Self-contained block — the completion holds the whole ``<think>...</think>`` span
-         (the model opened and closed the tag itself).
+         (the model opened and closed the tag itself); counted up to the first ``</think>``.
       2. Prompt-opened block — the chat template appended ``<think>\\n`` to the *prompt*
          (Qwen3.5 / MiniCPM hybrid thinking with ``enable_thinking=true``), so the
          completion starts mid-reasoning and only carries the closing ``</think>``. The
          reasoning is then everything before the first ``</think>``.
     Without case 2 the penalty silently no-ops for the common enable_thinking=true path.
+    Any later ``<think>`` blocks (uncommon — a malformed re-open) are NOT added to the count.
     """
     if not completion:
         return 0
