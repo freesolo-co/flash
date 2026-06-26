@@ -212,6 +212,14 @@ _CHECKPOINT_TRAINER_STATE = (
 _ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
 
 
+def _has_deployable_adapter(ckpt_dir: str) -> bool:
+    """Whether ``ckpt_dir`` carries a loadable LoRA adapter (config AND weights) — i.e. is publishable
+    as a deployable step. A step missing either is never advertised."""
+    return os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")) and any(
+        os.path.isfile(os.path.join(ckpt_dir, w)) for w in _ADAPTER_WEIGHT_FILES
+    )
+
+
 def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
     """Mirror a trainer checkpoint's LoRA adapter to a stable, NON-pruned per-step path so a
     run cancelled mid-RL is still one-command-deployable from its last good step.
@@ -225,11 +233,9 @@ def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
     """
     if not _w.HF_REPO:
         return None
-    # Only publish a checkpoint that actually carries a loadable adapter (config AND weights) —
-    # never advertise a non-deployable step.
-    has_config = os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json"))
-    has_weights = any(os.path.isfile(os.path.join(ckpt_dir, w)) for w in _ADAPTER_WEIGHT_FILES)
-    if not (has_config and has_weights):
+    # Only publish a checkpoint that actually carries a loadable adapter — never advertise a
+    # non-deployable step.
+    if not _has_deployable_adapter(ckpt_dir):
         return None
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
     try:
@@ -254,6 +260,29 @@ def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
 # leaving ``flash checkpoints`` empty even though training succeeded. The flush blocks (inside
 # ``trainer.train()``) up to this long so the last good step is reliably deployable.
 _CKPT_FLUSH_TIMEOUT_S = 300.0
+# When the flush can't take the lock in time (a daemon upload outran the window), it publishes the
+# final deployable WITHOUT the lock; these bound a tiny retry that rides out a transient
+# concurrent-commit 409 from the still-running daemon. Linear backoff, and ONLY on failure — a clean
+# publish (the common case) adds zero latency to worker exit.
+_CKPT_FLUSH_RETRIES = 3
+_CKPT_FLUSH_BACKOFF_S = 1.0
+
+
+def _publish_deployable_with_retry(ckpt_dir: str, step: int) -> None:
+    """Best-effort publish of the final deployable when the flush couldn't hold the upload lock.
+
+    Gated on the adapter actually being present so the retry is provably non-futile:
+    ``publish_deployable_checkpoint`` returns ``None`` for BOTH "no adapter" and "upload failed", so
+    after this precheck a ``None`` can only mean a real (likely transient-409) failure worth a retry —
+    an empty step returns immediately with no wasted sleeps."""
+    if not _has_deployable_adapter(ckpt_dir):
+        return
+    for attempt in range(_CKPT_FLUSH_RETRIES):
+        if publish_deployable_checkpoint(ckpt_dir, step) is not None:
+            return
+        if attempt + 1 < _CKPT_FLUSH_RETRIES:
+            time.sleep(_CKPT_FLUSH_BACKOFF_S * (attempt + 1))
+    print(f"[ckpt] could not publish final deployable for step {step} before exit")
 
 
 def _latest_checkpoint_dir(output_dir: str) -> tuple[int, str] | None:
@@ -335,27 +364,38 @@ def make_checkpoint_upload_callback():
             threading.Thread(target=_upload, daemon=True).start()
 
         def on_train_end(self, args, state, control, **kwargs):
-            # The per-save uploads run in DAEMON threads, killed the instant the worker exits at
-            # run end. A fast RL run can reach "done" (and tear down) before its last save's
-            # deployable per-step checkpoint finishes uploading — leaving `flash checkpoints`
-            # empty and `flash deploy --step` impossible even though training succeeded. Flush
-            # here, INSIDE trainer.train() (before the worker publishes the final adapter and
-            # exits), so the latest on-disk checkpoint is reliably published as a deployable
-            # snapshot. Acquiring the upload lock first waits out any in-flight on_save upload;
-            # publish_deployable_checkpoint is idempotent (same content-addressed path), so
-            # re-publishing a step the async upload already handled is a cheap no-op.
+            # The per-save uploads run in DAEMON threads, killed the instant the worker exits at run
+            # end. A fast RL run can reach "done" (and tear down) before its last save's deployable
+            # checkpoint finishes uploading — leaving `flash checkpoints` empty and `flash deploy
+            # --step` impossible even though training succeeded. Flush here, INSIDE trainer.train()
+            # (before the worker publishes the final adapter and exits), so the latest on-disk
+            # checkpoint is reliably published as a deployable snapshot. publish_deployable_checkpoint
+            # is idempotent (content-addressed path), so re-publishing a step the async upload already
+            # handled is a cheap no-op.
             if not _w.HF_REPO:
                 return
             latest = _latest_checkpoint_dir(args.output_dir)
             if latest is None:
                 return
             step, ckpt_dir = latest
+            # ALWAYS publish the final deployable before returning (the worker exits right after).
+            # Under the lock when we can get it (serialized against on_save -> no commit conflict);
+            # on timeout the lock is held by an over-budget on_save upload that the worker exit will
+            # kill before its OWN deployable publish runs, and this step's on_save may itself have
+            # been skipped on the busy lock -- so this flush is the only publisher of the final
+            # deployable. Publishing here (synchronously, in the train-end thread, so exit can't kill
+            # it) without the lock is strictly better than the silent skip this callback exists to
+            # prevent; the bounded retry rides out a transient concurrent-commit 409.
             if lock.acquire(timeout=_CKPT_FLUSH_TIMEOUT_S):
                 try:
                     publish_deployable_checkpoint(ckpt_dir, step)
                 finally:
                     lock.release()
             else:
-                print(f"[ckpt] flush timed out waiting for upload lock at final step {step}")
+                print(
+                    f"[ckpt] flush lock busy after {_CKPT_FLUSH_TIMEOUT_S:.0f}s; publishing final "
+                    f"deployable (step {step}) without it"
+                )
+                _publish_deployable_with_retry(ckpt_dir, step)
 
     return _CheckpointUpload()
