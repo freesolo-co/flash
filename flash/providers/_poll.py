@@ -275,10 +275,14 @@ def surface_heartbeat(
 ) -> tuple[tuple | None, str | None]:
     """Read a heartbeat and, if it advanced, log worker progress.
 
-    Returns ``(hb_key, stage)`` where ``hb_key`` is the new (stage, step, ts) key (or the
+    Returns ``(hb_key, stage)`` where ``hb_key`` is the new (stage, step, ts, attempt) key (or the
     unchanged ``last_hb_key`` when nothing advanced) and ``stage`` is the stage of the new
     heartbeat when it advanced (else None). Callers use the returned ``stage`` for their
     own setup-vs-training stall bookkeeping.
+
+    ``attempt`` (the worker-stamped attempt number) is part of the key because the seed heartbeat
+    path is shared across attempts: ``heartbeat_progress_ts`` reads it to reject a prior attempt's
+    late heartbeat that would otherwise satisfy THIS attempt's first-liveness by timestamp alone.
     """
     if heartbeat_reader is None:
         return last_hb_key, None
@@ -288,7 +292,7 @@ def surface_heartbeat(
         hb = None
     if not hb:
         return last_hb_key, None
-    key = (hb.get("stage"), hb.get("step"), hb.get("ts"))
+    key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
     if key == last_hb_key:
         return last_hb_key, None
     _record_heartbeat(hb)
@@ -297,7 +301,9 @@ def surface_heartbeat(
     return key, stage
 
 
-def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tuple[float, bool]:
+def heartbeat_progress_ts(
+    hb_key: tuple | None, launch_ts: float | None, current_attempt: int | None = None
+) -> tuple[float, bool]:
     """Wall-clock to credit as 'last worker progress' for a just-surfaced heartbeat, plus whether
     that heartbeat actually belongs to THIS attempt.
 
@@ -309,7 +315,8 @@ def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tupl
     ancient (premature stall) nor land its progress in the future.
 
     Returns ``(ts, fresh)``. ``fresh`` is False when the heartbeat's ts predates this attempt's
-    launch: that is a LEFTOVER heartbeat from a prior attempt (retries reuse the same seed
+    launch, OR (when ``current_attempt`` is given) when it carries a different ``attempt`` — both
+    mean a LEFTOVER heartbeat from a prior attempt (retries reuse the same seed
     heartbeat path), so the caller must NOT treat it as current progress — otherwise a stale
     training-stage heartbeat would arm the tighter training stall window and fail a healthy new
     attempt mid-setup before it has overwritten the old file. ``launch_ts`` uses truthiness (not
@@ -327,6 +334,15 @@ def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tupl
         return now, False
     lo = float(launch_ts) if launch_ts else 0.0  # unknown launch -> floor 0.0 (all heartbeats fresh)
     fresh = ts >= lo
+    # The seed heartbeat path is shared across attempts, so a prior attempt's worker still shutting
+    # down can upload a heartbeat with ts > this attempt's launch — fresh by timestamp, but belonging
+    # to a DIFFERENT attempt. It must NOT satisfy this attempt's first-liveness (else a silent active-
+    # but-never-booted replacement box waits the full setup grace instead of fast-failing). Reject on
+    # an EXPLICIT attempt mismatch only: a heartbeat without an attempt field (key < 4 or None) can't
+    # be dated this way, so keep the ts-based decision (back-compat with workers that don't stamp it).
+    hb_attempt = hb_key[3] if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
+    if fresh and current_attempt is not None and hb_attempt is not None and hb_attempt != current_attempt:
+        fresh = False
     return min(now, max(lo, ts)), fresh
 
 

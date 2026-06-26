@@ -533,7 +533,9 @@ def poll_hs_job(
             # leftover heartbeat predating this reattach is then consistently rejected instead of
             # blanket-trusted (which could otherwise arm the tighter training window off a prior
             # attempt's training heartbeat). On a real launch this is exactly handle.started_ts.
-            hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts)
+            # Pass handle.attempt so a prior attempt's still-shutting-down worker (heartbeating on the
+            # shared seed path with ts > this launch) can't satisfy this attempt's first-liveness.
+            hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
             if fresh:
                 last_progress = hb_ts
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied

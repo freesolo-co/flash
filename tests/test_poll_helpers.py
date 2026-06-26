@@ -50,3 +50,31 @@ def test_heartbeat_progress_no_ts_is_not_fresh():
         ts, fresh = heartbeat_progress_ts(bad, launch)
         assert fresh is False
         assert abs(ts - now) < 2
+
+
+def test_heartbeat_progress_rejects_other_attempt_even_when_ts_is_fresh():
+    # The seed heartbeat path is shared across attempts: a prior attempt's worker still shutting down
+    # can upload a heartbeat with ts > this attempt's launch. By ts alone it looks fresh, but it
+    # belongs to a DIFFERENT attempt, so it must NOT satisfy this attempt's first-liveness.
+    now = time.time()
+    launch = now - 100
+    # key carries attempt=0; we are polling attempt=1 -> not fresh despite a post-launch ts
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, 0), launch, current_attempt=1)
+    assert fresh is False
+    # same attempt -> fresh
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, 1), launch, current_attempt=1)
+    assert fresh is True
+
+
+def test_heartbeat_progress_attempt_check_is_backcompat_when_unstamped():
+    # A heartbeat without an attempt field (3-tuple key, or attempt=None) can't be dated by attempt,
+    # so the ts-based decision stands (back-compat with workers that don't stamp attempt).
+    now = time.time()
+    launch = now - 100
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10), launch, current_attempt=1)
+    assert fresh is True
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, None), launch, current_attempt=1)
+    assert fresh is True
+    # and with no current_attempt supplied, attempt is ignored entirely
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, 0), launch)
+    assert fresh is True

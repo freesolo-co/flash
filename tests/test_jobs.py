@@ -119,6 +119,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
         "step": 12,
         "loss": 1.23456,
         "ts": 123.0,
+        "attempt": 0,
         "gpu": {
             "device_name": "RTX 5090",
             "driver_version": "575.57",
@@ -138,7 +139,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
 
     key, stage = surface_heartbeat(lambda: hb, None, lines.append)
 
-    assert key == ("sft_step", 12, 123.0)
+    assert key == ("sft_step", 12, 123.0, 0)  # attempt is part of the key (shared seed hb path)
     assert stage == "sft_step"
     assert len(lines) == 1
     line = lines[0]
