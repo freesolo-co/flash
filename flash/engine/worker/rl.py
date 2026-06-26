@@ -252,6 +252,26 @@ def run_rl():
     ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
     ds = Dataset.from_list(ds_rows)
 
+    # Whether the rendered PROMPT actually pre-opens a <think> the completion continues (hybrid
+    # templates append `<think>` after the generation prompt for enable_thinking=true). Derived from a
+    # real rendered prompt, NOT from _w.THINKING: an uncurated model whose template IGNORES
+    # enable_thinking (thinking="unknown") would otherwise have its normal tagless answers treated as
+    # unterminated reasoning — over-penalized AND mis-graded toward terse/truncated outputs. Computed
+    # once: the pre-open is a template-level generation-prompt suffix, identical across examples.
+    _prompt_opens_thinking = False
+    if _w.THINKING and prompts:
+        _p0 = prompts[0]["prompt"]
+        if isinstance(_p0, str):
+            _rendered0 = _p0  # non-conversational: already the rendered prompt string
+        else:
+            try:  # conversational: render the message list the same way the rollout does
+                _rendered0 = tok.apply_chat_template(
+                    _p0, add_generation_prompt=True, tokenize=False, enable_thinking=True
+                )
+            except Exception:
+                _rendered0 = None
+        _prompt_opens_thinking = _w.prompt_opens_thinking(_rendered0)
+
     def reward_fn(completions, **kwargs):
         # rollout_func (pure multi-turn) path: the per-rollout reward is computed by the env
         # during the rollout and forwarded as the "reward" extra field — pass it through.
@@ -290,7 +310,7 @@ def run_rl():
                     r = env.reward_from_messages(comp, ex)
                     rewards.append(r)
                     continue
-                graded = _w.graded_text(comp)
+                graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
                 breakdown = None
                 if hasattr(env, "scores_breakdown"):
                     breakdown = env.scores_breakdown(graded, ex)
@@ -314,10 +334,14 @@ def run_rl():
             # lives outside the try/except above — an internal failure here should crash the run, not
             # be silently swallowed into a 0.0 reward.
             if _think_penalty > 0 and _w.THINKING:
-                # THINKING => the chat template pre-opened <think> in the PROMPT, so a completion that
-                # ran out of tokens before </think> (no tags at all) is still all reasoning — count it
-                # (prompt_opened_thinking=True), else the longest rambles would dodge the penalty.
-                r -= _think_penalty * _w.think_token_count(comp, tok, prompt_opened_thinking=True)
+                # When the rendered prompt pre-opened <think>, a completion that ran out of tokens
+                # before </think> (no tags at all) is still all reasoning — count it so the longest
+                # rambles don't dodge the penalty. Gated on _prompt_opens_thinking (the prompt ACTUALLY
+                # pre-opened the tag), so an uncurated template that ignored enable_thinking doesn't get
+                # its normal tagless answers counted as reasoning.
+                r -= _think_penalty * _w.think_token_count(
+                    comp, tok, prompt_opened_thinking=_prompt_opens_thinking
+                )
             rewards.append(r)
             if idx < 8:
                 debug_rows.append(

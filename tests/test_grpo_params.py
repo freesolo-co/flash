@@ -50,6 +50,44 @@ def test_think_token_count_counts_the_think_span() -> None:
     assert w.think_token_count("a b c</think>ans", tok, prompt_opened_thinking=True) == 3
     assert w.think_token_count("<think>a b</think>ans", tok, prompt_opened_thinking=True) == 2
     assert w.think_token_count("", tok, prompt_opened_thinking=True) == 0
+    # Case 1 vs 2 is decided by tag ORDER, not presence: a prompt-opened completion that CLOSES its
+    # reasoning and then echoes a literal <think> in the answer must count the span up to the FIRST
+    # </think> (the reasoning), NOT anchor on the echoed opener (which would count "echo here" = 2).
+    assert w.think_token_count("a b c d</think>answer with <think> echo here", tok) == 4
+    # a self-tagged block followed by an echoed opener still counts only the first real span.
+    assert w.think_token_count("<think>a b c</think>tail <think> echo", tok) == 3
+
+
+def test_prompt_opens_thinking_detects_preopened_tag() -> None:
+    import flash.engine.worker as w
+
+    # A hybrid template pre-opens <think> at the end of the generation prompt (no closing tag).
+    assert w.prompt_opens_thinking("<|im_start|>assistant\n<think>\n") is True
+    # An uncurated/non-thinking template appends no <think> -> a tagless completion is a real answer.
+    assert w.prompt_opens_thinking("<|im_start|>assistant\n") is False
+    assert w.prompt_opens_thinking("") is False
+    assert w.prompt_opens_thinking(None) is False
+    # A prompt that opened AND closed a <think> (e.g. a few-shot exemplar) is NOT pre-opened.
+    assert w.prompt_opens_thinking("...<think>example</think>...<|im_start|>assistant\n") is False
+    # If the LAST think is left open (after an earlier closed one), it IS pre-opened.
+    assert w.prompt_opens_thinking("<think>ex</think>q<|im_start|>assistant\n<think>\n") is True
+
+
+def test_graded_text_hides_tagless_prompt_opened_reasoning(monkeypatch) -> None:
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", True)
+    # Tagless completion under a prompt-opened <think>: the generation never closed reasoning, so the
+    # env must grade NOTHING (scores 0) — not the raw ramble (which a raw-text fallback could reward).
+    assert w.graded_text("rambling forever no answer", prompt_opened_thinking=True) == ""
+    # Without the prompt-opened signal (e.g. an uncurated template that didn't pre-open), the same
+    # tagless text is a normal answer and is graded as-is.
+    assert w.graded_text("the answer is 42", prompt_opened_thinking=False) == "the answer is 42"
+    # A normally-tagged thinking completion is unaffected: strip to the post-</think> answer.
+    assert w.graded_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True) == "\\boxed{5}"
+    # THINKING off: no stripping at all, even with the flag set.
+    monkeypatch.setattr(w, "THINKING", False)
+    assert w.graded_text("rambling forever", prompt_opened_thinking=True) == "rambling forever"
 
 
 def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:

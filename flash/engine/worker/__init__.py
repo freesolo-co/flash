@@ -64,6 +64,7 @@ from flash.engine.worker.adapter import (
 )
 from flash.engine.worker.decoding import (
     graded_text,
+    prompt_opens_thinking,
     render_prompt,
     strip_think,
     think_token_count,
@@ -558,10 +559,11 @@ __all__ = [
     "patch_vllm_language_model_only",
     "patch_vllm_lm_weight_sync",
     "prefetch_model",
+    # decoding
+    "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "remap_adapter_keys",
     "remap_vl_adapter_dir",
-    # decoding
     "render_prompt",
     "require_active_env",
     "require_vllm_for_rollout_func",
