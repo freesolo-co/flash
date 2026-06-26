@@ -185,6 +185,61 @@ def test_on_train_end_flushes_final_deployable_checkpoint(tmp_path, monkeypatch,
     assert "optimizer.pt" in deployable[0]["ignore_patterns"]
 
 
+def test_on_train_end_publishes_final_deployable_when_lock_is_held(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """Regression: a slow on_save upload can still hold the upload lock at run end (and the final
+    step's own on_save may have been skipped on that busy lock). on_train_end must then publish the
+    final deployable WITHOUT the lock instead of timing out and skipping it — otherwise the worker
+    exits, kills the daemon mid-upload, and `flash checkpoints` is empty despite a successful run."""
+    import threading
+
+    from flash.engine.worker import hf as worker_hf
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(worker_hf, "_CKPT_FLUSH_TIMEOUT_S", 0.05)  # give up on the held lock fast
+
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)  # earlier step; its on_save upload will block, holding the lock
+    _make_ckpt_dir(out, 8)  # the FINAL step (its on_save was skipped on the busy lock)
+
+    holding = threading.Event()
+    release = threading.Event()
+    base_upload = rec.upload_folder
+
+    def upload(**kwargs):
+        base_upload(**kwargs)
+        if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
+            holding.set()  # the resume upload now holds the lock...
+            release.wait(5)  # ...keep holding it across the on_train_end flush
+
+    rec.upload_folder = upload
+
+    started: list = []
+    real_thread = threading.Thread
+    monkeypatch.setattr(
+        worker.threading,
+        "Thread",
+        lambda *a, **k: started.append(real_thread(*a, **k)) or started[-1],
+    )
+
+    cb = worker.make_checkpoint_upload_callback()
+    try:
+        cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+        assert holding.wait(5), "the step-4 upload should be holding the lock"
+        cb.on_train_end(SimpleNamespace(output_dir=str(out)), None, None)
+        deployable = [
+            u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-8/adapter")
+        ]
+        assert len(deployable) == 1, "final deployable must publish even when the lock is held"
+    finally:
+        release.set()
+        for t in started:
+            t.join(5)
+
+
 def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch, fake_trainer_callback):
     import flash.engine.worker as worker
 

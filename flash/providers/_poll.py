@@ -122,13 +122,6 @@ def _num(value: Any) -> float | None:
         return None
 
 
-def _fmt_float(value: Any, digits: int = 3) -> str | None:
-    num = _num(value)
-    if num is None:
-        return None
-    return f"{num:.{digits}f}"
-
-
 def _fmt_gb(value: Any) -> str | None:
     num = _num(value)
     if num is None:

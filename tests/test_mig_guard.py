@@ -8,8 +8,10 @@ import types
 
 import pytest
 
-from flash.engine.worker import perf
-from flash.engine.worker.perf import (
+# verify_gpu + its helpers live in perf.lifecycle (dev split perf.py into the perf/ package); import
+# the module too so monkeypatches target the names wait_for_gpu/verify_gpu resolve internally.
+from flash.engine.worker.perf import lifecycle
+from flash.engine.worker.perf.lifecycle import (
     RetriableInfraError,
     _gpu_mismatch_reason,
     _sm_major,
@@ -154,14 +156,14 @@ def test_host_driver_cuda_parses_nvidia_smi_header(monkeypatch):
         "subprocess.run",
         lambda *a, **k: types.SimpleNamespace(stdout=header),
     )
-    assert perf._host_driver_cuda() == 12.8
+    assert lifecycle._host_driver_cuda() == 12.8
 
 
 def test_host_driver_cuda_none_when_unavailable(monkeypatch):
     monkeypatch.setattr(
         "subprocess.run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("no nvidia-smi"))
     )
-    assert perf._host_driver_cuda() is None
+    assert lifecycle._host_driver_cuda() is None
 
 
 def test_verify_gpu_noop_when_unset():
@@ -181,7 +183,7 @@ def test_verify_gpu_raises_retriable_on_mismatch(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda *a: "NVIDIA A100-40GB", raising=False)
-    monkeypatch.setattr(perf, "_host_driver_cuda", lambda: 12.8)
+    monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 12.8)
     # Requested H100 (sm90 / 80 GB) but the live box is a 40 GB sm80 card -> VRAM + capability fail.
     with pytest.raises(RetriableInfraError) as exc:
         verify_gpu("H100")
@@ -199,7 +201,7 @@ def test_verify_gpu_passes_on_correct_gpu(monkeypatch):
         lambda *a: types.SimpleNamespace(total_memory=int(47.5e9)),
         raising=False,
     )
-    monkeypatch.setattr(perf, "_host_driver_cuda", lambda: 12.8)
+    monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 12.8)
     verify_gpu("L40")  # sm89 / 48 GB / 12.8 -> matches -> no raise
 
 
@@ -218,7 +220,7 @@ def test_wait_for_gpu_propagates_verify_mismatch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda *a: "wrong-gpu", raising=False)
     monkeypatch.setattr(
-        perf,
+        lifecycle,
         "verify_gpu",
         lambda g: (_ for _ in ()).throw(RetriableInfraError("WRONG GPU substituted")),
     )

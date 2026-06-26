@@ -38,7 +38,7 @@ def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> N
     """`flash env setup` must scaffold a Freesolo SDK env, not a BaseEnvironment subclass."""
     from argparse import Namespace
 
-    from flash.cli.main import cmd_env_setup
+    from flash.cli import cmd_env_setup
 
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
@@ -73,7 +73,7 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
     pytest.importorskip("freesolo")
     from freesolo.datasets.records import load_task_examples
 
-    from flash.cli.main import cmd_env_setup
+    from flash.cli import cmd_env_setup
 
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0

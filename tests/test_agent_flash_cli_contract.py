@@ -34,7 +34,7 @@ def _import_agent(modpath: str):
 
 
 # --- flash side (always importable in the flash venv) ---------------------
-from flash.cli.main import main
+from flash.cli import main
 from flash.runner import (
     TERMINAL_STATES,
     RunStatus,
@@ -173,7 +173,7 @@ def test_agent_terminal_states_subset_of_flash_terminal_states() -> None:
     include every flash terminal state, or the agent could poll forever on a state
     the CLI never treats as done.
     """
-    from flash.cli import main as cli_main
+    import flash.cli as cli_main
 
     assert TERMINAL_STATES <= cli_main._CLI_DONE_STATES
     # "done" is the success terminal the agent's verifier gates run_completed on.
