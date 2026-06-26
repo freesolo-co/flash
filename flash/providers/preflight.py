@@ -25,6 +25,16 @@ __all__ = [
 _REQUIRED_RUNPOD_ACCOUNTS = 2
 
 
+def _present(var: str) -> bool:
+    """True iff env var ``var`` holds a NON-EMPTY value after stripping surrounding whitespace.
+
+    A whitespace-only secret (e.g. ``LAMBDA_API_KEY='   '``) is treated as MISSING here rather than
+    silently passing preflight and then failing later when the provider/auth layer actually tries to
+    use it. (RunPod is validated via ``keys()``, which already strips and drops empty entries.)
+    """
+    return bool((os.environ.get(var) or "").strip())
+
+
 def check_run_preflight(require_hf: bool = True) -> None:
     """Validate the FULL operator config for a managed control-plane deployment; raise on missing.
 
@@ -36,37 +46,42 @@ def check_run_preflight(require_hf: bool = True) -> None:
 
     problems: list[str] = []
 
-    # RunPod: a comma-separated pool of >= 2 account keys. key_count() is 0 when RUNPOD_API_KEY is
-    # unset/empty, so the two branches cover "missing" and "too few" without double-listing the line.
-    n = runpod_keys.key_count()
-    if n == 0:
+    # RunPod: a comma-separated pool of >= 2 DISTINCT account keys. keys() is already stripped and
+    # drops empties, so a blank / whitespace / ","-only value yields an EMPTY pool (caught as
+    # "missing", not "too few"), and counting DISTINCT keys rejects a pool padded with the same key
+    # twice (e.g. "rp-a,rp-a"): both entries authenticate to ONE account, so reap/failover still
+    # can't cross to a second — exactly the single-account leak this gate exists to block.
+    pool = runpod_keys.keys()
+    distinct = len(set(pool))
+    if not pool:
         problems.append(
             f"  - RUNPOD_API_KEY: the operator's RunPod API key "
             f"(>= {_REQUIRED_RUNPOD_ACCOUNTS} comma-separated account keys)"
         )
-    elif n < _REQUIRED_RUNPOD_ACCOUNTS:
+    elif distinct < _REQUIRED_RUNPOD_ACCOUNTS:
         problems.append(
-            f"  - RUNPOD_API_KEY: needs >= {_REQUIRED_RUNPOD_ACCOUNTS} comma-separated account keys "
-            f"(found {n}) — a single-account pool can't reap or fail over across accounts"
+            f"  - RUNPOD_API_KEY: needs >= {_REQUIRED_RUNPOD_ACCOUNTS} DISTINCT comma-separated "
+            f"account keys (found {distinct}) — duplicate keys hit the SAME account, and a "
+            f"single-account pool can't reap or fail over across accounts"
         )
 
     # The other two GPU substrates and the control-plane <-> backend auth key.
-    if not os.environ.get("LAMBDA_API_KEY"):
+    if not _present("LAMBDA_API_KEY"):
         problems.append("  - LAMBDA_API_KEY: the operator's Lambda Cloud API key")
-    if not os.environ.get("HYPERSTACK_API_KEY"):
+    if not _present("HYPERSTACK_API_KEY"):
         problems.append("  - HYPERSTACK_API_KEY: the operator's Hyperstack API key")
-    if not os.environ.get("FREESOLO_INTERNAL_KEY"):
+    if not _present("FREESOLO_INTERNAL_KEY"):
         problems.append(
             "  - FREESOLO_INTERNAL_KEY: the control-plane <-> Freesolo backend internal auth key"
         )
 
     # Shared run infra (the HF dataset repo itself is per-run, ``[train] hf_repo``, not checked here).
     if require_hf:
-        if not os.environ.get("GITHUB_TOKEN"):
+        if not _present("GITHUB_TOKEN"):
             problems.append(
                 "  - GITHUB_TOKEN: server token with access to managed Freesolo environments"
             )
-        if not os.environ.get("HF_TOKEN"):
+        if not _present("HF_TOKEN"):
             problems.append(
                 "  - HF_TOKEN: a token with write access to each run's "
                 "`[train] hf_repo`, e.g. `export HF_TOKEN=hf_...`"

@@ -81,6 +81,16 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
+    # The new preflight requires the Lambda/Hyperstack keys above, which also makes
+    # `configured_providers()` treat both as live — so the startup lifespan's `recover_runs()` and
+    # the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda/Hyperstack list calls) and
+    # break test hermeticity. These API tests don't exercise orphan reaping, so stub the provider set
+    # to empty: preflight still passes on the keys, but startup stays CPU-only with no network. (Both
+    # call sites do a function-local `from flash.providers import configured_providers`, so patching
+    # the package attribute covers them.)
+    import flash.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()

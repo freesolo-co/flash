@@ -72,6 +72,47 @@ def test_preflight_requires_two_runpod_keys(clean_env, monkeypatch):
     pf.check_run_preflight()
 
 
+def test_preflight_rejects_duplicate_runpod_keys(clean_env, monkeypatch):
+    # The same key twice satisfies a raw count of 2 but authenticates to ONE account, so reap/failover
+    # still can't cross to a second — preflight must count DISTINCT keys and reject it.
+    _full_config(monkeypatch)
+    _set_runpod(monkeypatch, "rp-a,rp-a")
+    with pytest.raises(pf.PreflightError) as excinfo:
+        pf.check_run_preflight()
+    msg = str(excinfo.value)
+    assert "RUNPOD_API_KEY" in msg
+    assert "found 1" in msg  # one DISTINCT account, despite two raw entries
+    # Whitespace around a dup doesn't make it distinct either.
+    _set_runpod(monkeypatch, "rp-a, rp-a ")
+    with pytest.raises(pf.PreflightError):
+        pf.check_run_preflight()
+
+
+def test_preflight_rejects_empty_runpod_pool(clean_env, monkeypatch):
+    # RUNPOD_API_KEY present but parsing to NO usable keys (","-only / whitespace) is "missing", not
+    # a silently-accepted empty pool — keys() drops the empties so the count is 0.
+    _full_config(monkeypatch)
+    for empty in (",", "   ", " , , "):
+        _set_runpod(monkeypatch, empty)
+        with pytest.raises(pf.PreflightError) as excinfo:
+            pf.check_run_preflight()
+        assert "RUNPOD_API_KEY" in str(excinfo.value), f"{empty!r} should flag RUNPOD as missing"
+
+
+@pytest.mark.parametrize(
+    "var",
+    ["LAMBDA_API_KEY", "HYPERSTACK_API_KEY", "FREESOLO_INTERNAL_KEY", "GITHUB_TOKEN", "HF_TOKEN"],
+)
+def test_preflight_rejects_whitespace_only_credentials(clean_env, monkeypatch, var):
+    # A whitespace-only secret would pass a bare truthiness check but fail later when the provider
+    # actually authenticates with it. Preflight strips before deciding presence, so it's caught now.
+    _full_config(monkeypatch)
+    monkeypatch.setenv(var, "   ")
+    with pytest.raises(pf.PreflightError) as excinfo:
+        pf.check_run_preflight()
+    assert var in str(excinfo.value)
+
+
 def test_preflight_requires_each_provider_and_internal_key(clean_env, monkeypatch):
     # Dropping any single required credential from an otherwise-complete config fails the deploy.
     for missing in ("LAMBDA_API_KEY", "HYPERSTACK_API_KEY", "FREESOLO_INTERNAL_KEY"):
