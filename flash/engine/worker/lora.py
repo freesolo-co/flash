@@ -738,19 +738,3 @@ def assert_adapter_delta_nonzero(model, model_id: str) -> int:
         )
     print(f"[init-adapter] verified non-zero lora_B in {nonzero}/{seen} module(s) for {model_id}")
     return nonzero
-
-
-def model_quant(model_id: str) -> str:
-    """Quantization tier for this model: catalog entry > bf16 (managed; no override).
-
-    The whole catalog is bf16, so this always returns ``"bf16"`` today; kept as the single
-    source of truth a future non-bf16 tier could feed (no caller branches on it now)."""
-    try:
-        from flash.catalog import MODELS
-
-        info = MODELS.get(model_id)
-        if info is not None:
-            return info.quant
-    except Exception as e:
-        print("model_quant: catalog probe failed:", e)
-    return "bf16"
