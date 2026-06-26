@@ -462,3 +462,34 @@ def test_best_effort_no_checkpoints(monkeypatch):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: [])
     assert ck.register_checkpoints_best_effort(_status()) == 0
+
+
+# ---------------------------------------------------------------------------
+# Finalize wiring: the FINAL training step is always published as a deployable
+# checkpoint (not only when it lands on a save_steps boundary). The per-save
+# callback / on_train_end publish at/near save boundaries; an unaligned last
+# step would otherwise have no `--step` entry even though it IS the served
+# default `<prefix>/adapter`. run_rl/run_sft must close that gap after saving
+# the final adapter. Source-wiring (a runtime test would need a full trainer).
+# ---------------------------------------------------------------------------
+def _finalize_src(module_name: str, fn_name: str) -> str:
+    import importlib
+    import inspect
+
+    mod = importlib.import_module(module_name)
+    return inspect.getsource(getattr(mod, fn_name))
+
+
+def test_run_rl_publishes_final_step_as_deployable_checkpoint():
+    src = _finalize_src("flash.engine.worker.rl", "run_rl")
+    # Final adapter is saved, then published as a deployable checkpoint keyed by the final step.
+    assert 'save_pretrained(adapter_dir)' in src
+    assert 'publish_deployable_checkpoint(adapter_dir, _steps_run)' in src
+
+
+def test_run_sft_publishes_final_step_as_deployable_checkpoint():
+    src = _finalize_src("flash.engine.worker.sft", "run_sft")
+    assert 'save_pretrained(adapter_dir)' in src
+    # SFT derives the final step from trainer state (no _steps_run var) and publishes it.
+    assert 'global_step' in src
+    assert 'publish_deployable_checkpoint(adapter_dir, _final_step)' in src
