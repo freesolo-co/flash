@@ -41,6 +41,15 @@ def test_think_token_count_counts_the_think_span() -> None:
     # before that close (without this the penalty no-ops on the common enable_thinking=true path).
     assert w.think_token_count("a b c d</think>{\"x\": 1}", tok) == 4
     assert w.think_token_count("</think>just the answer", tok) == 0
+    # case 3: prompt-opened thinking that NEVER closes (ran out of max_tokens) — no tags at all. With
+    # prompt_opened_thinking the WHOLE completion is unterminated reasoning and is counted, so the
+    # longest rambles can't dodge the penalty; without the flag a tag-less completion is plain text (0).
+    assert w.think_token_count("rambling on and on forever", tok, prompt_opened_thinking=True) == 5
+    assert w.think_token_count("rambling on and on forever", tok) == 0
+    # the flag does NOT change a completion that already carries a tag (cases 1/2 still win).
+    assert w.think_token_count("a b c</think>ans", tok, prompt_opened_thinking=True) == 3
+    assert w.think_token_count("<think>a b</think>ans", tok, prompt_opened_thinking=True) == 2
+    assert w.think_token_count("", tok, prompt_opened_thinking=True) == 0
 
 
 def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:

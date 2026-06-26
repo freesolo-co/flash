@@ -314,7 +314,10 @@ def run_rl():
             # lives outside the try/except above — an internal failure here should crash the run, not
             # be silently swallowed into a 0.0 reward.
             if _think_penalty > 0 and _w.THINKING:
-                r -= _think_penalty * _w.think_token_count(comp, tok)
+                # THINKING => the chat template pre-opened <think> in the PROMPT, so a completion that
+                # ran out of tokens before </think> (no tags at all) is still all reasoning — count it
+                # (prompt_opened_thinking=True), else the longest rambles would dodge the penalty.
+                r -= _think_penalty * _w.think_token_count(comp, tok, prompt_opened_thinking=True)
             rewards.append(r)
             if idx < 8:
                 debug_rows.append(

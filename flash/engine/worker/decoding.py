@@ -48,20 +48,28 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if _w.THINKING else completion
 
 
-def think_token_count(completion: str | None, tokenizer) -> int:
+def think_token_count(
+    completion: str | None, tokenizer, *, prompt_opened_thinking: bool = False
+) -> int:
     """Number of reasoning tokens in the completion's FIRST reasoning span (0 if none).
 
     Used for the thinking-length reward deduction: long reasoning is penalized in
     proportion to the tokens it spent, mirroring the SDK's thinking_length_penalty_coef.
 
     Counts the FIRST reasoning span only — which is the whole reasoning for a hybrid-thinking
-    model (it reasons once, then answers). Handles BOTH ways such a model surfaces that span:
+    model (it reasons once, then answers). Handles the ways such a model surfaces that span:
       1. Self-contained block — the completion holds the whole ``<think>...</think>`` span
          (the model opened and closed the tag itself); counted up to the first ``</think>``.
       2. Prompt-opened block — the chat template appended ``<think>\\n`` to the *prompt*
          (Qwen3.5 / MiniCPM hybrid thinking with ``enable_thinking=true``), so the
          completion starts mid-reasoning and only carries the closing ``</think>``. The
          reasoning is then everything before the first ``</think>``.
+      3. Prompt-opened but UNCLOSED — same prompt pre-open as (2), but the completion ran out of
+         ``max_tokens`` before ever emitting ``</think>``, so it carries NEITHER tag. Only reachable
+         when ``prompt_opened_thinking`` is set (the caller knows thinking was enabled): the WHOLE
+         completion is unterminated reasoning. Without this the LONGEST prompt-opened rambles — the
+         exact case the penalty targets — would score 0. When ``prompt_opened_thinking`` is False a
+         tag-less completion is plain (non-thinking) text and counts 0.
     Without case 2 the penalty silently no-ops for the common enable_thinking=true path.
     Any later ``<think>`` blocks (uncommon — a malformed re-open) are NOT added to the count.
     """
@@ -72,6 +80,8 @@ def think_token_count(completion: str | None, tokenizer) -> int:
         think_text = after.split("</think>", 1)[0] if "</think>" in after else after
     elif "</think>" in completion:  # case 2: prompt opened <think>; count up to the close
         think_text = completion.split("</think>", 1)[0]
+    elif prompt_opened_thinking:  # case 3: prompt opened <think>, never closed (ran out of tokens)
+        think_text = completion
     else:
         return 0
     if not think_text:
