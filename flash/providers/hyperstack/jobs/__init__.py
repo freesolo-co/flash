@@ -21,6 +21,7 @@ from collections.abc import Callable
 from flash._logging import get_logger
 from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
+    FIRST_LIVENESS_OBSERVED_FLOOR_S,
     FIRST_LIVENESS_S,
     PollErrorTracker,
     heartbeat_progress_ts,
@@ -430,6 +431,11 @@ def poll_hs_job(
     # hand a box silent since before a control-plane restart a fresh window. Advanced to now only on a
     # genuine inactive->active transition observed in this poll session.
     active_since = start
+    # Wall-clock this poll session FIRST observed the VM ACTIVE (set once, never reset). Unlike the
+    # launch-anchored ``active_since``, this is genuinely "how long WE have watched it active", so a
+    # reattach whose first read is already ACTIVE doesn't immediately fast-fail a VM that only just came
+    # up — see FIRST_LIVENESS_OBSERVED_FLOOR_S.
+    observed_active_since = None
     seen_training_hb = False
     # Any FRESH heartbeat from THIS attempt (boot stage included) proves the worker started — clears
     # the first-liveness deadline. A leftover prior-attempt heartbeat (ts < launch) is NOT fresh, so
@@ -474,6 +480,8 @@ def poll_hs_job(
             last_status = status
         if status == "ACTIVE":
             became_active = True
+            if observed_active_since is None:
+                observed_active_since = time.time()
 
         done = done_reader()
         if done is not None and done_is_fresh(done):
@@ -535,11 +543,14 @@ def poll_hs_job(
             # Fast-failover: a VM that reached 'ACTIVE' but never started a worker (no fresh hb AND no
             # attempt-scoped boot.log past first_liveness_s) is a wedged host -> 'stalled' (infra-shaped
             # -> runner escapes cross-provider via #241), instead of burning the ~50min setup grace. A
-            # healthy box (even mid image-pull) emits its boot.log within ~2 min.
+            # healthy box (even mid image-pull) emits its boot.log within ~2 min. The observed-active
+            # floor keeps a reattach from fast-failing a VM that only just came up (active_since is
+            # launch-anchored and may already be past first_liveness_s) — see the constant's note.
             if (
                 not seen_fresh_hb
                 and not boot_log_seen
                 and time.time() - active_since > first_liveness_s
+                and time.time() - observed_active_since > FIRST_LIVENESS_OBSERVED_FLOOR_S
             ):
                 # force=True bypasses the rate-limit so absent-vs-present is accurate; ``is None`` keeps
                 # an empty "" boot.log as liveness (its existence proves cloud-init ran), then latch.
@@ -548,6 +559,12 @@ def poll_hs_job(
                     # BOOT_LOG_ABSENT_POLLS before failing over, so a Hub blip doesn't burn a retry.
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
+                        # The worker may have written DONE / its attempt marker right before the non-
+                        # forced done/marker reads above were rate-limited; force-read terminals once
+                        # so a finished or explicitly-failed attempt is preserved, not torn down.
+                        terminal = terminal_artifact_result()
+                        if terminal is not None:
+                            return terminal
                         return PollResult(
                             False,
                             failure="stalled",
@@ -559,6 +576,11 @@ def poll_hs_job(
                     boot_log_seen = True
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
+                # Same terminal-artifact race as above: a run that finished right before the last non-
+                # forced done/marker read was rate-limited must be preserved, not stalled + retried.
+                terminal = terminal_artifact_result()
+                if terminal is not None:
+                    return terminal
                 phase = "training" if seen_training_hb else "setup (pre-training)"
                 return PollResult(
                     False,

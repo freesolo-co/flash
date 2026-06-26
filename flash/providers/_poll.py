@@ -61,8 +61,18 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
 # ``SETUP_GRACE_S`` (~50 min). Generous over the ~2 min boot.log-appears time to absorb HF
 # upload/propagation lag and a slow host huggingface_hub install; the boot.log presence — not this
 # raw timer — is what protects a healthy-but-slow (large-image-pull) box from a false failover.
-# Scaled x1.5 on the last GPU (nowhere left to escape), mirroring the setup-grace patience.
+# Applied uniformly per GPU (the instance providers ignore ``on_last_gpu`` in the submit/poll paths).
 FIRST_LIVENESS_S = 900.0
+
+# Minimum OBSERVED-active time (wall-clock since THIS poll session first saw the box ``active``) before
+# the fast-failover may fire. ``active_since`` is launch-anchored, so on a reattach whose very first
+# read is already ``active`` it can already exceed ``FIRST_LIVENESS_S`` even though the box only just
+# came up moments before the supervisor reattached (control plane was down through a long provision).
+# Gating ALSO on observed-active time hands such a genuinely-fresh box the documented ~2 min boot.log
+# window instead of failing it on the first reattach tick. Kept short (not a full ``FIRST_LIVENESS_S``)
+# so a box that has truly been silent since before the restart still fails over promptly — it gets at
+# most this floor of extra grace, never a fresh launch-length window.
+FIRST_LIVENESS_OBSERVED_FLOOR_S = 120.0
 
 # Consecutive forced boot.log reads that must come back absent before the first-liveness check
 # declares a region sick. ``make_hf_text_reader`` returns ``None`` for ANY read failure — a genuinely

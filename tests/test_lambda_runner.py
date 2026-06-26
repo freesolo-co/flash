@@ -823,7 +823,7 @@ def test_poll_reattach_already_active_anchors_liveness_to_launch(monkeypatch):
     The box is silent for ~5_000s — already PAST the 3_000s setup grace — so the setup-grace stall
     (which needs no boot.log read) fires immediately, before the first-liveness check accumulates its
     BOOT_LOG_ABSENT_POLLS confirmations. Either way it's a retriable ``stalled`` and the reported
-    elapsed (~5_020s) is measured from LAUNCH, not the reattach (~0s) — which is what proves the
+    elapsed (~5_000s) is measured from LAUNCH, not the reattach (~0s) — which is what proves the
     anchoring. A fresh launch (elapsed < setup grace) still fails over via the fast first-liveness
     path well before the setup grace, so the FAST-failover guarantee is unaffected."""
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
@@ -832,8 +832,11 @@ def test_poll_reattach_already_active_anchors_liveness_to_launch(monkeypatch):
     )
     assert not res.ok
     assert res.failure == "stalled"
-    # Elapsed counts from LAUNCH (5_000s ago), not the reattach — proves active_since stayed anchored.
-    assert "5020s" in res.detail
+    # Elapsed counts from LAUNCH (~5_000s ago), not the reattach (~0s) — proves active_since stayed
+    # anchored. Asserted as a floor (not an exact tick) so the terminal-artifact force-read before the
+    # stall return can't make this brittle on the precise fake-clock count.
+    elapsed = int(res.detail.split("for ", 1)[1].split("s", 1)[0])
+    assert elapsed >= 5_000, res.detail
 
 
 def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
