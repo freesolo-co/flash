@@ -51,16 +51,19 @@ def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
-def test_build_worker_env_forwards_judge_model(monkeypatch):
-    """The optimizer-authored verifiers env reads FLASH_JUDGE_MODEL on the worker to pick its
-    JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane
-    override must be forwarded, else the env silently falls back to its generated default."""
+def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
+    """flash is fully managed: reward-judge creds and the judge-model id are NOT hardcoded
+    control-plane forwards. An env that needs a judge provider key declares it as an
+    [environment].secrets entry (forwarded via runtime_secrets); the env's own default judge model
+    otherwise applies. A stray control-plane OPENROUTER_API_KEY / OPENAI_API_KEY / FLASH_JUDGE_MODEL
+    must NOT leak into every worker."""
     from flash.providers.runpod.train import build_worker_env
 
-    monkeypatch.setenv("FLASH_JUDGE_MODEL", "openai/gpt-oss-120b")
-    assert build_worker_env(_spec(), 0).get("FLASH_JUDGE_MODEL") == "openai/gpt-oss-120b"
-    monkeypatch.delenv("FLASH_JUDGE_MODEL", raising=False)
-    assert "FLASH_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
+    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
+        monkeypatch.setenv(key, "control-plane-should-not-forward")
+    env = build_worker_env(_spec(), 0)
+    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
+        assert key not in env
 
 
 def test_build_worker_env_forwards_github_env_source_token(monkeypatch):

@@ -373,19 +373,16 @@ def build_worker_env(
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }
-    # HF artifact creds + managed environment hub creds + optional reward-judge creds: a Freesolo
-    # environment whose reward calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
-    # where the reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env
-    # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
-    # control-plane override so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
-    # back to the env's generated default. Forward any that the operator has set; absent ones are
-    # simply not passed (the env then uses its own default model).
+    # Platform creds only: HF artifact creds (HF_TOKEN) + managed environment hub creds
+    # (GITHUB_TOKEN). flash is fully managed — there are no per-run env knobs and no hardcoded
+    # reward-judge creds. A Freesolo environment whose reward calls an LLM judge declares the
+    # provider key it needs (e.g. OPENROUTER_API_KEY / OPENAI_API_KEY) as an [environment].secrets
+    # entry, which is forwarded via runtime_secrets at submit time to the worker where the reward
+    # runs; the judge model id is the env's own default. Forward any platform cred below that the
+    # operator has set; absent ones are simply not passed.
     for key in (
         "HF_TOKEN",
         "GITHUB_TOKEN",
-        "OPENROUTER_API_KEY",
-        "OPENAI_API_KEY",
-        "FLASH_JUDGE_MODEL",
     ):
         if os.environ.get(key):
             env[key] = os.environ[key]
