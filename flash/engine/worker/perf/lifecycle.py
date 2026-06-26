@@ -4,6 +4,8 @@ signaling, and the metric-curve extractor. Torch is imported lazily so this is C
 
 from __future__ import annotations
 
+import contextlib
+
 # Human-readable sentinel embedded in the error message (debug tag only — the runner classifies
 # structurally off the worker's heartbeat ``retriable`` flag, not by matching this phrase).
 RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
@@ -58,12 +60,150 @@ def detect_mig_slice() -> str | None:
     return None
 
 
-def wait_for_gpu():
+def _sm_major(sm: str | None) -> int | None:
+    """Major compute-capability from a class ``sm`` token ('sm89'->8, 'sm120'->12), or None.
+    (sm digits = compute capability with a single minor digit, so major = all-but-last-digit.)"""
+    import re
+
+    m = re.fullmatch(r"sm(\d+)", (sm or "").strip().lower())
+    if not m:
+        return None
+    digits = m.group(1)
+    return int(digits[:-1]) if len(digits) >= 2 else int(digits)
+
+
+def _host_driver_cuda() -> float | None:
+    """Host driver's max supported CUDA — the PTX-JIT ceiling, NOT ``torch.version.cuda`` (build CUDA).
+    pynvml then ``nvidia-smi`` header; None if neither works (driver-floor check skipped, best-effort)."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            try:
+                v = pynvml.nvmlSystemGetCudaDriverVersion_v2()
+            except Exception:
+                v = pynvml.nvmlSystemGetCudaDriverVersion()
+        finally:
+            with contextlib.suppress(Exception):
+                pynvml.nvmlShutdown()
+        # NVML encodes the version as 1000*major + 10*minor (CUDA 12.8 -> 12080 -> 12.8).
+        return (v // 1000) + ((v % 1000) // 10) / 10.0
+    except Exception:
+        pass
+    try:
+        import re
+        import subprocess
+
+        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=20).stdout
+        m = re.search(r"CUDA Version:\s*(\d+\.\d+)", out)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _gpu_mismatch_reason(
+    requested_gpu: str | None,
+    live_cap: tuple[int, int] | None,
+    live_vram_gb: float | None,
+    driver_cuda: float | None,
+) -> str | None:
+    """Return a human reason the LIVE GPU can't satisfy the REQUESTED class, else None.
+
+    PURE (no CUDA/NVML) so it is unit-testable; a ``None`` live input skips that dimension. Three
+    independent failover triggers: driver CUDA below the class floor (``min_cuda_modern``: Blackwell
+    sm120 needs 13.0 to JIT the wheels' PTX, else 12.8); VRAM < ~90% of spec (a smaller substituted
+    card OOMs); compute-capability MAJOR below the class (generational downgrade — major only, since
+    the minor digit isn't capability-ordered: A100 sm80 < A6000 sm86, so VRAM guards within a major).
+    """
+    try:
+        from flash.providers.base import get_gpu_info, min_cuda_modern
+
+        info = get_gpu_info(requested_gpu or "")
+    except Exception:
+        return None  # unknown / unset class -> nothing to verify against (best-effort)
+    reasons: list[str] = []
+    floor = float(min_cuda_modern(info.name))
+    if driver_cuda is not None and driver_cuda + 1e-9 < floor:
+        reasons.append(
+            f"host driver CUDA {driver_cuda:g} < {floor:g} required for {info.name} ({info.sm})"
+        )
+    if live_vram_gb is not None and live_vram_gb < info.vram_gb * 0.9:
+        reasons.append(
+            f"only {live_vram_gb:.1f} GB VRAM but {info.name} needs ~{info.vram_gb} GB"
+        )
+    exp_major = _sm_major(info.sm)
+    if live_cap is not None and exp_major is not None and live_cap[0] < exp_major:
+        reasons.append(
+            f"compute capability {live_cap[0]}.{live_cap[1]} below sm{exp_major}x for {info.name}"
+        )
+    return "; ".join(reasons) or None
+
+
+def verify_gpu(requested_gpu: str | None) -> None:
+    """Assert the LIVE GPU matches the REQUESTED class (model + CUDA floor), or raise retriable.
+    No-op for a falsy/unknown class. Runs on every provider (standardizes the per-class CUDA floor that
+    only Hyperstack/RunPod enforce pre-launch + a GPU-model check no provider does); a mismatch raises
+    ``RetriableInfraError`` (fail over) instead of an opaque mid-setup crash. Best-effort reads."""
+    if not requested_gpu:
+        return
+    import torch
+
+    live_cap = None
+    live_vram_gb = None
+    with contextlib.suppress(Exception):
+        live_cap = torch.cuda.get_device_capability(0)
+    with contextlib.suppress(Exception):
+        # Decimal GB (/1e9), NOT binary GiB: the catalog `vram_gb` and all of flash.engine.vram
+        # (estimate_vram_gb, grpo_fits_resident) are decimal, so the `info.vram_gb * 0.9` comparison
+        # in _gpu_mismatch_reason must read live VRAM the same way. (The classes — 40/48/80 GB — are
+        # far enough apart that the unit doesn't flip any real check; this keeps the convention.)
+        live_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    reason = _gpu_mismatch_reason(requested_gpu, live_cap, live_vram_gb, _host_driver_cuda())
+    if reason:
+        name = "?"
+        with contextlib.suppress(Exception):
+            name = torch.cuda.get_device_name(0)
+        raise RetriableInfraError(
+            f"assigned GPU does not match requested {requested_gpu!r}: {reason} (live: {name}); "
+            "retrying on a fresh correctly-provisioned GPU"
+        )
+
+
+def _nvml_alive() -> bool:
+    """True if the host's NVML/driver layer initializes. A merely BUSY GPU still has live NVML; a
+    BROKEN host (driver crashed / GPU off the PCIe bus -> ``Failed to initialize NVML`` /
+    ``cudaErrorDevicesUnavailable``) fails NVML init entirely and won't recover in the readiness
+    window, so ``wait_for_gpu`` fails over FAST on it instead of waiting out the full patient loop a
+    transient 'device busy' deserves. Best-effort (pynvml, then ``nvidia-smi -L`` exit code)."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        with contextlib.suppress(Exception):
+            pynvml.nvmlShutdown()
+        return True
+    except Exception:
+        pass
+    try:
+        import subprocess
+
+        return subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=20).returncode == 0
+    except Exception:
+        return False
+
+
+def wait_for_gpu(requested_gpu: str | None = None):
     """Rented nodes sometimes report 'CUDA device not ready' transiently at startup.
     Poll a trivial CUDA op until it succeeds before doing real work; raise if never ready.
 
     Also fails fast (retriable) if the assigned GPU is a MIG slice — a partitioned GPU crashes the
-    CUDA allocator, so we re-provision on a fresh FULL GPU instead of dying mid-setup."""
+    CUDA allocator, so we re-provision on a fresh FULL GPU instead of dying mid-setup. Once CUDA is
+    live, ``verify_gpu(requested_gpu)`` asserts the box is the RIGHT GPU (model + driver-CUDA floor).
+    A HARD host fault (NVML can't init) fails over FAST (~30s) rather than burning the full patient
+    loop, which is reserved for a transient busy/not-ready GPU."""
     import time as _t
 
     mig = detect_mig_slice()
@@ -81,10 +221,22 @@ def wait_for_gpu():
                 _ = torch.zeros(8, device="cuda") + 1
                 torch.cuda.synchronize()
                 print(f"GPU ready after {i} retries: {torch.cuda.get_device_name(0)}")
+                verify_gpu(requested_gpu)  # right GPU for the run? (model + CUDA floor) else fail over
                 return True
             last = "cuda not available"
+        except RetriableInfraError:
+            raise  # a GPU/identity mismatch must propagate (fail over), not be masked as "never ready"
         except Exception as e:
             last = str(e)[:160]
+        # GPU not ready this iteration — CUDA threw OR ``is_available()`` returned False (a dead
+        # driver / GPU off the bus reports unavailable WITHOUT raising). A persistent NVML-init failure
+        # won't recover; after ~30s ruling out a transient blip, fail over FAST instead of the full
+        # ~120s. A BUSY device keeps NVML alive, so it stays in the patient loop. This check lives
+        # OUTSIDE the except so the no-exception ``is_available()``-False path fast-fails too.
+        if i >= 2 and not _nvml_alive():
+            raise RetriableInfraError(
+                f"GPU host NVML init failed (driver/host fault, won't recover): {last}; failing over"
+            )
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
         _t.sleep(10)
     # Infra-shaped: a host whose GPU never comes up is dead, not a code bug -> retry on a fresh one.

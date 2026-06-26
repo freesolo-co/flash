@@ -77,7 +77,7 @@ def run_rl():
             print("[rl] multi-turn: torch._dynamo suppress_errors=True (Liger loss falls back to eager on dynamic shapes)")
         except Exception as exc:  # never let a torch internals change block the run
             print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
-    wait_for_gpu()
+    wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     download_seconds = _w.prefetch_model(model_id)

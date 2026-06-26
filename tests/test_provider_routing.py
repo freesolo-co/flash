@@ -370,6 +370,54 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     assert orch.get_status(spec.run_id).remote["provider"] == "runpod"
 
 
+def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
+    """The new fast first-liveness failover returns failure='stalled' (a sick region where the box
+    reached 'active' but the worker never booted). It is infra-shaped, so the retry ESCAPES to a
+    different provider rather than re-rolling the same sick substrate — the observed us-east-1 /
+    CANADA-1 case, now caught in ~15 min instead of ~50."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs as hs_jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("hyperstack", "RTX A6000", 0.45, 48),  # cheapest -> attempt 0 (sick region)
+        Candidate("runpod", "RTX A6000", 0.49, 48),  # the cross-provider escape
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(hs_api, "delete_vm", lambda vid: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    hs_gpus, rp_gpus = [], []
+
+    def fake_hs(spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        hs_gpus.append(spec.gpu.type)
+        if on_handle:
+            on_handle(_hs_handle())
+        return PollResult(
+            False,
+            failure="stalled",
+            detail="no worker liveness (boot.log/heartbeat) within 900s of instance active",
+        )
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        rp_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle("ep3", "j3"))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(hs_jobs, "submit_run_hyperstack", fake_hs)
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec()
+    _seed_status(orch, spec)
+    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    assert metrics["train_tokens"] == 4096
+    assert hs_gpus == ["RTX A6000"]  # sick region tried once...
+    assert rp_gpus == ["RTX A6000"]  # ...then escaped cross-provider to RunPod
+    assert orch.get_status(spec.run_id).remote["provider"] == "runpod"
+
+
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
