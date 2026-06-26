@@ -276,11 +276,13 @@ def _record_heartbeat(hb: dict) -> None:
 #   tens of GB) -> sft_model_load/rl_train_start -> sft_initializing/rl_initializing (vLLM build +
 #   *Trainer.__init__) -> [dataset render/tokenize over the full -- possibly uncapped -- dataset,
 #   silent] -> first sft_step/rl_step (training has actually begun).
-# Every stage EXCEPT the per-step sft_step/rl_step is setup. The prefetch + init pings were added so
-# a long-but-LIVE cold start keeps re-arming liveness, but they are still setup: omitting them here
-# would latch the poller into the training stall the moment the first one lands, then false-kill a
-# healthy run whose silent dataset tokenization outlives that tighter window. Canonical here so all
-# three providers (runpod / lambdalabs / hyperstack) share ONE definition.
+# This set is specifically the COLD-START timeline above — it is what the first per-step
+# sft_step/rl_step heartbeat flips OUT of (later non-setup stages like *_trained/done are irrelevant:
+# the run is past stall detection by then). The prefetch + init pings were added so a long-but-LIVE
+# cold start keeps re-arming liveness, but they are still setup: omitting them here would latch the
+# poller into the training stall the moment the first one lands, then false-kill a healthy run whose
+# silent dataset tokenization outlives that tighter window. Canonical here so all three providers
+# (runpod / lambdalabs / hyperstack) share ONE definition.
 SETUP_HEARTBEAT_STAGES = frozenset(
     {
         "boot",

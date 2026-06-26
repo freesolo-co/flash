@@ -98,9 +98,9 @@ with contextlib.suppress(Exception):
 _STALL_STARTUP_GRACE_S = 3000
 with contextlib.suppress(Exception):
     _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "3000") or 3000)
-# Stages that mean real TRAINING has begun (vs. a setup ping). The first one tightens the watchdog
-# from the wide setup grace to the steady-state window. Mirrors the providers' SETUP_HEARTBEAT_STAGES
-# setup-vs-training boundary (everything except rl_step/sft_step is setup).
+# Stages that mean real TRAINING has begun (vs. a cold-start/setup ping). The first one tightens the
+# watchdog from the wide setup grace to the steady-state window. Mirrors the providers'
+# SETUP_HEARTBEAT_STAGES boundary: the cold-start stages there are setup, sft_step/rl_step are not.
 _STEP_STAGES = frozenset({"rl_step", "sft_step"})
 # False until the first per-step training heartbeat; until then every arm gets the startup grace.
 _SAW_STEP_HEARTBEAT = False

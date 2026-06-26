@@ -708,7 +708,15 @@ def run_rl():
 
     def _rl_init_heartbeat() -> None:
         while not _rl_init_done.wait(30.0):
-            _w.heartbeat("rl_initializing", gpu=gpu_diagnostics(include_torch=False))
+            # Same guards as prefetch_model: don't emit once init is done. Re-check after wait()
+            # returns (done may be set in the gap) AND after gpu_diagnostics (nvidia-smi can take
+            # seconds) so no stale rl_initializing lands after init completes / a later stage.
+            if _rl_init_done.is_set():
+                return
+            gpu = gpu_diagnostics(include_torch=False)
+            if _rl_init_done.is_set():
+                return
+            _w.heartbeat("rl_initializing", gpu=gpu)
 
     _rl_init_hb = threading.Thread(target=_rl_init_heartbeat, daemon=True)
     _rl_init_hb.start()
@@ -791,13 +799,21 @@ def run_rl():
 
     def _train_liveness_heartbeat() -> None:
         while not _train_done.wait(30.0):
+            # Don't emit once train() has returned: re-check after wait() (done may be set in the
+            # gap) before doing any work, else a stray rl_step could land during post-train teardown
+            # (adapter save/upload) and regress the last published stage.
+            if _train_done.is_set():
+                return
             try:
                 quiet_for = time.time() - float(getattr(_w, "_HB_LAST_UPLOAD", 0.0) or 0.0)
             except Exception:
                 quiet_for = 1e9
             if quiet_for >= 90.0:
                 step = int(getattr(getattr(trainer, "state", None), "global_step", 0) or 0)
-                _w.heartbeat("rl_step", step=step, gpu=gpu_diagnostics(include_torch=False))
+                gpu = gpu_diagnostics(include_torch=False)
+                if _train_done.is_set():  # train() may have finished during nvidia-smi
+                    return
+                _w.heartbeat("rl_step", step=step, gpu=gpu)
 
     _train_hb = threading.Thread(target=_train_liveness_heartbeat, daemon=True)
     _train_hb.start()

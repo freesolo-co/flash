@@ -215,16 +215,27 @@ def test_prefetch_model_joins_heartbeat_with_a_bounded_timeout():
         )
 
 
-def test_prefetch_heartbeat_skips_emit_once_done_is_set():
-    """The ordering guarantee that replaces the (removed) unbounded join: the side thread must
-    re-check ``_prefetch_done`` after its wait and RETURN without emitting once the download is done,
-    so no ``model_prefetching`` can START after ``model_prefetched`` and overtake it on HF."""
-    from flash.engine.worker import hf
+@pytest.mark.parametrize(
+    ("modname", "outer", "inner", "done"),
+    [
+        ("flash.engine.worker.hf", "prefetch_model", "_prefetch_heartbeat", "_prefetch_done"),
+        ("flash.engine.worker.rl", "run_rl", "_rl_init_heartbeat", "_rl_init_done"),
+        ("flash.engine.worker.rl", "run_rl", "_train_liveness_heartbeat", "_train_done"),
+        ("flash.engine.worker.sft", "run_sft", "_sft_init_heartbeat", "_sft_init_done"),
+    ],
+)
+def test_periodic_heartbeat_threads_guard_on_done(modname, outer, inner, done):
+    """Every periodic side-thread heartbeat must re-check its done Event AFTER wait() (the event can
+    be set in the gap between wait() timing out and the emit) and return without emitting, so it can't
+    publish a stale stage once the phase it covers has finished — the prefetch race, generalized to
+    the init + train-liveness threads. (An emit after gpu_diagnostics is additionally guarded in the
+    source; here we just pin that the closure consults <done>.is_set() before emitting.)"""
+    import importlib
 
-    node = _inner_func_node(hf.prefetch_model, "_prefetch_heartbeat")
-    assert node is not None, "prefetch_model no longer defines _prefetch_heartbeat"
+    mod = importlib.import_module(modname)
+    node = _inner_func_node(getattr(mod, outer), inner)
+    assert node is not None, f"{outer} no longer defines {inner}"
 
-    # Find the loop body and assert it guards on _prefetch_done.is_set() BEFORE the heartbeat call.
     guards = [
         n
         for n in ast.walk(node)
@@ -232,11 +243,11 @@ def test_prefetch_heartbeat_skips_emit_once_done_is_set():
         and isinstance(n.func, ast.Attribute)
         and n.func.attr == "is_set"
         and isinstance(n.func.value, ast.Name)
-        and n.func.value.id == "_prefetch_done"
+        and n.func.value.id == done
     ]
     assert guards, (
-        "_prefetch_heartbeat must re-check _prefetch_done.is_set() after waking, then return without "
-        "emitting model_prefetching — otherwise a stale stage can race past model_prefetched"
+        f"{inner} must re-check {done}.is_set() after waking, then return without emitting — "
+        "otherwise a stale stage can race past the terminal stage of the phase it covers"
     )
 
 

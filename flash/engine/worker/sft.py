@@ -489,7 +489,15 @@ def run_sft():
 
     def _sft_init_heartbeat() -> None:
         while not _sft_init_done.wait(30.0):
-            _w.heartbeat("sft_initializing", gpu=gpu_diagnostics(include_torch=False))
+            # Same guards as prefetch_model: don't emit once init is done. Re-check after wait()
+            # returns (done may be set in the gap) AND after gpu_diagnostics (nvidia-smi can take
+            # seconds) so no stale sft_initializing lands after init completes / a later stage.
+            if _sft_init_done.is_set():
+                return
+            gpu = gpu_diagnostics(include_torch=False)
+            if _sft_init_done.is_set():
+                return
+            _w.heartbeat("sft_initializing", gpu=gpu)
 
     _sft_init_hb = threading.Thread(target=_sft_init_heartbeat, daemon=True)
     _sft_init_hb.start()
