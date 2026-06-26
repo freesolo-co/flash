@@ -690,11 +690,25 @@ def run_rl():
         print("[rl] multi-turn env: driving the turn loop via rollout_func")
     # GRPOTrainer.__init__ blocks during model/vLLM init + FA2 kernel compilation (can be
     # 10-20 min on first use). Background heartbeats keep the stall detector quiet.
+    #
+    # CRITICAL: this heartbeat runs on a SIDE THREAD while the main thread is deep inside the
+    # blocking GRPOTrainer.__init__ (vLLM colocate engine build + weight load) — a long, CUDA- and
+    # allocator-busy section. gpu_diagnostics(include_torch=True) makes torch.cuda calls
+    # (mem_get_info / memory_allocated / memory_reserved / get_device_name) that serialize on the
+    # CUDA driver lock and PyTorch's caching-allocator mutex, both held by the init thread. Those
+    # calls can then BLOCK for the whole init -> the heartbeat thread freezes -> the control plane
+    # sees no heartbeat and false-flags a HANG on a run that is merely doing a slow (but live) cold
+    # init (observed on consumer GPUs: RTX 4090/5090/A6000, where cold init is longest). Use the
+    # nvidia-smi-only path (include_torch=False): it runs out-of-process with an 8s timeout and
+    # releases the GIL during the subprocess wait, so it keeps ticking through a CUDA-busy init. The
+    # torch memory numbers are meaningless here anyway (the model isn't built yet). If even THIS
+    # stops ticking, the main thread is holding the GIL in a C extension (a true wedge) -> that is
+    # what the FLASH_STALL_FAULTHANDLER_S watchdog (heartbeat.py) is for.
     _rl_init_done = threading.Event()
 
     def _rl_init_heartbeat() -> None:
         while not _rl_init_done.wait(30.0):
-            _w.heartbeat("rl_initializing", gpu=gpu_diagnostics())
+            _w.heartbeat("rl_initializing", gpu=gpu_diagnostics(include_torch=False))
 
     _rl_init_hb = threading.Thread(target=_rl_init_heartbeat, daemon=True)
     _rl_init_hb.start()

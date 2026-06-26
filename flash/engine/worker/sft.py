@@ -479,11 +479,17 @@ def run_sft():
     # SFTTrainer.__init__ blocks for 10-15 min on first use (FA2 CUDA kernel JIT compilation);
     # without a heartbeat the control plane can't distinguish this from a real hang and may
     # recycle the worker. A daemon thread pings every 30s so the stall detector stays quiet.
+    #
+    # include_torch=False: this side-thread heartbeat runs while the main thread is blocked in
+    # SFTTrainer.__init__ (CUDA- and allocator-busy). torch.cuda telemetry from a side thread
+    # serializes on the CUDA driver / allocator locks held by the init thread and can freeze the
+    # heartbeat for the whole init -> false hang. The nvidia-smi-only path (out-of-process, 8s
+    # timeout, GIL released during the wait) keeps ticking. Mirrors run_rl's rl_initializing fix.
     _sft_init_done = threading.Event()
 
     def _sft_init_heartbeat() -> None:
         while not _sft_init_done.wait(30.0):
-            _w.heartbeat("sft_initializing", gpu=gpu_diagnostics())
+            _w.heartbeat("sft_initializing", gpu=gpu_diagnostics(include_torch=False))
 
     _sft_init_hb = threading.Thread(target=_sft_init_heartbeat, daemon=True)
     _sft_init_hb.start()

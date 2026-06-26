@@ -51,20 +51,33 @@ _SFT_HEARTBEAT_INTERVAL_S = 60.0
 # every thread's Python stack (then exits, so the run FAILS instead of hanging until the
 # control-plane stall watchdog kills it ~25 min later, and the dump is uploaded with
 # console_<phase>.txt). The timer is re-armed on every heartbeat, so it only fires when NO progress
-# heartbeat lands for the whole window -- i.e. a real hang. OFF by default (0); opt-in per run via
-# [worker_env]. Used to localize the GRPO sleep-mode rollout hang.
-_STALL_FAULTHANDLER_S = 0
+# heartbeat lands for the whole window -- i.e. a real hang. Used to localize the GRPO sleep-mode
+# rollout hang and the consumer-GPU warm-start init hang.
+#
+# DEFAULT-ON (2400s / 40 min). This is SAFE — and strictly better than the old silent wedge —
+# because every heartbeat re-arms the timer: a slow-but-LIVE cold init pings
+# ``rl_initializing``/``sft_initializing`` every 30s (and those now use the GIL-friendly
+# nvidia-smi-only diagnostics, so they keep ticking through a CUDA-busy init), so the watchdog only
+# fires on a TRUE hang where NO heartbeat lands for the whole window. The window is set WELL above
+# the longest observed HEALTHY cold-init gap (a real 0.8B warm-start GRPO on an RTX 4090 had a
+# ~17-min init with the old frozen-heartbeat bug — the very thing this file fixes) and below the
+# control-plane setup grace (~50 min), so it adds a stack dump for a TRUE hang without ever
+# false-killing a healthy-but-slow init. When it fires it dumps every thread's stack (C-level
+# faulthandler -> fires even if the main thread holds the GIL) and fails the run, turning the
+# previously undiagnosable "process wedged, no console upload" hang into an uploaded stack trace.
+# Set FLASH_STALL_FAULTHANDLER_S=0 in [worker_env] to disable; lower it to localize a known hang.
+_STALL_FAULTHANDLER_S = 2400
 with contextlib.suppress(Exception):
-    _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "0") or 0)
+    _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "2400") or 2400)
 
 # Startup grace: model/vLLM/GRPO init can legitimately run for many minutes between the FIRST
 # heartbeat and the first per-step one, exceeding a tight FLASH_STALL_FAULTHANDLER_S window and
 # tripping the watchdog on a HEALTHY run. So the very first arm uses a wider window (at least
-# FLASH_STALL_FAULTHANDLER_STARTUP_S, default 900s) and only once real progress has re-armed it do
+# FLASH_STALL_FAULTHANDLER_STARTUP_S, default 2400s) and only once real progress has re-armed it do
 # we tighten to the configured interval. OFF inherits from _STALL_FAULTHANDLER_S (0 -> disabled).
-_STALL_STARTUP_GRACE_S = 900
+_STALL_STARTUP_GRACE_S = 2400
 with contextlib.suppress(Exception):
-    _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "900") or 900)
+    _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "2400") or 2400)
 # False until the watchdog has been armed at least once; the first arm gets the startup grace.
 _STALL_ARMED = False
 
