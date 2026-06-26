@@ -60,7 +60,12 @@ def _identity_for_token(token: str) -> dict[str, str]:
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
+    # Hyperstack + the shared tokens + the internal key); see tests/test_preflight.py for the gate.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     import flash.runner as runner

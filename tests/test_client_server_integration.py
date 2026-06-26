@@ -88,7 +88,10 @@ class _FakeUrlResponse:
 def make_client(tmp_path, monkeypatch):
     """Yields a factory building real ``ApiClient``s wired into one in-process
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
 

@@ -159,7 +159,10 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
