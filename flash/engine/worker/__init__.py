@@ -851,7 +851,7 @@ def run_sft():
     # transcript (proper multi-turn SFT, handled below); rows with a single-turn target completion
     # collapse to one assistant turn. Warn only for the collapsing case (computed during the
     # dataset build below), not unconditionally.
-    wait_for_gpu()
+    wait_for_gpu(JOB_SPEC.gpu.type if JOB_SPEC else None)
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
     download_seconds = prefetch_model(model_id)
@@ -1814,7 +1814,7 @@ def run_rl():
             print("[rl] multi-turn: torch._dynamo suppress_errors=True (Liger loss falls back to eager on dynamic shapes)")
         except Exception as exc:  # never let a torch internals change block the run
             print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
-    wait_for_gpu()
+    wait_for_gpu(JOB_SPEC.gpu.type if JOB_SPEC else None)
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
     download_seconds = prefetch_model(model_id)

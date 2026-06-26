@@ -818,12 +818,137 @@ def detect_mig_slice() -> str | None:
     return None
 
 
-def wait_for_gpu():
+def _sm_major(sm: str | None) -> int | None:
+    """Major compute-capability from a class ``sm`` token ('sm89' -> 8, 'sm120' -> 12), or None.
+
+    The encoding is compute-capability digits with a single minor digit: 'sm80'->8.0, 'sm89'->8.9,
+    'sm90'->9.0, 'sm120'->12.0 — so major = all-but-last-digit."""
+    import re
+
+    m = re.fullmatch(r"sm(\d+)", (sm or "").strip().lower())
+    if not m:
+        return None
+    digits = m.group(1)
+    return int(digits[:-1]) if len(digits) >= 2 else int(digits)
+
+
+def _host_driver_cuda() -> float | None:
+    """The HOST DRIVER's max supported CUDA (e.g. 12.8) — the PTX-JIT ceiling, NOT ``torch.version.cuda``
+    (the wheel's BUILD CUDA). pynvml first, ``nvidia-smi`` header fallback, None if neither works (the
+    driver-floor check is then skipped — best-effort, never a false fail)."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            try:
+                v = pynvml.nvmlSystemGetCudaDriverVersion_v2()
+            except Exception:
+                v = pynvml.nvmlSystemGetCudaDriverVersion()
+        finally:
+            with contextlib.suppress(Exception):
+                pynvml.nvmlShutdown()
+        # NVML encodes the version as 1000*major + 10*minor (CUDA 12.8 -> 12080 -> 12.8).
+        return (v // 1000) + ((v % 1000) // 10) / 10.0
+    except Exception:
+        pass
+    try:
+        import re
+        import subprocess
+
+        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=20).stdout
+        m = re.search(r"CUDA Version:\s*(\d+\.\d+)", out)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _gpu_mismatch_reason(
+    requested_gpu: str | None,
+    live_cap: tuple[int, int] | None,
+    live_vram_gb: float | None,
+    driver_cuda: float | None,
+) -> str | None:
+    """Return a human reason the LIVE GPU can't satisfy the REQUESTED class, else None.
+
+    PURE (no CUDA/NVML calls) so it is unit-testable with synthetic live values. A ``None`` live
+    input skips that dimension (best-effort). Three checks, each independently a failover trigger:
+
+    * host driver CUDA >= the class's floor (``min_cuda_modern``: Blackwell sm120 needs 13.0 to JIT
+      the wheels' PTX, else 12.8) — catches the opaque "PTX compiled with an unsupported toolchain"
+      crash up front instead of mid-setup;
+    * VRAM >= ~90% of the class spec — catches a provider substituting a SMALLER card (the run was
+      sized for the requested VRAM; a smaller card OOMs at model load);
+    * compute-capability MAJOR not below the class — catches a generational DOWNGRADE (e.g. an H100
+      sm90 request handed an sm80 card). Major only: the minor digit is NOT capability-ordered
+      (A100 sm80 < A6000 sm86 yet is the stronger datacenter card), so VRAM guards within a major.
+    """
+    try:
+        from flash.providers.base import get_gpu_info, min_cuda_modern
+
+        info = get_gpu_info(requested_gpu or "")
+    except Exception:
+        return None  # unknown / unset class -> nothing to verify against (best-effort)
+    reasons: list[str] = []
+    floor = float(min_cuda_modern(info.name))
+    if driver_cuda is not None and driver_cuda + 1e-9 < floor:
+        reasons.append(
+            f"host driver CUDA {driver_cuda:g} < {floor:g} required for {info.name} ({info.sm})"
+        )
+    if live_vram_gb is not None and live_vram_gb < info.vram_gb * 0.9:
+        reasons.append(
+            f"only {live_vram_gb:.1f} GB VRAM but {info.name} needs ~{info.vram_gb} GB"
+        )
+    exp_major = _sm_major(info.sm)
+    if live_cap is not None and exp_major is not None and live_cap[0] < exp_major:
+        reasons.append(
+            f"compute capability {live_cap[0]}.{live_cap[1]} below sm{exp_major}x for {info.name}"
+        )
+    return "; ".join(reasons) or None
+
+
+def verify_gpu(requested_gpu: str | None) -> None:
+    """Assert the LIVE GPU actually matches the REQUESTED class (model + CUDA), or raise retriable.
+
+    A no-op when ``requested_gpu`` is falsy/unknown. Standardizes — across ALL providers, on the one
+    code path that runs on every rented box — the per-class CUDA floor that otherwise only Hyperstack
+    (image fail-fast) and RunPod (SDK ``min_cuda_version``) enforce pre-launch and Lambda not at all,
+    PLUS a GPU-model substitution check that no provider does. A mismatch raises ``RetriableInfraError``
+    so the runner fails over to a fresh, correctly-provisioned GPU instead of crashing mid-setup with
+    an opaque "no kernel image" / "PTX unsupported toolchain" / OOM. Best-effort on the reads (a
+    dimension it can't measure is skipped), strict on the compare."""
+    if not requested_gpu:
+        return
+    import torch
+
+    live_cap = None
+    live_vram_gb = None
+    with contextlib.suppress(Exception):
+        live_cap = torch.cuda.get_device_capability(0)
+    with contextlib.suppress(Exception):
+        live_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    reason = _gpu_mismatch_reason(requested_gpu, live_cap, live_vram_gb, _host_driver_cuda())
+    if reason:
+        name = "?"
+        with contextlib.suppress(Exception):
+            name = torch.cuda.get_device_name(0)
+        raise RetriableInfraError(
+            f"assigned GPU does not match requested {requested_gpu!r}: {reason} (live: {name}); "
+            "retrying on a fresh correctly-provisioned GPU"
+        )
+
+
+def wait_for_gpu(requested_gpu: str | None = None):
     """Rented nodes sometimes report 'CUDA device not ready' transiently at startup.
     Poll a trivial CUDA op until it succeeds before doing real work; raise if never ready.
 
     Also fails fast (retriable) if the assigned GPU is a MIG slice — a partitioned GPU crashes the
-    CUDA allocator, so we re-provision on a fresh FULL GPU instead of dying mid-setup."""
+    CUDA allocator, so we re-provision on a fresh FULL GPU instead of dying mid-setup.
+
+    Once CUDA is live, ``verify_gpu(requested_gpu)`` asserts the box is the RIGHT GPU for the run
+    (model + driver-CUDA floor + VRAM); a mismatch is retriable infra (fail over to a fresh box)."""
     import time as _t
 
     mig = detect_mig_slice()
@@ -841,8 +966,14 @@ def wait_for_gpu():
                 _ = torch.zeros(8, device="cuda") + 1
                 torch.cuda.synchronize()
                 print(f"GPU ready after {i} retries: {torch.cuda.get_device_name(0)}")
+                # GPU is live -> verify it's the GPU we actually asked for (model + CUDA floor).
+                verify_gpu(requested_gpu)
                 return True
             last = "cuda not available"
+        except RetriableInfraError:
+            # A genuine GPU/identity mismatch must propagate to the runner (fail over), NOT be
+            # swallowed by the readiness retry loop below and masked as "never became ready".
+            raise
         except Exception as e:
             last = str(e)[:160]
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
