@@ -606,7 +606,11 @@ def poll_lambda_job(
             # shared seed path with ts > this launch) can't satisfy this attempt's first-liveness.
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
             if fresh:
-                last_progress = hb_ts
+                # MONOTONIC: never let progress REGRESS. A newer heartbeat whose bounded upload-lock
+                # acquire timed out can be skipped while an older, slow upload eventually lands as the
+                # latest heartbeat.json — so a later poll may read an OLDER ts. Clamp to the max so a
+                # delayed stale upload can't move progress backward and trip the stall clock early.
+                last_progress = max(last_progress, hb_ts)
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
                 if stage not in SETUP_HEARTBEAT_STAGES:
                     seen_training_hb = True
