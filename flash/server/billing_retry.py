@@ -27,11 +27,21 @@ import os
 from flash import runner
 from flash.server.auth import INTERNAL_KEY_ENV
 
-# States that produced a final, deployable adapter -> the only states a completion charge applies to.
-# A failed/cancelled run never completed, so it is never charged even if its billing_state is still
-# `pending` from submit. `deployed` is a `done` run with serving stood up on top -> still billable
-# (its done-time charge may have failed before the deploy).
+# States that produced a final, deployable adapter -> a completion charge applies. `deployed` is a
+# `done` run with serving stood up on top -> still billable (its done-time charge may have failed
+# before the deploy). A run still in one of these states whose charge is `pending` from submit but
+# never ran (a crash between the `done` write and the charge) is recovered via this set.
 _BILLABLE_STATES = frozenset({"done", "deployed"})
+
+# billing_state values that PROVE the completion charge machine already ran for this run, which only
+# happens after a run reached `done` (lifecycle._charge_completed_run_best_effort). So a run carrying
+# one of these has DEFINITELY completed training and incurred a charge, no matter what its current
+# state is now. This recovers a run that completed (`done`/`deployed`) and was LATER `cancelled`
+# (cancel flips a deployed run to `cancelled`, deploy.py:116) while its charge was still pending in
+# the backend -- without it, the widened cancel state would drop out of `_BILLABLE_STATES` and leak.
+# `pending` is intentionally NOT here: it is the submit-time default that a run cancelled BEFORE ever
+# completing also carries, so charging on `pending`+`cancelled` would bill a run that never trained.
+_CHARGE_STARTED_STATES = frozenset({"charging", "failed"})
 
 
 def charge_retry_enabled() -> bool:
@@ -40,12 +50,22 @@ def charge_retry_enabled() -> bool:
 
 
 def _needs_charge(status: runner.RunStatus) -> bool:
-    """True for a completed run that carries customer billing context but isn't `charged` yet."""
-    if status.state not in _BILLABLE_STATES:
-        return False
+    """True for a completed run that carries customer billing context but isn't `charged` yet.
+
+    Eligible when the run carries a customer billing context, isn't already `charged`, and EITHER it
+    is still in a billable terminal state (`done`/`deployed`) OR its charge machine already started
+    (`charging`/`failed`). The second arm recovers a run that completed training and was then
+    `cancelled` (e.g. a deployed run gets cancelled) while its charge was pending -- such a run leaves
+    `_BILLABLE_STATES` but provably completed, so its pending/failed charge must still be recovered.
+    A run cancelled BEFORE completing keeps the submit-time `pending` and a non-billable state, so it
+    stays ineligible: a run that never trained is never charged."""
     if not status.billing_context:
         return False
-    return status.billing_state != "charged"
+    if status.billing_state == "charged":
+        return False
+    if status.state in _BILLABLE_STATES:
+        return True
+    return status.billing_state in _CHARGE_STARTED_STATES
 
 
 def retry_completion_charges_once() -> int:
@@ -57,23 +77,20 @@ def retry_completion_charges_once() -> int:
     """
     if not charge_retry_enabled():
         return 0
-    from flash.runner.lifecycle import _charge_completed_run_best_effort
-    from flash.spec import JobSpec
+    from flash.runner.lifecycle import _charge_completed_run_by_id
 
     charged = 0
     for status in runner.list_runs():
         if not _needs_charge(status):
             continue
-        try:
-            spec = JobSpec.from_dict(status.spec)
-        except Exception:
-            # A malformed spec can't be charged; leave it for operator follow-up rather than
-            # aborting the whole sweep.
-            continue
         with contextlib.suppress(Exception):
+            # Charge by run id -- the charge reads everything it needs from the persisted RunStatus
+            # (billing_context + cost_usd + the raw spec dict), so we never reparse the JobSpec. A
+            # legacy/stale persisted spec that `JobSpec.from_dict` would reject must NOT block
+            # recovery of a real pending/failed charge.
             # Append to the run log so retry attempts surface in `flash status --logs`.
             with open(runner.runs_file_path(status.run_id, ".log"), "a") as log:
-                _charge_completed_run_best_effort(spec, log)
+                _charge_completed_run_by_id(status.run_id, log)
             if runner.get_status(status.run_id).billing_state == "charged":
                 charged += 1
     return charged

@@ -50,6 +50,28 @@ async def _reconcile_cost_loop() -> None:
             _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
 
 
+async def _charge_retry_startup() -> None:
+    """Run ONE completion-charge recovery sweep off the startup critical path.
+
+    The startup sweep must still happen promptly (the periodic loop sleeps a full interval before
+    its first sweep, and recover_runs deliberately excludes terminal `done`, so a crash between the
+    `done` write and the charge would otherwise leak revenue until the first periodic cycle). But it
+    must NOT block the lifespan from `yield`-ing: with a backlog of pending/failed charges and a slow
+    or down billing backend, each charge can wait the full billing timeout, turning a deploy/restart
+    into minutes of unavailability. So the lifespan schedules this as a background task and the sweep
+    runs in a thread (the charge is blocking urllib). Best-effort; cancelled cleanly at shutdown."""
+    from flash.server.billing_retry import retry_completion_charges_once
+
+    try:
+        recovered = await asyncio.to_thread(retry_completion_charges_once)
+        if recovered:
+            _log.info("recovered %d pending completion charge(s) at startup", recovered)
+    except asyncio.CancelledError:
+        raise  # shutdown during the startup sweep: let the lifespan's task.cancel() propagate
+    except Exception:
+        _log.debug("startup completion-charge sweep failed; periodic loop will retry", exc_info=True)
+
+
 async def _charge_retry_loop() -> None:
     """Background loop: periodically re-charge completed runs whose customer charge was left
     pending/charging/failed by a transient backend blip (or a crash between the ``done`` write and

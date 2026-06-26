@@ -576,11 +576,21 @@ def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
 
 def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
     """Bill a successfully completed external run without changing its training result."""
+    _charge_completed_run_by_id(spec.run_id, log)
+
+
+def _charge_completed_run_by_id(run_id: str, log) -> None:
+    """Bill a completed external run by run id, without changing its training result.
+
+    The charge reads everything it needs from the persisted ``RunStatus`` (``billing_context`` +
+    ``cost_usd`` + the raw ``spec`` dict), so a run id is the only input. The retry sweep calls this
+    directly so a legacy/stale persisted spec that ``JobSpec.from_dict`` would reject does NOT block
+    recovery of a real pending/failed charge."""
     from flash.runner import _update, get_status
     from flash.server.auth import INTERNAL_KEY_ENV
     from flash.server.billing import BillingError, charge_completed_run
 
-    status = get_status(spec.run_id)
+    status = get_status(run_id)
     if not status.billing_context or status.billing_state == "charged":
         return
 
@@ -588,8 +598,8 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
     if not internal_key:
         detail = f"{INTERNAL_KEY_ENV} is not configured; completed run was not billed"
         _update(
-            spec.run_id,
-            get_status(spec.run_id).state,
+            run_id,
+            get_status(run_id).state,
             billing_state="failed",
             billing_error=detail,
         )
@@ -597,18 +607,18 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
         return
 
     _update(
-        spec.run_id,
-        get_status(spec.run_id).state,
+        run_id,
+        get_status(run_id).state,
         billing_state="charging",
         billing_error=None,
     )
-    status = get_status(spec.run_id)
+    status = get_status(run_id)
     try:
         charge = charge_completed_run(internal_key=internal_key, status=status)
     except BillingError as exc:
         _update(
-            spec.run_id,
-            get_status(spec.run_id).state,
+            run_id,
+            get_status(run_id).state,
             billing_state="failed",
             billing_error=exc.detail,
         )
@@ -616,8 +626,8 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
         return
 
     _update(
-        spec.run_id,
-        get_status(spec.run_id).state,
+        run_id,
+        get_status(run_id).state,
         billing_state="charged",
         billing_error=None,
         billing_charge=charge,

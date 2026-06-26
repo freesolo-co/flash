@@ -74,11 +74,21 @@ def test_needs_charge_predicate():
         st(state="done", billing_context=ctx, billing_state="charged")
     )
     # never completed (failed/cancelled) -> never charged, even if billing_state is still pending
+    # (the submit-time default: the charge machine never ran, so the run never trained)
     assert not billing_retry._needs_charge(
         st(state="failed", billing_context=ctx, billing_state="pending")
     )
     assert not billing_retry._needs_charge(
         st(state="cancelled", billing_context=ctx, billing_state="pending")
+    )
+    # completed-THEN-cancelled: a run that reached `done`/`deployed` (so the charge machine ran and
+    # left `charging`/`failed`) and was later cancelled still owes its completion charge -> needs one,
+    # even though `cancelled` is not a billable state. This is the deployed-then-cancelled leak.
+    assert billing_retry._needs_charge(
+        st(state="cancelled", billing_context=ctx, billing_state="failed")
+    )
+    assert billing_retry._needs_charge(
+        st(state="cancelled", billing_context=ctx, billing_state="charging")
     )
     # internal/non-external run (no billing context) -> nothing to charge
     assert not billing_retry._needs_charge(
@@ -195,6 +205,94 @@ def test_sweep_skips_charged_failed_and_internal_runs(monkeypatch, tmp_path):
     assert billing_retry.retry_completion_charges_once() == 0
 
 
+def test_sweep_charges_completed_then_cancelled_run(monkeypatch, tmp_path):
+    """A run that completed training (its charge machine ran and left `failed`) and was LATER
+    cancelled -- e.g. a deployed run gets cancelled (deploy.py flips it to `cancelled`) -- still owes
+    its completion charge. The widened predicate keeps it eligible even though `cancelled` left
+    `_BILLABLE_STATES`, so the sweep recovers the otherwise-leaked revenue and charges it once.
+
+    A run cancelled BEFORE completing (submit-time `pending`, never charge-machine-touched) stays
+    ineligible in the same sweep -- it never trained, so it must never be charged."""
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    # completed-then-cancelled: charge machine already ran (`failed`) -> still owes a charge
+    _save_run(runner, tmp_path, state="cancelled", billing_state="failed")
+
+    calls = []
+    monkeypatch.setattr(
+        "flash.server.billing.charge_completed_run",
+        lambda *, internal_key, status: calls.append(status.run_id)
+        or {"amountCents": 123, "replay": False},
+    )
+
+    assert billing_retry.retry_completion_charges_once() == 1
+    assert calls == ["run-1"]
+    assert runner.get_status("run-1").billing_state == "charged"
+
+
+def test_sweep_never_charges_cancelled_before_completion(monkeypatch, tmp_path):
+    """Guard against over-correcting finding (1): a run cancelled BEFORE it completed carries the
+    submit-time `pending` (the charge machine never ran) and a non-billable state, so the sweep must
+    leave it alone. A run that never trained must never be charged."""
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_run(runner, tmp_path, state="cancelled", billing_state="pending")
+
+    monkeypatch.setattr(
+        "flash.server.billing.charge_completed_run",
+        lambda **_: (_ for _ in ()).throw(AssertionError("a never-completed run must not be charged")),
+    )
+    assert billing_retry.retry_completion_charges_once() == 0
+    assert runner.get_status("run-1").billing_state == "pending"
+
+
+def test_sweep_charges_run_with_stale_unparseable_spec(monkeypatch, tmp_path):
+    """A completed run whose persisted spec is legacy/stale and rejected by `JobSpec.from_dict` must
+    still be charged: the charge reads org/cost from the persisted RunStatus, not a reparsed spec, so
+    requiring a full reparse just to pass the run id would silently leak that run's revenue forever."""
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+
+    # a finished, uncharged run whose persisted spec no longer round-trips through JobSpec.from_dict.
+    # A legacy payload carrying a local `environment.path` is rejected by from_dict (local env paths
+    # are no longer supported) -- the exact "stale persisted spec" finding (3) is about.
+    stale_spec = {**SPEC, "environment": {"path": "./local/environment.py"}}
+    spec = _spec()
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="done",
+            spec=stale_spec,
+            cost_usd=1.23,
+            remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+            billing_context={"org_id": "org-A"},
+            billing_state="pending",
+        )
+    )
+
+    # belt-and-suspenders: prove this spec really would have aborted the old reparse path
+    from flash.spec import JobSpec
+
+    with pytest.raises(ValueError, match="local environment paths"):
+        JobSpec.from_dict(stale_spec)
+
+    calls = []
+    monkeypatch.setattr(
+        "flash.server.billing.charge_completed_run",
+        lambda *, internal_key, status: calls.append(status.run_id) or {"amountCents": 123},
+    )
+
+    assert billing_retry.retry_completion_charges_once() == 1
+    assert calls == ["run-1"]
+    assert runner.get_status("run-1").billing_state == "charged"
+
+
 # --------------------------------------------------------------------------- background loop
 # Same contract as the sibling reconcile loop: re-raise CancelledError (so shutdown's task.cancel()
 # stops it), swallow a real Exception and continue to the next cycle.
@@ -256,8 +354,11 @@ def _identity_for_token(token: str) -> dict[str, str]:
 def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
     """The lifespan must run the completion-charge recovery sweep at startup: a crash between the
     `done` write and the charge leaves a terminal `done` run that recover_runs cannot reach, so the
-    startup sweep is what charges it on the next boot."""
+    startup sweep is what charges it on the next boot. The sweep is scheduled as a BACKGROUND task
+    (off the critical path), so wait for it to land before asserting / leaving the context."""
     pytest.importorskip("fastapi")
+    import time
+
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
@@ -292,10 +393,72 @@ def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
 
     with TestClient(app_mod.create_app()):
-        pass  # entering the context runs the lifespan startup, which sweeps pending charges
+        # entering the context runs the lifespan startup, which SCHEDULES the recovery sweep as a
+        # background task; poll until it lands before leaving (shutdown cancels the task).
+        deadline = time.time() + 5.0
+        while runner.get_status("run-1").billing_state != "charged" and time.time() < deadline:
+            time.sleep(0.02)
 
     assert charged == ["run-1"]
     assert runner.get_status("run-1").billing_state == "charged"
+
+
+def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
+    """Finding (2): a slow/down billing backend with a backlog of pending charges must NOT delay the
+    server from accepting traffic. The startup recovery is scheduled off the critical path, so the
+    lifespan must reach `yield` (TestClient.__enter__ returns) WITHOUT waiting for the sweep -- even
+    when the sweep is blocked mid-charge."""
+    pytest.importorskip("fastapi")
+    import threading
+    import time
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setenv("HF_TOKEN", "hf-test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+
+    import flash.runner as runner
+    import flash.server.auth as auth_mod
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
+    monkeypatch.setattr(runner, "_run_job", lambda *a, **k: None)
+
+    _save_run(runner, tmp_path, billing_state="pending")
+
+    in_charge = threading.Event()  # set once the sweep is actually inside the (blocked) charge
+    release = threading.Event()  # held until the test lets the slow backend respond
+
+    def slow_charge(*, internal_key, status):
+        in_charge.set()
+        # simulate a slow/down billing backend: block until the test releases us
+        if not release.wait(timeout=10.0):
+            raise AssertionError("slow charge was never released")
+        return {"amountCents": 123}
+
+    monkeypatch.setattr("flash.server.billing.charge_completed_run", slow_charge)
+
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+
+    started = time.time()
+    with TestClient(app_mod.create_app()):
+        # __enter__ has returned -> the lifespan reached `yield` and the server accepts traffic.
+        # The startup sweep must already be mid-charge (proving it was scheduled, not skipped) while
+        # NOT having blocked __enter__ on the 10s backend.
+        elapsed = time.time() - started
+        assert elapsed < 5.0, f"startup blocked on the slow charge backlog ({elapsed:.1f}s)"
+        assert in_charge.wait(timeout=5.0), "startup sweep was not scheduled at all"
+        release.set()  # let the slow charge finish so shutdown is clean
 
 
 def test_completion_hook_failure_is_recoverable_by_sweep(monkeypatch, tmp_path):
