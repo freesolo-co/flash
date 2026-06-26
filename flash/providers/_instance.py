@@ -1,4 +1,4 @@
-"""Shared building blocks for the instance-based providers (Lambda, Hyperstack).
+"""Shared building blocks for the instance-based providers (e.g. Lambda).
 
 Both rent a single-GPU instance and bootstrap it identically: ship a cloud-init ``user_data`` that
 runs the prebuilt ``WORKER_IMAGE`` via Docker on the host, detect completion from the worker's HF
@@ -7,8 +7,8 @@ REST API (launch/list/terminate) and the capacity model; everything below — th
 sweep-matchable label, the bootstrap payload, and the cloud-init script — is identical, so it lives
 here (single source of truth, parameterized by the substrate ``arm`` and the run's image).
 
-The shipped bootstrap is the sibling ``_instance_bootstrap.py``; ``arm`` (e.g. ``lambda`` /
-``hyperstack``) travels in ``payload["flash_arm"]`` and decides FLASH_ARM + the ``<arm>_attempt<N>``
+The shipped bootstrap is the sibling ``_instance_bootstrap.py``; ``arm`` (e.g. ``lambda``)
+travels in ``payload["flash_arm"]`` and decides FLASH_ARM + the ``<arm>_attempt<N>``
 marker name.
 """
 
@@ -20,7 +20,7 @@ import io
 import json
 from pathlib import Path
 
-# Lambda/Hyperstack cap an instance/VM ``name`` at 64 chars. We keep the label at or under this so
+# Lambda caps an instance ``name`` at 64 chars. We keep the label at or under this so
 # the name is NEVER silently truncated at launch — truncation would desync the stored name from the
 # ``run_label_prefix`` the orphan-sweep matches on, which could fail to protect (or wrongly reap) a
 # live run. The seed/attempt suffix ``-s{seed}-a{attempt}`` is held to ``_SUFFIX_BUDGET`` chars (see
@@ -85,8 +85,8 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
 
 
 # The worker container path the per-region cache is bind-mounted at, and the HF cache under it. The
-# host mount differs per provider (Lambda NFS /lambda/nfs/<name>; Hyperstack block /mnt/flash-weights)
-# but the CONTAINER path is fixed, so HF_HOME is uniform regardless of substrate.
+# host mount differs per provider (e.g. Lambda NFS /lambda/nfs/<name>; a block-volume provider
+# /mnt/flash-weights) but the CONTAINER path is fixed, so HF_HOME is uniform regardless of substrate.
 CACHE_CONTAINER_MOUNT = "/weight-cache"
 CACHE_HF_HOME = f"{CACHE_CONTAINER_MOUNT}/hf-cache"
 # Sentinel file written onto a SUCCESSFULLY-mounted block-volume cache (by the cloud-init preamble),
@@ -96,7 +96,7 @@ CACHE_MOUNT_MARKER = ".flash-cache-mounted"
 
 
 def _cache_block_device_setup(payload: dict) -> str:
-    """Cloud-init preamble (block-volume providers, e.g. Hyperstack): wait for the attached volume's
+    """Cloud-init preamble (block-volume providers): wait for the attached volume's
     block device, format it ONCE if it has no filesystem (NEVER reformat a populated cache — guarded
     by ``blkid``), and mount it at the host ``cache_host_mount``. No-op for NFS providers (Lambda
     auto-mounts) and for cold runs. Best-effort: if the device never appears / mount fails, the bind
@@ -253,8 +253,8 @@ def build_payload(
     return payload
 
 
-# Host helper: best-effort upload of the consolidated boot log to HF. Neither Lambda nor Hyperstack
-# exposes an instance console/log API, so the box pushes its own boot log to HF — the only window
+# Host helper: best-effort upload of the consolidated boot log to HF. Lambda does not
+# expose an instance console/log API, so the box pushes its own boot log to HF — the only window
 # into a failure BEFORE the worker container can write its own artifacts (docker/GPU not ready,
 # image pull failure). Reads creds from the on-box payload.json. Never raises.
 #
@@ -379,8 +379,8 @@ def build_user_data(payload: dict, *, image: str) -> str:
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "_instance_bootstrap.py").read_text()
     # Weight cache: the provider mounts its region-scoped persistent storage on the HOST at
-    # ``cache_host_mount`` (Lambda auto-mounts its NFS filesystem there; Hyperstack's preamble below
-    # formats+mounts the attached block device there). Bind it into the worker container at the FIXED
+    # ``cache_host_mount`` (Lambda auto-mounts its NFS filesystem there; a block-volume provider's
+    # preamble below formats+mounts the attached block device there). Bind it into the worker container at the FIXED
     # ``/weight-cache`` so the worker's base-model prefetch (FLASH_WEIGHT_CACHE_DIR=/weight-cache/
     # hf-cache/hub, set in build_payload) persists the model download across runs in this region.
     # Absent -> no bind (cold run).

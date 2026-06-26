@@ -106,7 +106,7 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     now = time.time() if now is None else now
     remote = status.remote or {}
     # Truthiness (`or`), NOT `is not None`: this started_ts comes from a persisted provider handle
-    # whose from_dict coerces a MISSING started_ts to 0.0 (see Lambda/HyperstackJobHandle.from_dict),
+    # whose from_dict coerces a MISSING started_ts to 0.0 (see LambdaJobHandle.from_dict),
     # so 0.0 means "unknown launch", not a 1970 epoch launch. Billing the flat $/hr from 0.0 would
     # massively inflate realized cost, so fall back to created_at when started_ts is falsey/missing.
     start = float(remote.get("started_ts") or status.created_at)

@@ -262,7 +262,7 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     if not pool:
         # No RunPod key configured (e.g. an instance-only control plane): this is a best-effort
         # no-op, NOT an error — RunpodRestClient() would raise on a missing key and (under a chained
-        # `--teardown`) could abort the Lambda/Hyperstack reclaim. Mirror the instance providers'
+        # `--teardown`) could abort the Lambda reclaim. Mirror the instance providers'
         # missing-key behavior: log and return nothing reclaimed.
         logger.info("teardown: RUNPOD_API_KEY not configured — skipping RunPod cache teardown")
         return []
@@ -355,69 +355,16 @@ def teardown_lambda_filesystems(name: str | None = None) -> list[str]:
     return deleted
 
 
-def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
-    """Delete the Hyperstack cache volumes named ``name`` (default ``flash-weights``) across ALL
-    environments, reclaiming the standing block storage.
-
-    Best-effort and idempotent: a volume attached to a live VM won't delete — re-run once the run
-    finishes. Returns ``hyperstack:<env>/<name>`` per volume deleted. A missing Hyperstack key is not
-    an error — it logs and returns ``[]``.
-    """
-    from flash.providers.hyperstack import api as hs_api
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
-
-    base = name or WEIGHT_CACHE_VOLUME_NAME
-    deleted: list[str] = []
-    try:
-        vols = hs_api.list_volumes()
-    except Exception as exc:
-        logger.warning("teardown: hyperstack list_volumes failed (skipping): %s", exc)
-        return deleted
-    # Allowlist of EXACT deterministic cache-fleet names — the per-region ``flash-weights-<region>``
-    # this code provisions, PLUS the legacy bare ``flash-weights`` from before per-region naming. A
-    # broad ``startswith(base + "-")`` prefix would also nuke unrelated user volumes like
-    # ``flash-weights-backup`` / ``flash-weights-test``, so match exact names only.
-    fleet = {base}
-    try:
-        fleet |= {hs_api.cache_volume_name(base, r) for r in hs_api.cache_regions()}
-    except Exception as exc:
-        # cache_regions() failed (API down / auth) — we genuinely cannot enumerate the canonical
-        # region set, so we CANNOT distinguish a fleet volume ``flash-weights-us-1`` from a user volume
-        # ``flash-weights-backup-1`` / ``flash-weights-test-1`` (both are region-shaped). FAVOR DATA
-        # SAFETY: do NOT guess-delete per-region volumes by pattern — a missed cache volume is just
-        # recoverable leftover billing, but deleting a user's volume is unrecoverable data loss. Delete
-        # ONLY the unambiguous legacy bare ``base`` name, and warn LOUDLY that the per-region cache
-        # volumes could not be enumerated and were LEFT INTACT (re-run once regions are reachable, or
-        # clean them manually). This still satisfies "failure is loud/observable, never silently
-        # narrowed" without the over-broad deletion.
-        logger.warning(
-            "teardown: hyperstack cache_regions failed (%s) — could NOT enumerate per-region cache "
-            "volumes; deleting only the legacy bare %r and LEAVING any per-region "
-            "flash-weights-<region> volumes INTACT (re-run teardown once regions are reachable, or "
-            "delete them manually). Refusing to pattern-match region-shaped names to avoid deleting "
-            "unrelated user volumes.",
-            exc, base,
-        )
-    for v in vols:
-        vname = v.get("name") or ""
-        if vname in fleet and v.get("id") and hs_api.delete_volume(v["id"]):
-            env = (v.get("environment") or {}).get("name") or "?"
-            deleted.append(f"hyperstack:{env}/{vname}")
-    return deleted
-
-
-# Instance-provider WARM (Lambda + Hyperstack). RunPod warms via the serverless preload above; the
+# Instance-provider WARM (Lambda). RunPod warms via the serverless preload above; the
 # instance providers have no serverless API, so a warm is a real (cheap, short) GPU launch in download
 # -only mode: the bootstrap pulls the catalog into the mounted cache and exits (no worker). The box
 # self-reports completion by uploading ``preload_result.json`` to a shared status repo, which the
 # driver polls; the instance is ALWAYS terminated in a finally. Cheap class by default (the work is a
 # download, not compute) — override with FLASH_PRELOAD_INSTANCE_GPU.
-# Per-provider default warm GPU: a cheap class that the provider actually offers. A10 is LAMBDA-ONLY
-# (no hyperstack_name), so using it for Hyperstack makes usable_instances("A10") empty/raise and
-# Hyperstack is silently never warmed — pick L40 (a cheap Hyperstack datacenter card) there. An
-# explicit --gpu / FLASH_PRELOAD_INSTANCE_GPU overrides BOTH.
+# Per-provider default warm GPU: a cheap class that the provider actually offers. An explicit
+# --gpu / FLASH_PRELOAD_INSTANCE_GPU overrides it.
 _PRELOAD_INSTANCE_GPU = os.environ.get("FLASH_PRELOAD_INSTANCE_GPU") or "A10"
-_PRELOAD_GPU_BY_PROVIDER = {"lambda": "A10", "hyperstack": "L40"}
+_PRELOAD_GPU_BY_PROVIDER = {"lambda": "A10"}
 # Shared dataset repo the preload boxes upload their status marker to (the driver polls it). The
 # warmed WEIGHTS go to the per-region cache volume, NOT here — this holds only tiny status JSON.
 _PRELOAD_STATUS_REPO = os.environ.get("FLASH_PRELOAD_STATUS_REPO") or "Freesolo-Co/flash-weight-preload"
@@ -540,7 +487,7 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
 def warm_instances(models: list | None = None, gpu: str | None = None,
                    providers: list | None = None, timeout_s: int = 1800,
                    poll_interval_s: float = 20.0, max_workers: int = 4) -> list[dict]:
-    """WARM the Lambda + Hyperstack caches: one download-only launch per region that currently has
+    """WARM the Lambda caches: one download-only launch per region that currently has
     capacity (regions with no capacity now are skipped — warm-on-first-run covers them). Each launch
     is pinned to its region, polled to completion, and terminated. Best-effort: a provider with no key
     / no capacity contributes nothing. Returns a status dict per region attempted.
@@ -551,23 +498,20 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     HF download deps (huggingface_hub + hf_transfer), which the worker image already carries.
     """
     models = models or catalog_model_ids()
-    providers = providers or ["lambda", "hyperstack"]
+    providers = providers or ["lambda"]
     token = os.environ.get("HF_TOKEN")
 
-    from flash.providers.hyperstack import api as hs_api
-    from flash.providers.hyperstack import jobs as hs_jobs
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
-    mods = {"lambda": lambda_jobs, "hyperstack": hs_jobs}
-    # Per-provider "can this region host the cache?" predicate. Skipping a cache-incapable region (e.g.
-    # Hyperstack CANADA-2, excluded from cache_regions()) BEFORE launching avoids burning a paid GPU
-    # whose preload just reports "weight cache not supported in region" — which main() then counts as a
-    # failed warm, so the default --warm-instances would fail even when every cache-capable region
-    # succeeded. Lambda exposes no such filter (every region hosts filesystems), so it stays unfiltered.
-    region_ok = {"hyperstack": hs_api.region_supports_cache}
-    # One launch per region (dedupe so two candidates in a region don't double-launch — block volumes
-    # are single-attach anyway). Each entry carries its provider's resolved GPU (an explicit override
-    # applies to all; otherwise the per-provider default — so A10 doesn't silently skip Hyperstack).
+    mods = {"lambda": lambda_jobs}
+    # Per-provider "can this region host the cache?" predicate. A cache-incapable region is skipped
+    # BEFORE launching to avoid burning a paid GPU whose preload just reports "weight cache not
+    # supported in region" — which main() then counts as a failed warm. Lambda exposes no such filter
+    # (every region hosts filesystems), so it stays unfiltered.
+    region_ok: dict = {}
+    # One launch per region (dedupe so two candidates in a region don't double-launch). Each entry
+    # carries its provider's resolved GPU (an explicit override applies to all; otherwise the
+    # per-provider default).
     targets: list = []
     for provider in providers:
         jobs_mod = mods.get(provider)
@@ -593,7 +537,7 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             seen_regions.add(c.region)
             targets.append((provider, jobs_mod, c, provider_gpu))
     if not targets:
-        logger.warning("warm: no Lambda/Hyperstack capacity right now (nothing to warm)")
+        logger.warning("warm: no Lambda capacity right now (nothing to warm)")
         return []
     # Fail fast BEFORE launching any paid GPU: the status repo is the only completion signal, so if it
     # can't be created/accessed (missing/invalid HF_TOKEN) every box would just run to timeout warming
@@ -649,58 +593,13 @@ def provision_lambda_filesystems(name: str | None = None) -> list[str]:
     return done
 
 
-def provision_hyperstack_volumes(name: str | None = None, size_gb: int | None = None) -> list[str]:
-    """Eagerly create the ``flash-weights`` block volume in EVERY Hyperstack environment
-    (create-if-absent), so the cache storage exists before any run lands — pure control-plane API, no
-    GPU.
-
-    Idempotent (``ensure_volume`` reuses an existing same-name volume in the env). Returns
-    ``hyperstack:<env>`` per environment provisioned. A missing Hyperstack key is not an error; a
-    per-environment failure is logged and skipped.
-    """
-    from flash.providers.hyperstack import api as hs_api
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
-
-    base = name or WEIGHT_CACHE_VOLUME_NAME
-    gb = int(size_gb or WEIGHT_CACHE_VOLUME_GB)
-    done: list[str] = []
-    try:
-        # cache_regions() drops volume-incapable regions (e.g. CANADA-2) so we don't burn a
-        # guaranteed-400 create on a region that can't host the cache anyway.
-        regions = hs_api.cache_regions()
-    except Exception as exc:
-        logger.warning("provision: hyperstack cache_regions failed (skipping): %s", exc)
-        return done
-    # One PER-REGION volume (Hyperstack names are globally unique — see cache_volume_name), created in
-    # that region's default environment.
-    for region in regions:
-        try:
-            env = hs_api.environment_for_region(region)
-            vol_name = hs_api.cache_volume_name(base, region)
-            vol_id = hs_api.ensure_volume(vol_name, env, gb)
-            # ensure_volume returns the volume id; a falsy id means create-or-confirm did NOT yield a
-            # real volume (e.g. the API responded without an id). Don't record that region as
-            # provisioned — otherwise --provision reports success and the launch path treats a
-            # never-created region as warm.
-            if not vol_id:
-                logger.warning("provision: hyperstack ensure_volume(%s, %s) returned no id — region not "
-                               "provisioned", vol_name, region)
-                continue
-            done.append(f"hyperstack:{region}")
-        except Exception as exc:
-            logger.warning("provision: hyperstack ensure_volume(%s, %s) failed: %s", base, region, exc)
-    return done
-
-
 def provision_all() -> list[str]:
     """Eagerly create the cache storage on every instance provider, in every region/environment
     (pure control-plane API, no GPU). RunPod's per-DC network volumes are NOT provisioned here: they
     are create-or-attached automatically by the eager endpoint deploy (jobs.weight_cache_volumes
     covers every storage DC) and warmed by ``warm_weight_cache`` — there is no GPU-free RunPod
     volume-create in the SDK. Returns ``provider:<region/env>`` per storage created/confirmed."""
-    provisioned = provision_lambda_filesystems()
-    provisioned += provision_hyperstack_volumes()
-    return provisioned
+    return provision_lambda_filesystems()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -724,20 +623,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="print the plan, provision nothing")
     ap.add_argument(
         "--provision", action="store_true",
-        help="CREATE the Lambda/Hyperstack cache storage in every region/env (pure API, no GPU) and "
+        help="CREATE the Lambda cache storage in every region (pure API, no GPU) and "
              "exit; RunPod volumes are auto-created by the eager deploy/warm. Run before --teardown's "
              "inverse to set up all storage up front.",
     )
     ap.add_argument(
         "--warm-instances", action="store_true",
-        help="WARM the Lambda + Hyperstack caches: one download-only GPU launch per region with "
+        help="WARM the Lambda caches: one download-only GPU launch per region with "
              "capacity now (needs the merged worker image carrying the bootstrap preload branch).",
     )
     ap.add_argument(
         "--teardown", action="store_true",
         help="DELETE the weight-cache storage on every provider (reclaim standing storage) and exit. "
-             "With --datacenters it is SCOPED to that RunPod-DC subset only (Lambda/Hyperstack caches "
-             "are left intact, since DC ids don't map to their region/env namespace).",
+             "With --datacenters it is SCOPED to that RunPod-DC subset only (Lambda caches "
+             "are left intact, since DC ids don't map to their region namespace).",
     )
     args = ap.parse_args(argv)
 
@@ -806,27 +705,27 @@ def main(argv: list[str] | None = None) -> int:
         # Eagerly create the instance-provider cache storage in every region/env (GPU-free). RunPod's
         # per-DC fleet materializes on the next eager endpoint deploy / warm, so it's not created here.
         if args.dry_run:
-            print("would provision Lambda filesystems + Hyperstack volumes in every region/env")
+            print("would provision Lambda filesystems in every region")
             return 0
         provisioned = provision_all()
         print(f"provisioned {len(provisioned)} instance-provider cache store(s): "
-              f"{', '.join(provisioned) or '(none — no Lambda/Hyperstack key, or no regions)'}")
+              f"{', '.join(provisioned) or '(none — no Lambda key, or no regions)'}")
         return 0
     if args.warm_instances:
         if args.dry_run:
-            print("would warm Lambda + Hyperstack caches (one download-only launch per region with capacity)")
+            print("would warm Lambda caches (one download-only launch per region with capacity)")
             return 0
         # gpu=None lets warm_instances apply its own per-mode default (_PRELOAD_INSTANCE_GPU). Passing
         # args.gpu directly (no sentinel comparison) means an explicit --gpu, even RTX 4090, overrides.
         results = warm_instances(models=models, gpu=args.gpu,
                                  timeout_s=args.timeout_s, max_workers=args.max_workers)
         if not results:
-            # NOT the same as "warmed everything": zero launch targets means no Lambda/Hyperstack
+            # NOT the same as "warmed everything": zero launch targets means no Lambda
             # region had capacity to warm right now (or every candidate region is cache-incapable —
             # each such skip is logged above). This is a best-effort no-op, not a failure: those
             # regions' weights simply download cold on first run. Make it explicit so "0/0" isn't read
             # as success. (See the per-region "skipping cache-incapable region" / "no capacity" logs.)
-            print("0 regions warmed — no Lambda/Hyperstack region had capacity to warm right now "
+            print("0 regions warmed — no Lambda region had capacity to warm right now "
                   "(weights download cold on first run). Nothing launched.")
             return 0
         failed = [r for r in results if r.get("status") not in ("ok",)]
@@ -858,10 +757,10 @@ def main(argv: list[str] | None = None) -> int:
             scope_desc = (f"{len(parsed_dcs)} datacenter(s): {', '.join(parsed_dcs)}"
                           if scoped else "every RunPod storage datacenter")
             print(f"would delete the RunPod weight-cache volumes in {scope_desc}"
-                  + ("" if scoped else " + every Lambda filesystem + Hyperstack volume named flash-weights"))
+                  + ("" if scoped else " + every Lambda filesystem named flash-weights"))
             return 0
-        # Reclaim the cache storage on EVERY provider: RunPod network volumes, Lambda filesystems,
-        # and Hyperstack block volumes. Each provider is guarded INDEPENDENTLY so one provider's
+        # Reclaim the cache storage on EVERY provider: RunPod network volumes and Lambda filesystems.
+        # Each provider is guarded INDEPENDENTLY so one provider's
         # failure (e.g. RunPod auth absent/broken on an instance-only control plane, or a RunPod
         # outage) never aborts the others' best-effort cleanup — otherwise their billed caches would
         # leak behind a single RunPod error. A provider with no configured key is already a no-op.
@@ -874,20 +773,16 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             logger.warning("teardown: RunPod cache teardown failed (continuing): %s", exc)
         # `--datacenters` is a RunPod-DC subset and has no meaning for the instance providers (Lambda
-        # regions / Hyperstack envs are a different namespace), so a SCOPED teardown stays RunPod-only
-        # rather than unexpectedly deleting every Lambda/Hyperstack `flash-weights` cache too. Only a
+        # regions are a different namespace), so a SCOPED teardown stays RunPod-only
+        # rather than unexpectedly deleting every Lambda `flash-weights` cache too. Only a
         # FULL teardown (no --datacenters) reclaims the instance-provider caches.
         if not scoped:
             try:
                 deleted += teardown_lambda_filesystems()
             except Exception as exc:
                 logger.warning("teardown: Lambda cache teardown failed (continuing): %s", exc)
-            try:
-                deleted += teardown_hyperstack_volumes()
-            except Exception as exc:
-                logger.warning("teardown: Hyperstack cache teardown failed (continuing): %s", exc)
         else:
-            print("scoped teardown (--datacenters): RunPod-only; Lambda/Hyperstack caches left intact")
+            print("scoped teardown (--datacenters): RunPod-only; Lambda caches left intact")
         print(f"deleted {len(deleted)} weight-cache volume(s): {', '.join(deleted) or '(none)'}")
         return 0
     # Default mode = warm the RunPod serverless fleet. This is the ONE path that genuinely needs the
