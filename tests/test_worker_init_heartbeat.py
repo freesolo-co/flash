@@ -155,6 +155,18 @@ def test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges(monkeypatch):
     assert time.time() - t0 < 5, "exit must be bounded by join_timeout, not wait on a wedged emit"
 
 
+def test_liveness_heartbeat_default_join_covers_the_upload_lock_wait():
+    """The DEFAULT join_timeout is at least the upload-lock timeout, so the common 'daemon waiting for
+    the upload lock' case completes within the join instead of leaking a stale old-stage HF commit
+    after the context exits and a newer stage was emitted (which would regress the published stage)."""
+    import importlib
+    import inspect
+
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    default = inspect.signature(hb.liveness_heartbeat).parameters["join_timeout"].default
+    assert default >= hb._HB_UPLOAD_LOCK_TIMEOUT_S
+
+
 def test_liveness_heartbeat_quiet_gate_skips_when_channel_fresh(monkeypatch):
     hb, w, _ = _liveness_env(monkeypatch)
     emitted: list = []

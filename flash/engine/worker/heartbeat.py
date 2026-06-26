@@ -275,7 +275,7 @@ def liveness_heartbeat(
     max_duration_s=None,
     quiet_gate_s=None,
     fields=None,
-    join_timeout=10.0,
+    join_timeout=_HB_UPLOAD_LOCK_TIMEOUT_S,
 ):
     """Keep a ``stage`` heartbeat alive while the wrapped block runs on the main thread.
 
@@ -292,7 +292,11 @@ def liveness_heartbeat(
 
     Diagnostics are nvidia-smi-only (``include_torch=False``): the main thread owns the CUDA/allocator
     locks during these phases, so a side-thread ``torch.cuda`` query could block. The daemon is reaped
-    with a BOUNDED join so it can never wedge the worker if stuck inside an HF upload.
+    with a BOUNDED join so it can never wedge the worker if stuck inside an HF upload. The default
+    ``join_timeout`` is ``_HB_UPLOAD_LOCK_TIMEOUT_S`` so the COMMON "daemon is waiting for the upload
+    lock" case completes within the join — otherwise its in-flight commit for THIS (old) stage could
+    land after the context exits and a newer stage was emitted, regressing the published stage on HF.
+    Callers that need a tighter bound can still pass a smaller ``join_timeout``.
     """
     done = threading.Event()
 
