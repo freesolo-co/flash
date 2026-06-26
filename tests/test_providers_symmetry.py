@@ -75,10 +75,10 @@ def test_method_signatures_match_runpod(provider):
         assert rs == os_, f"{meth} param mismatch: runpod={rs} {provider}={os_}"
 
 
-@pytest.mark.parametrize("provider", ["runpod", "lambda", "hyperstack"])
+@pytest.mark.parametrize("provider", ["runpod", "lambda"])
 def test_setup_heartbeat_stages_are_the_one_canonical_set(provider):
-    """All three poll loops must draw the setup-vs-training stall boundary from the SAME canonical
-    SETUP_HEARTBEAT_STAGES in _poll (so a stage added in one place can't drift the others). It must
+    """Both poll loops (runpod, lambda) must draw the setup-vs-training stall boundary from the SAME
+    canonical SETUP_HEARTBEAT_STAGES in _poll (so a stage added in one place can't drift the others). It must
     treat the cold-start pings — including model_prefetching / *_initializing — as SETUP (else the
     poller latches into the tight training stall the moment one lands and false-kills a healthy run
     whose silent dataset tokenization outlives it), while the per-step rl_step/sft_step are NOT
