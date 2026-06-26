@@ -112,6 +112,7 @@ def _init_adapter_model(model_id: str):
     stays correct without any serving changes."""
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     if not prefix:
+        _w.WARMSTART_MERGED = False  # from-base: per-step adapters ARE catalog-base-deployable
         return model_id, make_lora(model_id)
     adir = _download_adapter(prefix)
     if not adir:
@@ -178,6 +179,10 @@ def _init_adapter_model(model_id: str):
     # finalize (combine_warmstart_into_adapter).
     merged = model.merge_and_unload()
     merged_dir = _save_merged_base(merged, model_id)
+    # GRPO now trains on a base with SFT MERGED in -> per-step adapter snapshots are GRPO-only deltas,
+    # not deployable on the catalog base. Flag it so publish_deployable_checkpoint stops advertising
+    # intermediate steps as deployable (only the recombined FINAL adapter is catalog-base-correct).
+    _w.WARMSTART_MERGED = True
     # Drop the CPU-resident copies promptly — TRL reloads merged_dir straight onto the GPU.
     del model, base, merged
     return merged_dir, make_lora(model_id)
@@ -217,9 +222,11 @@ def combine_warmstart_into_adapter(model_id: str, grpo_adapter_dir: str) -> bool
     existing deploy/serve path (catalog base + the run's one adapter) stays correct with no serving
     change. Returns False (no-op) for a from-base run.
 
-    Note: the per-step deployable checkpoints (``checkpoints/step-N/adapter``) are NOT recombined —
-    a mid-RL ``flash deploy --step N`` of a warm-started run still serves the GRPO-only adapter
-    (missing the SFT). Only the run's FINAL adapter is made deploy-correct here."""
+    Note: warm-start runs do NOT advertise per-step deployable checkpoints at all — those snapshots
+    are GRPO-only deltas on the merged base, so ``publish_deployable_checkpoint`` skips them while
+    ``WARMSTART_MERGED`` is set (a mid-RL / cancelled ``flash deploy --step N`` would otherwise serve
+    SFT-less weights). Only the run's FINAL adapter is recombined here into a catalog-base-correct,
+    deployable adapter."""
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     if not prefix:
         return False

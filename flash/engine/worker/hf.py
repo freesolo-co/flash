@@ -233,6 +233,16 @@ def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
     """
     if not _w.HF_REPO:
         return None
+    # Warm-start GRPO trains a fresh LoRA on a base with the SFT adapter MERGED in, so a per-step
+    # adapter snapshot is a GRPO-ONLY delta — served on the catalog base (what ``flash deploy --step N``
+    # does) it would silently MISS the SFT. Only the run's FINAL adapter is recombined
+    # (``combine_warmstart_into_adapter``) into a catalog-base-correct adapter, so do NOT advertise
+    # intermediate steps as deployable for warm-start runs. (Resume checkpoints — ``checkpoint/**`` full
+    # state — are written by the trainer and untouched here; only the deployable per-step snapshot is
+    # suppressed. A warm-start run thus becomes deployable only once finalized, never mid-run / on a
+    # cancel with SFT-less weights.)
+    if getattr(_w, "WARMSTART_MERGED", False):
+        return None
     # Only publish a checkpoint that actually carries a loadable adapter — never advertise a
     # non-deployable step.
     if not _has_deployable_adapter(ckpt_dir):

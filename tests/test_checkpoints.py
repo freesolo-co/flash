@@ -120,6 +120,29 @@ def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
     assert rec.uploads == []
 
 
+def test_publish_deployable_checkpoint_skipped_for_warmstart(tmp_path, monkeypatch):
+    """A warm-start GRPO run trains on a base with the SFT MERGED in, so a per-step adapter is a
+    GRPO-only delta — deploying it on the catalog base would silently miss the SFT. While
+    WARMSTART_MERGED is set, the per-step deployable snapshot must NOT be advertised (only the
+    recombined FINAL adapter is catalog-base-correct)."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    ckpt = tmp_path / "checkpoint-40"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")  # a fully loadable adapter
+
+    monkeypatch.setattr(worker, "WARMSTART_MERGED", True)
+    assert worker.publish_deployable_checkpoint(str(ckpt), 40) is None  # suppressed for warm-start
+    assert rec.uploads == []
+    # ...and a from-base run (flag cleared) still publishes the same loadable adapter.
+    monkeypatch.setattr(worker, "WARMSTART_MERGED", False)
+    assert worker.publish_deployable_checkpoint(str(ckpt), 40) is not None
+    assert len(rec.uploads) == 1
+
+
 # --------------------------------------------------------------------------------------------
 # Worker: make_checkpoint_upload_callback — durable flush of the final deployable checkpoint
 # --------------------------------------------------------------------------------------------

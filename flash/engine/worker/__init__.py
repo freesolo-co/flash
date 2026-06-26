@@ -182,6 +182,12 @@ RUN_ID = os.environ.get("RUN_ID", "local")
 SEED = int(os.environ.get("SEED", "0"))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = os.environ.get("ATTEMPT", "")
+# True once a warm-start GRPO run has MERGED its SFT adapter into the base (``_init_adapter_model``).
+# While set, the trainer trains a GRPO-only LoRA on that merged base, so a per-step adapter snapshot
+# is a GRPO-only delta — NOT deployable on the catalog base. ``publish_deployable_checkpoint`` reads
+# this to skip advertising intermediate warm-start steps (only the recombined FINAL adapter is
+# catalog-base-correct). Reset by ``_init_adapter_model`` on the from-base path.
+WARMSTART_MERGED = False
 JOB_SPEC = load_job_spec_from_env()
 # PHASE is the stable artifact namespace (sft|rl) and matches RUN_MODE for a train run.
 PHASE = os.environ.get(
