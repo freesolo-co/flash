@@ -185,6 +185,23 @@ def test_select_candidate_single_provider_walks_classes():
     assert _select_candidate(cands, {"runpod"}, {("runpod", "L4")}).gpu == "RTX A6000"
 
 
+def test_select_candidate_single_fitting_gpu_never_breaks():
+    """A large model with exactly ONE fitting class (e.g. only H200 fits a 35B run) must keep
+    re-picking THAT class on every infra retry — the candidate list only ever holds *fitting*
+    classes, so the walk can never escape to a card too small to hold the model, and the picker
+    must still return it (not None / not raise) even after it's been tried and its provider burned."""
+    from flash.providers.base import Candidate
+    from flash.runner.lifecycle import _select_candidate
+
+    only = Candidate("runpod", "H200", 4.0, 141)
+    cands = (only,)
+    # Attempt 0: the single class.
+    assert _select_candidate(cands, set(), set()) is only
+    # After it failed infra-shaped (provider burned, class tried), the next retry re-picks the SAME
+    # class — there is nowhere else to walk, and the picker must not break.
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "H200")}) is only
+
+
 def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     """Issue 7: a RunPod queue / no-capacity failure must retry on a DIFFERENT provider
     (Hyperstack) rather than walking to the next RunPod class while Hyperstack sits available."""
