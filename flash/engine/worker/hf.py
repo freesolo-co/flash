@@ -220,6 +220,21 @@ def _has_deployable_adapter(ckpt_dir: str) -> bool:
     )
 
 
+def _warmstart_suppresses_deployable() -> bool:
+    """Whether per-step deployable snapshots are suppressed because this is a warm-start GRPO run.
+
+    Warm-start trains a fresh LoRA on a base with the SFT adapter MERGED in, so a per-step adapter
+    snapshot is a GRPO-ONLY delta — served on the catalog base (what ``flash deploy --step N`` does)
+    it would silently MISS the SFT. Only the run's FINAL adapter is recombined
+    (``combine_warmstart_into_adapter``) into a catalog-base-correct adapter, so intermediate steps
+    are never advertised as deployable. (Resume checkpoints — ``checkpoint/**`` full state — are
+    written by the trainer and untouched; only the deployable per-step snapshot is suppressed. A
+    warm-start run thus becomes deployable only once finalized, never mid-run / on a cancel with
+    SFT-less weights.)
+    """
+    return bool(getattr(_w, "WARMSTART_MERGED", False))
+
+
 def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
     """Mirror a trainer checkpoint's LoRA adapter to a stable, NON-pruned per-step path so a
     run cancelled mid-RL is still one-command-deployable from its last good step.
@@ -233,15 +248,7 @@ def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
     """
     if not _w.HF_REPO:
         return None
-    # Warm-start GRPO trains a fresh LoRA on a base with the SFT adapter MERGED in, so a per-step
-    # adapter snapshot is a GRPO-ONLY delta — served on the catalog base (what ``flash deploy --step N``
-    # does) it would silently MISS the SFT. Only the run's FINAL adapter is recombined
-    # (``combine_warmstart_into_adapter``) into a catalog-base-correct adapter, so do NOT advertise
-    # intermediate steps as deployable for warm-start runs. (Resume checkpoints — ``checkpoint/**`` full
-    # state — are written by the trainer and untouched here; only the deployable per-step snapshot is
-    # suppressed. A warm-start run thus becomes deployable only once finalized, never mid-run / on a
-    # cancel with SFT-less weights.)
-    if getattr(_w, "WARMSTART_MERGED", False):
+    if _warmstart_suppresses_deployable():
         return None
     # Only publish a checkpoint that actually carries a loadable adapter — never advertise a
     # non-deployable step.
@@ -281,11 +288,12 @@ _CKPT_FLUSH_BACKOFF_S = 1.0
 def _publish_deployable_with_retry(ckpt_dir: str, step: int) -> None:
     """Best-effort publish of the final deployable when the flush couldn't hold the upload lock.
 
-    Gated on the adapter actually being present so the retry is provably non-futile:
-    ``publish_deployable_checkpoint`` returns ``None`` for BOTH "no adapter" and "upload failed", so
-    after this precheck a ``None`` can only mean a real (likely transient-409) failure worth a retry —
-    an empty step returns immediately with no wasted sleeps."""
-    if not _has_deployable_adapter(ckpt_dir):
+    Gated on the adapter actually being present (and on this not being a warm-start run, whose
+    per-step snapshots are intentionally suppressed) so the retry is provably non-futile:
+    ``publish_deployable_checkpoint`` returns ``None`` for "no adapter", "warm-start suppressed" AND
+    "upload failed", so after these prechecks a ``None`` can only mean a real (likely transient-409)
+    failure worth a retry — a suppressed or empty step returns immediately with no wasted sleeps."""
+    if _warmstart_suppresses_deployable() or not _has_deployable_adapter(ckpt_dir):
         return
     for attempt in range(_CKPT_FLUSH_RETRIES):
         if publish_deployable_checkpoint(ckpt_dir, step) is not None:

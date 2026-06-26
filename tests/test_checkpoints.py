@@ -143,6 +143,31 @@ def test_publish_deployable_checkpoint_skipped_for_warmstart(tmp_path, monkeypat
     assert len(rec.uploads) == 1
 
 
+def test_publish_deployable_with_retry_noops_for_warmstart(tmp_path, monkeypatch):
+    """The final-flush retry prechecks the adapter on disk, but a warm-start run HAS a loadable
+    (GRPO-only) adapter there — without an explicit warm-start gate it would call the suppressed
+    publish 3x, sleep on each ``None``, and log a false 'could not publish' failure. It must instead
+    return immediately: no uploads, no backoff sleeps."""
+    from types import SimpleNamespace
+
+    from flash.engine.worker import hf as worker_hf
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    ckpt = tmp_path / "checkpoint-40"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")  # a fully loadable adapter
+
+    sleeps: list = []
+    monkeypatch.setattr(worker_hf, "time", SimpleNamespace(sleep=lambda s: sleeps.append(s)))
+    monkeypatch.setattr(worker, "WARMSTART_MERGED", True)
+
+    worker_hf._publish_deployable_with_retry(str(ckpt), 40)
+    assert rec.uploads == []  # suppressed — nothing advertised
+    assert sleeps == []  # and no pointless backoff on the intentional None
+
+
 # --------------------------------------------------------------------------------------------
 # Worker: make_checkpoint_upload_callback — durable flush of the final deployable checkpoint
 # --------------------------------------------------------------------------------------------
