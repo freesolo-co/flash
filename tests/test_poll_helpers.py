@@ -50,3 +50,46 @@ def test_heartbeat_progress_no_ts_is_not_fresh():
         ts, fresh = heartbeat_progress_ts(bad, launch)
         assert fresh is False
         assert abs(ts - now) < 2
+
+
+def test_heartbeat_progress_rejects_other_attempt_even_when_ts_is_fresh():
+    # The seed heartbeat path is shared across attempts: a prior attempt's worker still shutting down
+    # can upload a heartbeat with ts > this attempt's launch. By ts alone it looks fresh, but it
+    # belongs to a DIFFERENT attempt, so it must NOT satisfy this attempt's first-liveness. The worker
+    # stamps attempt as a STRING (env var), the poller passes an int -> compare coerced to int.
+    now = time.time()
+    launch = now - 100
+    # worker-stamped string attempt "0"; we are polling attempt=1 -> not fresh despite a post-launch ts
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "0"), launch, current_attempt=1)
+    assert fresh is False
+    # int attempts mismatch likewise
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, 0), launch, current_attempt=1)
+    assert fresh is False
+
+
+def test_heartbeat_progress_same_attempt_string_vs_int_is_fresh():
+    # Regression (Cursor HIGH): the worker stamps ``attempt`` as a string ("0") while the poller
+    # passes an int (0). A naive `!=` would reject EVERY live heartbeat ("0" != 0) and spuriously
+    # stall healthy workers. Coercing both to int makes the SAME attempt match across types.
+    now = time.time()
+    launch = now - 100
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "0"), launch, current_attempt=0)
+    assert fresh is True
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "2"), launch, current_attempt=2)
+    assert fresh is True
+
+
+def test_heartbeat_progress_attempt_check_is_backcompat_when_unstamped():
+    # An empty/absent attempt can't be dated, so the ts-based decision stands (back-compat). The
+    # worker's default ATTEMPT is "" (env var unset), which must NOT be read as a mismatch.
+    now = time.time()
+    launch = now - 100
+    for attempt_field in ("", None):  # empty-string default and explicit None
+        _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, attempt_field), launch, current_attempt=1)
+        assert fresh is True
+    # 3-tuple key (no attempt element at all) -> fresh
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10), launch, current_attempt=1)
+    assert fresh is True
+    # and with no current_attempt supplied, attempt is ignored entirely
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "0"), launch)
+    assert fresh is True

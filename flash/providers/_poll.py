@@ -52,6 +52,41 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
     return float(m.group(1)) + grace_s < now
 
 
+# First-liveness deadline for the instance providers (Lambda / Hyperstack). Once an instance reaches
+# OS-level ``active`` a healthy box that actually ran cloud-init pushes its ``<arm>_attempt<N>_boot.log``
+# to HF within ~2 min (the uploader starts BEFORE the image pull) and a live worker soon heartbeats.
+# So if a box is active for this long with NO attempt-scoped boot.log AND no fresh heartbeat, cloud-
+# init/the worker never started (a sick region / wedged host) — fail it over FAST (retriable
+# ``stalled`` that the runner escapes cross-provider) instead of burning the full ``SETUP_GRACE_S``
+# (~50 min). (The predicate is boot.log + heartbeat only; an ok/error attempt marker, if one exists,
+# is acted on earlier in the poll loop and never reaches this fast-fail.) Generous over the ~2 min
+# boot.log-appears time to absorb HF
+# upload/propagation lag and a slow host huggingface_hub install; the boot.log presence — not this
+# raw timer — is what protects a healthy-but-slow (large-image-pull) box from a false failover.
+# Applied uniformly per GPU (the instance providers ignore ``on_last_gpu`` in the submit/poll paths).
+FIRST_LIVENESS_S = 900.0
+
+# Minimum OBSERVED-active time (wall-clock since THIS poll session first saw the box ``active``) before
+# the fast-failover may fire. ``active_since`` is launch-anchored, so on a reattach whose very first
+# read is already ``active`` it can already exceed ``FIRST_LIVENESS_S`` even though the box only just
+# came up moments before the supervisor reattached (control plane was down through a long provision).
+# Gating ALSO on observed-active time hands such a genuinely-fresh box the documented ~2 min boot.log
+# window instead of failing it on the first reattach tick. Kept short (not a full ``FIRST_LIVENESS_S``)
+# so a box that has truly been silent since before the restart still fails over promptly — it gets at
+# most this floor of extra grace, never a fresh launch-length window.
+FIRST_LIVENESS_OBSERVED_FLOOR_S = 120.0
+
+# Consecutive forced boot.log reads that must come back absent before the first-liveness check
+# declares a region sick. ``make_hf_text_reader`` returns ``None`` for ANY read failure — a genuinely
+# missing artifact OR a momentary HF/Hub network hiccup — so a single ``None`` at the deadline can't
+# be trusted to mean "cloud-init never ran". A transient error clears within a poll interval, while a
+# box whose worker never started stays absent indefinitely; requiring the absence to PERSIST across
+# this many polls (each ~``interval_s`` apart) distinguishes the two and keeps a Hub blip from
+# spuriously failing a healthy box over to another provider. The added failover latency is a few poll
+# intervals on top of the ~15 min ``FIRST_LIVENESS_S`` — negligible.
+BOOT_LOG_ABSENT_POLLS = 3
+
+
 def make_say(log) -> Callable[[str], None]:
     """A timestamped line logger that no-ops when ``log`` is None."""
 
@@ -240,10 +275,14 @@ def surface_heartbeat(
 ) -> tuple[tuple | None, str | None]:
     """Read a heartbeat and, if it advanced, log worker progress.
 
-    Returns ``(hb_key, stage)`` where ``hb_key`` is the new (stage, step, ts) key (or the
+    Returns ``(hb_key, stage)`` where ``hb_key`` is the new (stage, step, ts, attempt) key (or the
     unchanged ``last_hb_key`` when nothing advanced) and ``stage`` is the stage of the new
     heartbeat when it advanced (else None). Callers use the returned ``stage`` for their
     own setup-vs-training stall bookkeeping.
+
+    ``attempt`` (the worker-stamped attempt number) is part of the key because the seed heartbeat
+    path is shared across attempts: ``heartbeat_progress_ts`` reads it to reject a prior attempt's
+    late heartbeat that would otherwise satisfy THIS attempt's first-liveness by timestamp alone.
     """
     if heartbeat_reader is None:
         return last_hb_key, None
@@ -253,7 +292,7 @@ def surface_heartbeat(
         hb = None
     if not hb:
         return last_hb_key, None
-    key = (hb.get("stage"), hb.get("step"), hb.get("ts"))
+    key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
     if key == last_hb_key:
         return last_hb_key, None
     _record_heartbeat(hb)
@@ -262,7 +301,18 @@ def surface_heartbeat(
     return key, stage
 
 
-def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tuple[float, bool]:
+def _attempt_int(value: Any) -> int | None:
+    """Coerce an attempt number (worker stamps it as a str env var, default ""; poller passes an int)
+    to int, or None when empty/absent/unparseable (can't be used to date a heartbeat)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def heartbeat_progress_ts(
+    hb_key: tuple | None, launch_ts: float | None, current_attempt: int | None = None
+) -> tuple[float, bool]:
     """Wall-clock to credit as 'last worker progress' for a just-surfaced heartbeat, plus whether
     that heartbeat actually belongs to THIS attempt.
 
@@ -274,7 +324,8 @@ def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tupl
     ancient (premature stall) nor land its progress in the future.
 
     Returns ``(ts, fresh)``. ``fresh`` is False when the heartbeat's ts predates this attempt's
-    launch: that is a LEFTOVER heartbeat from a prior attempt (retries reuse the same seed
+    launch, OR (when ``current_attempt`` is given) when it carries a different ``attempt`` — both
+    mean a LEFTOVER heartbeat from a prior attempt (retries reuse the same seed
     heartbeat path), so the caller must NOT treat it as current progress — otherwise a stale
     training-stage heartbeat would arm the tighter training stall window and fail a healthy new
     attempt mid-setup before it has overwritten the old file. ``launch_ts`` uses truthiness (not
@@ -292,6 +343,18 @@ def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tupl
         return now, False
     lo = float(launch_ts) if launch_ts else 0.0  # unknown launch -> floor 0.0 (all heartbeats fresh)
     fresh = ts >= lo
+    # The seed heartbeat path is shared across attempts, so a prior attempt's worker still shutting
+    # down can upload a heartbeat with ts > this attempt's launch — fresh by timestamp, but belonging
+    # to a DIFFERENT attempt. It must NOT satisfy this attempt's first-liveness (else a silent active-
+    # but-never-booted replacement box waits the full setup grace instead of fast-failing). Reject on
+    # an EXPLICIT attempt mismatch only. The worker stamps ``attempt`` from an env var — a STRING,
+    # default "" — while the poller passes an int handle.attempt, so coerce BOTH to int before
+    # comparing (else "0" != 0 would reject every live heartbeat). An empty/unparseable attempt
+    # (older/unset worker) yields None and can't be dated, so keep the ts-based decision (back-compat).
+    hb_attempt = _attempt_int(hb_key[3]) if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
+    cur_attempt = _attempt_int(current_attempt)
+    if fresh and cur_attempt is not None and hb_attempt is not None and hb_attempt != cur_attempt:
+        fresh = False
     return min(now, max(lo, ts)), fresh
 
 

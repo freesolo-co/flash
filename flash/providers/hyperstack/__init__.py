@@ -55,13 +55,13 @@ class HyperstackProvider:
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
     ) -> PollResult:
-        # ``on_last_gpu`` stretches the setup/no-capacity grace when no further GPU attempt will be
-        # made after this one — either the candidate list is exhausted or the retry budget is exhausted.
+        # ``on_last_gpu`` is accepted for the shared Provider interface (RunPod stretches its grace on
+        # the last GPU); the instance providers use a UNIFORM per-GPU wait, so it is intentionally unused.
         from flash.providers.hyperstack.jobs import submit_run_hyperstack
 
         return submit_run_hyperstack(
             spec, seed, log=log, on_handle=on_handle, attempt=attempt,
-            runtime_secrets=runtime_secrets, on_last_gpu=on_last_gpu,
+            runtime_secrets=runtime_secrets,
         )
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
@@ -88,7 +88,16 @@ class HyperstackProvider:
         # recovered run is past half its window.
         deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S)
         try:
-            return poll_hs_job(hh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
+            # Uniform per-GPU wait: poll_hs_job uses its default FIRST_LIVENESS_S / SETUP_GRACE_S
+            # (no last-GPU scaling), matching the submit path.
+            return poll_hs_job(
+                hh,
+                spec,
+                seed,
+                log=log,
+                heartbeat_reader=reader,
+                deadline_s=deadline,
+            )
         finally:
             # Recovery has no submit_run_hyperstack teardown ``finally``; delete the reattached VM
             # here so a finished/abandoned recovered seed stops billing immediately.
