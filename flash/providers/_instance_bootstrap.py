@@ -505,14 +505,11 @@ def main() -> int:
         rc = run_mode(payload, env, phase, deadline)
         if not os.path.exists("/tmp/metrics.json"):
             if os.path.exists("/tmp/train_reached"):
-                # Training REACHED end-of-training (the sentinel is stamped right before the first
-                # required upload — the adapter), but no /tmp/metrics.json: the REQUIRED adapter upload,
-                # which precedes metrics.json, failed infra-shaped. That's a post-training UPLOAD
-                # failure, not a crash, so raise RetriableBootstrapError (retriable marker) — otherwise
-                # the poller hard-fails (job_failed) a COMPLETED training attempt when the worker's own
-                # retriable error heartbeat is also lost in the same HF outage. The marker's retriable
-                # flag is what carries the classification; host_neutral=retriable keeps it from
-                # quarantining the (healthy) region for a global upload failure.
+                # train_reached but no metrics.json -> the REQUIRED adapter upload (which precedes
+                # metrics.json) failed infra-shaped: a post-training UPLOAD failure, not a crash. Raise
+                # RetriableBootstrapError so the poller retries instead of hard-failing a COMPLETED
+                # attempt when the worker's own retriable hb is also lost; host_neutral keeps it from
+                # quarantining the healthy region for a global upload failure.
                 raise RetriableBootstrapError(
                     f"train phase '{phase}' reached end-of-training but produced no /tmp/metrics.json "
                     f"— the required adapter upload (which precedes metrics.json) failed infra-shaped; "
@@ -547,19 +544,15 @@ def main() -> int:
         retriable = isinstance(exc, RetriableBootstrapError)
         print(f"bootstrap failed: {error}", flush=True)
     finally:
-        # Training was REACHED this attempt if the worker stamped /tmp/train_reached (written right
-        # BEFORE the first required upload — the adapter) or wrote /tmp/metrics.json (end of training,
-        # AFTER the adapter upload). The sentinel is the one that matters when the REQUIRED ADAPTER
-        # upload itself fails: that happens before metrics.json, so metrics.json alone would miss it
-        # and a healthy, productive region would be quarantined for a post-training upload failure.
+        # Training reached if the worker stamped /tmp/train_reached (right BEFORE the first required
+        # upload) or /tmp/metrics.json (after it). The sentinel is what catches a failed REQUIRED
+        # adapter upload — it precedes metrics.json, so metrics.json alone would miss it and quarantine
+        # a healthy productive region for a post-training upload failure.
         trained = os.path.exists("/tmp/train_reached") or os.path.exists("/tmp/metrics.json")
-        # A bootstrap-RAISED retriable failure (RetriableBootstrapError: the pre-worker spilled-spec
-        # fetch or a required-artifact upload) is region-independent HF delivery, never a sick region,
-        # so flag it host_neutral so the poller doesn't quarantine. This is exactly the retriable set:
-        # a non-retriable bootstrap marker (a real worker/code error) must NOT be host_neutral — its
-        # quarantine, if any, is driven by the worker's own fresh retriable heartbeat. The HOST
-        # cloud-init failmark (docker/GPU never ready) is written elsewhere and omits the flag, so a
-        # genuinely sick region still quarantines.
+        # A bootstrap-RAISED retriable failure (spilled-spec fetch / required-artifact upload) is
+        # region-independent HF delivery -> host_neutral so the poller doesn't quarantine. Exactly the
+        # retriable set: a non-retriable marker (real worker error) is NOT neutral; the HOST failmark
+        # (docker/GPU never ready) omits the flag, so a genuinely sick region still quarantines.
         write_attempt_marker(
             payload, ok, error, retriable=retriable, trained=trained, host_neutral=retriable
         )

@@ -230,10 +230,9 @@ def build_payload(
 # into a failure BEFORE the worker container can write its own artifacts (docker/GPU not ready,
 # image pull failure). Reads creds from the on-box payload.json. Never raises.
 #
-# The HF path is ATTEMPT-SCOPED (``<arm>_attempt<N>_boot.log``): the poller's fast first-liveness
-# failover keys on this file's presence to tell a box that actually ran cloud-init from a silently
-# dead one, and a retry reuses the SAME run HF prefix — a non-attempt-scoped path would leave a prior
-# attempt's boot.log behind to falsely "prove" liveness for a later attempt whose cloud-init never ran.
+# ATTEMPT-SCOPED HF path (``<arm>_attempt<N>_boot.log``): first-liveness failover keys on its presence,
+# and a retry reuses the same run prefix — a non-scoped path would leave a prior attempt's boot.log to
+# falsely "prove" liveness for a later attempt whose cloud-init never ran.
 _HOSTLOG_PY = """\
 import json
 try:
@@ -269,12 +268,9 @@ try:
     p = json.load(open("/opt/flash/payload.json"))
     arm = p.get("flash_arm", "instance"); att = int(p.get("attempt") or 0)
     reason = sys.argv[1] if len(sys.argv) > 1 else "host boot failure"
-    # neutral=1 when the CONTAINER STARTED and then exited (the host verified docker+GPU were ready
-    # and `docker run` succeeded). That is NOT sick-region evidence: an in-container failure (e.g. a
-    # region-independent spilled-spec/HF-delivery retry) whose own neutral marker upload was lost would
-    # otherwise be relabeled a pre-training HOST fault by this fallback and quarantine a healthy region.
-    # So flag the fallback host_neutral; a genuinely sick GPU surfacing inside the container still
-    # quarantines via the worker's own non-neutral retriable heartbeat on the next clean signal. The
+    # neutral=1 when the container STARTED then exited (docker+GPU verified ready): an in-container
+    # failure whose own neutral marker upload was lost must not be relabeled a host fault and quarantine
+    # a healthy region (a real sick GPU still quarantines via the worker's own retriable heartbeat).
     # never-started failures (docker/GPU never ready, pull/run failed) pass neutral=0 -> real sick region.
     neutral = len(sys.argv) > 2 and sys.argv[2] == "1"
     marker_path = p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + ".json"
@@ -376,31 +372,23 @@ cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'
 cat > /opt/flash/failmark.py <<'FLASH_FAILMARK_EOF'
 {_FAILMARK_PY}FLASH_FAILMARK_EOF
 IMAGE={image!r}
-# huggingface_hub on the host for the boot-log + failure-marker uploaders. Best-effort (we must NOT
-# wedge cloud-init if PyPI/HF is unreachable — the worker container ships its own baked-in copy and
-# heartbeats once it starts), but RETRIED with an import verify: the boot.log this enables is exactly
-# what the poller's fast "active but the worker never started" failover keys on, so a transient
-# PyPI/network blip at boot must not PERMANENTLY disable the uploader and get a healthy box (still in
-# a long image pull) failed over for a missing liveness artifact it never had a chance to write.
+# huggingface_hub on the host for the boot-log + failmark uploaders. Best-effort (don't wedge cloud-init
+# if PyPI/HF is down — the worker container ships its own copy) but RETRIED with an import verify, so a
+# transient blip can't permanently disable the boot.log and get a healthy slow-pulling box failed over.
 for i in 1 2 3; do
   pip3 install -q huggingface_hub >/dev/null 2>&1 \\
     || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
   python3 -c "import huggingface_hub" >/dev/null 2>&1 && break
   echo "FLASH: hf_hub install retry $i"; sleep 10
 done
-# $2 (optional) = "1" to flag the failmark host_neutral (container started then exited -> not a sick
-# region). Defaults to 0 (never-started host fault) so existing callers stay region-quarantining.
+# $2 (optional) = "1" -> failmark host_neutral (container started then exited, not a sick region);
+# default 0 (never-started host fault) keeps existing callers region-quarantining.
 fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/failmark.py "$1" "${{2:-0}}" >/dev/null 2>&1 || true; exit 1; }}
-# Host->HF boot-log uploader, STARTED EARLY — BEFORE the docker-readiness wait and the (large, slow)
-# image pull — so a box that actually executed cloud-init leaves a liveness artifact on HF within
-# ~2 min. The control plane's poller keys its fast "instance active but the worker never started"
-# failover on this artifact's PRESENCE: it tells a healthy box still pulling the multi-GB image
-# (boot.log present, no heartbeat yet) from a silently dead one (cloud-init never ran -> no boot.log),
-# so the latter fails over in ~15 min instead of burning the full ~50 min setup grace. THROTTLED to
-# 120s and bounded (~30 min) to respect HF's per-repo hourly commit cap; it self-stops once the
-# worker container has STARTED and then exited (inspect succeeds + not running). The `docker inspect`
-# guard is what lets it keep emitting THROUGH the pull/start window: before the container exists the
-# inspect fails, so it does not mistake "not started yet" for "started then exited".
+# Host->HF boot-log uploader, started EARLY (before the docker wait + slow image pull) so a box that ran
+# cloud-init leaves a liveness artifact on HF in ~2 min — first-liveness failover keys on its presence
+# to tell a healthy-still-pulling box from a silently-dead one. Throttled 120s, bounded ~30 min (HF
+# commit cap); self-stops once the container has started then exited (the `docker inspect` guard lets it
+# keep emitting through the pull/start window — before the container exists, inspect fails).
 ( for i in $(seq 1 15); do
     python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true
     if docker inspect flashrun >/dev/null 2>&1 \\
@@ -445,14 +433,12 @@ sleep 5
 if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
   EXIT="$(docker inspect -f '{{{{.State.ExitCode}}}}' flashrun 2>/dev/null || echo 1)"
   docker logs flashrun >>/opt/flash/host_boot.log 2>&1 || true
-  # The container STARTED (docker run succeeded above) then exited non-zero -> neutral=1: an
-  # in-container failure whose own marker upload was lost must not quarantine a region whose
-  # docker+GPU we already verified healthy (see _FAILMARK_PY).
+  # Container started then exited non-zero -> neutral=1 (docker+GPU verified, so not a sick region; see
+  # _FAILMARK_PY).
   [ "$EXIT" = "0" ] || fail "worker container exited during startup (exit ${{EXIT}})" 1
 fi
 # Mirror the container's stdout into the host boot log (detached) so an early in-container crash is
-# visible on HF even if it dies before uploading its own console artifact (the early boot-log
-# uploader above keeps shipping host_boot.log to HF and self-stops once this container exits).
+# visible on HF even if it dies before its own console upload.
 ( docker logs -f flashrun >>/opt/flash/host_boot.log 2>&1 || true ) &
 disown || true
 """
