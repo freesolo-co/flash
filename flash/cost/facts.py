@@ -6,7 +6,6 @@ from __future__ import annotations
 from flash.catalog import MODELS
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
-# ===== GPU facts =====
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "L4": 60.0,
     "RTX 4090": 165.0,
@@ -78,7 +77,7 @@ def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     return best.name
 
 
-# ===== Model-size facts (catalog-only; five dense text models, no MoE/open-model sizing) =====
+# Model-size facts (catalog-only; five dense text models, no MoE/open-model sizing)
 def total_params_b(model_id: str) -> float:
     """Total parameter count (billions) for a catalog model -- the curated ``params_b`` stat."""
     info = MODELS.get(model_id)
@@ -101,7 +100,6 @@ def download_weight_gb(model_id: str) -> float:
     return total_params_b(model_id) * 2.0
 
 
-# ===== Reward-grader latency (GRPO) =====
 # A single average grader latency (s/completion) for every env. Graders span ~0.01s (regex/math)
 # to ~3s (LLM judge/code); ~1s is a middle-of-the-road default (a run can override it).
 AVG_REWARD_SECONDS_PER_COMPLETION = 1.0

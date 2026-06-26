@@ -435,10 +435,13 @@ def deploy_train_endpoint(
 
     _QUOTA_MAX_RETRIES = 3
     resource = None
-    # One pass over the pool: advance_key() WRAPS (always True for a multi-key pool, even after the
-    # last account), so without a bound an all-exhausted pool would fail over forever here. Cap the
-    # failovers at "every OTHER account once" and then raise — the lifecycle retry budget handles
-    # waiting for quota to recover and re-enters this with a fresh attempt.
+    # One pass over the pool, bounded purely by a COUNT — NOT by advance_key()'s return value.
+    # advance_key() wraps (so it can't itself report "all accounts tried" — that depends on where
+    # THIS failover started, which it can't know; a prior run may have left _idx mid-pool). Exactly
+    # key_count()-1 advances visit every OTHER account once from any starting account, then we raise
+    # — the lifecycle retry budget handles waiting for quota to recover and re-enters with a fresh
+    # attempt. Relying on advance_key()'s boolean here would skip the wrapped-over accounts when the
+    # loop starts on a non-first key.
     failovers_left = max(0, rp_keys.key_count() - 1)
     while resource is None:
         ensure_auth()  # collapse RUNPOD_API_KEY to the (possibly failed-over) active account key
@@ -470,9 +473,12 @@ def deploy_train_endpoint(
         if resource is not None:
             break
         # Quota still exhausted after sweeping this account dry — fail over to the next one, but only
-        # until every account has been tried once (failovers_left). advance_key() wraps and always
-        # returns True for a multi-key pool, so the count — not its return value — is what stops us.
-        if failovers_left > 0 and rp_keys.advance_key():
+        # until every other account has been tried once (the key_count()-based failovers_left bound).
+        # The COUNT is the sole exhaustion signal: advance_key() always advances (wrapping) for a
+        # multi-key pool, so a failover that started mid-pool still visits each remaining account
+        # exactly once before this budget runs out and we raise.
+        if failovers_left > 0:
+            rp_keys.advance_key()
             failovers_left -= 1
             logger.warning(
                 "RunPod worker quota exhausted on this account after sweeping; failing over to "

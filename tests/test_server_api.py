@@ -609,6 +609,35 @@ def test_bad_spec_is_400(api):
     assert "model" in r.json()["detail"]
 
 
+def test_non_object_spec_fields_get_targeted_400(api):
+    # A falsy NON-object JSON value (""/0/[]/false) for spec / spec.environment / runtime_secrets
+    # must 400 with the intended "must be a JSON object" message, not get coerced to {} (which
+    # would surface a misleading downstream error like "config must set [environment] id").
+    key = _login()
+    for bad_spec in ("", 0, [], False):
+        r = api.post("/v1/runs", json={"spec": bad_spec}, headers=_bearer(key))
+        assert r.status_code == 400, (bad_spec, r.text)
+        assert "spec must be a JSON object" in r.json()["detail"], (bad_spec, r.text)
+
+    for bad_env in ("", 0, [], False):
+        r = api.post(
+            "/v1/runs",
+            json={"spec": {**SPEC, "environment": bad_env}},
+            headers=_bearer(key),
+        )
+        assert r.status_code == 400, (bad_env, r.text)
+        assert "spec.environment must be a JSON object" in r.json()["detail"], (bad_env, r.text)
+
+    for bad_secrets in ("", 0, [], False):
+        r = api.post(
+            "/v1/runs",
+            json={"spec": SPEC, "dry_run": True, "runtime_secrets": bad_secrets},
+            headers=_bearer(key),
+        )
+        assert r.status_code == 400, (bad_secrets, r.text)
+        assert "runtime_secrets must be a JSON object" in r.json()["detail"], (bad_secrets, r.text)
+
+
 def test_deploy_dry_run(api):
     key = _login()
     run_id = api.post(
