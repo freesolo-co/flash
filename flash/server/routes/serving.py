@@ -222,11 +222,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             status_code=400,
             detail="repository is required: the destination HuggingFace repo 'owner/name'",
         )
-    # Destination must be a well-formed 'owner/name': exactly two non-empty, whitespace-free path
-    # parts. A bare "/"-present check would accept malformed ids ('owner/name/extra', 'owner//name',
-    # 'owner/ name') that only blow up later in the HF upload — reject them here with a fast 400.
-    repo_parts = repository.split("/")
-    if len(repo_parts) != 2 or not all(p and not any(ch.isspace() for ch in p) for p in repo_parts):
+    if "/" not in repository.strip("/"):
         raise HTTPException(
             status_code=400,
             detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
@@ -266,7 +262,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     if status.state not in allowed_states:
         detail = (
             f"run {run_id} is {status.state!r}; export a checkpoint only once the run "
-            "has finished, been cancelled, or failed"
+            "has finished or been cancelled"
             if is_checkpoint
             else f"run {run_id} is {status.state!r}; only finished runs with "
             "trained adapter artifacts can be exported"
