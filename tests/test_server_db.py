@@ -161,7 +161,6 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
     monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
-    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
@@ -220,8 +219,8 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
-    # The Lambda/Hyperstack keys above (required by the new preflight) make configured_providers()
-    # treat both as live, so create_app()'s lifespan recover_runs() would dispatch real sweep_orphans()
+    # The Lambda key above (required by the new preflight) makes configured_providers()
+    # treat it as live, so create_app()'s lifespan recover_runs() would dispatch real sweep_orphans()
     # list calls at startup. This test only checks /v1/me, so stub the provider set to empty to keep it
     # hermetic. (Pre-PR this fixture set only RUNPOD_API_KEY, whose sweep is a no-op.)
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)

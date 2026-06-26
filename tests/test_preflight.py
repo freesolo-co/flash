@@ -11,7 +11,6 @@ import flash.providers.runpod.keys as runpod_keys
 _ALL_REQUIRED = (
     "RUNPOD_API_KEY",
     "LAMBDA_API_KEY",
-    "HYPERSTACK_API_KEY",
     "GITHUB_TOKEN",
     "HF_TOKEN",
     "FREESOLO_INTERNAL_KEY",
@@ -28,7 +27,6 @@ def _full_config(monkeypatch) -> None:
     """A complete, deploy-ready operator config (>= 2 RunPod accounts + every other credential)."""
     _set_runpod(monkeypatch, "rp-a,rp-b")
     monkeypatch.setenv("LAMBDA_API_KEY", "lam")
-    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp")
     monkeypatch.setenv("HF_TOKEN", "hf")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fsk")
@@ -101,7 +99,7 @@ def test_preflight_rejects_empty_runpod_pool(clean_env, monkeypatch):
 
 @pytest.mark.parametrize(
     "var",
-    ["LAMBDA_API_KEY", "HYPERSTACK_API_KEY", "FREESOLO_INTERNAL_KEY", "GITHUB_TOKEN", "HF_TOKEN"],
+    ["LAMBDA_API_KEY", "FREESOLO_INTERNAL_KEY", "GITHUB_TOKEN", "HF_TOKEN"],
 )
 def test_preflight_rejects_whitespace_only_credentials(clean_env, monkeypatch, var):
     # A whitespace-only secret would pass a bare truthiness check but fail later when the provider
@@ -115,7 +113,7 @@ def test_preflight_rejects_whitespace_only_credentials(clean_env, monkeypatch, v
 
 def test_preflight_requires_each_provider_and_internal_key(clean_env, monkeypatch):
     # Dropping any single required credential from an otherwise-complete config fails the deploy.
-    for missing in ("LAMBDA_API_KEY", "HYPERSTACK_API_KEY", "FREESOLO_INTERNAL_KEY"):
+    for missing in ("LAMBDA_API_KEY", "FREESOLO_INTERNAL_KEY"):
         _full_config(monkeypatch)
         monkeypatch.delenv(missing, raising=False)
         with pytest.raises(pf.PreflightError) as excinfo:
@@ -145,7 +143,6 @@ def test_preflight_always_requires_shared_hf_and_github(clean_env, monkeypatch):
     # Complete EXCEPT the shared HF/GitHub tokens -> both still flagged (HF_REPO is per-run, not here).
     _set_runpod(monkeypatch, "rp-a,rp-b")
     monkeypatch.setenv("LAMBDA_API_KEY", "lam")
-    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fsk")
     with pytest.raises(pf.PreflightError) as excinfo:
         pf.check_run_preflight()
