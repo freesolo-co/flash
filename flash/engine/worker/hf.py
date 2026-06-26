@@ -35,21 +35,26 @@ def hf_prefix() -> str:
     return f"{_w.PHASE}/{_w.RUN_ID}/seed{_w.SEED}"
 
 
-def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> None:
+def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool:
     """Shared HF upload loop for files/folders: HF_REPO guard + retry/raise-or-warn.
 
     ``required=True`` (completion artifacts DONE/metrics.json, the trained adapter) retries
     and finally raises: a swallowed upload failure would make the control plane mark a
     finished run failed/retried, or mark the run done while deployment can never download
     the missing adapter. Optional artifacts (generations, logs) only warn.
+
+    Returns ``True`` when a commit actually landed (or there is no HF_REPO, so there is nothing
+    to retry) and ``False`` when a best-effort upload failed. Callers that claimed throttle/quiet
+    state on the strength of a commit (heartbeat()) read this to roll back when nothing landed; the
+    return is advisory and the many callers that ignore it keep their warn-only behavior.
     """
     if not _w.HF_REPO:
-        return
+        return True
     attempts = 3 if required else 1
     for attempt in range(attempts):
         try:
             do_upload()
-            return
+            return True
         except Exception as e:
             if required and attempt + 1 < attempts:
                 print(f"{label} retry {attempt + 1}/{attempts}: {e}")
@@ -59,12 +64,13 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> None
                 # Already retried 3x -> the host/network is bad, not the run. Infra-shaped.
                 raise RetriableInfraError(f"required upload of {repo_subpath!r} failed: {e}") from e
             print(f"{label} warn:", e)
-            return
+            return False
+    return False
 
 
-def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False):
-    """Upload one file to the run's HF prefix."""
-    _hf_upload(
+def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -> bool:
+    """Upload one file to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
+    return _hf_upload(
         lambda: _w.hf_api().upload_file(
             path_or_fileobj=local_path,
             path_in_repo=f"{hf_prefix()}/{repo_subpath}",
@@ -109,9 +115,9 @@ def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> 
         print(f"debug upload warn ({repo_name}): {e}")
 
 
-def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False):
-    """Upload a folder to the run's HF prefix."""
-    _hf_upload(
+def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
+    """Upload a folder to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
+    return _hf_upload(
         lambda: _w.hf_api().upload_folder(
             folder_path=local_dir,
             path_in_repo=f"{hf_prefix()}/{repo_subpath}",

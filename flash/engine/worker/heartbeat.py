@@ -199,10 +199,19 @@ def heartbeat(stage: str, **kw):
                 with open(up, "w") as f:
                     f.write(snapshot)
                 try:
-                    _w.hf_upload_file(up, "heartbeat.json")
+                    committed = _w.hf_upload_file(up, "heartbeat.json")
                 finally:
                     with contextlib.suppress(OSError):
                         os.remove(up)
+                if committed is False:
+                    # The best-effort HF commit failed (hf_upload_file swallows the error and reports
+                    # False); HF is still stale. Roll the slot claim back exactly as the lock-timeout
+                    # branch does, so the throttle doesn't defer the next retry and quiet_gate doesn't
+                    # read the channel as fresh. ``is False`` (not falsy) so a mock/None never trips it.
+                    with _HB_LOCK:
+                        if now == _w._HB_LAST_UPLOAD:
+                            _w._HB_LAST_UPLOAD = prev_last_upload
+                    print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
@@ -351,7 +360,14 @@ def liveness_heartbeat(
             gpu = gpu_diagnostics(include_torch=False)
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
-            extra = fields() if callable(fields) else (fields or {})
+            # Compute the merged fields defensively: ``fields`` may be a callback that re-reads live
+            # state (train_liveness_heartbeat's lambda calls get_step()), and an exception there must
+            # NOT kill this daemon for the rest of the wrapped block — same reason progress() above is
+            # suppressed. Fall back to no extra fields; the bare heartbeat still re-arms the watchdog.
+            extra = fields if isinstance(fields, dict) else {}
+            if callable(fields):
+                with contextlib.suppress(Exception):
+                    extra = fields() or {}
             _w.heartbeat(stage, gpu=gpu, **extra)
 
     t = threading.Thread(target=_loop, daemon=True)

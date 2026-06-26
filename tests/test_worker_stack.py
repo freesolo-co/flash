@@ -381,6 +381,63 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
     )
 
 
+def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
+    """The optimistic _HB_LAST_UPLOAD slot is claimed BEFORE the best-effort HF commit. If that commit
+    fails, hf_upload_file swallows the error and returns False (it never raises on best-effort) — HF is
+    still stale, so the slot must roll back exactly as the lock-timeout skip does. Otherwise the
+    throttle defers the next retry and liveness_heartbeat's quiet_gate reads the dead channel as fresh.
+    """
+    import importlib
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: None)
+    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    sentinel_last_upload = 123.0  # a prior successful-commit timestamp the failed retry must restore
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
+
+    calls = []
+    # Mirror the real hf_upload_file contract: best-effort failure returns False (does not raise).
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: (calls.append(a[1]), False)[1])
+
+    w.heartbeat("model_prefetched")
+
+    assert calls == ["heartbeat.json"], "the upload must actually be attempted"
+    assert sentinel_last_upload == w._HB_LAST_UPLOAD, (
+        f"a failed upload must roll _HB_LAST_UPLOAD back to its prior value (got {w._HB_LAST_UPLOAD})"
+    )
+
+
+def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
+    """The dual of the rollback test: a SUCCESSFUL commit (or a mock that doesn't report False) must
+    KEEP the advanced slot so the throttle works. ``is False`` — not falsy — gates the rollback, so a
+    None-returning mock (legacy tests) counts as success."""
+    import importlib
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: None)
+    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: True)
+
+    w.heartbeat("model_prefetched")
+
+    assert w._HB_LAST_UPLOAD > 0.0, "a successful commit must keep the advanced throttle slot"
+
+
 def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
     """done/already_done/error_* are CRITICAL — no later heartbeat repairs a skipped terminal commit,
     and error_* carries the `retriable` flag worker_flagged_retriable() reads. So they wait the LONGER

@@ -237,6 +237,25 @@ def test_train_liveness_heartbeat_gap_fills_with_step(monkeypatch):
     assert any(st is not None for _, st in emitted), "train liveness must carry the step in the payload"
 
 
+def test_liveness_heartbeat_survives_raising_fields_callback(monkeypatch):
+    """The ``fields`` callback can re-read live state (train_liveness_heartbeat's lambda calls
+    get_step() again), so a raise there must NOT kill the gap-filler thread for the rest of the wrapped
+    block — same defensive contract as progress(). The daemon falls back to no extra fields and keeps
+    emitting the bare heartbeat (which still re-arms the watchdog)."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    emitted: list = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append((s, k)))
+
+    def boom():
+        raise RuntimeError("get_step exploded mid-train")
+
+    with hb.liveness_heartbeat("rl_step", fields=boom):
+        time.sleep(0.2)
+    assert emitted, "a raising fields callback must not kill the daemon — it must keep emitting"
+    assert all(s == "rl_step" for s, _ in emitted)
+    assert all("step" not in k for _, k in emitted), "failed fields must fall back to no extra fields"
+
+
 # --------------------------------------------------------------------------------------------
 # _hf_cache_bytes feeds the prefetch progress gate: bytes downloaded, or None when the cache dir
 # doesn't exist yet (unmeasurable). liveness_heartbeat treats None as "no advancement", so the
