@@ -35,9 +35,9 @@ def realized_cost_for_remote(
     Two distinct time bounds, because the two cost sources are different:
       * ``start``/``end`` bound the RunPod BILLING-API query window. The caller pads ``end`` past the
         run's terminal time so the settled invoice row is in range (see reconcile ``_SETTLE_SECONDS``).
-      * ``run_end`` is the run's ACTUAL terminal time (~teardown). The instance providers
-        (Lambda/Hyperstack) have no billing endpoint: an instance bills at a flat $/hr from launch to
-        teardown, so their realized COGS is wall x rate over ``started_ts -> run_end`` — it must NOT
+      * ``run_end`` is the run's ACTUAL terminal time (~teardown). The instance provider
+        (Lambda) has no billing endpoint: an instance bills at a flat $/hr from launch to
+        teardown, so its realized COGS is wall x rate over ``started_ts -> run_end`` — it must NOT
         use the settle-padded ``end`` or it would over-bill by the padding (up to an hour). Defaults
         to ``end`` for back-compat when the caller doesn't distinguish.
     """
@@ -48,7 +48,7 @@ def realized_cost_for_remote(
         from flash.providers.runpod.cost import realized_cost as runpod_realized
 
         return runpod_realized(remote.get("endpoint_id"), start=start, end=end)
-    if provider in ("lambda", "hyperstack"):
+    if provider == "lambda":
         return _instance_realized_cost(remote, start=start, end=run_end if run_end is not None else end)
     return None
 
@@ -63,7 +63,7 @@ def _instance_realized_cost(
     rate persisted) so the run stays unreconciled rather than booking $0.
     """
     rate = remote.get("hourly_usd")
-    rid = remote.get("instance_id") or remote.get("vm_id")
+    rid = remote.get("instance_id")
     # Honor the module contract: no rate OR no auditable resource id -> unattributable (None), so the
     # run stays unreconciled rather than booking instance cost we can't tie to a resource.
     if not rate or not rid:
