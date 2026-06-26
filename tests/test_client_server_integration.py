@@ -90,7 +90,6 @@ def make_client(tmp_path, monkeypatch):
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
     monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
-    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
@@ -116,8 +115,8 @@ def make_client(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
-    # The Lambda/Hyperstack keys above (required by the startup preflight) also make
-    # configured_providers() treat both as live, so create_app()'s lifespan recover_runs() would
+    # The Lambda key above (required by the startup preflight) also makes
+    # configured_providers() treat it as live, so create_app()'s lifespan recover_runs() would
     # dispatch real sweep_orphans() list calls — and the urllib->TestClient shim below isn't installed
     # until AFTER create_app() runs. Stub the provider set to empty so startup stays hermetic.
     import flash.providers as providers_mod
