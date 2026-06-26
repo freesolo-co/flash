@@ -68,6 +68,11 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
+    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
+    import flash.providers.runpod.keys as runpod_keys
+
+    runpod_keys.reset()
     import flash.runner as runner
     import flash.server.auth as auth_mod
     import flash.server.db as db_mod
