@@ -55,10 +55,12 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
 # First-liveness deadline for the instance providers (Lambda / Hyperstack). Once an instance reaches
 # OS-level ``active`` a healthy box that actually ran cloud-init pushes its ``<arm>_attempt<N>_boot.log``
 # to HF within ~2 min (the uploader starts BEFORE the image pull) and a live worker soon heartbeats.
-# So if a box is active for this long with NO attempt-scoped boot.log AND no fresh heartbeat AND no
-# marker, cloud-init/the worker never started (a sick region / wedged host) — fail it over FAST
-# (retriable ``stalled`` that the runner escapes cross-provider) instead of burning the full
-# ``SETUP_GRACE_S`` (~50 min). Generous over the ~2 min boot.log-appears time to absorb HF
+# So if a box is active for this long with NO attempt-scoped boot.log AND no fresh heartbeat, cloud-
+# init/the worker never started (a sick region / wedged host) — fail it over FAST (retriable
+# ``stalled`` that the runner escapes cross-provider) instead of burning the full ``SETUP_GRACE_S``
+# (~50 min). (The predicate is boot.log + heartbeat only; an ok/error attempt marker, if one exists,
+# is acted on earlier in the poll loop and never reaches this fast-fail.) Generous over the ~2 min
+# boot.log-appears time to absorb HF
 # upload/propagation lag and a slow host huggingface_hub install; the boot.log presence — not this
 # raw timer — is what protects a healthy-but-slow (large-image-pull) box from a false failover.
 # Applied uniformly per GPU (the instance providers ignore ``on_last_gpu`` in the submit/poll paths).
