@@ -563,19 +563,19 @@ def run_rl():
                 {"cudagraph_mode": "FULL_AND_PIECEWISE"},
                 "vLLM cudagraph_mode (verl rollout default)",
             )
-    # Adapter init: continue training the SFT adapter (peft_config=None, model is the
-    # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
-    # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
-    # to fp32 and double VRAM).
+    # Adapter init: ALWAYS a (model_path_str, fresh LoRA) pair — from-base passes model_id, warm
+    # start (train.init_from_adapter) passes a temp dir with the SFT adapter MERGED into the base
+    # (see _init_adapter_model). Both feed TRL a model-PATH string + a LoraConfig, so colocate vLLM
+    # init is identical on both paths (the old warm-start path handed TRL a live CPU PeftModel and
+    # hung at 0% GPU for ~25 min). The merged SFT is reassembled into the deploy adapter at finalize.
     init_model, init_peft = _w._init_adapter_model(model_id)
     # chalk's kernels are applied AFTER construction (below) against trainer.model: chalk's apply
-    # patches the LIVE nn.Module, so there is nothing to install pre-build. On the fresh-LoRA path
-    # init_model is just the model-id string (TRL builds the module), and even on the
-    # continue-adapter path TRL may rebuild/wrap the PeftModel, so trainer.model is the
+    # patches the LIVE nn.Module, so there is nothing to install pre-build. init_model is a model-id /
+    # merged-base PATH string (TRL builds + GPU-places the module), so trainer.model is the
     # authoritative target.
     if init_peft is not None:
-        # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
-        # adapter. Force bf16 (TRL string-loading can fall back to fp32 and double VRAM).
+        # TRL loads the string model path with these kwargs, then attaches the fresh LoRA. Force
+        # bf16 (TRL string-loading can fall back to fp32 and double VRAM).
         _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
         grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
         if _attn:
@@ -805,6 +805,12 @@ def run_rl():
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
+    # Warm start: this GRPO LoRA was trained on a base with the SFT adapter MERGED in (see
+    # _init_adapter_model), so served alone on the catalog base it would MISS the SFT. Recombine
+    # SFT+GRPO into one deployable adapter IN PLACE so deploy/serve (catalog base + the run's one
+    # adapter) stays correct. No-op (returns False) for a from-base run.
+    if _w.combine_warmstart_into_adapter(model_id, adapter_dir):
+        print("[rl] warm-start: deploy adapter = SFT(+)GRPO recombined for serving on the catalog base")
     _w.hf_upload_folder(adapter_dir, "adapter", required=True)
     _w.heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 

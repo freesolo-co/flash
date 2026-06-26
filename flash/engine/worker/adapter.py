@@ -16,6 +16,7 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
+    is_vl_checkpoint,
     remap_vl_adapter_dir,
 )
 from flash.engine.worker.perf import optimal_attn_impl
@@ -86,11 +87,29 @@ def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_
 
 
 def _init_adapter_model(model_id: str):
-    """Base model + the ``train.init_from_adapter`` adapter loaded as a trainable
-    PeftModel, or the plain ``model_id`` string + a fresh LoRA when it is unset.
+    """The base for GRPO + the LoRA config to attach — ALWAYS a ``(model_path_str, LoraConfig)``
+    pair, so the warm-start path is structurally identical to the from-base path.
 
-    GRPO continuing an SFT adapter: TRL trains the LOADED adapter (peft_config=None)
-    instead of attaching a fresh one."""
+    From base (``init_from_adapter`` unset): returns ``(model_id, make_lora(model_id))``. TRL loads
+    and GPU-places the string itself, then attaches a fresh LoRA.
+
+    Warm start (``init_from_adapter`` set): the SFT adapter is MERGED into a disk copy of the base
+    and we return ``(merged_base_dir, make_lora(model_id))`` — the SAME shape. GRPO then trains a
+    FRESH LoRA on the SFT-merged base. Two reasons this is the right design:
+
+    * **Fixes the warm-start init hang.** The old path handed GRPOTrainer a live, CPU-resident
+      PeftModel (``peft_config=None``). Under colocate vLLM (always on for GRPO) that pre-loaded
+      object stalls trainer construction at 0% GPU for ~25 min with no error. Passing a model-path
+      STRING + a LoraConfig makes TRL load/place the model itself — the proven from-base init path —
+      so colocate vLLM never sees an unexpected pre-built module.
+    * **Decouples LoRA rank/alpha from SFT.** The SFT delta is baked into the merged base, so the
+      fresh GRPO LoRA's ``train.lora_rank``/``train.lora_alpha`` (read by ``make_lora``) no longer
+      have to match the SFT run's adapter shape.
+
+    Caveat handled at finalize: the GRPO LoRA alone, served on the ORIGINAL catalog base, would MISS
+    the merged SFT. ``combine_warmstart_into_adapter`` recombines SFT+GRPO into one deployable
+    adapter before upload, so the existing deploy/serve path (catalog base + the run's one adapter)
+    stays correct without any serving changes."""
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     if not prefix:
         return model_id, make_lora(model_id)
@@ -105,17 +124,30 @@ def _init_adapter_model(model_id: str):
             "the base model. Fix the adapter prefix / HF credentials, or omit "
             "init_from_adapter to train a fresh LoRA."
         )
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM
-
-    print(f"[init-adapter] initializing LoRA from {prefix}")
+    print(f"[init-adapter] warm-start: merging SFT adapter {prefix} into the base for GRPO")
     # VL checkpoints (Qwen3.5/3.6): the SFT step saved the adapter against the FULL multimodal model
     # (keys under ``base_model.model.model.language_model.layers.*``), but we load the base here via
     # AutoModelForCausalLM (text-only tree, ``base_model.model.model.layers.*``). Strip the
     # ``.language_model.`` infix on disk so PeftModel.from_pretrained matches the SFT keys —
     # otherwise peft only WARNS about missing keys and silently trains a fresh LoRA, discarding the
-    # SFT. No-op for non-VL checkpoints. See flash/engine/worker/lora.py.
-    remap_vl_adapter_dir(adir, model_id)
+    # SFT. No-op for non-VL checkpoints. See flash/engine/worker/lora.py. The return value also tells
+    # us the adapter carried VL keys (evidence-based, robust to a flaky is_vl_checkpoint probe).
+    n_vl_remapped = remap_vl_adapter_dir(adir, model_id)
+    if n_vl_remapped > 0 or is_vl_checkpoint(model_id):
+        # Merge-to-string is not yet safe for VL checkpoints: merging the SFT into the text-only
+        # AutoModelForCausalLM tree and saving it writes a text-only config/weight layout, which the
+        # colocate vLLM engine (which loads the merged dir as the VL arch) cannot reconcile. Fail
+        # FAST (before importing peft/loading the base or wasting a paid GPU on a broken merged base —
+        # the old path hung here instead). Follow-up: merge against the full VL model / preserve the
+        # VL config so the merged dir round-trips through vLLM.
+        raise RuntimeError(
+            f"warm-start GRPO (train.init_from_adapter) is not yet supported for the natively-"
+            f"multimodal checkpoint {model_id!r}. Run GRPO from the base model (omit "
+            "init_from_adapter), or deploy/continue from the SFT adapter directly."
+        )
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
     _attn = optimal_attn_impl()
     base = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -124,16 +156,16 @@ def _init_adapter_model(model_id: str):
         **({"attn_implementation": _attn} if _attn else {}),
     )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
-    # Fail loudly if the adapter didn't actually apply (a key mismatch would otherwise silently start
-    # GRPO from the base model again). from_pretrained loads with load_state_dict(strict=False) and
-    # only WARNS on a mismatch, discarding the load result — so re-run load_adapter to CAPTURE which
-    # keys matched and assert matched==saved (peft injects the LoRA modules from target_modules BEFORE
-    # loading weights, so the module-count check alone can't see a silent weight discard). The reload
-    # is idempotent: same weights into the same "default" adapter. See flash/engine/worker/lora.py.
-    # Mirror from_pretrained's key_mapping: for transformers models that define a
-    # ``_checkpoint_conversion_mapping`` (renamed-arch checkpoints), from_pretrained remaps the adapter
-    # keys before loading; the reload must apply the SAME mapping or it would reinterpret valid keys as
-    # mismatched and falsely abort. peft reads it off the base model (peft_model.py from_pretrained).
+    # Fail loudly if the adapter didn't actually apply (a key mismatch would otherwise silently merge
+    # an all-zero identity and start GRPO from the base model). from_pretrained loads with
+    # load_state_dict(strict=False) and only WARNS on a mismatch, discarding the load result — so
+    # re-run load_adapter to CAPTURE which keys matched and assert matched==saved (peft injects the
+    # LoRA modules from target_modules BEFORE loading weights, so the module-count check alone can't
+    # see a silent weight discard). The reload is idempotent: same weights into the same "default"
+    # adapter. See flash/engine/worker/lora.py. Mirror from_pretrained's key_mapping: for transformers
+    # models that define a ``_checkpoint_conversion_mapping`` (renamed-arch checkpoints),
+    # from_pretrained remaps the adapter keys before loading; the reload must apply the SAME mapping
+    # or it would reinterpret valid keys as mismatched and falsely abort.
     key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
     load_result = model.load_adapter(
         adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
@@ -141,7 +173,86 @@ def _init_adapter_model(model_id: str):
     assert_adapter_load_clean(load_result, model_id)
     assert_lora_applied(model, model_id)
     assert_adapter_delta_nonzero(model, model_id)
-    return model, None
+    # Bake the (verified non-zero) SFT delta into the base weights and hand TRL a STRING path. GRPO
+    # trains a fresh LoRA on this merged base; the deployable SFT⊕GRPO adapter is reassembled at
+    # finalize (combine_warmstart_into_adapter).
+    merged = model.merge_and_unload()
+    merged_dir = _save_merged_base(merged, model_id)
+    # Drop the CPU-resident copies promptly — TRL reloads merged_dir straight onto the GPU.
+    del model, base, merged
+    return merged_dir, make_lora(model_id)
+
+
+def _save_merged_base(merged_model, model_id: str) -> str:
+    """Save a merge_and_unload()'d base (SFT folded in) to a fresh temp dir + its tokenizer, and
+    return the dir. TRL/colocate-vLLM load it as a plain base model (string path), exactly like the
+    from-base ``model_id``. Ephemeral: the per-run GPU pod is torn down after the run."""
+    import tempfile
+
+    from transformers import AutoTokenizer
+
+    out = tempfile.mkdtemp(prefix="flash-warmstart-merged-")
+    merged_model.save_pretrained(out, safe_serialization=True)
+    AutoTokenizer.from_pretrained(model_id, trust_remote_code=True).save_pretrained(out)
+    print(f"[init-adapter] SFT merged into base at {out} — GRPO trains a fresh LoRA on it")
+    return out
+
+
+def combine_warmstart_into_adapter(model_id: str, grpo_adapter_dir: str) -> bool:
+    """Recombine a warm start's SFT adapter with the freshly-trained GRPO LoRA into ONE adapter
+    deployable on the ORIGINAL catalog base, rewritten IN PLACE at ``grpo_adapter_dir``.
+
+    Warm-start GRPO trains a fresh LoRA on a base that already has the SFT adapter merged in (see
+    ``_init_adapter_model``), so the GRPO adapter alone, served on the catalog base, would miss the
+    SFT gain. A LoRA delta is just an additive low-rank term, independent of which base it sits on,
+    so PEFT's ``add_weighted_adapter(..., combination_type="cat")`` concatenates the SFT and GRPO
+    LoRAs into a single rank-(r_sft+r_grpo) adapter whose delta on the original base is exactly
+    ΔSFT + ΔGRPO — i.e. the trained model (base + SFT + GRPO). cat sets the combined adapter's
+    ``lora_alpha == r`` (scaling 1) and folds each source adapter's alpha/r scaling into the
+    concatenated weights, so weights ``[1.0, 1.0]`` reproduce the plain sum. Ranks may differ
+    (the SFT and GRPO runs can use different lora_rank/lora_alpha).
+
+    Saves the combined adapter as the ``"default"`` adapter, which PEFT writes to the dir ROOT
+    (overwriting the GRPO-only ``adapter_config.json`` + ``adapter_model.safetensors``), so the
+    existing deploy/serve path (catalog base + the run's one adapter) stays correct with no serving
+    change. Returns False (no-op) for a from-base run.
+
+    Note: the per-step deployable checkpoints (``checkpoints/step-N/adapter``) are NOT recombined —
+    a mid-RL ``flash deploy --step N`` of a warm-started run still serves the GRPO-only adapter
+    (missing the SFT). Only the run's FINAL adapter is made deploy-correct here."""
+    prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
+    if not prefix:
+        return False
+    adir = _download_adapter(prefix)  # cached locally from _init_adapter_model; re-resolve statelessly
+    if not adir:
+        raise RuntimeError(
+            f"warm-start finalize: SFT adapter {prefix!r} is no longer resolvable to recombine with "
+            "the GRPO LoRA. The deployed adapter would silently miss the SFT — failing instead."
+        )
+    remap_vl_adapter_dir(adir, model_id)  # idempotent (already stripped at init); VL is guarded out
+
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    # The cat only manipulates LoRA weights; the base is loaded (CPU, bf16) just to host the adapter
+    # modules, so this never contends with the trainer's still-resident GPU copy.
+    base = AutoModelForCausalLM.from_pretrained(model_id, dtype="bfloat16", trust_remote_code=True)
+    model = PeftModel.from_pretrained(base, adir, adapter_name="sft", is_trainable=False)
+    model.load_adapter(grpo_adapter_dir, adapter_name="grpo", is_trainable=False)
+    r_sft = model.peft_config["sft"].r
+    r_grpo = model.peft_config["grpo"].r
+    model.add_weighted_adapter(
+        ["sft", "grpo"], [1.0, 1.0], adapter_name="default", combination_type="cat"
+    )
+    # selected_adapters=["default"] + the "default" name => PEFT writes to grpo_adapter_dir ROOT
+    # (peft_model.save_pretrained), overwriting the GRPO-only adapter files in place.
+    model.save_pretrained(grpo_adapter_dir, selected_adapters=["default"])
+    print(
+        f"[finalize] recombined warm-start SFT(r={r_sft}) + GRPO(r={r_grpo}) -> one deployable "
+        f"rank-{r_sft + r_grpo} adapter at {grpo_adapter_dir} (serves on the catalog base)"
+    )
+    del model, base
+    return True
 
 
 def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:

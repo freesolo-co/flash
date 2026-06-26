@@ -312,9 +312,10 @@ Pick SFT when you already have good answers and want the model to imitate them.
   more.
 - **SFT is a great warm start for GRPO.** SFT first to teach the format and a competent
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
-  model and the same `lora_rank` / `lora_alpha`** — `init_from_adapter` loads a LoRA
-  adapter specific to one base model and one adapter shape, so mixing sizes is an
-  invalid shape mismatch.
+  model** — `init_from_adapter` is tied to one base model. The SFT adapter is merged into
+  the base at the start of GRPO, so `lora_rank` / `lora_alpha` are **independent of the SFT
+  run**: GRPO trains a fresh LoRA at whatever rank/alpha you set here, and the deployed
+  adapter is the SFT and GRPO LoRAs recombined onto the catalog base.
 
 ```toml
 # configs/rl.toml — warm-start GRPO from the SFT run's adapter
@@ -324,8 +325,8 @@ algorithm = "grpo"
 # paste the full adapter_ref `flash status <sft-run-id>` prints, verbatim
 # (shape: <owner>/<repo>:sft/<run-id>/seed0 — the owner/repo prefix is required)
 init_from_adapter = "your-org/your-repo:sft/<sft-run-id>/seed0"
-lora_rank = 32     # must match the SFT run
-lora_alpha = 64    # must match the SFT run
+lora_rank = 32     # free to differ from the SFT run (SFT is merged into the base)
+lora_alpha = 64    # free to differ from the SFT run
 ```
 
 SFT is **epoch-driven** (`epochs`); GRPO is **step-driven** (`steps`).

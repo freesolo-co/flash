@@ -59,6 +59,7 @@ from flash.engine.worker.adapter import (
     _download_adapter,
     _init_adapter_model,
     _resolve_adapter_ref,
+    combine_warmstart_into_adapter,
     make_lora,
     require_vllm_for_rollout_func,
 )
@@ -521,6 +522,7 @@ __all__ = [
     "assert_lora_applied",
     # grpo batching / no-op guards
     "build_grpo_prompt_dataset",
+    "combine_warmstart_into_adapter",
     "compute_grpo_batching",
     "disable_liger_grpo_torch_compile",
     # hf artifact channel
