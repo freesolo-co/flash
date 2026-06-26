@@ -811,8 +811,11 @@ def poll_job(
             # silent FIRST step (a cold vLLM rollout can run many minutes before global_step ticks to
             # 1); counting that as "training started" would drop the larger setup grace before any real
             # step ran and stall a perfectly healthy cold first step. Real per-step progress heartbeats
-            # carry global_step >= 1, so they still tighten the window.
-            is_training_hb = stage not in SETUP_HEARTBEAT_STAGES and int(hb_step or 0) >= 1
+            # carry global_step >= 1, so they still tighten the window. Coerce the step through
+            # _attempt_int (like the attempt above): a malformed/missing/non-numeric step must NOT raise
+            # inside the poll loop (no local handler would abort poll_job) — treat it as 0, i.e. keep
+            # the setup grace.
+            is_training_hb = stage not in SETUP_HEARTBEAT_STAGES and (_attempt_int(hb_step) or 0) >= 1
             if hb_attempt is not None and hb_attempt > last_hb_attempt:
                 # Newer attempt = a fresh worker after a retry/preemption. Attempts SHARE this run's HF
                 # heartbeat path, and the new worker restarts from cold setup, so reset the ts baseline

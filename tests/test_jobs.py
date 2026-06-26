@@ -630,6 +630,33 @@ def test_poll_job_gapfill_step0_does_not_tighten(monkeypatch):
     assert "during training" in res2.detail
 
 
+def test_poll_job_malformed_step_does_not_crash(monkeypatch):
+    # A heartbeat whose `step` is missing or non-numeric must NOT raise inside the poll loop (there is
+    # no local handler — a ValueError would abort poll_job). The step is coerced like `attempt`, so an
+    # unparseable step is treated as 0 (keep setup grace, don't tighten).
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    hbs = iter([{"stage": "rl_step", "step": "not-a-number", "ts": 1}])  # malformed step
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs, None),
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert res.failure == "stalled"  # did NOT raise
+    assert "during setup" in res.detail  # unparseable step -> treated as 0 -> setup grace kept
+    assert "limit 5000s" in res.detail
+
+
 def test_poll_job_older_attempt_heartbeat_does_not_reset_progress(monkeypatch):
     # Attempts (retries / preemptions) SHARE this run's HF heartbeat path. A prior attempt's worker,
     # still shutting down, can upload a heartbeat with an ADVANCING ts but a LOWER attempt number. By
