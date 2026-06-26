@@ -319,9 +319,6 @@ def test_heartbeat_rearms_watchdog_before_optional_upload(monkeypatch):
     # the submodule — resolve the module path explicitly.
     hbmod = importlib.import_module("flash.engine.worker.heartbeat")
 
-    if hbmod._STALL_FAULTHANDLER_S <= 0:
-        pytest.skip("stall watchdog disabled in this env")
-
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)

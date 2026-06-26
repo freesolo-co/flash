@@ -62,43 +62,19 @@ _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
 
-# Stall watchdog: a faulthandler that dumps every thread's stack and exits when NO heartbeat lands
-# for the window (re-armed on every heartbeat, so it only fires on a true hang) — turning a silent
-# wedge into an uploaded stack trace. DEFAULT-ON; this is the steady-state (training) window, with
-# the wider _STALL_STARTUP_GRACE_S used through cold start. Safe because every long phase keeps
-# heartbeating (init/prefetch/step liveness). Set FLASH_STALL_FAULTHANDLER_S=0 in [worker_env] to
-# disable, or lower it to localize a known hang.
-_STALL_FAULTHANDLER_S = 2400
-with contextlib.suppress(Exception):
-    _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "2400") or 2400)
-
-# Cold start (prefetch, weight load, vLLM/trainer build, the silent full-dataset tokenize) can run
-# many minutes with only coarse pings, so until the first training step the watchdog uses this wider
-# window for every arm. Kept STRICTLY LONGER than the providers' SETUP_GRACE_S (3000s) so a stuck
-# setup trips the provider's RETRIABLE path before this (exit=True) hard-fails it (asserted in tests).
-_STALL_STARTUP_GRACE_S = 3600
-# Stages that mean real TRAINING has begun (vs. a cold-start/setup ping). The first one tightens the
-# watchdog from the wide setup grace to the steady-state window. Mirrors the providers'
-# SETUP_HEARTBEAT_STAGES boundary: the cold-start stages there are setup, sft_step/rl_step are not.
-_STEP_STAGES = frozenset({"rl_step", "sft_step"})
-# False until the first per-step training heartbeat; until then every arm gets the startup grace.
-_SAW_STEP_HEARTBEAT = False
+# Stall watchdog: arm a faulthandler that, if NO heartbeat lands for the window, dumps every thread's
+# stack (C-level — fires even under a held GIL) and exits, turning a silent wedge into an uploaded
+# stack trace. Re-armed on every heartbeat, so it only fires on a true hang; safe because every long
+# phase keeps heartbeating (init / prefetch / per-step liveness). Always on. Kept longer than the
+# providers' setup grace (3000s) so a stuck SETUP trips the provider's RETRIABLE path before this
+# exit=True watchdog hard-fails the run (asserted in tests).
+_STALL_WATCHDOG_S = 3600
 
 
-def _rearm_stall_faulthandler(stage: str = "") -> None:
-    global _SAW_STEP_HEARTBEAT
-    if _STALL_FAULTHANDLER_S <= 0:
-        return
-    if stage in _STEP_STAGES:
-        _SAW_STEP_HEARTBEAT = True
-    # Until the first per-step training heartbeat the run is still in setup (prefetch, weight load,
-    # vLLM/trainer build, full-dataset render/tokenize) — phases that can run many minutes with only
-    # coarse (or no) progress pings — so widen to the startup grace so a healthy-but-slow setup
-    # can't trip the watchdog. Once training steps are flowing, tighten to the configured interval.
-    window = _STALL_FAULTHANDLER_S if _SAW_STEP_HEARTBEAT else max(_STALL_FAULTHANDLER_S, _STALL_STARTUP_GRACE_S)
+def _rearm_stall_faulthandler() -> None:
     with contextlib.suppress(Exception):
         faulthandler.cancel_dump_traceback_later()
-        faulthandler.dump_traceback_later(window, exit=True)
+        faulthandler.dump_traceback_later(_STALL_WATCHDOG_S, exit=True)
 
 
 def heartbeat(stage: str, **kw):
@@ -147,12 +123,10 @@ def heartbeat(stage: str, **kw):
         prev_last_upload = _w._HB_LAST_UPLOAD
         if upload_due:
             _w._HB_LAST_UPLOAD = now  # claim the slot under the lock (throttle stays atomic)
-    # Re-arm the stall watchdog NOW, off the LOCAL write that just landed — the live-progress signal
-    # is the local heartbeat, NOT the optional HF commit below. Re-arming after the upload (as before)
-    # let a stalled best-effort upload run out the timer and faulthandler-kill a worker that had
-    # already produced a live heartbeat. Pass the stage so the watchdog keeps the wide setup grace
-    # until the first rl_step/sft_step, then tightens for training.
-    _rearm_stall_faulthandler(stage)
+    # Re-arm the stall watchdog off the LOCAL write that just landed (not the optional HF commit
+    # below) — a stalled best-effort upload must not run out the timer on a worker that already
+    # produced a live heartbeat.
+    _rearm_stall_faulthandler()
     if upload_due:
         # Serialize the network commit under a SEPARATE lock so uploads can't reorder, and upload the
         # captured snapshot (via a private temp file, since hf_upload_file takes a path) rather than

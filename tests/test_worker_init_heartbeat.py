@@ -376,84 +376,30 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
 # the timer and the init/training heartbeats now keep ticking through slow-but-live phases.
 
 
-@pytest.mark.skipif(
-    "FLASH_STALL_FAULTHANDLER_S" in __import__("os").environ,
-    reason="env overrides the watchdog default under test",
-)
-def test_stall_watchdog_enabled_by_default():
+def test_stall_watchdog_always_on_and_outlasts_provider_grace():
     import importlib
 
-    # Note: ``from flash.engine.worker import heartbeat`` resolves to the re-exported heartbeat()
-    # FUNCTION, not the submodule — import the module path explicitly. Reload so the module-level
-    # defaults reflect the env AT TEST TIME, not whatever env was present when it was first imported
-    # (another test may have reloaded it under a patched env).
-    hb = importlib.reload(importlib.import_module("flash.engine.worker.heartbeat"))
+    # ``from flash.engine.worker import heartbeat`` resolves to the re-exported heartbeat() FUNCTION,
+    # not the submodule — import the module path explicitly.
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
 
-    assert hb._STALL_FAULTHANDLER_S >= 600, "stall watchdog must be ON by default so hangs self-dump"
-    # The setup window must be at least as wide as the steady-state window...
-    assert hb._STALL_STARTUP_GRACE_S >= hb._STALL_FAULTHANDLER_S
-    # ...and STRICTLY LONGER than the providers' setup grace, so a stuck setup trips the provider's
-    # RETRIABLE setup-stall path before this (exit=True) faulthandler hard-fails the run. Compare to
-    # the canonical provider value rather than a magic number so the two can't silently drift apart.
+    assert hb._STALL_WATCHDOG_S > 0, "stall watchdog is always on (no disable knob)"
+    # Strictly longer than the providers' setup grace so a stuck SETUP trips the provider's RETRIABLE
+    # path before this exit=True watchdog hard-fails the run. Compare to the canonical provider value
+    # so the two can't silently drift apart.
     from flash.providers.runpod import jobs as runpod_jobs
 
-    provider_setup_grace = runpod_jobs.stall_kwargs()["setup_grace_s"]
-    assert provider_setup_grace < hb._STALL_STARTUP_GRACE_S, (
-        "setup faulthandler window must be strictly longer than the provider setup_grace_s "
-        f"({hb._STALL_STARTUP_GRACE_S} vs {provider_setup_grace})"
-    )
+    assert runpod_jobs.stall_kwargs()["setup_grace_s"] < hb._STALL_WATCHDOG_S
 
 
-def test_stall_watchdog_disabled_via_worker_env(monkeypatch):
+def test_rearm_arms_the_single_window(monkeypatch):
     import importlib
 
     hb = importlib.import_module("flash.engine.worker.heartbeat")
-
-    monkeypatch.setenv("FLASH_STALL_FAULTHANDLER_S", "0")
-    try:
-        importlib.reload(hb)
-        assert hb._STALL_FAULTHANDLER_S == 0, "FLASH_STALL_FAULTHANDLER_S=0 must disable the watchdog"
-    finally:
-        monkeypatch.delenv("FLASH_STALL_FAULTHANDLER_S", raising=False)
-        importlib.reload(hb)  # restore to env-current state for the rest of the suite
-
-
-@pytest.mark.skipif(
-    "FLASH_STALL_FAULTHANDLER_S" in __import__("os").environ,
-    reason="env overrides the watchdog windows under test",
-)
-def test_stall_watchdog_stays_wide_until_first_training_step(monkeypatch):
-    """The watchdog must keep the WIDE setup grace for EVERY arm until the first per-step TRAINING
-    heartbeat (rl_step/sft_step) — not just the first arm. The whole cold start (prefetch, weight
-    load, vLLM/trainer build, and the silent full-dataset render/tokenize over a possibly-uncapped
-    dataset) runs before any rl_step/sft_step, so tightening on the first (setup) heartbeat would
-    false-kill a healthy-but-slow setup. The providers' SETUP_HEARTBEAT_STAGES draws the same line."""
-    import importlib
-
-    hb = importlib.reload(importlib.import_module("flash.engine.worker.heartbeat"))
-    if hb._STALL_FAULTHANDLER_S <= 0:
-        pytest.skip("watchdog disabled")
-
     windows: list = []
     monkeypatch.setattr(
         hb.faulthandler, "dump_traceback_later", lambda w, exit=False: windows.append(w)
     )
     monkeypatch.setattr(hb.faulthandler, "cancel_dump_traceback_later", lambda: None)
-
-    setup_window = max(hb._STALL_FAULTHANDLER_S, hb._STALL_STARTUP_GRACE_S)
-    assert setup_window > hb._STALL_FAULTHANDLER_S, (
-        "setup grace must be strictly wider than the training window (>= provider SETUP_GRACE_S), "
-        "else a slow silent setup phase gets only the tight training window"
-    )
-
-    # Every SETUP arm (start ping, prefetch ping, model load, init ping) keeps the wide setup grace.
-    for stage in ("rl_start", "model_prefetching", "sft_model_load", "rl_initializing"):
-        hb._rearm_stall_faulthandler(stage)
-        assert windows[-1] == setup_window, f"{stage} must keep the wide setup grace"
-
-    # The first per-step TRAINING heartbeat tightens to the steady-state window — and stays tight
-    # even if a late setup-shaped ping arrives afterward.
-    hb._rearm_stall_faulthandler("sft_step")
-    assert windows[-1] == hb._STALL_FAULTHANDLER_S, "first training step must tighten the watchdog"
-    hb._rearm_stall_faulthandler("rl_initializing")
-    assert windows[-1] == hb._STALL_FAULTHANDLER_S, "watchdog must stay tight once training started"
+    hb._rearm_stall_faulthandler()
+    assert windows == [hb._STALL_WATCHDOG_S], "every arm uses the single always-on window"
