@@ -532,29 +532,20 @@ def poll_hs_job(
                 if stage not in _SETUP_HEARTBEAT_STAGES:
                     seen_training_hb = True
         if became_active:
-            # Fast failover for a VM that reached 'ACTIVE' but never started a worker (sick region /
-            # wedged cloud-init): no fresh heartbeat AND no attempt-scoped host boot.log. A healthy
-            # box — even one still pulling the multi-GB image — emits its boot.log within ~2 min, so
-            # the log's ABSENCE past first_liveness_s means cloud-init/the worker never ran. 'stalled'
-            # is infra-shaped, so the runner escapes it cross-provider (PR #241) instead of burning
-            # the full setup grace (~50 min). The boot.log is read only AFTER the timer AND only until
-            # it's seen once (short-circuit + latch), so the normal cold-start path makes at most one
-            # extra HF read.
+            # Fast-failover: a VM that reached 'ACTIVE' but never started a worker (no fresh hb AND no
+            # attempt-scoped boot.log past first_liveness_s) is a wedged host -> 'stalled' (infra-shaped
+            # -> runner escapes cross-provider via #241), instead of burning the ~50min setup grace. A
+            # healthy box (even mid image-pull) emits its boot.log within ~2 min.
             if (
                 not seen_fresh_hb
                 and not boot_log_seen
                 and time.time() - active_since > first_liveness_s
             ):
-                # make_hf_text_reader returns None for BOTH a missing file AND a rate-limited/errored
-                # read, so a bare ``not boot_log_reader()`` would spuriously stall a healthy VM on a
-                # throttled poll. force=True bypasses the rate-limit (accurate absent-vs-present);
-                # ``is None`` keeps an empty "" boot.log counting as liveness (the file existing proves
-                # cloud-init ran); the latch then stops re-reading once the VM has proven itself.
+                # force=True bypasses the rate-limit so absent-vs-present is accurate; ``is None`` keeps
+                # an empty "" boot.log as liveness (its existence proves cloud-init ran), then latch.
                 if boot_log_reader(force=True) is None:
-                    # A lone None can also be a momentary HF/Hub network error (not a true absence), so
-                    # require the absence to PERSIST across consecutive polls before failing over — a
-                    # transient blip clears within a poll interval; a VM whose worker never started
-                    # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
+                    # A lone None can be a transient HF error -> require the absence to persist across
+                    # BOOT_LOG_ABSENT_POLLS before failing over, so a Hub blip doesn't burn a retry.
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
                         return PollResult(
