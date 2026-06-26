@@ -241,8 +241,10 @@ _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 #   * FLASH_*_KERNEL / FLASH_FP8_BASE / FLASH_TRITON_LORA — chalk kernel SELECTION is now fixed in
 #     engine.chalk_kernels._KERNELS (reads no env); a per-run flag is dead but still stripped.
 #   * FLASH_WORKER_DEPS / FLASH_WORKER_EXTRA_DEPS — the pinned WORKER_DEPS stack is authoritative.
-# Matched case-INSENSITIVELY (env keys are upper-cased on merge); FLASH_CHALK_SPEC is deliberately
-# NOT here — it is a still-supported install-SOURCE override (see build_worker_env's forward list).
+# Matched case-INSENSITIVELY (build_worker_env upper-cases each [worker_env] key ONLY for this
+# membership check — `ku = str(k).upper()`; the merge itself preserves the key's original casing).
+# FLASH_CHALK_SPEC is deliberately NOT here — it is a still-supported install-SOURCE override (see
+# build_worker_env's forward list).
 _REMOVED_OPTIMIZATION_ENV = frozenset(
     {
         "PYTORCH_ALLOC_CONF",

@@ -42,5 +42,7 @@ def publish_env(payload: dict, key: Annotated[dict, Depends(require_key)]):
     try:
         record_published_environment(slug=slug, name="" if _name is None else _name, key=key)
     except Exception as exc:
-        logger.warning("record_published_environment failed (non-fatal): %s", exc)
+        # exc_info=True keeps the full traceback for diagnosing unexpected failures (e.g. the
+        # urllib ValueError noted above) while the publish stays non-fatal.
+        logger.warning("record_published_environment failed (non-fatal): %s", exc, exc_info=True)
     return {"id": slug}
