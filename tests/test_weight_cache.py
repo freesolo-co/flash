@@ -417,6 +417,41 @@ def test_assign_weight_cache_does_not_override_existing():
     assert out.gpu.network_volume == "explicit-vol"  # an explicit/test value is never clobbered
 
 
+def test_assign_weight_cache_skips_oversized_catalog_model():
+    # SIZE GATE: the 35B MoE's ~70 GB checkpoint (peak ~140 GB with Xet temp) can't fit the fixed
+    # 100 GB shared cache. Attaching it would redirect HF_HOME onto the undersized mount and overflow
+    # mid-download — so the run is left cache-less and downloads to the (200 GB) container disk.
+    from flash import runner
+    from flash.catalog import MODELS
+
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    out = runner._assign_weight_cache_volume(
+        JobSpec(model=info.id, run_id="r", model_policy="catalog"), info
+    )
+    assert out.gpu.network_volume is None  # too big for the shared cache -> cache-less
+
+
+def test_assign_weight_cache_attaches_fitting_catalog_model():
+    # A model whose download fits the cache (with temp headroom) is still attached when info is passed.
+    from flash import runner
+    from flash.catalog import MODELS
+
+    info = MODELS["Qwen/Qwen3.5-9B"]  # ~19.4 GB download, peak ~39 GB < 100 GB
+    out = runner._assign_weight_cache_volume(
+        JobSpec(model=info.id, run_id="r", model_policy="catalog"), info
+    )
+    assert out.gpu.network_volume == "flash-weights"
+
+
+def test_fits_weight_cache_dense_models_fit_moe_does_not():
+    from flash import runner
+    from flash.catalog import MODELS
+
+    assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-35B-A3B"])  # 35B MoE overflows
+    for mid in ("openbmb/MiniCPM5-1B", "Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"):
+        assert runner._fits_weight_cache(MODELS[mid]), mid  # every dense catalog model fits
+
+
 def test_submit_job_assigns_weight_cache(monkeypatch):
     # Integration: the assignment is wired into submit_job and visible on the dry-run spec.
     from flash import runner

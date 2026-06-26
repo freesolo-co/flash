@@ -286,8 +286,28 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 WEIGHT_CACHE_VOLUME_GB = 100
 
+# Peak HF footprint during a cold download ~= the persisted bf16 checkpoint + Xet/incremental temp
+# ~= 2x the bf16 download. (This is exactly why the 35B MoE's catalog ``min_disk_gb`` is 200, not the
+# cache size — see its catalog comment.) A model whose peak doesn't fit the fixed cache volume must
+# stay cache-less, or HF_HOME would redirect onto the undersized mount and snapshot_download fills it.
+_WEIGHT_CACHE_PEAK_FACTOR = 2.0
 
-def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
+
+def _fits_weight_cache(info: ModelInfo) -> bool:
+    """Whether a model's cold HF download fits the fixed shared weight-cache volume WITH temp headroom.
+
+    Attaching the shared cache redirects HF_HOME onto a fixed ``WEIGHT_CACHE_VOLUME_GB`` mount, so the
+    download's PEAK footprint (checkpoint + Xet temp, ~= ``_WEIGHT_CACHE_PEAK_FACTOR`` x the bf16
+    download) must fit. A model that doesn't fit (e.g. the ~70 GB Qwen3.6-35B-A3B, whose peak ~140 GB
+    exceeds the 100 GB cache) is left cache-less so HF_HOME stays on the larger container disk (sized
+    by the catalog ``min_disk_gb``) instead of overflowing the mount mid-download."""
+    if not info.params_b:
+        return True  # unknown size -> keep the (attach) default; curated catalog models always set it
+    download_gb = info.params_b * 2.0  # bf16: 2 bytes/param (mirrors cost.facts.download_weight_gb)
+    return _WEIGHT_CACHE_PEAK_FACTOR * download_gb <= WEIGHT_CACHE_VOLUME_GB
+
+
+def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:
     """Attach the shared, platform-managed weight-cache volume — ONLY for PUBLIC catalog models.
 
     Platform-managed (never user config), exactly like the managed HF repo: assigned here, not
@@ -313,9 +333,16 @@ def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
     mount. A different (per-org / custom) volume name on an open run is left intact: that's the
     escape-hatch isolation, not the shared cache.
 
+    SIZE GATE: the cache is a FIXED ``WEIGHT_CACHE_VOLUME_GB`` mount and attaching it redirects HF_HOME
+    onto it, so a model whose cold download wouldn't fit (``_fits_weight_cache``, e.g. the ~70 GB 35B
+    MoE on a 100 GB cache) is left cache-less — HF_HOME stays on the larger container disk instead of
+    overflowing the mount mid-``snapshot_download``. Requires ``info`` (the resolved ``ModelInfo``); a
+    bare ``info=None`` call skips the size gate (preserves the legacy attach-by-policy behavior).
+
     Outcomes: (a) open-model run -> never on the SHARED cache (strip it if pre-set; keep a non-shared
     volume); (b) catalog run with a pre-set volume -> left as-is (explicit/test assignment honored);
-    (c) catalog run with no volume -> attach the shared cache.
+    (c) catalog run with no volume that FITS the cache -> attach the shared cache; (d) catalog run
+    whose download exceeds the cache -> left cache-less (download to the container disk instead).
 
     See the module-level TRUST MODEL note above for the shared-cache integrity tradeoff (a run's env
     code has write access to the shared mount; RO mount isn't SDK-expressible yet).
@@ -334,6 +361,11 @@ def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
         return spec  # no shared cache to strip (cache-less already, or a non-shared escape-hatch volume)
     if existing:
         return spec  # catalog run with an explicit/test volume already assigned — honor it
+    # SIZE GATE: don't pin a model whose cold download won't fit the fixed shared cache — HF_HOME would
+    # redirect onto the undersized mount and snapshot_download would fill it ("No space left"). Such a
+    # model stays cache-less so HF_HOME stays on the container disk (sized by the catalog min_disk_gb).
+    if info is not None and not _fits_weight_cache(info):
+        return spec
     d = spec.to_dict()
     d["gpu"] = {
         **d["gpu"],
@@ -415,8 +447,10 @@ def submit_job(
     spec = _assign_managed_hf_repo(spec)
     # Attach the shared model-weight cache (platform-managed). Before the RunStatus build so a
     # dry-run spec carries it too (the dry-run short-circuits below) — keeps the assignment testable
-    # without a real provision and visible in `flash status`.
-    spec = _assign_weight_cache_volume(spec)
+    # without a real provision and visible in `flash status`. ``info`` (the resolved ModelInfo) lets
+    # the size gate leave an oversized model (e.g. the 35B MoE) cache-less rather than overflow the
+    # fixed-size mount.
+    spec = _assign_weight_cache_volume(spec, info)
     # NB: the env ref->sha pin (_assign_resolved_env_sha) makes a GitHub commits-API call, so it is
     # deliberately NOT done here, on the run-creation critical path. The status is created + saved +
     # reported FIRST (below) so creation never blocks/delays on a slow or rate-limited GitHub — the
