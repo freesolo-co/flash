@@ -114,6 +114,7 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
     checkpoint-upload daemon during GRPO. There is no worker-local heartbeat file (the control plane
     reads the HF copy), so each call must hand its HF upload a COMPLETE, valid JSON snapshot (never a
     truncated/interleaved one) and leave no upload temp files behind."""
+    import contextlib
     import glob
     import json
     import threading as _threading
@@ -121,6 +122,12 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
     import flash.engine.worker as ne
 
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)  # force every call through the upload path
+
+    # Remove any stale upload temp files a prior failed run (or another process) left behind, so the
+    # end-of-test "no temp files" assertion measures only THIS test's cleanup, not pre-existing cruft.
+    for _stale in glob.glob("/tmp/.hb-upload-*"):
+        with contextlib.suppress(OSError):
+            os.remove(_stale)
 
     bad: list[Exception] = []
 
@@ -166,6 +173,7 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     separate _HB_UPLOAD_LOCK and uploads the bytes captured under _HB_LOCK. This asserts:
     (1) uploads never overlap (serialized), and (2) every upload's bytes match the payload
     the caller wrote (no stale/re-read mismatch)."""
+    import contextlib
     import glob
     import json
     import threading as _threading
@@ -173,7 +181,13 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
 
     import flash.engine.worker as ne
 
-    os.environ["HF_REPO"] = ""
+    monkeypatch.setenv("HF_REPO", "")  # scoped to this test (auto-restored), not a raw os.environ write
+
+    # Clear stale upload temp files up front so the end-of-test "no temp files" assertion isn't a false
+    # failure against cruft from a prior failed run or another process on the same host.
+    for _stale in glob.glob("/tmp/.hb-upload-*"):
+        with contextlib.suppress(OSError):
+            os.remove(_stale)
 
     inflight = 0
     max_inflight = 0
