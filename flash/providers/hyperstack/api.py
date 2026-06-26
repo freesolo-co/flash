@@ -66,13 +66,16 @@ _FLAVORS_TTL_S = 45.0
 _flavors_cache: dict[str, Any] = {"ts": 0.0, "by_region": None}
 
 
-# Regions excluded from allocation + launch. CANADA-1's on-demand stock is a known-broken-driver
-# fleet: instances reach ACTIVE then die without a DONE sentinel (NVML init failure / cuda
-# unavailable), so launching there burns GPU budget on guaranteed-failed retries. Skip it by default
-# rather than waterfall through it. Override with HYPERSTACK_BLOCKED_REGIONS (comma-separated): unset
-# -> the default below; set (even to "") -> exactly that list, so operators can re-enable CANADA-1
-# (HYPERSTACK_BLOCKED_REGIONS="") or block others once capacity/driver health changes.
-_DEFAULT_BLOCKED_REGIONS = frozenset({"CANADA-1"})
+# Regions statically excluded from allocation + launch. EMPTY by default: a one-off regional/driver
+# outage is handled by fast-failover (a stuck instance trips FIRST_LIVENESS_S -> stalled -> the
+# cross-provider GPU walk moves on) rather than a hand-edited denylist. CANADA-1 USED to be hard-banned
+# here for a known-broken-driver L40 fleet (instances reached ACTIVE then died with an NVML init
+# failure / cuda unavailable); a live re-probe on 2026-06-26 confirmed that fleet recovered (L40,
+# driver 570.195.03, nvidia-smi clean), so the static ban is lifted. Override with
+# HYPERSTACK_BLOCKED_REGIONS (comma-separated) to hard-block a region the moment its driver/capacity
+# health regresses again, without a code change: unset -> the default below (none); set (even to "")
+# -> exactly that list.
+_DEFAULT_BLOCKED_REGIONS: frozenset[str] = frozenset()
 
 
 def _blocked_regions() -> set[str]:

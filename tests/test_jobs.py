@@ -119,6 +119,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
         "step": 12,
         "loss": 1.23456,
         "ts": 123.0,
+        "attempt": 0,
         "gpu": {
             "device_name": "RTX 5090",
             "driver_version": "575.57",
@@ -138,7 +139,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
 
     key, stage = surface_heartbeat(lambda: hb, None, lines.append)
 
-    assert key == ("sft_step", 12, 123.0)
+    assert key == ("sft_step", 12, 123.0, 0)  # attempt is part of the key (shared seed hb path)
     assert stage == "sft_step"
     assert len(lines) == 1
     line = lines[0]
@@ -851,6 +852,62 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
             orch.submit_job(_spec("fail-fast"), dry_run=False, background=False)
         assert calls["n"] == 1
         assert orch.get_status("fail-fast").state == "failed"
+
+
+def test_supervisor_infra_failure_retries_up_to_floor(monkeypatch):
+    """A STREAK of infra-shaped failures (broken/busy GPU -> stalled/job_preempted) walks past up to
+    INFRA_RETRY_FLOOR hosts even though the spec's max_retries is only 2 — so a run of bad GPUs finds a
+    healthy host instead of dying on the small default budget. (Genuine worker errors still fail fast:
+    test_supervisor_does_not_retry_worker_code_errors.)"""
+    from flash.runner.lifecycle import INFRA_RETRY_FLOOR
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        calls = {"n": 0}
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            calls["n"] += 1
+            return jobs.PollResult(False, failure="stalled", detail="GPU never became ready")
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        with pytest.raises(RuntimeError):
+            orch.submit_job(_spec("infra-floor"), dry_run=False, background=False)  # max_retries=2
+        # floor=5 -> 6 attempts (walk 0..5), NOT the 3 the raw max_retries=2 would give.
+        assert calls["n"] == INFRA_RETRY_FLOOR + 1
+        assert orch.get_status("infra-floor").state == "failed"
+
+
+def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
+    """An explicit max_retries=0 (deliberate single-shot) is NOT forced to retry by the infra floor."""
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        calls = {"n": 0}
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            calls["n"] += 1
+            return jobs.PollResult(False, failure="stalled", detail="frozen")
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        spec = JobSpec(
+            run_id="no-retry", model="Qwen/Qwen3.5-0.8B", algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1), gpu=GpuSpec(type="RTX 4090", max_retries=0),
+        )
+        with pytest.raises(RuntimeError):
+            orch.submit_job(spec, dry_run=False, background=False)
+        assert calls["n"] == 1  # single shot — floor does not apply at max_retries=0
+        assert orch.get_status("no-retry").state == "failed"
 
 
 def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):

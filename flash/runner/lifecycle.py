@@ -17,6 +17,14 @@ import time
 
 from flash.spec import JobSpec
 
+# Floor on the GPU-walk budget for INFRA-shaped failures (broken/busy GPU, stall, preemption,
+# no-capacity) when the user left retries enabled. A broken/busy rented GPU (NVML-init fail /
+# cudaErrorDevicesUnavailable) is pure infra bad-luck and cheap to walk past, so a healthy host
+# should be found rather than a streak of bad ones killing the run on the default ``max_retries`` (2).
+# Genuine training errors are NON-infra and still fail fast (no retry). An explicit ``max_retries==0``
+# (single-shot, no retries) is respected — the floor only applies when retries are enabled.
+INFRA_RETRY_FLOOR = 5
+
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
@@ -181,6 +189,10 @@ def _submit_seed_supervised(
                 runpod_api.delete_endpoint(eid)
 
     max_retries = int(spec.gpu.max_retries)
+    # The effective GPU-walk budget for infra-shaped failures: floored to INFRA_RETRY_FLOOR so a streak
+    # of broken/busy GPUs is walked past to a healthy host, but only when the user left retries enabled
+    # (max_retries==0 stays 0 — a deliberate single-shot run is never forced to retry).
+    infra_budget = max(max_retries, INFRA_RETRY_FLOOR) if max_retries else 0
     last_detail = None
     # Sticky: once a no-capacity failure shows the weight-cache datacenter set is starved, drop the
     # cache (volume) for every remaining attempt so they run on the unrestricted all-DC pool.
@@ -211,7 +223,7 @@ def _submit_seed_supervised(
     # (the fallback would silently steal the only user retry). ``walk_attempt`` = attempt index with the
     # cache-drop attempt(s) removed, so the GPU walk gets its full budget AFTER a cache drop.
     cache_drop_consumed = 0
-    for attempt in range(max_retries + 1 + cache_fallback_attempts):
+    for attempt in range(infra_budget + 1 + cache_fallback_attempts):
         walk_attempt = attempt - cache_drop_consumed
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
@@ -317,7 +329,7 @@ def _submit_seed_supervised(
                 and chosen.provider == "runpod"
             )
             on_last_gpu = len(untried) <= 1 or (
-                walk_attempt >= max_retries and not cache_fallback_available
+                walk_attempt >= infra_budget and not cache_fallback_available
             )
             # Mirror into the closure cell so on_handle persists THIS attempt's value (see
             # current_on_last_gpu) for a recovery to reproduce the same stall tuning.
@@ -353,7 +365,7 @@ def _submit_seed_supervised(
                 # GraphQL "Something went wrong" x3 during a retry deploy). That must
                 # consume a retry, not kill the run — the budget exists precisely for flakes.
                 res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
-                if attempt < max_retries:
+                if attempt < infra_budget:
                     time.sleep(10 * (attempt + 1))  # let the transient clear
         if res.ok:
             # A best-effort cancel may fail to stop the worker, which then completes
@@ -412,7 +424,7 @@ def _submit_seed_supervised(
         # continues with the reserved cache-less fallback attempt.
         print(
             f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < max_retries or first_cache_drop) else 'not retrying'}"
+            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < infra_budget or first_cache_drop) else 'not retrying'}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
@@ -423,7 +435,7 @@ def _submit_seed_supervised(
         # available. The bonus attempt granted above is reserved for exactly this transition; once the
         # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
         # and the loop cannot spin past its one extra cache-less attempt.
-        if walk_attempt >= max_retries and not first_cache_drop:
+        if walk_attempt >= infra_budget and not first_cache_drop:
             break
         if first_cache_drop:
             drop_weight_cache = True
