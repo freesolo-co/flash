@@ -168,6 +168,27 @@ def prefetch_model(model_id: str) -> float:
     from huggingface_hub import snapshot_download
 
     t0 = time.time()
+    # snapshot_download blocks with NO heartbeat until it returns, but a cold cache can pull tens of
+    # GB over many minutes — longer than the stall-faulthandler window (heartbeat.py) AND the
+    # provider setup grace. The preceding ``rl_start``/``sft_start`` heartbeat already armed the
+    # watchdog, so a silent long download would look like a hang and self-kill a HEALTHY cold start.
+    # Ping a progress heartbeat on a side thread so the download counts as real progress: it re-arms
+    # the watchdog and keeps the control plane / provider setup grace seeing liveness throughout.
+    _prefetch_done = threading.Event()
+
+    def _prefetch_heartbeat() -> None:
+        while not _prefetch_done.wait(30.0):
+            # nvidia-smi-only (include_torch=False): the GPU isn't in use yet and torch telemetry
+            # could block; this just needs to prove the worker is alive and re-arm the watchdog.
+            _w.heartbeat(
+                "model_prefetching",
+                model=model_id,
+                elapsed_seconds=round(time.time() - t0, 1),
+                gpu=gpu_diagnostics(include_torch=False),
+            )
+
+    _prefetch_hb = threading.Thread(target=_prefetch_heartbeat, daemon=True)
+    _prefetch_hb.start()
     try:
         snapshot_download(
             repo_id=model_id,
@@ -178,6 +199,9 @@ def prefetch_model(model_id: str) -> float:
         # Surface but don't fail here: gated/local-only models still load fine through
         # the normal from_pretrained path the trainer uses next.
         print("prefetch_model warn:", e)
+    finally:
+        _prefetch_done.set()
+        _prefetch_hb.join(timeout=5.0)
     secs = round(time.time() - t0, 1)
     _w.heartbeat(
         "model_prefetched",

@@ -74,7 +74,9 @@ with contextlib.suppress(Exception):
 # heartbeat and the first per-step one, exceeding a tight FLASH_STALL_FAULTHANDLER_S window and
 # tripping the watchdog on a HEALTHY run. So the very first arm uses a wider window (at least
 # FLASH_STALL_FAULTHANDLER_STARTUP_S, default 2400s) and only once real progress has re-armed it do
-# we tighten to the configured interval. OFF inherits from _STALL_FAULTHANDLER_S (0 -> disabled).
+# we tighten to the configured interval. This always reads its OWN env var (independent of
+# FLASH_STALL_FAULTHANDLER_S); it is simply never consulted when the watchdog is disabled
+# (_STALL_FAULTHANDLER_S <= 0 -> _rearm_stall_faulthandler returns before arming).
 _STALL_STARTUP_GRACE_S = 2400
 with contextlib.suppress(Exception):
     _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "2400") or 2400)

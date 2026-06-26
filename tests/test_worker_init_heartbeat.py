@@ -158,6 +158,33 @@ def test_sft_init_heartbeat_disables_torch_telemetry():
 
 
 # --------------------------------------------------------------------------------------------
+# prefetch_model: snapshot_download blocks with NO heartbeat until it returns. A cold cache can pull
+# tens of GB for many minutes — longer than the stall watchdog AND the provider setup grace — so the
+# download must ping a progress heartbeat (re-arming the watchdog) or a HEALTHY long fetch self-kills.
+def test_prefetch_model_heartbeats_during_download():
+    from flash.engine.worker import hf
+
+    node = _inner_func_node(hf.prefetch_model, "_prefetch_heartbeat")
+    assert node is not None, (
+        "prefetch_model no longer pings a heartbeat during snapshot_download — a long cold-cache "
+        "download would look like a hang and trip the stall watchdog / provider setup grace"
+    )
+    # nvidia-smi only (the GPU isn't in use yet, and torch telemetry could block).
+    _assert_gpu_diag_disables_torch(node, "prefetch_model._prefetch_heartbeat")
+    # ...and it must emit the progress stage that proves liveness + re-arms the watchdog.
+    stages = [
+        n.args[0].value
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "heartbeat"
+        and n.args
+        and isinstance(n.args[0], ast.Constant)
+    ]
+    assert "model_prefetching" in stages, f"expected a model_prefetching heartbeat, got {stages}"
+
+
+# --------------------------------------------------------------------------------------------
 # Stall watchdog default. A true hang (no heartbeat for the window) must self-dump every thread's
 # stack and fail the run instead of wedging silently until the control-plane kill (the
 # "process wedged, no console upload" gap). This is safe-by-default because every heartbeat re-arms
@@ -165,15 +192,21 @@ def test_sft_init_heartbeat_disables_torch_telemetry():
 
 
 @pytest.mark.skipif(
-    "FLASH_STALL_FAULTHANDLER_S" in __import__("os").environ,
-    reason="env overrides the default under test",
+    bool(
+        {"FLASH_STALL_FAULTHANDLER_S", "FLASH_STALL_FAULTHANDLER_STARTUP_S"}
+        & set(__import__("os").environ)
+    ),
+    # Both knobs are asserted below; either one set in the env overrides the defaults under test.
+    reason="env overrides the watchdog default(s) under test",
 )
 def test_stall_watchdog_enabled_by_default():
     import importlib
 
     # Note: ``from flash.engine.worker import heartbeat`` resolves to the re-exported heartbeat()
-    # FUNCTION, not the submodule — import the module path explicitly.
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    # FUNCTION, not the submodule — import the module path explicitly. Reload so the module-level
+    # defaults reflect the env AT TEST TIME, not whatever env was present when it was first imported
+    # (another test may have reloaded it under a patched env).
+    hb = importlib.reload(importlib.import_module("flash.engine.worker.heartbeat"))
 
     assert hb._STALL_FAULTHANDLER_S >= 600, "stall watchdog must be ON by default so hangs self-dump"
     # The first-arm startup grace must be at least as wide as the steady-state window.
