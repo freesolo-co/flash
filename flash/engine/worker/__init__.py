@@ -1777,6 +1777,22 @@ def _grpo_is_no_op_failure(reward_history, resume_ckpt, target_steps: int, steps
     return not _grpo_resume_already_complete(resume_ckpt, target_steps, steps_run)
 
 
+def grpo_mask_truncated_completions(train) -> bool:
+    """Whether GRPO should drop TRUNCATED (non-EOS) completions from the loss.
+
+    Default True (TRL's footgun is off-by-default): a completion cut at
+    max_completion_length without an EOS is not a real sample from the policy's
+    distribution over finished sequences, so training on it biases the policy
+    gradient and — on envs that frequently hit the budget — can degrade the model
+    below its SFT start. GATED OFF when ``stop_sequences`` is set, because TRL flags
+    truncation by "last token != EOS/PAD" and a stop-string rollout terminates on the
+    stop *string* (stripped from the output, so the last token is not EOS); masking
+    would then wrongly drop every normally-terminated completion and the run would
+    learn nothing. ``stop_sequences`` defaults to () (the common case → on).
+    """
+    return not (train and train.stop_sequences)
+
+
 def run_rl():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -2170,7 +2186,9 @@ def run_rl():
         # constant batch*max_completion_length (not mask.sum()), so masking every completion in a
         # batch yields a 0 loss / 0 gradient — safe, never a divide-by-zero. TRL>=1.6 also applies
         # this mask to the multi-turn tool/env mask, so the rollout_func path is covered too.
-        "mask_truncated_completions": True,
+        # GATED OFF when stop_sequences is set (see grpo_mask_truncated_completions): TRL flags
+        # truncation by "last token != EOS/PAD", but a stop-string rollout's last token is not EOS.
+        "mask_truncated_completions": grpo_mask_truncated_completions(_t),
         # Optimizer: 8-bit paged AdamW (int8 state paged to host RAM -> fits a smaller GPU);
         # colocated GRPO (trainer + vLLM on one GPU) is memory-tight, so this is the right default.
         "optim": fused_optim_name(),

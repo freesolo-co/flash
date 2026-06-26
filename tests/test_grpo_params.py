@@ -602,24 +602,46 @@ def test_build_grpo_prompt_dataset_keeps_columns_arrow_safe() -> None:
     assert [e["metadata"]["param"] for e in mapped] == [12, 8, "gentle", 8]
 
 
-def test_grpo_recipe_masks_truncated_completions() -> None:
-    """run_rl pins mask_truncated_completions=True so GRPO never trains on the loss of a
-    completion that ran to max_completion_length without an EOS.
+def test_grpo_masks_truncated_completions_by_default() -> None:
+    """GRPO drops truncated (non-EOS) completions from the loss by default.
 
     TRL's GRPOConfig default is False (it WOULD train on truncated rollouts); a truncated
     completion is not a real sample from the policy's distribution over finished sequences, so
     including it biases the policy gradient and — on long-completion / multi-turn envs that
-    frequently hit the budget — can degrade the model below its SFT start. This is a stable
-    recipe constant (not a per-run knob), so guard it at the source.
+    frequently hit the budget — can degrade the model below its SFT start.
     """
-    import inspect
-
     import flash.engine.worker as w
 
-    src = inspect.getsource(w.run_rl)
-    assert '"mask_truncated_completions": True' in src, (
-        "run_rl must pin mask_truncated_completions=True in the GRPO recipe"
+    # No stop_sequences (the common case) -> masking ON.
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "environment": {"id": "owner/env"},
+            "train": {"seeds": [0]},
+        }
     )
+    assert w.grpo_mask_truncated_completions(spec.train) is True
+    # Defensive: a None train spec (no JOB_SPEC) still resolves to the safe default (ON).
+    assert w.grpo_mask_truncated_completions(None) is True
+
+
+def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
+    """With stop_sequences, vLLM strips the stop string so a normally-terminated completion does
+    NOT end in EOS — TRL's "last token != EOS" truncation check would then flag (and mask) every
+    completion, so the run would learn nothing. Gate the flag OFF in that case."""
+    import flash.engine.worker as w
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "environment": {"id": "owner/env"},
+            "train": {"seeds": [0], "stop_sequences": ["</answer>"]},
+        }
+    )
+    assert spec.train.stop_sequences == ("</answer>",)
+    assert w.grpo_mask_truncated_completions(spec.train) is False
 
 
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override() -> None:
