@@ -14,11 +14,17 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY . .
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates git curl \
+    && curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
+    && apt-get update && apt-get install -y --no-install-recommends infisical \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod +x /app/infisical-entrypoint.sh
 RUN pip install --no-cache-dir ".[server]"
 
 VOLUME /root/.flash
 EXPOSE 8080
 
+# secret injection wrapper: no-op passthrough unless INFISICAL_CLIENT_ID is set, else
+# `infisical login` (universal-auth) then `infisical run --path /flash` before the server.
+ENTRYPOINT ["/app/infisical-entrypoint.sh"]
 CMD ["python", "-m", "flash.server", "--host", "0.0.0.0", "--port", "8080"]
