@@ -19,6 +19,7 @@ from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
+    build_completion_mask,
     gdn_packing_available,
     model_is_gdn_hybrid,
     model_is_pure_attention,
@@ -89,12 +90,22 @@ def run_sft():
         completion = env.sft_completion(ex)
         if len(completion) > 1:  # a multi-turn target trajectory (vs a single assistant turn)
             multiturn_targets += 1
-        msgs = [*env.prompt_messages(ex), *completion]
+        prompt_messages = env.prompt_messages(ex)
+        msgs = [*prompt_messages, *completion]
         texts.append(
             {
                 "text": tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=False, enable_thinking=_w.THINKING
-                )
+                ),
+                # The prompt rendered exactly as serving renders it for generation (the chat preamble
+                # + the assistant generation prompt). Used to locate the prompt/completion token
+                # boundary for completion-only loss (the prompt tokens are masked from the loss). For
+                # a multi-turn target trajectory this is just the INITIAL prompt — the whole target
+                # transcript after it is the completion (the model learns the tool-call protocol +
+                # replies), matching flash's multi-turn SFT intent.
+                "prompt_text": tok.apply_chat_template(
+                    prompt_messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
+                ),
             }
         )
     if multiturn_targets:
@@ -111,7 +122,8 @@ def run_sft():
             "trace — training on non-reasoning targets teaches the model to SKIP "
             "thinking. Use a dataset with reasoning traces, or set thinking = false."
         )
-    ds = Dataset.from_list(texts)
+    # The dataset is pre-tokenized into {input_ids, completion_mask} once sft_max_len is known
+    # (below) — a single boundary shared by the unpacked, TRL-bfd-packed, and flash-packed paths.
 
     setup_seconds = time.time() - t_start
     _w.heartbeat("sft_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
@@ -133,6 +145,26 @@ def run_sft():
         if _t and _t.max_length is not None
         else (RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len)
     )
+    # Pre-tokenize ONCE into {input_ids, completion_mask}. input_ids is the full rendered transcript
+    # (+EOS, truncated to sft_max_len) — token-identical to TRL's own non-packed SFT prep, see
+    # tokenize_for_packing. completion_mask is 0 over the prompt tokens and 1 over the completion (the
+    # assistant turn[s] to learn). This SINGLE representation feeds every path: TRL's unpacked collator
+    # and TRL-bfd packing read input_ids+completion_mask directly, and flash's SDPA / GDN packing
+    # reuses these same ids+masks via pack_token_ids(completion_masks=...). With completion_only_loss
+    # (set on the SFTConfig below) the loss is computed only on the completion — the prompt is masked.
+    _full_ids = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
+    _pretok = [
+        {"input_ids": ids, "completion_mask": build_completion_mask(t["prompt_text"], ids, tok, sft_max_len)}
+        for t, ids in zip(texts, _full_ids, strict=True)
+    ]
+    ds = Dataset.from_list(_pretok)
+    _masked_tok = sum(m.count(0) for m in (r["completion_mask"] for r in _pretok))
+    _total_tok = sum(len(r["input_ids"]) for r in _pretok)
+    if _total_tok:
+        print(
+            f"[sft] completion-only loss: masking {_masked_tok}/{_total_tok} "
+            f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
+        )
     # batch_size is the GLOBAL/effective batch; sft_grad_accum sizes the per-device micro-batch +
     # grad-accum to realize it (shared with the cost estimator's step count, see engine.vram).
     effective_batch = (
@@ -202,7 +234,11 @@ def run_sft():
         # Non-reentrant checkpointing: composes cleanly with autograd hooks (verl #3629) and is
         # required by TRL for correct grad flow through the LoRA adapters.
         "gradient_checkpointing_kwargs": {"use_reentrant": False},
-        "completion_only_loss": False,
+        # Train the loss on the completion only — the prompt tokens are masked (labels -100) via the
+        # per-row completion_mask built above (and threaded through packing). This is standard
+        # instruction-tuning SFT: the model isn't graded on reproducing its own prompt, so the
+        # gradient signal concentrates on the assistant turn it must learn to generate.
+        "completion_only_loss": True,
         # Optimizer: 8-bit paged AdamW (int8 state paged to host RAM -> fits a smaller GPU).
         "optim": fused_optim_name(),
     }
@@ -304,10 +340,13 @@ def run_sft():
         cfg_kwargs["dataset_kwargs"] = _dk
         cfg_kwargs["remove_unused_columns"] = False
 
-        # Tokenize EXACTLY like TRL's non-packed prep (EOS-append parity so the model still learns to
-        # stop; batched; truncate to max_length) then bin-pack into <= max_length blocks.
-        _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
-        _packed_rows = pack_token_ids(_tokenized, sft_max_len)
+        # Reuse the single pre-tokenization (_pretok) — the SAME input_ids the unpacked path sees
+        # (EOS-append parity, truncated to max_length) — and bin-pack into <= max_length blocks. The
+        # parallel completion_mask rides along so completion-only loss survives packing (the collator
+        # masks each packed example's prompt tokens out of the loss).
+        _ids = [r["input_ids"] for r in _pretok]
+        _cmask = [r["completion_mask"] for r in _pretok]
+        _packed_rows = pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)
         ds = Dataset.from_list(_packed_rows)
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
         # Memory: re-size the per-device micro-batch (in BLOCKS) for the full-block [pd, max_length,
@@ -324,14 +363,14 @@ def run_sft():
         # so pd can be 4, and at long context that mask alone is GBs. Cap pd so the mask stays <=512MB
         # (a no-op at short ctx: at T=2048 it allows pd up to ~125; it only bites past ~12k tokens).
         _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
-        _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
+        _ex_per_block = len(_ids) / max(1, len(_packed_rows))
         cfg_kwargs["per_device_train_batch_size"] = _pd_pack
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, _pd_pack * _ex_per_block))
         )
         print(
             "[sft] true token packing ENABLED (4D block-diagonal SDPA mask): "
-            f"{len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} ex/block, "
+            f"{len(_ids)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} ex/block, "
             f"{packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} tok; "
             f"pd={_pd_pack} ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept "
             f"~{effective_batch} ex); no flash-attn / no flex_attention"
@@ -354,20 +393,22 @@ def run_sft():
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
         cfg_kwargs["remove_unused_columns"] = False
-        # EOS-append parity + batched + truncated tokenization (same as the unpacked path), then pack.
-        _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
-        _packed_rows = pack_token_ids(_tokenized, sft_max_len)
+        # Reuse the single pre-tokenization (_pretok, same input_ids as the unpacked path), then pack;
+        # the parallel completion_mask rides along so completion-only loss survives packing.
+        _ids = [r["input_ids"] for r in _pretok]
+        _cmask = [r["completion_mask"] for r in _pretok]
+        _packed_rows = pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)
         ds = Dataset.from_list(_packed_rows)
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
         # cu_seqlens spans ONE packed block, so per-device is a single block; keep the effective batch
         # in EXAMPLES at the configured value via grad-accum (each block holds ~ex_per_block examples —
         # without this the effective batch would balloon ~ex_per_block-fold -> undertraining).
-        _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
+        _ex_per_block = len(_ids) / max(1, len(_packed_rows))
         cfg_kwargs["per_device_train_batch_size"] = 1
         cfg_kwargs["gradient_accumulation_steps"] = max(1, math.ceil(effective_batch / max(1.0, _ex_per_block)))
         print(
             "[sft] true token packing ENABLED for GatedDeltaNet hybrid (4D mask + cu_seqlens/seq_idx "
-            f"varlen): {len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} "
+            f"varlen): {len(_ids)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} "
             f"ex/block, {packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} "
             f"tok; pd=1 ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept ~{effective_batch} ex)"
         )

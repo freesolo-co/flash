@@ -185,7 +185,11 @@ def gdn_packing_available(model_id: str | None = None) -> bool:
         return False
 
 
-def pack_token_ids(sequences: list[list[int]], max_length: int) -> list[dict]:
+def pack_token_ids(
+    sequences: list[list[int]],
+    max_length: int,
+    completion_masks: list[list[int]] | None = None,
+) -> list[dict]:
     """Greedily bin-pack tokenized examples into blocks of at most ``max_length`` tokens WITHOUT
     splitting an example (first-fit-decreasing, like TRL's ``bfd``: tighter blocks = less padding).
 
@@ -193,25 +197,55 @@ def pack_token_ids(sequences: list[list[int]], max_length: int) -> list[dict]:
     unpacked trainer's right-truncation). Empty sequences are dropped. Returns rows shaped
     ``{"input_ids": [...], "seq_lengths": [l1, l2, ...]}`` where ``sum(seq_lengths) == len(input_ids)``
     — the collator turns ``seq_lengths`` into the block-diagonal mask + per-example position_ids.
+
+    ``completion_masks`` (optional, parallel to ``sequences``): per-token completion flags (1 = a
+    completion token trained on, 0 = a prompt token masked from the loss). When provided, each packed
+    row additionally carries a ``"completion_mask"`` aligned with its ``"input_ids"`` so completion-
+    only SFT loss survives packing (the collator turns it into per-token label masking). Each mask is
+    truncated to ``max_length`` in lockstep with its sequence, so the per-example invariant holds.
     """
     if max_length <= 0:
         raise ValueError(f"max_length must be positive, got {max_length}")
-    seqs = [s[:max_length] for s in sequences if s]
+    if completion_masks is not None and len(completion_masks) != len(sequences):
+        raise ValueError(
+            f"completion_masks must be parallel to sequences: {len(completion_masks)} != {len(sequences)}"
+        )
+    # Keep each sequence with its completion mask (if any) so truncation + the FFD reorder can't
+    # desync them. Drop empty sequences (and their masks) exactly as the no-mask path does.
+    if completion_masks is None:
+        items = [(s[:max_length], None) for s in sequences if s]
+    else:
+        items = [
+            (s[:max_length], m[:max_length])
+            for s, m in zip(sequences, completion_masks, strict=True)
+            if s
+        ]
     # First-fit-decreasing: place the longest examples first so the small ones fill the gaps.
-    order = sorted(range(len(seqs)), key=lambda i: len(seqs[i]), reverse=True)
-    bins: list[dict] = []  # each: {"input_ids": [...], "seq_lengths": [...], "free": int}
+    order = sorted(range(len(items)), key=lambda i: len(items[i][0]), reverse=True)
+    bins: list[dict] = []  # each: {"input_ids": [...], "seq_lengths": [...], "completion_mask"?, "free": int}
     for i in order:
-        s = seqs[i]
+        s, m = items[i]
         need = len(s)
         for b in bins:
             if b["free"] >= need:
                 b["input_ids"].extend(s)
                 b["seq_lengths"].append(need)
+                if m is not None:
+                    b["completion_mask"].extend(m)
                 b["free"] -= need
                 break
         else:  # no open bin fits -> start a new one
-            bins.append({"input_ids": list(s), "seq_lengths": [need], "free": max_length - need})
-    return [{"input_ids": b["input_ids"], "seq_lengths": b["seq_lengths"]} for b in bins]
+            nb = {"input_ids": list(s), "seq_lengths": [need], "free": max_length - need}
+            if m is not None:
+                nb["completion_mask"] = list(m)
+            bins.append(nb)
+    rows: list[dict] = []
+    for b in bins:
+        row = {"input_ids": b["input_ids"], "seq_lengths": b["seq_lengths"]}
+        if "completion_mask" in b:
+            row["completion_mask"] = b["completion_mask"]
+        rows.append(row)
+    return rows
 
 
 def packing_efficiency(rows: list[dict], max_length: int) -> float:
@@ -240,6 +274,39 @@ def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[l
     rows = [t if (eos and t.endswith(eos)) else t + eos for t in texts]
     enc = tokenizer(rows, truncation=True, max_length=max_length)  # default add_special_tokens (TRL parity)
     return enc["input_ids"]
+
+
+def build_completion_mask(
+    prompt_text: str, full_ids: list[int], tokenizer, max_length: int
+) -> list[int]:
+    """Token-level completion mask for completion-only SFT loss: ``0`` for the prompt tokens, ``1``
+    for the completion (the assistant turn(s) the model must learn to generate). ``full_ids`` are the
+    example's tokens from :func:`tokenize_for_packing` (the SAME tokens the trainer sees);
+    ``prompt_text`` is the chat-templated prompt rendered with ``add_generation_prompt=True``.
+
+    We tokenize the prompt the SAME way :func:`tokenize_for_packing` tokenizes the full row (default
+    ``add_special_tokens``, truncate to ``max_length``; NO appended EOS — the prompt never ends a
+    turn) and mask the LONGEST SHARED TOKEN PREFIX of the prompt and the full row. The shared-prefix
+    (rather than ``len(prompt_ids)``) is what makes this robust to the thinking chat template, whose
+    ``add_generation_prompt=True`` render pre-opens ``<think>\\n`` so the prompt diverges from the
+    full render by a token — we mask up to that divergence and train on everything after, and never
+    mask the whole row (>=1 completion token is always kept). This mirrors TRL's own prompt-completion
+    masking (it likewise derives the boundary from the prompt token length), but in flash's single
+    pre-tokenization pass so the unpacked and packed paths share one boundary.
+    """
+    n_full = len(full_ids)
+    if n_full == 0:
+        return []
+    # List form + [0] mirrors tokenize_for_packing's call EXACTLY (default add_special_tokens, same
+    # truncation), so the prompt tokens line up with the full row's prefix token-for-token.
+    prompt_ids = tokenizer([prompt_text], truncation=True, max_length=max_length)["input_ids"][0]
+    n = 0
+    for a, b in zip(prompt_ids, full_ids, strict=False):  # different lengths by design (prefix)
+        if a != b:
+            break
+        n += 1
+    n = max(0, min(n, n_full - 1))  # keep at least one completion token to train on
+    return [0] * n + [1] * (n_full - n)
 
 
 # Process-local cache of the lower-triangular causal matrix: the collator runs on every batch, and
@@ -343,6 +410,20 @@ class BlockDiagonalCollator:
         labels = input_ids.clone()
         labels[seg < 0] = self.label_pad_token_id
         labels[position_ids == 0] = self.label_pad_token_id
+
+        # Completion-only loss under packing: when the packed rows carry per-token completion masks
+        # (1 = completion token trained on, 0 = prompt token), additionally ignore every prompt token
+        # so the loss matches the unpacked completion_only_loss path. Each mask spans only its row's
+        # REAL tokens (sum(seq_lengths)); trailing pad keeps its already-ignored label. Prompt-start
+        # tokens are mask 0 here AND position_ids == 0 above, so the two masks agree at boundaries.
+        if any("completion_mask" in f for f in features):
+            keep = torch.zeros((bsz, total), dtype=torch.bool)  # True == contributes to the loss
+            for b, f in enumerate(features):
+                cm = f.get("completion_mask")
+                if cm:
+                    cm = cm[:total]
+                    keep[b, : len(cm)] = torch.tensor([bool(x) for x in cm], dtype=torch.bool)
+            labels[~keep] = self.label_pad_token_id
 
         batch = {
             "input_ids": input_ids,
