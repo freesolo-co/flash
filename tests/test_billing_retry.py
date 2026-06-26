@@ -60,8 +60,12 @@ def test_needs_charge_predicate():
 
     ctx = {"org_id": "o"}
     # a completed external run not yet charged -> needs a charge
-    assert billing_retry._needs_charge(st(state="done", billing_context=ctx, billing_state="pending"))
-    assert billing_retry._needs_charge(st(state="done", billing_context=ctx, billing_state="failed"))
+    assert billing_retry._needs_charge(
+        st(state="done", billing_context=ctx, billing_state="pending")
+    )
+    assert billing_retry._needs_charge(
+        st(state="done", billing_context=ctx, billing_state="failed")
+    )
     assert billing_retry._needs_charge(
         st(state="done", billing_context=ctx, billing_state="charging")
     )
@@ -149,8 +153,9 @@ def test_sweep_charges_crashed_pending_run(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(
         "flash.server.billing.charge_completed_run",
-        lambda *, internal_key, status: calls.append(status.run_id)
-        or {"amountCents": 123, "replay": False},
+        lambda *, internal_key, status: (
+            calls.append(status.run_id) or {"amountCents": 123, "replay": False}
+        ),
     )
 
     assert billing_retry.retry_completion_charges_once() == 1
@@ -195,6 +200,56 @@ def test_transient_failure_then_retry_charges_exactly_once(monkeypatch, tmp_path
     # sweep #3: already charged -> the backend is NOT hit again (no second/double charge)
     assert billing_retry.retry_completion_charges_once() == 0
     assert len(calls) == 2
+
+
+def test_sweep_tolerates_unreadable_status_file(monkeypatch, tmp_path):
+    """A single corrupt/legacy status file must NOT abort the sweep: every other eligible run is
+    still charged. (Regression: list_runs() parsed all files up front and raised on the bad one,
+    skipping every pending charge until the bad file was removed.)"""
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_run(runner, tmp_path, billing_state="pending")
+    # a malformed record sorted BEFORE the good run -> eager list_runs() would have died here.
+    (tmp_path / "runs" / "aaa-bad.json").write_text("{ not valid json")
+
+    calls = []
+    monkeypatch.setattr(
+        "flash.server.billing.charge_completed_run",
+        lambda *, internal_key, status: (
+            calls.append(status.run_id) or {"amountCents": 123, "replay": False}
+        ),
+    )
+
+    assert billing_retry.retry_completion_charges_once() == 1
+    assert calls == ["run-1"]
+    assert runner.get_status("run-1").billing_state == "charged"
+
+
+def test_sweep_cooperative_stop_halts_between_runs(monkeypatch, tmp_path):
+    """should_stop() is honored BETWEEN runs so shutdown can bound a slow charge backlog: when it
+    returns True the sweep charges nothing and never reaches the backend."""
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_run(runner, tmp_path, billing_state="pending")
+
+    calls = []
+    monkeypatch.setattr(
+        "flash.server.billing.charge_completed_run",
+        lambda *, internal_key, status: (
+            calls.append(status.run_id) or {"amountCents": 1, "replay": False}
+        ),
+    )
+
+    # stop signalled from the start -> nothing charged, backend never hit
+    assert billing_retry.retry_completion_charges_once(should_stop=lambda: True) == 0
+    assert calls == []
+    # control: without the stop, the same run IS charged
+    assert billing_retry.retry_completion_charges_once() == 1
+    assert calls == ["run-1"]
 
 
 def test_sweep_skips_charged_failed_and_internal_runs(monkeypatch, tmp_path):
@@ -271,7 +326,9 @@ def test_sweep_never_charges_partial_multiseed_attach_run(monkeypatch, tmp_path)
 
     monkeypatch.setattr(
         "flash.server.billing.charge_completed_run",
-        lambda **_: (_ for _ in ()).throw(AssertionError("a partial multi-seed run must not be charged")),
+        lambda **_: (_ for _ in ()).throw(
+            AssertionError("a partial multi-seed run must not be charged")
+        ),
     )
     assert billing_retry.retry_completion_charges_once() == 0
     assert runner.get_status("partial-running").billing_state == "pending"
@@ -296,8 +353,9 @@ def test_sweep_charges_completed_then_cancelled_run(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(
         "flash.server.billing.charge_completed_run",
-        lambda *, internal_key, status: calls.append(status.run_id)
-        or {"amountCents": 123, "replay": False},
+        lambda *, internal_key, status: (
+            calls.append(status.run_id) or {"amountCents": 123, "replay": False}
+        ),
     )
 
     assert billing_retry.retry_completion_charges_once() == 1
@@ -317,7 +375,9 @@ def test_sweep_never_charges_cancelled_before_completion(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         "flash.server.billing.charge_completed_run",
-        lambda **_: (_ for _ in ()).throw(AssertionError("a never-completed run must not be charged")),
+        lambda **_: (_ for _ in ()).throw(
+            AssertionError("a never-completed run must not be charged")
+        ),
     )
     assert billing_retry.retry_completion_charges_once() == 0
     assert runner.get_status("run-1").billing_state == "pending"
@@ -521,7 +581,9 @@ def test_record_billing_state_never_downgrades_charged(monkeypatch, tmp_path):
     runner.record_billing_state("run-1", billing_state="charging")
     assert runner.get_status("run-1").billing_state == "charged"
     # re-writing `charged` itself is still allowed (idempotent)
-    runner.record_billing_state("run-1", billing_state="charged", billing_charge={"amountCents": 42})
+    runner.record_billing_state(
+        "run-1", billing_state="charged", billing_charge={"amountCents": 42}
+    )
     assert runner.get_status("run-1").billing_state == "charged"
 
 

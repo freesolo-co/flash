@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections.abc import Callable
 
 from flash import runner
 from flash.server.auth import INTERNAL_KEY_ENV
@@ -79,29 +80,43 @@ def _needs_charge(status: runner.RunStatus) -> bool:
     return status.billing_state in _CHARGE_STARTED_STATES
 
 
-def retry_completion_charges_once() -> int:
+def retry_completion_charges_once(should_stop: Callable[[], bool] | None = None) -> int:
     """One sweep: re-invoke the completion charge for every completed-but-uncharged run.
 
     Returns how many runs ended this sweep ``charged``. Reuses the runner's charge hook (the single
     source of truth for the billing state machine -- it sets ``charging``, charges, then records
     ``charged``/``failed``), and the backend's idempotency-by-runId makes every retry safe.
+
+    Resilient to one bad record: runs are listed by id and loaded ONE AT A TIME, so a single
+    corrupt/legacy status file (which would make ``list_runs`` raise) is skipped instead of aborting
+    the whole sweep and blocking charge recovery for every other run.
+
+    ``should_stop`` is an optional cooperative-cancel callback checked BETWEEN runs. The startup/
+    periodic sweeps run in a worker thread (the charge is blocking urllib), which ``task.cancel()``
+    cannot interrupt; at shutdown the caller sets a stop flag so a backlog of slow charges can't keep
+    the thread (and the default executor) alive long after the server was told to stop.
     """
     if not charge_retry_enabled():
         return 0
     from flash.runner.lifecycle import _charge_completed_run_by_id
 
     charged = 0
-    for status in runner.list_runs():
-        if not _needs_charge(status):
-            continue
+    for run_id in runner.list_run_ids():
+        if should_stop is not None and should_stop():
+            break
         with contextlib.suppress(Exception):
+            # Load per-run so one unreadable/legacy status file is skipped (caught here), never
+            # aborting recovery of the rest.
+            status = runner.get_status(run_id)
+            if not _needs_charge(status):
+                continue
             # Charge by run id -- the charge reads everything it needs from the persisted RunStatus
             # (billing_context + cost_usd + the raw spec dict), so we never reparse the JobSpec. A
             # legacy/stale persisted spec that `JobSpec.from_dict` would reject must NOT block
             # recovery of a real pending/failed charge.
             # Append to the run log so retry attempts surface in `flash status --logs`.
-            with open(runner.runs_file_path(status.run_id, ".log"), "a") as log:
-                _charge_completed_run_by_id(status.run_id, log)
-            if runner.get_status(status.run_id).billing_state == "charged":
+            with open(runner.runs_file_path(run_id, ".log"), "a") as log:
+                _charge_completed_run_by_id(run_id, log)
+            if runner.get_status(run_id).billing_state == "charged":
                 charged += 1
     return charged

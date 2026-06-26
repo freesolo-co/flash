@@ -117,9 +117,7 @@ class RunStatus:
     def to_dict(self) -> dict:
         data = asdict(self)
         data["adapter_ref"] = (
-            _adapter_ref_from_status_spec(self.spec)
-            if self.state in {"done", "deployed"}
-            else None
+            _adapter_ref_from_status_spec(self.spec) if self.state in {"done", "deployed"} else None
         )
         return data
 
@@ -475,6 +473,17 @@ def list_runs() -> list[RunStatus]:
             with open(os.path.join(RUNS_DIR, name)) as f:
                 runs.append(RunStatus(**json.load(f)))
     return runs
+
+
+def list_run_ids() -> list[str]:
+    """Run ids from RUNS_DIR by FILENAME only (no JSON parse), so a single corrupt or legacy
+    status file can't make the listing itself raise. A caller that must tolerate bad records --
+    e.g. the billing-charge recovery sweep, which has to keep charging every other eligible run --
+    pairs this with ``get_status(id)`` under its own per-run error handling."""
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    return [
+        name[: -len(".json")] for name in sorted(os.listdir(RUNS_DIR)) if name.endswith(".json")
+    ]
 
 
 def get_logs(run_id: str) -> str:

@@ -62,14 +62,20 @@ async def _charge_retry_startup() -> None:
     runs in a thread (the charge is blocking urllib). Best-effort; cancelled cleanly at shutdown."""
     from flash.server.billing_retry import retry_completion_charges_once
 
+    stop = threading.Event()
     try:
-        recovered = await asyncio.to_thread(retry_completion_charges_once)
+        recovered = await asyncio.to_thread(retry_completion_charges_once, stop.is_set)
         if recovered:
             _log.info("recovered %d pending completion charge(s) at startup", recovered)
     except asyncio.CancelledError:
+        # task.cancel() only cancels the await, not the worker thread; signal it to stop between
+        # runs so a backlog of slow charges can't keep the thread alive past shutdown.
+        stop.set()
         raise  # shutdown during the startup sweep: let the lifespan's task.cancel() propagate
     except Exception:
-        _log.debug("startup completion-charge sweep failed; periodic loop will retry", exc_info=True)
+        _log.debug(
+            "startup completion-charge sweep failed; periodic loop will retry", exc_info=True
+        )
 
 
 async def _charge_retry_loop() -> None:
@@ -86,11 +92,13 @@ async def _charge_retry_loop() -> None:
         await asyncio.sleep(interval)
         # Mirror the sibling reaper/reconcile loops: re-raise CancelledError so the lifespan's
         # task.cancel() stops it at shutdown, and swallow only real Exceptions to keep sweeping.
+        stop = threading.Event()
         try:
-            charged = await asyncio.to_thread(retry_completion_charges_once)
+            charged = await asyncio.to_thread(retry_completion_charges_once, stop.is_set)
             if charged:
                 _log.info("recovered %d pending completion charge(s) on retry", charged)
         except asyncio.CancelledError:
+            stop.set()  # signal the worker thread to stop between runs (see _charge_retry_startup)
             raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
         except Exception:
             _log.debug("completion-charge retry sweep failed; retrying next cycle", exc_info=True)
