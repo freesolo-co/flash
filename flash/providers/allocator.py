@@ -36,11 +36,11 @@ from flash.providers.base import (
 logger = get_logger(__name__)
 
 # Classes that stay in the catalog (the name resolves; provider runner machinery/tests use them) but
-# are NEVER auto-allocated. L40 is here because its only Flash home is Hyperstack's on-demand L40
-# stock — the CANADA-1 fleet, which shipped a broken NVIDIA driver — and it is strictly dominated by
-# RTX A6000 (same 48 GB, half the price, on all three providers). Excluding it at the candidate-
-# generation seam means the cheapest-fitting walk never lands on the broken fleet via L40, even if
-# CANADA-1 is re-enabled via HYPERSTACK_BLOCKED_REGIONS. See base.py's L40 row.
+# are NEVER auto-allocated. L40 is here on PRICE alone: it is strictly dominated by RTX A6000 (same
+# 48 GB, half the price, on all three providers), so the cheapest-fitting walk should never pick it.
+# (Its only stock is Hyperstack's CANADA-1 fleet, once hard-banned for a broken driver but re-verified
+# healthy and un-banned on 2026-06-26; the price domination is independent of that and stands.) See
+# base.py's L40 row.
 _POOL_EXCLUDED = frozenset({"L40"})
 
 # "Comfortably" = the open-model VRAM estimate plus headroom, so a full SFT+GRPO run

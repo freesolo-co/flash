@@ -28,10 +28,12 @@ def test_required_vram_catalog_and_open(monkeypatch):
 
 
 def test_l40_dropped_from_auto_allocation():
-    """L40's only Flash home is Hyperstack's on-demand L40 stock (the broken-driver CANADA-1 fleet),
-    and it is strictly dominated by RTX A6000 (same 48 GB, half the price, on all three providers), so
-    it is excluded from auto-allocation. The catalog row is KEPT (the name still resolves and the
-    Hyperstack runner machinery/tests use it) — only the allocator candidate seam drops it."""
+    """L40 is excluded from auto-allocation on PRICE: it is strictly dominated by RTX A6000 (same 48 GB,
+    half the price, on all three providers), so the cheapest-fitting walk should never pick it. (Its only
+    Flash home is Hyperstack's on-demand L40 stock; that CANADA-1 fleet was once broken-driver but is
+    healthy + un-banned now — the price domination is what keeps L40 excluded.) The catalog row is KEPT
+    (the name still resolves and the Hyperstack runner machinery/tests use it) — only the allocator
+    candidate seam drops it."""
     from flash.providers import allocator
     from flash.providers.base import GPU_INFO
 

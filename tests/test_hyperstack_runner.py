@@ -201,9 +201,11 @@ def test_launch_raises_when_no_stock(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=[], attempt=0)
 
 
-def test_regions_excludes_canada1_by_default(monkeypatch):
-    """CANADA-1 (known broken-driver on-demand fleet) is dropped from the region list by default, so
-    the allocator + launcher never offer or boot there. The API still returns it; flash filters it."""
+def test_regions_no_static_block_by_default(monkeypatch):
+    """No region is statically dropped by default — a region that goes bad is now learned + demoted at
+    runtime by the dynamic quarantine (flash.providers._health), not hand-banned here. CANADA-1 used to
+    be the lone default-banned region (broken-driver L40 fleet); it was re-verified healthy on
+    2026-06-26 and un-banned, so every API-returned region now passes through."""
     from flash.providers.hyperstack import api as hs_api
 
     monkeypatch.setattr(
@@ -213,13 +215,13 @@ def test_regions_excludes_canada1_by_default(monkeypatch):
     )
     monkeypatch.delenv("HYPERSTACK_BLOCKED_REGIONS", raising=False)
     regions = hs_api._regions()
-    assert "CANADA-1" not in regions
-    assert regions == ["NORWAY-1", "US-1"]
+    assert "CANADA-1" in regions
+    assert regions == ["NORWAY-1", "CANADA-1", "US-1"]
 
 
 def test_regions_blocklist_is_env_overridable(monkeypatch):
-    """HYPERSTACK_BLOCKED_REGIONS overrides the default: set to "" re-enables CANADA-1 (operator
-    opt-in once the fleet recovers); set to another region blocks that instead."""
+    """HYPERSTACK_BLOCKED_REGIONS overrides the empty default: an operator can hard-block a region the
+    moment its driver/capacity health regresses, without a code change; set to "" blocks nothing."""
     from flash.providers.hyperstack import api as hs_api
 
     monkeypatch.setattr(
