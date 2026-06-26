@@ -125,6 +125,14 @@ async def _reap_idle_endpoints_loop() -> None:
     thread, and a failed sweep is logged and retried next cycle."""
     interval = 600.0  # sweep every 10 min
     min_idle_s = 900.0  # only reap an endpoint idle for >= 15 min (well past any cold start)
+    # Startup heartbeat: the reaper otherwise logs nothing unless it deletes something, so an
+    # operator can't tell a silently-stalled reaper from a healthy one with nothing to reap. One
+    # INFO line at boot confirms the task is alive and pins its cadence.
+    _log.info(
+        "idle-endpoint reaper started (sweep every %ds, reap after %ds idle)",
+        int(interval),
+        int(min_idle_s),
+    )
     while True:
         await asyncio.sleep(interval)
         try:
