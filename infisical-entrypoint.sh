@@ -26,17 +26,20 @@ INFISICAL_TOKEN="$(infisical login --method=universal-auth \
   --silent --plain)"
 export INFISICAL_TOKEN
 
-# snapshot the docker-network overrides so they survive infisical injection
-keep=""
+# Re-apply the docker-network overrides AFTER infisical injection so they win. infisical
+# run overrides existing env, so we hand each KEEP var to `env` as its own quoted `K=V`
+# argument — values that contain spaces or shell metacharacters survive intact. (Building
+# an unquoted string and word-splitting it would corrupt such values, and a leading space
+# would make `env` choke.) INFISICAL_KEEP itself is a whitespace-separated list of variable
+# NAMES, so splitting *it* is intentional.
+# shellcheck disable=SC2086
 for k in ${INFISICAL_KEEP:-}; do
-  v=$(eval "printf '%s' \"\${$k:-}\"")
-  keep="$keep $k=$v"
+  set -- "$k=$(eval "printf '%s' \"\${$k:-}\"")" "$@"
 done
 
-# shellcheck disable=SC2086
 exec infisical run \
   --projectId "$INFISICAL_PROJECT_ID" \
   --env "${INFISICAL_ENV:-prod}" \
   --path "$INFISICAL_PATH" \
   --silent \
-  -- env $keep "$@"
+  -- env "$@"
