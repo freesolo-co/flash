@@ -65,16 +65,35 @@ _SFT_HEARTBEAT_INTERVAL_S = 60.0
 # Stall watchdog: arm a faulthandler that, if NO heartbeat lands for the window, dumps every thread's
 # stack (C-level — fires even under a held GIL) and exits, turning a silent wedge into an uploaded
 # stack trace. Re-armed on every heartbeat, so it only fires on a true hang; safe because every long
-# phase keeps heartbeating (init / prefetch / per-step liveness). Always on. Kept longer than the
-# providers' setup grace (3000s) so a stuck SETUP trips the provider's RETRIABLE path before this
-# exit=True watchdog hard-fails the run (asserted in tests).
-_STALL_WATCHDOG_S = 3600
+# phase keeps heartbeating (init / prefetch / per-step liveness). DEFAULT-ON and tunable via the
+# FLASH_STALL_FAULTHANDLER_S env var (seconds): unset uses the default below; ``<=0`` DISABLES it so
+# ops can turn it off. The default is kept longer than the providers' setup grace (3000s) so a stuck
+# SETUP trips the provider's RETRIABLE path before this exit=True watchdog hard-fails the run
+# (asserted in tests) — any override below that grace forfeits this ordering, by operator choice.
+_STALL_WATCHDOG_DEFAULT_S = 3600.0
+_STALL_WATCHDOG_ENV = "FLASH_STALL_FAULTHANDLER_S"
+
+
+def _stall_watchdog_window_s() -> float:
+    """The stall-watchdog window in seconds. Reads ``FLASH_STALL_FAULTHANDLER_S`` (default
+    ``_STALL_WATCHDOG_DEFAULT_S``); ``<=0`` disables the watchdog. An unset/unparseable value falls
+    back to the default so a typo can never silently switch the safety watchdog OFF."""
+    raw = os.environ.get(_STALL_WATCHDOG_ENV)
+    if raw is None or raw.strip() == "":
+        return _STALL_WATCHDOG_DEFAULT_S
+    try:
+        return float(raw)
+    except ValueError:
+        return _STALL_WATCHDOG_DEFAULT_S
 
 
 def _rearm_stall_faulthandler() -> None:
+    window = _stall_watchdog_window_s()
     with contextlib.suppress(Exception):
         faulthandler.cancel_dump_traceback_later()
-        faulthandler.dump_traceback_later(_STALL_WATCHDOG_S, exit=True)
+        # window <= 0 means the operator disabled the watchdog: cancel any pending dump, arm nothing.
+        if window > 0:
+            faulthandler.dump_traceback_later(window, exit=True)
 
 
 def heartbeat(stage: str, **kw):

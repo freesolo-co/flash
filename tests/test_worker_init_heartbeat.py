@@ -376,30 +376,66 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
 # the timer and the init/training heartbeats now keep ticking through slow-but-live phases.
 
 
-def test_stall_watchdog_always_on_and_outlasts_provider_grace():
+def test_stall_watchdog_default_on_and_outlasts_provider_grace(monkeypatch):
     import importlib
 
     # ``from flash.engine.worker import heartbeat`` resolves to the re-exported heartbeat() FUNCTION,
     # not the submodule — import the module path explicitly.
     hb = importlib.import_module("flash.engine.worker.heartbeat")
 
-    assert hb._STALL_WATCHDOG_S > 0, "stall watchdog is always on (no disable knob)"
-    # Strictly longer than the providers' setup grace so a stuck SETUP trips the provider's RETRIABLE
-    # path before this exit=True watchdog hard-fails the run. Compare to the canonical provider value
-    # so the two can't silently drift apart.
+    # Default-on: with the env unset the watchdog window is the positive default.
+    monkeypatch.delenv(hb._STALL_WATCHDOG_ENV, raising=False)
+    assert hb._stall_watchdog_window_s() == hb._STALL_WATCHDOG_DEFAULT_S > 0
+    # The DEFAULT is strictly longer than the providers' setup grace so a stuck SETUP trips the
+    # provider's RETRIABLE path before this exit=True watchdog hard-fails the run. Compare to the
+    # canonical provider value so the two can't silently drift apart.
     from flash.providers.runpod import jobs as runpod_jobs
 
-    assert runpod_jobs.stall_kwargs()["setup_grace_s"] < hb._STALL_WATCHDOG_S
+    assert runpod_jobs.stall_kwargs()["setup_grace_s"] < hb._STALL_WATCHDOG_DEFAULT_S
 
 
-def test_rearm_arms_the_single_window(monkeypatch):
+def test_stall_watchdog_env_overrides_window_and_disables(monkeypatch):
     import importlib
 
     hb = importlib.import_module("flash.engine.worker.heartbeat")
+
+    # A positive override sets the window verbatim and is what _rearm arms.
+    monkeypatch.setenv(hb._STALL_WATCHDOG_ENV, "900")
+    assert hb._stall_watchdog_window_s() == 900.0
+    armed: list = []
+    monkeypatch.setattr(
+        hb.faulthandler, "dump_traceback_later", lambda w, exit=False: armed.append(w)
+    )
+    cancels: list = []
+    monkeypatch.setattr(
+        hb.faulthandler, "cancel_dump_traceback_later", lambda: cancels.append(True)
+    )
+    hb._rearm_stall_faulthandler()
+    assert armed == [900.0]
+
+    # ``=0`` DISABLES it: _rearm cancels any pending dump and arms nothing.
+    armed.clear()
+    cancels.clear()
+    monkeypatch.setenv(hb._STALL_WATCHDOG_ENV, "0")
+    assert hb._stall_watchdog_window_s() == 0.0
+    hb._rearm_stall_faulthandler()
+    assert armed == [], "watchdog disabled -> no dump armed"
+    assert cancels, "disable still cancels any previously-armed dump"
+
+    # A garbage value falls back to the default (never silently disables the safety watchdog).
+    monkeypatch.setenv(hb._STALL_WATCHDOG_ENV, "not-a-number")
+    assert hb._stall_watchdog_window_s() == hb._STALL_WATCHDOG_DEFAULT_S
+
+
+def test_rearm_arms_the_default_window(monkeypatch):
+    import importlib
+
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    monkeypatch.delenv(hb._STALL_WATCHDOG_ENV, raising=False)
     windows: list = []
     monkeypatch.setattr(
         hb.faulthandler, "dump_traceback_later", lambda w, exit=False: windows.append(w)
     )
     monkeypatch.setattr(hb.faulthandler, "cancel_dump_traceback_later", lambda: None)
     hb._rearm_stall_faulthandler()
-    assert windows == [hb._STALL_WATCHDOG_S], "every arm uses the single always-on window"
+    assert windows == [hb._STALL_WATCHDOG_DEFAULT_S], "an unset env arms the default window"
