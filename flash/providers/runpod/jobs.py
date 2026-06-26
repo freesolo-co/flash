@@ -285,7 +285,10 @@ def _is_flash_endpoint(name: str) -> bool:
 
 
 def _sweep_idle_flash_endpoints(
-    protected: set[str], min_idle_s: float = 0.0, reap_warm: bool = True
+    protected: set[str],
+    min_idle_s: float = 0.0,
+    reap_warm: bool = True,
+    known: set[str] | None = None,
 ) -> int:
     """Delete idle, ORPHANED flash training endpoints — workers doing nothing that still hold
     RunPod worker quota (runs that finished/crashed without tearing their endpoint down). Returns
@@ -293,6 +296,11 @@ def _sweep_idle_flash_endpoints(
 
     Safe by construction:
 
+    - ``known`` — when supplied, the endpoint names for EVERY run THIS control plane has a record
+      of. Only endpoints in this set are reapable; one whose name this plane has never issued
+      belongs to ANOTHER control plane sharing the account and is left alone (multi-plane safety).
+      ``None`` keeps the legacy unscoped behavior. Unlike ``protected`` this guards a second plane's
+      *idle/between-jobs* endpoint — a busy one is already safe (it never reads as idle).
     - ``protected`` — endpoint names tied to a LIVE run (both the bare ``flash-...`` and the SDK's
       ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between seeds).
     - ``reap_warm`` — when True (the run-aware periodic reaper, which protects EVERY live run),
@@ -348,6 +356,10 @@ def _sweep_idle_flash_endpoints(
                     continue
                 # Protect the run's endpoint in either registered form.
                 if ep_name in protected or ep_name.removeprefix("live-") in protected:
+                    continue
+                # Multi-plane scope: only reap endpoints this plane has a record of. One whose name
+                # is unknown here belongs to another control plane on the same account — leave it.
+                if known is not None and ep_name not in known and ep_name.removeprefix("live-") not in known:
                     continue
                 try:
                     # Account-scoped: we know which pool account owns this endpoint (its non-secret
