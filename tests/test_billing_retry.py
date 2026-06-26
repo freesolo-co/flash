@@ -593,10 +593,19 @@ def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
 
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
+    # Hyperstack + the shared tokens + the internal key); mirrors tests/test_server_api.py.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make this self-contained).
+    import flash.providers.runpod.keys as runpod_keys
+
+    runpod_keys.reset()
 
     import flash.runner as runner
     import flash.server.auth as auth_mod
@@ -646,10 +655,19 @@ def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
 
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
+    # Hyperstack + the shared tokens + the internal key); mirrors tests/test_server_api.py.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make this self-contained).
+    import flash.providers.runpod.keys as runpod_keys
+
+    runpod_keys.reset()
 
     import flash.runner as runner
     import flash.server.auth as auth_mod
