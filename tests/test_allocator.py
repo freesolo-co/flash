@@ -78,13 +78,17 @@ def test_runpod_allocation_lands_on_full_validated_cards(monkeypatch):
 
 
 def test_default_max_retries():
-    """The GPU retry budget default (2) covers infra-shaped flakes (worker loss / stall / timeout).
-    Covers both the GpuSpec default and the JobSpec.from_dict default (the worker payload path)."""
+    """The GPU retry budget default (5) covers infra-shaped flakes (worker loss / stall / timeout)
+    and matches INFRA_RETRY_FLOOR (runner.lifecycle), which the runner already floored the effective
+    budget to — so the declared default now reflects the real GPU-walk budget. Covers both the
+    GpuSpec default and the JobSpec.from_dict default (the worker payload path)."""
+    from flash.runner.lifecycle import INFRA_RETRY_FLOOR
     from flash.spec import GpuSpec, JobSpec
 
-    assert GpuSpec().max_retries == 2
-    assert JobSpec.from_dict({}).gpu.max_retries == 2
-    assert JobSpec.from_dict({"gpu": {}}).gpu.max_retries == 2
+    assert GpuSpec().max_retries == 5
+    assert GpuSpec().max_retries == INFRA_RETRY_FLOOR  # default tracks the runner's infra floor
+    assert JobSpec.from_dict({}).gpu.max_retries == 5
+    assert JobSpec.from_dict({"gpu": {}}).gpu.max_retries == 5
     # An explicit value still wins (the default is only the fallback).
     assert JobSpec.from_dict({"gpu": {"max_retries": 3}}).gpu.max_retries == 3
 
