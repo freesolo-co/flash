@@ -61,10 +61,9 @@ def _identity_for_token(token: str) -> dict[str, str]:
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
-    # Hyperstack + the shared tokens + the internal key); see tests/test_preflight.py for the gate.
+    # the shared tokens + the internal key); see tests/test_preflight.py for the gate.
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
     monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
-    monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
@@ -86,9 +85,9 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
-    # The new preflight requires the Lambda/Hyperstack keys above, which also makes
-    # `configured_providers()` treat both as live — so the startup lifespan's `recover_runs()` and
-    # the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda/Hyperstack list calls) and
+    # The new preflight requires the Lambda key above, which also makes
+    # `configured_providers()` treat it as live — so the startup lifespan's `recover_runs()` and
+    # the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda list calls) and
     # break test hermeticity. These API tests don't exercise orphan reaping, so stub the provider set
     # to empty: preflight still passes on the keys, but startup stays CPU-only with no network. (Both
     # call sites do a function-local `from flash.providers import configured_providers`, so patching

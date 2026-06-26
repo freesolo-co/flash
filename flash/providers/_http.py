@@ -59,7 +59,7 @@ def is_conflict(err: Exception) -> bool:
     Same status-CODE-authoritative logic as ``is_not_found`` (see ``_status_matches``): a real 409
     has the chained ``HTTPError`` whose ``.code == 409``; a non-409 failure whose message merely
     contains ``"409"`` (e.g. a ``4090`` GPU name) plus the word "conflict" is NOT a conflict and must
-    still surface. Used by Hyperstack ``delete_vm`` to treat an in-flight-teardown 409 as success."""
+    still surface. Available for providers that treat an in-flight-teardown 409 as success."""
     return _status_matches(err, 409, _HTTP_409_RE)
 
 
@@ -104,8 +104,8 @@ class RestClient:
         # by ``request`` and win on a key collision.
         self.extra_headers = dict(extra_headers or {})
         # How the API key is presented. Default is RunPod/Lambda's ``Authorization: Bearer <key>``;
-        # Hyperstack uses a bare ``api_key: <key>`` header instead (``auth_header_name="api_key"``,
-        # ``auth_value_format="{key}"``).
+        # a provider can override with a bare ``api_key: <key>`` header instead
+        # (``auth_header_name="api_key"``, ``auth_value_format="{key}"``).
         self.auth_header_name = auth_header_name
         self.auth_value_format = auth_value_format
 
