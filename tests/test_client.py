@@ -248,3 +248,38 @@ def test_deploy_passes_integer_step(stub):
     assert seen["path"] == "/v1/runs/flash-run/deploy"
     assert seen["body"]["step"] == 40
     assert seen["body"]["dry_run"] is False
+
+
+def test_export_sends_repository_token_and_step(stub):
+    """`flash export` posts the destination repo, the user's HF token, and an optional step."""
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.export("r1", repository="me/adapters", hf_token="hf_secret", step=40, private=False)
+    assert seen["path"] == "/v1/runs/r1/export"
+    assert seen["auth"] == "Bearer fslo-user-test"
+    assert seen["body"] == {
+        "repository": "me/adapters",
+        "hf_token": "hf_secret",
+        "private": False,
+        "step": 40,
+    }
+
+
+def test_export_omits_step_when_unset_and_defaults_private(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.export("r1", repository="me/adapters", hf_token="hf_secret")
+    assert seen["body"] == {
+        "repository": "me/adapters",
+        "hf_token": "hf_secret",
+        "private": True,
+    }
+    assert "step" not in seen["body"]
+
+
+def test_export_rejects_bool_step():
+    """A bool step would int-coerce to 0/1 server-side, so fail fast client-side (mirrors deploy)."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    for bad in (True, False):
+        with pytest.raises(ClientError, match="invalid checkpoint step"):
+            client.export("r1", repository="me/a", hf_token="hf", step=bad)

@@ -206,6 +206,102 @@ def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
         return {"run_id": run_id, "deleted_endpoints": deleted}
 
 
+@router.post("/v1/runs/{run_id}/export")
+def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
+    """Copy a run's trained adapter into a user-owned HuggingFace repo.
+
+    Reads the adapter from the run's private artifact repo with the operator token and
+    re-uploads it to ``repository`` with the user-supplied ``hf_token`` (write access to their
+    own repo). ``step`` selects an intermediate checkpoint — resolved against the same published
+    checkpoints as ``flash deploy --step`` — instead of the run's final adapter.
+    """
+    payload = payload or {}
+    repository = str(payload.get("repository") or "").strip()
+    if not repository:
+        raise HTTPException(
+            status_code=400,
+            detail="repository is required: the destination HuggingFace repo 'owner/name'",
+        )
+    if "/" not in repository.strip("/"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
+        )
+    hf_token = str(payload.get("hf_token") or "").strip()
+    if not hf_token:
+        raise HTTPException(
+            status_code=400,
+            detail="hf_token is required: a HuggingFace token with write access to the destination repo",
+        )
+    # Validate ``private`` is an actual JSON boolean (mirrors deploy's ``dry_run`` guard): a
+    # truthy non-bool like "false" must not silently flip the destination's visibility.
+    private = payload.get("private", True)
+    if not isinstance(private, bool):
+        raise HTTPException(status_code=400, detail="private must be a boolean")
+
+    status = owned_run(run_id, key)
+    spec = JobSpec.from_dict(status.spec)
+    # Legacy runs with no artifact repo (mirrors the /deploy guard): the adapter can't be located.
+    if not spec.train.hf_repo:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
+                "cannot be located, so it cannot be exported"
+            ),
+        )
+    # Optional `step`: export a specific intermediate checkpoint instead of the final adapter,
+    # validated against what's actually on HF (a missing step 404s with the available list).
+    checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
+    is_checkpoint = checkpoint_step is not None
+    # Same state gate as deploy: a final adapter exists only once a run finished; a per-step
+    # checkpoint also survives a run that stopped mid-RL (cancelled/failed).
+    allowed_states = (
+        _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
+    )
+    if status.state not in allowed_states:
+        detail = (
+            f"run {run_id} is {status.state!r}; export a checkpoint only once the run "
+            "has finished or been cancelled"
+            if is_checkpoint
+            else f"run {run_id} is {status.state!r}; only finished runs with "
+            "trained adapter artifacts can be exported"
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    # The per-step adapter folder for a checkpoint, otherwise the run's final adapter folder.
+    prefix = (
+        checkpoint_adapter_prefix(spec, checkpoint_step)
+        if is_checkpoint
+        else adapter_prefix(spec)
+    )
+    subfolder = f"{prefix}/adapter"
+    try:
+        url = _app.export_adapter(
+            source_repo=spec.train.hf_repo,
+            source_subfolder=subfolder,
+            dest_repo=repository,
+            dest_token=hf_token,
+            private=private,
+        )
+    except ValueError as exc:
+        # The source has no adapter artifacts at that path — nothing to export.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ServingError as exc:
+        # An HF transport/permission failure (download or upload) — an upstream problem, not a
+        # flash bug, so surface a clean 502 with the real reason (mirrors deploy/undeploy).
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    result = {
+        "run_id": run_id,
+        "adapter_id": run_id,
+        "repository": repository,
+        "url": url,
+        "source": f"{spec.train.hf_repo}:{subfolder}",
+    }
+    if is_checkpoint:
+        result["step"] = checkpoint_step
+    return result
+
+
 @router.get("/v1/deployments")
 def deployments(key: Annotated[dict, Depends(require_key)]):
     out = []

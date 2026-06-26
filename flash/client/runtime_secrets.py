@@ -11,6 +11,10 @@ from pathlib import Path
 
 DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
 
+# Env-var names `flash export` accepts for the destination HuggingFace token, in priority order
+# (HF_TOKEN is the convention the rest of flash uses; the others are common huggingface_hub aliases).
+HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN")
+
 
 def _read_env_file(path: Path, keys: set[str]) -> dict[str, str]:
     if not path.exists() or not path.is_file():
@@ -63,3 +67,26 @@ def runtime_secrets_from_local_env(
             "do not put secret values in TOML."
         )
     return secrets
+
+
+def resolve_hf_token(explicit: str | None = None) -> str | None:
+    """Resolve the HuggingFace token `flash export` writes the destination repo with.
+
+    Order: an explicit value (the ``--api-key`` flag) > the process environment (HF_TOKEN /
+    HUGGING_FACE_HUB_TOKEN / HUGGINGFACE_TOKEN) > a local ``.env`` / ``.env.local`` in the cwd.
+    Returns ``None`` when none is set. Read on the user's machine and sent only with the export
+    request — never persisted in the run spec (same contract as the run secrets above).
+    """
+    if explicit and explicit.strip():
+        return explicit.strip()
+    for name in HF_TOKEN_ENV_VARS:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    wanted = set(HF_TOKEN_ENV_VARS)
+    for path in (Path.cwd() / ".env", Path.cwd() / ".env.local"):
+        found = _read_env_file(path, wanted)
+        for name in HF_TOKEN_ENV_VARS:
+            if found.get(name):
+                return found[name]
+    return None

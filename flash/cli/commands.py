@@ -578,6 +578,37 @@ def cmd_deploy(args) -> int:
     return 0
 
 
+def cmd_export(args) -> int:
+    from flash.client.runtime_secrets import resolve_hf_token
+
+    hf_token = resolve_hf_token(args.api_key)
+    if not hf_token:
+        raise ClientError(
+            "no HuggingFace token: pass `--api-key <hf_...>`, or set HF_TOKEN "
+            "(export it in your shell or put it in a local .env)"
+        )
+    client = client_from_config()
+    where = f" (step {args.step})" if args.step is not None else ""
+    print(
+        f"exporting adapter {args.adapter_id}{where} to {args.repository} — "
+        "downloading then re-uploading; this can take a minute...",
+        file=sys.stderr,
+    )
+    result = client.export(
+        args.adapter_id,
+        repository=args.repository,
+        hf_token=hf_token,
+        step=args.step,
+        private=not args.public,
+    )
+    if render.styled():
+        print(render.object_panel("export", result))
+    else:
+        print(json.dumps(result, indent=2))
+    print(f"exported to {result.get('url', args.repository)}", file=sys.stderr)
+    return 0
+
+
 def cmd_undeploy(args) -> int:
     result = client_from_config().undeploy(args.run_id)
     if render.styled():

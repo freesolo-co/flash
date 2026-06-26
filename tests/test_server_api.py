@@ -1424,3 +1424,206 @@ def test_create_run_records_flash_training_run(api, monkeypatch):
     # Org attribution rides on the persisted platform_context (org_id/user_id/api_key_id),
     # which submit_job reports for us — create_run no longer double-POSTs with an explicit key.
     assert last["status"].platform_context["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
+
+
+# --- export: copy a trained adapter to a user-owned HuggingFace repo ----------------------
+
+
+def _finished_run(api, key) -> str:
+    """Submit a run and flip it to `done` (a finished run with a trained final adapter)."""
+    import flash.runner as runner
+
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    return run_id
+
+
+def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
+    """A finished run's final adapter is read from its private artifact repo (operator side) and
+    re-uploaded to the user's repo with the user's token; the response reports the source path."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    # The platform auto-assigns each run a per-run HF dataset repo under the OPERATOR's org, so
+    # only the control plane (operator token) can read the source — read it back from the run.
+    src_repo = runner.get_status(run_id).spec["train"]["hf_repo"]
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return "https://huggingface.co/me/adapters"
+
+    monkeypatch.setattr(app_mod, "export_adapter", capture)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/adapters", "hf_token": "hf_user"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["repository"] == "me/adapters"
+    assert body["url"] == "https://huggingface.co/me/adapters"
+    assert body["source"] == f"{src_repo}:rl/{run_id}/seed0/adapter"
+    assert "step" not in body
+    # Source = the run's private dataset repo + final-adapter subfolder; dest = the user's repo.
+    assert seen["source_repo"] == src_repo
+    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/adapter"
+    assert seen["dest_repo"] == "me/adapters"
+    assert seen["dest_token"] == "hf_user"
+    assert seen["private"] is True  # private by default
+
+
+def test_export_public_flag_sets_private_false(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    seen: dict = {}
+    monkeypatch.setattr(
+        app_mod,
+        "export_adapter",
+        lambda **kw: (seen.update(kw), "https://huggingface.co/me/a")[1],
+    )
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf", "private": False},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["private"] is False
+
+
+def test_export_validates_repository_and_token(api):
+    key = _login()
+    run_id = _finished_run(api, key)
+    missing_repo = api.post(
+        f"/v1/runs/{run_id}/export", json={"hf_token": "hf"}, headers=_bearer(key)
+    )
+    assert missing_repo.status_code == 400
+    assert "repository" in missing_repo.json()["detail"]
+    missing_token = api.post(
+        f"/v1/runs/{run_id}/export", json={"repository": "me/a"}, headers=_bearer(key)
+    )
+    assert missing_token.status_code == 400
+    assert "hf_token" in missing_token.json()["detail"]
+    malformed = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "noslash", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert malformed.status_code == 400
+    assert "owner/name" in malformed.json()["detail"]
+
+
+def test_export_unfinished_run_is_409(api, monkeypatch):
+    """A run with no trained final adapter (never finished) can't be exported — and the HF copy
+    is never attempted."""
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+
+    def must_not_run(**kw):
+        raise AssertionError("export_adapter must not run for an unfinished run")
+
+    monkeypatch.setattr(app_mod, "export_adapter", must_not_run)
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 409, resp.text
+
+
+def test_export_missing_artifacts_is_404(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    def boom(**kw):
+        raise ValueError("no adapter artifacts found at org/test-runs:... (nothing to export)")
+
+    monkeypatch.setattr(app_mod, "export_adapter", boom)
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 404, resp.text
+    assert "no adapter artifacts" in resp.json()["detail"]
+
+
+def test_export_hf_failure_is_clean_502(api, monkeypatch):
+    """An HF transport/permission failure (download or upload) surfaces as a clean 502 carrying the
+    real reason — not an unhandled 500 (mirrors the deploy/undeploy ServingError handling)."""
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    def boom(**kw):
+        raise ServingError("could not upload adapter to me/a: 403 Forbidden")
+
+    monkeypatch.setattr(app_mod, "export_adapter", boom)
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 502, resp.text
+    assert "could not upload" in resp.json()["detail"]
+
+
+def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
+    """`--step N` exports the exact per-step checkpoint `flash deploy --step N` would serve; an
+    unknown step 404s with the available list (resolved against published checkpoints)."""
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    monkeypatch.setattr(
+        app_mod,
+        "list_checkpoints",
+        lambda spec: [
+            {
+                "step": 40,
+                "subfolder": f"rl/{run_id}/seed0/checkpoints/step-40/adapter",
+                "repo_id": "org/test-runs",
+                "repo_type": "dataset",
+            }
+        ],
+    )
+    seen: dict = {}
+    monkeypatch.setattr(
+        app_mod,
+        "export_adapter",
+        lambda **kw: (seen.update(kw), "https://huggingface.co/me/a")[1],
+    )
+    ok = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf", "step": 40},
+        headers=_bearer(key),
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["step"] == 40
+    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/checkpoints/step-40/adapter"
+
+    bad = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf", "step": 99},
+        headers=_bearer(key),
+    )
+    assert bad.status_code == 404, bad.text
+    assert "step 99" in bad.json()["detail"]
