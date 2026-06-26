@@ -24,6 +24,21 @@ from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
 
+# Stale-artifact patterns cleared on (re-)export so a previous, DIFFERENT adapter in the destination
+# repo can't leave weights/metadata behind: upload_folder only overwrites matching paths, so an old
+# ``adapter_model.safetensors`` could otherwise survive next to a freshly-exported bin-only adapter and
+# be loaded as stale weights. Scoped to adapter weight + metadata files — README/.gitattributes are
+# left alone so re-exporting mirrors just the adapter, not the whole repo.
+_STALE_ADAPTER_PATTERNS = [
+    "*.safetensors",
+    "*.bin",
+    "*.pt",
+    "*.gguf",
+    "*.h5",
+    "adapter_config.json",
+    "adapter_model.*",
+]
+
 
 def _hf_api():
     """Import huggingface_hub lazily (it's a server extra, not a base CLI dependency)."""
@@ -92,11 +107,18 @@ def export_adapter(
             api.create_repo(
                 repo_id=dest_repo, repo_type="model", private=private, exist_ok=True
             )
+            # create_repo(exist_ok=True) does NOT change the visibility of a repo that already
+            # exists, so a default-private export into a pre-existing PUBLIC repo would otherwise
+            # stay public (and vice-versa). Enforce the requested visibility explicitly.
+            api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=private)
             api.upload_folder(
                 repo_id=dest_repo,
                 repo_type="model",
                 folder_path=str(adapter_dir),
                 commit_message=f"Export Freesolo adapter ({source_subfolder})",
+                # Clear stale weights/metadata a previous adapter left in this repo (see
+                # _STALE_ADAPTER_PATTERNS) so a re-export can't serve a mix of old + new files.
+                delete_patterns=_STALE_ADAPTER_PATTERNS,
             )
         except Exception as exc:
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc

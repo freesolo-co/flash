@@ -50,11 +50,21 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
                 "exist_ok": exist_ok,
             }
 
-        def upload_folder(self, *, repo_id, repo_type, folder_path, commit_message):
+        def update_repo_settings(self, *, repo_id, repo_type, private):
+            calls["update_settings"] = {
+                "repo_id": repo_id,
+                "repo_type": repo_type,
+                "private": private,
+            }
+
+        def upload_folder(
+            self, *, repo_id, repo_type, folder_path, commit_message, delete_patterns=None
+        ):
             calls["upload"] = {
                 "repo_id": repo_id,
                 "repo_type": repo_type,
                 "files": sorted(p.name for p in Path(folder_path).iterdir()),
+                "delete_patterns": delete_patterns,
             }
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
@@ -86,6 +96,16 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     assert calls["upload"]["repo_id"] == "me/adapters"
     assert calls["upload"]["repo_type"] == "model"
     assert set(calls["upload"]["files"]) == {"adapter_config.json", "adapter_model.safetensors"}
+    # Visibility is ENFORCED after create (create_repo(exist_ok=True) won't change an existing repo).
+    assert calls["update_settings"] == {
+        "repo_id": "me/adapters",
+        "repo_type": "model",
+        "private": True,
+    }
+    # Stale adapter weights/metadata from a prior export are cleared (delete_patterns), so a re-export
+    # can't serve a mix of old + new files.
+    assert "*.safetensors" in calls["upload"]["delete_patterns"]
+    assert "adapter_model.*" in calls["upload"]["delete_patterns"]
 
 
 def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
@@ -104,6 +124,9 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
             pass
 
         def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
             pass
 
         def upload_folder(self, **kw):
