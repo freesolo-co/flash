@@ -59,6 +59,12 @@ _HB_UPLOAD_LOCK = threading.Lock()
 # already landed and the next heartbeat re-commits a fresher snapshot. Generous so a healthy-but-slow
 # upload is never skipped — only a genuinely stuck one trips it.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
+# Terminal (done/already_done) and error_* commits are CRITICAL — the control plane has no later
+# heartbeat to repair a skipped terminal commit, and error_* carries the `retriable` flag that
+# worker_flagged_retriable() reads. So those wait MUCH longer for the upload lock before giving up
+# (a slow progress upload ahead of them resolves well within this), at the cost of a bounded delay to
+# the worker's exit. Still bounded (not unbounded) so a truly-wedged upload can't hang exit forever.
+_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
@@ -90,14 +96,16 @@ with contextlib.suppress(Exception):
 # many minutes with only coarse 30s setup pings, or, inside dataset tokenization, none at all. A
 # tight FLASH_STALL_FAULTHANDLER_S window would false-kill such a HEALTHY-but-slow setup, so until
 # the first per-step TRAINING heartbeat (rl_step/sft_step) lands, the watchdog uses this WIDER
-# window for EVERY arm (not just the first one). Default 3000s == the providers' SETUP_GRACE_S so
-# the provider's own (retriable) setup grace governs a genuinely-stuck setup; only once real
-# training steps flow do we tighten to FLASH_STALL_FAULTHANDLER_S, where a fast in-process stack
-# dump is the point. Reads its OWN env var (independent of FLASH_STALL_FAULTHANDLER_S); never
-# consulted when the watchdog is disabled (_STALL_FAULTHANDLER_S <= 0 -> early return below).
-_STALL_STARTUP_GRACE_S = 3000
+# window for EVERY arm (not just the first one). Default 3600s -- deliberately STRICTLY LONGER than
+# the providers' SETUP_GRACE_S (3000s) so a genuinely-stuck setup trips the provider's RETRIABLE
+# setup-stall path FIRST; if this faulthandler (exit=True) fired first, the worker would exit and the
+# provider's poll loop would see a terminal FAILED and hard-fail a stall that should have been
+# retried. Only once real training steps flow do we tighten to FLASH_STALL_FAULTHANDLER_S, where a
+# fast in-process stack dump is the point. Reads its OWN env var (independent of
+# FLASH_STALL_FAULTHANDLER_S); never consulted when the watchdog is disabled (early return below).
+_STALL_STARTUP_GRACE_S = 3600
 with contextlib.suppress(Exception):
-    _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "3000") or 3000)
+    _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "3600") or 3600)
 # Stages that mean real TRAINING has begun (vs. a cold-start/setup ping). The first one tightens the
 # watchdog from the wide setup grace to the steady-state window. Mirrors the providers'
 # SETUP_HEARTBEAT_STAGES boundary: the cold-start stages there are setup, sft_step/rl_step are not.
@@ -181,7 +189,11 @@ def heartbeat(stage: str, **kw):
         # and this upload. Acquire the lock with a BOUND (see _HB_UPLOAD_LOCK_TIMEOUT_S) so a wedged
         # upload holding the lock can't block this heartbeat indefinitely; on timeout skip the
         # best-effort commit (local write already landed; next heartbeat re-commits fresher state).
-        if _HB_UPLOAD_LOCK.acquire(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S):
+        # Terminal/error commits are CRITICAL (no later heartbeat repairs them; error_* carries the
+        # retriable flag) so they wait far longer before skipping (_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S).
+        critical = stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
+        lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
+        if _HB_UPLOAD_LOCK.acquire(timeout=lock_timeout):
             try:
                 up = p + f".{os.getpid()}.{threading.get_ident()}.upload.tmp"
                 with open(up, "w") as f:
@@ -202,7 +214,7 @@ def heartbeat(stage: str, **kw):
             with _HB_LOCK:
                 if now == _w._HB_LAST_UPLOAD:
                     _w._HB_LAST_UPLOAD = prev_last_upload
-            print(f"HEARTBEAT upload-lock busy >{_HB_UPLOAD_LOCK_TIMEOUT_S}s; skipping commit for {stage}")
+            print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", json.dumps(payload))
 
 
@@ -278,3 +290,57 @@ def make_sft_heartbeat_callback():
             _w.heartbeat("sft_step", **{k: v for k, v in payload.items() if v is not None})
 
     return _SFTHeartbeat()
+
+
+# Gap-filler liveness around trainer.train(). The per-step rl_step/sft_step heartbeat only fires on
+# on_log AFTER a step (RL after each step; SFT logs every N steps), so the cold FIRST step (vLLM
+# rollout warmup + backward, ~17 min observed) emits no heartbeat while it runs and would look like a
+# hang to the default-on watchdog / provider stall. This daemon emits a synthetic per-step heartbeat
+# whenever the channel has gone quiet, covering the first step and any unusually slow later step.
+#
+# It must NOT mask a GENUINELY stuck train() (a CUDA/vLLM call that releases the GIL but makes no
+# optimizer progress): a synthetic heartbeat re-arms the watchdog and refreshes the provider
+# timestamp, so emitting unconditionally would keep BOTH stall detectors alive forever. So it is
+# GATED on step ADVANCEMENT — once the current step has made no progress for _TRAIN_LIVENESS_MAX_STEP_S
+# it STOPS emitting, letting the stall watchdog/provider fire on the real wedge.
+_TRAIN_LIVENESS_TICK_S = 30.0
+_TRAIN_LIVENESS_QUIET_S = 90.0
+_TRAIN_LIVENESS_MAX_STEP_S = 1800.0
+
+
+def train_liveness_loop(done, get_step, stage: str) -> None:
+    """Daemon-thread body run next to trainer.train() (see the block comment above).
+
+    ``done`` is the Event set in the train() ``finally``; ``get_step`` returns the trainer's current
+    ``global_step``; ``stage`` is ``"rl_step"``/``"sft_step"``.
+    """
+    last_step = -1
+    step_since = time.time()
+    while not done.wait(_TRAIN_LIVENESS_TICK_S):
+        if done.is_set():
+            return
+        step = None
+        with contextlib.suppress(Exception):
+            step = int(get_step() or 0)
+        if step is None:
+            # Can't read progress -> assume progress (reset the stuck timer) so a flaky read never
+            # false-stops liveness and false-kills healthy training; degrade to always-emit.
+            step_since = time.time()
+            step = max(last_step, 0)
+        elif step != last_step:
+            last_step = step
+            step_since = time.time()
+        if (time.time() - step_since) > _TRAIN_LIVENESS_MAX_STEP_S:
+            # No optimizer progress for longer than any legit single step -> train() is stuck. Stop
+            # covering so the stall watchdog/provider catch it instead of masking it indefinitely.
+            print(f"train_liveness: no step progress for >{_TRAIN_LIVENESS_MAX_STEP_S}s; stopping")
+            return
+        try:
+            quiet_for = time.time() - float(getattr(_w, "_HB_LAST_UPLOAD", 0.0) or 0.0)
+        except Exception:
+            quiet_for = 1e9
+        if quiet_for >= _TRAIN_LIVENESS_QUIET_S:
+            gpu = gpu_diagnostics(include_torch=False)
+            if done.is_set():  # train() may have finished during nvidia-smi
+                return
+            _w.heartbeat(stage, step=step, gpu=gpu)

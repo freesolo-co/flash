@@ -9,6 +9,7 @@ CALL time, so tests that ``monkeypatch.setattr(worker, "<name>", ...)`` then cal
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -157,6 +158,33 @@ def hf_resume_checkpoint() -> str | None:
         return None
 
 
+# No new download bytes for this long => snapshot_download is WEDGED (not slow): stop the liveness
+# ping so the stall watchdog / provider setup-stall fire, instead of masking a stuck transfer to the
+# outer job timeout. Generous — a live transfer (even hf_transfer parallel chunks on a slow link)
+# moves SOME bytes well within this, so only a dead connection trips it.
+_MAX_PREFETCH_SILENCE_S = 600.0
+
+
+def _hf_cache_bytes(model_id: str) -> int:
+    """Best-effort total bytes in the HF hub cache for ``model_id`` (blob sizes, incl. ``.incomplete``
+    partials an in-flight download is growing). Returns -1 if it can't be determined, so callers fail
+    SAFE (assume progress, never false-stop a real download)."""
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        d = os.path.join(HF_HUB_CACHE, "models--" + model_id.replace("/", "--"))
+        if not os.path.isdir(d):
+            return -1
+        total = 0
+        for root, _dirs, files in os.walk(d):
+            for fn in files:
+                with contextlib.suppress(OSError):
+                    total += os.path.getsize(os.path.join(root, fn))
+        return total
+    except Exception:
+        return -1
+
+
 def prefetch_model(model_id: str) -> float:
     """Pull the model weights into the local HF cache up front; return seconds spent.
 
@@ -177,6 +205,8 @@ def prefetch_model(model_id: str) -> float:
     _prefetch_done = threading.Event()
 
     def _prefetch_heartbeat() -> None:
+        last_bytes = -1
+        progress_since = time.time()
         while not _prefetch_done.wait(30.0):
             # Re-check after wait() returns: if the download finished in the gap between wait()
             # returning False and here, do NOT emit. A model_prefetching that STARTS after
@@ -187,6 +217,20 @@ def prefetch_model(model_id: str) -> float:
             # that in-flight upload is ordered strictly BEFORE model_prefetched's. That keeps
             # model_prefetched the last prefetch stage WITHOUT an unbounded join below.
             if _prefetch_done.is_set():
+                return
+            # Gate liveness on REAL download progress: a synthetic model_prefetching re-arms the
+            # watchdog and refreshes the provider timestamp, so emitting while snapshot_download is
+            # WEDGED (no bytes) would mask a stuck transfer until the outer job timeout. Track cache
+            # bytes; a measurement failure (-1) fails SAFE (treated as progress, never false-stops).
+            cur = _hf_cache_bytes(model_id)
+            if cur < 0 or cur > last_bytes:
+                last_bytes = cur
+                progress_since = time.time()
+            if (time.time() - progress_since) > _MAX_PREFETCH_SILENCE_S:
+                print(
+                    f"prefetch_model: no download progress for >{_MAX_PREFETCH_SILENCE_S}s; "
+                    "stopping liveness so the stall path can fire"
+                )
                 return
             # nvidia-smi-only (include_torch=False): the GPU isn't in use yet and torch telemetry
             # could block; this just needs to prove the worker is alive and re-arm the watchdog.

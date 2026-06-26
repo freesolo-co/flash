@@ -17,6 +17,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.heartbeat import train_liveness_loop
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     disable_liger_grpo_torch_compile,
@@ -795,27 +796,15 @@ def run_rl():
     # any unusually slow later step. It no-ops during normal fast stepping (rl_step keeps the channel
     # fresh within _HB_MIN_INTERVAL_S=60s) so it adds no commit spam. nvidia-smi-only diagnostics: the
     # trainer thread owns the CUDA/allocator locks during a step, so torch.cuda telemetry would block.
+    # Shared gap-filler (heartbeat.train_liveness_loop): emits rl_step when the channel goes quiet,
+    # but STOPS once a step has made no global_step progress for _TRAIN_LIVENESS_MAX_STEP_S, so a
+    # genuinely stuck train() trips the stall watchdog/provider instead of being masked forever.
     _train_done = threading.Event()
-
-    def _train_liveness_heartbeat() -> None:
-        while not _train_done.wait(30.0):
-            # Don't emit once train() has returned: re-check after wait() (done may be set in the
-            # gap) before doing any work, else a stray rl_step could land during post-train teardown
-            # (adapter save/upload) and regress the last published stage.
-            if _train_done.is_set():
-                return
-            try:
-                quiet_for = time.time() - float(getattr(_w, "_HB_LAST_UPLOAD", 0.0) or 0.0)
-            except Exception:
-                quiet_for = 1e9
-            if quiet_for >= 90.0:
-                step = int(getattr(getattr(trainer, "state", None), "global_step", 0) or 0)
-                gpu = gpu_diagnostics(include_torch=False)
-                if _train_done.is_set():  # train() may have finished during nvidia-smi
-                    return
-                _w.heartbeat("rl_step", step=step, gpu=gpu)
-
-    _train_hb = threading.Thread(target=_train_liveness_heartbeat, daemon=True)
+    _train_hb = threading.Thread(
+        target=train_liveness_loop,
+        args=(_train_done, lambda: getattr(getattr(trainer, "state", None), "global_step", 0), "rl_step"),
+        daemon=True,
+    )
     _train_hb.start()
     try:
         with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)

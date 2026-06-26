@@ -381,6 +381,47 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
     )
 
 
+def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
+    """done/already_done/error_* are CRITICAL — no later heartbeat repairs a skipped terminal commit,
+    and error_* carries the `retriable` flag worker_flagged_retriable() reads. So they wait the LONGER
+    _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S for the upload lock before skipping, vs the short progress
+    timeout. Proven by timing: with the lock held, a terminal stage blocks for the critical timeout
+    while a progress stage gives up after the short one."""
+    import importlib
+    import time as _time
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(hbmod, "_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S", 0.4)
+    monkeypatch.setattr(hbmod.faulthandler, "dump_traceback_later", lambda *a, **k: None)
+    monkeypatch.setattr(hbmod.faulthandler, "cancel_dump_traceback_later", lambda: None)
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: None)
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+
+    assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
+    try:
+        t = _time.monotonic()
+        w.heartbeat("rl_step", step=1)  # progress -> short timeout, skips fast
+        progress_wait = _time.monotonic() - t
+
+        t = _time.monotonic()
+        w.heartbeat("done")  # critical -> waits the long timeout before skipping
+        critical_wait = _time.monotonic() - t
+    finally:
+        hbmod._HB_UPLOAD_LOCK.release()
+
+    assert progress_wait < 0.3, f"progress stage should skip after the short timeout, waited {progress_wait:.2f}s"
+    assert critical_wait >= 0.3, f"critical stage should wait the long timeout, waited {critical_wait:.2f}s"
+    assert critical_wait > progress_wait + 0.15
+
+
 def test_heartbeat_terminal_only_mode(monkeypatch):
     """TERMINAL_ONLY mode throttles every non-terminal stage (not just rl_step) so a fan-out of
     runs sharing one HF_REPO stays under the 128-commits/hour cap; terminal done/error_* still

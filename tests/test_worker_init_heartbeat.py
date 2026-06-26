@@ -220,7 +220,6 @@ def test_prefetch_model_joins_heartbeat_with_a_bounded_timeout():
     [
         ("flash.engine.worker.hf", "prefetch_model", "_prefetch_heartbeat", "_prefetch_done"),
         ("flash.engine.worker.rl", "run_rl", "_rl_init_heartbeat", "_rl_init_done"),
-        ("flash.engine.worker.rl", "run_rl", "_train_liveness_heartbeat", "_train_done"),
         ("flash.engine.worker.sft", "run_sft", "_sft_init_heartbeat", "_sft_init_done"),
     ],
 )
@@ -228,8 +227,9 @@ def test_periodic_heartbeat_threads_guard_on_done(modname, outer, inner, done):
     """Every periodic side-thread heartbeat must re-check its done Event AFTER wait() (the event can
     be set in the gap between wait() timing out and the emit) and return without emitting, so it can't
     publish a stale stage once the phase it covers has finished — the prefetch race, generalized to
-    the init + train-liveness threads. (An emit after gpu_diagnostics is additionally guarded in the
-    source; here we just pin that the closure consults <done>.is_set() before emitting.)"""
+    the init threads. (An emit after gpu_diagnostics is additionally guarded in the source; here we
+    just pin that the closure consults <done>.is_set() before emitting. The shared train-liveness loop
+    has its own guard, covered by test_train_liveness_loop_*.)"""
     import importlib
 
     mod = importlib.import_module(modname)
@@ -252,32 +252,142 @@ def test_periodic_heartbeat_threads_guard_on_done(modname, outer, inner, done):
 
 
 # --------------------------------------------------------------------------------------------
-# Training-phase gap-filler. The per-step rl_step heartbeat fires on on_log AFTER a step, so the
-# FIRST GRPO step (cold vLLM rollout warmup + backward — measured ~17 min on a consumer GPU) emits
-# NO heartbeat while it runs. That stale-heartbeat window was the actual escalation symptom (and a
-# slow-enough step would trip the stall watchdog). run_rl must run a liveness daemon around
-# trainer.train() that fills the gap.
-def test_train_phase_has_liveness_heartbeat():
-    from flash.engine.worker import rl
+# A synthetic model_prefetching ping re-arms the watchdog + refreshes the provider timestamp, so it
+# must NOT mask a WEDGED snapshot_download (no bytes). The liveness is gated on real download progress
+# (HF cache byte growth); after _MAX_PREFETCH_SILENCE_S of zero growth it stops so the stall path fires.
+def test_hf_cache_bytes_counts_blobs_and_fails_safe(tmp_path, monkeypatch):
+    import huggingface_hub.constants as hconst
 
-    node = _inner_func_node(rl.run_rl, "_train_liveness_heartbeat")
-    assert node is not None, (
-        "run_rl no longer runs a liveness heartbeat around trainer.train() — the cold first-step "
-        "rollout would emit no heartbeat and look like a hang (the original escalation)"
-    )
-    # nvidia-smi only: the trainer thread owns the CUDA/allocator locks during a step.
-    _assert_gpu_diag_disables_torch(node, "run_rl._train_liveness_heartbeat")
-    # ...and it must emit a progress heartbeat (rl_step) to refresh the channel + re-arm the watchdog.
-    stages = [
-        n.args[0].value
+    from flash.engine.worker import hf
+
+    monkeypatch.setattr(hconst, "HF_HUB_CACHE", str(tmp_path))
+    # Nothing downloaded yet -> -1, so the caller assumes progress (never false-stops a real fetch).
+    assert hf._hf_cache_bytes("org/model") == -1
+    blobs = tmp_path / "models--org--model" / "blobs"
+    blobs.mkdir(parents=True)
+    (blobs / "complete").write_bytes(b"x" * 100)
+    (blobs / "partial.incomplete").write_bytes(b"y" * 50)  # an in-flight download's growing partial
+    assert hf._hf_cache_bytes("org/model") == 150
+
+
+def test_prefetch_heartbeat_gates_on_download_progress():
+    from flash.engine.worker import hf
+
+    node = _inner_func_node(hf.prefetch_model, "_prefetch_heartbeat")
+    assert node is not None, "prefetch_model no longer defines _prefetch_heartbeat"
+    calls_cache = [
+        n
         for n in ast.walk(node)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "heartbeat"
-        and n.args
-        and isinstance(n.args[0], ast.Constant)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_hf_cache_bytes"
     ]
-    assert "rl_step" in stages, f"expected an rl_step liveness heartbeat, got {stages}"
+    assert calls_cache, "prefetch liveness must gate on real download progress via _hf_cache_bytes"
+    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    assert "_MAX_PREFETCH_SILENCE_S" in names, (
+        "prefetch liveness must STOP after _MAX_PREFETCH_SILENCE_S of no byte progress so a wedged "
+        "download trips the stall path instead of being masked to the job timeout"
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# Training-phase gap-filler. The per-step rl_step/sft_step heartbeat fires on on_log AFTER a step, so
+# the FIRST step (cold vLLM rollout warmup + backward — measured ~17 min on a consumer GPU; SFT logs
+# only every N steps) emits NO heartbeat while it runs. That stale-heartbeat window was the actual
+# escalation symptom (and a slow-enough step would trip the stall watchdog). BOTH run_rl and run_sft
+# must run the shared liveness daemon (heartbeat.train_liveness_loop) around trainer.train().
+
+
+@pytest.mark.parametrize(
+    ("modname", "outer", "stage"),
+    [
+        ("flash.engine.worker.rl", "run_rl", "rl_step"),
+        ("flash.engine.worker.sft", "run_sft", "sft_step"),
+    ],
+)
+def test_train_phase_runs_shared_liveness_loop(modname, outer, stage):
+    import importlib
+
+    mod = importlib.import_module(modname)
+    src = inspect.getsource(getattr(mod, outer))
+    tree = ast.parse(src)
+    # It must spawn the SHARED train_liveness_loop (not a bespoke inline closure) with this stage.
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "train_liveness_loop"
+    ]
+    target_refs = "train_liveness_loop" in src and "target=train_liveness_loop" in src
+    assert calls or target_refs, (
+        f"{outer} must run heartbeat.train_liveness_loop around trainer.train() — without a gap "
+        "filler the cold first step emits no heartbeat and looks like a hang"
+    )
+    assert f'"{stage}"' in src, f"{outer} must pass stage {stage!r} to train_liveness_loop"
+
+
+def test_train_liveness_loop_emits_when_quiet_and_advancing(monkeypatch):
+    """The gap-filler emits the per-step stage while the channel is quiet and the step is advancing."""
+    import importlib
+    import threading
+    import time
+
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(hb, "_TRAIN_LIVENESS_TICK_S", 0.01)
+    monkeypatch.setattr(hb, "_TRAIN_LIVENESS_QUIET_S", 0.0)  # always "quiet" -> emit each tick
+    monkeypatch.setattr(hb, "_TRAIN_LIVENESS_MAX_STEP_S", 60.0)  # generous -> never the stop reason
+    monkeypatch.setattr(hb, "gpu_diagnostics", lambda include_torch=True: {})
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    emitted = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append((s, k.get("step"))))
+
+    counter = {"n": 0}
+
+    def advancing():
+        counter["n"] += 1
+        return counter["n"]
+
+    done = threading.Event()
+    th = threading.Thread(target=hb.train_liveness_loop, args=(done, advancing, "sft_step"), daemon=True)
+    th.start()
+    time.sleep(0.3)
+    done.set()
+    th.join(timeout=1.0)
+    assert not th.is_alive()
+    assert emitted, "expected liveness heartbeats while quiet + advancing"
+    assert all(s == "sft_step" for s, _ in emitted)
+
+
+def test_train_liveness_loop_stops_when_step_is_stuck(monkeypatch):
+    """A synthetic per-step heartbeat re-arms the watchdog + refreshes the provider timestamp, so the
+    gap-filler must NOT emit forever when train() is genuinely stuck (no global_step progress). After
+    _TRAIN_LIVENESS_MAX_STEP_S of no advancement it must STOP so the stall path can fire."""
+    import importlib
+    import threading
+    import time
+
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(hb, "_TRAIN_LIVENESS_TICK_S", 0.01)
+    monkeypatch.setattr(hb, "_TRAIN_LIVENESS_QUIET_S", 0.0)
+    monkeypatch.setattr(hb, "_TRAIN_LIVENESS_MAX_STEP_S", 0.2)  # stuck after 0.2s of no advance
+    monkeypatch.setattr(hb, "gpu_diagnostics", lambda include_torch=True: {})
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    emitted = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(s))
+
+    done = threading.Event()
+    th = threading.Thread(target=hb.train_liveness_loop, args=(done, lambda: 0, "rl_step"), daemon=True)
+    th.start()
+    time.sleep(1.0)  # well past _TRAIN_LIVENESS_MAX_STEP_S
+    stopped = not th.is_alive()
+    done.set()
+    th.join(timeout=1.0)
+    assert stopped, "train_liveness_loop must STOP covering a stuck (no-progress) step, not emit forever"
+    # It covered the step briefly (a few emits) then stopped — bounded, not unbounded.
+    assert len(emitted) <= 40, f"expected a bounded number of synthetic emits before stopping, got {len(emitted)}"
 
 
 # --------------------------------------------------------------------------------------------
@@ -305,8 +415,18 @@ def test_stall_watchdog_enabled_by_default():
     hb = importlib.reload(importlib.import_module("flash.engine.worker.heartbeat"))
 
     assert hb._STALL_FAULTHANDLER_S >= 600, "stall watchdog must be ON by default so hangs self-dump"
-    # The first-arm startup grace must be at least as wide as the steady-state window.
+    # The setup window must be at least as wide as the steady-state window...
     assert hb._STALL_STARTUP_GRACE_S >= hb._STALL_FAULTHANDLER_S
+    # ...and STRICTLY LONGER than the providers' setup grace, so a stuck setup trips the provider's
+    # RETRIABLE setup-stall path before this (exit=True) faulthandler hard-fails the run. Compare to
+    # the canonical provider value rather than a magic number so the two can't silently drift apart.
+    from flash.providers.runpod import jobs as runpod_jobs
+
+    provider_setup_grace = runpod_jobs.stall_kwargs()["setup_grace_s"]
+    assert provider_setup_grace < hb._STALL_STARTUP_GRACE_S, (
+        "setup faulthandler window must be strictly longer than the provider setup_grace_s "
+        f"({hb._STALL_STARTUP_GRACE_S} vs {provider_setup_grace})"
+    )
 
 
 def test_stall_watchdog_disabled_via_worker_env(monkeypatch):

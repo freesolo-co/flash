@@ -17,6 +17,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.heartbeat import train_liveness_loop
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
     gdn_packing_available,
@@ -523,8 +524,23 @@ def run_sft():
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
     t_train = time.time()
-    with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
-        trainer.train(resume_from_checkpoint=resume_ckpt)
+    # Gap-filler liveness: make_sft_heartbeat_callback only emits on on_log, and this SFT config logs
+    # every N steps, so the first batch of steps (cold first step especially) can outlast the setup
+    # grace with NO sft_step — looking like a hang to the default-on watchdog/provider. Same shared
+    # loop as RL (emits sft_step when the channel is quiet; stops if a step makes no progress for
+    # _TRAIN_LIVENESS_MAX_STEP_S so a genuinely stuck train() still trips the stall path).
+    _train_done = threading.Event()
+    _train_hb = threading.Thread(
+        target=train_liveness_loop,
+        args=(_train_done, lambda: getattr(getattr(trainer, "state", None), "global_step", 0), "sft_step"),
+        daemon=True,
+    )
+    _train_hb.start()
+    try:
+        with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+            trainer.train(resume_from_checkpoint=resume_ckpt)
+    finally:
+        _train_done.set()
     train_wall = time.time() - t_train
     sft_peak_gpu_gb = _peak_gpu_gb()
     sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()
