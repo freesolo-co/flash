@@ -602,6 +602,137 @@ def test_build_grpo_prompt_dataset_keeps_columns_arrow_safe() -> None:
     assert [e["metadata"]["param"] for e in mapped] == [12, 8, "gentle", 8]
 
 
+def test_grpo_masks_truncated_completions_by_default() -> None:
+    """GRPO drops truncated (non-EOS) completions from the loss by default.
+
+    TRL's GRPOConfig default is False (it WOULD train on truncated rollouts); a truncated
+    completion is not a real sample from the policy's distribution over finished sequences, so
+    including it biases the policy gradient and — on long-completion / multi-turn envs that
+    frequently hit the budget — can degrade the model below its SFT start.
+    """
+    import flash.engine.worker as w
+
+    # No stop_sequences (the common case) -> masking ON.
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "environment": {"id": "owner/env"},
+            "train": {"seeds": [0]},
+        }
+    )
+    assert w.grpo_mask_truncated_completions(spec.train) is True
+    # Defensive: a None train spec (no JOB_SPEC) still resolves to the safe default (ON).
+    assert w.grpo_mask_truncated_completions(None) is True
+
+
+def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
+    """With stop_sequences, vLLM strips the stop string so a normally-terminated completion does
+    NOT end in EOS — TRL's "last token != EOS" truncation check would then flag (and mask) every
+    completion, so the run would learn nothing. Gate the flag OFF in that case."""
+    import flash.engine.worker as w
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "grpo",
+            "environment": {"id": "owner/env"},
+            "train": {"seeds": [0], "stop_sequences": ["</answer>"]},
+        }
+    )
+    assert spec.train.stop_sequences == ("</answer>",)
+    assert w.grpo_mask_truncated_completions(spec.train) is False
+
+
+def test_run_rl_wires_mask_truncated_completions_to_the_gating_helper() -> None:
+    """run_rl's grpo_kwargs literal must pin mask_truncated_completions to the
+    grpo_mask_truncated_completions(...) helper. The helper's True/False logic is covered above, but
+    nothing else guarantees run_rl actually USES it: drop that dict entry and the helper tests still
+    pass while GRPO silently reverts to TRL's footgun default (False). Assert the wiring on run_rl's
+    AST (not a source substring) so it survives reformatting/quote changes — mirrors
+    tests/test_flash_worker.py's _train_body AST checks."""
+    import ast
+    import inspect
+
+    import flash.engine.worker as w
+
+    tree = ast.parse(inspect.getsource(w.run_rl))
+
+    # Accept plain OR annotated assignment (`grpo_kwargs = {...}` / `grpo_kwargs: dict = {...}`) so
+    # the test stays focused on the wiring invariant, not the exact assignment node type.
+    def _grpo_dict(node):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            return None
+        if isinstance(value, ast.Dict) and any(
+            isinstance(t, ast.Name) and t.id == "grpo_kwargs" for t in targets
+        ):
+            return value
+        return None
+
+    grpo_dict = next(
+        (d for node in ast.walk(tree) if (d := _grpo_dict(node)) is not None), None
+    )
+    assert grpo_dict is not None, "run_rl no longer builds a grpo_kwargs dict literal"
+
+    value = next(
+        (
+            v
+            for k, v in zip(grpo_dict.keys, grpo_dict.values, strict=True)
+            if isinstance(k, ast.Constant) and k.value == "mask_truncated_completions"
+        ),
+        None,
+    )
+    assert value is not None, (
+        "run_rl's grpo_kwargs no longer pins mask_truncated_completions -> GRPO would silently "
+        "revert to TRL's footgun default (False) and train on truncated rollouts"
+    )
+    # Must be wired to the helper (so stop_sequences gating applies), not a bare True/False literal.
+    # Accept a bare name OR a qualified call (`grpo_mask_truncated_completions(...)` /
+    # `worker.grpo_mask_truncated_completions(...)`) — only the called name is the invariant.
+    func = value.func if isinstance(value, ast.Call) else None
+    called = (
+        func.id
+        if isinstance(func, ast.Name)
+        else func.attr
+        if isinstance(func, ast.Attribute)
+        else None
+    )
+    assert called == "grpo_mask_truncated_completions", (
+        "mask_truncated_completions must be wired to grpo_mask_truncated_completions(...) so the "
+        "stop_sequences gating is honored"
+    )
+
+
+def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:
+    """Document the TRL contract the recipe depends on: the field exists and TRL defaults it OFF,
+    so the explicit True in run_rl is load-bearing. A TRL rename would silently drop our override,
+    so fail loudly here if the field disappears."""
+    import dataclasses as dc
+
+    GRPOConfig = pytest.importorskip("trl").GRPOConfig
+    fields = {f.name: f for f in dc.fields(GRPOConfig)}
+    assert "mask_truncated_completions" in fields, (
+        "TRL renamed/removed mask_truncated_completions — update the GRPO recipe in run_rl"
+    )
+    assert fields["mask_truncated_completions"].default is False
+    # The flag composes with the recipe's loss_type without GRPOConfig rejecting the combo
+    # (use_cpu/bf16=False so the config validates on a CPU-only CI host). tmp_path gives a unique,
+    # writable output_dir (no /tmp collisions between parallel test runs).
+    cfg = GRPOConfig(
+        output_dir=str(tmp_path),
+        loss_type="dr_grpo",
+        mask_truncated_completions=True,
+        report_to=[],
+        bf16=False,
+        use_cpu=True,
+    )
+    assert cfg.mask_truncated_completions is True
+
+
 def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
     # The actual failure point: Dataset.from_list over the rich records raises ArrowInvalid on the
     # mixed-type column, while the index-based rows construct cleanly.
