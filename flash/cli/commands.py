@@ -35,7 +35,7 @@ from flash.schema import ConfigError, spec_from_file
 from . import render
 from .training_doc import TRAINING_MD
 
-logger = get_logger("flash.cli.main")
+logger = get_logger("flash.cli")
 
 
 # Exceptions that represent expected user/config errors: report them as a clean one-line

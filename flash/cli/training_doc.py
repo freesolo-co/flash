@@ -151,9 +151,6 @@ flash deployments                # active serving endpoints
 flash undeploy <run-id>          # tear the endpoint down
 ```
 
-> Flash also ships an **MCP bridge** (`flash` as an MCP server) so a coding agent can
-> drive these same commands as tools.
-
 The rest of this file is about doing the above *well* — designing a reward that teaches,
 and deciding honestly whether a run improved.
 
