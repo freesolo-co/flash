@@ -165,6 +165,7 @@ def heartbeat(stage: str, **kw):
         else:
             throttled = stage in _HB_THROTTLED_STAGES
             upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= _w._HB_MIN_INTERVAL_S
+        prev_last_upload = _w._HB_LAST_UPLOAD
         if upload_due:
             _w._HB_LAST_UPLOAD = now  # claim the slot under the lock (throttle stays atomic)
     # Re-arm the stall watchdog NOW, off the LOCAL write that just landed — the live-progress signal
@@ -193,6 +194,14 @@ def heartbeat(stage: str, **kw):
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
+            # We claimed the upload slot above but never committed. Roll it back so the throttle
+            # doesn't defer the NEXT commit by up to _HB_MIN_INTERVAL_S on the strength of an upload
+            # that never happened, and so _train_liveness_heartbeat's quiet_for (which reads
+            # _HB_LAST_UPLOAD) doesn't treat the channel as fresh while HF is still stale. Guard on
+            # equality so we only undo OUR claim, never a newer one another thread landed meanwhile.
+            with _HB_LOCK:
+                if now == _w._HB_LAST_UPLOAD:
+                    _w._HB_LAST_UPLOAD = prev_last_upload
             print(f"HEARTBEAT upload-lock busy >{_HB_UPLOAD_LOCK_TIMEOUT_S}s; skipping commit for {stage}")
     print("HEARTBEAT", json.dumps(payload))
 

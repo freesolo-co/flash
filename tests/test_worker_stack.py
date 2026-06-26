@@ -361,7 +361,8 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
     uploads = []
     monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: uploads.append(a))
     monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    sentinel_last_upload = 123.0  # a prior successful-commit timestamp the skip must NOT clobber
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
 
     assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
     try:
@@ -373,6 +374,11 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
 
     assert elapsed < 5.0, f"heartbeat wedged on the held upload lock ({elapsed:.2f}s)"
     assert uploads == [], "the best-effort commit must be skipped while the lock is stuck"
+    # The skipped upload must ROLL BACK its optimistic slot claim — otherwise the throttle defers the
+    # next real commit and _train_liveness_heartbeat's quiet_for treats a stale channel as fresh.
+    assert sentinel_last_upload == w._HB_LAST_UPLOAD, (
+        f"a skipped commit must not advance _HB_LAST_UPLOAD (got {w._HB_LAST_UPLOAD})"
+    )
 
 
 def test_heartbeat_terminal_only_mode(monkeypatch):
