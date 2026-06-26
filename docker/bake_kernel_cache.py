@@ -69,7 +69,10 @@ def main() -> int:
     ap.add_argument("--gpu-type-id", required=True, help="RunPod gpuTypeId, e.g. 'NVIDIA H100 80GB HBM3'")
     ap.add_argument("--image", default="ghcr.io/freesolo-co/flash-worker:cu128")
     ap.add_argument("--out", default="build/kernel_cache")
-    ap.add_argument("--container-disk-gb", type=int, default=80)
+    # the warm pod only pulls the ~20GB image + writes the cache (no model download), so keep this
+    # modest -- an over-large ask shrinks the eligible host pool and trips "machine does not have the
+    # resources" on scarce classes (e.g. Blackwell sm120 on secure cloud).
+    ap.add_argument("--container-disk-gb", type=int, default=60)
     ap.add_argument("--deadline-min", type=int, default=45)
     ap.add_argument("--run-id", default="", help="unique suffix for the temp repo (default: time+uuid)")
     ap.add_argument(
