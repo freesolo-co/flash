@@ -310,7 +310,10 @@ def liveness_heartbeat(
 
     def _loop() -> None:
         last_val = None
-        advanced_at = time.time()
+        # Measure the no-progress silence with the MONOTONIC clock: a wall-clock jump (NTP step, VM
+        # suspend/resume) must not make max_silence_s trip early/late — it decides when liveness STOPS
+        # and hands off to the stall watchdog, so a spurious early stop would false-fail a healthy run.
+        advanced_at = time.monotonic()
         while not done.wait(_LIVENESS_TICK_S):
             if progress is not None:
                 val = None
@@ -318,11 +321,13 @@ def liveness_heartbeat(
                     v = progress()
                     val = None if v is None else float(v)
                 if val is not None and (last_val is None or val > last_val):
-                    last_val, advanced_at = val, time.time()
-                if max_silence_s and (time.time() - advanced_at) > max_silence_s:
+                    last_val, advanced_at = val, time.monotonic()
+                if max_silence_s and (time.monotonic() - advanced_at) > max_silence_s:
                     print(f"liveness[{stage}]: no progress for >{max_silence_s:.0f}s; stopping")
                     return
             if quiet_gate_s is not None:
+                # Wall-clock here on purpose: this compares against _HB_LAST_UPLOAD, a time.time()
+                # timestamp set in heartbeat(), so both ends must be the same (wall) clock.
                 quiet_for = 1e9
                 with contextlib.suppress(Exception):
                     quiet_for = time.time() - float(getattr(_w, "_HB_LAST_UPLOAD", 0.0) or 0.0)

@@ -217,6 +217,22 @@ def test_liveness_heartbeat_rechecks_done_after_diagnostics(monkeypatch):
     assert "done.is_set()" in between, "must re-check done.is_set() between diagnostics and emit"
 
 
+def test_liveness_silence_uses_monotonic_clock_not_wall_clock():
+    """The no-progress silence (max_silence_s) measures an ELAPSED interval, so it must use the
+    monotonic clock — a wall-clock jump (NTP step, VM suspend/resume) must not trip it early/late,
+    since it decides when liveness stops and hands off to the stall watchdog. The quiet_gate compares
+    against _HB_LAST_UPLOAD (a time.time() stamp), so that one stays on wall clock."""
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    src = inspect.getsource(inspect.unwrap(hb.liveness_heartbeat))
+    # The silence window between an advance and the max_silence_s check is the monotonic span.
+    silence = src[src.index("advanced_at =") : src.index("if quiet_gate_s is not None")]
+    assert "time.monotonic()" in silence, "silence/progress interval must use time.monotonic()"
+    assert "time.time()" not in silence, "silence/progress interval must NOT use wall-clock time.time()"
+    # The quiet-gate still pairs with the wall-clock _HB_LAST_UPLOAD stamp.
+    quiet = src[src.index("if quiet_gate_s is not None") : src.index("gpu = gpu_diagnostics")]
+    assert "time.time()" in quiet, "quiet_gate must stay on wall clock to match _HB_LAST_UPLOAD"
+
+
 def test_train_liveness_heartbeat_gap_fills_with_step(monkeypatch):
     """train_liveness_heartbeat composes liveness_heartbeat for the train phase: gap-fill the per-step
     stage when quiet, carrying the live global_step."""
