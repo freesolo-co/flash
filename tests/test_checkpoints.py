@@ -132,6 +132,24 @@ def _make_ckpt_dir(parent, step):
     return ckpt
 
 
+@pytest.fixture
+def fake_trainer_callback(monkeypatch):
+    """make_checkpoint_upload_callback does ``from transformers import TrainerCallback`` at call
+    time; the offline CI env has no transformers, so stub a minimal base class (we invoke our
+    own on_save/on_train_end overrides directly, so the base is just a placeholder)."""
+    import sys
+    import types
+
+    mod = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    mod.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", mod)
+    return mod
+
+
 def test_latest_checkpoint_dir_picks_highest_step(tmp_path):
     import flash.engine.worker as worker
 
@@ -146,7 +164,7 @@ def test_latest_checkpoint_dir_picks_highest_step(tmp_path):
     assert worker._latest_checkpoint_dir(str(tmp_path / "missing")) is None
 
 
-def test_on_train_end_flushes_final_deployable_checkpoint(tmp_path, monkeypatch):
+def test_on_train_end_flushes_final_deployable_checkpoint(tmp_path, monkeypatch, fake_trainer_callback):
     """A fast RL run can exit before its last save's async (daemon) upload finishes, so
     on_train_end must SYNCHRONOUSLY publish the latest on-disk checkpoint as a deployable
     snapshot — otherwise `flash checkpoints` is empty even though the run trained fine."""
@@ -167,7 +185,7 @@ def test_on_train_end_flushes_final_deployable_checkpoint(tmp_path, monkeypatch)
     assert "optimizer.pt" in deployable[0]["ignore_patterns"]
 
 
-def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch):
+def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch, fake_trainer_callback):
     import flash.engine.worker as worker
 
     rec = _RecordingHfApi()
@@ -180,7 +198,7 @@ def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch):
     assert rec.uploads == []
 
 
-def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch):
+def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_trainer_callback):
     """The durable, accumulating deployable adapter must be uploaded BEFORE the larger
     latest-only resume checkpoint, so it lands first if the worker is torn down mid-upload."""
     import flash.engine.worker as worker
