@@ -52,11 +52,17 @@ _HB_LOCK = threading.Lock()
 # one on HF (reorder), so this lock makes uploads strictly ordered.
 _HB_UPLOAD_LOCK = threading.Lock()
 # Acquire the upload lock with a BOUND: hf upload has no hard timeout, so a wedged upload could hold
-# the lock and block the next heartbeat. Past the bound we skip the best-effort commit (the local
-# write already landed; the next heartbeat re-commits). Terminal/error_* commits are CRITICAL — no
-# later heartbeat repairs them — so they wait much longer before giving up, but still bounded.
+# the lock and block the next heartbeat. Past the bound we skip the best-effort commit and roll the
+# slot claim back so the throttle doesn't defer the NEXT (non-terminal) heartbeat, which re-commits
+# fresher state — HF is the only durable channel, there is no local copy. Terminal/error_* commits
+# are CRITICAL (no later heartbeat repairs them) so they wait much longer before giving up.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
 _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
+# Monotonic counter: each upload slot-claim takes the next value. The rollback guard compares its
+# captured claim to this counter to tell "my claim is still the latest" from "a newer claim landed",
+# WITHOUT relying on the wall-clock ts — two heartbeats can read the same _HB_LAST_UPLOAD on a coarse
+# clock, and equality on that ts would let one thread's rollback undo another thread's live claim.
+_HB_CLAIM_SEQ = 0
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
@@ -73,6 +79,7 @@ def _dump_thread_stacks(reason: str) -> None:
 
 
 def heartbeat(stage: str, **kw):
+    global _HB_CLAIM_SEQ
     payload = {
         "stage": stage,
         "ts": time.time(),
@@ -111,6 +118,8 @@ def heartbeat(stage: str, **kw):
             upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= _w._HB_MIN_INTERVAL_S
         prev_last_upload = _w._HB_LAST_UPLOAD
         if upload_due:
+            _HB_CLAIM_SEQ += 1
+            my_claim = _HB_CLAIM_SEQ  # collision-free identity for THIS slot claim
             _w._HB_LAST_UPLOAD = now  # claim the slot under the lock (throttle stays atomic)
     if upload_due:
         # Serialize the network commit under a SEPARATE lock so uploads can't reorder, and upload the
@@ -118,7 +127,8 @@ def heartbeat(stage: str, **kw):
         # re-reading p — which a newer heartbeat may already have overwritten between our slot-claim
         # and this upload. Acquire the lock with a BOUND (see _HB_UPLOAD_LOCK_TIMEOUT_S) so a wedged
         # upload holding the lock can't block this heartbeat indefinitely; on timeout skip the
-        # best-effort commit (local write already landed; next heartbeat re-commits fresher state).
+        # best-effort commit and roll the slot claim back below so the throttle doesn't defer the next
+        # heartbeat, which re-commits fresher state (HF is the only durable channel — no local copy).
         # Terminal/error commits are CRITICAL (no later heartbeat repairs them; error_* carries the
         # retriable flag) so they wait far longer before skipping (_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S).
         critical = stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
@@ -139,7 +149,7 @@ def heartbeat(stage: str, **kw):
                     # branch does, so the throttle doesn't defer the next retry and quiet_gate doesn't
                     # read the channel as fresh. ``is False`` (not falsy) so a mock/None never trips it.
                     with _HB_LOCK:
-                        if now == _w._HB_LAST_UPLOAD:
+                        if my_claim == _HB_CLAIM_SEQ:  # ours is still the latest claim
                             _w._HB_LAST_UPLOAD = prev_last_upload
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
             finally:
@@ -148,10 +158,11 @@ def heartbeat(stage: str, **kw):
             # We claimed the upload slot above but never committed. Roll it back so the throttle
             # doesn't defer the NEXT commit by up to _HB_MIN_INTERVAL_S on the strength of an upload
             # that never happened, and so liveness_heartbeat's quiet_gate (which reads
-            # _HB_LAST_UPLOAD) doesn't treat the channel as fresh while HF is still stale. Guard on
-            # equality so we only undo OUR claim, never a newer one another thread landed meanwhile.
+            # _HB_LAST_UPLOAD) doesn't treat the channel as fresh while HF is still stale. Guard on the
+            # claim SEQ (not the wall-clock ts, which two heartbeats can share on a coarse clock) so we
+            # only undo OUR claim, never a newer one another thread landed meanwhile.
             with _HB_LOCK:
-                if now == _w._HB_LAST_UPLOAD:
+                if my_claim == _HB_CLAIM_SEQ:
                     _w._HB_LAST_UPLOAD = prev_last_upload
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", snapshot)
