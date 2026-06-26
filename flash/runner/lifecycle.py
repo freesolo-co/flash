@@ -586,7 +586,7 @@ def _charge_completed_run_by_id(run_id: str, log) -> None:
     ``cost_usd`` + the raw ``spec`` dict), so a run id is the only input. The retry sweep calls this
     directly so a legacy/stale persisted spec that ``JobSpec.from_dict`` would reject does NOT block
     recovery of a real pending/failed charge."""
-    from flash.runner import _update, get_status
+    from flash.runner import get_status, record_billing_state
     from flash.server.auth import INTERNAL_KEY_ENV
     from flash.server.billing import BillingError, charge_completed_run
 
@@ -597,37 +597,23 @@ def _charge_completed_run_by_id(run_id: str, log) -> None:
     internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
     if not internal_key:
         detail = f"{INTERNAL_KEY_ENV} is not configured; completed run was not billed"
-        _update(
-            run_id,
-            get_status(run_id).state,
-            billing_state="failed",
-            billing_error=detail,
-        )
+        # Field-only billing write that re-reads state under the lock: never overwrite a `deployed`
+        # that a concurrent /deploy may have written since we last read the run.
+        record_billing_state(run_id, billing_state="failed", billing_error=detail)
         print(f"billing failed: {detail}", file=log, flush=True)
         return
 
-    _update(
-        run_id,
-        get_status(run_id).state,
-        billing_state="charging",
-        billing_error=None,
-    )
+    record_billing_state(run_id, billing_state="charging", billing_error=None)
     status = get_status(run_id)
     try:
         charge = charge_completed_run(internal_key=internal_key, status=status)
     except BillingError as exc:
-        _update(
-            run_id,
-            get_status(run_id).state,
-            billing_state="failed",
-            billing_error=exc.detail,
-        )
+        record_billing_state(run_id, billing_state="failed", billing_error=exc.detail)
         print(f"billing failed: {exc.detail}", file=log, flush=True)
         return
 
-    _update(
+    record_billing_state(
         run_id,
-        get_status(run_id).state,
         billing_state="charged",
         billing_error=None,
         billing_charge=charge,

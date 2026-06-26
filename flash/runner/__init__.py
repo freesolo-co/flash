@@ -637,6 +637,34 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
     _report_status(status)
 
 
+# Billing fields that are field-only metadata, never a run-state transition.
+_BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
+
+
+def record_billing_state(run_id: str, **fields) -> None:
+    """Persist the customer-billing fields (billing_state/billing_error/billing_charge) WITHOUT
+    touching the run's state. Like ``record_realized_cost``, it re-reads the run UNDER the lock and
+    writes only the billing columns, so a run that advanced (e.g. ``done`` -> ``deployed`` via a
+    concurrent ``mark_deployed``) keeps its current state. The completion-charge hook must use this
+    rather than ``_update(run_id, get_status(run_id).state, ...)``: that read-state-then-write pattern
+    samples the state OUTSIDE the lock, so a deploy landing between the read and ``_update`` taking the
+    lock would let the stale state clobber ``deployed``. No-ops if the run vanished. Always allowed:
+    these are field-only updates on any state (incl. terminal)."""
+    bad = set(fields) - _BILLING_FIELDS
+    if bad:
+        raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
+    with _STATUS_LOCK:
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        for key, value in fields.items():
+            setattr(status, key, value)
+        status.updated_at = time.time()
+        _save_status(status)
+    _report_status(status)
+
+
 def _report_status(status: RunStatus) -> None:
     with contextlib.suppress(Exception):
         from flash.server.run_registry import record_training_run

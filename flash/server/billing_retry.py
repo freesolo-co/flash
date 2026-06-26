@@ -33,9 +33,14 @@ from flash.server.auth import INTERNAL_KEY_ENV
 # never ran (a crash between the `done` write and the charge) is recovered via this set.
 _BILLABLE_STATES = frozenset({"done", "deployed"})
 
-# billing_state values that PROVE the completion charge machine already ran, which only happens after
-# a run reached `done` (lifecycle._charge_completed_run_best_effort). Kept as a defensive backup
-# completion signal alongside the primary `artifacts_dir` anchor below.
+# billing_state values that PROVE the completion charge machine already ran for this run, which only
+# happens after a run reached `done` (lifecycle._charge_completed_run_best_effort). So a run carrying
+# one of these has DEFINITELY completed training and incurred a charge, no matter what its current
+# state is now. This recovers a run that completed (`done`/`deployed`) and was LATER `cancelled`
+# (cancel flips a deployed run to `cancelled`, deploy.py:116) while its charge was still pending in
+# the backend -- without it, the widened cancel state would drop out of `_BILLABLE_STATES` and leak.
+# `pending` is intentionally NOT here: it is the submit-time default that a run cancelled BEFORE ever
+# completing also carries, so charging on `pending`+`cancelled` would bill a run that never trained.
 _CHARGE_STARTED_STATES = frozenset({"charging", "failed"})
 
 
@@ -44,42 +49,34 @@ def charge_retry_enabled() -> bool:
     return bool(os.environ.get(INTERNAL_KEY_ENV))
 
 
-def _completed_training(status: runner.RunStatus) -> bool:
-    """True iff the run reached `done` -- i.e. it finished training and produced a final adapter.
-
-    `artifacts_dir` is the DURABLE completion marker: it is written ONLY on the `done` transition
-    (runner.lifecycle line 555, runner.deploy lines 236/255) and never on submit/queued/running/
-    failed/cancelled, and no later transition clears it. So a run that completed training carries it
-    forever, even after it is deployed and then cancelled. This is the anchor that distinguishes a
-    completed-then-cancelled run (owes its completion charge) from a run cancelled BEFORE it ever
-    finished training (never owes one) -- neither `billing_context` nor `cost_usd` can, since both are
-    set at submit / accumulated per-seed mid-run (runner.__init__ line 429, runner.lifecycle line 538)
-    and so are present on a run cancelled before completion too.
-
-    `billing_state in {charging, failed}` is a defensive backup: those are written only by the
-    post-`done` charge machine, so they also imply completion (covers any legacy run missing
-    artifacts_dir whose inline charge already attempted)."""
-    return bool(status.artifacts_dir) or status.billing_state in _CHARGE_STARTED_STATES
-
-
 def _needs_charge(status: runner.RunStatus) -> bool:
     """True for a completed run that carries customer billing context but isn't `charged` yet.
 
     Eligible when the run carries a customer billing context, isn't already `charged`, and EITHER it
-    is still in a billable terminal state (`done`/`deployed`) OR it provably completed training
-    (`_completed_training`). The second arm recovers a run that completed training and was then
-    `cancelled` (e.g. a deployed run gets cancelled, or a recovery-path completion via attach_run that
-    never ran the inline charge) while its charge was still `pending` -- such a run leaves
-    `_BILLABLE_STATES` but provably finished, so its pending charge must still be recovered. A run
-    cancelled BEFORE completing never reached `done`, so it has no `artifacts_dir` and stays
-    ineligible: a run that never trained is never charged, even with a submit-time `pending`."""
+    is still in a billable terminal state (`done`/`deployed`) OR its charge machine already started
+    (`charging`/`failed`). The second arm recovers a run that completed training and was then
+    `cancelled` (e.g. a deployed run gets cancelled) while its charge was pending -- such a run leaves
+    `_BILLABLE_STATES` but provably completed, so its pending/failed charge must still be recovered.
+    A run cancelled BEFORE completing keeps the submit-time `pending` and a non-billable state, so it
+    stays ineligible: a run that never trained is never charged.
+
+    KNOWN RESIDUAL LEAK (intentionally NOT closed here): a run that completed ALL training but whose
+    FIRST charge attempt never ran (e.g. attach_run completes the last seed via deploy.py:255 without
+    the inline charge, so billing_state stays `pending`) and is THEN deployed and cancelled ends up
+    `cancelled`+`pending` and is skipped. It cannot be safely recovered without wrongly charging a
+    PARTIAL multi-seed run: attach_run also writes `artifacts_dir`/partial `cost_usd` for an
+    intermediate seed while still `running` (deploy.py:232-238), so no durable field distinguishes
+    "fully completed then cancelled" from "one seed recovered, still running, then cancelled" once the
+    state is overwritten by cancel. Closing this needs a new persistent "training completed" column
+    (set ONLY at the terminal done hook, lifecycle.py:551). Flagged for a schema follow-up; charging
+    a partial/incomplete run is worse than this narrow leak, so the predicate stays conservative."""
     if not status.billing_context:
         return False
     if status.billing_state == "charged":
         return False
     if status.state in _BILLABLE_STATES:
         return True
-    return _completed_training(status)
+    return status.billing_state in _CHARGE_STARTED_STATES
 
 
 def retry_completion_charges_once() -> int:

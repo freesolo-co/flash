@@ -32,15 +32,7 @@ def _spec():
     return spec_from_dict(SPEC, run_id="run-1")
 
 
-def _save_run(
-    runner,
-    tmp_path,
-    *,
-    state="done",
-    billing_state="pending",
-    billing_context=None,
-    artifacts_dir=None,
-):
+def _save_run(runner, tmp_path, *, state="done", billing_state="pending", billing_context=None):
     spec = _spec()
     status = runner.RunStatus(
         run_id=spec.run_id,
@@ -50,7 +42,6 @@ def _save_run(
         remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
         billing_context={"org_id": "org-A"} if billing_context is None else billing_context,
         billing_state=billing_state,
-        artifacts_dir=artifacts_dir,
     )
     runner._save_status(status)
     return spec
@@ -82,8 +73,8 @@ def test_needs_charge_predicate():
     assert not billing_retry._needs_charge(
         st(state="done", billing_context=ctx, billing_state="charged")
     )
-    # never completed (failed/cancelled, NO artifacts_dir) -> never charged, even if billing_state is
-    # still the submit-time pending: the run never reached `done`, so it never trained.
+    # never completed (failed/cancelled) -> never charged, even if billing_state is still pending
+    # (the submit-time default: the charge machine never ran, so the run never trained)
     assert not billing_retry._needs_charge(
         st(state="failed", billing_context=ctx, billing_state="pending")
     )
@@ -99,23 +90,29 @@ def test_needs_charge_predicate():
     assert billing_retry._needs_charge(
         st(state="cancelled", billing_context=ctx, billing_state="charging")
     )
-    # THE WINDOW: completed (artifacts_dir set on the `done` write) then deployed-then-cancelled
-    # BEFORE the first charge attempt, so billing_state is still the submit-time `pending`. The
-    # durable artifacts_dir anchor keeps it eligible (the charge machine never running does NOT mean
-    # the run never completed -- e.g. attach_run completes a recovered run without the inline charge).
-    assert billing_retry._needs_charge(
-        st(state="cancelled", billing_context=ctx, billing_state="pending", artifacts_dir="/r/done")
+    # PARTIAL MULTI-SEED ATTACH (must NOT charge): attach_run sets `artifacts_dir` + partial
+    # `cost_usd` for an intermediate seed while the run is still `running` (deploy.py:232-238). Such a
+    # run -- still running, or later cancelled -- has NOT finished all training, so the predicate must
+    # leave it alone. `artifacts_dir`/`cost_usd` are deliberately NOT eligibility signals here: only
+    # `state in {done,deployed}` or a started charge (`charging`/`failed`) qualifies, neither of which
+    # this partial run has. Charging it would bill a partial amount and pre-empt the real final charge.
+    assert not billing_retry._needs_charge(
+        st(
+            state="running",
+            billing_context=ctx,
+            billing_state="pending",
+            artifacts_dir="/results/runpod/rl/run-1",
+            cost_usd=0.5,
+            resume_seed_index=1,
+        )
     )
-    # ...but a run cancelled BEFORE completing (pending + NO artifacts_dir) stays ineligible: the
-    # over-correction guard. billing_context/cost_usd alone can't tell these apart (both submit-time),
-    # only the completion marker can.
     assert not billing_retry._needs_charge(
         st(
             state="cancelled",
             billing_context=ctx,
             billing_state="pending",
-            cost_usd=0.5,  # partial per-seed cost accrued before the cancel; still NOT chargeable
-            artifacts_dir=None,
+            artifacts_dir="/results/runpod/rl/run-1",
+            cost_usd=0.5,
         )
     )
     # internal/non-external run (no billing context) -> nothing to charge
@@ -233,6 +230,54 @@ def test_sweep_skips_charged_failed_and_internal_runs(monkeypatch, tmp_path):
     assert billing_retry.retry_completion_charges_once() == 0
 
 
+def test_sweep_never_charges_partial_multiseed_attach_run(monkeypatch, tmp_path):
+    """Regression for the over-charge the artifacts_dir anchor caused: attach_run sets `artifacts_dir`
+    and a partial per-seed `cost_usd` for a multi-seed run while it is still `running` after recovering
+    ONE intermediate seed (deploy.py:232-238). That run has NOT finished all training, so the sweep
+    must NEVER charge it -- charging would bill a partial amount and pre-empt the real final charge.
+    The same holds if that partial run is then cancelled mid-recovery (still `pending`, no charge
+    attempt). The conservative predicate (state in {done,deployed} OR billing_state in
+    {charging,failed}) leaves both alone."""
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+
+    # mid-recovery: one seed done so artifacts_dir + partial cost are set, but still running
+    runner._save_status(
+        runner.RunStatus(
+            run_id="partial-running",
+            state="running",
+            spec=_spec().to_dict(),
+            cost_usd=0.5,
+            artifacts_dir="/results/runpod/rl/partial-running",
+            resume_seed_index=1,
+            billing_context={"org_id": "org-A"},
+            billing_state="pending",
+        )
+    )
+    # the same partial run cancelled mid-recovery: artifacts_dir set, charge never attempted
+    runner._save_status(
+        runner.RunStatus(
+            run_id="partial-cancelled",
+            state="cancelled",
+            spec=_spec().to_dict(),
+            cost_usd=0.5,
+            artifacts_dir="/results/runpod/rl/partial-cancelled",
+            billing_context={"org_id": "org-A"},
+            billing_state="pending",
+        )
+    )
+
+    monkeypatch.setattr(
+        "flash.server.billing.charge_completed_run",
+        lambda **_: (_ for _ in ()).throw(AssertionError("a partial multi-seed run must not be charged")),
+    )
+    assert billing_retry.retry_completion_charges_once() == 0
+    assert runner.get_status("partial-running").billing_state == "pending"
+    assert runner.get_status("partial-cancelled").billing_state == "pending"
+
+
 def test_sweep_charges_completed_then_cancelled_run(monkeypatch, tmp_path):
     """A run that completed training (its charge machine ran and left `failed`) and was LATER
     cancelled -- e.g. a deployed run gets cancelled (deploy.py flips it to `cancelled`) -- still owes
@@ -260,47 +305,14 @@ def test_sweep_charges_completed_then_cancelled_run(monkeypatch, tmp_path):
     assert runner.get_status("run-1").billing_state == "charged"
 
 
-def test_sweep_charges_completed_then_cancelled_run_still_pending(monkeypatch, tmp_path):
-    """The Cursor HIGH window: a run that completed training (artifacts_dir set on the `done` write)
-    was deployed and then cancelled BEFORE the first charge attempt, so billing_state is still the
-    submit-time `pending` -- not `charging`/`failed`. The durable artifacts_dir completion anchor must
-    keep it eligible so the sweep still recovers the charge; the old `charging`/`failed`-only check
-    would have leaked it forever."""
-    import flash.runner as runner
-
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    # completed (artifacts_dir set) -> deployed -> cancelled, charge never attempted (still pending)
-    _save_run(
-        runner,
-        tmp_path,
-        state="cancelled",
-        billing_state="pending",
-        artifacts_dir="/results/runpod/rl/run-1",
-    )
-
-    calls = []
-    monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
-        lambda *, internal_key, status: calls.append(status.run_id) or {"amountCents": 123},
-    )
-
-    assert billing_retry.retry_completion_charges_once() == 1
-    assert calls == ["run-1"]
-    assert runner.get_status("run-1").billing_state == "charged"
-
-
 def test_sweep_never_charges_cancelled_before_completion(monkeypatch, tmp_path):
-    """Guard against over-correcting finding (1): a run cancelled BEFORE it completed never reached
-    `done`, so it has NO artifacts_dir and carries only the submit-time `pending` (charge machine
-    never ran). It must stay ineligible -- a run that never trained is never charged -- even though it
-    has a billing_context and a partial per-seed cost_usd, neither of which can tell it apart from a
-    completed run (both are set pre-completion)."""
+    """Guard against over-correcting finding (1): a run cancelled BEFORE it completed carries the
+    submit-time `pending` (the charge machine never ran) and a non-billable state, so the sweep must
+    leave it alone. A run that never trained must never be charged."""
     import flash.runner as runner
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    # no artifacts_dir (default None): never completed, so never chargeable
     _save_run(runner, tmp_path, state="cancelled", billing_state="pending")
 
     monkeypatch.setattr(
@@ -352,6 +364,52 @@ def test_sweep_charges_run_with_stale_unparseable_spec(monkeypatch, tmp_path):
     assert billing_retry.retry_completion_charges_once() == 1
     assert calls == ["run-1"]
     assert runner.get_status("run-1").billing_state == "charged"
+
+
+def test_record_billing_state_preserves_run_state(monkeypatch, tmp_path):
+    """codex P2 race fix (unit): record_billing_state writes ONLY the billing fields, re-reading the
+    run UNDER the lock, so it never re-asserts (and so never clobbers) the run's state. This is what
+    lets the completion charge run concurrently with a /deploy without the stale `done` overwriting a
+    just-written `deployed`. It also rejects any non-billing field so it can't be misused to move
+    state."""
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_run(runner, tmp_path, state="deployed", billing_state="charging")
+
+    # a billing-fields-only write must leave `deployed` intact (the race the old _update lost)
+    runner.record_billing_state("run-1", billing_state="charged", billing_charge={"amountCents": 9})
+    st = runner.get_status("run-1")
+    assert st.state == "deployed"
+    assert st.billing_state == "charged"
+    assert st.billing_charge == {"amountCents": 9}
+
+    # vanished run -> no-op (no raise)
+    runner.record_billing_state("nope", billing_state="charged")
+
+    # guard: only billing fields are writable, so it can never be used to change `state`
+    with pytest.raises(ValueError, match="only writes billing fields"):
+        runner.record_billing_state("run-1", state="done")
+
+
+def test_sweep_charge_does_not_downgrade_deployed_state(monkeypatch, tmp_path):
+    """End to end: charging a run that is `deployed` (a done-then-deployed run whose inline charge
+    failed) records the charge WITHOUT moving the run off `deployed`."""
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_run(runner, tmp_path, state="deployed", billing_state="failed")
+
+    monkeypatch.setattr(
+        "flash.server.billing.charge_completed_run",
+        lambda *, internal_key, status: {"amountCents": 123},
+    )
+
+    assert billing_retry.retry_completion_charges_once() == 1
+    st = runner.get_status("run-1")
+    assert st.billing_state == "charged"
+    assert st.state == "deployed"  # charge never downgraded the live deployment
 
 
 # --------------------------------------------------------------------------- background loop
