@@ -13,9 +13,9 @@ name: flash worker kernel-cache (per-arch)
 # Secrets: RUNPOD_API_KEY (the warmup GPU pod) + HF_TOKEN (the temp dataset that ferries code + the
 # cache artifact) are pulled from Infisical (/flash, prod) via the bootstrap INFISICAL_CLIENT_ID /
 # CLIENT_SECRET / PROJECT_ID repo secrets; the GHCR push uses the default GITHUB_TOKEN. Heavy + paid,
-# so the bake sits behind the `gpu-bake` Environment's required reviewer (one approval releases all
-# arches). Invoked by hand (workflow_dispatch) OR automatically by auto-rebake.yml (workflow_call)
-# when the kernel toolchain changed.
+# but UNGATED: the fingerprint detection in auto-rebake.yml decides WHEN this runs (only on a real
+# kernel-toolchain change), so there is no manual approval step. Invoked by hand (workflow_dispatch)
+# OR automatically by auto-rebake.yml (workflow_call) when the kernel toolchain changed.
 
 on:
   workflow_dispatch:
@@ -54,17 +54,11 @@ permissions:
   packages: write
 
 jobs:
-  # One-click approval gate for the PAID RunPod bake: the gpu-bake Environment's required reviewer
-  # pauses this job, and a single approval then releases the whole arch matrix below. (Manual dispatch
-  # pauses here too -- intended; the bake spins up real GPU pods.)
-  approve:
-    runs-on: ubuntu-latest
-    environment: gpu-bake
-    steps:
-      - run: echo "approved bake for ${{ inputs.sms }}"
-
+  # Ungated: the PAID RunPod bake runs as soon as it's called/dispatched. The decision of WHEN to run
+  # lives in auto-rebake.yml's fingerprint gate (it only invokes this when fp_cache changed), so a
+  # second manual approval here would be redundant. Re-add an `approve` job with `environment: gpu-bake`
+  # (and `needs: approve`) if you ever want a human checkpoint back.
   bake:
-    needs: approve
     runs-on: ubuntu-24.04-8core
     strategy:
       fail-fast: false

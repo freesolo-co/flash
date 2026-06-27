@@ -6,8 +6,8 @@ name: auto-rebake per-arch kernel cache
 # the fp_cache / fp_base labels worker-image.yml stamps on :cu128 (docker/kernel_fingerprint.py):
 #
 #   * fp_cache changed -> the baked Triton/Inductor mega-cache is INVALID -> a real GPU re-warm is
-#     required (bake-kernel-cache.yml). PAID, so it sits behind the gpu-bake environment's one-click
-#     approval.
+#     required (bake-kernel-cache.yml). PAID, and AUTO-fired by this detection (no manual approval) --
+#     fp_cache only moves on a deliberate toolchain bump, so spend stays tied to real need.
 #   * fp_cache same but fp_base changed -> the cache is still valid, the base just moved (FA wheel /
 #     causal-conv1d / rp_handler / a non-kernel dep) -> a FREE re-layer grafts the existing cache onto
 #     the fresh base (docker/Dockerfile.kernelcache.relayer), no GPU.
@@ -138,10 +138,12 @@ jobs:
             echo ""
             echo -e "$summary"
             echo ""
-            echo "re-layer (free): \`$relayer_json\` | GPU re-warm (paid, needs approval): \`${gpu_csv:-none}\`"
+            echo "re-layer (free): \`$relayer_json\` | GPU re-warm (paid, auto-started): \`${gpu_csv:-none}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Open/update pending-bake issue
+      # FYI notification (not an action item -- the bake auto-runs). Keeps a heads-up + cost trail of
+      # which arches a paid GPU re-warm fired for.
+      - name: Notify GPU re-bake auto-started
         if: steps.base.outputs.proceed == 'true' && steps.classify.outputs.gpu_sms != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -149,11 +151,11 @@ jobs:
           REV: ${{ steps.base.outputs.revision }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          title="kernel-cache: per-arch GPU re-bake pending approval"
-          body=$(printf 'The kernel toolchain changed (fp_cache), so these per-arch images need a PAID GPU re-warm and are waiting on the **gpu-bake** environment approval:\n\n- arches: `%s`\n- base rev: `%s`\n\nApprove the gpu-warm job in the run: %s' "$GPU_SMS" "$REV" "$RUN_URL")
+          title="kernel-cache: per-arch GPU re-bake auto-started"
+          body=$(printf 'The kernel toolchain changed (fp_cache), so a PAID GPU re-warm auto-started for these per-arch images (no approval needed):\n\n- arches: `%s`\n- base rev: `%s`\n\nTrack it in the run: %s' "$GPU_SMS" "$REV" "$RUN_URL")
           # best-effort: a labeling/permission hiccup must never fail the gate. self-heal the label so
           # no manual setup is needed, then reuse one open issue (comment) instead of spamming new ones.
-          gh label create kernel-rebake-pending --color B60205 --description "per-arch kernel cache awaiting GPU re-bake" 2>/dev/null || true
+          gh label create kernel-rebake-pending --color B60205 --description "per-arch kernel cache GPU re-bake auto-started" 2>/dev/null || true
           existing=$(gh issue list --label kernel-rebake-pending --state open --json number -q '.[0].number' 2>/dev/null || true)
           if [ -n "${existing:-}" ]; then
             gh issue comment "$existing" --body "$body" || true
@@ -225,8 +227,8 @@ jobs:
             FP_BASE=${{ env.FP_BASE }}
             BASE_REVISION=${{ env.BASE_REVISION }}
 
-  # PAID path: re-warm the cache on a real GPU per arch. The reusable bake's `bake` job sits behind the
-  # gpu-bake environment, so this auto-queues and pauses for one approval (which releases all arches).
+  # PAID path: re-warm the cache on a real GPU per arch. Runs automatically -- the fingerprint gate
+  # above is the only thing that decides it fires (only when fp_cache changed), so no manual approval.
   gpu-warm:
     needs: gate
     if: needs.gate.outputs.proceed == 'true' && needs.gate.outputs.gpu_sms != ''
