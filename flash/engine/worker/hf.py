@@ -9,6 +9,7 @@ CALL time, so tests that ``monkeypatch.setattr(worker, "<name>", ...)`` then cal
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -34,21 +35,26 @@ def hf_prefix() -> str:
     return f"{_w.PHASE}/{_w.RUN_ID}/seed{_w.SEED}"
 
 
-def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> None:
+def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool:
     """Shared HF upload loop for files/folders: HF_REPO guard + retry/raise-or-warn.
 
     ``required=True`` (completion artifacts DONE/metrics.json, the trained adapter) retries
     and finally raises: a swallowed upload failure would make the control plane mark a
     finished run failed/retried, or mark the run done while deployment can never download
     the missing adapter. Optional artifacts (generations, logs) only warn.
+
+    Returns ``True`` when a commit actually landed (or there is no HF_REPO, so there is nothing
+    to retry) and ``False`` when a best-effort upload failed. Callers that claimed throttle/quiet
+    state on the strength of a commit (heartbeat()) read this to roll back when nothing landed; the
+    return is advisory and the many callers that ignore it keep their warn-only behavior.
     """
     if not _w.HF_REPO:
-        return
+        return True
     attempts = 3 if required else 1
     for attempt in range(attempts):
         try:
             do_upload()
-            return
+            return True
         except Exception as e:
             if required and attempt + 1 < attempts:
                 print(f"{label} retry {attempt + 1}/{attempts}: {e}")
@@ -58,12 +64,13 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> None
                 # Already retried 3x -> the host/network is bad, not the run. Infra-shaped.
                 raise RetriableInfraError(f"required upload of {repo_subpath!r} failed: {e}") from e
             print(f"{label} warn:", e)
-            return
+            return False
+    return False
 
 
-def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False):
-    """Upload one file to the run's HF prefix."""
-    _hf_upload(
+def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -> bool:
+    """Upload one file to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
+    return _hf_upload(
         lambda: _w.hf_api().upload_file(
             path_or_fileobj=local_path,
             path_in_repo=f"{hf_prefix()}/{repo_subpath}",
@@ -108,9 +115,9 @@ def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> 
         print(f"debug upload warn ({repo_name}): {e}")
 
 
-def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False):
-    """Upload a folder to the run's HF prefix."""
-    _hf_upload(
+def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
+    """Upload a folder to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
+    return _hf_upload(
         lambda: _w.hf_api().upload_folder(
             folder_path=local_dir,
             path_in_repo=f"{hf_prefix()}/{repo_subpath}",
@@ -224,6 +231,38 @@ def _link_base_model_into_ephemeral_cache(model_id: str, shared_hub: str) -> Non
         print("prefetch_model link warn:", e)
 
 
+def _hf_cache_bytes(model_id: str, cache_dir: str | None = None) -> int | None:
+    """Downloaded-byte total for ``model_id`` under ``cache_dir`` (or the default HF hub cache): the
+    sum of the repo's ``blobs/`` files (the data, incl. the ``.incomplete`` partials an in-flight
+    download grows). Scans ONLY ``blobs/`` (snapshots/ are symlinks; refs/metadata are tiny), so it
+    matches "bytes downloaded" and stays cheap. ``cache_dir`` must be the dir snapshot_download writes
+    to (the shared weight-cache mount when set, else the ephemeral default) or growth is invisible.
+
+    Returns the blob byte total (``0`` if the repo dir exists but no blob is written yet — a real
+    "0 bytes" measurement that still lets the silence timer trip), or ``None`` when the repo cache dir
+    does not exist yet / on any error — the unmeasurable window ``liveness_heartbeat`` treats as
+    "no advancement".
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        repo = os.path.join(cache_dir or HF_HUB_CACHE, _repo_folder_name(model_id))
+        if not os.path.isdir(repo):
+            return None  # cache structure not created yet -> can't measure
+        blobs = os.path.join(repo, "blobs")
+        if not os.path.isdir(blobs):
+            return 0  # repo dir exists but no blobs written yet -> 0 bytes downloaded (measurable)
+        total = 0
+        for fn in os.listdir(blobs):
+            fp = os.path.join(blobs, fn)
+            with contextlib.suppress(OSError):
+                if os.path.isfile(fp):
+                    total += os.path.getsize(fp)
+        return total
+    except Exception:
+        return None
+
+
 def prefetch_model(model_id: str) -> float:
     """Pull the base-model weights into the HF cache up front; return seconds spent.
 
@@ -240,20 +279,30 @@ def prefetch_model(model_id: str) -> float:
 
     shared_hub = _shared_weight_cache_dir()
     t0 = time.time()
-    try:
-        snapshot_download(
-            repo_id=model_id,
-            # Base model ONLY onto the shared mount; None => the per-worker ephemeral default cache.
-            cache_dir=shared_hub,
-            # weights + tokenizer/config only (same exclusions as the image bake)
-            ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
-        )
-        if shared_hub:
-            _link_base_model_into_ephemeral_cache(model_id, shared_hub)
-    except Exception as e:
-        # Surface but don't fail here: gated/local-only models still load fine through
-        # the normal from_pretrained path the trainer uses next.
-        print("prefetch_model warn:", e)
+    # snapshot_download blocks with NO heartbeat until it returns, but a cold cache can pull tens of GB
+    # over many minutes — longer than the provider setup grace — so a silent
+    # download would look like a hang and self-kill a HEALTHY cold start. Keep a model_prefetching
+    # heartbeat alive, gated on downloaded-byte GROWTH (in the dir the download actually writes to, so a
+    # genuinely WEDGED transfer still yields to the stall path). See heartbeat.liveness_heartbeat.
+    from flash.engine.worker.heartbeat import liveness_heartbeat
+
+    with liveness_heartbeat(
+        "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
+    ):
+        try:
+            snapshot_download(
+                repo_id=model_id,
+                # Base model ONLY onto the shared mount; None => the per-worker ephemeral default cache.
+                cache_dir=shared_hub,
+                # weights + tokenizer/config only (same exclusions as the image bake)
+                ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+            )
+            if shared_hub:
+                _link_base_model_into_ephemeral_cache(model_id, shared_hub)
+        except Exception as e:
+            # Surface but don't fail here: gated/local-only models still load fine through
+            # the normal from_pretrained path the trainer uses next.
+            print("prefetch_model warn:", e)
     secs = round(time.time() - t0, 1)
     _w.heartbeat(
         "model_prefetched",
