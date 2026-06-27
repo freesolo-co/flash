@@ -25,10 +25,12 @@ PaperCase manifest
 
 ### Scoring
 `achievement = clamp((agent − base) / (paper − base), 0, 1)` — credits the delta the agent's
-training produced over the *measured* untrained base, relative to the paper's delta. Robust to
-training a different (Flash-supported) base model than the paper used. The **headline metric is
-independent of the env reward** the agent optimized (computed on `(gold, response)`), so a
-reward-hacked run can't inflate the score.
+training produced over the baseline, relative to the paper's delta. The baseline is the paper's
+reported untrained number (`base_reported`); independently *measuring* the base on the same
+eval is a later milestone (Flash serving is adapter-scoped, so there's no bare-base endpoint).
+This is robust to training a different (Flash-supported) base model than the paper used. The
+**headline metric is independent of the env reward** the agent optimized (computed on
+`(gold, response)`), so a reward-hacked run can't inflate the score.
 
 ## What's implemented (milestones M0–M1, offline + CI-tested)
 - `manifest.py` — `PaperCase` schema + TOML loader/validator.

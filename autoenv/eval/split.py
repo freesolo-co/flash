@@ -42,6 +42,17 @@ def split_rows(
     return train_rows, eval_rows
 
 
+def subsample(rows: list[dict], n: int, *, seed: int = 0) -> list[dict]:
+    """A deterministic, order-independent subsample of ``n`` rows (fixed-seed hash shuffle)."""
+    if n <= 0 or n >= len(rows):
+        return list(rows)
+    ordered = sorted(
+        rows,
+        key=lambda r: hashlib.sha256(f"{seed}:{_row_key(r)}".encode()).hexdigest(),
+    )
+    return ordered[:n]
+
+
 @dataclass
 class LeakageReport:
     """Result of checking the eval split against the rows the run trained on."""

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import autoenv
 from autoenv.cli import build_parser, main
 
@@ -16,7 +18,7 @@ def test_parser_builds_with_expected_subcommands():
     actions = [a for a in parser._actions if a.dest == "cmd"]
     assert actions, "expected a subcommand action"
     names = set(actions[0].choices)
-    assert {"gate", "drive", "run", "eval", "score", "report"} <= names
+    assert {"gate", "drive", "run", "eval", "report"} <= names
 
 
 def test_gate_offline_exits_zero():
@@ -43,5 +45,11 @@ def test_run_gates_then_drives(tmp_path, capsys):
     assert "[dry_run]" in out
 
 
-def test_eval_stub_reports_not_yet():
-    assert main(["eval", SMOKE_CASE]) == 2
+def test_report_stub_reports_not_yet():
+    assert main(["report", SMOKE_CASE]) == 2
+
+
+def test_eval_requires_run_id():
+    # eval is no longer a stub; argparse rejects a missing --run-id with SystemExit(2).
+    with pytest.raises(SystemExit):
+        main(["eval", SMOKE_CASE])

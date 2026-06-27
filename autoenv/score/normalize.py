@@ -4,11 +4,14 @@ The headline number is **improvement-normalized**:
 
     achievement = clamp((agent - base) / (paper - base), 0, 1)
 
-It credits the *delta the agent's training produced* relative to the paper's delta over the
-same untrained base. That is robust to the harness using a different (Flash-supported) base
-model than the paper: an absolute ratio would punish a smaller base unfairly, but the
-improvement ratio asks "did the agent close the same fraction of the gap?" For
-lower-is-better metrics the deltas are flipped so improvement is always positive-good.
+It credits the *delta the agent's training produced* relative to the paper's delta over a
+shared ``base`` baseline metric. ``base`` is whatever the caller passes — today the eval stage
+passes the paper's reported baseline (``base_reported``), since Flash serving is adapter-scoped
+and there is no bare-base endpoint to measure against; independently measuring the base is a
+later milestone. This is robust to the harness using a different (Flash-supported) base model
+than the paper: an absolute ratio would punish a smaller base unfairly, but the improvement
+ratio asks "did the agent close the same fraction of the gap?" For lower-is-better metrics the
+deltas are flipped so improvement is always positive-good.
 
 A noise band (``1.96*sqrt(p(1-p)/N)`` for a rate metric over ``N`` eval rows) is reported
 alongside; an agent-vs-base gap inside the band is "no signal", not a win.

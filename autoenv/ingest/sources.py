@@ -73,15 +73,22 @@ def _load_http(url: str) -> list[dict]:
     except Exception as exc:
         raise DatasetUnavailable(f"could not download {url}: {exc}") from exc
     text = body.strip()
-    if "\n" in text and not text.startswith("["):
+    # Try the whole body as one JSON document first; only fall back to JSONL (one object per
+    # line) if that fails — a pretty-printed JSON object spans lines too, so a newline heuristic
+    # would mis-parse it line-by-line.
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError:
         return [json.loads(line) for line in text.splitlines() if line.strip()]
-    loaded = json.loads(text)
     if isinstance(loaded, dict):
         return loaded.get("records") or loaded.get("data") or []
     return loaded if isinstance(loaded, list) else []
 
 
-def _load_hf(dataset_id: str, split: str) -> list[dict]:
+def _load_hf(spec: str, split: str) -> list[dict]:
+    # ``spec`` is the part after ``hf:`` — ``<dataset_id>`` or ``<dataset_id>:<config>`` (a
+    # dataset like GSM8K requires a config name, e.g. ``openai/gsm8k:main``).
+    dataset_id, _, config = spec.partition(":")
     try:
         from datasets import load_dataset  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -90,10 +97,11 @@ def _load_hf(dataset_id: str, split: str) -> list[dict]:
             "(install the autoenv extra: pip install -e '.[autoenv]')"
         ) from exc
     try:
-        ds = load_dataset(dataset_id, split=split)
+        ds = load_dataset(dataset_id, config or None, split=split)
     except Exception as exc:
+        where = f"{dataset_id!r}" + (f" config {config!r}" if config else "")
         raise DatasetUnavailable(
-            f"could not load HF dataset {dataset_id!r} split {split!r}: {exc}"
+            f"could not load HF dataset {where} split {split!r}: {exc}"
         ) from exc
     return [dict(row) for row in ds]
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from autoenv import __version__
 from autoenv.manifest import ManifestError, PaperCase
@@ -82,19 +83,48 @@ def cmd_run(args) -> int:
 
 def _not_yet(stage: str) -> int:
     print(
-        f"`autoenv {stage}` needs a completed real training run (plan milestone M2+); "
-        "not available in this build.",
+        f"`autoenv {stage}` is not available in this build yet; see autoenv/README.md "
+        "for the roadmap.",
         file=sys.stderr,
     )
     return 2
 
 
 def cmd_eval(args) -> int:
-    return _not_yet("eval")
+    """Benchmark a completed run: deploy → infer over the eval split → improvement-normalized score."""
+    from autoenv.eval.score import EvalConfig, evaluate_run
+    from autoenv.ingest import fetch_rows
+    from flash.client import client_from_config
 
-
-def cmd_score(args) -> int:
-    return _not_yet("score")
+    case = _load_case(args.case)
+    eval_rows = fetch_rows(
+        case.resolved_eval(),
+        split=case.dataset.eval_split,
+        input_field=case.dataset.input_field,
+        output_field=case.dataset.output_field,
+    )
+    # Mirror the rows the run trained on for the leakage guard (best-effort; same cap as drive).
+    train_rows = fetch_rows(
+        case.resolved_train(),
+        split=case.dataset.train_split,
+        input_field=case.dataset.input_field,
+        output_field=case.dataset.output_field,
+        limit=case.max_train_examples or None,
+    )
+    result = evaluate_run(
+        case,
+        args.run_id,
+        client=client_from_config(),
+        eval_rows=eval_rows,
+        train_rows=train_rows,
+        config=EvalConfig(max_eval=args.max_eval, max_tokens=args.max_tokens),
+    )
+    print(result.summary())
+    out = args.out or f"autoenv-runs/{case.id}-result.json"
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    result.write_json(out)
+    print(f"  wrote {out}")
+    return 0 if result.state == "scored" else 1
 
 
 def cmd_report(args) -> int:
@@ -139,10 +169,21 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--offline", action="store_true", help="skip the dataset-availability probe")
     run.set_defaults(func=cmd_run)
 
-    for name, fn in (("eval", cmd_eval), ("score", cmd_score), ("report", cmd_report)):
-        p = sub.add_parser(name, help=f"{name} a completed run (milestone M2+)")
-        _add_case_arg(p)
-        p.set_defaults(func=fn)
+    ev = sub.add_parser("eval", help="benchmark a completed run on the paper's eval split")
+    _add_case_arg(ev)
+    ev.add_argument(
+        "--run-id", dest="run_id", required=True, help="the completed Flash run id to benchmark"
+    )
+    ev.add_argument("--max-eval", type=int, default=40, help="eval subsample size (default: 40)")
+    ev.add_argument(
+        "--max-tokens", type=int, default=512, help="generation budget per row (default: 512)"
+    )
+    ev.add_argument("--out", default=None, help="where to write the BenchResult JSON")
+    ev.set_defaults(func=cmd_eval)
+
+    report = sub.add_parser("report", help="aggregate BenchResults across cases (milestone M4)")
+    _add_case_arg(report)
+    report.set_defaults(func=cmd_report)
 
     return parser
 
