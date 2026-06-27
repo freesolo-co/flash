@@ -423,11 +423,6 @@ def build_worker_env(
     for k in (
         "SFT_PER_DEVICE_BS",
         "VLLM_USE_V1",
-        # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
-        # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
-        # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a
-        # control-plane `FLASH_UPLOAD_CONSOLE=1` only reaches run_mode if it's forwarded here.
-        "FLASH_UPLOAD_CONSOLE",
         # The chalk install SOURCE (an exact version / git URL / wheel). Kernel SELECTION is fixed
         # in engine.chalk_kernels (no env flags); this only points install_chalk_kernels at a
         # specific chalk build, and is also consumed at submit time to add chalk to extra_pip.
