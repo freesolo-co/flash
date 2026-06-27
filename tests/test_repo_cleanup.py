@@ -462,6 +462,21 @@ def test_incomplete_live_set_aborts_destructive_tier_but_not_code(monkeypatch):
     assert any("deployed" in s.reason for s in plan.skips)
 
 
+def test_incomplete_live_set_reports_incomplete_not_confirmed(monkeypatch, capsys):
+    # The report must not say "confirmed" when the keep-set is incomplete (false sense of safety).
+    from flash.serve import deploy
+
+    monkeypatch.setattr(
+        deploy, "list_deployed_adapters",
+        lambda: [{"repoId": f"{NS}/flashrun-live"}, {"adapterId": "unmappable"}],
+    )
+    api = FakeApi({f"{NS}/flashrun-c": (_days_ago(90), SUCCEEDED)})
+    rc.run(_cfg(code=True), dry_run=True, sleep=0, api=api)
+    out = capsys.readouterr().out
+    assert "INCOMPLETE" in out
+    assert "live set: confirmed" not in out
+
+
 # ---- unknown age + invalid retention windows --------------------------------------------------
 
 def test_repo_with_no_last_modified_is_skipped_for_safety():
