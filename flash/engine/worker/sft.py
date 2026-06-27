@@ -152,11 +152,20 @@ def run_sft():
     # and TRL-bfd packing read input_ids+completion_mask directly, and flash's SDPA / GDN packing
     # reuses these same ids+masks via pack_token_ids(completion_masks=...). With completion_only_loss
     # (set on the SFTConfig below) the loss is computed only on the completion — the prompt is masked.
-    _full_ids = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
-    _pretok = [
-        {"input_ids": ids, "completion_mask": build_completion_mask(t["prompt_text"], ids, tok, sft_max_len)}
-        for t, ids in zip(texts, _full_ids, strict=True)
-    ]
+    # tokenize_for_packing + per-example build_completion_mask is the heaviest main-thread CPU-bound
+    # phase of setup (one tokenize for the full row + one for the prompt, per example) and the only
+    # such blocking phase not already under a liveness daemon (cf. sft_initializing / sft_step). Wrap
+    # it so a long pre-tokenization stays visible (liveness pings advance the alive ts) and the stall
+    # watchdog can dump thread stacks if it wedges. Provider-side stall protection for this whole
+    # pre-first-step window remains the intentional setup_grace_s — liveness pings are deliberately
+    # ignored by surface_heartbeat; emitting a REAL heartbeat for this non-setup stage would wrongly
+    # flip the provider into the tight post-training grace before the first step even runs.
+    with liveness_heartbeat("sft_pretokenizing"):
+        _full_ids = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
+        _pretok = [
+            {"input_ids": ids, "completion_mask": build_completion_mask(t["prompt_text"], ids, tok, sft_max_len)}
+            for t, ids in zip(texts, _full_ids, strict=True)
+        ]
     # Drop rows with NO completion target (all-zero completion_mask). build_completion_mask returns an
     # all-zero mask when sft_max_len truncation removed the entire assistant turn (an over-long prompt)
     # or the completion was empty: such a row is all -100 labels. A micro-batch — or a packed block at
