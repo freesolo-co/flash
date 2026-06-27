@@ -378,13 +378,24 @@ def apply_plan(api, plan: Plan, *, dry_run: bool, sleep: float, refresh_live=Non
             now_t = time.monotonic()
             if live_fetched_at is None or now_t - live_fetched_at >= live_ttl:
                 try:
-                    live, _complete = refresh_live()
-                    live_fetched_at = now_t
+                    live, live_complete = refresh_live()
                 except Exception as exc:
+                    # Don't retain the stale cache — force a re-fetch on the next action (and skip
+                    # again if serving stays down) rather than deleting against an old keep-set.
+                    live_fetched_at = None
                     record["skipped"] = f"live re-check failed ({exc}); skipped to stay safe"
                     logger.warning("skipping %s %s: live re-check failed: %s", action.kind, action.repo_id, exc)
                     manifest.append(record)
                     continue
+                if not live_complete:
+                    # An unmappable live record means an unidentifiable live repo could be the one
+                    # we're about to delete. Fail closed: skip, and don't cache the incomplete set.
+                    live_fetched_at = None
+                    record["skipped"] = "live set incomplete on re-check (a record lacked a repo id); skipped to stay safe"
+                    logger.warning("skipping %s %s: live set incomplete on re-check", action.kind, action.repo_id)
+                    manifest.append(record)
+                    continue
+                live_fetched_at = now_t  # cache only a successful, COMPLETE fetch
             if action.repo_id in live:
                 record["skipped"] = "repo became deployed during apply"
                 logger.warning("skipping %s %s: repo became deployed during apply", action.kind, action.repo_id)
