@@ -232,6 +232,10 @@ def _submit_seed_supervised(
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
             from flash.providers import INSTANCE_PROVIDERS
 
+            # Whether the previous attempt's resource is CONFIRMED gone. Only then is it safe to clear
+            # the persisted handle; an unconfirmed instance teardown keeps the handle so the still-
+            # billing box stays reachable for cancel / recovery / sweep (Codex MtrgI).
+            teardown_confirmed = True
             if last_handle.get("endpoint_id"):
                 try:
                     from flash.providers.runpod import api as runpod_api
@@ -252,7 +256,7 @@ def _submit_seed_supervised(
                 # attempt's instance down so the retry lands on a fresh host (and we stop paying for the
                 # sick one). Dispatched generically through the handle's provider (destroy() knows the
                 # provider's own id field — instance_id for Lambda/Vast).
-                with contextlib.suppress(Exception):
+                try:
                     from flash.providers import get_provider
                     from flash.providers.base import JobHandle
 
@@ -264,13 +268,31 @@ def _submit_seed_supervised(
                         file=log,
                         flush=True,
                     )
-            # The previous endpoint is now deleted; clear the persisted handle so a cancel
-            # or control-plane restart during the fresh deploy doesn't operate on (or get
-            # shielded by) the dead handle. The next on_handle() records the new one.
-            with contextlib.suppress(FileNotFoundError):
-                st = get_status(spec.run_id)
-                if st.state not in TERMINAL_STATES and st.remote is not None:
-                    _update(spec.run_id, st.state, remote=None)
+                except Exception as exc:
+                    # An instance-provider destroy raises only when teardown is UNCONFIRMED (Vast's
+                    # destroy() raises on a DELETE success:false / network breakdown — the box may STILL
+                    # be billing/running). Do NOT clear the handle below: keep it so a cancel, a control-
+                    # plane recovery, or the next sweep can still reach and kill the live instance rather
+                    # than orphaning it until a label sweep. The run's terminal destroy_run_instances
+                    # (by label) is the backstop. We still proceed to the retry — blocking on Vast ever
+                    # confirming the DELETE could hang the run indefinitely.
+                    teardown_confirmed = False
+                    print(
+                        f"retry {attempt}: {last_handle.get('provider')} instance "
+                        f"{last_handle.get('instance_id')} teardown UNCONFIRMED ({exc}); keeping the "
+                        "handle so the possibly-billing box stays reachable for cleanup",
+                        file=log,
+                        flush=True,
+                    )
+            # Clear the persisted handle so a cancel or control-plane restart during the fresh deploy
+            # doesn't operate on (or get shielded by) the dead handle — but ONLY when teardown was
+            # CONFIRMED. On an unconfirmed instance teardown we keep it (see above). The next on_handle()
+            # records the new one.
+            if teardown_confirmed:
+                with contextlib.suppress(FileNotFoundError):
+                    st = get_status(spec.run_id)
+                    if st.state not in TERMINAL_STATES and st.remote is not None:
+                        _update(spec.run_id, st.state, remote=None)
         res = None
         alloc = None
         chosen = None

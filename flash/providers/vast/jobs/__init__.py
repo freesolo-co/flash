@@ -534,7 +534,17 @@ def poll_vast_job(
         if done is not None and done_is_fresh(done):
             return finish_ok(done)
 
-        dead = missing_streak >= 4 or status in _DEAD_STATES
+        # ``unknown`` is Vast's "host has no recent heartbeat and won't progress" status — a host loss,
+        # so treat it as dead for fast failover instead of waiting out the setup/training stall window.
+        # But gate it on ``became_running``: ``unknown`` is ALSO the fallback this poller substitutes
+        # when a present instance has no ``actual_status`` yet (line above), which happens during normal
+        # provisioning — failing a still-booting box on that would be wrong. A box that WAS running and
+        # then reports ``unknown`` is the genuine host-loss case (Codex MtrgK).
+        dead = (
+            missing_streak >= 4
+            or status in _DEAD_STATES
+            or (became_running and status == "unknown")
+        )
         if dead:
             # One forced final read: the worker may have finished right before the box self-destroyed
             # (the normal success order on this substrate).

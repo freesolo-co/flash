@@ -209,7 +209,19 @@ def test_create_instance_unreadable_response_is_ambiguous(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    for resp in (_NonJsonResp(), _ReadFailsResp()):
+    class _InvalidUtf8Resp:  # 200 with invalid UTF-8 -> json.loads(bytes) raises UnicodeDecodeError
+        # Codex MtrgJ: UnicodeDecodeError is a SIBLING of JSONDecodeError under ValueError, so the
+        # JSONDecodeError clause alone would miss it and let it escape raw past the ambiguous reconcile.
+        def read(self):
+            return b'\xff\xfe{"new_contract": 1}'  # leading invalid-UTF8 bytes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    for resp in (_NonJsonResp(), _ReadFailsResp(), _InvalidUtf8Resp()):
         monkeypatch.setattr(
             vast_api.urllib.request, "urlopen", lambda req, timeout=None, _r=resp: _r
         )
@@ -262,6 +274,12 @@ def test_create_error_is_ambiguous_classification():
     assert vast_api.create_error_is_ambiguous(err(http(429))) is True  # Cursor MsA6e: rate-limit
     assert vast_api.create_error_is_ambiguous(err(urllib.error.URLError("timed out"))) is True
     assert vast_api.create_error_is_ambiguous(err(msg="...: no instance id in response: {}")) is True
+    # Codex MtrgJ: json.loads on bytes with invalid UTF-8 raises UnicodeDecodeError (a SIBLING of
+    # JSONDecodeError under ValueError, NOT caught by the JSONDecodeError clause) — an unreadable
+    # response on the non-idempotent create, so it MUST be ambiguous (else the contract leaks).
+    _utf8_err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    assert vast_api.create_error_is_ambiguous(err(_utf8_err)) is True
+    assert vast_api.create_error_is_ambiguous(_utf8_err) is True  # bare cause too (defensive)
     # Codex MsMPk: the _http RestClient also chains BARE socket errors (TimeoutError ==
     # socket.timeout, ConnectionError, generic OSError) — a RESPONSE-leg timeout of the non-idempotent
     # PUT /asks AFTER the host billed a contract surfaces as one of these, NOT a URLError. They MUST be
@@ -273,7 +291,8 @@ def test_create_error_is_ambiguous_classification():
     # create -> AMBIGUOUS. JSONDecodeError (a ValueError) and IncompleteRead (an HTTPException) are
     # NOT OSErrors, so they miss the branches above and must be classified explicitly — both when
     # create_instance wraps them as a VastApiError-from-cause AND if a bare one ever reaches here.
-    from http.client import IncompleteRead  # bare name: the local http() helper above shadows the module
+    # bare name: the local http() helper above shadows the module
+    from http.client import IncompleteRead
 
     jde = json.JSONDecodeError("Expecting value", "x", 0)
     assert vast_api.create_error_is_ambiguous(err(jde)) is True  # wrapped (cause is JSONDecodeError)

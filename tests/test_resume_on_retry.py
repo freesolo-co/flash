@@ -356,6 +356,58 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
     assert "resume from last checkpoint" in log.getvalue()
 
 
+def test_unconfirmed_instance_teardown_preserves_handle(orch, monkeypatch):
+    """Codex MtrgI: when an instance-provider destroy() RAISES (Vast's unconfirmed DELETE — the box may
+    still be billing/running), the retry teardown must NOT clear the persisted handle. Keep it so a
+    cancel / control-plane recovery / the next sweep can still reach the live box instead of orphaning
+    it. The retry still proceeds (we can't block on Vast ever confirming the DELETE)."""
+    import flash.providers as providers
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    def _vast_handle(iid):
+        return {"provider": "vast", "instance_id": iid}
+
+    seen_remote = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        seen_remote.append(orch.get_status(run_spec.run_id).remote)  # what's persisted at ENTRY
+        on_handle(_vast_handle(f"i{attempt}"))  # persist a vast handle (drives the instance teardown)
+        if attempt == 0:
+            return PollResult(False, failure="stalled", detail="infra")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+
+    class _RaisingVast:  # destroy() raises -> teardown UNCONFIRMED
+        def destroy(self, handle):
+            from flash.providers.vast import api as vast_api
+
+            raise vast_api.VastApiError("destroy unconfirmed (success:false)")
+
+    real_get = providers.get_provider
+    monkeypatch.setattr(
+        providers,
+        "get_provider",
+        lambda name: _RaisingVast() if name == "vast" else real_get(name),
+    )
+
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+
+    assert metrics["train_tokens"] == 4096  # retry still proceeded to success
+    assert "teardown UNCONFIRMED" in log.getvalue()
+    assert "keeping the handle" in log.getvalue()
+    # attempt 1 saw the PRESERVED prior handle at entry — the unconfirmed teardown did NOT clear it
+    # (would be None if cleared) and it is still attempt 0's instance (the new on_handle runs after).
+    assert seen_remote[1] is not None
+    assert seen_remote[1].get("instance_id") == "i0"
+    assert seen_remote[1].get("provider") == "vast"
+
+
 def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
     """A genuine worker error (the run's own code crashed) must NOT consume a retry.
 

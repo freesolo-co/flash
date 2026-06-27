@@ -154,10 +154,12 @@ def create_instance(
     # detail, destroy — keep their retries.)
     try:
         out = request_with_retries(f"/v0/asks/{int(offer_id)}/", method="PUT", body=body, retries=0)
-    except (json.JSONDecodeError, http.client.HTTPException) as e:
-        # A 200 whose body is truncated / non-JSON on this NON-IDEMPOTENT create: Vast may have
-        # already accepted the PUT and billed a contract while the RESPONSE leg failed, so we have a
-        # phantom instance with no returned id. JSONDecodeError (ValueError) and IncompleteRead
+    except (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException) as e:
+        # A 200 whose body is truncated / non-JSON / invalid-UTF8 on this NON-IDEMPOTENT create: Vast
+        # may have already accepted the PUT and billed a contract while the RESPONSE leg failed, so we
+        # have a phantom instance with no returned id. JSONDecodeError (ValueError), UnicodeDecodeError
+        # (a SIBLING of JSONDecodeError under ValueError — raised by ``json.loads`` on bytes with
+        # invalid UTF-8, so the JSONDecodeError clause alone would miss it), and IncompleteRead
         # (HTTPException) are NOT OSErrors, so the _http retry wrapper neither catches nor wraps them
         # — they'd otherwise escape as a raw decode error past deploy_and_submit's ``except
         # VastApiError`` and skip the ambiguous-create reconcile (leaking the contract). Re-raise as a
@@ -200,13 +202,14 @@ def create_error_is_ambiguous(err: Exception) -> bool:
     if isinstance(cause, OSError):  # URLError / TimeoutError / ConnectionError + any other socket error
         return True
     # A 200 whose body could not be read/parsed on the non-idempotent create (truncated read /
-    # non-JSON): the host may have billed a contract while the RESPONSE was lost, so this is
-    # ambiguous, NOT a clean rejection. JSONDecodeError (ValueError) and IncompleteRead/HTTPException
-    # are not OSErrors so they miss the branches above; create_instance wraps them as a VastApiError
-    # chaining the cause, but match a bare one too (defensive).
-    if isinstance(err, (json.JSONDecodeError, http.client.HTTPException)) or isinstance(
-        cause, (json.JSONDecodeError, http.client.HTTPException)
-    ):
+    # non-JSON / invalid UTF-8): the host may have billed a contract while the RESPONSE was lost, so
+    # this is ambiguous, NOT a clean rejection. JSONDecodeError (ValueError), UnicodeDecodeError (its
+    # SIBLING under ValueError — ``json.loads`` on bytes with invalid UTF-8 raises THIS, not
+    # JSONDecodeError) and IncompleteRead/HTTPException are not OSErrors so they miss the branches
+    # above; create_instance wraps them as a VastApiError chaining the cause, but match a bare one too
+    # (defensive).
+    _unreadable = (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException)
+    if isinstance(err, _unreadable) or isinstance(cause, _unreadable):
         return True
     return "no instance id" in str(err)  # success body without a contract id -> may be billing
 

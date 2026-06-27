@@ -507,6 +507,32 @@ def test_poll_dead_host_unknown_launch_same_attempt_error_is_job_failed(monkeypa
     assert "deterministic crash" in res.detail
 
 
+def test_poll_running_then_unknown_is_dead_host_preempted(monkeypatch):
+    """Codex MtrgK: a host that WAS running and then reports actual_status='unknown' (Vast's
+    no-recent-heartbeat-won't-progress state) is a host loss -> take the dead-host path NOW (preempted)
+    instead of waiting out the stall window while the box keeps billing."""
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}, {"actual_status": "unknown"}],
+        logs="+ training ...\nFLASH: host went silent",
+    )
+    res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_preempted"
+
+
+def test_poll_unknown_before_running_is_not_dead(monkeypatch):
+    """The became_running gate: 'unknown' is ALSO the fallback the poller substitutes for a present
+    instance with no actual_status yet (normal provisioning), so a box that has NEVER run must NOT be
+    failed as a dead host on 'unknown' — it stays governed by the load/stall window."""
+    vast = _wire_poll(monkeypatch, instances=[{"actual_status": "unknown"}], step=100.0)
+    monkeypatch.setattr(vast, "LOAD_TIMEOUT_S", 300.0)
+    res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "stalled"  # never-started load timeout, NOT a dead-host preempt
+    assert "never started" in res.detail
+
+
 def test_poll_loading_timeout(monkeypatch):
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "loading"}], step=100.0)
     monkeypatch.setattr(vast, "LOAD_TIMEOUT_S", 300.0)
