@@ -17,10 +17,14 @@ The freesolo serving app pulls adapter weights straight from these dataset repos
 (``flash/serve/deploy.py`` registers ``{repoId}:{subfolder}``). So the *live serving set* is the
 authoritative do-not-touch set:
 
-* A repo whose ``repoId`` is registered with serving is **never** modified or deleted.
-* If the live set cannot be confirmed (serving unreachable), any tier that removes servable content
-  **aborts** rather than guessing. The ``code/`` purge (which serving never reads) is the one
-  exception and may still proceed.
+* When the live set is known, a repo whose ``repoId`` is registered with serving is **never**
+  modified or deleted (it is skipped wholesale before any tier runs).
+* If the live set cannot be confirmed (serving unreachable) or is incomplete (a live record had no
+  repo id), any tier that removes servable content **aborts** rather than guessing. The ``code/``
+  purge is the one exception and still proceeds — serving never reads ``code/flash``, so deleting it
+  is harmless even from a deployed repo. NOTE the consequence: with ``--code`` and an
+  unavailable/incomplete live set, ``code/flash`` MAY be purged from a currently-deployed repo
+  (serving keeps running off the already-loaded adapter; only the unused source snapshot is lost).
 
 Every repo is classified from three self-contained signals — no backend DB required:
 
@@ -150,9 +154,11 @@ class RepoView:
 
     def age_seconds(self, now: datetime) -> float:
         if self.last_modified is None:
-            # No timestamp → treat as "very old" so the age gate never *protects* it; the deployed
-            # and content gates still apply, so this can't cause an unsafe delete on its own.
-            return float("inf")
+            # Unknown age (HF returned no last_modified — e.g. a freshly created / queued run repo).
+            # Treat it as just-written (age 0) so the inactive-age gate PROTECTS it: an ambiguous
+            # timestamp must never make a brand-new repo look old enough to delete. ``classify`` also
+            # skips ``last_modified is None`` explicitly with a clear reason.
+            return 0.0
         return (now - self.last_modified).total_seconds()
 
 
@@ -258,6 +264,12 @@ def classify(view: RepoView, deployed: set[str], cfg: Config, now: datetime) -> 
     ``kind="skip"`` action explaining why nothing is done)."""
     if view.repo_id in deployed:
         return [Action(view.repo_id, "skip", None, 0, "deployed (serving live set)", skipped=True)]
+
+    if view.last_modified is None:
+        # No timestamp at all — can't prove the repo is old/terminal (it may be freshly created or
+        # queued). Leave it untouched rather than guess; a missing age must never green-light a
+        # delete. (Operators can investigate a repo that genuinely lost its timestamp.)
+        return [Action(view.repo_id, "skip", None, 0, "unknown age (no last_modified) — left for safety", skipped=True)]
 
     age = view.age_seconds(now)
     if age < cfg.inactive_age_hours * 3600:
@@ -446,7 +458,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-code", dest="code", action="store_false", help="do NOT purge code/flash (default: purge it)")
     p.add_argument("--checkpoints", action="store_true", help="T2: trim checkpoints/ from old undeployed repos (keeps adapter/)")
     p.add_argument("--repos", action="store_true", help="T3: delete whole repos for old undeployed runs with no servable adapter")
-    p.add_argument("--delete-with-adapter", action="store_true", help="let T3 also delete old undeployed repos that DO have a final adapter")
+    p.add_argument("--delete-with-adapter", action="store_true", help="let T3 also delete old undeployed repos that DO have a servable adapter (final OR checkpoint); requires --repos")
     p.add_argument("--inactive-age-hours", type=float, default=6.0, help="min idle time before a repo is considered not in-flight (default: 6)")
     p.add_argument("--trim-age-days", type=float, default=14.0, help="min age for checkpoint trimming (default: 14)")
     p.add_argument("--delete-age-days", type=float, default=60.0, help="min age for whole-repo deletion (default: 60)")
@@ -464,6 +476,16 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    for name, value in (
+        ("--inactive-age-hours", args.inactive_age_hours),
+        ("--trim-age-days", args.trim_age_days),
+        ("--delete-age-days", args.delete_age_days),
+    ):
+        # A negative window would make its age gate true for (nearly) every repo — a typo must not
+        # silently widen deletion. Reject it.
+        if value < 0:
+            print(f"{name} must be >= 0 (got {value})", file=sys.stderr)
+            return 2
     cfg = Config(
         namespace=args.namespace,
         code=args.code,
