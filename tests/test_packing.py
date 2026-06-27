@@ -481,6 +481,25 @@ def test_completion_mask_from_ids_matches_wrapper():
     assert completion_mask_from_ids([1, 2, 3], []) == []
 
 
+def test_pretokenize_completion_only_drops_empty_and_keeps_lockstep():
+    # The SFT pre-tokenizer batches both tokenizations, builds the masks, and drops rows with no
+    # completion target — keeping texts and pretok in lockstep so downstream token accounting matches.
+    from flash.engine.worker.sft import _pretokenize_completion_only
+
+    tok = _FakeTok(eos="!")
+    texts = [
+        {"text": "ABxy", "prompt_text": "AB"},  # real completion -> kept
+        {"text": "AB", "prompt_text": "AB!"},  # prompt == full row -> all-zero mask -> dropped
+        {"text": "CDz", "prompt_text": "CD"},  # real completion -> kept
+    ]
+    kept_texts, pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)
+    assert n_dropped == 1
+    assert [t["text"] for t in kept_texts] == ["ABxy", "CDz"]  # lockstep: the dropped row is gone
+    assert len(pretok) == 2
+    assert all(any(r["completion_mask"]) for r in pretok)  # every kept row has a completion token
+    assert all(len(r["completion_mask"]) == len(r["input_ids"]) for r in pretok)
+
+
 def test_pack_carries_completion_mask_aligned():
     # The completion mask rides along with input_ids through the FFD reorder + truncation, staying
     # token-aligned (sum(seq_lengths) == len(input_ids) == len(completion_mask)).

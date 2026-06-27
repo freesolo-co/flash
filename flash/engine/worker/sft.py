@@ -47,6 +47,36 @@ from flash.engine.worker.perf import (
 )
 
 
+def _pretokenize_completion_only(texts, tokenizer, max_length):
+    """Pre-tokenize SFT rows into ``{input_ids, completion_mask}`` and drop rows with no completion
+    target, returning ``(kept_texts, pretok, n_dropped)`` filtered in lockstep.
+
+    ``texts`` is a list of ``{"text", "prompt_text"}`` — the full rendered transcript (its tokens are
+    what the trainer sees) and its generation prompt. Both fields are tokenized in ONE batched call
+    each (default ``add_special_tokens``, truncate to ``max_length``; the full row carries the EOS via
+    :func:`tokenize_for_packing`, the prompt never does), then :func:`completion_mask_from_ids` derives
+    each row's prompt/completion boundary from the longest shared token prefix — no O(N) per-row
+    tokenize. ``input_ids`` is token-identical to TRL's own non-packed SFT prep; ``completion_mask`` is
+    0 over the prompt, 1 over the completion (the assistant turn[s] to learn).
+
+    Rows whose mask is all-zero — the whole row is prompt because ``max_length`` truncation removed the
+    completion, or the completion was empty — carry no loss and are dropped: a micro-batch (or a packed
+    block at ``per_device_train_batch_size==1``) of only such rows is all -100 and yields a NaN under
+    TRL's default nll loss. ``kept_texts`` is filtered in lockstep with ``pretok`` (zip preserves their
+    1:1 correspondence) so the caller's token/cost accounting reflects only the rows actually trained.
+    """
+    full_ids = tokenize_for_packing([t["text"] for t in texts], tokenizer, max_length)
+    prompt_ids = tokenizer(
+        [t["prompt_text"] for t in texts], truncation=True, max_length=max_length
+    )["input_ids"]
+    pretok = [
+        {"input_ids": ids, "completion_mask": completion_mask_from_ids(pids, ids)}
+        for ids, pids in zip(full_ids, prompt_ids, strict=True)
+    ]
+    kept = [(t, r) for t, r in zip(texts, pretok, strict=True) if any(r["completion_mask"])]
+    return [t for t, _ in kept], [r for _, r in kept], len(pretok) - len(kept)
+
+
 def run_sft():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -145,59 +175,28 @@ def run_sft():
         if _t and _t.max_length is not None
         else (RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len)
     )
-    # Pre-tokenize ONCE into {input_ids, completion_mask}. input_ids is the full rendered transcript
-    # (+EOS, truncated to sft_max_len) — token-identical to TRL's own non-packed SFT prep, see
-    # tokenize_for_packing. completion_mask is 0 over the prompt tokens and 1 over the completion (the
-    # assistant turn[s] to learn). This SINGLE representation feeds every path: TRL's unpacked collator
-    # and TRL-bfd packing read input_ids+completion_mask directly, and flash's SDPA / GDN packing
-    # reuses these same ids+masks via pack_token_ids(completion_masks=...). With completion_only_loss
-    # (set on the SFTConfig below) the loss is computed only on the completion — the prompt is masked.
-    # tokenize_for_packing + per-example build_completion_mask is the heaviest main-thread CPU-bound
-    # phase of setup (one tokenize for the full row + one for the prompt, per example) and the only
-    # such blocking phase not already under a liveness daemon (cf. sft_initializing / sft_step). Wrap
-    # it so a long pre-tokenization stays visible (liveness pings advance the alive ts) and the stall
-    # watchdog can dump thread stacks if it wedges. Provider-side stall protection for this whole
-    # pre-first-step window remains the intentional setup_grace_s — liveness pings are deliberately
-    # ignored by surface_heartbeat; emitting a REAL heartbeat for this non-setup stage would wrongly
-    # flip the provider into the tight post-training grace before the first step even runs.
+    # Pre-tokenize into {input_ids, completion_mask} and drop rows with no completion target (see
+    # _pretokenize_completion_only). This SINGLE representation feeds every path: TRL's unpacked
+    # collator and TRL-bfd packing read input_ids+completion_mask directly, and flash's SDPA / GDN
+    # packing reuses them via pack_token_ids(completion_masks=...); with completion_only_loss the loss
+    # is computed only on the completion. It's the heaviest main-thread CPU-bound setup phase, so wrap
+    # it in the liveness daemon (cf. sft_initializing / sft_step): a long pre-tokenization stays
+    # visible (liveness pings advance the alive ts) and the stall watchdog can dump stacks if it
+    # wedges. Provider stall protection here stays the intentional setup_grace_s — liveness pings are
+    # ignored by surface_heartbeat; a REAL heartbeat for this non-setup stage would wrongly flip the
+    # provider into the tight post-training grace before the first step runs.
     with liveness_heartbeat("sft_pretokenizing"):
-        _full_ids = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
-        # Batch-tokenize the prompts in ONE call too (this was the remaining O(N) per-row tokenize,
-        # inside build_completion_mask). Same call shape as tokenize_for_packing — default
-        # add_special_tokens, truncate to sft_max_len, NO appended EOS (the prompt never ends a turn) —
-        # so each prompt's ids line up token-for-token with its full row's prefix; completion_mask_from_ids
-        # then derives the boundary from the longest shared prefix without re-tokenizing.
-        _prompt_ids = tok(
-            [t["prompt_text"] for t in texts], truncation=True, max_length=sft_max_len
-        )["input_ids"]
-        _pretok = [
-            {"input_ids": ids, "completion_mask": completion_mask_from_ids(pids, ids)}
-            for ids, pids in zip(_full_ids, _prompt_ids, strict=True)
-        ]
-    # Drop rows with NO completion target (all-zero completion_mask). build_completion_mask returns an
-    # all-zero mask when sft_max_len truncation removed the entire assistant turn (an over-long prompt)
-    # or the completion was empty: such a row is all -100 labels. A micro-batch — or a packed block at
-    # per_device_train_batch_size==1 — made up solely of these has ZERO scored positions, and the
-    # default TRL 1.6 nll loss returns NaN (not a true no-op), poisoning the step. Filtering them up
-    # front guarantees every training row carries >=1 completion token, so no all-ignored batch/block
-    # can form regardless of how rows are micro-batched or packed.
-    # Filter ``texts`` in LOCKSTEP with ``_pretok`` (zip preserves their 1:1 index correspondence) so
-    # downstream token/cost accounting keyed off ``texts`` (train_tokens below) reflects what is
-    # ACTUALLY trained, not the dropped examples.
-    _kept_pairs = [(t, r) for t, r in zip(texts, _pretok, strict=True) if any(r["completion_mask"])]
-    _dropped = len(_pretok) - len(_kept_pairs)
+        texts, _pretok, _dropped = _pretokenize_completion_only(texts, tok, sft_max_len)
     if _dropped:
         print(
-            f"[sft] dropped {_dropped}/{len(_pretok)} rows with no completion target "
+            f"[sft] dropped {_dropped} rows with no completion target "
             "(sft_max_len truncated away the whole completion, or an empty completion)"
         )
-    if not _kept_pairs:
+    if not _pretok:
         raise ValueError(
             "every SFT example has an empty completion after sft_max_len truncation (nothing to "
             "train on); increase sft_max_len or shorten the prompts"
         )
-    texts = [t for t, _ in _kept_pairs]
-    _pretok = [r for _, r in _kept_pairs]
     ds = Dataset.from_list(_pretok)
     _masked_tok = sum(m.count(0) for m in (r["completion_mask"] for r in _pretok))
     _total_tok = sum(len(r["input_ids"]) for r in _pretok)

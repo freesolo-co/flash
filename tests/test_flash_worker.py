@@ -362,13 +362,19 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     from flash.engine.worker import sft
 
     src = inspect.getsource(sft.run_sft)
+    # The {input_ids, completion_mask} representation is built by the extracted pre-tokenizer; inspect
+    # it for the boundary/representation, and run_sft for the wiring + surviving optimizations.
+    pre_src = inspect.getsource(sft._pretokenize_completion_only)
 
     # completion-only loss is ON (and the old `False` literal for that key is gone)
     assert '"completion_only_loss": True' in src
     assert '"completion_only_loss": False' not in src
-    # the prompt boundary + pre-tokenized {input_ids, completion_mask} representation
-    assert "build_completion_mask(" in src
-    assert '"completion_mask":' in src
+    # the prompt boundary + pre-tokenized {input_ids, completion_mask} representation lives in the
+    # helper; run_sft consumes it and turns it into the dataset
+    assert "completion_mask_from_ids(" in pre_src
+    assert '"completion_mask":' in pre_src
+    assert "tokenize_for_packing(" in pre_src  # EOS-append parity tokenization
+    assert "_pretokenize_completion_only(" in src
     assert "Dataset.from_list(_pretok)" in src
     # both flash custom-packing paths thread the completion mask through the packer
     assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
@@ -380,7 +386,7 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "emit_varlen=True" in src                              # GDN varlen
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
-    assert "tokenize_for_packing(" in src                        # EOS-append parity tokenization
+    # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
     # Liger fused CE/RMSNorm/RoPE
     assert 'cfg_kwargs["use_liger_kernel"] = True' in src
     # LoRA+ (B-matrix LR ratio)
