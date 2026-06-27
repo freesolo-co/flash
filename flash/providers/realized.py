@@ -35,11 +35,11 @@ def realized_cost_for_remote(
     Two distinct time bounds, because the two cost sources are different:
       * ``start``/``end`` bound the RunPod BILLING-API query window. The caller pads ``end`` past the
         run's terminal time so the settled invoice row is in range (see reconcile ``_SETTLE_SECONDS``).
-      * ``run_end`` is the run's ACTUAL terminal time (~teardown). The instance provider
-        (Lambda) has no billing endpoint: an instance bills at a flat $/hr from launch to
-        teardown, so its realized COGS is wall x rate over ``started_ts -> run_end`` — it must NOT
-        use the settle-padded ``end`` or it would over-bill by the padding (up to an hour). Defaults
-        to ``end`` for back-compat when the caller doesn't distinguish.
+      * ``run_end`` is the run's ACTUAL terminal time (~teardown). Instance-billed providers
+        (Lambda, Vast) have no billing endpoint: each bills at a flat $/hr from launch to
+        teardown, so their realized COGS is wall x rate over ``started_ts -> run_end`` — they must
+        NOT use the settle-padded ``end`` or they would over-bill by the padding (up to an hour).
+        Defaults to ``end`` for back-compat when the caller doesn't distinguish.
     """
     if not remote:
         return None
