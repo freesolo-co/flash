@@ -16,3 +16,13 @@ ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
     TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor
 
 COPY build/kernel_cache/ /opt/flash/kernelcache/
+
+# Fingerprint + base-revision stamps so auto-rebake.yml can read what this image was baked from and
+# decide skip / re-layer / re-warm (docker/kernel_fingerprint.py is the source of truth for the
+# values). Default to "unknown" so a hand build still works; CI always passes the real ones.
+ARG FP_CACHE=unknown
+ARG FP_BASE=unknown
+ARG BASE_REVISION=unknown
+LABEL co.freesolo.flash.kernelcache.fp_cache=$FP_CACHE \
+      co.freesolo.flash.kernelcache.fp_base=$FP_BASE \
+      org.opencontainers.image.revision=$BASE_REVISION
