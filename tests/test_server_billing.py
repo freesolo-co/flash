@@ -382,6 +382,62 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
     assert "billing charged" in log.getvalue()
 
 
+def test_completion_charge_recovers_billing_meta_after_handle_cleared(monkeypatch, tmp_path):
+    """The seed loop nulls status.remote after the last seed (so a restart resumes instead of
+    re-attaching+re-billing). The completion charge must still attribute provider/gpu by recovering
+    them from the last seed's persisted metrics.json."""
+    import os
+
+    import flash.runner as runner
+    from flash.runner import RunStatus, artifacts_dir, lifecycle
+
+    spec = _spec(monkeypatch)
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    runner._save_status(
+        RunStatus(
+            run_id=spec.run_id,
+            state="done",
+            spec=spec.to_dict(),
+            cost_usd=4.5,
+            billing_context={"org_id": "org-A"},
+            billing_state="pending",
+            remote=None,  # handle cleared at seed completion
+        )
+    )
+    last_seed = spec.train.seeds[-1]
+    seed_dir = os.path.join(artifacts_dir(spec), f"seed{last_seed}")
+    os.makedirs(seed_dir, exist_ok=True)
+    with open(os.path.join(seed_dir, "metrics.json"), "w") as f:
+        json.dump(
+            {"allocated_gpu": "H100 SXM", "notes": {"provider": "runpod"}}, f
+        )
+
+    captured = {}
+
+    def fake_charge(*, internal_key, status):
+        captured["remote"] = dict(status.remote or {})
+        return {"amountCents": 450, "replay": False}
+
+    monkeypatch.setattr("flash.server.billing.charge_completed_run", fake_charge)
+    lifecycle._charge_completed_run_best_effort(spec, io.StringIO())
+
+    assert captured["remote"] == {"provider": "runpod", "allocated_gpu": "H100 SXM"}
+    assert runner.get_status("run-1").billing_state == "charged"
+
+
+def test_billing_meta_from_last_seed_returns_none_without_metrics(monkeypatch, tmp_path):
+    """No persisted metrics.json -> no recovered meta (charge falls back to spec.gpu, provider=None)."""
+    import flash.runner as runner
+    from flash.runner import RunStatus, lifecycle
+
+    spec = _spec(monkeypatch)
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    status = RunStatus(run_id=spec.run_id, state="done", spec=spec.to_dict())
+    assert lifecycle._billing_meta_from_last_seed(status) is None
+
+
 def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
     import flash.runner as runner
     from flash.runner import RunStatus, lifecycle

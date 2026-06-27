@@ -64,12 +64,14 @@ class RunpodProvider:
 
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
-        reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
-        failure_reader = (
-            make_hf_failure_detail_reader(hf_repo, prefix, spec.phase) if hf_repo else None
-        )
         hd = handle.to_dict()
         rh = RunpodJobHandle.from_dict(hd)
+        reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
+        failure_reader = (
+            make_hf_failure_detail_reader(hf_repo, prefix, spec.phase, attempt=rh.attempt)
+            if hf_repo
+            else None
+        )
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         on_last_gpu = bool(hd.get("on_last_gpu", False))
