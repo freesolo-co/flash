@@ -34,6 +34,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_deployments,
     cmd_env_list,
     cmd_env_setup,
+    cmd_export,
     cmd_gpus,
     cmd_login,
     cmd_models,
@@ -193,6 +194,39 @@ def main(argv: list[str] | None = None) -> int:
     undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")
     undeploy.add_argument("run_id")
     undeploy.set_defaults(func=cmd_undeploy)
+
+    export = sub.add_parser(
+        "export", help="export a trained adapter to your own HuggingFace repo"
+    )
+    export.add_argument(
+        "--adapter-id",
+        dest="adapter_id",
+        required=True,
+        help="the Freesolo adapter id (the run id) to export",
+    )
+    export.add_argument(
+        "--repository",
+        required=True,
+        help="destination HuggingFace repo 'owner/name' (created if it doesn't exist)",
+    )
+    export.add_argument(
+        "--api-key",
+        help="HuggingFace token with write access to --repository "
+        "(default: HF_TOKEN from your shell or a local .env / .env.local)",
+    )
+    export.add_argument(
+        "--step",
+        type=int,
+        default=None,
+        help="export a specific intermediate checkpoint (see `flash checkpoints <adapter-id>`) "
+        "instead of the run's final adapter; works even for a run cancelled mid-RL",
+    )
+    export.add_argument(
+        "--public",
+        action="store_true",
+        help="create the destination repo as public (default: private)",
+    )
+    export.set_defaults(func=cmd_export)
 
     deployments = sub.add_parser("deployments", help="list active serving deployments")
     deployments.set_defaults(func=cmd_deployments)
