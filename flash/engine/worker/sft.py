@@ -253,8 +253,9 @@ def run_sft():
     # (FA2 and FA3 both expose flash_attn_varlen_func; plain SDPA cross-contaminates packed examples).
     # Use the ARCH-BEST flash impl optimal_attn_impl already picked (so Hopper packs under FA3, not
     # FA2). Cases when it did NOT pick a flash impl:
-    #   * _attn == "sdpa" (sm120, the deliberate no-flash exception): DISABLE packing — consumer
-    #     Blackwell stays plain SDPA; do NOT force FA2 (its sm120 kernel coverage is unverified).
+    #   * _attn == "sdpa" (Blackwell sm120 5090/RTX Pro + sm100 B200, the deliberate no-flash archs):
+    #     DISABLE TRL bfd packing — they stay plain SDPA; do NOT force FA2 (its Blackwell-SASS coverage
+    #     is unverified). The SDPA-mask packing block below still repacks pure-attention models here.
     #   * _attn is None (Hopper without FA3): force FA2 for boundary-correct varlen IF the wheel is
     #     importable; else drop packing rather than silently cross-contaminate.
     if cfg_kwargs.get("packing"):
