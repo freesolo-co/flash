@@ -7,8 +7,10 @@ managed Flash control plane.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,6 +18,22 @@ from . import render
 
 if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
+
+
+def _atomic_write_bytes(out: Path, data: bytes) -> None:
+    """Write ``data`` to ``out`` atomically and symlink-safely: stage to a temp file in the same
+    directory, then ``os.replace`` it into place. A mid-write failure (disk full / quota) therefore
+    never truncates an existing file, and ``os.replace`` swaps the path itself — replacing a symlink
+    at ``out`` rather than writing through it to the link target."""
+    fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=".flash-env-pull-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def cmd_env_install(args) -> int:
@@ -70,12 +88,15 @@ def cmd_env_pull(args) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            if out.exists() and not args.force:
+            # ``out.is_symlink()`` is checked explicitly: a dangling symlink has ``exists()==False``,
+            # so without this a pull would proceed and write THROUGH the link to its target, outside
+            # the requested path. Treat any symlink as occupied → require --force.
+            if (out.exists() or out.is_symlink()) and not args.force:
                 print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
                 return 1
             data = download_environment_file(env_id, args.path)
             out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_bytes(data)
+            _atomic_write_bytes(out, data)
             if render.styled():
                 print(render.env_pulled(str(out), f"{args.path} · {len(data):,} bytes"))
             else:
