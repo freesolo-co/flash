@@ -560,6 +560,36 @@ def test_poll_caps_recovered_cost_at_done_timestamp(monkeypatch):
     assert res.metrics["cost_usd"] == round((9100.0 - 9000.0) / 3600.0 * 1.29, 6)
 
 
+def test_poll_retries_transient_metrics_blip_after_done(monkeypatch):
+    # A fresh DONE guarantees metrics.json was uploaded first, so a None read is a transient HF blip
+    # (the reader swallows 429/network and returns None) — it must be retried, not turned into a
+    # terminal job_failed that discards (while still billing) a successful run.
+    reads = {"n": 0}
+
+    def metrics():
+        reads["n"] += 1
+        return None if reads["n"] <= 2 else json.dumps({"wall_seconds": 100, "cost_usd": 0.0})
+
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], done="10500.0", metrics=metrics
+    )
+    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
+    assert res.ok, res
+    assert reads["n"] >= 3  # retried past the two transient None reads instead of failing
+
+
+def test_poll_persistent_metrics_unreadable_is_retriable_not_job_failed(monkeypatch):
+    # If metrics.json stays unreadable after retries, fail RETRIABLY (poll_error) so the run is
+    # re-attempted (a re-launch hits the worker's DONE-idempotency and restores the persisted
+    # metrics without re-training) — NEVER the terminal job_failed that drops a billed success.
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], done="10500.0", metrics=lambda: None
+    )
+    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "poll_error"
+
+
 def test_poll_marker_failure_is_job_failed(monkeypatch):
     jobs = _wire_poll(
         monkeypatch,

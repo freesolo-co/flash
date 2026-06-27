@@ -19,6 +19,12 @@ def test_job_handle_roundtrip():
 
     h = JobHandle("ep123", "flash-5090-abc", "job456")
     assert JobHandle.from_dict(h.to_dict()) == h
+    # attempt persists so a cross-process reattach knows which attempt's heartbeats are current.
+    h2 = JobHandle("ep123", "flash-5090-abc", "job456", 2)
+    assert h2.to_dict()["attempt"] == 2
+    assert JobHandle.from_dict(h2.to_dict()) == h2
+    # An old handle dict persisted before the attempt field defaults to 0.
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).attempt == 0
 
 
 def test_decode_output_success():
@@ -516,6 +522,38 @@ def test_poll_job_tight_stall_after_first_heartbeat(monkeypatch):
     )
     assert res.failure == "stalled"
     assert "during training" in res.detail
+
+
+def test_poll_job_ignores_prior_attempt_heartbeat_keeps_setup_grace(monkeypatch):
+    # On a retry (current_attempt=1) the shared seed heartbeat path first returns the PRIOR attempt's
+    # leftover TRAINING heartbeat (attempt=0). It must be IGNORED so this cold start keeps the larger
+    # setup_grace_s instead of latching the dead attempt and dropping to the tight stall_after_s —
+    # otherwise a healthy-but-slow retry cold start (image pull + big snapshot_download) false-stalls.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    # Every read returns attempt 0's leftover training heartbeat; this poll is attempt 1.
+    leftover = {"stage": "train", "step": 5, "ts": 1, "attempt": 0}
+    h = jobs.JobHandle("ep", "name", "job", 1)
+    res = jobs.poll_job(
+        h,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: leftover,
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+        current_attempt=1,
+    )
+    assert res.failure == "stalled"
+    # The foreign-attempt heartbeat did NOT tighten the window: setup grace governed.
+    assert "during setup" in res.detail
+    assert "limit 5000s" in res.detail
 
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
