@@ -1,9 +1,4 @@
-"""Managed Freesolo environment publishing.
-
-``POST /v1/envs`` accepts a packaged Freesolo environment and uploads it to the
-managed environment hub. The returned id is a Freesolo environment slug
-(``namespace/name``) that Flash resolves internally.
-"""
+"""Managed Freesolo environment publishing."""
 
 from __future__ import annotations
 
@@ -44,19 +39,11 @@ class EnvPublishError(Exception):
         self.status = status
 
 
-# Reserved hub namespace for the operator/internal service key. Its /v1/me identity is synthetic
-# and shared (no per-user email), so it can't derive a namespace from an email like a user key does —
-# but it IS a trusted identity that can submit runs and read everything, so it must be able to
-# publish environments too. Matches the slug `internal@freesolo.co` would yield (see
-# flash.server.db.ensure_internal_key) so the namespace is stable regardless of the row's email.
+# Internal service key has no per-user email; fixed namespace keeps it stable.
 _INTERNAL_NAMESPACE = "internal-freesolo-co"
 
 
 def namespace_for(key: dict) -> str:
-    # Special case RESERVED for the internal service key ONLY (auth_kind == "internal"): give it a
-    # fixed namespace instead of requiring an email. Every other key is a freesolo USER key and still
-    # must carry a real email — we never loosen that, so two different users can't collide on one
-    # namespace.
     if key.get("auth_kind") == "internal":
         return _INTERNAL_NAMESPACE
     email = str(key.get("email") or "")

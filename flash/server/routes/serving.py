@@ -1,9 +1,7 @@
 """Serving endpoints: deploy / undeploy an adapter, list deployments, and chat.
 
-Service functions that the test-suite monkeypatches (``deploy_adapter``, ``undeploy_adapter``,
-``serve_chat``/``serve_chat_stream``, ``list_checkpoints``, ``get_status``) plus the per-run
-deploy lock and the deployable-state sets are resolved through the ``flash.server.app`` module
-(``_app.<name>``) at call time, so patching ``app.<name>`` is honored here.
+Service functions are resolved through ``flash.server.app`` at call time so test-suite patches on
+``app.<name>`` are honored here.
 """
 
 from __future__ import annotations
@@ -32,18 +30,7 @@ router = APIRouter()
 
 
 def _validate_hf_repo_id(repository: str) -> None:
-    """Reject a destination repo id that violates the HuggingFace repo-name grammar — FAST, before any
-    export work touches HF. Delegates to huggingface_hub's own ``validate_repo_id`` (the canonical Hub
-    rules: charset ``[A-Za-z0-9._-]``, no leading/trailing ``-``/``.``, no ``--``/``..``, length <= 96)
-    so this never drifts from the Hub. Without it a malformed id (e.g. ``owner/-bad``,
-    ``owner/bad--name``, a >96-char name, embedded whitespace) is accepted here and only fails LATER as
-    a wrapped 502 inside ``create_repo`` — after ``export_adapter`` already downloaded the private
-    source adapter. Raises ``HTTPException(400)`` on a bad id.
-
-    If the ``huggingface_hub`` server extra is somehow absent the grammar check is skipped (the export
-    path itself surfaces the missing extra as a 500); the cheap ``owner/name`` shape check upstream
-    still runs regardless.
-    """
+    """Validate HF repo id grammar early — malformed ids only 502 AFTER downloading the private source adapter."""
     try:
         from huggingface_hub.utils import HFValidationError, validate_repo_id
     except ModuleNotFoundError:
@@ -58,16 +45,12 @@ def _validate_hf_repo_id(repository: str) -> None:
 
 
 def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
-    """Validate an optional deploy ``step`` against the run's published checkpoints.
-
-    Returns the integer step to deploy, or ``None`` when no step was requested (deploy the
-    final adapter). Raises ``HTTPException(400)`` for a malformed step and ``HTTPException(404)``
-    — listing the available steps — when the run has no deployable checkpoint at that step."""
+    """Validate optional checkpoint step; returns int or None (final adapter). 400 on bad step, 404 on missing."""
     if raw_step is None:
         return None
 
-    # Accept only an actual integer step — NOT a bool (True would coerce to step 1) and not a
-    # non-integer float/string (40.9 / "40.9" must not silently round to a different checkpoint).
+    # Reject bool (True -> step 1) and non-integer floats; str path uses fullmatch not isdigit
+    # (isdigit accepts unicode digits + "-5" which crash int() -> 500).
     want: int | None = None
     if isinstance(raw_step, bool):
         want = None
@@ -76,13 +59,8 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
     elif isinstance(raw_step, float):
         want = int(raw_step) if raw_step.is_integer() else None
     elif isinstance(raw_step, str):
-        # Match an ASCII signed integer only, then int() — NOT str.isdigit()/lstrip("-"), which
-        # accepts unicode digits and multi-dash strings ("--5") that then crash int() with an
-        # uncaught ValueError (HTTP 500). A non-match leaves want=None -> the clean 400 below.
         s = raw_step.strip()
         want = int(s) if re.fullmatch(r"-?[0-9]+", s) else None
-    # Checkpoint steps are always non-negative (derived from ``step-<N>``); reject a negative
-    # value as malformed (400) rather than letting it fall through to the 404 below.
     if want is not None and want < 0:
         want = None
     if want is None:
@@ -100,17 +78,10 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
 def _resolve_deployable_target(
     run_id: str, spec, status, raw_step, *, action: str, enforce_state: bool
 ) -> tuple[int | None, bool, str]:
-    """Shared deploy/export target resolution: resolve an optional checkpoint ``step`` against the
-    run's published checkpoints, gate on the run's training state, and compute the adapter prefix.
-
-    Returns ``(checkpoint_step, is_checkpoint, prefix)``. ``action`` ("deploy"/"export") only tunes
-    the 409 wording; ``enforce_state`` is ``False`` for a deploy dry-run (which validates/shapes
-    without the state gate). The legacy hf_repo 409 guard stays at each handler's call-site (its
-    precedence differs between deploy and export), so it is intentionally NOT done here."""
+    """Resolve checkpoint step, gate on training state, and return (checkpoint_step, is_checkpoint, prefix)."""
     checkpoint_step = _resolve_deploy_step(run_id, spec, raw_step)
     is_checkpoint = checkpoint_step is not None
-    # A final adapter exists only once a run finished; a per-step checkpoint also survives a run
-    # that stopped mid-RL (cancelled/failed).
+    # Per-step checkpoints survive cancelled/failed runs; final adapter only exists once done.
     allowed_states = (
         _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
     )
@@ -123,7 +94,6 @@ def _resolve_deployable_target(
             f"trained adapter artifacts can be {'deployed' if action == 'deploy' else 'exported'}"
         )
         raise HTTPException(status_code=409, detail=detail)
-    # A checkpoint serves/exports the per-step adapter; otherwise the run's final adapter.
     prefix = (
         checkpoint_adapter_prefix(spec, checkpoint_step)
         if is_checkpoint
@@ -135,24 +105,13 @@ def _resolve_deployable_target(
 @router.post("/v1/runs/{run_id}/deploy")
 def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
     payload = payload or {}
-    # Serialize deploy vs undeploy (and a second deploy) for this run: registration
-    # with the freesolo serving app runs outside the status lock, so without this they
-    # could interleave and leave the serving record and the control plane inconsistent.
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
         dry_run = _require_bool(payload, "dry_run", False)
-        # Optional `step`: deploy a specific intermediate checkpoint instead of the run's
-        # final adapter. We resolve it against what's actually on HF (the source of truth),
-        # so a missing step 404s with the available list rather than 500ing at serve time. The
-        # shared helper also runs the state gate (skipped for a dry run) and the prefix selection.
         checkpoint_step, is_checkpoint, deploy_prefix = _resolve_deployable_target(
             run_id, spec, status, payload.get("step"), action="deploy", enforce_state=not dry_run
         )
-        # Legacy runs persisted before [train].hf_repo was mandatory rehydrate with an
-        # empty hf_repo; without this guard freesolo serving cannot locate the adapter
-        # artifacts (the per-run HF dataset repo). Reject early with a clear 409. Kept at this
-        # call-site (out of the shared helper) so deploy's error precedence is unchanged.
         if not dry_run and not spec.train.hf_repo:
             raise HTTPException(
                 status_code=409,
@@ -161,15 +120,9 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                     "cannot be located, so it cannot be deployed"
                 ),
             )
-        # The state the run must still be in for this deploy to finalize — a CAS guard so
-        # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't be
-        # silently overwritten by the deployment record.
+        # CAS guard: /cancel is NOT serialized by the deploy lock, so capture state before deploy.
         prev_state = status.state
-        # Attribute the adapter to the RUN's owning org so serving can authorize external chat
-        # by org. Prefer the org persisted WITH the run — billing_context for user runs,
-        # platform_context for internal/operator runs (see submit path) — over the caller's key,
-        # so an operator deploy still lands on the run's owner. Each context is isinstance-guarded
-        # against a non-dict legacy value (mirrors flash/server/billing.py / checkpoints.py).
+        # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         def _run_org(*contexts) -> str:
             for ctx in contexts:
                 if isinstance(ctx, dict):
@@ -199,9 +152,6 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 org_id=deploy_org_id,
             )
         except ServingError as exc:
-            # The serving backend rejected the registration or was unreachable. This is an
-            # upstream/gateway failure, not a flash bug, so surface a clean 502 with the
-            # real reason instead of letting httpx escape as an unhandled 500 + traceback.
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
             if isinstance(exc, ValueError):
@@ -212,15 +162,11 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             dep_dict["checkpoint_step"] = checkpoint_step
         if not dry_run:
             if is_checkpoint and status.state not in _app._DEPLOYABLE_STATES:
-                # Deploying a checkpoint of a run that stopped mid-RL (cancelled/failed):
-                # attach the serving deployment but KEEP the run's terminal training state
-                # — flipping it to `deployed` would erase the outcome and make undeploy
-                # wrongly restore it to `done`.
+                # Keep the terminal training state — flipping to `deployed` would erase the outcome
+                # and make undeploy wrongly restore it to `done`.
                 attach_checkpoint_deployment(run_id, dep_dict)
             else:
-                # Record the deployment. The CAS no-ops only if a /cancel raced finalization
-                # — then the adapter we just registered is orphaned, so deregister it and
-                # report the conflict instead of a bogus 200.
+                # CAS: if /cancel raced us, the adapter is orphaned — deregister and 409.
                 marked = mark_deployed(run_id, dep_dict, expect_state=prev_state)
                 if marked.state != "deployed":
                     with contextlib.suppress(Exception):
@@ -234,19 +180,13 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
 
 @router.delete("/v1/runs/{run_id}/deploy")
 def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
-    # Same per-run lock as deploy: an undeploy must not interleave with an in-flight
-    # deploy's provisioning/finalization.
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         try:
             deleted = _app.undeploy_adapter(run_id)
         except ServingError as exc:
-            # A serving-backend failure (unreachable / non-404 error) is an upstream/gateway
-            # problem, not a flash bug — surface a clean 502 with the real reason (mirrors the
-            # deploy handler) instead of letting the ServingError escape as an unhandled 500.
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        # Delete is idempotent: a missing serving-side adapter still means the local
-        # deployment record can be cleared.
+        # Idempotent: clear local record even if serving side already had no adapter.
         if status.deployment:
             mark_undeployed(run_id)
         return {"run_id": run_id, "deleted_endpoints": deleted}
@@ -254,13 +194,7 @@ def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
 
 @router.post("/v1/runs/{run_id}/export")
 def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
-    """Copy a run's trained adapter into a user-owned HuggingFace repo.
-
-    Reads the adapter from the run's private artifact repo with the operator token and
-    re-uploads it to ``repository`` with the user-supplied ``hf_token`` (write access to their
-    own repo). ``step`` selects an intermediate checkpoint — resolved against the same published
-    checkpoints as ``flash deploy --step`` — instead of the run's final adapter.
-    """
+    """Copy a run's trained adapter into a user-owned HuggingFace repo."""
     payload = payload or {}
     repository = str(payload.get("repository") or "").strip()
     if not repository:
@@ -268,22 +202,12 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             status_code=400,
             detail="repository is required: the destination HuggingFace repo 'owner/name'",
         )
-    # A HF repo id is EXACTLY two non-empty segments (``owner/name``). "at least one '/'" wrongly
-    # accepted ``owner/name/extra``, ``owner//name``, ``/name``, ``name/`` — which would 404/400 deep
-    # in huggingface_hub. Strip surrounding slashes, then require precisely two non-empty parts.
     if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
         raise HTTPException(
             status_code=400,
             detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
         )
-    # Use the CANONICAL ``owner/name`` form downstream (and in the echoed URL), not the raw input: a
-    # value like ``/owner/name`` or ``owner/name/`` passes the shape check but would otherwise reach HF
-    # and the returned url with stray slashes.
     repository = "/".join(parts)
-    # Counting parts is not enough: ``owner/ name``, ``owner/-bad``, ``owner/bad--name`` or a >96-char
-    # name all have two segments but are NOT valid HF repo ids — they'd be accepted here and only blow
-    # up DEEP inside huggingface_hub (a wrapped 502) AFTER export_adapter downloaded the private source
-    # adapter. Validate the FULL Hub repo-name grammar up front so a malformed id fails fast with a 400.
     _validate_hf_repo_id(repository)
     hf_token = str(payload.get("hf_token") or "").strip()
     if not hf_token:
@@ -291,14 +215,11 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             status_code=400,
             detail="hf_token is required: a HuggingFace token with write access to the destination repo",
         )
-    # private is a JSON boolean (mirrors deploy's dry_run guard): a truthy non-bool like "false"
-    # must not silently flip the destination's visibility.
+    # _require_bool: reject non-bool like "false" that would silently flip visibility.
     private = _require_bool(payload, "private", True)
 
     status = owned_run(run_id, key)
     spec = JobSpec.from_dict(status.spec)
-    # Legacy runs with no artifact repo (mirrors the /deploy guard): the adapter can't be located.
-    # Kept FIRST (out of the shared helper) so export's error precedence is unchanged.
     if not spec.train.hf_repo:
         raise HTTPException(
             status_code=409,
@@ -307,9 +228,6 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 "cannot be located, so it cannot be exported"
             ),
         )
-    # Optional `step`: export a specific intermediate checkpoint instead of the final adapter,
-    # validated against what's actually on HF (a missing step 404s with the available list). The
-    # shared helper also runs the same state gate as deploy and the prefix selection.
     checkpoint_step, is_checkpoint, prefix = _resolve_deployable_target(
         run_id, spec, status, payload.get("step"), action="export", enforce_state=True
     )
@@ -323,11 +241,8 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             private=private,
         )
     except ValueError as exc:
-        # The source has no adapter artifacts at that path — nothing to export.
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ServingError as exc:
-        # An HF transport/permission failure (download or upload) — an upstream problem, not a
-        # flash bug, so surface a clean 502 with the real reason (mirrors deploy/undeploy).
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     result = {
         "run_id": run_id,
@@ -362,36 +277,24 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     status = owned_run(run_id, key)
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
-    # A cancelled run's serve endpoint was torn down at cancel time; never let a
-    # chat recreate it (closes the window before cancel marks the deployment
-    # inactive, and covers a teardown that deleted nothing).
     if status.state == "cancelled":
         raise HTTPException(
             status_code=409, detail=f"run {run_id} was cancelled; redeploy is not allowed"
         )
-    # Chat must ride an explicit deployment (with its cost controls), not
-    # implicitly provision a serving endpoint that /v1/deployments cannot see.
     if deployment.get("state") in (None, "undeployed", "dry_run"):
         raise HTTPException(
             status_code=409,
             detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
         )
-    # Legacy run with no artifact repo (mirrors the /deploy guard): a run that never had a
-    # [train].hf_repo was never registered with freesolo serving, so reject early with a
-    # clear 409 instead of an opaque downstream inference error.
     if not spec.train.hf_repo:
         raise HTTPException(
             status_code=409,
             detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
         )
-    # Parse the client-supplied sampling params BEFORE the broad try: a bad value
-    # (e.g. {"temperature": "hot"}) is a request error -> 400, not a 502 inference
-    # failure (which would misclassify the bad payload as an upstream serving fault).
+    # Parse sampling params before the broad try so bad values are 400, not 502.
     try:
         temperature = float(payload.get("temperature") or 0.0)
-        # Default ONLY when max_tokens is missing/None — `or 512` would silently turn an
-        # explicit 0 into 512, surprising callers and inflating cost/latency. An explicit
-        # non-positive value is rejected below as a request error rather than masked.
+        # Avoid `or 512`: that silently coerces an explicit 0 to 512.
         raw_max_tokens = payload.get("max_tokens")
         max_tokens = 512 if raw_max_tokens is None else int(raw_max_tokens)
     except (TypeError, ValueError) as exc:
@@ -411,7 +314,6 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                     messages=payload.get("messages") or [],
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 ),
                 media_type="text/plain; charset=utf-8",
@@ -421,7 +323,6 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             messages=payload.get("messages") or [],
             temperature=temperature,
             max_tokens=max_tokens,
-            # a run trained with thinking serves with thinking (per-run parity)
             thinking=spec.thinking,
         )
     except Exception as exc:

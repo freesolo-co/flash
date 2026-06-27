@@ -9,10 +9,7 @@ from pathlib import Path
 
 
 def read_json_or_empty(path: Path) -> dict:
-    """Parse a JSON object file, returning ``{}`` if it's missing, unreadable, or not a JSON
-    object. The ``-> dict`` contract is unconditional: valid-but-non-object JSON (a list, scalar,
-    or ``null``) also yields ``{}`` so callers (credentials, env manifest, update cache) can rely
-    on ``.get(...)``/item-assignment without an ``AttributeError``/``TypeError``."""
+    """Parse a JSON object file, returning ``{}`` on any error or if the root is not a dict."""
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -21,13 +18,7 @@ def read_json_or_empty(path: Path) -> dict:
 
 
 def secure_json_write(path: Path, data: dict) -> None:
-    """Write ``data`` as JSON with private permissions (the file may hold a secret).
-
-    Creates the parent dir (0700) and opens the file 0600 from the start — never
-    write_text + chmod, which leaves it umask-readable in between. ``O_NOFOLLOW``
-    (where available) refuses to follow a symlink planted at ``path`` so the write
-    can't be redirected to clobber an arbitrary file.
-    """
+    """Write ``data`` as JSON 0600. Opens with O_CREAT|0o600 — never write_text+chmod (TOCTOU). O_NOFOLLOW blocks symlink redirect."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(path.parent, 0o700)

@@ -1,9 +1,4 @@
-"""Background lifecycle helpers for the control plane: realized-cost reconciliation, run
-recovery after a restart, and per-run log / worker-artifact access.
-
-No fastapi dependency, so this module is safe to import at ``flash.server.app`` import time
-(it must not pull in the optional server extras).
-"""
+"""Background lifecycle helpers: cost reconciliation, run recovery, and log access."""
 
 from __future__ import annotations
 
@@ -20,46 +15,28 @@ from . import db
 
 _log = logging.getLogger("flash.server")
 
-# Run states that are still in flight and must be recovered after a control-plane restart.
 _RECOVERABLE = {"queued", "provisioning", "running"}
 
 
 async def _reconcile_cost_loop() -> None:
-    """Background loop: periodically pull realized provider cost (COGS) for finished runs and
-    report it to the freesolo backend for estimator accuracy. The provider billing calls are
-    blocking urllib, so each sweep is offloaded to a thread; failures are swallowed and retried
-    next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
+    """Periodically pull realized provider COGS for finished runs and report to the backend."""
     from flash.server.reconcile import reconcile_once
 
-    interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
+    interval = 3600.0
     while True:
         await asyncio.sleep(interval)
-        # Handle cancellation EXPLICITLY (re-raise it) and swallow only real Exceptions, exactly
-        # like the sibling reaper loops in app.py (_reap_idle_endpoints_loop /
-        # _sweep_orphan_instances_loop). On the supported Pythons (>=3.11) asyncio.CancelledError
-        # already derives from BaseException, so the old `contextlib.suppress(Exception)` did not
-        # swallow a shutdown cancel arriving during the blocking sweep — but being explicit makes the
-        # cancel path obvious and uniform, and logs a failed sweep instead of silently dropping it.
         try:
             reported = await asyncio.to_thread(reconcile_once)
             if reported:
                 _log.info("reconciled realized cost for %d run(s)", reported)
         except asyncio.CancelledError:
-            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+            raise
         except Exception:
             _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
 
 
 async def _charge_retry_startup() -> None:
-    """Run ONE completion-charge recovery sweep off the startup critical path.
-
-    The startup sweep must still happen promptly (the periodic loop sleeps a full interval before
-    its first sweep, and recover_runs deliberately excludes terminal `done`, so a crash between the
-    `done` write and the charge would otherwise leak revenue until the first periodic cycle). But it
-    must NOT block the lifespan from `yield`-ing: with a backlog of pending/failed charges and a slow
-    or down billing backend, each charge can wait the full billing timeout, turning a deploy/restart
-    into minutes of unavailability. So the lifespan schedules this as a background task and the sweep
-    runs in a thread (the charge is blocking urllib). Best-effort; cancelled cleanly at shutdown."""
+    """Run one completion-charge recovery sweep at startup without blocking the lifespan yield."""
     from flash.server.billing_retry import retry_completion_charges_once
 
     stop = threading.Event()
@@ -68,10 +45,8 @@ async def _charge_retry_startup() -> None:
         if recovered:
             _log.info("recovered %d pending completion charge(s) at startup", recovered)
     except asyncio.CancelledError:
-        # task.cancel() only cancels the await, not the worker thread; signal it to stop between
-        # runs so a backlog of slow charges can't keep the thread alive past shutdown.
-        stop.set()
-        raise  # shutdown during the startup sweep: let the lifespan's task.cancel() propagate
+        stop.set()  # task.cancel() only cancels the await; signal thread to stop between runs
+        raise
     except Exception:
         _log.debug(
             "startup completion-charge sweep failed; periodic loop will retry", exc_info=True
@@ -79,27 +54,20 @@ async def _charge_retry_startup() -> None:
 
 
 async def _charge_retry_loop() -> None:
-    """Background loop: periodically re-charge completed runs whose customer charge was left
-    pending/charging/failed by a transient backend blip (or a crash between the ``done`` write and
-    the charge), so a finished-but-uncharged run never leaks revenue. The backend charge is
-    idempotent by runId, so every retry is safe. Each sweep is offloaded to a thread (the charge is
-    blocking urllib); failures are swallowed and retried next cycle. The interval IS the bounded
-    backoff. Off entirely when FREESOLO_INTERNAL_KEY is unset (see charge_retry_enabled)."""
+    """Periodically re-charge completed runs whose customer charge was left pending/failed."""
     from flash.server.billing_retry import retry_completion_charges_once
 
-    interval = 300.0  # retry pending/failed customer charges every 5 min
+    interval = 300.0
     while True:
         await asyncio.sleep(interval)
-        # Mirror the sibling reaper/reconcile loops: re-raise CancelledError so the lifespan's
-        # task.cancel() stops it at shutdown, and swallow only real Exceptions to keep sweeping.
         stop = threading.Event()
         try:
             charged = await asyncio.to_thread(retry_completion_charges_once, stop.is_set)
             if charged:
                 _log.info("recovered %d pending completion charge(s) on retry", charged)
         except asyncio.CancelledError:
-            stop.set()  # signal the worker thread to stop between runs (see _charge_retry_startup)
-            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+            stop.set()
+            raise
         except Exception:
             _log.debug("completion-charge retry sweep failed; retrying next cycle", exc_info=True)
 
@@ -113,15 +81,7 @@ def _append_run_log(run_id: str, message: str) -> None:
 
 
 def _worker_artifacts(spec) -> dict[str, str]:
-    """The run's train-subprocess stdout + traceback, fetched from its HF artifact repo.
-
-    The control-plane ``.log`` only carries orchestrator lines (and, on a terminal failure, a
-    truncated tail of the worker console). The full ``console_<phase>.txt`` / ``error_<phase>.txt``
-    the worker streams to HF are the real train stdout/traceback — but the repo is PRIVATE, so a
-    user's own HF token 404s. We fetch them here with the OPERATOR ``HF_TOKEN`` (the control plane
-    already holds it) so ``flash status --logs`` shows the real worker output regardless of run
-    state and without the user needing repo access. Best-effort: a missing file / no repo yields {}.
-    """
+    """Fetch worker console/error logs from the private HF artifact repo using the operator token."""
     repo = getattr(getattr(spec, "train", None), "hf_repo", None)
     if not repo:
         return {}
@@ -138,24 +98,18 @@ def _worker_artifacts(spec) -> dict[str, str]:
                 repo_type="dataset",
                 filename=f"{prefix}/{name}",
                 token=os.environ.get("HF_TOKEN"),
-                # The worker appends to console/error files across the run, so a cached copy goes
-                # stale; force a fresh pull (matches other HF artifact readers, e.g.
-                # flash/providers/runpod/jobs.py:make_hf_text_reader).
-                force_download=True,
+                force_download=True,  # worker appends across run; cached copy goes stale
             )
-            # errors="replace": worker stdout can carry non-UTF-8 bytes (tracebacks, progress bars);
-            # decode leniently so a single bad byte never drops the whole log on UnicodeDecodeError.
+            # errors="replace": worker stdout can carry non-UTF-8 bytes from tracebacks/progress bars
             with open(path, encoding="utf-8", errors="replace") as f:
                 out[name] = f.read()
         except Exception:
-            continue  # file not uploaded yet / not produced for this phase
+            continue
     return out
 
 
 def recover_runs() -> None:
-    """Recover every in-flight run after a restart so a redeploy never loses a training session:
-    re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
-    ``queued``/``provisioning`` runs that never reached a worker."""
+    """Re-attach running jobs, resume multi-seed runs, and resubmit unprovisioned runs after restart."""
     from flash.runner import (
         _gc_run_endpoints,
         _run_job_background,
@@ -165,9 +119,7 @@ def recover_runs() -> None:
     )
 
     active: set[str] = set()
-    # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
-    # attempt is reaped without racing the resubmit's fresh allocation.
-    resubmit: list[JobSpec] = []
+    resubmit: list[JobSpec] = []  # deferred until after orphan sweep to avoid racing fresh allocation
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
@@ -176,19 +128,13 @@ def recover_runs() -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
-            # Only handle-backed runs are kept by the sweep; a handle-less run is being
-            # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         elif status.resume_seed_index is not None:
-            # Restarted between seeds: resume the remaining seeds, preserving the finished ones.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
-            # No handle yet: the restart hit the submit->provisioning window, so no worker exists.
-            # A spec that won't parse can never be resubmitted -> mark it terminally failed
-            # (operator-visible, dropped from _RECOVERABLE so it isn't re-skipped every restart);
-            # otherwise GC any half-made endpoint and resubmit from scratch.
+            # No handle: restart hit the submit→provisioning window; GC any half-made endpoint and resubmit.
             try:
                 spec = JobSpec.from_dict(status.spec)
             except Exception as exc:
@@ -202,16 +148,8 @@ def recover_runs() -> None:
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
                     _append_run_log(status.run_id, detail)
-                # The aborted attempt may STILL have registered its uniquely-named RunPod
-                # endpoint before crashing (the exact leak the good-spec branch's
-                # `_gc_run_endpoints` guards against). The `sweep_orphans` dispatch below is a
-                # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
-                # 15-min idle grace — so tear it down by name HERE for immediate cleanup.
-                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
-                # endpoint name is derived deterministically from the run id + GPU class
-                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
-                # persisted status without parsing the spec. Terminate by that reconstructed
-                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
+                # Crashed run may have registered a RunPod endpoint before dying; tear it down now
+                # rather than waiting for the 15-min idle grace period.
                 with contextlib.suppress(Exception):
                     gpu_type = (status.spec.get("gpu") or {}).get("type")
                     if gpu_type:
@@ -222,7 +160,6 @@ def recover_runs() -> None:
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
             resubmit.append(spec)
-    # Reap orphaned per-run provider resources; each provider sweeps its own.
     from flash.providers import configured_providers
 
     for prov in configured_providers():
