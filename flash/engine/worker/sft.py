@@ -19,7 +19,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
-    build_completion_mask,
+    completion_mask_from_ids,
     gdn_packing_available,
     model_is_gdn_hybrid,
     model_is_pure_attention,
@@ -162,9 +162,17 @@ def run_sft():
     # flip the provider into the tight post-training grace before the first step even runs.
     with liveness_heartbeat("sft_pretokenizing"):
         _full_ids = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
+        # Batch-tokenize the prompts in ONE call too (this was the remaining O(N) per-row tokenize,
+        # inside build_completion_mask). Same call shape as tokenize_for_packing — default
+        # add_special_tokens, truncate to sft_max_len, NO appended EOS (the prompt never ends a turn) —
+        # so each prompt's ids line up token-for-token with its full row's prefix; completion_mask_from_ids
+        # then derives the boundary from the longest shared prefix without re-tokenizing.
+        _prompt_ids = tok(
+            [t["prompt_text"] for t in texts], truncation=True, max_length=sft_max_len
+        )["input_ids"]
         _pretok = [
-            {"input_ids": ids, "completion_mask": build_completion_mask(t["prompt_text"], ids, tok, sft_max_len)}
-            for t, ids in zip(texts, _full_ids, strict=True)
+            {"input_ids": ids, "completion_mask": completion_mask_from_ids(pids, ids)}
+            for ids, pids in zip(_full_ids, _prompt_ids, strict=True)
         ]
     # Drop rows with NO completion target (all-zero completion_mask). build_completion_mask returns an
     # all-zero mask when sft_max_len truncation removed the entire assistant turn (an over-long prompt)

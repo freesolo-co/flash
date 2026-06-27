@@ -16,6 +16,7 @@ import pytest
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
     build_completion_mask,
+    completion_mask_from_ids,
     gdn_packing_available,
     model_is_gdn_hybrid,
     model_is_pure_attention,
@@ -462,6 +463,22 @@ def test_build_completion_mask_all_prompt_masks_everything():
 
 def test_build_completion_mask_empty_full():
     assert build_completion_mask("anything", [], _FakeTok("!"), max_length=100) == []
+
+
+def test_completion_mask_from_ids_matches_wrapper():
+    # The batched SFT path tokenizes all prompts in one call and feeds prompt_ids straight into
+    # completion_mask_from_ids; it must produce the SAME mask the per-row build_completion_mask wrapper
+    # does (which tokenizes prompt_text internally). Equivalence holds because batched tokenization is
+    # per-sequence identical to single-row tokenization (no padding requested).
+    tok = _FakeTok(eos="!")
+    for prompt, full_text in [("AB", "ABxy"), ("AB<", "ABxy"), ("AB!", "AB")]:
+        full = tokenize_for_packing([full_text], tok, max_length=100)[0]
+        prompt_ids = tok([prompt], truncation=True, max_length=100)["input_ids"][0]
+        assert completion_mask_from_ids(prompt_ids, full) == build_completion_mask(
+            prompt, full, tok, max_length=100
+        )
+    # Empty full row -> empty mask, regardless of prompt ids.
+    assert completion_mask_from_ids([1, 2, 3], []) == []
 
 
 def test_pack_carries_completion_mask_aligned():
