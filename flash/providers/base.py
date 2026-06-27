@@ -392,7 +392,9 @@ class Provider(Protocol):
         ...
 
     def sweep_orphans(
-        self, active_labels: set[str] | Callable[[], set[str]] | None = None
+        self,
+        active_labels: set[str] | Callable[[], set[str]] | None = None,
+        known_labels: set[str] | Callable[[], set[str]] | None = None,
     ) -> list[int | str]:
         """Destroy any billable resource this provider owns that no live run claims.
 
@@ -401,7 +403,18 @@ class Provider(Protocol):
         prefix from them via ``run_label_prefix`` and reaps anything matching none of them. It may
         instead be a CALLABLE returning that set, which the instance providers resolve AFTER listing
         their resources (the periodic in-lifetime sweep passes one to close the launch race — see the
-        instance ``sweep_orphans``). Returns the destroyed resource ids (RunPod uses int ids; the
-        instance providers use opaque string ids). Providers without a standing-billing substrate
-        (RunPod's serverless endpoints self-reap) implement this as a no-op."""
+        instance ``sweep_orphans``).
+
+        ``known_labels`` is the (optional) set of RAW run ids this control plane has ANY record of —
+        the universe of resources it may attribute to itself. When supplied, a resource is reaped
+        ONLY if it maps to a run in this set (and is not in ``active_labels``); a resource whose run
+        id is absent is left alone. This is the multi-plane safety guard: two control planes sharing
+        one provider account each only reap their OWN orphans, so neither executes the other's live
+        instances. ``None`` (the default) preserves the legacy unscoped behavior (reap every unowned
+        ``flash-`` resource), which is correct for the single-control-plane production setup. Like
+        ``active_labels`` it may be a CALLABLE, resolved after listing.
+
+        Returns the destroyed resource ids (RunPod uses int ids; the instance providers use opaque
+        string ids). Providers without a standing-billing substrate (RunPod's serverless endpoints
+        self-reap) implement this as a no-op."""
         ...

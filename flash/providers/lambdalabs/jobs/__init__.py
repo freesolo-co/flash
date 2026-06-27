@@ -736,6 +736,7 @@ def terminate_run_instances(run_id: str) -> list[str]:
 
 def sweep_orphans(
     active_labels: set[str] | Callable[[], set[str]] | None = None,
+    known_labels: set[str] | Callable[[], set[str]] | None = None,
 ) -> list[str]:
     """Terminate Flash-named instances that no live run owns; return terminated ids.
 
@@ -750,6 +751,15 @@ def sweep_orphans(
     the instance was launched (hence before this list call), so resolving the live set now is
     guaranteed to include it — closing the launch race where a run started after a pre-captured set
     could have its fresh worker reaped as a phantom orphan.
+
+    ``known_labels`` (optional, RAW run ids or a callable) is the universe of runs THIS control
+    plane has a record of. When supplied, an instance is reaped only if its name maps to one of
+    them — instances whose run id this plane has never seen are left ALONE. This is the multi-plane
+    guard: two control planes sharing one Lambda account each carry disjoint run ids, so without it
+    each plane's sweep treats the OTHER's live instances as orphans (their run ids are absent from
+    this plane's ``active_labels``) and terminates them — they mutually reap each other every sweep.
+    ``None`` keeps the legacy unscoped behavior (reap every non-active ``flash-`` box), correct for
+    the single-plane production setup. Resolving it (like ``active_labels``) failing skips the sweep.
     """
     try:
         instances = lambda_api.list_instances()
@@ -758,13 +768,24 @@ def sweep_orphans(
         return []
     try:
         labels = active_labels() if callable(active_labels) else active_labels
+        known = known_labels() if callable(known_labels) else known_labels
     except Exception as exc:
-        # Resolving the protection set failed (e.g. a db/status read error in the callable). SKIP the
-        # sweep — never fall through to an empty set, which would treat every live run's instance as
-        # an orphan and reap it. Honors the "never raises" contract.
-        logger.warning("lambda orphan sweep skipped: could not resolve active set: %s", exc)
+        # Resolving a protection/known set failed (e.g. a db/status read error in the callable). SKIP
+        # the sweep — never fall through to an empty set, which would treat every live run's instance
+        # as an orphan and reap it. Honors the "never raises" contract.
+        logger.warning("lambda orphan sweep skipped: could not resolve run sets: %s", exc)
         return []
     active = {run_label_prefix(a) for a in (labels or set())}
+    # None => unscoped (legacy reap-all); a set => only instances attributable to one of THIS
+    # plane's known runs are reapable (multi-plane safety). An empty known set means this plane
+    # owns no runs at all -> it reaps nothing, never another plane's live boxes.
+    known_prefixes = None if known_labels is None else {run_label_prefix(a) for a in (known or set())}
+
+    def _matches(prefixes: set[str]) -> bool:
+        # Name-boundary match (EQUAL or followed by the ``-s`` seed boundary) so ``flash-100`` can't
+        # shield/claim ``flash-1000-...`` (or vice versa).
+        return any(name == p or name.startswith(p + "-s") for p in prefixes)
+
     now = time.time()
     orphans: list[str] = []
     for inst in instances:
@@ -788,10 +809,12 @@ def sweep_orphans(
                         "reaping orphaned lambda preload box %s (outlived its wall deadline + grace; "
                         "driver lost)", name)
             continue
-        # Match on the name boundary, not a raw string prefix: a live run's prefix must EQUAL the
-        # name or be followed by the ``-s`` seed boundary, so ``flash-100`` can't shield
-        # ``flash-1000-...`` (or vice versa).
-        if any(name == a or name.startswith(a + "-s") for a in active):
+        if _matches(active):
+            continue  # a live run owns this box — protected
+        # Multi-plane guard: with a known set, only reap boxes attributable to one of THIS plane's
+        # runs. A box whose run id is absent belongs to ANOTHER control plane on the same account
+        # (or predates this plane's registry) — never ours to terminate.
+        if known_prefixes is not None and not _matches(known_prefixes):
             continue
         iid = inst.get("id")
         if iid:
