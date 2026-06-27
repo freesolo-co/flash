@@ -514,7 +514,7 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
                 plan.actions = kept
 
     _print_report(plan, cfg, dry_run=dry_run, live_set_known=live_set_known, live_set_complete=live_set_complete)
-    # For destructive tiers, re-check the live set just before each mutation (TTL-cached) so a repo
+    # For destructive tiers, re-fetch the live set just before EVERY mutation (no caching) so a repo
     # deployed mid-apply is skipped — the pre-apply sample above only catches deploys up to this
     # point. Code-only purge is serving-safe and needs no per-action re-check.
     refresh_live = deployed_repo_ids if (not dry_run and cfg.needs_live_set) else None
