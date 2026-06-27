@@ -151,12 +151,14 @@ def create_error_is_ambiguous(err: Exception) -> bool:
     the host while the response is lost).
 
     DEFINITIVE (created nothing -> safe to walk to the next offer): a 4xx client rejection (offer
-    taken / bad request) carries a chained ``HTTPError`` with ``code < 500``; a ``success: false``
-    body is raised with NO chained cause. AMBIGUOUS (a contract may exist): a 5xx, a network/timeout
+    taken / bad request, ``code < 500`` and not 429) carries a chained ``HTTPError``; a
+    ``success: false`` body is raised with NO chained cause. AMBIGUOUS (a contract may exist): a 5xx,
+    a 429 (rate-limit — the request may have been accepted then throttled on the response, so a billed
+    instance can exist without a returned id; mirrors Lambda's launch path), a network/timeout
     (``URLError`` with no ``.code``), or a ``success`` body that carried no instance id."""
     cause = getattr(err, "__cause__", None)
     if isinstance(cause, urllib.error.HTTPError):  # subclass of URLError -> check first
-        return cause.code >= 500
+        return cause.code >= 500 or cause.code == 429
     if isinstance(cause, urllib.error.URLError):  # connection error / timeout
         return True
     return "no instance id" in str(err)  # success body without a contract id -> may be billing

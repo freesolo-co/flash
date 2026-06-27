@@ -169,38 +169,43 @@ def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
         raise e
 
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
-    # the contract DID materialize under our exact attempt label -> list_instances surfaces it
+    # the contract DID materialize under our exact attempt label -> list_instances surfaces it, with
+    # the box's real launch epoch in start_date
     label = "flash-1700000000-abcd1234-s0-a2"
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 555, "label": label}])
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda: [{"id": 555, "label": label, "start_date": 1699999000.0}]
+    )
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
     h = vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
     assert h.instance_id == 555  # adopted the existing contract, not a fresh rent
     assert h.offer_id == 1
+    assert h.started_ts == 1699999000.0  # Codex Mr72L / Cursor MsA6d: real launch time, not now
     assert rented == [1]  # did NOT walk on to offer 2 (no duplicate create)
 
 
-def test_deploy_walks_when_ambiguous_create_left_nothing(monkeypatch):
-    # Same ambiguous failure, but NO instance materialized under our label -> safe to continue the
-    # walk as before (the create truly didn't happen).
+def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
+    # Cursor MsA6X: an ambiguous failure with NO instance visible under our label must ABORT the walk
+    # (the contract may exist but not be visible yet) rather than rent another offer and double-bill.
     import io
     import urllib.error
 
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
+    rented = []
+
     def fake_create(offer_id, **kw):
-        if offer_id == 1:
-            e = vast_api.VastApiError("create failed: 503")
-            e.__cause__ = urllib.error.HTTPError("u", 503, "boom", None, io.BytesIO(b""))
-            raise e
-        return 9999
+        rented.append(offer_id)
+        e = vast_api.VastApiError("create failed: 503")
+        e.__cause__ = urllib.error.HTTPError("u", 503, "boom", None, io.BytesIO(b""))
+        raise e
 
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
     monkeypatch.setattr(vast_api, "list_instances", lambda: [])  # nothing under our label
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
-    h = vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
-    assert h.instance_id == 9999  # walked to offer 2 and rented normally
-    assert h.offer_id == 2
+    with pytest.raises(vast_api.VastApiError, match="aborting the offer walk"):
+        vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
+    assert rented == [1]  # aborted after the FIRST offer — never rented offer 2
 
 
 def test_vast_image_honors_worker_image_override(monkeypatch):

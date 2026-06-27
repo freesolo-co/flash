@@ -199,6 +199,7 @@ def test_create_error_is_ambiguous_classification():
     assert vast_api.create_error_is_ambiguous(err(msg="rejected: {'success': False}")) is False
     # AMBIGUOUS (a contract may exist) -> reconcile by label
     assert vast_api.create_error_is_ambiguous(err(http(503))) is True
+    assert vast_api.create_error_is_ambiguous(err(http(429))) is True  # Cursor MsA6e: rate-limit
     assert vast_api.create_error_is_ambiguous(err(urllib.error.URLError("timed out"))) is True
     assert vast_api.create_error_is_ambiguous(err(msg="...: no instance id in response: {}")) is True
 

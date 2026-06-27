@@ -165,17 +165,16 @@ def usable_offers(
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
 
 
-def _adopt_instance_by_label(label: str) -> int | None:
-    """Best-effort id of the instance carrying this EXACT (unique per run/seed/attempt) label, or
+def _adopt_instance_by_label(label: str) -> dict | None:
+    """Best-effort instance DICT carrying this EXACT (unique per run/seed/attempt) label, or
     ``None``. Reclaims a contract a possibly-successful-but-unconfirmed create left behind, so the
-    offer walk adopts it instead of renting a duplicate. Any lookup failure -> ``None`` (the caller
-    falls back to the normal walk; the orphan sweep remains the backstop)."""
+    offer walk adopts it instead of renting a duplicate. The full dict (not just the id) is returned
+    so the caller can stamp the handle with the instance's REAL launch time. Any lookup failure ->
+    ``None`` (the caller falls back; the orphan sweep remains the backstop)."""
     try:
         for inst in vast_api.list_instances():
-            if str(inst.get("label") or "") == label:
-                iid = inst.get("id")
-                if iid:
-                    return int(iid)
+            if str(inst.get("label") or "") == label and inst.get("id"):
+                return inst
     except Exception as exc:  # listing is best-effort; never let it abort the launch
         logger.warning("vast label reconcile failed (%s); proceeding without adoption", exc)
     return None
@@ -232,20 +231,34 @@ def deploy_and_submit(
             if vast_api.create_error_is_ambiguous(e):
                 adopted = _adopt_instance_by_label(label)
                 if adopted is not None:
+                    iid = int(adopted["id"])
+                    # Stamp the handle with the box's REAL launch time (Vast ``start_date`` epoch) so
+                    # realized cost + liveness/stall/deadline timing align with its actual runtime, not
+                    # the later reconciliation moment. Fall back to now if the field is absent.
+                    started = float(adopted.get("start_date") or 0.0) or time.time()
                     say(
-                        f"adopted vast instance {adopted} from an ambiguous create "
+                        f"adopted vast instance {iid} from an ambiguous create "
                         f"(label={label}, offer {offer.offer_id}, {offer.gpu})"
                     )
                     return VastJobHandle(
-                        instance_id=adopted,
+                        instance_id=iid,
                         offer_id=offer.offer_id,
                         machine_id=offer.machine_id,
                         label=label,
                         gpu=offer.gpu,
                         hourly_usd=offer.dph_total,
                         attempt=attempt,
-                        started_ts=time.time(),
+                        started_ts=started,
                     )
+                # AMBIGUOUS create with NOTHING adopted: a billed contract may still exist but not be
+                # visible yet (object-store / API eventual consistency). Renting another offer would
+                # double-provision, so ABORT the walk and surface to the orchestrator (which consumes a
+                # run retry); the orphan sweep reclaims any instance that later materializes. We do NOT
+                # walk on — a duplicate paid instance is the worse failure (see create_instance).
+                raise vast_api.VastApiError(
+                    f"ambiguous vast create on offer {offer.offer_id} (label={label}); aborting the "
+                    f"offer walk to avoid double-provisioning (orphan sweep reclaims any leak): {e}"
+                ) from e
             if not candidates and not refreshed:
                 refreshed = True
                 taken = {o.machine_id for o in tried}
