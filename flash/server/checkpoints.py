@@ -7,11 +7,13 @@ cancelled run's checkpoints survive in one queryable place.
 
 Like ``flash.server.billing``, the POST is authenticated with the operator INTERNAL key (the
 control plane never persists a user's freesolo key) and carries the org id persisted WITH the
-run — ``billing_context`` for user runs, ``platform_context`` for internal/operator runs (see
-the submit path; mirrors ``serving.py`` / ``run_registry.py``). Unlike billing, checkpoint
-persistence is STRICTLY best-effort: a failure here must never disturb a run or a deploy, so the
-public entry point swallows everything. Internal/operator runs with no org attribution at all
-are skipped quietly (HF stays the source of truth) — only genuine backend failures warn."""
+run — ``billing_context`` for user runs, THEN ``platform_context`` for internal/operator runs
+(the submit-path order). That billing-then-platform precedence matches
+``routes/serving.py::_run_org`` (NOT ``run_registry._context_from_status``, which prefers
+``platform_context`` first — see ``_run_org_id``). Unlike billing, checkpoint persistence is
+STRICTLY best-effort: a failure here must never disturb a run or a deploy, so the public entry
+point swallows everything. Internal/operator runs with no org attribution at all are skipped
+quietly (HF stays the source of truth) — only genuine backend failures warn."""
 
 from __future__ import annotations
 
