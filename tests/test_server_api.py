@@ -1513,22 +1513,10 @@ def test_export_validates_repository_and_token(api):
     )
     assert missing_token.status_code == 400
     assert "hf_token" in missing_token.json()["detail"]
-    # A HF repo id is EXACTLY two non-empty segments: reject no-slash AND the over-/under-segmented
-    # forms that the old "at least one '/'" check let through (which would 404/400 deep in hf_hub).
-    # Also reject segments that pass the count test but violate the HF repo-name grammar (embedded
-    # whitespace / illegal chars) — those must fail FAST here, not after export_adapter has already
-    # downloaded the private source adapter and hit a wrapped 502 from huggingface_hub.
-    for bad_repo in (
-        "noslash",
-        "owner/name/extra",
-        "owner//name",
-        "/name",
-        "name/",
-        "owner/ name",
-        "own er/name",
-        "owner/na\tme",
-        "owner/na me",
-    ):
+    # SHAPE check: a HF repo id is EXACTLY two non-empty segments — reject no-slash AND the over-/
+    # under-segmented forms that the old "at least one '/'" check let through (which would 404/400 deep
+    # in hf_hub). These produce the "owner/name" shape error.
+    for bad_repo in ("noslash", "owner/name/extra", "owner//name", "/name", "name/"):
         malformed = api.post(
             f"/v1/runs/{run_id}/export",
             json={"repository": bad_repo, "hf_token": "hf"},
@@ -1536,6 +1524,29 @@ def test_export_validates_repository_and_token(api):
         )
         assert malformed.status_code == 400, bad_repo
         assert "owner/name" in malformed.json()["detail"]
+    # GRAMMAR check: two segments but NOT a valid HF repo id — embedded whitespace, a segment that
+    # starts/ends with '-' or '.', a '--'/'..' run, or a >96-char name. The full Hub grammar
+    # (huggingface_hub.validate_repo_id) must reject these FAST with a 400, not let export_adapter
+    # download the private source adapter first and hit a wrapped 502 from create_repo.
+    for bad_repo in (
+        "owner/ name",
+        "own er/name",
+        "owner/na\tme",
+        "owner/na me",
+        "owner/-bad",
+        "owner/bad-",
+        "owner/.bad",
+        "owner/bad--name",
+        "owner/ba..d",
+        "owner/" + "x" * 97,
+    ):
+        malformed = api.post(
+            f"/v1/runs/{run_id}/export",
+            json={"repository": bad_repo, "hf_token": "hf"},
+            headers=_bearer(key),
+        )
+        assert malformed.status_code == 400, bad_repo
+        assert "valid HuggingFace repo id" in malformed.json()["detail"], bad_repo
 
 
 def test_export_unfinished_run_is_409(api, monkeypatch):

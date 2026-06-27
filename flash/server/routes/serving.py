@@ -9,7 +9,6 @@ deploy lock and the deployable-state sets are resolved through the ``flash.serve
 from __future__ import annotations
 
 import contextlib
-import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,10 +29,31 @@ from flash.spec import JobSpec
 
 router = APIRouter()
 
-# One segment (``owner`` or ``name``) of a HuggingFace repo id: a non-empty run of the only
-# characters HF permits — letters, digits, ``.``, ``_``, ``-``. Used to reject malformed ids (e.g.
-# embedded whitespace) up front, before any export work touches HF.
-_HF_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+def _validate_hf_repo_id(repository: str) -> None:
+    """Reject a destination repo id that violates the HuggingFace repo-name grammar — FAST, before any
+    export work touches HF. Delegates to huggingface_hub's own ``validate_repo_id`` (the canonical Hub
+    rules: charset ``[A-Za-z0-9._-]``, no leading/trailing ``-``/``.``, no ``--``/``..``, length <= 96)
+    so this never drifts from the Hub. Without it a malformed id (e.g. ``owner/-bad``,
+    ``owner/bad--name``, a >96-char name, embedded whitespace) is accepted here and only fails LATER as
+    a wrapped 502 inside ``create_repo`` — after ``export_adapter`` already downloaded the private
+    source adapter. Raises ``HTTPException(400)`` on a bad id.
+
+    If the ``huggingface_hub`` server extra is somehow absent the grammar check is skipped (the export
+    path itself surfaces the missing extra as a 500); the cheap ``owner/name`` shape check upstream
+    still runs regardless.
+    """
+    try:
+        from huggingface_hub.utils import HFValidationError, validate_repo_id
+    except ModuleNotFoundError:
+        return
+    try:
+        validate_repo_id(repository)
+    except HFValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"repository is not a valid HuggingFace repo id: {exc}",
+        ) from exc
 
 
 def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
@@ -236,21 +256,15 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             status_code=400,
             detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
         )
-    # Counting parts is not enough: ``owner/ name`` or ``own er/name`` have two non-empty segments but
-    # are NOT valid HF repo ids — they'd be accepted here and only blow up DEEP inside huggingface_hub
-    # (a wrapped 502) AFTER export_adapter has already downloaded the private source adapter. Validate
-    # the HF repo-name grammar up front so a malformed id fails fast with a client-side 400 and zero
-    # export work. HF segments are non-empty runs of [A-Za-z0-9._-] (this also rejects any whitespace).
-    if not all(_HF_SEGMENT_RE.fullmatch(p) for p in parts):
-        raise HTTPException(
-            status_code=400,
-            detail=f"repository must be a HuggingFace repo of the form 'owner/name' "
-            f"(each segment may contain only letters, digits, '.', '_', '-'), got {repository!r}",
-        )
     # Use the CANONICAL ``owner/name`` form downstream (and in the echoed URL), not the raw input: a
-    # value like ``/owner/name`` or ``owner/name/`` passes validation but would otherwise reach HF and
-    # the returned url with stray slashes.
+    # value like ``/owner/name`` or ``owner/name/`` passes the shape check but would otherwise reach HF
+    # and the returned url with stray slashes.
     repository = "/".join(parts)
+    # Counting parts is not enough: ``owner/ name``, ``owner/-bad``, ``owner/bad--name`` or a >96-char
+    # name all have two segments but are NOT valid HF repo ids — they'd be accepted here and only blow
+    # up DEEP inside huggingface_hub (a wrapped 502) AFTER export_adapter downloaded the private source
+    # adapter. Validate the FULL Hub repo-name grammar up front so a malformed id fails fast with a 400.
+    _validate_hf_repo_id(repository)
     hf_token = str(payload.get("hf_token") or "").strip()
     if not hf_token:
         raise HTTPException(
