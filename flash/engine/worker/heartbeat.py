@@ -37,7 +37,14 @@ from flash.engine.worker.perf import gpu_diagnostics
 #     every 30s risks the repo commit cap _HB_MIN_INTERVAL_S exists to avoid, so we throttle the
 #     UPLOAD to hold commits well under the 128/hr cap. Terminal transitions are never throttled.
 _HB_THROTTLED_STAGES = frozenset(
-    {"rl_step", "sft_step", "model_prefetching", "sft_initializing", "rl_initializing"}
+    {
+        "rl_step",
+        "sft_step",
+        "model_prefetching",
+        "sft_pretokenizing",
+        "sft_initializing",
+        "rl_initializing",
+    }
 )
 # Terminal transitions the control plane must never miss — always committed.
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
