@@ -1526,13 +1526,14 @@ def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
 
 
 def test_deploy_rejects_non_integer_step(api, monkeypatch):
-    """A bool (True->1) or non-integer step must be rejected, not silently coerced."""
+    """A bool (True->1) or non-integer step must be rejected, not silently coerced. An all-digit string
+    over Python's 4300-digit int()-conversion limit must also be a clean 400, not int()->uncaught 500."""
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
     run_id = _make_run(api, key, "done")
-    for bad in (True, 40.9, "40.9"):
+    for bad in (True, 40.9, "40.9", "1" * 5000):
         r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": bad}, headers=_bearer(key))
         assert r.status_code == 400, f"{bad!r} -> {r.status_code} {r.text}"
 

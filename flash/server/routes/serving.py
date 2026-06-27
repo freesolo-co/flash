@@ -51,7 +51,8 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
         return None
 
     # Reject bool (True -> step 1) and non-integer floats; str path uses fullmatch not isdigit
-    # (isdigit accepts unicode digits + "-5" which crash int() -> 500).
+    # (isdigit accepts unicode digits + "-5" which crash int() -> 500). The length bound also keeps a
+    # 4301+ digit string from tripping Python's int-string-conversion limit (another int() -> 500).
     want: int | None = None
     if isinstance(raw_step, bool):
         want = None
@@ -61,7 +62,7 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
         want = int(raw_step) if raw_step.is_integer() else None
     elif isinstance(raw_step, str):
         s = raw_step.strip()
-        want = int(s) if re.fullmatch(r"-?[0-9]+", s) else None
+        want = int(s) if re.fullmatch(r"-?[0-9]{1,18}", s) else None
     if want is not None and want < 0:
         want = None
     if want is None:
