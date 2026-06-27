@@ -259,7 +259,7 @@ def main():
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
-            err_name = error_artifact_name(RUN_MODE)
+            err_name = error_artifact_name(RUN_MODE, ATTEMPT)
             err_path = f"/tmp/{err_name}"
             with open(err_path, "w") as f:
                 f.write(tb)

@@ -324,13 +324,19 @@ def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():
     require_vllm_for_rollout_func(False, True, "m")
 
 
-def test_error_artifact_name_is_per_phase():
-    """Per-phase error files keep the root-cause train traceback under a stable name."""
+def test_error_artifact_name_is_per_phase_and_attempt():
+    """Error files are scoped per-phase and per-attempt so a stale prior-attempt
+    traceback can't be mistaken for the current attempt's crash on a retry."""
     from flash.engine.worker import error_artifact_name
 
     names = {error_artifact_name(m) for m in ("sft", "rl")}
     assert len(names) == 2  # distinct per phase -> no clobber
-    assert error_artifact_name("rl") == "error_rl.txt"
+    assert error_artifact_name("rl") == "error_rl_attempt0.txt"
+    assert error_artifact_name("rl", 0) != error_artifact_name("rl", 1)
+    assert error_artifact_name("sft", 2) == "error_sft_attempt2.txt"
+    # str-typed ATTEMPT env value coerces cleanly
+    assert error_artifact_name("sft", "3") == "error_sft_attempt3.txt"
+    assert error_artifact_name("sft", "") == "error_sft_attempt0.txt"
 
 
 def test_train_body_imports_every_name_it_uses():

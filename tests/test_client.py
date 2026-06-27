@@ -250,6 +250,24 @@ def test_deploy_passes_integer_step(stub):
     assert seen["body"]["dry_run"] is False
 
 
+def test_deploy_rejects_fractional_step():
+    """A fractional step would int-truncate (2.7 -> 2) and deploy the WRONG checkpoint, so reject it
+    client-side (mirrors export's guard)."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    for bad in (2.5, 0.1, 3.9):
+        with pytest.raises(ClientError, match="invalid checkpoint step"):
+            client.deploy("flash-run", step=bad)
+
+
+def test_deploy_passes_whole_float_step(stub):
+    """A float that is a whole number (40.0) passes the guard and forwards as an int."""
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.deploy("flash-run", step=40.0)
+    assert seen["body"]["step"] == 40
+    assert isinstance(seen["body"]["step"], int)
+
+
 def test_export_sends_repository_token_and_step(stub):
     """`flash export` posts the destination repo, the user's HF token, and an optional step."""
     url, seen = stub

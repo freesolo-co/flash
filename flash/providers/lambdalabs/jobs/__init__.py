@@ -253,9 +253,10 @@ def _failure_detail(hf_repo: str, prefix: str, phase: str, marker: dict | None, 
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
-    err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{phase}.txt")(force=True)
+    err_name = f"error_{phase}_attempt{int(attempt or 0)}.txt"  # matches worker error_artifact_name
+    err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
     if err:
-        parts.append(f"--- error_{phase}.txt ---\n{err[-2000:]}")
+        parts.append(f"--- {err_name} ---\n{err[-2000:]}")
     boot = _make_hf_file_reader(hf_repo, f"{prefix}/lambda_attempt{attempt}_boot.log")(force=True)
     if boot:
         parts.append(f"--- lambda_attempt{attempt}_boot.log (host) ---\n{boot[-3000:]}")
@@ -420,11 +421,13 @@ def poll_lambda_job(
             terminal = terminal_artifact_result()
             if terminal is not None:
                 return terminal
-            # error_{phase}.txt present = deterministic crash (fail fast); absent = host loss (retry).
+            # THIS attempt's error file present = deterministic crash (fail fast); absent = host loss
+            # (retry). Attempt-scoped so a prior attempt's stale traceback can't force a false job_failed.
             # A retriable heartbeat keeps the path on job_preempted regardless.
             from flash.providers.runpod.jobs import worker_flagged_retriable
 
-            err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
+            err_name = f"error_{spec.phase}_attempt{int(handle.attempt or 0)}.txt"
+            err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
             worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,
