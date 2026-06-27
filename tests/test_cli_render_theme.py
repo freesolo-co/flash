@@ -133,7 +133,7 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
         ),
         render.cancelled({"run_id": "r", "state": "cancelled"}),
         render.deployed({"run_id": "r", "state": "deployed", "endpoint_name": "ep", "url": "u"}),
-        render.undeployed({"run_id": "r", "endpoint_name": "ep"}),
+        render.undeployed({"run_id": "r", "deleted_endpoints": ["ep"]}),
         render.exported({"adapter_id": "r", "repository": "acme/x", "url": "u", "private": True}),
         render.error("config invalid — bad [environment] id"),
         render.warn("FREESOLO_API_KEY is set — it will override the saved login"),
@@ -188,6 +188,40 @@ def test_cancel_noop_on_terminal_run_is_not_a_false_confirmation(monkeypatch) ->
     assert "cancel requested" not in noop
     assert "already done" in noop
     assert "done" in noop  # the real terminal state is still surfaced via the badge
+
+
+def test_deploy_dry_run_is_not_a_false_success(monkeypatch) -> None:
+    """`flash deploy --dry-run` validates without creating a deployment (server state `dry_run`);
+    the themed card must not flash a green `✓ deploy` for it — only a real deploy confirms."""
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    # a real deploy still confirms
+    live = render.deployed(
+        {"run_id": "flash-1", "state": "ready", "endpoint_name": "ep", "gpu": "A100"}
+    )
+    assert "deploy" in live
+    # a dry run is a neutral validation line, not a success confirmation
+    dry = render.deployed(
+        {"run_id": "flash-1", "state": "dry_run", "endpoint_name": "ep", "gpu": "A100"}
+    )
+    assert "dry run" in dry
+    assert "nothing deployed" in dry
+    assert "dry_run" not in dry  # the old green `✓ deploy ● dry_run` badge form is gone
+
+
+def test_undeploy_noop_is_not_a_false_confirmation(monkeypatch) -> None:
+    """`flash undeploy` against a run with no active deployment deletes nothing (`deleted_endpoints:
+    []`); the themed card must not claim a teardown for that no-op — only a real deletion confirms."""
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    # a real teardown confirms and names what was deregistered
+    real = render.undeployed({"run_id": "flash-1", "deleted_endpoints": ["live-x"]})
+    assert "torn down flash-1" in real
+    assert "live-x" in real
+    # a no-op: no false "torn down", just an honest "no active deployment" line
+    noop = render.undeployed({"run_id": "flash-1", "deleted_endpoints": []})
+    assert "torn down" not in noop
+    assert "no active deployment" in noop
 
 
 def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:

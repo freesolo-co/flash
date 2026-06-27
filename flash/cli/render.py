@@ -568,18 +568,31 @@ def deployed(dep: dict) -> str:
         ("url", _paint(dep["url"], _ACCENT2) if dep.get("url") else None),
     ]
     state = dep.get("state", "deployed")
-    head = ok("deployed") if state == "deployed" else f"{ok('deploy')}  {badge(state)}"
+    if state == "dry_run":
+        # a dry run validates and shapes the deployment without creating one, so don't dress it
+        # up as a successful deploy — a neutral validation line instead of the green ✓.
+        head = note(
+            f"validated {_paint(dep.get('run_id', ''), _ACCENT2)} (dry run — nothing deployed)"
+        )
+    elif state == "deployed":
+        head = ok("deployed")
+    else:
+        head = f"{ok('deploy')}  {badge(state)}"
     return _safe(f"{head}\n{_kv(pairs)}")
 
 
 def undeployed(result: dict) -> str:
-    """`flash undeploy`: confirm the serving endpoint was torn down."""
+    """`flash undeploy`: confirm the serving endpoint was torn down. A no-op undeploy (the run had
+    no active deployment, so the server deletes nothing) shows a neutral line instead of a green
+    confirmation — mirroring the cancel/deploy no-op handling, so nothing is faked as torn down."""
+    deleted = result.get("deleted_endpoints") or []
+    if not deleted:
+        return _safe(
+            note(f"{result.get('run_id', '')} had no active deployment — nothing to tear down")
+        )
     rid = _paint(result.get("run_id", ""), _ACCENT2)
-    line = ok(f"torn down {rid}")
-    endpoint = result.get("endpoint_name")
-    if endpoint:
-        line += "\n" + _dim(f"  endpoint {endpoint} deregistered")
-    return _safe(line)
+    names = ", ".join(deleted)
+    return _safe(f"{ok(f'torn down {rid}')}\n{_dim(f'  deregistered {names}')}")
 
 
 def exported(result: dict) -> str:
