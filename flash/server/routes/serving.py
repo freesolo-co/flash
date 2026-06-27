@@ -9,6 +9,7 @@ deploy lock and the deployable-state sets are resolved through the ``flash.serve
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -28,6 +29,11 @@ from flash.server._deps import owned_run, require_key
 from flash.spec import JobSpec
 
 router = APIRouter()
+
+# One segment (``owner`` or ``name``) of a HuggingFace repo id: a non-empty run of the only
+# characters HF permits — letters, digits, ``.``, ``_``, ``-``. Used to reject malformed ids (e.g.
+# embedded whitespace) up front, before any export work touches HF.
+_HF_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
@@ -229,6 +235,17 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         raise HTTPException(
             status_code=400,
             detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
+        )
+    # Counting parts is not enough: ``owner/ name`` or ``own er/name`` have two non-empty segments but
+    # are NOT valid HF repo ids — they'd be accepted here and only blow up DEEP inside huggingface_hub
+    # (a wrapped 502) AFTER export_adapter has already downloaded the private source adapter. Validate
+    # the HF repo-name grammar up front so a malformed id fails fast with a client-side 400 and zero
+    # export work. HF segments are non-empty runs of [A-Za-z0-9._-] (this also rejects any whitespace).
+    if not all(_HF_SEGMENT_RE.fullmatch(p) for p in parts):
+        raise HTTPException(
+            status_code=400,
+            detail=f"repository must be a HuggingFace repo of the form 'owner/name' "
+            f"(each segment may contain only letters, digits, '.', '_', '-'), got {repository!r}",
         )
     # Use the CANONICAL ``owner/name`` form downstream (and in the echoed URL), not the raw input: a
     # value like ``/owner/name`` or ``owner/name/`` passes validation but would otherwise reach HF and

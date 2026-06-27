@@ -41,7 +41,7 @@ def _hf_api():
     """Import huggingface_hub lazily (it's a server extra, not a base CLI dependency)."""
     try:
         from huggingface_hub import HfApi, snapshot_download
-    except ModuleNotFoundError as exc:  # pragma: no cover - the server always has the extra
+    except ModuleNotFoundError as exc:
         # A missing server extra is an internal MISCONFIGURATION, not an upstream gateway/transport
         # failure — raise a plain RuntimeError (NOT ServingError, which the route maps to 502) so it
         # surfaces as a 500. ServingError is reserved for real HF download/upload failures.

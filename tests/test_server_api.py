@@ -1515,7 +1515,20 @@ def test_export_validates_repository_and_token(api):
     assert "hf_token" in missing_token.json()["detail"]
     # A HF repo id is EXACTLY two non-empty segments: reject no-slash AND the over-/under-segmented
     # forms that the old "at least one '/'" check let through (which would 404/400 deep in hf_hub).
-    for bad_repo in ("noslash", "owner/name/extra", "owner//name", "/name", "name/"):
+    # Also reject segments that pass the count test but violate the HF repo-name grammar (embedded
+    # whitespace / illegal chars) — those must fail FAST here, not after export_adapter has already
+    # downloaded the private source adapter and hit a wrapped 502 from huggingface_hub.
+    for bad_repo in (
+        "noslash",
+        "owner/name/extra",
+        "owner//name",
+        "/name",
+        "name/",
+        "owner/ name",
+        "own er/name",
+        "owner/na\tme",
+        "owner/na me",
+    ):
         malformed = api.post(
             f"/v1/runs/{run_id}/export",
             json={"repository": bad_repo, "hf_token": "hf"},
