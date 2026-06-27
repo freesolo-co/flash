@@ -586,11 +586,19 @@ def test_non_capacity_failure_keeps_weight_cache(monkeypatch):
 # ---------------------------------------------------------------------------
 # preload: warm the per-region volumes with the catalog models (operator action)
 # ---------------------------------------------------------------------------
-def test_catalog_model_ids_are_the_catalog():
+def test_catalog_model_ids_are_the_cache_fitting_catalog():
     from flash.catalog import MODELS
     from flash.providers.runpod import preload
+    from flash.runner import _fits_weight_cache
 
-    assert set(preload.catalog_model_ids()) == set(MODELS)
+    ids = set(preload.catalog_model_ids())
+    # The default preload set is the catalog RESTRICTED to models that fit the weight cache (warming a
+    # non-fitting model only overflows the fixed mount). Mirrors the submit path's _fits_weight_cache.
+    assert ids == {mid for mid, info in MODELS.items() if _fits_weight_cache(info)}
+    assert ids <= set(MODELS)
+    # The ~70 GB 35B MoE (peak ~140 GB > 100 GB cache) must be excluded from the default warm set.
+    assert "Qwen/Qwen3.6-35B-A3B" in MODELS
+    assert "Qwen/Qwen3.6-35B-A3B" not in ids
 
 
 def test_preload_branch_passes_explicit_cache_dir(monkeypatch):

@@ -80,14 +80,21 @@ _TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
 
 
 def catalog_model_ids() -> list[str]:
-    """The public base models to warm: every curated catalog entry (the cache holds public weights).
+    """The public base models to warm: every curated catalog entry that FITS the weight cache.
 
     Open-model-policy (``allow``) runs may use arbitrary/private models that aren't worth — or safe —
     to pre-warm globally; those simply download cold on first use and then cache like any other.
+
+    Models whose cold download doesn't fit the fixed weight-cache volume are EXCLUDED (the same
+    ``_fits_weight_cache`` gate the submit path uses to leave them cache-less, e.g. the ~70 GB
+    Qwen3.6-35B-A3B whose peak ~140 GB exceeds the 100 GB cache). Warming a non-fitting model here
+    only overflows the mount — regions report ``partial`` / exit 1 — and burns paid preload workers
+    downloading weights the cache can't hold.
     """
     from flash.catalog import MODELS
+    from flash.runner import _fits_weight_cache
 
-    return list(MODELS)
+    return [mid for mid, info in MODELS.items() if _fits_weight_cache(info)]
 
 
 def _preload_one_dc(
