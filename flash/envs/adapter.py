@@ -9,6 +9,7 @@ low-level refs remain parseable for compatibility. The canonical generated envir
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -31,6 +32,11 @@ _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+# Ceiling on the COMPRESSED whole-repo tarball download. GitHub serves only repo-wide tarballs (no
+# per-subdirectory tarball), so pulling one small env from the shared environment-hub still fetches
+# the whole repo; this ceiling must therefore bound the entire hub, NOT a single env. The per-env
+# uncompressed extract stays capped at _MAX_ARCHIVE_BYTES after filtering to the requested subtree.
+_MAX_TARBALL_BYTES = 1024 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -322,10 +328,12 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
-    if len(data) > _MAX_ARCHIVE_BYTES:
+    # Bound the whole-repo tarball (the per-env subtree is filtered + capped later, in
+    # _safe_extract_archive). Use the larger whole-repo ceiling so a small env pull from a big
+    # shared hub isn't rejected just because unrelated siblings make the repo tarball large.
+    if len(data) > _MAX_TARBALL_BYTES:
         raise RuntimeError(
-            f"environment archive is too large ({len(data)} bytes; "
-            f"limit {_MAX_ARCHIVE_BYTES} bytes)"
+            f"repository tarball is too large ({len(data)} bytes; limit {_MAX_TARBALL_BYTES} bytes)"
         )
     return data
 
@@ -541,12 +549,28 @@ def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 1
     return data
 
 
+def _atomic_copy2(src: Path, dst: Path) -> None:
+    """Copy ``src`` onto ``dst`` atomically: stage to a temp file in ``dst``'s directory, then
+    ``os.replace``. A mid-copy failure (disk full / quota / read error) therefore never truncates an
+    existing ``dst`` — the swap is all-or-nothing."""
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=".flash-env-pull-")
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def _merge_into_dir(source: Path, dest: Path) -> None:
     """Recursively copy ``source``'s contents into existing ``dest``, overwriting same-named
     children. Unlike ``shutil.copytree(dirs_exist_ok=True)``, a child of ``dest`` that is a SYMLINK
     is removed before writing, never followed — so a pre-existing ``datasets -> /elsewhere`` link in
     the destination (e.g. the cwd, when merging in place with ``--force``) can't redirect writes
-    outside the requested output tree."""
+    outside the requested output tree. Each file is replaced atomically (stage + ``os.replace``) so a
+    failed merge never leaves an existing file truncated."""
     dest.mkdir(parents=True, exist_ok=True)
     for child in source.iterdir():
         target = dest / child.name
@@ -559,7 +583,7 @@ def _merge_into_dir(source: Path, dest: Path) -> None:
         else:
             if target.is_dir():
                 shutil.rmtree(target)
-            shutil.copy2(child, target)
+            _atomic_copy2(child, target)
 
 
 def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool = False) -> Path:
@@ -636,17 +660,20 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             # outside the output tree.
             _merge_into_dir(source, dest_path)
         else:
-            # Overwriting an OCCUPIED destination: build the new tree in a sibling staging dir and
-            # atomically swap it in, so a mid-copy failure never destroys the existing data.
+            # Overwriting an OCCUPIED destination: build the new tree in a sibling staging dir, move
+            # the live tree ASIDE, swap the new one in, and only then drop the old — so the previous
+            # package is never partially removed. If the swap fails, the old tree is restored intact.
             staging_parent = Path(tempfile.mkdtemp(prefix=".flash-env-pull-", dir=dest_path.parent))
             try:
                 staging = staging_parent / dest_path.name
                 shutil.copytree(source, staging)
-                if dest_path.is_dir():
-                    shutil.rmtree(dest_path)
-                else:
-                    dest_path.unlink()
-                os.replace(staging, dest_path)
+                backup = staging_parent / (dest_path.name + ".old")
+                os.replace(dest_path, backup)  # atomic move-aside (works for a file or a dir)
+                try:
+                    os.replace(staging, dest_path)
+                except BaseException:
+                    os.replace(backup, dest_path)  # restore the original on failure
+                    raise
             finally:
                 shutil.rmtree(staging_parent, ignore_errors=True)
         return dest_path
