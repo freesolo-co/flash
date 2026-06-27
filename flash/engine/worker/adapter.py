@@ -16,6 +16,7 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
+    is_vl_checkpoint,
     remap_vl_adapter_dir,
 )
 from flash.engine.worker.perf import optimal_attn_impl
@@ -106,34 +107,65 @@ def _init_adapter_model(model_id: str):
             "init_from_adapter to train a fresh LoRA."
         )
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM
 
     print(f"[init-adapter] initializing LoRA from {prefix}")
-    # VL checkpoints (Qwen3.5/3.6): the SFT step saved the adapter against the FULL multimodal model
-    # (keys under ``base_model.model.model.language_model.layers.*``), but we load the base here via
-    # AutoModelForCausalLM (text-only tree, ``base_model.model.model.layers.*``). Strip the
-    # ``.language_model.`` infix on disk so PeftModel.from_pretrained matches the SFT keys —
-    # otherwise peft only WARNS about missing keys and silently trains a fresh LoRA, discarding the
-    # SFT. No-op for non-VL checkpoints. See flash/engine/worker/lora.py.
-    remap_vl_adapter_dir(adir, model_id)
     _attn = optimal_attn_impl()
+    attn_kw = {"attn_implementation": _attn} if _attn else {}
+
+    if is_vl_checkpoint(model_id):
+        # VL checkpoints (Qwen3.5/3.6): MERGE the SFT into the base and train a FRESH LoRA on the
+        # merged weights, instead of continuing the live SFT LoRA. Continuing it makes the colocated
+        # vLLM rollout engine AND the KL reference key off the BARE base — the SFT only reaches vLLM
+        # through the text-trainer<->VL-vLLM weight-sync, which round-trips poorly for these
+        # `*ForConditionalGeneration` models, so GRPO rolls out base-verbose and collapses a working
+        # concise-thinking SFT back to base (observed: every Qwen3.5 GRPO reverts; non-VL MiniCPM
+        # does not). We merge into the FULL multimodal model (NOT the text-only tree) so the saved
+        # checkpoint keeps the VL config + ``language_model.*`` keys that BOTH the trainer reload and
+        # vLLM's VL loader (language_model_only skips the vision weights) expect — a text-only
+        # AutoModelForCausalLM merge saves a Qwen3_5TextConfig that vLLM's VL loader rejects. The SFT
+        # adapter was trained against the full VL model, so its keys match here WITHOUT the infix strip.
+        from transformers import AutoModelForImageTextToText
+
+        base = AutoModelForImageTextToText.from_pretrained(
+            model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
+        )
+        model = PeftModel.from_pretrained(base, adir, is_trainable=False)
+        key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+        load_result = model.load_adapter(
+            adir, adapter_name="default", is_trainable=False, key_mapping=key_mapping
+        )
+        assert_adapter_load_clean(load_result, model_id)
+        assert_lora_applied(model, model_id)
+        assert_adapter_delta_nonzero(model, model_id)
+        import gc
+        import tempfile
+
+        merged = model.merge_and_unload()
+        merged_dir = os.path.join(tempfile.gettempdir(), "flash_sft_merged")
+        merged.save_pretrained(merged_dir, safe_serialization=True)
+        from transformers import AutoProcessor
+
+        # processor (preferred for VL) so vLLM/loaders find tokenizer + image-processor config; fall
+        # back to the bare tokenizer if no processor is published.
+        try:
+            AutoProcessor.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
+        except Exception:  # noqa: BLE001
+            from transformers import AutoTokenizer
+
+            AutoTokenizer.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
+        del base, model, merged
+        gc.collect()
+        print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
+        return merged_dir, make_lora(model_id)
+
+    # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
+    # so keep it — TRL trains the LOADED adapter (peft_config=None).
+    from transformers import AutoModelForCausalLM
+
     base = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype="bfloat16",
-        trust_remote_code=True,
-        **({"attn_implementation": _attn} if _attn else {}),
+        model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
     )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
-    # Fail loudly if the adapter didn't actually apply (a key mismatch would otherwise silently start
-    # GRPO from the base model again). from_pretrained loads with load_state_dict(strict=False) and
-    # only WARNS on a mismatch, discarding the load result — so re-run load_adapter to CAPTURE which
-    # keys matched and assert matched==saved (peft injects the LoRA modules from target_modules BEFORE
-    # loading weights, so the module-count check alone can't see a silent weight discard). The reload
-    # is idempotent: same weights into the same "default" adapter. See flash/engine/worker/lora.py.
-    # Mirror from_pretrained's key_mapping: for transformers models that define a
-    # ``_checkpoint_conversion_mapping`` (renamed-arch checkpoints), from_pretrained remaps the adapter
-    # keys before loading; the reload must apply the SAME mapping or it would reinterpret valid keys as
-    # mismatched and falsely abort. peft reads it off the base model (peft_model.py from_pretrained).
     key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
     load_result = model.load_adapter(
         adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
