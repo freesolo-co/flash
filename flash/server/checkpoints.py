@@ -32,10 +32,12 @@ _RECORD_PATH = "/api/runs/internal/checkpoints"
 def _run_org_id(status) -> str:
     """Org that owns the run, or "" if none.
 
-    Prefers the org persisted WITH the run — ``billing_context`` for user runs, then
-    ``platform_context`` for internal/operator runs (see the submit path). Mirrors
-    ``serving.py::_run_org`` / ``run_registry._context_from_status``. Each context is
-    isinstance-guarded against a non-dict legacy value."""
+    Prefers the org persisted WITH the run — ``billing_context`` for user runs, THEN
+    ``platform_context`` for internal/operator runs (the submit-path order). Same
+    billing-then-platform precedence as ``routes/serving.py::_run_org``. (NB: this is the
+    OPPOSITE order to ``run_registry._context_from_status``, which prefers ``platform_context``
+    first — don't conflate them.) Each context is isinstance-guarded against a non-dict legacy
+    value."""
     for ctx in (getattr(status, "billing_context", None), getattr(status, "platform_context", None)):
         if isinstance(ctx, dict):
             org = str(ctx.get("org_id") or "").strip()
@@ -112,12 +114,13 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
     except Exception as exc:
         _log(f"[ckpt] register skipped ({status.run_id}): bad spec: {exc}")
         return 0
-    checkpoints = list_checkpoints(spec)
-    if not checkpoints:
-        return 0
     if not _run_org_id(status):
         # Internal/operator run with no org attribution: nothing to scope the rows to. Skip
-        # quietly — HF stays the source of truth — rather than warn on this expected condition.
+        # quietly BEFORE the HF listing — HF stays the source of truth — so an expected-skip run
+        # does no unnecessary network work and emits no `[ckpt] list warn` noise.
+        return 0
+    checkpoints = list_checkpoints(spec)
+    if not checkpoints:
         return 0
     try:
         register_run_checkpoints(

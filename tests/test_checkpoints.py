@@ -480,14 +480,22 @@ def test_best_effort_swallows_backend_failure(monkeypatch):
 
 
 def test_best_effort_skips_silently_when_no_org(monkeypatch):
-    # Internal/operator run with no org in either context: skip quietly, do NOT warn and do NOT
-    # hit the backend. Regression guard for the noisy "missing org id" log.
+    # Internal/operator run with no org in either context: skip quietly, do NOT warn, do NOT hit the
+    # backend, and (Copilot Msbm-) do NOT perform the HF checkpoint listing — the org check
+    # short-circuits BEFORE the network call. Regression guard for the noisy "missing org id" log and
+    # the wasted HF listing on an expected-skip run.
     import io
 
     import flash.server.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
-    monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
+    listed = {"called": False}
+
+    def fake_list(spec):
+        listed["called"] = True
+        return _CKPTS
+
+    monkeypatch.setattr(ck, "list_checkpoints", fake_list)
 
     def fail(*, token, body):  # pragma: no cover - must never be called
         raise AssertionError("_post_checkpoints must not be called without an org")
@@ -497,6 +505,7 @@ def test_best_effort_skips_silently_when_no_org(monkeypatch):
     status = _status(billing_context={}, platform_context=None)
     assert ck.register_checkpoints_best_effort(status, log=log) == 0
     assert "warn" not in log.getvalue()
+    assert listed["called"] is False  # org check short-circuits before the HF listing
 
 
 def test_best_effort_no_checkpoints(monkeypatch):
