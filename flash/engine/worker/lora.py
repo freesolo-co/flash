@@ -752,10 +752,14 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
         norm: dict = {}
         for k, v in sd.items():
             nk = strip_language_model_infix(k)
-            if nk in norm and nk != k:
+            # Fail closed on ANY post-normalization collision. A malformed adapter carrying BOTH the
+            # infixed and the already-text-only form of a key would otherwise let the second write
+            # silently overwrite the first (the text-only key has nk == k, so a ``nk != k`` guard
+            # would skip it) — recombining whichever duplicate wins instead of rejecting the mix.
+            if nk in norm:
                 raise ValueError(
                     f"recombine: {which} adapter key {k!r} collides with another after stripping "
-                    "the '.language_model.' infix — cannot normalize"
+                    "the '.language_model.' infix — cannot normalize a mixed VL adapter"
                 )
             norm[nk] = v
         return norm
@@ -788,8 +792,19 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
                     "rank/alpha) — cat-recombine assumes a uniform rank and is unsupported"
                 )
 
+    # Real PEFT adapters embed the adapter NAME in the saved key (``...lora_A.default.weight`` — see
+    # tests/test_vl_warmstart_adapter_keys.py and _is_lora_key), not the bare ``...lora_A.weight``
+    # form. Match the ``.lora_A.``/``.lora_B.`` weight tensors by infix so BOTH the ``.default.`` and
+    # the bare form are recognized — otherwise real keys fall into ``extra`` below and the recombine
+    # wrongly aborts as "non-LoRA tensors present", blocking the VL warm-start deploy.
+    def _is_lora_a(k):
+        return ".lora_A." in k and k.endswith(".weight")
+
+    def _is_lora_b(k):
+        return ".lora_B." in k and k.endswith(".weight")
+
     def _ab(sd):
-        return {k for k in sd if k.endswith((".lora_A.weight", ".lora_B.weight"))}
+        return {k for k in sd if _is_lora_a(k) or _is_lora_b(k)}
 
     sft_ab, grpo_ab = _ab(sft_sd), _ab(grpo_sd)
     extra = (set(sft_sd) - sft_ab) | (set(grpo_sd) - grpo_ab)
@@ -818,8 +833,10 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     # Sorted so ``out``'s insertion order — and thus the serialized safetensors byte layout — is
     # deterministic across runs (``sft_ab`` is a set; its iteration order is not). Stable output
     # keeps the recombined adapter content-addressable for uploads/caching.
-    for ak in sorted(k for k in sft_ab if k.endswith(".lora_A.weight")):
-        bk = ak[: -len("lora_A.weight")] + "lora_B.weight"
+    for ak in sorted(k for k in sft_ab if _is_lora_a(k)):
+        # Pair B by swapping the A/B marker — robust to the ``.default.`` adapter-name segment that
+        # bare ``lora_A.weight`` -> ``lora_B.weight`` suffix slicing would miss.
+        bk = ak.replace(".lora_A.", ".lora_B.", 1)
         # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
         out[ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
         # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
