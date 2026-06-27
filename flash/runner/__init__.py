@@ -340,9 +340,12 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     bare ``info=None`` call skips the size gate (preserves the legacy attach-by-policy behavior).
 
     Outcomes: (a) open-model run -> never on the SHARED cache (strip it if pre-set; keep a non-shared
-    volume); (b) catalog run with a pre-set volume -> left as-is (explicit/test assignment honored);
-    (c) catalog run with no volume that FITS the cache -> attach the shared cache; (d) catalog run
-    whose download exceeds the cache -> left cache-less (download to the container disk instead).
+    volume); (b) catalog run with a pre-set NON-shared volume -> left as-is (explicit/test assignment
+    honored); (b') catalog run with a pre-set SHARED-cache name whose download EXCEEDS the cache ->
+    stripped to cache-less (the size gate re-applies so a stale/programmatic ``flash-weights`` pin
+    can't overflow the mount); (c) catalog run with no volume that FITS the cache -> attach the shared
+    cache; (d) catalog run with no volume whose download exceeds the cache -> left cache-less (download
+    to the container disk instead).
 
     See the module-level TRUST MODEL note above for the shared-cache integrity tradeoff (a run's env
     code has write access to the shared mount; RO mount isn't SDK-expressible yet).
@@ -360,6 +363,16 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
             return JobSpec.from_dict(d)
         return spec  # no shared cache to strip (cache-less already, or a non-shared escape-hatch volume)
     if existing:
+        # A pre-set volume is normally honored as an explicit/test assignment. EXCEPTION: the SIZE
+        # GATE also applies to a pre-set SHARED-cache name — a programmatic or stale spec that already
+        # pinned ``flash-weights`` must NOT let an oversized model (the 35B MoE) bypass the gate below
+        # and redirect HF_HOME onto the fixed mount, overflowing it mid-download. Strip it (force
+        # cache-less) in that case. A non-shared (per-org / custom) volume is left intact — the caller
+        # owns its sizing — so only the managed shared name is re-gated here.
+        if existing == WEIGHT_CACHE_VOLUME_NAME and info is not None and not _fits_weight_cache(info):
+            d = spec.to_dict()
+            d["gpu"] = {**d["gpu"], "network_volume": None}
+            return JobSpec.from_dict(d)
         return spec  # catalog run with an explicit/test volume already assigned — honor it
     # SIZE GATE: don't pin a model whose cold download won't fit the fixed shared cache — HF_HOME would
     # redirect onto the undersized mount and snapshot_download would fill it ("No space left"). Such a
