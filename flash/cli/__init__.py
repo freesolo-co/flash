@@ -206,7 +206,11 @@ def _build_parser() -> argparse.ArgumentParser:
     env_pull = env_sub.add_parser(
         "pull", help="download a published Freesolo environment (or one file from it)"
     )
-    env_pull.add_argument("env_id", help='the Freesolo environment id, e.g. "your-name/your-env"')
+    env_pull.add_argument(
+        "env_id",
+        help='the Freesolo environment id: a managed slug "your-name/your-env", a '
+        '"github:owner/repo@ref:path" ref, or a github.com URL',
+    )
     env_pull.add_argument(
         "path",
         nargs="?",
