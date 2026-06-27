@@ -1,0 +1,238 @@
+name: auto-rebake per-arch kernel cache
+
+# Keeps the per-arch ghcr.io/freesolo-co/flash-worker:cu128-sm* images fresh whenever the :cu128 base
+# is rebuilt. Each cu128-smXX is physically `FROM :cu128` + a baked mega-cache, so a new base leaves
+# the per-arch tags pointing at the OLD base until rebaked. "Out of date" has two flavors, keyed off
+# the fp_cache / fp_base labels worker-image.yml stamps on :cu128 (docker/kernel_fingerprint.py):
+#
+#   * fp_cache changed -> the baked Triton/Inductor mega-cache is INVALID -> a real GPU re-warm is
+#     required (bake-kernel-cache.yml). PAID, so it sits behind the gpu-bake environment's one-click
+#     approval.
+#   * fp_cache same but fp_base changed -> the cache is still valid, the base just moved (FA wheel /
+#     causal-conv1d / rp_handler / a non-kernel dep) -> a FREE re-layer grafts the existing cache onto
+#     the fresh base (docker/Dockerfile.kernelcache.relayer), no GPU.
+#   * both same -> skip (this is the pure-flash-code case the old reminder over-fired on).
+#
+# The gate READS the published labels (authoritative for what was actually built, incl. a manual FA3
+# override) rather than recomputing from the checkout, and aborts unless the base's revision label ==
+# the build's head_sha (so a superseded base build or a `tag=...` dispatch that never touched :cu128
+# can't trigger a stale rebake).
+
+on:
+  workflow_run:
+    workflows: ["flash worker image"]
+    types: [completed]
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
+  issues: write
+
+concurrency:
+  group: auto-rebake
+  cancel-in-progress: true
+
+env:
+  BASE: ghcr.io/freesolo-co/flash-worker:cu128
+
+jobs:
+  gate:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.base.outputs.proceed }}
+      relayer_sms: ${{ steps.classify.outputs.relayer_sms }}
+      gpu_sms: ${{ steps.classify.outputs.gpu_sms }}
+      fp_cache: ${{ steps.base.outputs.fp_cache }}
+      fp_base: ${{ steps.base.outputs.fp_base }}
+      base_ref: ${{ steps.base.outputs.base_ref }}
+      base_revision: ${{ steps.base.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install crane
+        run: |
+          curl -sSL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin crane
+          crane version
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read base labels
+        id: base
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # canonical digest ref (repo@sha256, no tag) so every tool (crane/docker/runpod) accepts it.
+          digest=$(crane digest "$BASE")
+          repo=${BASE%:*}
+          cfg=$(crane config "$repo@$digest")
+          fpc=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')
+          fpb=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_base"] // ""')
+          rev=$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')
+          echo "base_ref=$repo@$digest" >> "$GITHUB_OUTPUT"
+          echo "fp_cache=$fpc" >> "$GITHUB_OUTPUT"
+          echo "fp_base=$fpb" >> "$GITHUB_OUTPUT"
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
+          # Only proceed if this base IS the build that triggered us: its revision label must match the
+          # build's head_sha. Guards (a) a newer base that already superseded this run, and (b) a
+          # `tag=cu128-test` dispatch that never updated :cu128 (the workflow_run payload can't reveal
+          # the dispatch tag). An unlabeled base (pre-rollout) also no-ops here.
+          if [ -n "$fpc" ] && [ "$rev" = "$HEAD_SHA" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "base $BASE@$digest is rev $rev (== head_sha) fp_cache=$fpc fp_base=$fpb"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::auto-rebake no-op: base rev '$rev' != head_sha '$HEAD_SHA' (or base unlabeled)"
+          fi
+
+      - name: Classify arches
+        id: classify
+        if: steps.base.outputs.proceed == 'true'
+        env:
+          FP_CACHE: ${{ steps.base.outputs.fp_cache }}
+          FP_BASE: ${{ steps.base.outputs.fp_base }}
+          REV: ${{ steps.base.outputs.revision }}
+        run: |
+          # arch list is the single source of truth in deps.py (mirrored by the bake matrix; a test
+          # pins that mirror). textual parse -> no flash import / uv sync needed.
+          arches=$(python3 -c "import re,pathlib; t=pathlib.Path('flash/providers/runpod/train/deps.py').read_text(); m=re.search(r'BAKED_PER_SM_ARCHES\s*=\s*frozenset\(\{([^}]+)\}\)', t); print(' '.join(re.findall(r'sm\d+', m.group(1))))")
+          relayer=(); gpu=()
+          summary="| arch | published fp_cache | published fp_base | action |\n|---|---|---|---|\n"
+          for sm in $arches; do
+            img="ghcr.io/freesolo-co/flash-worker:cu128-$sm"
+            if cfg=$(crane config "$img" 2>/dev/null); then
+              pc=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')
+              pb=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_base"] // ""')
+            else
+              pc="(missing)"; pb="(missing)"
+            fi
+            if [ "$pc" != "$FP_CACHE" ]; then
+              gpu+=("$sm"); action="GPU re-warm (cache invalid)"
+            elif [ "$pb" != "$FP_BASE" ]; then
+              relayer+=("$sm"); action="re-layer (free)"
+            else
+              action="up to date"
+            fi
+            echo "$sm: pc=$pc pb=$pb -> $action"
+            summary="$summary| $sm | \`$pc\` | \`$pb\` | $action |\n"
+          done
+          if [ ${#relayer[@]} -gt 0 ]; then
+            relayer_json=$(printf '%s\n' "${relayer[@]}" | jq -R . | jq -cs .)
+          else
+            relayer_json='[]'
+          fi
+          gpu_csv=$(IFS=,; echo "${gpu[*]}")
+          echo "relayer_sms=$relayer_json" >> "$GITHUB_OUTPUT"
+          echo "gpu_sms=$gpu_csv" >> "$GITHUB_OUTPUT"
+          {
+            echo "### auto-rebake plan (base rev \`$REV\`, fp_cache \`$FP_CACHE\` fp_base \`$FP_BASE\`)"
+            echo ""
+            echo -e "$summary"
+            echo ""
+            echo "re-layer (free): \`$relayer_json\` | GPU re-warm (paid, needs approval): \`${gpu_csv:-none}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open/update pending-bake issue
+        if: steps.base.outputs.proceed == 'true' && steps.classify.outputs.gpu_sms != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPU_SMS: ${{ steps.classify.outputs.gpu_sms }}
+          REV: ${{ steps.base.outputs.revision }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="kernel-cache: per-arch GPU re-bake pending approval"
+          body=$(printf 'The kernel toolchain changed (fp_cache), so these per-arch images need a PAID GPU re-warm and are waiting on the **gpu-bake** environment approval:\n\n- arches: `%s`\n- base rev: `%s`\n\nApprove the gpu-warm job in the run: %s' "$GPU_SMS" "$REV" "$RUN_URL")
+          # best-effort: a labeling/permission hiccup must never fail the gate.
+          existing=$(gh issue list --label kernel-rebake-pending --state open --json number -q '.[0].number' 2>/dev/null || true)
+          if [ -n "${existing:-}" ]; then
+            gh issue comment "$existing" --body "$body" || true
+          else
+            gh issue create --title "$title" --body "$body" --label kernel-rebake-pending \
+              || gh issue create --title "$title" --body "$body" || true
+          fi
+
+  # FREE path: graft the existing valid cache onto the fresh base, no GPU. Runs automatically.
+  relayer:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true' && needs.gate.outputs.relayer_sms != '[]' && needs.gate.outputs.relayer_sms != ''
+    runs-on: ubuntu-24.04-8core
+    strategy:
+      fail-fast: false
+      matrix:
+        sm: ${{ fromJson(needs.gate.outputs.relayer_sms || '[]') }}
+    env:
+      BASE_REF: ${{ needs.gate.outputs.base_ref }}
+      FP_CACHE: ${{ needs.gate.outputs.fp_cache }}
+      FP_BASE: ${{ needs.gate.outputs.fp_base }}
+      BASE_REVISION: ${{ needs.gate.outputs.base_revision }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # The graft pulls two ~20GB images (old per-arch tag + fresh base); reclaim runner disk first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache /usr/share/swift \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            /usr/local/share/powershell /usr/share/miniconda || true
+          sudo apt-get clean || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pin OLDCACHE by digest so a concurrent overwrite of the source tag can't graft a wrong cache.
+      - name: Resolve old per-arch cache digest
+        id: old
+        run: |
+          img="ghcr.io/freesolo-co/flash-worker:cu128-${{ matrix.sm }}"
+          digest=$(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}')
+          # canonical digest ref (repo@sha256, no tag) for the FROM in the relayer build.
+          echo "ref=${img%:*}@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Re-layer cache onto the fresh base (no GPU)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.kernelcache.relayer
+          push: true
+          tags: ghcr.io/freesolo-co/flash-worker:cu128-${{ matrix.sm }}
+          provenance: false
+          build-args: |
+            BASE=${{ env.BASE_REF }}
+            OLDCACHE=${{ steps.old.outputs.ref }}
+            FP_CACHE=${{ env.FP_CACHE }}
+            FP_BASE=${{ env.FP_BASE }}
+            BASE_REVISION=${{ env.BASE_REVISION }}
+
+  # PAID path: re-warm the cache on a real GPU per arch. The reusable bake's `bake` job sits behind the
+  # gpu-bake environment, so this auto-queues and pauses for one approval (which releases all arches).
+  gpu-warm:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true' && needs.gate.outputs.gpu_sms != ''
+    uses: ./.github/workflows/bake-kernel-cache.yml
+    with:
+      sms: ${{ needs.gate.outputs.gpu_sms }}
+      fp_cache: ${{ needs.gate.outputs.fp_cache }}
+      fp_base: ${{ needs.gate.outputs.fp_base }}
+      base_ref: ${{ needs.gate.outputs.base_ref }}
+      base_revision: ${{ needs.gate.outputs.base_revision }}
+    secrets: inherit
