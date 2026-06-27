@@ -261,6 +261,63 @@ def test_heartbeat_commit_is_throttled(monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("stage", ["model_prefetching", "sft_initializing", "rl_initializing"])
+def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
+    """The periodic setup pings run on a side thread every 30s through a long phase (a cold
+    snapshot_download can pull tens of GB for ~40 min, and disaggregated workers share one HF_REPO),
+    so their HF UPLOAD must be throttled like rl_step or they blow HF's 128/hour repo commit cap. The
+    "HEARTBEAT" stderr line still prints every call (the only per-call side effect now — HF is the one
+    durable channel); this pins only that the repeated stage does NOT commit to HF on every call."""
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    calls = []
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: calls.append(a[1]))
+    # Large interval -> only the FIRST emit of the stage commits; the rest are upload-throttled.
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 9999.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    w.heartbeat(stage, elapsed_seconds=1)
+    w.heartbeat(stage, elapsed_seconds=31)
+    w.heartbeat(stage, elapsed_seconds=61)
+    assert calls.count("heartbeat.json") == 1, f"{stage} must be upload-throttled, got {calls}"
+
+
+def test_heartbeat_rollback_guards_on_claim_seq_not_coarse_ts(monkeypatch):
+    """A failed/timed-out commit rolls its slot claim back, but the rollback is gated on a monotonic
+    claim SEQ, not on wall-clock-ts equality. So if a NEWER heartbeat claims the slot (which on a
+    coarse clock can share the same _HB_LAST_UPLOAD ts) before our older commit fails, our rollback
+    must NOT wipe that fresher claim — doing so would let the throttle / quiet_gate read the channel
+    as stale right after a real upload."""
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    hbmod = sys.modules[w.heartbeat.__module__]
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+
+    seen = []
+
+    def fake_upload(path, name):
+        seen.append(name)
+        if len(seen) == 1:
+            # A concurrent NEWER heartbeat claims the slot (higher claim seq) while our older commit
+            # is in flight; our commit then fails, so we attempt to roll our claim back.
+            hbmod._HB_CLAIM_SEQ += 1
+            return False
+        return True
+
+    monkeypatch.setattr(w, "hf_upload_file", fake_upload)
+
+    w.heartbeat("rl_step", step=1)
+    # The newer claim owns the slot now, so our failed older commit must NOT restore _HB_LAST_UPLOAD
+    # to its pre-claim 0.0. A ts-equality guard (now == _HB_LAST_UPLOAD) would have wrongly fired and
+    # wiped the fresh claim; the claim-seq guard does not.
+    assert w._HB_LAST_UPLOAD != 0.0
+
+
 def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     """Perf regression guard: the synchronous hf_upload_file network call must run OUTSIDE
     _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
@@ -284,6 +341,137 @@ def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
     w.heartbeat("rl_start")
     assert lock_free_during_upload == [True], "hf_upload_file must run with _HB_LOCK released"
+
+
+def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
+    """A wedged upload holding _HB_UPLOAD_LOCK must not block the NEXT heartbeat. A milestone like
+    model_prefetched (unthrottled, on the worker's critical path right before trainer construction)
+    must skip its best-effort commit after a bounded wait rather than wedge the worker."""
+    import importlib
+    import time as _time
+
+    # NB: resolve the submodule explicitly (the package re-exports the heartbeat() function).
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
+    uploads = []
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: uploads.append(a))
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    sentinel_last_upload = 123.0  # a prior successful-commit timestamp the skip must NOT clobber
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
+
+    assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
+    try:
+        t0 = _time.monotonic()
+        w.heartbeat("model_prefetched")  # must NOT block on the held lock
+        elapsed = _time.monotonic() - t0
+    finally:
+        hbmod._HB_UPLOAD_LOCK.release()
+
+    assert elapsed < 5.0, f"heartbeat wedged on the held upload lock ({elapsed:.2f}s)"
+    assert uploads == [], "the best-effort commit must be skipped while the lock is stuck"
+    # The skipped upload must ROLL BACK its optimistic slot claim — otherwise the throttle defers the
+    # next real commit and the throttle treats a stale channel as fresh.
+    assert sentinel_last_upload == w._HB_LAST_UPLOAD, (
+        f"a skipped commit must not advance _HB_LAST_UPLOAD (got {w._HB_LAST_UPLOAD})"
+    )
+
+
+def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
+    """The optimistic _HB_LAST_UPLOAD slot is claimed BEFORE the best-effort HF commit. If that commit
+    fails, hf_upload_file swallows the error and returns False (it never raises on best-effort) — HF is
+    still stale, so the slot must roll back exactly as the lock-timeout skip does. Otherwise the
+    throttle defers the next retry on the strength of an upload that never happened.
+    """
+    import importlib
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    sentinel_last_upload = 123.0  # a prior successful-commit timestamp the failed retry must restore
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
+
+    calls = []
+    # Mirror the real hf_upload_file contract: best-effort failure returns False (does not raise).
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: (calls.append(a[1]), False)[1])
+
+    w.heartbeat("model_prefetched")
+
+    assert calls == ["heartbeat.json"], "the upload must actually be attempted"
+    assert sentinel_last_upload == w._HB_LAST_UPLOAD, (
+        f"a failed upload must roll _HB_LAST_UPLOAD back to its prior value (got {w._HB_LAST_UPLOAD})"
+    )
+
+
+def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
+    """The dual of the rollback test: a SUCCESSFUL commit (or a mock that doesn't report False) must
+    KEEP the advanced slot so the throttle works. ``is False`` — not falsy — gates the rollback, so a
+    None-returning mock (legacy tests) counts as success."""
+    import importlib
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: True)
+
+    w.heartbeat("model_prefetched")
+
+    assert w._HB_LAST_UPLOAD > 0.0, "a successful commit must keep the advanced throttle slot"
+
+
+def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
+    """done/already_done/error_* are CRITICAL — no later heartbeat repairs a skipped terminal commit,
+    and error_* carries the `retriable` flag worker_flagged_retriable() reads. So they wait the LONGER
+    _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S for the upload lock before skipping, vs the short progress
+    timeout. Proven by timing: with the lock held, a terminal stage blocks for the critical timeout
+    while a progress stage gives up after the short one."""
+    import importlib
+    import time as _time
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(hbmod, "_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S", 0.4)
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: None)
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+
+    assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
+    try:
+        t = _time.monotonic()
+        w.heartbeat("rl_step", step=1)  # progress -> short timeout, skips fast
+        progress_wait = _time.monotonic() - t
+
+        t = _time.monotonic()
+        w.heartbeat("done")  # critical -> waits the long timeout before skipping
+        critical_wait = _time.monotonic() - t
+    finally:
+        hbmod._HB_UPLOAD_LOCK.release()
+
+    assert progress_wait < 0.3, f"progress stage should skip after the short timeout, waited {progress_wait:.2f}s"
+    assert critical_wait >= 0.3, f"critical stage should wait the long timeout, waited {critical_wait:.2f}s"
+    assert critical_wait > progress_wait + 0.15
 
 
 def test_heartbeat_terminal_only_mode(monkeypatch):

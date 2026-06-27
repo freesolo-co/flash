@@ -11,12 +11,12 @@ from __future__ import annotations
 import math
 import os
 import random
-import threading
 import time
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
     gdn_packing_available,
@@ -479,15 +479,13 @@ def run_sft():
     # SFTTrainer.__init__ blocks for 10-15 min on first use (FA2 CUDA kernel JIT compilation);
     # without a heartbeat the control plane can't distinguish this from a real hang and may
     # recycle the worker. A daemon thread pings every 30s so the stall detector stays quiet.
-    _sft_init_done = threading.Event()
-
-    def _sft_init_heartbeat() -> None:
-        while not _sft_init_done.wait(30.0):
-            _w.heartbeat("sft_initializing", gpu=gpu_diagnostics())
-
-    _sft_init_hb = threading.Thread(target=_sft_init_heartbeat, daemon=True)
-    _sft_init_hb.start()
-    try:
+    #
+    # include_torch=False: this side-thread heartbeat runs while the main thread is blocked in
+    # SFTTrainer.__init__ (CUDA- and allocator-busy). torch.cuda telemetry from a side thread
+    # serializes on the CUDA driver / allocator locks held by the init thread and can freeze the
+    # heartbeat for the whole init -> false hang. The nvidia-smi-only path (out-of-process, 8s
+    # timeout, GIL released during the wait) keeps ticking. Mirrors run_rl's rl_initializing fix.
+    with liveness_heartbeat("sft_initializing"):
         trainer = _SFT(
             model=model_id,
             args=cfg,
@@ -498,8 +496,6 @@ def run_sft():
             data_collator=_collator,
             callbacks=[_w.make_sft_heartbeat_callback(), _w.make_checkpoint_upload_callback()],
         )
-    finally:
-        _sft_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
     # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
     # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
@@ -509,7 +505,11 @@ def run_sft():
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
     t_train = time.time()
-    with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+    # Gap-filler liveness around the train loop: make_sft_heartbeat_callback only emits on on_log
+    # (every N steps), so the first step(s) can be silent for minutes. liveness_heartbeat emits
+    # best-effort liveness pings for operator visibility/stack dumps; pollers ignore liveness for stalls.
+    # See heartbeat.liveness_heartbeat.
+    with liveness_heartbeat("sft_step"), _sdpa_cudnn_ctx(_attn):  # cuDNN SDPA on sm120 (no-op else)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     sft_peak_gpu_gb = _peak_gpu_gb()
