@@ -271,11 +271,8 @@ def _submit_seed_supervised(
                 except Exception as exc:
                     # An instance-provider destroy raises only when teardown is UNCONFIRMED (Vast's
                     # destroy() raises on a DELETE success:false / network breakdown — the box may STILL
-                    # be billing/running). Do NOT clear the handle below: keep it so a cancel, a control-
-                    # plane recovery, or the next sweep can still reach and kill the live instance rather
-                    # than orphaning it until a label sweep. The run's terminal destroy_run_instances
-                    # (by label) is the backstop. We still proceed to the retry — blocking on Vast ever
-                    # confirming the DELETE could hang the run indefinitely.
+                    # be running). Keep the handle (don't clear remote below) so a cancel / recovery /
+                    # sweep can still reach the live box.
                     teardown_confirmed = False
                     print(
                         f"retry {attempt}: {last_handle.get('provider')} instance "
@@ -286,13 +283,32 @@ def _submit_seed_supervised(
                     )
             # Clear the persisted handle so a cancel or control-plane restart during the fresh deploy
             # doesn't operate on (or get shielded by) the dead handle — but ONLY when teardown was
-            # CONFIRMED. On an unconfirmed instance teardown we keep it (see above). The next on_handle()
+            # CONFIRMED. On an unconfirmed instance teardown we keep it (see below). The next on_handle()
             # records the new one.
             if teardown_confirmed:
                 with contextlib.suppress(FileNotFoundError):
                     st = get_status(spec.run_id)
                     if st.state not in TERMINAL_STATES and st.remote is not None:
                         _update(spec.run_id, st.state, remote=None)
+            else:
+                # MtzrH: do NOT launch the retry's worker while the previous instance's teardown is
+                # unconfirmed. The old worker may still be running and writing this seed's HF artifacts
+                # (DONE/metrics/error); a second worker on the same seed would double-bill AND corrupt
+                # those shared artifacts, and the active-run orphan sweep shields the label so it isn't
+                # reaped meanwhile. Actively force-reap this run's instances by label first (gc is
+                # run-scoped and NOT shielded), then FAIL the seed terminally rather than race a live
+                # box. The preserved handle + the run's terminal GC are the cleanup backstops.
+                with contextlib.suppress(Exception):
+                    from flash.providers import get_provider
+
+                    get_provider(last_handle["provider"]).gc(spec)
+                _gc_seen_endpoints()
+                raise RuntimeError(
+                    f"seed {seed}: previous attempt's {last_handle.get('provider')} instance "
+                    f"{last_handle.get('instance_id')} teardown could not be confirmed; failing to avoid "
+                    "double-provisioning a second worker over a possibly-live box (last: "
+                    f"{last_detail})"
+                )
         res = None
         alloc = None
         chosen = None

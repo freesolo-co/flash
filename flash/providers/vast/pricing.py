@@ -38,18 +38,30 @@ def _static_rates() -> dict[str, float]:
     return {name: info.hourly_usd for name, info in GPU_INFO.items() if info.vast_name}
 
 
-def live_rates(refresh: bool = False) -> dict[str, float]:
+def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str, float]:
     """Friendly-name -> cheapest live verified-datacenter $/hr (static fallback).
 
     Cached for ``_RATES_TTL_S`` so repeated lookups share one market fetch; ``refresh=True`` bypasses
     the cache and forces a fresh query. Offline-safe: without ``VAST_API_KEY`` (or on any fetch
     failure) returns the static rates (and does not cache the failure).
+
+    ``max_wall_seconds`` (>0) restricts the market query to offers available for the run's whole wall
+    cap — the SAME duration floor the allocator and submit path pass to ``usable_offers`` — so a
+    duration-bound cost estimate is not set by a cheap short-lived offer that gets filtered out at
+    launch (Codex MtzrI). Duration-bound queries narrow the offer set, so they BYPASS the shared
+    duration-agnostic cache (the ``flash gpus`` table path) — computed fresh and not stored.
     """
     static = _static_rates()
     if not os.environ.get("VAST_API_KEY"):
         return static
     now = time.monotonic()
-    if not refresh and _rates_cache["data"] is not None and now - _rates_cache["ts"] < _RATES_TTL_S:
+    use_cache = max_wall_seconds <= 0  # duration-bound queries must not read/write the shared cache
+    if (
+        use_cache
+        and not refresh
+        and _rates_cache["data"] is not None
+        and now - _rates_cache["ts"] < _RATES_TTL_S
+    ):
         return _rates_cache["data"]
     try:
         from flash.providers.base import GPU_INFO
@@ -66,20 +78,25 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
         vram_floor = int(min((i.vram_gb for i in GPU_INFO.values() if i.vast_name), default=0))
         # Gate on MIN_DISK_GB (what create() enforces): disk_gb=0 would disable disk filtering and
         # price the run off "cheapest" offers that aren't actually provisionable, making live pricing
-        # optimistic and inconsistent with the allocator/submit paths (both pass MIN_DISK_GB).
-        for offer in usable_offers(vram_floor, MIN_DISK_GB):  # offers are price-sorted, cheapest first
-            rates.setdefault(offer.gpu, offer.dph_total)
+        # optimistic and inconsistent with the allocator/submit paths (both pass MIN_DISK_GB). Thread
+        # the wall cap so duration-bound estimates match the offers a launch would actually accept.
+        for offer in usable_offers(vram_floor, MIN_DISK_GB, max_wall_seconds=max_wall_seconds):
+            rates.setdefault(offer.gpu, offer.dph_total)  # offers are price-sorted, cheapest first
         merged = {**static, **rates}
-        _rates_cache.update(ts=now, data=merged)
+        if use_cache:
+            _rates_cache.update(ts=now, data=merged)
         return merged
     except Exception as exc:
         logger.warning("live vast pricing unavailable (%s); using static rates", exc)
         return static
 
 
-def hourly_rate(gpu_name: str) -> float:
-    """$/hr for one friendly GPU name (cheapest live offer if available, else static)."""
+def hourly_rate(gpu_name: str, max_wall_seconds: float = 0.0) -> float:
+    """$/hr for one friendly GPU name (cheapest live offer if available, else static).
+
+    ``max_wall_seconds`` (>0) prices against offers that outlast the run's wall cap (see ``live_rates``)
+    so a long run is not underquoted by a short-lived offer that won't survive to launch."""
     from flash.providers.base import canonical_gpu
 
     name = canonical_gpu(gpu_name)
-    return live_rates().get(name) or _static_rates().get(name, 0.0)
+    return live_rates(max_wall_seconds=max_wall_seconds).get(name) or _static_rates().get(name, 0.0)

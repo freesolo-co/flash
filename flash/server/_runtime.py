@@ -237,8 +237,23 @@ def recover_runs() -> None:
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active, known_labels=known)
 
+    from flash.providers import INSTANCE_PROVIDERS
+
     for spec in resubmit:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
+        # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
+        # create (Vast's PUT /asks) may have been accepted while the response/handle was lost — a
+        # phantom contract that bills and, worse, writes this run/seed's HF artifacts. The batch
+        # sweep_orphans above reaps it only if it was VISIBLE then; force-reap this run's label across
+        # the instance providers RIGHT BEFORE relaunching, so a phantom that surfaced in the
+        # sweep->resubmit gap (Vast's instance list is eventually consistent) is killed before the fresh
+        # worker starts writing the same seed-scoped artifacts. gc is run-scoped (by label) and not
+        # active-shielded; best-effort across configured instance providers (the spec's provider isn't
+        # committed until allocation, so reap all of them).
+        for prov in configured_providers():
+            with contextlib.suppress(Exception):
+                if getattr(prov, "name", None) in INSTANCE_PROVIDERS:
+                    prov.gc(spec)
         with contextlib.suppress(Exception):
             _append_run_log(
                 spec.run_id, "control plane restarted before provisioning; resubmitting"

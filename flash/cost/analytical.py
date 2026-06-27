@@ -96,7 +96,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     return gen_s + reward_s + update_s
 
 
-def select_gpu(config: RunConfig) -> tuple[str, int]:
+def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str, int]:
     """(chosen GPU class, required VRAM GB): the cheapest fitting class for the cost.
 
     Uses ``pick_gpu``, which (unlike the submit-time allocator) intentionally stays gate-free —
@@ -110,7 +110,7 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
         train=config.train_knobs(),
         thinking=config.thinking,
     )
-    gpu = pick_gpu(need, provider=config.provider)
+    gpu = pick_gpu(need, provider=config.provider, max_wall_seconds=max_wall_seconds)
     return gpu, need
 
 
@@ -140,10 +140,13 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
 
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost calculation."""
-    gpu, need = select_gpu(config)
-    hourly = gpu_hourly_usd(gpu, provider=config.provider)
-    # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
+    # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced. Computed
+    # BEFORE GPU selection/pricing so the Vast live market is queried for offers that outlast the run's
+    # wall cap — a duration-bound quote must not be set (or its class chosen) by a short-lived offer
+    # that the launch-time duration filter would reject (Codex MtzrI).
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
+    gpu, need = select_gpu(config, max_wall_seconds=cap_s)
+    hourly = gpu_hourly_usd(gpu, provider=config.provider, max_wall_seconds=cap_s)
 
     # Each seed is its own job (own cold start + own wall cap): price one seed, clamp, x seeds.
     seeds = config.setup_repeats

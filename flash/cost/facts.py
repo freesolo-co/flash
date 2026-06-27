@@ -29,13 +29,16 @@ def gpu_tflops(name: str) -> float:
     return GPU_COMPUTE_TFLOPS.get(name, _DEFAULT_TFLOPS)
 
 
-def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
+def gpu_hourly_usd(name: str, provider: str | None = None, max_wall_seconds: float = 0.0) -> float:
     """Representative $/hr for a class, on ``provider`` when given.
 
     The nominal ``GpuClass.hourly_usd`` is the RunPod rate, which is WRONG for a provider-specific
     quote (e.g. a Lambda RTX A6000 is $1.09/hr, not RunPod's $0.49). When ``provider`` is ``lambda``
     or ``vast`` and the class is offered there, price it through that provider's pricing module (live
     with a static fallback); otherwise (runpod/auto/None) use the nominal rate.
+
+    ``max_wall_seconds`` (>0) is threaded into the Vast live market so a duration-bound quote prices
+    against offers that outlast the run, not a short-lived one filtered out at launch (Codex MtzrI).
     """
     info = GPU_INFO.get(name)
     if info is None:
@@ -51,7 +54,7 @@ def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
         # fallback), not fall back to GpuClass.hourly_usd (the RunPod rate).
         from flash.providers.vast.pricing import hourly_rate
 
-        return hourly_rate(name)
+        return hourly_rate(name, max_wall_seconds=max_wall_seconds)
     return info.hourly_usd
 
 
@@ -62,13 +65,17 @@ def gpu_vram_gb(name: str) -> int:
     return info.vram_gb
 
 
-def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
+def pick_gpu(
+    required_vram_gb: int, *, provider: str | None = None, max_wall_seconds: float = 0.0
+) -> str:
     """Cheapest GPU class that fits ``required_vram_gb``, ranked by static $/hr.
 
     No pin; every fitting class is eligible, validated or not. NOTE this is intentionally
     gate-free: the submit-time allocator restricts to the validated pool, so the
     actually-provisioned class can be pricier than the one priced here. ``provider`` restricts
-    candidates to what it can provision.
+    candidates to what it can provision. ``max_wall_seconds`` (>0) prices the Vast market against
+    offers that outlast the run, so a long-run quote doesn't SELECT a class on the strength of a
+    short-lived offer that won't survive to launch (Codex MtzrI).
     """
 
     def _selectable(g: GpuClass) -> bool:
@@ -79,7 +86,14 @@ def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
     # Rank by the rate on the REQUESTED provider so a provider-specific quote picks that provider's
     # cheapest fit (not the cheapest by the RunPod nominal rate).
-    best = min(candidates, key=lambda g: (gpu_hourly_usd(g.name, provider=provider), g.vram_gb, g.name))
+    best = min(
+        candidates,
+        key=lambda g: (
+            gpu_hourly_usd(g.name, provider=provider, max_wall_seconds=max_wall_seconds),
+            g.vram_gb,
+            g.name,
+        ),
+    )
     return best.name
 
 

@@ -356,34 +356,34 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
     assert "resume from last checkpoint" in log.getvalue()
 
 
-def test_unconfirmed_instance_teardown_preserves_handle(orch, monkeypatch):
-    """Codex MtrgI: when an instance-provider destroy() RAISES (Vast's unconfirmed DELETE — the box may
-    still be billing/running), the retry teardown must NOT clear the persisted handle. Keep it so a
-    cancel / control-plane recovery / the next sweep can still reach the live box instead of orphaning
-    it. The retry still proceeds (we can't block on Vast ever confirming the DELETE)."""
+def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatch):
+    """Codex MtzrH: when an instance-provider destroy() RAISES (Vast's unconfirmed DELETE — the old box
+    may STILL be running and writing this seed's HF artifacts), the retry must NOT launch a second
+    worker over it (double-bill + corrupt the shared seed-scoped DONE/metrics). Force-reap the run's
+    label (provider.gc, run-scoped / not active-shielded) and FAIL the seed terminally; the handle is
+    preserved (not cleared) for the run's outer GC."""
     import flash.providers as providers
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
 
-    def _vast_handle(iid):
-        return {"provider": "vast", "instance_id": iid}
-
-    seen_remote = []
+    submits = []
+    gc_calls = []
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        seen_remote.append(orch.get_status(run_spec.run_id).remote)  # what's persisted at ENTRY
-        on_handle(_vast_handle(f"i{attempt}"))  # persist a vast handle (drives the instance teardown)
-        if attempt == 0:
-            return PollResult(False, failure="stalled", detail="infra")
-        return PollResult(True, metrics={"train_tokens": 4096})
+        submits.append(attempt)
+        on_handle({"provider": "vast", "instance_id": f"i{attempt}"})  # vast handle drives the teardown
+        return PollResult(False, failure="stalled", detail="infra")  # attempt 0 fails infra-shaped
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
 
-    class _RaisingVast:  # destroy() raises -> teardown UNCONFIRMED
-        def destroy(self, handle):
+    class _RaisingVast:
+        def destroy(self, handle):  # unconfirmed teardown
             from flash.providers.vast import api as vast_api
 
             raise vast_api.VastApiError("destroy unconfirmed (success:false)")
+
+        def gc(self, spec):  # run-scoped force-reap by label
+            gc_calls.append(spec.run_id)
 
     real_get = providers.get_provider
     monkeypatch.setattr(
@@ -396,16 +396,16 @@ def test_unconfirmed_instance_teardown_preserves_handle(orch, monkeypatch):
     _seed_status(orch, spec)
     log = io.StringIO()
 
-    metrics = orch._submit_seed_supervised(spec, 0, log)
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed"):
+        orch._submit_seed_supervised(spec, 0, log)
 
-    assert metrics["train_tokens"] == 4096  # retry still proceeded to success
+    assert submits == [0], "must NOT launch a second worker over a possibly-live box"
+    assert gc_calls == [spec.run_id], "force-reap the run's label before failing terminally"
     assert "teardown UNCONFIRMED" in log.getvalue()
-    assert "keeping the handle" in log.getvalue()
-    # attempt 1 saw the PRESERVED prior handle at entry — the unconfirmed teardown did NOT clear it
-    # (would be None if cleared) and it is still attempt 0's instance (the new on_handle runs after).
-    assert seen_remote[1] is not None
-    assert seen_remote[1].get("instance_id") == "i0"
-    assert seen_remote[1].get("provider") == "vast"
+    # handle preserved (not cleared) so the run's outer GC can still reach the box
+    remote = orch.get_status(spec.run_id).remote
+    assert remote is not None
+    assert remote.get("instance_id") == "i0"
 
 
 def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):

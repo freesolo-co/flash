@@ -97,6 +97,12 @@ MIN_DISK_GB = 60.0
 # Vast instance states that mean "the container is gone / will not progress".
 _DEAD_STATES = {"exited", "stopped", "offline", "deleted"}
 
+# A fresh DONE can be visible before the separately-uploaded metrics.json (HF read-after-write is
+# eventually consistent). Re-read metrics this many times (this far apart) before treating a
+# DONE-without-metrics as a real failure, so a successful run isn't failed on a transient read gap.
+_METRICS_AFTER_DONE_RETRIES = 6
+_METRICS_AFTER_DONE_WAIT_S = 5.0
+
 
 def _effective_disk_gb(spec) -> float:
     """The disk size an instance is actually provisioned with (the create-time floor).
@@ -395,7 +401,18 @@ def poll_vast_job(
     metrics_reader = _make_hf_file_reader(hf_repo, f"{prefix}/metrics.json")
 
     def finish_ok(done_content: str | None = None) -> PollResult:
+        # DONE and metrics.json are SEPARATE HF artifacts; the worker writes metrics.json BEFORE the
+        # DONE sentinel, but HF read-after-write is eventually consistent, so a fresh DONE can be
+        # visible before metrics.json is readable. Don't fail a SUCCESSFUL run on that transient gap:
+        # re-read metrics a few times before classifying DONE-without-metrics as a real failure (Codex
+        # MtzrL). time.sleep is mocked in tests, so this adds no test wall-time.
         raw = metrics_reader(force=True)
+        attempts_left = _METRICS_AFTER_DONE_RETRIES
+        while raw is None and attempts_left > 0:
+            say("DONE seen but metrics.json not visible yet; waiting for HF read-after-write")
+            time.sleep(_METRICS_AFTER_DONE_WAIT_S)
+            raw = metrics_reader(force=True)
+            attempts_left -= 1
         if raw is None:
             return PollResult(False, failure="job_failed", detail="DONE without metrics.json")
         metrics = json.loads(raw)

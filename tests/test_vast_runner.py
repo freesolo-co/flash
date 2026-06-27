@@ -533,6 +533,46 @@ def test_poll_unknown_before_running_is_not_dead(monkeypatch):
     assert "never started" in res.detail
 
 
+def test_poll_done_waits_for_eventually_consistent_metrics(monkeypatch):
+    """Codex MtzrL: a fresh DONE can be visible before the separately-uploaded metrics.json is readable
+    (HF read-after-write is eventually consistent). finish_ok must RE-READ metrics before failing — a
+    successful run must not be classified job_failed on that transient gap. (time.sleep is mocked.)"""
+    seq = {"n": 0}
+
+    def metrics_seq():
+        seq["n"] += 1
+        # None on the first reads (metrics.json not visible yet), then it surfaces
+        if seq["n"] <= 2:
+            return None
+        return json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0})
+
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done="10500.0",
+        metrics=metrics_seq,
+    )
+    res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
+    assert res.ok  # not a false job_failed
+    assert res.metrics["train_tokens"] == 4096
+    assert seq["n"] >= 3  # re-read past the initial misses
+
+
+def test_poll_done_without_metrics_eventually_fails(monkeypatch):
+    """The complement: if metrics.json NEVER surfaces (a genuine DONE-without-metrics), the retries are
+    bounded and the poll still classifies job_failed rather than spinning forever."""
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done="10500.0",
+        metrics=None,  # never visible
+    )
+    res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert "DONE without metrics.json" in res.detail
+
+
 def test_poll_loading_timeout(monkeypatch):
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "loading"}], step=100.0)
     monkeypatch.setattr(vast, "LOAD_TIMEOUT_S", 300.0)

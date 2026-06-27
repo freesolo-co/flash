@@ -195,6 +195,29 @@ def test_live_rates_floors_query_at_smallest_managed_vram(monkeypatch):
     assert captured["min_vram_gb"] > 0  # not the old crowding-prone 0
 
 
+def test_live_rates_threads_wall_cap_and_bypasses_cache(monkeypatch):
+    # Codex MtzrI: a duration-bound estimate must price against offers that OUTLAST the run — thread
+    # max_wall_seconds into usable_offers (the same duration floor the allocator/submit use), so a
+    # cheap short-lived offer that the launch-time filter rejects can't set the rate. Duration-bound
+    # queries must also NOT pollute the shared duration-agnostic cache (the `flash gpus` path).
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast import pricing
+
+    captured = {}
+
+    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
+        captured["max_wall_seconds"] = max_wall_seconds
+        return []
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})  # isolate
+    pricing.hourly_rate("RTX 4090", max_wall_seconds=7200.0)
+    assert captured["max_wall_seconds"] == 7200.0
+    # the duration-bound query did NOT write the shared cache (would serve a narrowed set to `flash gpus`)
+    assert pricing._rates_cache["data"] is None
+
+
 def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
     # Copilot Msbs9: repeated live_rates() within the TTL must share ONE market fetch (the refresh
     # param was previously ignored); refresh=True forces a fresh query.

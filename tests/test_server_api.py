@@ -1034,11 +1034,31 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
 
+    # Codex MtzrJ: a handle-less run may have left a phantom instance from a non-idempotent create
+    # (Vast PUT /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label
+    # across instance providers RIGHT BEFORE resubmitting, so a phantom isn't left writing the same
+    # seed-scoped artifacts as the fresh worker. Capture the gc-by-run.
+    reaped = []
+
+    class _FakeVast:
+        name = "vast"
+
+        def gc(self, s):
+            reaped.append(s.run_id)
+
+        def sweep_orphans(self, **k):
+            return []
+
+    import flash.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
+
     app_mod.recover_runs()
 
     assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
     assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint first"
     assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
+    assert reaped == ["nohandle-1"], "must force-reap the run's instance-provider label before resubmit"
     # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
     assert runner.get_status("nohandle-1").state != "failed"
 
@@ -1112,7 +1132,10 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     swept = threading.Event()
 
     class _FakeProvider:
-        def sweep_orphans(self, active_labels=None):
+        # known_labels is part of the real sweep_orphans signature (multi-plane guard); accept it so the
+        # actual call prov.sweep_orphans(active_labels=..., known_labels=...) doesn't TypeError (which
+        # the recovery suppress would swallow, silently skipping the sweep this test asserts fired).
+        def sweep_orphans(self, active_labels=None, known_labels=None):
             swept.set()
             return []
 
