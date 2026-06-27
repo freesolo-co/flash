@@ -146,6 +146,10 @@ def test_usable_offers_threads_duration_floor(monkeypatch):
     monkeypatch.setattr(vast_api, "search_offers", fake_search)
     vast.usable_offers(24, disk_gb=60, max_wall_seconds=7200.0)
     assert captured["min_duration_seconds"] == 7200.0 + vast.PROVISION_GRACE_S
+    # Cursor MtO8P: a sub-60s wall is floored at 60 (matching the poller's max(60, max_wall)+grace
+    # deadline) so the duration floor never undershoots what poll_vast_job actually enforces.
+    vast.usable_offers(24, disk_gb=60, max_wall_seconds=30.0)
+    assert captured["min_duration_seconds"] == 60.0 + vast.PROVISION_GRACE_S
     vast.usable_offers(24, disk_gb=60)  # no wall cap -> filter stays off
     assert captured["min_duration_seconds"] == 0
 

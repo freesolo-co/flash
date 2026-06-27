@@ -76,8 +76,8 @@ def test_method_signatures_match_runpod(provider):
 
 @pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
 def test_setup_vs_training_gate_is_the_one_canonical_helper(provider):
-    """Both poll loops (runpod, lambda) must draw the setup-vs-training stall boundary from the SAME
-    canonical is_training_heartbeat helper in _poll (so the rule can't drift between providers). The
+    """Every poll loop (runpod, lambda, vast) must draw the setup-vs-training stall boundary from the
+    SAME canonical is_training_heartbeat helper in _poll (so the rule can't drift between providers). The
     helper keeps the cold-start pings — including model_prefetching / *_initializing — under the wide
     setup grace, flips to the tight window only on a COMPLETED-step rl_step/sft_step, and also flips on
     POST-training stages (so a hung teardown isn't left under setup grace)."""

@@ -120,10 +120,15 @@ def usable_offers(
     down client-side (a wider page only gives it more candidates).
 
     ``max_wall_seconds`` is the run's wall cap; when set, the search additionally requires offers to be
-    available for at least ``max_wall + PROVISION_GRACE_S`` (the SAME deadline the poller enforces, so
-    the search never advertises capacity an offer can't outlast). 0 = no duration floor.
+    available for at least ``max(60, max_wall) + PROVISION_GRACE_S`` — the SAME deadline the poller
+    enforces (it floors the wall at 60 s before adding grace, see poll_vast_job), so the search never
+    advertises capacity an offer can't outlast. 0 = no duration floor.
     """
-    min_duration = (max_wall_seconds + PROVISION_GRACE_S) if max_wall_seconds and max_wall_seconds > 0 else 0
+    min_duration = (
+        max(60.0, float(max_wall_seconds)) + PROVISION_GRACE_S
+        if max_wall_seconds and max_wall_seconds > 0
+        else 0
+    )
     rows = vast_api.search_offers(
         int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
