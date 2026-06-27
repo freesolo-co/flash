@@ -31,18 +31,27 @@ Every repo is classified from three self-contained signals — no backend DB req
 
 Tiers (conservative defaults; each opt-in beyond ``--code``)
 -----------------------------------------------------------
-* ``--code``        (default ON)  T1: delete ``code/flash`` from terminal repos. Deployed repos are
+* ``--code``        (default ON)  T1: delete ``code/flash`` from repos that have BOOTED (produced
+                                  any output beyond the pre-boot code snapshot). Deployed repos are
                                   skipped wholesale before any tier runs, and serving never reads
-                                  ``code/flash`` regardless; reclaims little but is the safe default.
-* ``--checkpoints`` (default off) T2: on terminal + undeployed + older than ``--trim-age-days``,
-                                  delete ``checkpoints/`` while **keeping** ``adapter/``. The big
-                                  byte win; you lose only ``flash deploy --step N`` for old runs.
+                                  ``code/flash`` regardless. A code-only repo (no run output) may be
+                                  a run still queued for capacity that needs the code to boot, so its
+                                  code is held until ``--delete-age-days``. Reclaims little; safe.
+* ``--checkpoints`` (default off) T2: on terminal + undeployed + older than ``--trim-age-days`` and
+                                  carrying a FINAL ``adapter/``, delete ``checkpoints/`` while
+                                  **keeping** that final adapter. The big byte win; you lose only
+                                  ``flash deploy --step N`` for old runs. A checkpoint-only repo
+                                  (no final adapter) is left intact — its checkpoints are its only
+                                  servable content.
 * ``--repos``       (default off) T3: ``delete_repo`` for terminal + undeployed + older than
-                                  ``--delete-age-days`` repos that have **no** ``adapter/`` (i.e.
-                                  failed/cancelled runs that never produced a servable adapter).
+                                  ``--delete-age-days`` repos with **no servable adapter at all**
+                                  (neither a final ``adapter/`` nor a deployable
+                                  ``checkpoints/step-N/adapter``) — i.e. failed/cancelled runs that
+                                  never produced anything deployable.
 * ``--delete-with-adapter`` (default off)  let T3 also whole-delete *old undeployed* repos that DO
-                                  carry a final adapter. Off by default so a redeployable adapter is
-                                  never dropped implicitly.
+                                  carry a servable adapter (final or checkpoint). Off by default so a
+                                  redeployable adapter is never dropped implicitly; requires
+                                  ``--repos`` (it only widens T3 and does nothing on its own).
 
 Operator-only: needs the ``Freesolo-Co`` operator ``HF_TOKEN`` (owns the repos) and
 ``FREESOLO_INTERNAL_KEY`` (queries serving). Run from the control-plane host::
@@ -91,11 +100,12 @@ class RepoView:
 
     def _artifact_folders(self, name: str) -> list[str]:
         """Actual folder paths whose trailing path segments are ``name``, found *anywhere* in the
-        tree. Worker uploads nest every artifact under ``hf_prefix() = {phase}/{run_id}/seed{N}/``
-        (``flash.engine.worker.hf.hf_prefix``), so ``adapter``/``code/flash``/``checkpoints`` are
-        never at the repo root — a root-anchored match would silently find nothing. A folder is
-        only reported when at least one file lives beneath it (a bare file *named* ``adapter`` is
-        not a folder)."""
+        tree. The layout is mixed: the control plane uploads ``code/flash`` at the repo ROOT
+        (``providers.runpod.train.upload_code``, before the worker boots), while the worker nests
+        the adapter and checkpoints under ``hf_prefix() = {phase}/{run_id}/seed{N}/``
+        (``flash.engine.worker.hf``). A root-anchored match would silently miss the nested ones, so
+        match the segment-aligned ``name`` at any depth. A folder is only reported when at least one
+        file lives beneath it (a bare file *named* ``adapter`` is not a folder)."""
         segs = name.split("/")
         n = len(segs)
         folders: set[str] = set()
@@ -118,6 +128,33 @@ class RepoView:
 
     def bytes_under(self, name: str) -> int:
         return sum(self.bytes_in(folder) for folder in self._artifact_folders(name))
+
+    def adapter_folders(self) -> list[str]:
+        """Every deployable-adapter folder: the final ``<prefix>/adapter`` AND each checkpoint
+        ``<prefix>/checkpoints/step-N/adapter`` (both serve via ``flash deploy``)."""
+        return self._artifact_folders(ADAPTER_PATH)
+
+    def has_servable_adapter(self) -> bool:
+        """True if the repo holds ANY deployable adapter — final or per-checkpoint. A repo with
+        only checkpoint adapters (no final ``adapter/``) is still servable and must not be
+        whole-deleted as 'unservable'."""
+        return bool(self.adapter_folders())
+
+    def has_final_adapter(self) -> bool:
+        """True only for the final trained adapter at ``<prefix>/adapter`` — never an adapter
+        nested under ``checkpoints/``. T2 trims checkpoints only when this remains, so it never
+        strips a checkpoint-only repo's sole servable content."""
+        return any("checkpoints" not in folder.split("/") for folder in self.adapter_folders())
+
+    def has_run_output(self) -> bool:
+        """True once the run actually booted and wrote something beyond the pre-boot ``code/flash``
+        snapshot (adapter / checkpoints / metrics / heartbeat / console / DONE). A repo holding
+        ONLY ``code/flash`` has not booted yet — it may be a run still queued for GPU capacity that
+        needs that code to boot — so its code must not be purged on the short inactive-age gate."""
+        code_dirs = self._artifact_folders(CODE_PATH)
+        return any(
+            not any(f == d or f.startswith(d + "/") for d in code_dirs) for f, _ in self.files
+        )
 
     def age_seconds(self, now: datetime) -> float:
         if self.last_modified is None:
@@ -222,25 +259,32 @@ def classify(view: RepoView, deployed: set[str], cfg: Config, now: datetime) -> 
     if age < cfg.inactive_age_hours * 3600:
         return [Action(view.repo_id, "skip", None, 0, "recently written (maybe in-flight)", skipped=True)]
 
-    # T3 first: a repo with NO final adapter never produced anything servable (failed/cancelled/empty).
-    # Whole-deleting it reclaims everything and can't compromise serving. A repo WITH an adapter is
-    # whole-deleted only under the explicit --delete-with-adapter opt-in.
-    has_adapter = view.has(ADAPTER_PATH)
+    # T3 first: a repo with NO servable adapter never produced anything deployable
+    # (failed/cancelled/empty). Whole-deleting it reclaims everything and can't compromise serving.
+    # "Servable" includes per-step CHECKPOINT adapters, not just the final adapter/ — a repo whose
+    # only adapter is checkpoints/step-N/adapter is still one-command-deployable, so it is NOT
+    # treated as unservable. A repo with any servable adapter is whole-deleted only under the
+    # explicit --delete-with-adapter opt-in.
+    has_servable = view.has_servable_adapter()
     if cfg.repos and age >= cfg.delete_age_days * 86400:
-        if not has_adapter:
+        if not has_servable:
             return [Action(view.repo_id, "delete_repo", None, view.total_bytes, "terminal, no servable adapter")]
         if cfg.delete_with_adapter:
             return [Action(view.repo_id, "delete_repo", None, view.total_bytes, "old undeployed adapter (--delete-with-adapter)")]
 
     actions: list[Action] = []
-    if cfg.code:
-        # Emit one delete per *actual* nested folder (e.g. ``rl/<run>/seed0/code/flash``); a single
-        # root-anchored ``code/flash`` path would never match the real upload layout.
+    if cfg.code and (view.has_run_output() or age >= cfg.delete_age_days * 86400):
+        # Emit one delete per *actual* folder (root ``code/flash`` and/or nested
+        # ``<phase>/<run>/seed<N>/code/flash``). Skip a repo that holds ONLY code/flash and is not
+        # yet delete-age old: it may be a run still queued for capacity whose worker needs that code
+        # to boot — purging it on the short inactive-age gate would break the pending run.
         actions.extend(
             Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "training source snapshot")
             for folder in view._artifact_folders(CODE_PATH)
         )
-    if cfg.checkpoints and age >= cfg.trim_age_days * 86400:
+    if cfg.checkpoints and age >= cfg.trim_age_days * 86400 and view.has_final_adapter():
+        # Only trim checkpoints when a FINAL adapter remains to serve. A checkpoint-only repo's
+        # checkpoints ARE its sole servable content — trimming them would leave nothing deployable.
         actions.extend(
             Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "intermediate checkpoints (final adapter kept)")
             for folder in view._artifact_folders(CHECKPOINTS_PATH)
@@ -337,6 +381,28 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
     views = list_run_repos(api, cfg.namespace)
     plan = build_plan(views, deployed, cfg, now)
     _print_report(plan, cfg, dry_run=dry_run, live_set_known=live_set_known)
+
+    # The live set was sampled before enumeration; a deploy may have landed during enumeration +
+    # classification (minutes, for a large namespace). Re-confirm it immediately before mutating
+    # and drop any action now targeting a live repo, so we never write to a repo that became
+    # deployed in that window. (Dry-run reports the pre-check plan and mutates nothing.)
+    if not dry_run and plan.actions and live_set_known:
+        try:
+            fresh = deployed_repo_ids()
+        except Exception as exc:
+            if cfg.needs_live_set:
+                raise CleanupAborted(
+                    f"could not re-confirm the serving live set before applying ({exc}); aborting "
+                    "rather than risk deleting a newly-deployed repo."
+                ) from exc
+            logger.warning("could not re-confirm live set before apply (%s); proceeding (code-only)", exc)
+            fresh = set()
+        if fresh:
+            kept = [a for a in plan.actions if a.repo_id not in fresh]
+            dropped = len(plan.actions) - len(kept)
+            if dropped:
+                logger.warning("dropping %d planned action(s) against repos deployed since enumeration", dropped)
+                plan.actions = kept
 
     manifest = apply_plan(api, plan, dry_run=dry_run, sleep=sleep)
     if manifest_path:
