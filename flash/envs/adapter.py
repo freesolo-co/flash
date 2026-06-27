@@ -670,7 +670,20 @@ class FreesoloEnvironment(BaseEnvironment):
         its final text, so the two are equivalent for the one-prompt-one-response case). Equals one
         :meth:`reward` per item: each path scores every rollout independently — ``score_responses``
         runs ``score_response`` per completion and ``_reward_to_breakdown(...)['total']`` is exactly
-        ``reward.score`` — so batching changes only concurrency, not values."""
+        ``reward.score`` — so batching changes only concurrency, not values.
+
+        Honors ``reward_thread_safe``: an env whose scorer keeps mutable or thread-bound state opts out
+        with ``reward_thread_safe = False`` and MUST NOT be raced. Batching a group's whole completion
+        set into one ``score_responses`` / ``score_episodes`` call hands them to the env's concurrent
+        scorer (``max_score_concurrency``), so for an opted-out env we fall back to the proven serial
+        path — one single-item :meth:`reward` per rollout, in input order — exactly as the pre-batching
+        code did. Same values; only the concurrency is dropped."""
+        if not self.reward_thread_safe:
+            # Single-item scoring per rollout (each reward() makes a ONE-element score_responses /
+            # score_episodes call, so the env's concurrent scorer never sees a batch to parallelize).
+            # reward() reads the rollout's own response_text/episode from its state, like the batched
+            # paths below — passing it as the completion is a no-op for the multi-turn (state) branch.
+            return [self.reward(str(st.get("response_text") or ""), ex, st) for ex, st in items]
         if not self.multi_turn:
             # Single-turn: group rollouts of the same example so their completions go through ONE
             # score_responses() call (env-concurrent), mirroring the multi-turn score_episodes()
