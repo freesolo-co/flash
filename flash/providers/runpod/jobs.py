@@ -277,11 +277,25 @@ _idle_since: dict[str, tuple[float, str]] = {}
 _idle_since_lock = threading.Lock()
 
 
+def canonical_endpoint_name(name: str) -> str:
+    """The bare ``flash-<gpu>-<run>`` endpoint name, with the ``runpod-flash`` SDK's live-provisioned
+    ``live-`` prefix stripped.
+
+    One RunPod endpoint has TWO names: flash computes and stores the bare ``flash-...`` form (the
+    name it asks the SDK to deploy), but the SDK registers the live resource as ``live-flash-...`` so
+    it can't collide with the same-named template — so the RunPod account *lists* it as
+    ``live-flash-...``. Canonicalizing on the boundary (every set we build AND every listed name we
+    test) means the rest of the code only ever deals with the single bare form, instead of every call
+    site re-deriving both. Idempotent; safe on non-flash names. Actual RunPod ops are keyed by
+    endpoint *id*, never the name, so this normalization only affects matching."""
+    return (name or "").removeprefix("live-")
+
+
 def _is_flash_endpoint(name: str) -> bool:
-    """True for a flash training endpoint this sweep may reap (matches the SDK's ``live-`` form).
+    """True for a flash training endpoint this sweep may reap (in either registered form).
     Serving runs on freesolo's Modal app, not RunPod, so the only flash-* RunPod endpoints are
     training endpoints."""
-    return name.removeprefix("live-").startswith("flash-")
+    return canonical_endpoint_name(name).startswith("flash-")
 
 
 def _sweep_idle_flash_endpoints(
@@ -354,12 +368,14 @@ def _sweep_idle_flash_endpoints(
                 eid = ep.get("id")
                 if not (eid and _is_flash_endpoint(ep_name)):
                     continue
-                # Protect the run's endpoint in either registered form.
-                if ep_name in protected or ep_name.removeprefix("live-") in protected:
+                # Compare against the bare form: ``protected``/``known`` are canonical, and RunPod
+                # lists endpoints under the SDK's ``live-flash-...`` form (see canonical_endpoint_name).
+                canon = canonical_endpoint_name(ep_name)
+                if canon in protected:
                     continue
                 # Multi-plane scope: only reap endpoints this plane has a record of. One whose name
                 # is unknown here belongs to another control plane on the same account — leave it.
-                if known is not None and ep_name not in known and ep_name.removeprefix("live-") not in known:
+                if known is not None and canon not in known:
                     continue
                 try:
                     # Account-scoped: we know which pool account owns this endpoint (its non-secret
@@ -508,7 +524,7 @@ def deploy_train_endpoint(
                 # to zero, never another live run's between-seeds WARM endpoint. The control-plane
                 # periodic reaper does the run-aware, graced warm-idle sweep across all live runs.
                 swept = _sweep_idle_flash_endpoints(
-                    protected={name, f"live-{name}"}, min_idle_s=0.0, reap_warm=False
+                    protected={canonical_endpoint_name(name)}, min_idle_s=0.0, reap_warm=False
                 )
                 wait_s = 30 * quota_attempt
                 logger.warning(
