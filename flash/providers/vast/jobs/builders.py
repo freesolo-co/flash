@@ -151,7 +151,15 @@ def build_onstart(payload: dict) -> str:
 set -x
 export PIP_BREAK_SYSTEM_PACKAGES=1
 PYBIN=/opt/conda/bin/python; [ -x "$PYBIN" ] || PYBIN=/usr/local/bin/python; [ -x "$PYBIN" ] || PYBIN=$(command -v python3 || command -v python)
-[ -n "$PYBIN" ] || echo "flash: no python interpreter (python3/python) on PATH or at /opt/conda,/usr/local" >&2
+# No python at all: neither the bootstrap NOR the python-based self-destroy backstop below can run, so
+# don't fall through to confusing "command not found" failures. Hold briefly so the control plane can
+# pull the log tail, then exit non-zero — the instance carries the flash- label, so the poller's
+# stall/first-liveness detection + sweep_orphans reap it (the control-plane destroy is primary anyway).
+if [ -z "$PYBIN" ]; then
+  echo "flash: no python interpreter (python3/python) on PATH or at /opt/conda,/usr/local; cannot run bootstrap or self-destroy" >&2
+  sleep 600
+  exit 1
+fi
 mkdir -p /root/flash
 cat > /root/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
 {payload_b64}

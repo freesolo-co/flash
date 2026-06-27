@@ -140,3 +140,25 @@ def test_live_rates_gates_on_min_disk(monkeypatch):
     monkeypatch.setattr(vast, "usable_offers", fake_usable)
     pricing.live_rates(refresh=True)
     assert captured["disk_gb"] == vast.MIN_DISK_GB
+
+
+def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
+    # Copilot Msbs9: repeated live_rates() within the TTL must share ONE market fetch (the refresh
+    # param was previously ignored); refresh=True forces a fresh query.
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast import pricing
+
+    calls = {"n": 0}
+
+    def fake_usable(min_vram_gb, disk_gb, *a, **k):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})  # isolate from other tests
+    pricing.live_rates()  # first call -> one fetch
+    pricing.live_rates()  # within TTL -> served from cache, no new fetch
+    assert calls["n"] == 1
+    pricing.live_rates(refresh=True)  # forced -> fetches again
+    assert calls["n"] == 2

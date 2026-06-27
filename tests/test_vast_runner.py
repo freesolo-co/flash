@@ -110,6 +110,10 @@ def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch
     # PYBIN never silently empty: python fallback + a diagnostic when nothing resolves.
     assert "command -v python3 || command -v python" in script
     assert "no python interpreter" in script
+    # Copilot Msbs6: an empty PYBIN must EXIT (after a log-retrieval hold), not fall through to the
+    # doomed `"$PYBIN"` bootstrap + self-destroy invocations.
+    assert 'if [ -z "$PYBIN" ]; then' in script
+    assert "exit 1" in script
 
 
 def test_onstart_spills_large_spec_to_hf(monkeypatch):

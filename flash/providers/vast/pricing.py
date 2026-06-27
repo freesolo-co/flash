@@ -14,10 +14,18 @@ estimate / ``flash gpus`` render never crashes. (A dedicated Vast static snapsho
 from __future__ import annotations
 
 import os
+import time
+from typing import Any
 
 from flash._logging import get_logger
 
 logger = get_logger(__name__)
+
+# Cache the live market query (like Lambda's /instance-types cache) so repeated hourly_rate() lookups
+# — e.g. the `flash gpus` table renders a row per class — share ONE Vast market fetch within the TTL
+# instead of hammering the API. ``refresh=True`` bypasses it.
+_RATES_TTL_S = 45.0
+_rates_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 
 
 def _static_rates() -> dict[str, float]:
@@ -33,11 +41,16 @@ def _static_rates() -> dict[str, float]:
 def live_rates(refresh: bool = False) -> dict[str, float]:
     """Friendly-name -> cheapest live verified-datacenter $/hr (static fallback).
 
-    Offline-safe: without ``VAST_API_KEY`` (or on any fetch failure) returns the static rates.
+    Cached for ``_RATES_TTL_S`` so repeated lookups share one market fetch; ``refresh=True`` bypasses
+    the cache and forces a fresh query. Offline-safe: without ``VAST_API_KEY`` (or on any fetch
+    failure) returns the static rates (and does not cache the failure).
     """
     static = _static_rates()
     if not os.environ.get("VAST_API_KEY"):
         return static
+    now = time.monotonic()
+    if not refresh and _rates_cache["data"] is not None and now - _rates_cache["ts"] < _RATES_TTL_S:
+        return _rates_cache["data"]
     try:
         from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
 
@@ -47,7 +60,9 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
         # optimistic and inconsistent with the allocator/submit paths (both pass MIN_DISK_GB).
         for offer in usable_offers(0, MIN_DISK_GB):  # offers are price-sorted, cheapest first
             rates.setdefault(offer.gpu, offer.dph_total)
-        return {**static, **rates}
+        merged = {**static, **rates}
+        _rates_cache.update(ts=now, data=merged)
+        return merged
     except Exception as exc:
         logger.warning("live vast pricing unavailable (%s); using static rates", exc)
         return static
