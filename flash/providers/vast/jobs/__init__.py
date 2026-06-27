@@ -729,8 +729,12 @@ def _best_effort_destroy(instance_id, *, context: str) -> bool:
     Returns the confirmation bool and WARNS when teardown is unconfirmed (Vast ``success: false`` /
     breakdown -> the instance may still be billing) so operators get immediate visibility instead of
     waiting for the next ``sweep_orphans`` pass (Copilot). ``VastProvider.destroy`` keeps RAISING for
-    its suppress-wrapped callers; this is the variant for contexts where raising is wrong."""
-    ok = vast_api.destroy_instance(int(instance_id))
+    its suppress-wrapped callers; this is the variant for contexts where raising is wrong.
+
+    Pass ``instance_id`` THROUGH unconverted: ``destroy_instance`` does the ``int()`` inside its own
+    try/except (-> False on a non-numeric/None id), so converting HERE would re-introduce a raise in
+    the very ``finally``/``suppress`` paths this helper exists to keep quiet (Cursor MtlVb)."""
+    ok = vast_api.destroy_instance(instance_id)
     if not ok:
         logger.warning(
             "vast teardown unconfirmed for instance %s (%s): success:false / breakdown — instance may "

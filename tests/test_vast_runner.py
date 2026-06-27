@@ -784,6 +784,20 @@ def test_best_effort_destroy_returns_confirmation(monkeypatch):
     assert vast._best_effort_destroy(123, context="t") is False
 
 
+def test_best_effort_destroy_passes_raw_id_and_never_int_raises(monkeypatch):
+    """Cursor MtlVb: the helper must NOT int()-convert the id itself — destroy_instance does that inside
+    its own try/except (-> False on a bad id, "never raises"), so converting in the wrapper would
+    re-introduce a ValueError in the very finally/suppress paths this helper exists to keep quiet.
+    Assert the id reaches destroy_instance UNCONVERTED and a non-numeric id returns False, no raise."""
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    seen = []
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: seen.append(iid) or False)
+    assert vast._best_effort_destroy("not-a-number", context="t") is False  # must not raise
+    assert seen == ["not-a-number"]  # passed through raw — no int() in the wrapper
+
+
 def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
