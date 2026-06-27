@@ -523,24 +523,51 @@ SUCCEEDED_WITH_RESUME = [
 ]
 
 
-def test_checkpoint_trim_also_removes_singular_resume_checkpoint():
-    v = _view(f"{NS}/flashrun-rs", _days_ago(30), SUCCEEDED_WITH_RESUME)
+def test_plural_checkpoints_trimmed_at_trim_age_resume_held_to_delete_age():
+    # Plural deployable snapshots trim at trim-age; the singular resume checkpoint is held until
+    # delete-age (a delayed preemption retry could still re-download it).
+    v = _view(f"{NS}/flashrun-rs", _days_ago(30), SUCCEEDED_WITH_RESUME)  # > trim-age, < delete-age
     actions = rc.classify(v, deployed=set(), cfg=_cfg(code=False, checkpoints=True), now=NOW)
     paths = {(a.kind, a.path) for a in actions}
-    assert ("delete_folder", rc.CHECKPOINTS_PATH) in paths  # plural deployable snapshots
-    assert ("delete_folder", rc.RESUME_CHECKPOINT_PATH) in paths  # singular resume state
+    assert ("delete_folder", rc.CHECKPOINTS_PATH) in paths  # plural deployable snapshots trimmed
+    assert ("delete_folder", rc.RESUME_CHECKPOINT_PATH) not in paths  # resume state HELD (< delete-age)
     assert ("delete_folder", rc.ADAPTER_PATH) not in paths  # final adapter kept
 
 
-def test_resume_checkpoint_trimmed_even_without_final_adapter():
-    # The singular resume checkpoint is never servable, so trim it even for a checkpoint-only repo.
+def test_resume_checkpoint_trimmed_at_delete_age():
+    v = _view(f"{NS}/flashrun-rs", _days_ago(90), SUCCEEDED_WITH_RESUME)  # > delete-age
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=False, checkpoints=True), now=NOW)
+    paths = {(a.kind, a.path) for a in actions}
+    assert ("delete_folder", rc.RESUME_CHECKPOINT_PATH) in paths  # resume state trimmed once abandoned
+
+
+def test_resume_checkpoint_trimmed_even_without_final_adapter_at_delete_age():
+    # The singular resume checkpoint is never servable, so trim it even for a checkpoint-only repo —
+    # but only at delete-age.
     files = [*CHECKPOINT_ONLY, ("rl/flash-9-ck/seed0/checkpoint/checkpoint-3/optimizer.pt", 80_000_000)]
-    v = _view(f"{NS}/flashrun-rs2", _days_ago(30), files)
+    v = _view(f"{NS}/flashrun-rs2", _days_ago(90), files)
     actions = rc.classify(v, deployed=set(), cfg=_cfg(code=False, checkpoints=True), now=NOW)
     paths = {(a.kind, a.path) for a in actions}
     assert ("delete_folder", "rl/flash-9-ck/seed0/checkpoint") in paths  # resume state trimmed
     # the deployable plural checkpoints are NOT trimmed (no final adapter to fall back to)
     assert not any(a.path and a.path.endswith("checkpoints") for a in actions)
+
+
+def test_multiseed_checkpoint_trim_is_per_prefix():
+    # seed0 has a complete final adapter; seed1 has only deployable checkpoint adapters (no final).
+    # Only seed0's checkpoints may be trimmed — seed1's are its sole servable content.
+    files = [
+        ("rl/run/seed0/adapter/adapter_config.json", 500),
+        ("rl/run/seed0/adapter/adapter_model.safetensors", 50_000_000),
+        ("rl/run/seed0/checkpoints/step-1/adapter/adapter_model.safetensors", 50_000_000),
+        ("rl/run/seed1/checkpoints/step-1/adapter/adapter_config.json", 500),
+        ("rl/run/seed1/checkpoints/step-1/adapter/adapter_model.safetensors", 50_000_000),
+    ]
+    v = _view(f"{NS}/flashrun-ms", _days_ago(30), files)
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=False, checkpoints=True), now=NOW)
+    trimmed = {a.path for a in actions if a.kind == "delete_folder"}
+    assert "rl/run/seed0/checkpoints" in trimmed  # seed0 has a final adapter → trimmable
+    assert "rl/run/seed1/checkpoints" not in trimmed  # seed1 has no final adapter → kept
 
 
 def test_apply_per_action_recheck_skips_repo_deployed_mid_apply(monkeypatch):
@@ -595,9 +622,9 @@ def test_apply_per_action_recheck_incomplete_set_skips(monkeypatch):
     assert api.deleted_repos == []  # incomplete set → skipped, not deleted
 
 
-def test_apply_recheck_failure_invalidates_cache_so_next_action_refetches(monkeypatch):
-    # After a failed re-check, the TTL cache must be invalidated so a LATER action re-fetches
-    # instead of deleting against a stale/empty set within the 30s window.
+def test_apply_recheck_refetches_per_action_after_failure(monkeypatch):
+    # The live set is re-fetched for EVERY destructive action, so a failed re-check on one action
+    # never lets a LATER action delete against a stale/empty set — each one re-checks fresh.
     api = FakeApi({
         f"{NS}/flashrun-f1": (_days_ago(90), FAILED),
         f"{NS}/flashrun-f2": (_days_ago(90), FAILED),
