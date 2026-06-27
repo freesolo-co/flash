@@ -15,8 +15,10 @@ import time
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
+from flash.engine.vram import grpo_rollout_seq_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.kernel_warmup import prewarm_gdn_autotune
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     disable_liger_grpo_torch_compile,
@@ -141,6 +143,20 @@ def run_rl():
         f"[rl] vLLM sleep mode = {sleep_mode} "
         f"(model={model_id}, ctx={_grpo_ctx}, card={_card_vram_gb:.0f}GB)"
     )
+    # Pre-warm the GatedDeltaNet l2norm Triton autotuner NOW — while the GPU is free, before the
+    # colocated vLLM rollout engine + optimizer make the FIRST training backward memory-tight. fla's
+    # l2norm_bwd is @fla_cache_autotune'd over 25 configs and the worker's fla defaults to benchmarking
+    # on a cold key; on a RESIDENT colocate step (sleep off — which is the norm whenever the run fits
+    # resident, since the sleep/wake cycle stalls large-model GRPO) that benchmark's transient OOMs the
+    # ~full card (prod run flash-1782588906: 9B GRPO on an 80 GB A100 PCIe died in l2norm_bwd's do_bench,
+    # not in steady-state training). Doing the benchmark here populates the in-process autotune cache so
+    # every training step hits cache. The autotune key buckets by token count, so prewarm_gdn_autotune
+    # sweeps the NB buckets bounded by this run's rollout length x group. Wrapped in liveness_heartbeat
+    # so the CUDA-busy sweep can't trip the stall watchdog (PR #273 class); best-effort and a no-op for
+    # non-GDN models (MiniCPM) / missing fla / no CUDA, so it can never block a paid run.
+    _warm_seq = grpo_rollout_seq_len(_grpo_ctx, gcfg.get("max_tokens"), _w.THINKING)
+    with liveness_heartbeat("rl_prewarm_kernels"):
+        prewarm_gdn_autotune(model_id, max_length=_warm_seq, group_size=group_size)
     # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
     # colocated vLLM; there is no transformers-generation fallback.
     use_vllm = True

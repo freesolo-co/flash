@@ -201,8 +201,21 @@ def warm_liger_ce(torch) -> bool:
     return warmed
 
 
-def warm_fla_gdn(torch) -> bool:
-    """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path)."""
+def warm_fla_gdn(
+    torch, *, head_dim: int = 64, num_heads: int = 4, seq_len: int = 256, varlen: bool = True
+) -> bool:
+    """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path).
+
+    ``head_dim`` is the GatedDeltaNet linear-attention head dim (the model's ``linear_key_head_dim``);
+    it is the feature dim the fused ``l2norm`` kernel normalizes over. ``seq_len`` x ``num_heads`` is the
+    ROW count that — together with head_dim — drives that kernel's Triton autotune key: at the pinned
+    fla SHA ``l2norm_{fwd,bwd}_kernel`` is ``@fla_cache_autotune(..., key=["D", "NB"])`` where
+    ``D = head_dim`` and ``NB = cdiv(B*seq*num_heads, 65536)`` — a COARSE bucket of the row count, NOT
+    head-dim-only. So one warm covers only one NB bucket; the runtime caller (``prewarm_gdn_autotune``)
+    drives ``seq_len`` across every NB bucket a run can visit so the live training backward gets a cache
+    hit instead of benchmarking 25 configs on the memory-tight colocate step. The defaults match a
+    representative Qwen3.5 head for the build-time bake. Pass ``varlen=False`` to skip the (cu_seqlens)
+    packing warm — GRPO is unpacked, so the bucket sweep only needs the plain path."""
     try:
         # mirror the worker boot: on Hopper (sm90) the production path runs this first so fla's GDN
         # chunk_bwd uses the CORRECT tilelang backend (fla #640: the Triton path miscomputes/raises).
@@ -215,7 +228,7 @@ def warm_fla_gdn(torch) -> bool:
             _log(f"hopper fla fast-path setup skipped: {e}")
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
-        b, h, t, d = 1, 4, 256, 64
+        b, h, t, d = 1, int(num_heads or 4), int(seq_len or 256), int(head_dim or 64)
         q = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         k = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         v = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -226,33 +239,141 @@ def warm_fla_gdn(torch) -> bool:
             out = out[0]
         out.sum().backward()
         torch.cuda.synchronize()
-        _log("flash-linear-attention GDN fwd/bwd compiled")
+        # Free the warm tensors so a multi-bucket sweep (prewarm_gdn_autotune drives this across NB
+        # buckets) doesn't pile resident allocations ahead of the real model/engine load — the in-memory
+        # autotune cache (what must persist) is independent of these tensors.
+        del q, k, v, g, beta, out
+        torch.cuda.empty_cache()
+        _log(f"flash-linear-attention GDN fwd/bwd compiled (seq_len={t}, heads={h}, head_dim={d})")
         # also warm the varlen path SFT token-packing (#218) uses: BlockDiagonalCollator(emit_varlen=True)
         # feeds cu_seq_lens into the fla DeltaNet so the recurrence resets per packed example, which
         # compiles different chunk kernels than the equal-length call above. shape it like one packed
-        # block (batch flattened to 1) with two unequal segments.
-        try:
-            tv = 128 + 96  # two example lengths packed into one sequence
-            qv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            kv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            vv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            gv = torch.randn(1, tv, h, device="cuda", dtype=torch.float32, requires_grad=True)
-            betav = torch.rand(1, tv, h, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            cu = torch.tensor([0, 128, tv], device="cuda", dtype=torch.int32)
-            outv = chunk_gated_delta_rule(
-                qv, kv, vv, gv, betav, use_qk_l2norm_in_kernel=True, cu_seqlens=cu
-            )
-            if isinstance(outv, tuple):
-                outv = outv[0]
-            outv.sum().backward()
-            torch.cuda.synchronize()
-            _log("flash-linear-attention GDN varlen (cu_seqlens) fwd/bwd compiled")
-        except Exception as e:
-            _log(f"fla GDN varlen warm skipped: {e}")
+        # block (batch flattened to 1) with two unequal segments. Skipped on the GRPO NB-bucket sweep
+        # (varlen=False): GRPO rollouts are unpacked, so only the plain path is hit at train time.
+        if varlen:
+            try:
+                tv = 128 + 96  # two example lengths packed into one sequence
+                qv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                kv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                vv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                gv = torch.randn(1, tv, h, device="cuda", dtype=torch.float32, requires_grad=True)
+                betav = torch.rand(1, tv, h, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                cu = torch.tensor([0, 128, tv], device="cuda", dtype=torch.int32)
+                outv = chunk_gated_delta_rule(
+                    qv, kv, vv, gv, betav, use_qk_l2norm_in_kernel=True, cu_seqlens=cu
+                )
+                if isinstance(outv, tuple):
+                    outv = outv[0]
+                outv.sum().backward()
+                torch.cuda.synchronize()
+                del qv, kv, vv, gv, betav, cu, outv
+                torch.cuda.empty_cache()
+                _log("flash-linear-attention GDN varlen (cu_seqlens) fwd/bwd compiled")
+            except Exception as e:
+                _log(f"fla GDN varlen warm skipped: {e}")
         return True
     except Exception as e:
         _log(f"fla GDN warm skipped: {e}")
         return False
+
+
+# fla's l2norm autotune key is ["D", "NB"] with NB = cdiv(rows, _L2NORM_NB_GRANULARITY) where rows is
+# the FLATTENED token count (B*seq*num_key_heads). So the key buckets by row count, not head-dim-only:
+# one warm shape covers only ONE NB bucket. Keep this in lockstep with the pinned fla SHA in
+# Dockerfile.worker (fla/modules/l2norm.py: NB = triton.cdiv(T, 2048 * 32)).
+_L2NORM_NB_GRANULARITY = 2048 * 32  # 65536
+# Cap the bucket sweep so a pathological (huge group x context x heads) config can't warm dozens of
+# shapes; the common GRPO range is NB 1-6. A run that legitimately exceeds this re-benchmarks only the
+# uncovered tail buckets (logged), not every step.
+_MAX_NB_BUCKETS = 6
+# Above this head dim fla dispatches a NON-autotuned l2norm kernel (no benchmark -> no OOM to prevent),
+# so there is nothing to warm. Mirrors fla/modules/l2norm.py's BLOCK_N<=512 fast-path gate.
+_L2NORM_AUTOTUNE_MAX_D = 512
+
+
+def _gdn_dims_from_config(model_id: str):
+    """``(head_dim, num_key_heads)`` of the model's GatedDeltaNet block, read from its HF config WITHOUT
+    loading weights — or ``None`` when the model has no linear-attention layer (a plain Llama / MiniCPM
+    checkpoint has no l2norm kernel to warm). Mirrors ``packing.py``'s probe: the GDN dims live on
+    ``linear_key_head_dim`` / ``linear_num_key_heads`` (under ``text_config`` for VL checkpoints)."""
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        cfg = getattr(cfg, "text_config", None) or cfg
+        d = getattr(cfg, "linear_key_head_dim", None)
+        if not d:
+            return None  # not a GatedDeltaNet hybrid -> no l2norm kernel to warm
+        h = getattr(cfg, "linear_num_key_heads", None) or 4
+        return int(d), int(h)
+    except Exception as e:
+        _log(f"GDN dim probe failed for {model_id} ({e}); skipping autotune prewarm")
+        return None
+
+
+def gdn_autotune_nb_buckets(num_key_heads: int, max_rows: int) -> list[int]:
+    """The l2norm sequence lengths to warm so the autotune cache covers every NB bucket a GRPO run can
+    visit. ``NB = cdiv(rows, 65536)`` and ``rows = B*seq*num_key_heads``; for each bucket ``nb`` we pick
+    the SMALLEST seq whose row count lands in that bucket (cheapest warm that still trains the right
+    ``[D, NB]`` key). Capped at ``_MAX_NB_BUCKETS``."""
+    h = max(1, int(num_key_heads))
+    nb_max = max(1, -(-int(max_rows) // _L2NORM_NB_GRANULARITY))  # ceil
+    nb_max = min(nb_max, _MAX_NB_BUCKETS)
+    seqs = []
+    for nb in range(1, nb_max + 1):
+        # smallest seq with rows just inside bucket nb: rows just above (nb-1)*granularity
+        seq = max(256, (nb - 1) * _L2NORM_NB_GRANULARITY // h + 64)
+        seqs.append(int(seq))
+    return seqs
+
+
+def prewarm_gdn_autotune(model_id: str, *, max_length: int = 0, group_size: int = 8) -> bool:
+    """Run the GatedDeltaNet ``l2norm`` (and chunk) fwd/bwd while VRAM is free, across every NB autotune
+    bucket the run can reach — so TRL's GRPO training backward gets a cache HIT instead of benchmarking
+    25 Triton configs on the memory-tight colocate step.
+
+    WHY: ``l2norm_{fwd,bwd}_kernel`` is ``@fla_cache_autotune(..., key=["D","NB"])``; the worker's pinned
+    fla defaults ``FLA_CACHE_MODE`` to DISABLED, so a cold ``[D,NB]`` key falls through to Triton's
+    benchmark (``do_bench`` over 25 configs). On a colocated GRPO step the vLLM rollout engine stays
+    RESIDENT through the backward (sleep mode is off whenever the run fits resident — and the sleep/wake
+    cycle stalls large-model GRPO, so we can't just force it), leaving ~0 headroom, and the benchmark's
+    transient OOMs (prod run flash-1782588906: 9B GRPO on an 80 GB A100 PCIe died in ``l2norm_bwd``'s
+    ``do_bench``, NOT in steady-state training). Benchmarking HERE — before the engine/optimizer load —
+    has the whole card free, and the in-process autotune cache then serves every training step.
+
+    NB depends on the ROW count (``B*seq*num_key_heads``), not just head_dim, so a single shape would
+    cover only one bucket; we sweep ``seq`` across the buckets bounded by the run's
+    ``group_size x max_length x num_key_heads`` rows. Best-effort: a non-GDN model, head_dim above the
+    autotuned range, missing fla, or no CUDA is a silent no-op and NEVER blocks a paid run."""
+    dims = _gdn_dims_from_config(model_id)
+    if not dims:
+        return False
+    head_dim, num_key_heads = dims
+    if head_dim > _L2NORM_AUTOTUNE_MAX_D:
+        _log(f"head_dim={head_dim} uses fla's non-autotuned l2norm kernel; no prewarm needed")
+        return False
+    try:
+        import torch
+    except Exception:
+        return False
+    if not (getattr(torch, "cuda", None) and torch.cuda.is_available()):
+        return False
+    # Upper-bound the training l2norm rows: the per-device logp micro-batch is <= group_size, the seq is
+    # <= the run's engine context (max_length). Size the bucket sweep to that worst case.
+    max_rows = max(1, int(group_size)) * max(256, int(max_length or 1024)) * num_key_heads
+    seqs = gdn_autotune_nb_buckets(num_key_heads, max_rows)
+    _log(
+        f"pre-warming GatedDeltaNet l2norm autotuner: head_dim={head_dim}, num_key_heads={num_key_heads}, "
+        f"NB buckets via seq_lens={seqs} (free VRAM; avoids a train-time benchmark OOM on the colocate step)"
+    )
+    warmed = False
+    for i, seq in enumerate(seqs):
+        # varlen only on the first pass: GRPO rollouts are unpacked, so the plain path is what the
+        # training backward hits — the bucket sweep just needs that one.
+        warmed = warm_fla_gdn(
+            torch, head_dim=head_dim, num_heads=num_key_heads, seq_len=seq, varlen=(i == 0)
+        ) or warmed
+    return warmed
 
 
 def warm_chalk_kernels() -> bool:
