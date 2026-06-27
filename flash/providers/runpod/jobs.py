@@ -835,14 +835,17 @@ def poll_job(
             hb_attempt = _attempt_int(new_key[3]) if new_key else None
             # A heartbeat means cold-start setup is OVER (switch to the tight window) only when it is a
             # training-phase ping that reports a COMPLETED step (step >= 1) — not merely a non-setup
-            # stage. The train-liveness gap-filler emits rl_step/sft_step at step=0 throughout the
-            # silent FIRST step (a cold vLLM rollout can run many minutes before global_step ticks to
-            # 1); counting that as "training started" would drop the larger setup grace before any real
-            # step ran and stall a perfectly healthy cold first step. Real per-step progress heartbeats
-            # carry global_step >= 1, so they still tighten the window. Coerce the step through
-            # _attempt_int (like the attempt above): a malformed/missing/non-numeric step must NOT raise
-            # inside the poll loop (no local handler would abort poll_job) — treat it as 0, i.e. keep
-            # the setup grace.
+            # stage. A real per-step heartbeat (sft_step/rl_step) can still report step=0 on its FIRST
+            # log, before any optimizer step completes (a cold vLLM rollout can run many minutes before
+            # global_step ticks to 1); counting that as "training started" would drop the larger setup
+            # grace before any real step ran and stall a perfectly healthy cold first step. (The
+            # train-loop liveness daemon's pings during that silent step are liveness=True, which
+            # surface_heartbeat drops, so they never reach here at all — the cold first step is held in
+            # setup grace by THIS step>=1 gate, backed by the generous setup_grace_s, until a real
+            # completed step lands.) Real per-step progress heartbeats carry global_step >= 1, so they
+            # still tighten the window. Coerce the step through _attempt_int (like the attempt above): a
+            # malformed/missing/non-numeric step must NOT raise inside the poll loop (no local handler
+            # would abort poll_job) — treat it as 0, i.e. keep the setup grace.
             is_training_hb = stage not in SETUP_HEARTBEAT_STAGES and (_attempt_int(hb_step) or 0) >= 1
             if hb_attempt is not None and hb_attempt > last_hb_attempt:
                 # Newer attempt = a fresh worker after a retry/preemption. Attempts SHARE this run's HF
