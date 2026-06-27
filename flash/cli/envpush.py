@@ -25,7 +25,8 @@ def cmd_env_install(args) -> int:
     env_id = args.env_id
     if not is_freesolo_environment_id(env_id):
         print(
-            f'env id must be a Freesolo environment id, e.g. "your-name/your-env" (got {env_id!r})',
+            'env id must be a Freesolo environment id — a managed slug "your-name/your-env", '
+            f'a "github:owner/repo@ref:path" ref, or a github.com URL (got {env_id!r})',
             file=sys.stderr,
         )
         return 1
@@ -54,7 +55,8 @@ def cmd_env_pull(args) -> int:
     env_id = args.env_id
     if not is_freesolo_environment_id(env_id):
         print(
-            f'env id must be a Freesolo environment id, e.g. "your-name/your-env" (got {env_id!r})',
+            'env id must be a Freesolo environment id — a managed slug "your-name/your-env", '
+            f'a "github:owner/repo@ref:path" ref, or a github.com URL (got {env_id!r})',
             file=sys.stderr,
         )
         return 1
