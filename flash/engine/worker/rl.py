@@ -201,30 +201,37 @@ def run_rl():
         getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
     )
 
+    def _render_for_budget(p) -> str:
+        """Render a prompt to text EXACTLY as the rollout does (incl. tool schemas) — the SINGLE
+        render path shared by the budget filter and the prompt-opened-<think> detection below, so
+        the two can never disagree on what the model actually sees. Fails loud on a template
+        incompatibility (rather than silently degrading) so it can be fixed before a paid run."""
+        if not conversational:
+            return p["prompt"]
+        # Render to text then tokenize — the SAME path the rollout uses — so the filter count
+        # matches the rollout's count (avoids a tokenize=True vs text mismatch). Tool schemas TRL
+        # injects for native tools= GRPO are included so a prompt isn't undercounted vs rollout.
+        kw = {"tools": _oai_tools} if _oai_tools else {}
+        try:
+            return tok.apply_chat_template(
+                p["prompt"],
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=_w.THINKING,
+                **kw,
+            )
+        except Exception as exc:
+            # Fail fast WITH context: a tokenizer/template incompatibility would render every
+            # prompt uncountable and otherwise surface as a misleading "all prompts exceed
+            # budget" — raise so the model/template can be fixed before a paid run trains on
+            # a degenerate dataset.
+            raise RuntimeError(
+                "failed to render a conversational prompt with this model's chat template "
+                f"(fix the model/template or the env's prompts): {exc}"
+            ) from exc
+
     def _prompt_tokens(p) -> int:
-        if conversational:
-            # Render to text then tokenize — the SAME path the rollout uses — so the filter
-            # count matches the rollout's count (avoids a tokenize=True vs text mismatch).
-            kw = {"tools": _oai_tools} if _oai_tools else {}
-            try:
-                text = tok.apply_chat_template(
-                    p["prompt"],
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    enable_thinking=_w.THINKING,
-                    **kw,
-                )
-            except Exception as exc:
-                # Fail fast WITH context: a tokenizer/template incompatibility would render every
-                # prompt uncountable and otherwise surface as a misleading "all prompts exceed
-                # budget" — raise so the model/template can be fixed before a paid run trains on
-                # a degenerate dataset.
-                raise RuntimeError(
-                    "failed to render a conversational prompt with this model's chat template "
-                    f"(fix the model/template or the env's prompts): {exc}"
-                ) from exc
-            return len(tok(text, add_special_tokens=False).input_ids)
-        return len(tok(p["prompt"], add_special_tokens=False).input_ids)
+        return len(tok(_render_for_budget(p), add_special_tokens=False).input_ids)
 
     kept = [p for p in prompts if 0 < _prompt_tokens(p) <= prompt_budget]
     if len(kept) < len(prompts):
@@ -251,6 +258,26 @@ def run_rl():
     # the index back to the original example object below.
     ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
     ds = Dataset.from_list(ds_rows)
+
+    # Whether the rendered PROMPT actually pre-opens a <think> the completion continues (hybrid
+    # templates append `<think>` after the generation prompt for enable_thinking=true). Derived from a
+    # real rendered prompt, NOT from _w.THINKING: an uncurated model whose template IGNORES
+    # enable_thinking (thinking="unknown") would otherwise have its normal tagless answers treated as
+    # unterminated reasoning — over-penalized AND mis-graded toward terse/truncated outputs. The pre-
+    # open is a template-level generation-prompt suffix (identical across examples), so ONE render of a
+    # kept prompt decides it. It re-renders through the SAME _render_for_budget path the filter used —
+    # a second call, NOT a cached result, but identical logic so the text can't drift from the filter's
+    # — and lets a render error fail fast rather than swallowing it into a silent no-op.
+    _prompt_opens_thinking = (
+        bool(_w.THINKING)
+        and bool(prompts)
+        and _w.prompt_opens_thinking(_render_for_budget(prompts[0]))
+    )
+    if _w.THINKING:
+        # Surface the resolved flag: a False here on a thinking run silently disables the <think>
+        # strip + length penalty, so log it rather than let a missed detection look like "no
+        # reasoning" (the failure mode this whole path exists to prevent).
+        print(f"[rl] prompt_opens_thinking={_prompt_opens_thinking}")
 
     def reward_fn(completions, **kwargs):
         # rollout_func (pure multi-turn) path: the per-rollout reward is computed by the env
@@ -290,7 +317,7 @@ def run_rl():
                     r = env.reward_from_messages(comp, ex)
                     rewards.append(r)
                     continue
-                graded = _w.graded_text(comp)
+                graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
                 breakdown = None
                 if hasattr(env, "scores_breakdown"):
                     breakdown = env.scores_breakdown(graded, ex)
@@ -314,7 +341,14 @@ def run_rl():
             # lives outside the try/except above — an internal failure here should crash the run, not
             # be silently swallowed into a 0.0 reward.
             if _think_penalty > 0 and _w.THINKING:
-                r -= _think_penalty * _w.think_token_count(comp, tok)
+                # When the rendered prompt pre-opened <think>, a completion that ran out of tokens
+                # before </think> (no tags at all) is still all reasoning — count it so the longest
+                # rambles don't dodge the penalty. Gated on _prompt_opens_thinking (the prompt ACTUALLY
+                # pre-opened the tag), so an uncurated template that ignored enable_thinking doesn't get
+                # its normal tagless answers counted as reasoning.
+                r -= _think_penalty * _w.think_token_count(
+                    comp, tok, prompt_opened_thinking=_prompt_opens_thinking
+                )
             rewards.append(r)
             if idx < 8:
                 debug_rows.append(
