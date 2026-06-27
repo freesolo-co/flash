@@ -128,9 +128,72 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
         render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"),
         render.submitted("flash-xyz"),
         render.run_status({"run_id": "r", "state": "failed", "spec": {}, "error": "boom — bad"}),
+        render.checkpoints_table(
+            "r", [{"step": 8, "repo_id": "acme/x", "subfolder": "grpo/step-8"}]
+        ),
+        render.cancelled({"run_id": "r", "state": "cancelled"}),
+        render.deployed({"run_id": "r", "state": "deployed", "endpoint_name": "ep", "url": "u"}),
+        render.undeployed({"run_id": "r", "endpoint_name": "ep"}),
+        render.exported({"adapter_id": "r", "repository": "acme/x", "url": "u", "private": True}),
+        render.error("config invalid — bad [environment] id"),
+        render.warn("FREESOLO_API_KEY is set — it will override the saved login"),
+        render.note("exporting adapter — downloading then re-uploading…"),
+        render.log_section("console_sft.txt"),
     ]
     for out in outputs:
         out.encode("ascii")  # raises if any non-ASCII slipped through
+
+
+def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
+    """checkpoints and the run-lifecycle mutations (cancel/deploy/undeploy/export) used to print a
+    plain list / raw JSON on the styled path; they now render themed tables and curated cards."""
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    ck = render.checkpoints_table(
+        "flash-1", [{"step": 8, "repo_id": "acme/x", "subfolder": "grpo/step-8"}]
+    )
+    # themed header + table, not a bare `step N` list
+    assert "checkpoints" in ck
+    assert "STEP" in ck
+    assert "acme/x:grpo/step-8" in ck
+
+    dep = render.deployed(
+        {"run_id": "flash-1", "state": "deployed", "endpoint_name": "ep", "url": "https://x"}
+    )
+    # curated card, not a raw json dump
+    assert "deployed" in dep
+    assert "endpoint" in dep
+    assert "{" not in dep
+
+    exp = render.exported(
+        {"adapter_id": "flash-1", "repository": "acme/x", "url": "https://x", "private": True}
+    )
+    assert "exported" in exp
+    assert "acme/x" in exp
+    assert "{" not in exp
+
+
+def test_error_path_themed_on_tty_plain_on_machine(monkeypatch, capsys) -> None:
+    """main()'s catch-all error is the red ✗ idiom on a styled terminal, but stays the plain
+    `error: {exc}` prefix on the machine path (what scripts and test_cli_errors.py match on)."""
+
+    def _boom(*a, **k):
+        raise ValueError("bad [environment] id")
+
+    monkeypatch.setattr(cli.commands, "client_from_config", _boom)
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert cli.main(["runs"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("✗")  # ✗ leads the themed line
+    assert "error:" in err
+    assert "bad [environment] id" in err
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    assert cli.main(["runs"]) == 1
+    assert capsys.readouterr().err.startswith("error:")  # machine path unchanged
 
 
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:

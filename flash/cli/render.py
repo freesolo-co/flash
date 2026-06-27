@@ -143,6 +143,27 @@ def login_failed(reason: str) -> str:
     )
 
 
+def error(msg: str) -> str:
+    """Themed twin of the plain ``error: {msg}`` line — the red ✗ idiom of ``login_failed``, used
+    by main()'s catch-all so every command's failure is styled on a TTY, not just ``flash login``.
+    The machine path keeps the plain ``error: {msg}`` prefix that scripts and tests match on."""
+    mark = _paint(_glyph("✗", "x:"), _RED, "1")
+    return _safe(f"{mark} {_paint('error:', _RED, '1')} {msg}")
+
+
+def warn(msg: str) -> str:
+    """A themed warning (amber ⚠) — distinct from the red error idiom: the command still
+    proceeds or succeeded. Machine path keeps the plain ``warning: {msg}`` text."""
+    mark = _paint(_glyph("⚠", "!"), _AMBER, "1")
+    return _safe(f"{mark} {_paint('warning:', _AMBER, '1')} {msg}")
+
+
+def note(msg: str) -> str:
+    """A quiet, dimmed line for transient progress / info (e.g. ``exporting ...``). The
+    machine path prints the same text undimmed."""
+    return _safe(_dim(msg))
+
+
 # These renderers are only ever called when `styled()` is true (an interactive stdout, or
 # FLASH_STYLE=1). Each command keeps its exact plain/JSON output on the machine path, so
 # `jq`, scripts, and the agent contract are untouched; this is purely the human view.
@@ -166,9 +187,10 @@ _PALETTE: dict[str, dict[str, tuple[str, int]]] = {
     "violet": {"dark": ("9a8cff", 105), "light": ("6d28d9", 92)},  # JSON literals
     "gray": {"dark": ("8a93a8", 245), "light": ("5b6472", 242)},  # neutral
     "faint": {"dark": ("4d5470", 240), "light": ("9aa1b5", 248)},  # rules, punctuation
+    "amber": {"dark": ("ffb454", 215), "light": ("b45309", 130)},  # warnings (non-fatal)
 }
 # semantic handles used throughout the renderers (resolved per mode at paint time)
-_ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT = (
+_ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT, _AMBER = (
     "accent",
     "accent2",
     "green",
@@ -177,6 +199,7 @@ _ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT = (
     "violet",
     "gray",
     "faint",
+    "amber",
 )
 
 
@@ -234,6 +257,9 @@ _STATE_STYLE: dict[str, tuple[str, str, str]] = {
     "error": (_RED, "●", "*"),
     "cancelled": (_GRAY, "●", "*"),
     "canceled": (_GRAY, "●", "*"),
+    "cancelling": (_GRAY, "◐", "o"),
+    "deploying": (_TEAL, "◐", "o"),
+    "torn_down": (_GRAY, "○", "o"),
     "dry_run": (_ACCENT2, "○", "o"),
 }
 
@@ -441,6 +467,20 @@ def deployments_table(rows: list[dict]) -> str:
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
+def checkpoints_table(run_id: str, rows: list[dict]) -> str:
+    """Deployable per-step RL checkpoints: the step number + the stable repo path it lives at."""
+    body = [
+        [
+            (str(c.get("step", "")), _TEAL),
+            (f"{c.get('repo_id', '')}:{c.get('subfolder', '')}", _ACCENT2),
+        ]
+        for c in sorted(rows, key=lambda c: c.get("step", 0))
+    ]
+    table = _table(["STEP", "CHECKPOINT"], body, aligns=["r", "l"])
+    foot = arrow(f"deploy one with: flash deploy {run_id} --step <STEP>")
+    return _safe(f"{header('checkpoints', f'{len(rows)} deployable')}\n{table}\n\n{foot}")
+
+
 def empty(cmd: str, desc: str, message: str) -> str:
     """A styled empty state (e.g. no runs yet)."""
     return _safe(f"{header(cmd, desc)}\n{_dim('  ' + message)}")
@@ -486,7 +526,11 @@ def run_status(obj: dict) -> str:
 
 
 def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
-    """Header (+ state badge when present) over syntax-highlighted JSON. Lossless."""
+    """Header (+ state badge when present) over syntax-highlighted JSON. Lossless.
+
+    Used for `flash train --dry-run` / `--background`, where the full validated spec is the
+    point. The run-lifecycle mutations (cancel/deploy/undeploy/export) instead use the curated
+    confirmation cards below — their machine path still emits the full JSON for scripts."""
     parts = [header(cmd, desc)]
     if isinstance(obj, dict) and obj.get("state"):
         rid = obj.get("run_id")
@@ -496,6 +540,52 @@ def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
         parts.append(line + "\n")
     parts.append(_json(obj))
     return _safe("\n".join(parts))
+
+
+# Run-lifecycle mutation confirmations — the curated `✓ ... + detail card` idiom (same as
+# login_ok / env_published), not a raw JSON dump. The machine path keeps json.dumps untouched.
+
+
+def cancelled(payload: dict) -> str:
+    """`flash cancel`: the run id + a state badge (cancelled, or cancelling while it winds down)."""
+    rid = _paint(payload.get("run_id", ""), _ACCENT2)
+    return _safe(
+        f"{ok(f'cancel requested for {rid}')}\n  {badge(payload.get('state', 'cancelled'))}"
+    )
+
+
+def deployed(dep: dict) -> str:
+    """`flash deploy`: the endpoint, gpu, and serving url as an aligned card (not a JSON dump)."""
+    pairs = [
+        ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
+        ("endpoint", _paint(dep["endpoint_name"], _GREEN) if dep.get("endpoint_name") else None),
+        ("gpu", dep.get("gpu")),
+        ("url", _paint(dep["url"], _ACCENT2) if dep.get("url") else None),
+    ]
+    state = dep.get("state", "deployed")
+    head = ok("deployed") if state == "deployed" else f"{ok('deploy')}  {badge(state)}"
+    return _safe(f"{head}\n{_kv(pairs)}")
+
+
+def undeployed(result: dict) -> str:
+    """`flash undeploy`: confirm the serving endpoint was torn down."""
+    rid = _paint(result.get("run_id", ""), _ACCENT2)
+    line = ok(f"torn down {rid}")
+    endpoint = result.get("endpoint_name")
+    if endpoint:
+        line += "\n" + _dim(f"  endpoint {endpoint} deregistered")
+    return _safe(line)
+
+
+def exported(result: dict) -> str:
+    """`flash export`: where the adapter landed on HuggingFace, as an aligned card."""
+    pairs = [
+        ("adapter", _paint(result.get("adapter_id", ""), _ACCENT2)),
+        ("repo", _paint(result.get("repository", ""), _ACCENT2)),
+        ("url", _paint(result["url"], _ACCENT2) if result.get("url") else None),
+        ("visibility", "private" if result.get("private") else "public"),
+    ]
+    return _safe(f"{ok('exported to HuggingFace')}\n{_kv(pairs)}")
 
 
 def cost_panel(est) -> str:
@@ -585,6 +675,14 @@ def chat_label() -> str:
     """A faint speaker label printed above a styled chat reply (the reply itself stays plain
     text so a piped transcript is unchanged)."""
     return _paint("assistant", _ACCENT2, "1")
+
+
+def log_section(name: str) -> str:
+    """A themed divider above a passthrough worker-log section in `flash status --logs` — the same
+    idiom as chat_label sitting above a raw chat reply (the log body stays raw). The machine path
+    keeps the plain ``----- name -----`` divider that scripts and tests match on."""
+    rule = _paint(_glyph("─", "-") * 3, _FAINT)
+    return _safe(f"{rule} {_paint(name, _ACCENT2, '1')} {rule}")
 
 
 def env_published(slug: str) -> str:
