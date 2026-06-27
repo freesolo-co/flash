@@ -149,6 +149,64 @@ def test_pull_environment_package_dest_is_a_file(monkeypatch, tmp_path):
     assert (dest / "environment.py").is_file()
 
 
+def test_pull_environment_package_creates_nested_parent_dirs(monkeypatch, tmp_path):
+    # A nested output path whose parents don't exist must be created (mirrors the single-file
+    # download), not fail in copytree.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    dest = tmp_path / "a" / "b" / "c" / "stuff"
+    out = pull_environment_package("david-freesolo-co/stuff", dest)
+    assert out == dest
+    assert (dest / "environment.py").is_file()
+
+
+def test_pull_environment_package_preserves_dest_when_copy_fails(monkeypatch, tmp_path):
+    # Overwriting must stage the new tree and swap it in: a mid-copy failure must NOT destroy the
+    # existing destination (no remove-before-copy).
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    dest = tmp_path / "stuff"
+    dest.mkdir()
+    (dest / "keep.txt").write_text("precious")
+
+    real_copytree = adapter.shutil.copytree
+
+    def boom_copytree(src, dst, *a, **k):
+        if ".flash-env-pull-" in str(dst):  # the staging copy
+            raise OSError("disk full")
+        return real_copytree(src, dst, *a, **k)
+
+    monkeypatch.setattr(adapter.shutil, "copytree", boom_copytree)
+    with pytest.raises(OSError, match="disk full"):
+        pull_environment_package("david-freesolo-co/stuff", dest, overwrite=True)
+    # the original is intact — it was never removed before the copy succeeded
+    assert (dest / "keep.txt").read_text() == "precious"
+
+
+def test_pull_environment_package_replaces_symlink_without_touching_target(monkeypatch, tmp_path):
+    # A symlinked destination is unlinked (not rmtree'd, which shutil refuses; not followed), so the
+    # symlink TARGET is left untouched and a real directory is written in its place.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    real_target = tmp_path / "real"
+    real_target.mkdir()
+    (real_target / "precious.txt").write_text("keep me")
+    dest = tmp_path / "stuff"
+    dest.symlink_to(real_target)
+
+    pull_environment_package("david-freesolo-co/stuff", dest, overwrite=True)
+    assert not dest.is_symlink()
+    assert (dest / "environment.py").is_file()
+    assert (real_target / "precious.txt").read_text() == "keep me"  # target NOT deleted
+
+
+def test_pull_environment_package_refuses_whole_hub_root(monkeypatch, tmp_path):
+    # An explicit github ref to the shared hub's ROOT environment.py would copy every namespace;
+    # refuse it (managed namespace/name ids always resolve to a subdir and are unaffected).
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    with pytest.raises(ValueError, match="whole shared environment hub"):
+        pull_environment_package(
+            "github:freesolo-co/environment-hub@main:environment.py", tmp_path / "x"
+        )
+
+
 # --- helpers ----------------------------------------------------------------
 
 
@@ -211,6 +269,32 @@ def test_cmd_env_pull_rejects_bad_env_id(capsys):
     rc = cmd_env_pull(_args(env_id="!!!not-an-id!!!", path="x"))
     assert rc == 1
     assert "env id must be" in capsys.readouterr().err
+
+
+def test_cmd_env_pull_no_token_hint_for_non_auth_error(monkeypatch, tmp_path, capsys):
+    # A non-auth RuntimeError (e.g. "too large") must NOT print the misleading GITHUB_TOKEN hint.
+    def boom(*a, **k):
+        raise RuntimeError("environment archive is too large (999 bytes; limit 1 bytes)")
+
+    monkeypatch.setattr(adapter, "pull_environment_package", boom)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    rc = cmd_env_pull(_args(output=str(tmp_path / "out")))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "too large" in err
+    assert "GITHUB_TOKEN" not in err
+
+
+def test_cmd_env_pull_token_hint_for_github_request_failure(monkeypatch, tmp_path, capsys):
+    # A GitHub request failure (the auth-relevant case) DOES surface the token hint.
+    def boom(*a, **k):
+        raise RuntimeError("GitHub environment request failed (404): Not Found")
+
+    monkeypatch.setattr(adapter, "pull_environment_package", boom)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    rc = cmd_env_pull(_args(output=str(tmp_path / "out")))
+    assert rc == 1
+    assert "GITHUB_TOKEN" in capsys.readouterr().err
 
 
 # --- additional coverage (from adversarial review) --------------------------

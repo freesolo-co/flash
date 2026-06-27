@@ -95,9 +95,11 @@ def cmd_env_pull(args) -> int:
         return 1
     except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
         print(f"env pull failed: {exc}", file=sys.stderr)
-        # GitHub request failures surface as RuntimeError; a missing token is the usual cause for a
-        # private/internal env. Skip the hint for local filesystem errors (OSError/FileNotFoundError).
-        if isinstance(exc, RuntimeError) and not os.environ.get("GITHUB_TOKEN"):
+        # A GitHub HTTP request failure surfaces as RuntimeError carrying "GitHub environment
+        # request failed" (see envs/adapter._urlopen); a missing token is the usual cause for a
+        # private/internal env. Gate the hint on THAT message so non-auth RuntimeErrors (e.g. "too
+        # large", "too many members", "unsafe path") don't print a misleading token hint.
+        if "GitHub environment request failed" in str(exc) and not os.environ.get("GITHUB_TOKEN"):
             print(
                 "hint: private/internal environments need a GitHub token; set GITHUB_TOKEN "
                 "(e.g. `export GITHUB_TOKEN=$(gh auth token)`).",
