@@ -701,6 +701,110 @@ def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
     return is_vl_checkpoint(model_id)
 
 
+def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
+    """Stack two LoRA adapters (SFT ⊕ GRPO) into ONE rank-(r_sft+r_grpo) adapter in ``out_dir``.
+
+    The VL warm-start path (#296) MERGES the SFT into the base and trains a FRESH LoRA on the merged
+    weights, so the saved GRPO adapter is a delta RELATIVE TO base+SFT. Deploying it alone on the
+    catalog base drops the SFT entirely (served output collapses to ~base). Concatenating the two
+    LoRAs reproduces ``base + SFT_delta + GRPO_delta`` — the exact model GRPO trained — on the
+    ORIGINAL base: for each module, ``A_out = cat([A_sft, A_grpo], 0)`` and
+    ``B_out = cat([s_sft·B_sft, s_grpo·B_grpo], 1)`` with each adapter's own scale (``alpha/r``, or
+    ``alpha/√r`` under rsLoRA) BAKED into its ``B`` and the combined adapter set to unit scale
+    (``alpha=r`` ⇒ ``alpha/r=1``). Then ``delta_out = B_out @ A_out = s_sft·B_sft@A_sft +
+    s_grpo·B_grpo@A_grpo`` exactly, for ANY input scales. Returns the combined rank.
+
+    Both adapters must target the SAME modules (true for managed flash: target_modules is
+    model-derived, not user-set) and be plain LoRA — DoRA / ``modules_to_save`` / non-LoRA tensors
+    raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead).
+    """
+    import json
+    import math
+    import os
+
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    def _load(d: str):
+        cfg_path = os.path.join(d, "adapter_config.json")
+        st_path = os.path.join(d, "adapter_model.safetensors")
+        if not os.path.isfile(st_path):
+            raise ValueError(
+                f"recombine: {d!r} has no adapter_model.safetensors "
+                f"(dir contents: {sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING'}); "
+                "only safetensors adapters can be recombined"
+            )
+        with open(cfg_path) as f:
+            return json.load(f), load_file(st_path)
+
+    sft_cfg, sft_sd = _load(sft_dir)
+    grpo_cfg, grpo_sd = _load(grpo_dir)
+
+    for name, cfg in (("SFT", sft_cfg), ("GRPO", grpo_cfg)):
+        if cfg.get("use_dora"):
+            raise ValueError(f"recombine: {name} adapter uses DoRA — cat-recombine is unsupported")
+        if cfg.get("modules_to_save"):
+            raise ValueError(
+                f"recombine: {name} adapter has modules_to_save={cfg['modules_to_save']!r} "
+                "(full-weight tensors) — cat-recombine is unsupported"
+            )
+
+    def _ab(sd):
+        return {k for k in sd if k.endswith((".lora_A.weight", ".lora_B.weight"))}
+
+    sft_ab, grpo_ab = _ab(sft_sd), _ab(grpo_sd)
+    extra = (set(sft_sd) - sft_ab) | (set(grpo_sd) - grpo_ab)
+    if extra:
+        raise ValueError(
+            f"recombine: non-LoRA tensors present (e.g. {sorted(extra)[:4]}) — only plain "
+            "lora_A/lora_B adapters can be recombined"
+        )
+    if sft_ab != grpo_ab:
+        only_sft, only_grpo = sorted(sft_ab - grpo_ab)[:3], sorted(grpo_ab - sft_ab)[:3]
+        raise ValueError(
+            "recombine: SFT and GRPO adapters target DIFFERENT modules "
+            f"(only-SFT={only_sft}, only-GRPO={only_grpo}); their target_modules must match for a "
+            "rank-stacked recombine"
+        )
+
+    def _scale(cfg) -> float:
+        r, alpha = int(cfg["r"]), float(cfg["lora_alpha"])
+        return alpha / math.sqrt(r) if cfg.get("use_rslora") else alpha / r
+
+    s_sft, s_grpo = _scale(sft_cfg), _scale(grpo_cfg)
+    r_sft, r_grpo = int(sft_cfg["r"]), int(grpo_cfg["r"])
+    r_out = r_sft + r_grpo
+
+    out: dict[str, torch.Tensor] = {}
+    for ak in (k for k in sft_ab if k.endswith(".lora_A.weight")):
+        bk = ak[: -len("lora_A.weight")] + "lora_B.weight"
+        # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
+        out[ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
+        # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
+        # combined adapter carries unit scale, so the per-component scales survive intact.
+        dt = sft_sd[bk].dtype
+        b_sft = sft_sd[bk].to(torch.float32) * s_sft
+        b_grpo = grpo_sd[bk].to(torch.float32) * s_grpo
+        out[bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
+
+    out_cfg = dict(grpo_cfg)
+    out_cfg["r"] = r_out
+    out_cfg["lora_alpha"] = r_out  # alpha/r == 1.0 (scales already baked into each B block)
+    out_cfg["use_rslora"] = False
+    out_cfg["rank_pattern"] = {}
+    out_cfg["alpha_pattern"] = {}
+    # The GRPO adapter was trained on the ephemeral SFT-merged temp dir, so its
+    # base_model_name_or_path points there; name the real catalog base (from the SFT config) instead.
+    if sft_cfg.get("base_model_name_or_path"):
+        out_cfg["base_model_name_or_path"] = sft_cfg["base_model_name_or_path"]
+
+    os.makedirs(out_dir, exist_ok=True)
+    save_file(out, os.path.join(out_dir, "adapter_model.safetensors"), metadata={"format": "pt"})
+    with open(os.path.join(out_dir, "adapter_config.json"), "w") as f:
+        json.dump(out_cfg, f, indent=2)
+    return r_out
+
+
 def assert_lora_applied(model, model_id: str) -> int:
     """After ``PeftModel.from_pretrained``, verify the adapter's LoRA actually loaded (non-empty)
     so a future key-mismatch regression fails LOUDLY instead of silently training a fresh LoRA.

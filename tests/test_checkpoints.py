@@ -534,9 +534,12 @@ def _finalize_src(module_name: str, fn_name: str) -> str:
 
 def test_run_rl_publishes_final_step_as_deployable_checkpoint():
     src = _finalize_src("flash.engine.worker.rl", "run_rl")
-    # Final adapter is saved, then published as a deployable checkpoint keyed by the final step.
+    # Final adapter is saved, recombined for a VL warm-start (SFT⊕GRPO so the deploy isn't SFT-less),
+    # then both the default upload and the deployable checkpoint ship that recombined dir.
     assert 'save_pretrained(adapter_dir)' in src
-    assert 'publish_deployable_checkpoint(adapter_dir, _steps_run)' in src
+    assert 'recombined_warmstart_adapter_dir(adapter_dir) or adapter_dir' in src
+    assert 'hf_upload_folder(deploy_dir, "adapter"' in src
+    assert 'publish_deployable_checkpoint(deploy_dir, _steps_run)' in src
 
 
 def test_run_sft_publishes_final_step_as_deployable_checkpoint():
