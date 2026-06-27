@@ -35,8 +35,15 @@ from flash.providers._poll import (
     make_say,
     surface_heartbeat,
 )
-from flash.providers.base import GPU_INFO, PollResult, min_cuda_modern, vast_gpu_for_offer
+from flash.providers.base import (
+    GPU_INFO,
+    PollResult,
+    UnreconciledCreateError,
+    min_cuda_modern,
+    vast_gpu_for_offer,
+)
 from flash.providers.runpod.jobs import (
+    heartbeat_is_stale_prior_attempt,
     make_hf_heartbeat_reader,
     make_hf_text_reader,
     worker_flagged_retriable,
@@ -273,7 +280,13 @@ def deploy_and_submit(
                 destroyed = destroy_run_instances(spec.run_id)
                 if destroyed:
                     say(f"destroyed {len(destroyed)} possible phantom instance(s) {destroyed} on abort")
-                raise vast_api.VastApiError(
+                # TERMINAL, not retriable: ``destroy_run_instances`` is a point-in-time sweep, so a
+                # phantom contract that has not surfaced yet (eventual consistency) survives it. A
+                # plain VastApiError here is caught by the orchestrator as ``poll_error`` and RETRIED —
+                # which rents another instance while that phantom may still appear and bill under the
+                # still-active run (``sweep_orphans`` shields active runs). Raise the terminal type so
+                # the run fails fast; teardown + a later sweep (run now inactive) reclaim any late box.
+                raise UnreconciledCreateError(
                     f"ambiguous vast create on offer {offer.offer_id} (label={label}); aborting the "
                     f"offer walk to avoid double-provisioning (destroyed phantom by label): {e}"
                 ) from e
@@ -525,10 +538,23 @@ def poll_vast_job(
             # left error_{phase}.txt (a bad env id, a config/code error, an OOM): that is DETERMINISTIC,
             # so fail FAST. A crash the worker flagged retriable still retries.
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
-            # Gate to THIS attempt: a prior attempt's stale retriable heartbeat must not mask the
-            # current attempt's deterministic crash (error_{phase}.txt) into a preemption-style retry.
-            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(
+            # ``error_{phase}.txt`` and the heartbeat are BOTH seed-scoped (shared across this seed's
+            # retries), so a prior attempt can leave either behind. Treat the error as a CURRENT
+            # deterministic crash only when it is THIS attempt's evidence:
+            #  - if the latest heartbeat is a leftover from a PRIOR attempt, the co-located error is
+            #    presumed leftover too -> a host LOSS, not a crash (retry on a fresh host); AND
+            #  - the worker did not flag the failure retriable for THIS attempt.
+            # Without this first guard, gating only the retriable flag (the 1a28224 fix) flips a genuine
+            # retry-after-host-loss into a fail-fast job_failed once the stale flag is ignored.
+            crash_evidence_is_current = not heartbeat_is_stale_prior_attempt(
                 heartbeat_reader, launch_ts=launch_ts, current_attempt=handle.attempt
+            )
+            worker_crashed = (
+                bool(err and err.strip())
+                and crash_evidence_is_current
+                and not worker_flagged_retriable(
+                    heartbeat_reader, launch_ts=launch_ts, current_attempt=handle.attempt
+                )
             )
             return PollResult(
                 False,

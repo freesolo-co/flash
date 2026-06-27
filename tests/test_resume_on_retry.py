@@ -387,3 +387,29 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
 
     assert calls == [0], "a non-infra failure must fail fast, not relaunch"
     assert "not retrying" in log.getvalue()
+
+
+def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
+    """Codex MtbAD: an ambiguous, unreconciled non-idempotent create (Vast's ``PUT /asks`` 5xx with no
+    instance adoptable) raises ``UnreconciledCreateError`` from submit. The supervisor must classify it
+    TERMINAL (job_failed), NOT as the generic ``poll_error`` flake — retrying would rent a SECOND box
+    while the phantom from this attempt may still surface and bill under the still-active run."""
+    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.runpod import jobs as rp_jobs
+
+    calls = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        calls.append(attempt)
+        raise UnreconciledCreateError("ambiguous vast create; aborting the offer walk")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert calls == [0], "an unreconciled create must fail fast, not relaunch (no double-provision)"
+    assert "not retrying" in log.getvalue()

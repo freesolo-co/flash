@@ -372,12 +372,22 @@ def _submit_seed_supervised(
                     submit_kwargs["runtime_secrets"] = runtime_secrets
                 res = provider.submit_run(run_spec, seed, **submit_kwargs)
             except Exception as exc:
-                # Deploy/submit themselves can fail transiently (observed: RunPod
-                # GraphQL "Something went wrong" x3 during a retry deploy). That must
-                # consume a retry, not kill the run — the budget exists precisely for flakes.
-                res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
-                if attempt < infra_budget:
-                    time.sleep(10 * (attempt + 1))  # let the transient clear
+                from flash.providers.base import UnreconciledCreateError
+
+                if isinstance(exc, UnreconciledCreateError):
+                    # A non-idempotent create failed AMBIGUOUSLY and could not be reconciled: a phantom
+                    # instance may still materialize. Retrying would rent a SECOND box while that
+                    # phantom bills under this still-active run (sweep_orphans shields active runs), so
+                    # fail the run TERMINALLY (job_failed, NOT retried) — teardown + a later sweep
+                    # reclaim any late instance once the run is inactive. Not a flake: no clear-sleep.
+                    res = PollResult(False, failure="job_failed", detail=f"unreconciled create: {exc}")
+                else:
+                    # Deploy/submit themselves can fail transiently (observed: RunPod
+                    # GraphQL "Something went wrong" x3 during a retry deploy). That must
+                    # consume a retry, not kill the run — the budget exists precisely for flakes.
+                    res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
+                    if attempt < infra_budget:
+                        time.sleep(10 * (attempt + 1))  # let the transient clear
         if res.ok:
             # A best-effort cancel may fail to stop the worker, which then completes
             # successfully after cancel_run() persisted `cancelled`. Don't let a late

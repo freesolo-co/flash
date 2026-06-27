@@ -36,17 +36,17 @@ def _offer(**kw):
     return make_vast_offer(**kw)
 
 
-def _handle(started_ts=10_000.0, rate=0.47):
+def _handle(started_ts=10_000.0, rate=0.47, attempt=0):
     from flash.providers.vast.jobs.builders import VastJobHandle
 
     return VastJobHandle(
         instance_id=9999,
         offer_id=1,
         machine_id=10,
-        label="flash-x-s0-a0",
+        label=f"flash-x-s0-a{attempt}",
         gpu="RTX 4090",
         hourly_usd=rate,
-        attempt=0,
+        attempt=attempt,
         started_ts=started_ts,
     )
 
@@ -244,9 +244,13 @@ def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
 def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
     # Cursor MsA6X: an ambiguous failure with NO instance visible under our label must ABORT the walk
     # (the contract may exist but not be visible yet) rather than rent another offer and double-bill.
+    # Codex MtbAD: the abort must raise the TERMINAL UnreconciledCreateError (not a plain VastApiError
+    # that the orchestrator retries as poll_error) — a phantom contract that surfaces AFTER the
+    # point-in-time destroy_run_instances sweep would otherwise bill under a retry's new instance.
     import io
     import urllib.error
 
+    from flash.providers.base import UnreconciledCreateError
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
@@ -264,7 +268,7 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
     destroyed_for = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
-    with pytest.raises(vast_api.VastApiError, match="aborting the offer walk"):
+    with pytest.raises(UnreconciledCreateError, match="aborting the offer walk"):
         vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
     assert rented == [1]  # aborted after the FIRST offer — never rented offer 2
     assert destroyed_for  # destroy_run_instances was called to reap any phantom contract
@@ -430,6 +434,52 @@ def test_poll_dead_host_with_error_file_is_job_failed(monkeypatch):
     assert not res.ok
     assert res.failure == "job_failed"
     assert "environment archive" in res.detail
+
+
+def test_poll_dead_host_stale_prior_attempt_error_is_preempted(monkeypatch):
+    """Codex MtbAD: ``error_<phase>.txt`` is seed-scoped (shared across this seed's retries). When the
+    latest heartbeat provably belongs to a PRIOR attempt (here attempt=0 while we poll attempt=1), the
+    co-located error file is a LEFTOVER — a fresh host LOSS on attempt 1, not a deterministic crash.
+    Without this guard, gating only the retriable flag (1a28224) would fail-fast a genuine retry."""
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}, {"actual_status": "exited"}],
+        error="Traceback (most recent call last):\nRuntimeError: stale crash from a prior attempt ...",
+    )
+    # ts AFTER this attempt's launch (10_000) yet attempt=0 != the polled attempt=1 — the subtle
+    # "fresh by timestamp but belongs to a different attempt" leftover.
+    prior_hb = {"stage": "sft_train", "step": 5, "ts": 10_500.0, "attempt": 0}
+    res = vast.poll_vast_job(
+        _handle(started_ts=10_000.0, attempt=1),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: prior_hb,
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # leftover crash artifact -> retry on a fresh host
+
+
+def test_poll_dead_host_current_attempt_error_is_job_failed(monkeypatch):
+    """The complement of the stale-leftover case: when the heartbeat belongs to THIS attempt (attempt
+    matches) and the worker did not flag the failure retriable, the error file IS this attempt's
+    deterministic crash -> fail fast even on a retry (attempt=1)."""
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}, {"actual_status": "exited"}],
+        error="Traceback (most recent call last):\nValueError: bad config on this very attempt ...",
+    )
+    cur_hb = {"stage": "sft_train", "step": 5, "ts": 10_500.0, "attempt": 1}
+    res = vast.poll_vast_job(
+        _handle(started_ts=10_000.0, attempt=1),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: cur_hb,
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert "bad config" in res.detail
 
 
 def test_poll_loading_timeout(monkeypatch):
@@ -681,6 +731,25 @@ def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
     )  # a policy word that never reached the allocator
     with pytest.raises(vast_api.VastApiError, match="concrete gpu class"):
         vast.submit_run_vast(spec, seed=0)
+
+
+def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
+    """Codex MtbAK: ``destroy_instance`` returning False (success:false / breakdown) means the box is
+    STILL billing. ``VastProvider.destroy`` must SURFACE that (raise) instead of returning normally —
+    else the best-effort callers log "terminated" and clear the handle while it keeps billing."""
+    from flash.providers.base import JobHandle
+    from flash.providers.vast import PROVIDER
+    from flash.providers.vast import api as vast_api
+
+    handle = JobHandle.from_dict(_handle().to_dict())
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)  # unconfirmed
+    with pytest.raises(vast_api.VastApiError, match="unconfirmed"):
+        PROVIDER.destroy(handle)
+    # confirmed teardown returns normally (no raise)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
+    PROVIDER.destroy(handle)
+    # no instance_id -> nothing to destroy, no raise (idempotent)
+    PROVIDER.destroy(JobHandle.from_dict({"provider": "vast"}))
 
 
 # ---------------------------------------------------------------------------

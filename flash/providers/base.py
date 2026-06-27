@@ -238,6 +238,17 @@ class UnsupportedGpuError(ValueError):
     pass
 
 
+class UnreconciledCreateError(RuntimeError):
+    """A non-idempotent provider create (e.g. Vast's ``PUT /asks``) failed AMBIGUOUSLY and could NOT be
+    reconciled: the possibly-created resource is not visible yet (object-store / API eventual
+    consistency), so we cannot adopt it and we cannot prove it does not exist. Retrying the run would
+    rent a SECOND instance while a phantom from this attempt may still materialize and bill under the
+    still-active run (where ``sweep_orphans`` shields it). The orchestrator must therefore FAIL THE RUN
+    TERMINALLY rather than consume a retry — the run's teardown plus a later sweep (the run is now
+    inactive, so no longer shielded) reclaim any late-materializing instance, preserving the
+    cost-safety invariant that a rented box is always destroyed."""
+
+
 def canonical_gpu(name: str) -> str:
     """Normalize a friendly GPU name to one of ``KNOWN``; raise otherwise."""
     key = (name or "").strip().lower()

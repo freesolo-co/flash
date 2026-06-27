@@ -1080,3 +1080,44 @@ def worker_flagged_retriable(
     hb_key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
     _ts, fresh = heartbeat_progress_ts(hb_key, launch_ts, current_attempt)
     return fresh
+
+
+def heartbeat_is_stale_prior_attempt(
+    heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
+) -> bool:
+    """True ONLY when a heartbeat can be POSITIVELY attributed to a PRIOR (earlier) attempt — either it
+    carries an explicit ``attempt`` that differs from ``current_attempt``, OR a parseable ``ts`` that
+    predates THIS attempt's launch. Everything else returns False: no heartbeat, an empty/uninformative
+    heartbeat (no ts AND no attempt — e.g. ``{}``), a heartbeat matching this attempt, or one that
+    cannot be dated. The asymmetry is deliberate — we suppress a crash classification only on PROOF of
+    a leftover, never on mere absence of proof (an un-dateable heartbeat is NOT evidence of a prior run
+    and must not mask THIS attempt's deterministic crash).
+
+    The seed heartbeat path AND the seed-scoped ``error_<phase>.txt`` crash artifact are BOTH shared
+    across this seed's retries, so a prior attempt can leave either behind. When the latest heartbeat
+    provably belongs to an earlier attempt, the co-located error file is presumed leftover too — so a
+    dead-host poll on attempt N must NOT read that stale crash file as THIS attempt's DETERMINISTIC
+    failure (which would fail-fast a genuine host LOSS instead of retrying it on a fresh host). Gating
+    requires BOTH ``launch_ts`` and ``current_attempt``; without them a heartbeat cannot be dated, so
+    it is never called stale (conservative — keep the caller's existing classification)."""
+    if heartbeat_reader is None:
+        return False
+    hb = heartbeat_reader(force=True)
+    if not isinstance(hb, dict) or launch_ts is None or current_attempt is None:
+        return False
+    # (1) An explicit attempt number that differs is definitive: a heartbeat from a DIFFERENT attempt.
+    hb_attempt = _attempt_int(hb.get("attempt"))
+    cur_attempt = _attempt_int(current_attempt)
+    if hb_attempt is not None and cur_attempt is not None and hb_attempt != cur_attempt:
+        return True
+    # (2) A parseable ts that predates THIS attempt's launch was written before we booted -> leftover.
+    # Truthy ``launch_ts`` only: 0.0 means "unknown launch" (instance handles coerce a missing
+    # started_ts to 0.0), and we cannot date a heartbeat against an unknown launch.
+    if launch_ts:
+        try:
+            ts = float(hb.get("ts"))
+        except (TypeError, ValueError):
+            ts = None
+        if ts is not None and ts < float(launch_ts):
+            return True
+    return False

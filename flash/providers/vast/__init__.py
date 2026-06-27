@@ -115,11 +115,28 @@ class VastProvider:
         cancel(handle.to_dict())
 
     def destroy(self, handle: JobHandle) -> None:
+        from flash._logging import get_logger
         from flash.providers.vast import api as vast_api
 
         d = handle.to_dict()
-        if d.get("instance_id"):
-            vast_api.destroy_instance(int(d["instance_id"]))
+        iid = d.get("instance_id")
+        if not iid:
+            return
+        # ``destroy_instance`` returns False on a ``success: false`` / network breakdown — the box is
+        # STILL billable. Dropping that bool (the prior behavior) let the best-effort callers log
+        # "terminated …" and clear the handle while the instance kept billing, leaving only the slow
+        # ``sweep_orphans`` backstop to notice. Surface it: warn here, then raise so the caller does not
+        # record a FALSE success (the deploy/cancel callers catch it and still run their endpoint GC /
+        # later sweep; a future non-suppressing caller sees the real failure instead of a clean return).
+        if not vast_api.destroy_instance(int(iid)):
+            get_logger(__name__).warning(
+                "vast destroy_instance(%s) returned unconfirmed (success:false / breakdown); "
+                "instance may still be billing — relying on sweep_orphans backstop",
+                iid,
+            )
+            raise vast_api.VastApiError(
+                f"vast destroy_instance({iid}) unconfirmed (success:false); instance may still bill"
+            )
 
     def gc(self, spec) -> None:
         from flash.providers.vast.jobs import destroy_run_instances
