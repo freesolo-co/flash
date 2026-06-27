@@ -667,6 +667,50 @@ def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
     assert _latest_error_artifact_name("org/repo", "rl/r/seed0", "rl") == "error_rl_attempt0.txt"
 
 
+def test_worker_artifacts_scans_all_seeds(monkeypatch, tmp_path):
+    """A multi-seed run that fails on a LATER seed keeps its traceback under that seed's prefix, not
+    seed0 — the fetcher must scan every seed and key entries by seed so the real crash surfaces."""
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo", seeds=[0, 1]),
+    )
+    content = {
+        "rl/r1/seed0/console_rl.txt": "seed0 console\n",
+        "rl/r1/seed1/console_rl.txt": "seed1 console\n",
+        "rl/r1/seed1/error_rl_attempt0.txt": "TRACEBACK seed1\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert out["seed0/console_rl.txt"] == "seed0 console\n"
+    assert out["seed1/console_rl.txt"] == "seed1 console\n"
+    assert out["seed1/error_rl_attempt0.txt"] == "TRACEBACK seed1\n"  # the actual crash surfaces
+    assert "seed0/error_rl_attempt0.txt" not in out  # seed0 had no error -> not fabricated
+
+
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()

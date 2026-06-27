@@ -337,6 +337,37 @@ def _latest_checkpoint_dir(output_dir: str) -> tuple[int, str] | None:
     return best
 
 
+def _prune_stale_resume_checkpoints(keep_step: int) -> None:
+    """Delete every ``{prefix}/checkpoint/checkpoint-N`` except ``keep_step``.
+
+    The streamed resume checkpoint is meant to be latest-only, but ``upload_folder``'s delete_patterns
+    are matched RELATIVE to path_in_repo (the per-step dir), so they can never reach sibling step dirs —
+    without this they accumulate unbounded on HF and ``hf_resume_checkpoint`` re-downloads them all.
+    Runs AFTER the new checkpoint lands, so the latest is always present. The deployable-adapter tree
+    (``{prefix}/checkpoints/...``, plural) has a different prefix and is untouched.
+    """
+    if not _w.HF_REPO:
+        return
+    api = _w.hf_api()
+    base = f"{hf_prefix()}/checkpoint/"
+    try:
+        files = api.list_repo_files(repo_id=_w.HF_REPO, repo_type="dataset")
+    except Exception as e:
+        print("ckpt prune warn (list):", e)
+        return
+    stale: set[str] = set()
+    for f in files:
+        if not f.startswith(base):
+            continue
+        seg = f[len(base) :].split("/", 1)[0]
+        n = seg[len("checkpoint-") :]
+        if seg.startswith("checkpoint-") and n.isdigit() and int(n) != keep_step:
+            stale.add(f"{base}{seg}")
+    for folder in sorted(stale):
+        with contextlib.suppress(Exception):
+            api.delete_folder(path_in_repo=folder, repo_id=_w.HF_REPO, repo_type="dataset")
+
+
 def make_checkpoint_upload_callback():
     """Return a TrainerCallback that streams each save to HF and publishes deployable per-step adapters.
 
@@ -368,8 +399,9 @@ def make_checkpoint_upload_callback():
                         path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
                         repo_id=_w.HF_REPO,
                         repo_type="dataset",
-                        delete_patterns=[f"{hf_prefix()}/checkpoint/**"],
                     )
+                    # Prune older step dirs only after the new one is safely up (latest-only resume).
+                    _prune_stale_resume_checkpoints(step)
                     _w.heartbeat("checkpoint_uploaded", step=step)
                 except Exception as e:
                     print("ckpt upload warn:", e)

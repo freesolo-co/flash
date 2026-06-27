@@ -142,6 +142,12 @@ def rollout_one(
             break
 
         glue = env_glue(env_msgs)
+        # Collapse a duplicate turn terminator at the seam: env_glue leads with the assistant turn's
+        # terminator (e.g. <|im_end|>), which vLLM also keeps as the last token of a naturally-stopped
+        # turn — keep the assistant's own (env_mask=1, real logprob) over the env copy. See
+        # _advance_after_turn (the rollout_async twin) for the same fix.
+        if glue and completion_ids and completion_ids[-1] == glue[0]:
+            glue = glue[1:]
         if token_budget is not None and len(completion_ids) + len(glue) > token_budget:
             break
         completion_ids.extend(glue)
@@ -232,6 +238,12 @@ def _advance_after_turn(
         r.done = True
         return
     glue = env_glue(env_msgs)
+    # env_glue's text starts at the assistant turn's terminator (e.g. <|im_end|>); vLLM also keeps that
+    # terminator as the final token of a naturally-stopped turn (it's in asst_ids). Collapse the duplicate
+    # at the seam so the stream has exactly one terminator per turn (matches the chat template + SFT
+    # transcripts), keeping the assistant's own token (env_mask=1, real logprob) over the env copy.
+    if glue and r.completion_ids and r.completion_ids[-1] == glue[0]:
+        glue = glue[1:]
     if r.budget is not None and len(r.completion_ids) + len(glue) > r.budget:
         r.done = True
         return

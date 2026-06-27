@@ -242,8 +242,19 @@ def _urlopen(
                     f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
                 ) from exc
             raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            # Connection reset/DNS/connect-or-read-timeout: transient infra on the same cold-spawn wave
+            # that triggers rate limits. Retry on the shared budget, then surface as the retriable
+            # env-fetch signal so the worker reschedules instead of failing the run outright.
+            if attempt < max_rate_limit_retries:
+                delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
+                time.sleep(delay)
+                attempt += 1
+                continue
+            reason = getattr(exc, "reason", exc)
+            raise GitHubRateLimitError(
+                f"GitHub environment request failed after {attempt} retries (transient network): {reason}"
+            ) from exc
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
