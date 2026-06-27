@@ -461,7 +461,7 @@ def test_register_run_checkpoints_requires_org():
 
 def test_register_run_checkpoints_falls_back_to_platform_context(monkeypatch):
     # Internal/operator runs carry org only in platform_context (billing_context is None):
-    # registration must still scope rows to that org. _run_org_id falls back billing-then-platform
+    # registration must still scope rows to that org. _run_org_id falls back to billing-then-platform
     # (same order as routes/serving.py::_run_org; NOT run_registry, which is platform-first).
     import flash.server.checkpoints as ck
 
