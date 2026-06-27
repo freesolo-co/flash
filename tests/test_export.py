@@ -60,14 +60,25 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
                 "private": private,
             }
 
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
         def upload_folder(
-            self, *, repo_id, repo_type, folder_path, commit_message, delete_patterns=None
+            self,
+            *,
+            repo_id,
+            repo_type,
+            folder_path,
+            commit_message,
+            delete_patterns=None,
+            parent_commit=None,
         ):
             calls["upload"] = {
                 "repo_id": repo_id,
                 "repo_type": repo_type,
                 "files": sorted(p.name for p in Path(folder_path).iterdir()),
                 "delete_patterns": delete_patterns,
+                "parent_commit": parent_commit,
             }
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
@@ -110,6 +121,8 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     # Stale adapter artifacts are cleared by STATIC, adapter-scoped patterns (never the user's
     # unrelated files), so a re-export of the same format is a no-op delete.
     assert calls["upload"]["delete_patterns"] == ["adapter_model*", "adapter_config.json"]
+    # The commit is pinned to the repo's current head (concurrent-export guard).
+    assert calls["upload"]["parent_commit"] == "parent-sha"
 
 
 def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeypatch):
@@ -141,6 +154,9 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
 
         def update_repo_settings(self, **kw):
             pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
 
         def upload_folder(self, *, folder_path, delete_patterns, **kw):
             calls["files"] = sorted(p.name for p in Path(folder_path).iterdir())
@@ -175,6 +191,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
         (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
         return str(local_dir)
 
     class FakeHfApi:
@@ -186,6 +203,9 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
 
         def update_repo_settings(self, *, repo_id, repo_type, private):
             order.append(("update_settings", private))
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
 
         def upload_folder(self, **kw):
             order.append(("upload", None))
@@ -215,6 +235,7 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
         (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
         return str(local_dir)
 
     class FakeHfApi:
@@ -226,6 +247,9 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
 
         def update_repo_settings(self, *, repo_id, repo_type, private):
             order.append(("update_settings", private))
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
 
         def upload_folder(self, **kw):
             order.append(("upload", None))
@@ -254,6 +278,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
         (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
         return str(local_dir)
 
     class FakeHfApi:
@@ -265,6 +290,9 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
 
         def update_repo_settings(self, **kw):
             pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
 
         def upload_folder(self, **kw):
             pass
@@ -293,7 +321,7 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
     from flash.serve.export import export_adapter
 
-    with pytest.raises(ValueError, match="no adapter artifacts"):
+    with pytest.raises(ValueError, match="no loadable LoRA adapter"):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="rl/run-x/seed0/adapter",
@@ -301,6 +329,43 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
             dest_token="hf_user",
             source_token="hf_operator",
         )
+
+
+def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
+    """A source folder with adapter_config.json but NO adapter_model* weight is not a loadable
+    adapter (the non-deployable shape checkpoint-publishing filters out). Exporting it would clear
+    the destination's prior weights via delete_patterns and commit a repo that can't load while
+    reporting success — reject up front with a ValueError before any create/upload happens."""
+    uploaded = {"called": False}
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")  # config only, no weight
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            uploaded["called"] = True
+
+        def upload_folder(self, **kw):
+            uploaded["called"] = True
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    with pytest.raises(ValueError, match="no loadable LoRA adapter"):
+        export_adapter(
+            source_repo="org/test-runs",
+            source_subfolder="rl/run-x/seed0/adapter",
+            dest_repo="me/adapters",
+            dest_token="hf_user",
+            source_token="hf_operator",
+        )
+    assert not uploaded["called"], "must reject before touching the destination repo"
 
 
 def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):

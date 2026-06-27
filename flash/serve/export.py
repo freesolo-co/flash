@@ -99,6 +99,11 @@ def export_adapter(
                 local_dir=tmp,
                 token=read_token,
             )
+        except OSError:
+            # A LOCAL filesystem/tempdir failure (e.g. disk full writing the snapshot) is an INTERNAL
+            # error, not an upstream HF transport/permission failure — let it propagate as a 500 rather
+            # than wrapping it in ServingError (which the route maps to a misleading 502 "upstream").
+            raise
         except Exception as exc:
             raise ServingError(
                 f"could not download adapter {source_repo}:{source_subfolder}: {exc}"
@@ -109,10 +114,16 @@ def export_adapter(
             if adapter_dir.is_dir()
             else []
         )
-        if not files:
+        # A LOADABLE LoRA needs BOTH adapter_config.json AND an adapter_model* weight. A source folder
+        # with only tokenizer/config files (the same non-deployable shape checkpoint-publishing filters
+        # out) must NOT be "exported": the upload's delete_patterns would clear any prior destination
+        # weights and commit a repo that can't load the adapter while reporting success. Reject up front.
+        names = {p.name for p in files}
+        has_weight = any(n.startswith("adapter_model") for n in names)
+        if not has_weight or "adapter_config.json" not in names:
             raise ValueError(
-                f"no adapter artifacts found at {source_repo}:{source_subfolder} "
-                "(nothing to export)"
+                f"no loadable LoRA adapter at {source_repo}:{source_subfolder} "
+                "(need adapter_config.json + an adapter_model* weight; nothing to export)"
             )
         api = HfApi(token=dest_token)
         try:
@@ -133,17 +144,30 @@ def export_adapter(
             # linger — without touching the user's unrelated repo files. delete_patterns runs against
             # the repo's pre-commit state; the files uploaded in this commit win, so re-exporting the
             # same format is a no-op delete.
+            #
+            # Concurrent-export guard: pass the repo's CURRENT head as parent_commit. Our
+            # delete_patterns were computed against this tree, so if a racing export to the SAME dest
+            # commits in between, HF rejects ours (412) instead of layering on a now-stale base and
+            # possibly leaving MIXED weights (an old .bin our delete didn't catch + the new
+            # .safetensors). A rejected race surfaces as a ServingError the caller can retry — far
+            # better than a false success with a repo loaders can't reliably resolve.
+            parent_commit = api.repo_info(repo_id=dest_repo, repo_type="model").sha
             api.upload_folder(
                 repo_id=dest_repo,
                 repo_type="model",
                 folder_path=str(adapter_dir),
                 commit_message=f"Export Freesolo adapter ({source_subfolder})",
                 delete_patterns=_STALE_ADAPTER_DELETE_PATTERNS,
+                parent_commit=parent_commit,
             )
             # PUBLIC export: flip to public only now that the adapter is committed, so the repo is never
             # exposed empty/partial.
             if not private:
                 api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=False)
+        except OSError:
+            # Local I/O failure reading the staged adapter dir is INTERNAL (-> 500), not an upstream HF
+            # error (-> 502). HF transport/permission failures are not OSError, so they still wrap below.
+            raise
         except Exception as exc:
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc
     logger.info(
