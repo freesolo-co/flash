@@ -39,7 +39,7 @@ class GpuClass:
     # card). The deployed control plane REJECTS a submit for a non-validated class ("gpu type 'X'
     # has not passed Flash's live validation smoke"), so client-side allocation restricts to the
     # validated pool by default (see ``validated_classes`` / allocator) — otherwise a default
-    # `flash train` could pick the absolute-cheapest fitting class (e.g. "L4") that the
+    # `flash train` could pick the absolute-cheapest fitting class (e.g. a newly-added, not-yet-validated one) that the
     # server then refuses, and the run never submits. Exactly the smoke-validated members below
     # are marked True.
     validated: bool = False
@@ -75,11 +75,12 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     # 24 GB is the floor: the sub-24 GB tiers (16 GB RTX A4000 / RTX 2000 Ada, 20 GB RTX A4500 /
     # RTX 4000 Ada) were dropped — the 24 GB classes below are the smallest managed cards.
     # (RTX 3090 was removed from the catalog — see git history.)
-    GpuClass("L4", "NVIDIA_L4", 24, "l4", "sm89", 0.39),
     # Lambda-only 24 GB Ampere datacenter card (RunPod has no A10). Instance-based capacity
-    # complement: chosen by the allocator only when the cheaper RunPod 24 GB classes are out of
-    # capacity, so it never undercuts RunPod on price.
-    GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10"),
+    # complement: the price-sorted allocator only reaches it once every cheaper FITTING RunPod class is
+    # out of capacity — not just the 24 GB tiers but e.g. the $0.49 48 GB RTX A6000 — so it never
+    # undercuts RunPod on price.
+    # Live-validated 2026-06-27: Qwen3.5-0.8B SFT train smoke (Lambda gpu_1x_a10, us-east-1).
+    GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
     # Live-validated 2026-06-22: Qwen3.5-0.8B/9B SFT+GRPO train smokes (RunPod). The 48 GB tier that
     # fills the 32->80 GB gap (e.g. 4B GRPO @ 35 GB) ~55% cheaper than the A100.
     GpuClass(
@@ -87,19 +88,12 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
         lambda_name="gpu_1x_a6000",
     ),
-    GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44),
-    GpuClass(
-        "RTX 6000 Ada",
-        "NVIDIA_RTX_6000_ADA_GENERATION",
-        48,
-        "6000ada",
-        "sm89",
-        0.77,
-    ),
     # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
     # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
+    # Live-validated 2026-06-27: Qwen3.5-0.8B SFT train smoke (Lambda gpu_1x_a100_sxm4, us-east-1).
     GpuClass(
-        "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99, lambda_name="gpu_1x_a100_sxm4"
+        "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99,
+        lambda_name="gpu_1x_a100_sxm4", validated=True,
     ),
     # big-VRAM tier (9B bf16 GRPO, future >9B bf16)
     # Validated 2026-06-11: 0.6B SFT smoke (phase6).
@@ -183,10 +177,6 @@ _ALIASES.update(
     {
         "nvidia geforce rtx 4090": "RTX 4090",
         "nvidia geforce rtx 5090": "RTX 5090",
-        "nvidia l4": "L4",
-        "nvidia a40": "A40",
-        "nvidia rtx 6000 ada generation": "RTX 6000 Ada",
-        "rtx 6000 ada generation": "RTX 6000 Ada",
         "nvidia a100 80gb pcie": "A100 PCIe",
         "a100 80gb pcie": "A100 PCIe",
         "a100-80g-pcie": "A100 PCIe",
