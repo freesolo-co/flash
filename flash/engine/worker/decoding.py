@@ -47,9 +47,12 @@ def strip_think(completion: str | None, *, prompt_opened_thinking: bool = False)
     """Drop <think>...</think> reasoning before the environment grades/rewards a
     thinking-mode completion.
 
-    - closed block(s): keep only the text after the LAST </think>. This also covers
-      always-thinking templates that pre-open <think> inside the generation prompt,
-      whose completions contain </think> with no opening tag.
+    - closed block(s): keep only the text after the LAST </think> (so a model that
+      prematurely closes then RE-OPENS reasoning still grades on its final answer). This
+      also covers always-thinking templates that pre-open <think> inside the generation
+      prompt, whose completions contain </think> with no opening tag. NB this uses the LAST
+      </think> by design, whereas think_token_count counts up to the FIRST — the two
+      intentionally differ (answer extraction vs reasoning measurement).
     - unclosed <think> (completion budget exhausted): keep only the pre-think text
       (usually empty), so answer extraction fails and the completion scores 0 —
       deliberate reward pressure to close thinking within budget, and it keeps a
@@ -95,72 +98,47 @@ def graded_text(completion: str | None, *, prompt_opened_thinking: bool = False)
 def think_token_count(
     completion: str | None, tokenizer, *, prompt_opened_thinking: bool = False
 ) -> int:
-    """Number of reasoning tokens in the completion's FIRST reasoning span (0 if none).
+    """Number of reasoning tokens in the completion's FIRST ``<think>`` span (0 if none).
 
-    Used for the thinking-length reward deduction: long reasoning is penalized in
-    proportion to the tokens it spent, mirroring the SDK's thinking_length_penalty_coef.
+    Drives the thinking-length reward deduction (mirrors the SDK's thinking_length_penalty_coef):
+    long reasoning is penalized in proportion to the tokens it spent. A hybrid-thinking model
+    reasons once then answers, so the FIRST span IS the whole reasoning — it is bounded at the
+    FIRST ``</think>`` on purpose, so a later ``</think>`` echoed in the *answer* is never counted.
+    (``strip_think`` deliberately uses the LAST ``</think>`` instead — see its docstring — because
+    the two answer different questions: this counts the reasoning, that extracts the final answer.
+    The first-vs-last difference is intentional; do not "unify" them.)
 
-    Counts the FIRST reasoning span only — which is the whole reasoning for a hybrid-thinking
-    model (it reasons once, then answers). Handles the ways such a model surfaces that span:
-      1. Self-contained block — the completion holds the whole ``<think>...</think>`` span
-         (the model opened and closed the tag itself); counted up to the first ``</think>``.
-      2. Prompt-opened block — the chat template appended ``<think>\\n`` to the *prompt*
-         (Qwen3.5 / MiniCPM hybrid thinking with ``enable_thinking=true``), so the
-         completion starts mid-reasoning and only carries the closing ``</think>``. The
-         reasoning is then everything before the first ``</think>``.
-      3. Prompt-opened but UNCLOSED — same prompt pre-open as (2), but the completion ran out of
-         ``max_tokens`` before ever emitting ``</think>``, so it carries NEITHER tag. Only reachable
-         when ``prompt_opened_thinking`` is set (the caller knows thinking was enabled): the WHOLE
-         completion is unterminated reasoning. Without this the LONGEST prompt-opened rambles — the
-         exact case the penalty targets — would score 0. When ``prompt_opened_thinking`` is False a
-         tag-less completion is plain (non-thinking) text and counts 0.
-    Without case 2 the penalty silently no-ops for the common enable_thinking=true path.
-    When ``prompt_opened_thinking`` is set the reasoning ALWAYS begins at the completion's first
-    token (the prompt pre-opened ``<think>``), so cases 2/3 span from the start to the first
-    ``</think>`` (or the whole completion if it never closes) — INCLUDING any ``<think>`` the model
-    redundantly echoed *inside* the reasoning. The lone exception is a ``<think>`` re-emitted at the
-    very START (only whitespace before it): that leading tag is the opener, not content, so it's
-    skipped. Anchoring on a mid-reasoning echoed opener (e.g. ``reason 42 <think> more </think> ans``)
-    would wrongly count only the post-echo sliver instead of the full pre-opened span.
-    When ``prompt_opened_thinking`` is False, case 1 vs 2 is decided by tag ORDER, not mere presence:
-    a completion that closes its reasoning and then echoes a literal/malformed ``<think>`` in the
-    answer must still count the span up to the FIRST ``</think>`` (case 2) — anchoring on the echoed
-    opener would count the wrong span. Any later ``<think>`` blocks (a malformed re-open) are NOT
-    added to the count.
+    ``prompt_opened_thinking`` (the rendered PROMPT itself pre-opened ``<think>`` — not merely that
+    THINKING was set; see ``prompt_opens_thinking``) decides where the reasoning STARTS:
+      - pre-opened: at the completion's first token (the opener lives in the prompt), so an
+        unclosed, tag-less ramble that ran out of ``max_tokens`` is still all reasoning and is
+        counted in full. A ``<think>`` the model echoes is content, NOT the opener — except one
+        re-emitted at the very START (whitespace-only before it), which is skipped as the opener.
+      - not pre-opened: at the model's OWN opening ``<think>`` (decided by tag ORDER — a
+        close-before-open completion is prompt-style reasoning). A tag-less completion here is a
+        plain (non-thinking) answer and counts 0 — never over-penalize an uncurated template.
     """
     if not completion:
         return 0
     open_idx = completion.find("<think>")
     close_idx = completion.find("</think>")
-    if prompt_opened_thinking:
-        # cases 2 & 3, prompt pre-opened: reasoning starts at the completion's FIRST token. Count from
-        # there to the first </think> (or the whole completion when it never closes — budget ran out),
-        # INCLUDING any <think> the model echoed mid-reasoning. The one exception: a <think> re-emitted
-        # at the very START is the opener, not content — skip past it so its tokens aren't counted.
-        start = (
-            open_idx + len("<think>")
-            if open_idx != -1 and not completion[:open_idx].strip()
-            else 0
-        )
-        think_text = (
-            completion[start:close_idx]
-            if close_idx != -1 and close_idx >= start
-            else completion[start:]
-        )
-    elif close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
-        # case 2 (flag not passed): a hybrid template pre-opened <think> in the PROMPT, so the
-        # completion starts mid-reasoning and carries only the close. Count up to the FIRST </think>;
-        # a later literal <think> in the answer is NOT the opener (tag order, not presence).
-        think_text = completion[:close_idx]
-    elif open_idx != -1 and close_idx != -1:
-        # case 1: the model emitted its OWN opening <think> before the close — count between them.
-        think_text = completion[open_idx + len("<think>") : close_idx]
-    elif open_idx != -1:
-        # the model opened <think>, never closed it, and the prompt did NOT pre-open — count after the
-        # opener (the unclosed model-emitted span).
-        think_text = completion[open_idx + len("<think>") :]
-    else:
+    # No tags at all and the prompt did not pre-open: a plain (non-thinking) answer — count nothing.
+    if not prompt_opened_thinking and open_idx == -1 and close_idx == -1:
         return 0
+    # The reasoning is the single span [start, end). END = the FIRST </think> (a later one is an
+    # answer echo), or the whole completion when reasoning never closes (budget ran out). START =
+    # just past the genuine OPENING <think>, else the completion's first token (prompt pre-opened).
+    if prompt_opened_thinking:
+        # Pre-opened: reasoning starts at the first token; only a <think> echoed at the very START
+        # (whitespace-only before it) is the opener — a mid-reasoning echo is content, not a tag.
+        opens_in_completion = open_idx != -1 and not completion[:open_idx].strip()
+    else:
+        # Not pre-opened: the model's own <think> is the opener only when it precedes the close
+        # (tag ORDER, not mere presence — a close-before-open completion is prompt-style reasoning).
+        opens_in_completion = open_idx != -1 and (close_idx == -1 or open_idx < close_idx)
+    start = open_idx + len("<think>") if opens_in_completion else 0
+    end = close_idx if close_idx != -1 else len(completion)
+    think_text = completion[start:end] if end >= start else completion[start:]
     if not think_text:
         return 0
     return len(tokenizer(think_text, add_special_tokens=False)["input_ids"])

@@ -782,6 +782,49 @@ def test_run_rl_wires_mask_truncated_completions_to_the_gating_helper() -> None:
     )
 
 
+def test_run_rl_threads_prompt_opened_thinking_to_grading_and_penalty() -> None:
+    """run_rl must forward the computed _prompt_opens_thinking flag to BOTH graded_text and
+    think_token_count. The leaf-helper tests above cover the flag's True/False logic, but nothing
+    else guarantees run_rl actually PASSES it: drop either keyword and the helper tests stay green
+    while production silently reverts to the pre-fix no-op (the thinking-length penalty does nothing
+    and a tag-less reasoning ramble is graded as the answer — PR #281). Assert on run_rl's AST so it
+    survives reformatting — mirrors test_run_rl_wires_mask_truncated_completions_* above."""
+    import ast
+    import inspect
+
+    import flash.engine.worker as w
+
+    tree = ast.parse(inspect.getsource(w.run_rl))
+
+    def _forwards_flag(call: ast.Call, fname: str) -> bool:
+        # The called name, whether bare (think_token_count(...)) or qualified (_w.graded_text(...)).
+        func = call.func
+        name = (
+            func.id
+            if isinstance(func, ast.Name)
+            else func.attr
+            if isinstance(func, ast.Attribute)
+            else None
+        )
+        if name != fname:
+            return False
+        # ...passing prompt_opened_thinking=_prompt_opens_thinking (the computed flag, not a literal).
+        return any(
+            kw.arg == "prompt_opened_thinking"
+            and isinstance(kw.value, ast.Name)
+            and kw.value.id == "_prompt_opens_thinking"
+            for kw in call.keywords
+        )
+
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    for fname in ("graded_text", "think_token_count"):
+        assert any(_forwards_flag(c, fname) for c in calls), (
+            f"run_rl must call {fname}(..., prompt_opened_thinking=_prompt_opens_thinking); without "
+            "it the prompt-opened-<think> fix silently no-ops (the length penalty and <think> strip "
+            "do nothing on the common enable_thinking=true path — PR #281)"
+        )
+
+
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:
     """Document the TRL contract the recipe depends on: the field exists and TRL defaults it OFF,
     so the explicit True in run_rl is load-bearing. A TRL rename would silently drop our override,
