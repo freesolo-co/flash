@@ -746,6 +746,44 @@ def test_runner_destroys_when_handle_persist_fails(monkeypatch):
     assert destroyed == [9999]
 
 
+def test_submit_teardown_warns_on_unconfirmed_destroy_without_raising(monkeypatch, caplog):
+    """Copilot Mtjga: the PRIMARY teardown (submit_run_vast ``finally``) must NOT silently ignore a
+    success:false from destroy_instance — a raise there would mask the poll result, so instead it WARNS
+    so operators see a possible leak immediately (not only at the next sweep). The run still returns."""
+    import logging
+
+    from flash.providers.base import PollResult
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)  # unconfirmed teardown
+    monkeypatch.setattr(
+        vast,
+        "deploy_and_submit",
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None: _handle(),
+    )
+    monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
+    monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
+
+    with caplog.at_level(logging.WARNING):
+        res = vast.submit_run_vast(_spec(), seed=0)  # the finally must not raise on False
+    assert res.ok
+    assert any("teardown unconfirmed" in r.message for r in caplog.records), (
+        "an unconfirmed teardown in the primary path must emit an operator-visible warning"
+    )
+
+
+def test_best_effort_destroy_returns_confirmation(monkeypatch):
+    """The helper returns the destroy_instance bool and only warns on False (no warn on a clean True)."""
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
+    assert vast._best_effort_destroy(123, context="t") is True
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)
+    assert vast._best_effort_destroy(123, context="t") is False
+
+
 def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast

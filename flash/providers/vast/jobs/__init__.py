@@ -720,14 +720,32 @@ def submit_run_vast(
             deadline_s=deadline,
         )
     finally:
-        vast_api.destroy_instance(handle.instance_id)
+        _best_effort_destroy(handle.instance_id, context="submit_run_vast teardown")
+
+
+def _best_effort_destroy(instance_id, *, context: str) -> bool:
+    """``destroy_instance`` for the best-effort teardown paths (submit/poll ``finally``, cancel) that
+    must NOT raise — a raise in a ``finally`` would mask the poll result or the original exception.
+    Returns the confirmation bool and WARNS when teardown is unconfirmed (Vast ``success: false`` /
+    breakdown -> the instance may still be billing) so operators get immediate visibility instead of
+    waiting for the next ``sweep_orphans`` pass (Copilot). ``VastProvider.destroy`` keeps RAISING for
+    its suppress-wrapped callers; this is the variant for contexts where raising is wrong."""
+    ok = vast_api.destroy_instance(int(instance_id))
+    if not ok:
+        logger.warning(
+            "vast teardown unconfirmed for instance %s (%s): success:false / breakdown — instance may "
+            "still be billing; sweep_orphans is the backstop",
+            instance_id,
+            context,
+        )
+    return ok
 
 
 def cancel(remote: dict) -> None:
     """Cross-process cancel: destroy the persisted instance (stops billing)."""
     instance_id = remote.get("instance_id")
     if instance_id:
-        vast_api.destroy_instance(int(instance_id))
+        _best_effort_destroy(instance_id, context="cancel")
 
 
 def destroy_run_instances(run_id: str) -> list[int]:

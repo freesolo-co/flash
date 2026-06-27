@@ -77,7 +77,6 @@ class VastProvider:
         import contextlib
 
         from flash.providers.runpod.jobs import make_hf_heartbeat_reader
-        from flash.providers.vast import api as vast_api
         from flash.providers.vast.jobs import (
             PROVISION_GRACE_S,
             VastJobHandle,
@@ -105,9 +104,12 @@ class VastProvider:
             )
         finally:
             # Recovery (attach_run) has no submit_run_vast teardown ``finally``; destroy the reattached
-            # instance here so a finished/abandoned recovered seed stops billing immediately.
+            # instance here so a finished/abandoned recovered seed stops billing immediately. Best-effort
+            # (warns on an unconfirmed teardown so a leak is visible now, not just at the next sweep).
+            from flash.providers.vast.jobs import _best_effort_destroy
+
             with contextlib.suppress(Exception):
-                vast_api.destroy_instance(vh.instance_id)
+                _best_effort_destroy(vh.instance_id, context="poll recovery teardown")
 
     def cancel(self, handle: JobHandle) -> None:
         from flash.providers.vast.jobs import cancel
