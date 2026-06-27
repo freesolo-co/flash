@@ -17,6 +17,7 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "A100 SXM": 312.0,
     "H100": 990.0,
     "RTX Pro 6000": 250.0,
+    "B200": 2250.0,
 }
 _DEFAULT_TFLOPS = 100.0
 

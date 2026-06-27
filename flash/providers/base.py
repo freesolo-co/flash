@@ -134,6 +134,19 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         min_cuda_modern="13.0",
         validated=True,
     ),
+    # Datacenter Blackwell (sm100, distinct from the sm120 RTX Pro 6000 above). 180 GB HBM3e -- the
+    # largest managed card, for >9B bf16 GRPO / full-attn models that overflow the 96 GB tier. Per-arch
+    # kernel cache is baked as cu128-sm100; CUDA-13 host like the other Blackwell parts. NOT yet
+    # live-validated -- flip validated=True after a real SFT/GRPO smoke passes on it.
+    GpuClass(
+        "B200",
+        "NVIDIA_B200",
+        180,
+        "b200",
+        "sm100",
+        5.89,
+        min_cuda_modern="13.0",
+    ),
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}

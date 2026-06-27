@@ -535,7 +535,7 @@ def _patch_runpod_backoff() -> None:
 def min_cuda_for(friendly_gpu: str) -> str:
     """Minimum host CUDA (driver) version for this GPU class on the active stack.
 
-    Blackwell classes (sm_120 — RTX 5090, RTX Pro 6000): pypi wheels for
+    Blackwell classes (sm_120 — RTX 5090, RTX Pro 6000; sm_100 — B200): pypi wheels for
     the modern stack (vllm 0.19) ship no Blackwell SASS, so every custom CUDA kernel
     is PTX-JIT'd by the driver — and their PTX is built with a newer toolchain than
     CUDA-12.8-era drivers can JIT (observed: "the provided PTX was compiled with an
