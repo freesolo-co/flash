@@ -17,11 +17,9 @@ class RunMetrics:
     phase: str = ""  # "sft" | "rl"
     seed: int = 0
     model_id: str = ""
-    # Speed
     wall_seconds: float = 0.0
     setup_seconds: float = 0.0  # cold start / provisioning + model load
     train_throughput_toks_per_s: float = 0.0
-    # Token accounting
     train_tokens: int = 0
     generated_tokens: int = 0  # RL: total sampled completion tokens
     # Misc / friction. cost_usd is computed/stamped downstream by the runner from the

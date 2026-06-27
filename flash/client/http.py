@@ -1,6 +1,6 @@
 """Stdlib HTTP client for the Flash control plane (no extra dependencies).
 
-Every CLI/MCP operation maps to one method here. Server errors (FastAPI's
+Every CLI operation maps to one method here. Server errors (FastAPI's
 ``{"detail": ...}``) surface as ``ApiError`` with the server's message; connection
 problems surface as ``ClientError`` with an actionable hint.
 """
@@ -201,14 +201,12 @@ class ApiClient:
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
-    # -- identity ----------------------------------------------------------------------
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
 
     def health(self) -> dict:
         return self._request("GET", "/v1/health", timeout=10.0)
 
-    # -- environments ------------------------------------------------------------------
     def publish_env(
         self,
         *,
@@ -226,7 +224,6 @@ class ApiClient:
             return self._request("POST", "/v1/envs", body=body, timeout=1800.0)
         return self._post_with_progress("/v1/envs", body, progress=progress, timeout=1800.0)
 
-    # -- runs --------------------------------------------------------------------------
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
         if runtime_secrets:
@@ -265,7 +262,6 @@ class ApiClient:
         """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""
         return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
 
-    # -- serving -----------------------------------------------------------------------
     def deploy(
         self,
         run_id: str,
@@ -289,6 +285,39 @@ class ApiClient:
             f"/v1/runs/{run_id}/deploy",
             body=body,
             timeout=deploy_timeout,
+        )
+
+    def export(
+        self,
+        run_id: str,
+        *,
+        repository: str,
+        hf_token: str,
+        step: int | None = None,
+        private: bool = True,
+    ) -> dict:
+        """Export a run's trained adapter into a user-owned HuggingFace repo.
+
+        Copies the adapter (or a specific ``--step`` checkpoint) from the platform's private
+        artifact repo into ``repository``, authenticated with the user's ``hf_token`` (write
+        access to their own repo). The server downloads then re-uploads the adapter, which can
+        take a while for a large adapter, so the timeout matches deploy's."""
+        body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
+        if step is not None:
+            # Reject a bool explicitly: int(True)/int(False) would silently coerce to step 1/0,
+            # but the server guard treats a bool as an invalid step and 400s — fail fast here
+            # with a clear client-side error instead (matches deploy()'s bool guard).
+            if isinstance(step, bool):
+                raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
+            # Reject a FRACTIONAL step before int() silently truncates it (e.g. 2.7 -> 2 would export
+            # the wrong checkpoint). An integral float (2.0) is fine.
+            if isinstance(step, float) and not step.is_integer():
+                raise ClientError(
+                    f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
+                )
+            body["step"] = int(step)
+        return self._request(
+            "POST", f"/v1/runs/{run_id}/export", body=body, timeout=30 * 60
         )
 
     def undeploy(self, run_id: str) -> dict:

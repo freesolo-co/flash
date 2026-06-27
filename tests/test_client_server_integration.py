@@ -88,9 +88,16 @@ class _FakeUrlResponse:
 def make_client(tmp_path, monkeypatch):
     """Yields a factory building real ``ApiClient``s wired into one in-process
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
+    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
+    import flash.providers.runpod.keys as runpod_keys
+
+    runpod_keys.reset()
 
     import flash.runner as runner
     import flash.server.auth as auth_mod
@@ -108,6 +115,23 @@ def make_client(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
+    # The Lambda key above (required by the startup preflight) also makes
+    # configured_providers() treat it as live, so create_app()'s lifespan recover_runs() would
+    # dispatch real sweep_orphans() list calls — and the urllib->TestClient shim below isn't installed
+    # until AFTER create_app() runs. Stub the provider set to empty so startup stays hermetic.
+    import flash.providers as providers_mod
+    import flash.providers.runpod.train.endpoints as rp_endpoints
+    import flash.server.run_registry as run_registry
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    # FREESOLO_INTERNAL_KEY also makes startup run the RunPod slot-store reconcile
+    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST) BEFORE the urllib->
+    # TestClient shim below is installed, so it would hit real network. No-op it at the entry.
+    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
+    # And the same key makes each run-status update best-effort report via run_registry._post(); with
+    # the urllib shim that POST would otherwise route into THIS app (no such route) and log a 404 warn
+    # on every status change. Stub it (as the other server fixtures do) to keep output clean.
+    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)

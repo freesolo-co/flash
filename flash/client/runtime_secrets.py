@@ -12,10 +12,6 @@ from pathlib import Path
 DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
 
 
-def _runtime_secret_keys(keys: tuple[str, ...] | list[str] | set[str] | None = None) -> set[str]:
-    return set(DEFAULT_RUNTIME_SECRET_KEYS) | {str(key) for key in (keys or ())}
-
-
 def _read_env_file(path: Path, keys: set[str]) -> dict[str, str]:
     if not path.exists() or not path.is_file():
         return {}
@@ -49,7 +45,8 @@ def runtime_secrets_from_local_env(
     scan arbitrary parent directories or serialize secrets into the run spec.
     """
 
-    wanted = _runtime_secret_keys(keys)
+    required = {str(key) for key in (keys or ())}
+    wanted = set(DEFAULT_RUNTIME_SECRET_KEYS) | required
     secrets = {key: value for key in wanted if (value := os.environ.get(key))}
     candidates = [Path.cwd() / ".env", Path.cwd() / ".env.local"]
     if config_path:
@@ -58,7 +55,6 @@ def runtime_secrets_from_local_env(
     for path in candidates:
         for key, value in _read_env_file(path, wanted).items():
             secrets.setdefault(key, value)
-    required = {str(key) for key in (keys or ())}
     missing = sorted(required - set(secrets))
     if missing:
         raise ValueError(
@@ -67,3 +63,24 @@ def runtime_secrets_from_local_env(
             "do not put secret values in TOML."
         )
     return secrets
+
+
+def resolve_hf_token(explicit: str | None = None) -> str | None:
+    """Resolve the HuggingFace token `flash export` writes the destination repo with.
+
+    Order: an explicit value (the ``--api-key`` flag) > the process environment (HF_TOKEN) > a local
+    ``.env`` / ``.env.local`` in the cwd. Only HF_TOKEN is accepted — the convention the rest of flash
+    uses — not the huggingface_hub aliases, so the token source is unambiguous.
+    Returns ``None`` when none is set. Read on the user's machine and sent only with the export
+    request — never persisted in the run spec (same contract as the run secrets above).
+    """
+    if explicit and explicit.strip():
+        return explicit.strip()
+    value = os.environ.get("HF_TOKEN")
+    if value and value.strip():
+        return value.strip()
+    for path in (Path.cwd() / ".env", Path.cwd() / ".env.local"):
+        found = _read_env_file(path, {"HF_TOKEN"})
+        if found.get("HF_TOKEN"):
+            return found["HF_TOKEN"]
+    return None

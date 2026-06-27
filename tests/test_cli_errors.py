@@ -16,7 +16,7 @@ def _run(args, env=None):
     if env:
         full_env.update(env)
     return subprocess.run(
-        [sys.executable, "-m", "flash.cli.main", *args],
+        [sys.executable, "-m", "flash.cli", *args],
         cwd=ROOT,
         text=True,
         env=full_env,

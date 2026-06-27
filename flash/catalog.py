@@ -46,6 +46,13 @@ class ModelInfo:
     # tier needs a bigger card than SFT (the colocate 2nd weight copy + KV pool). Consumed by
     # engine.vram.model_required_vram_gb.
     grpo_min_vram_gb: int = 0
+    # SFT hard VRAM floor (GB). 0 => SFT sizes purely from the param-based estimate and is free to
+    # down-route to a smaller validated card (the default — e.g. a 4B SFT estimates ~17 GB and rents
+    # a 48 GB card, NOT its ``min_vram_gb`` reference). Set it ONLY when a curated model must not be
+    # placed on the cheapest card the estimate would otherwise allow — e.g. a very large checkpoint
+    # whose ~param-est margin over the frozen-weights floor is too thin on the next card down.
+    # Consumed by engine.vram.model_required_vram_gb (the SFT analog of ``grpo_min_vram_gb``).
+    sft_min_vram_gb: int = 0
     notes: str = ""
     # Worker container disk this model needs (GB). 0 = the platform default (64 GB)
     # suffices. The runner raises gpu.disk_gb to at least this, so big-checkpoint
@@ -64,8 +71,14 @@ class ModelInfo:
     # completion cap. Curated per model below; defaults to the open-model fallback.
     vocab_size: int = _DEFAULT_VOCAB_SIZE
     # Total parameters in billions — the numeric model size the cost estimator reads directly
-    # (no parsing of the ``params`` display string). Curated per catalog model below.
+    # (no parsing of the ``params`` display string). Drives the memory/size terms (VRAM, disk,
+    # download), which always size the FULL checkpoint. Curated per catalog model below.
     params_b: float = 0.0
+    # Parameters ACTIVE per token in billions — only meaningful for an MoE, where a token routes
+    # through a small subset of experts. The cost estimator's per-token FLOPs/step-time term reads
+    # this (a token exercises only the active params), while VRAM/disk/download keep using the total
+    # ``params_b``. 0.0 (the dense default) means "same as params_b" — every token hits every param.
+    active_params_b: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -89,7 +102,7 @@ MODELS: dict[str, ModelInfo] = {
         thinking="hybrid",
         notes="On-device class SLM (131k ctx); standard Llama architecture.",
     ),
-    # ---- Qwen3.5 dense family: validated on the modern worker stack ----
+    # Qwen3.5 dense family: validated on the modern worker stack
     # (trl 1.x / vllm 0.19 / transformers 5.x). Trained + served TEXT-ONLY: the
     # checkpoints are natively multimodal, so LoRA excludes the vision tower and vLLM
     # loads language_model_only (see flash.engine.worker). Each entry passed a real
@@ -152,6 +165,64 @@ MODELS: dict[str, ModelInfo] = {
         notes="bf16 LoRA. ~19 GB of weights; SFT fits a 48 GB card, while colocated GRPO "
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
+    ),
+    # ---- Qwen3.6 MoE: the big-checkpoint tier (H200 for SFT, B200 for GRPO) ----
+    # 35B-A3B is a Mixture-of-Experts checkpoint: ~3B parameters are ACTIVE per token, but all 35B
+    # are materialized on the GPU, so the MEMORY/disk/download terms size the FULL 35B (~70 GB bf16)
+    # while the COMPUTE terms (activations, KV pool, rank-linear LoRA) size the ~3B active backbone
+    # (engine.vram is MoE-aware via active_params_b). bf16 LoRA, NOT QLoRA — same reason as the 9B.
+    # Because the resident weights dominate and the active compute is tiny, the GPU tier is set by
+    # how many weight copies each algorithm holds, NOT by context length:
+    #   * SFT — ONE ~70 GB copy + small active-compute (~82 GB peak, ~flat in context) -> fits the
+    #     141 GB H200 with wide margin (context ~unbounded by VRAM). Live-validated on a B200; the
+    #     H200 down-tier is the MoE-aware win (cheaper, plentiful stock).
+    #   * GRPO — colocates the vLLM rollout, so TWO ~70 GB copies (trainer + engine) are resident at
+    #     the rollout peak (~167 GB) -> needs the 180 GB B200; the H200 can't hold both. The MoE
+    #     rollout weight-sync needed a fused-expert name fix (engine.worker.lora._remap_vl_sync_weights
+    #     passes the multimodal ``model.language_model.*`` names through to vLLM's own mapper). Both
+    #     single- and multi-turn GRPO live-validated on a B200.
+    "Qwen/Qwen3.6-35B-A3B": ModelInfo(
+        id="Qwen/Qwen3.6-35B-A3B",
+        display_name="Qwen3.6 35B-A3B (MoE)",
+        params="35B total / ~3B active (MoE)",
+        # TOTAL parameters (billions) the SFT VRAM equation + cost projection read. For an MoE
+        # checkpoint the size term is the TOTAL count, not the ~3B active: download/VRAM/disk size the
+        # FULL checkpoint that lands on the GPU (all experts are materialized). 35.0 is the CALIBRATED
+        # total: the live-validated single-B200 SFT fit depends on it — the honest-peak equation lands
+        # at the 180 GB B200's usable budget, and the marketing "~35.95B" figure tips it over (186 GB,
+        # see test_sft_equation_covers_honest_peak_across_seq_boundary). Keep 35.0.
+        params_b=35.0,
+        # ~3B ACTIVE per token (the "A3B" in the name): a token routes through a small subset of
+        # experts, so cost/step-time FLOPs scale with ~3B, not the 35B total. Without this the
+        # estimator would price SFT as if every token exercised all 35B params — ~10x too slow/costly.
+        active_params_b=3.0,
+        vocab_size=248_320,
+        algos=("sft", "grpo"),
+        min_vram_gb=141,
+        # Hard SFT floor: with MoE-aware sizing the SFT estimate is ~82 GB (the 70 GB resident weights
+        # dominate; the active-3B activations/KV are tiny), which would otherwise down-route to the
+        # 96 GB RTX Pro 6000 (consumer Blackwell, thin margin over the 70 GB base) or the 80 GB H100
+        # (too tight). Floor to 100 GB so SFT lands on the 141 GB H200 — a datacenter card with wide
+        # margin, ~$1.50/hr cheaper than the B200 and not needed here.
+        sft_min_vram_gb=100,
+        # GRPO floor = the 180 GB B200 (colocated GRPO holds two ~70 GB weight copies + a KV pool; the
+        # 141 GB H200 can't hold the trainer + vLLM rollout). The base ~167 GB two-copy estimate already
+        # routes GRPO to the B200, but setting the floor ALSO ENGAGES the long-context escalation —
+        # model_required_vram_gb only adds grpo_seq_escalation_gb when a grpo floor is set. The
+        # escalation keys on the ~3B ACTIVE params, so default/moderate GRPO still fits the B200 but a
+        # long (>~16k-token, e.g. 32k) rollout is sized PAST 180 GB and rejected at parse time, instead
+        # of booting a B200 and OOMing in vLLM's KV allocation.
+        grpo_min_vram_gb=180,
+        quant="bf16",
+        recommended_gpu="H200",
+        thinking="hybrid",
+        # ~70 GB bf16 checkpoint. Peak disk = HF download (~70 GB) + Xet temp (~70 GB) + per-step
+        # deployable-checkpoint saves; floor to 200 GB so the rent doesn't hit "No space left on
+        # device" (the runner raises gpu.disk_gb to this out of the box).
+        min_disk_gb=200,
+        notes="MoE (35B total / ~3B active), bf16 LoRA. SFT runs on the 141 GB H200 (the ~70 GB "
+        "weights dominate; active-3B compute keeps activations/KV tiny, so context is ~unbounded by "
+        "VRAM); colocated GRPO needs the 180 GB B200 (trainer + vLLM rollout = two 70 GB copies).",
     ),
 }
 

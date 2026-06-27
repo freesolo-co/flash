@@ -51,16 +51,19 @@ def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
-def test_build_worker_env_forwards_judge_model(monkeypatch):
-    """The optimizer-authored verifiers env reads FLASH_JUDGE_MODEL on the worker to pick its
-    JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane
-    override must be forwarded, else the env silently falls back to its generated default."""
+def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
+    """flash is fully managed: reward-judge creds and the judge-model id are NOT hardcoded
+    control-plane forwards. An env that needs a judge provider key declares it as an
+    [environment].secrets entry (forwarded via runtime_secrets); the env's own default judge model
+    otherwise applies. A stray control-plane OPENROUTER_API_KEY / OPENAI_API_KEY / FLASH_JUDGE_MODEL
+    must NOT leak into every worker."""
     from flash.providers.runpod.train import build_worker_env
 
-    monkeypatch.setenv("FLASH_JUDGE_MODEL", "openai/gpt-oss-120b")
-    assert build_worker_env(_spec(), 0).get("FLASH_JUDGE_MODEL") == "openai/gpt-oss-120b"
-    monkeypatch.delenv("FLASH_JUDGE_MODEL", raising=False)
-    assert "FLASH_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
+    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
+        monkeypatch.setenv(key, "control-plane-should-not-forward")
+    env = build_worker_env(_spec(), 0)
+    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
+        assert key not in env
 
 
 def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
@@ -112,16 +115,28 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     assert "UNDECLARED_API_KEY" not in env
 
 
-def test_build_worker_env_forwards_upload_console(monkeypatch):
-    """FLASH_UPLOAD_CONSOLE (upload the worker console on SUCCESS, not just on crash) is read on the
-    worker by run_mode() from the forwarded env dict. It MUST be on the allowlist or the
-    success-console upload silently no-ops on every remote run."""
-    from flash.providers.runpod.train import build_worker_env
+def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
+    """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
+    when it exits — so every print reaches `flash status --logs`, not just a post-mortem tail on
+    crash. There is no FLASH_UPLOAD_CONSOLE flag to forget: it is NOT forwarded to the worker (even
+    if an operator sets it), and neither worker run_mode path gates the upload."""
+    import inspect
 
+    from flash.providers import _instance_bootstrap
+    from flash.providers.runpod.train import build_worker_env, endpoints
+
+    # the flag is gone — setting it in the control-plane env does not reach the worker
     monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")
-    assert build_worker_env(_spec(), 0).get("FLASH_UPLOAD_CONSOLE") == "1"
-    monkeypatch.delenv("FLASH_UPLOAD_CONSOLE", raising=False)
     assert "FLASH_UPLOAD_CONSOLE" not in build_worker_env(_spec(), 0)
+
+    # both worker run_mode paths upload unconditionally (no flag, no gating var)
+    for src in (
+        inspect.getsource(_instance_bootstrap.run_mode),
+        inspect.getsource(endpoints._train_body),
+    ):
+        assert "FLASH_UPLOAD_CONSOLE" not in src
+        assert "upload_enabled" not in src
+        assert "_force_console" not in src
 
 
 def _clear_chalk_flags(monkeypatch):
@@ -183,6 +198,51 @@ def test_chalk_extra_pip_per_run_worker_env_spec_override(monkeypatch):
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
     # the per-run [worker_env] spec overrides the source for that run
     assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
+
+
+def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
+    """A per-run [worker_env] block can NOT re-inject the optimization toggles removed in PR #175
+    (flash is deterministic + fully managed). The dangerous case: a recipe pinning
+    PYTORCH_ALLOC_CONF=expandable_segments:True would crash GRPO vLLM sleep mode — it must be
+    dropped, and flash's computed sleep-safe RL conf must survive. Non-removed keys still merge."""
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    spec = _spec_worker_env(
+        {
+            # Removed optimization toggles — must all be stripped.
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "VLLM_ATTENTION_BACKEND": "FLASHINFER",
+            "VLLM_FLASH_ATTN_VERSION": "2",
+            "TORCHDYNAMO_DISABLE": "1",
+            "FLASH_DISABLE_FA2": "1",
+            "RL_VLLM_SLEEP": "0",
+            "FLASH_ROPE_KERNEL": "0",
+            "FLASH_WORKER_DEPS": "evil==9",
+            # Case-insensitive match: a lower-cased re-injection is also stripped.
+            "pytorch_alloc_conf": "expandable_segments:True",
+            # A legitimate, non-removed per-run override still wins.
+            "MY_ENV_FLAG": "keep-me",
+        }
+    )
+    env = build_worker_env(spec, 0)  # grpo -> sleep-safe non-expandable alloc conf
+    # The unsafe alloc conf was NOT injected; flash's computed RL conf stands.
+    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
+    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
+    for stripped in (
+        "VLLM_ATTENTION_BACKEND",
+        "VLLM_FLASH_ATTN_VERSION",
+        "TORCHDYNAMO_DISABLE",
+        "FLASH_DISABLE_FA2",
+        "RL_VLLM_SLEEP",
+        "FLASH_ROPE_KERNEL",
+        "FLASH_WORKER_DEPS",
+    ):
+        assert stripped not in env, f"{stripped} should have been filtered from worker_env"
+    # A non-removed per-run key is honored — the filter is targeted, not a blanket block.
+    assert env["MY_ENV_FLAG"] == "keep-me"
 
 
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
@@ -290,8 +350,9 @@ def test_train_body_imports_every_name_it_uses():
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
-    # Names that must be locally imported (regression: contextlib was missing).
-    for name in ("contextlib", "json", "os", "subprocess", "sys"):
+    # Names that must be locally imported (regression: contextlib was missing; threading is used by
+    # the always-on console uploader).
+    for name in ("contextlib", "json", "os", "subprocess", "sys", "threading"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
 
 
@@ -303,6 +364,80 @@ def test_train_body_has_no_prime_install_path():
     src = inspect.getsource(train._train_body)
     assert '"install", "prime"' not in src
     assert 'shutil.which("prime")' not in src
+
+
+def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
+    """Guard: completion-only loss is ON and every prior SFT optimization is still wired. The
+    completion-only change only touched the data representation + label masking — packing, Liger,
+    LoRA+, the large-vocab logits cap, grad-checkpointing, and the 8-bit optimizer must all survive."""
+    import inspect
+
+    from flash.engine.worker import sft
+
+    src = inspect.getsource(sft.run_sft)
+    # The {input_ids, completion_mask} representation is built by the extracted pre-tokenizer; inspect
+    # it for the boundary/representation, and run_sft for the wiring + surviving optimizations.
+    pre_src = inspect.getsource(sft._pretokenize_completion_only)
+
+    # completion-only loss is ON (and the old `False` literal for that key is gone)
+    assert '"completion_only_loss": True' in src
+    assert '"completion_only_loss": False' not in src
+    # the prompt boundary + pre-tokenized {input_ids, completion_mask} representation lives in the
+    # helper; run_sft consumes it and turns it into the dataset
+    assert "completion_mask_from_ids(" in pre_src
+    assert '"completion_mask":' in pre_src
+    assert "tokenize_for_packing(" in pre_src  # EOS-append parity tokenization
+    assert "_pretokenize_completion_only(" in src
+    assert "Dataset.from_list(_pretok)" in src
+    # both flash custom-packing paths thread the completion mask through the packer
+    assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
+
+    # --- every prior optimization still present ---
+    # example packing (all three backends: TRL bfd, SDPA 4D-mask, GDN varlen)
+    assert 'cfg_kwargs["packing"] = True' in src                  # TRL bfd (pure-attn FA2)
+    assert "BlockDiagonalCollator(pad_token_id=tok.pad_token_id)" in src  # SDPA 4D-mask
+    assert "emit_varlen=True" in src                              # GDN varlen
+    assert "model_is_pure_attention" in src
+    assert "gdn_packing_available" in src
+    # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
+    # Liger fused CE/RMSNorm/RoPE
+    assert 'cfg_kwargs["use_liger_kernel"] = True' in src
+    # LoRA+ (B-matrix LR ratio)
+    assert "create_loraplus_optimizer" in src
+    assert "_lp_ratio" in src
+    # large-vocab logits cap (per-device micro-batch sizing)
+    assert "sft_grad_accum(" in src
+    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer
+    assert '"gradient_checkpointing": grad_checkpointing_on(model_id, sft_max_len)' in src
+    assert '"use_reentrant": False' in src
+    assert '"optim": fused_optim_name()' in src
+
+
+def test_trl_collator_masks_prompt_from_pretokenized_rows():
+    """The UNPACKED / TRL-bfd path (not covered by BlockDiagonalCollator tests): feed TRL's real
+    DataCollatorForLanguageModeling pre-tokenized {input_ids, completion_mask} rows with
+    completion_only_loss=True and assert it masks exactly the prompt tokens (labels -100) and keeps
+    the completion — the same representation run_sft now builds."""
+    pytest.importorskip("torch")
+    pytest.importorskip("trl")
+    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+
+    col = DataCollatorForLanguageModeling(pad_token_id=0, completion_only_loss=True)
+    rows = [
+        {"input_ids": [10, 11, 12, 13, 14], "completion_mask": [0, 0, 0, 1, 1]},  # 3-tok prompt
+        {"input_ids": [20, 21, 22], "completion_mask": [0, 1, 1]},                # 2-tok prompt
+    ]
+    out = col(rows)
+    labels = out["labels"]
+    # row 0: first three (prompt) masked, last two kept
+    assert labels[0, :3].tolist() == [-100, -100, -100]
+    assert labels[0, 3:5].tolist() == [13, 14]
+    # row 1: first token (prompt) masked, last two kept; trailing pad masked
+    assert labels[1, 0].item() == -100
+    assert labels[1, 1:3].tolist() == [21, 22]
+    # every completion token is trained, every prompt/pad token is ignored
+    keep = labels != -100
+    assert keep.sum().item() == 4  # 2 + 2 completion tokens across the batch
 
 
 def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):

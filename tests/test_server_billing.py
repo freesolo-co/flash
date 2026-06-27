@@ -204,9 +204,16 @@ def test_http_error_detail_falls_back_to_reason():
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
+    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
+    import flash.providers.runpod.keys as runpod_keys
+
+    runpod_keys.reset()
     import flash.runner as runner
     import flash.server.auth as auth_mod
     import flash.server.db as db_mod
@@ -221,6 +228,21 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
+    # The Lambda key above (required by the startup preflight) makes configured_providers()
+    # treat it as live, so startup recover_runs() would dispatch real sweep_orphans() list calls.
+    # And the dummy FREESOLO_INTERNAL_KEY enables the best-effort backend reporting path: every
+    # /v1/runs submit -> _report_status() -> run_registry._post() would urllib-POST the real backend
+    # (or wait out its 10s timeout). These billing tests assert on the API response, not on reporting,
+    # so stub both to keep startup + submit hermetic (CPU-only, no network).
+    import flash.providers as providers_mod
+    import flash.providers.runpod.train.endpoints as rp_endpoints
+    import flash.server.run_registry as run_registry
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    # FREESOLO_INTERNAL_KEY also makes create_app() startup run the RunPod slot-store reconcile
+    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
+    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)

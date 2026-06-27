@@ -119,6 +119,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
         "step": 12,
         "loss": 1.23456,
         "ts": 123.0,
+        "attempt": 0,
         "gpu": {
             "device_name": "RTX 5090",
             "driver_version": "575.57",
@@ -138,7 +139,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
 
     key, stage = surface_heartbeat(lambda: hb, None, lines.append)
 
-    assert key == ("sft_step", 12, 123.0)
+    assert key == ("sft_step", 12, 123.0, 0)  # attempt is part of the key (shared seed hb path)
     assert stage == "sft_step"
     assert len(lines) == 1
     line = lines[0]
@@ -544,6 +545,199 @@ def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
     assert "limit 5000s" in res.detail
 
 
+def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
+    # A newer heartbeat can be skipped (bounded _HB_UPLOAD_LOCK) while an OLDER one lands late,
+    # changing heartbeat.json content but carrying an OLDER ts. That stale heartbeat must NOT buy a
+    # fresh stall window for a genuinely stuck worker — progress is gated on the heartbeat ts
+    # ADVANCING, not on the content merely changing. Proven by ABSOLUTE simulated stall time: a run
+    # whose 2nd heartbeat is STALE stalls at the SAME time as a run with no 2nd heartbeat (stale ==
+    # no-op), while a run whose 2nd heartbeat is FRESH stalls strictly LATER (it reset progress).
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    def _stall_abs_time(second_hb):
+        state = {"t": 0.0}
+
+        def _time():
+            state["t"] += 100.0
+            return state["t"]
+
+        monkeypatch.setattr(jobs.time, "time", _time)
+        seq = [{"stage": "train", "step": 5, "ts": 1000}]
+        if second_hb is not None:
+            seq.append(second_hb)
+        hbs = iter(seq)
+        res = jobs.poll_job(
+            jobs.JobHandle("ep", "name", "job"),
+            interval_s=0,
+            heartbeat_reader=lambda: next(hbs, None),
+            stall_after_s=150.0,
+            setup_grace_s=5000.0,
+        )
+        assert res.failure == "stalled"
+        assert "during training" in res.detail  # the fresh ts=1000 hb tightened the window
+        return state["t"]  # absolute simulated time when it stalled
+
+    none_run = _stall_abs_time(None)
+    stale_run = _stall_abs_time({"stage": "train", "step": 4, "ts": 500})  # OLDER ts -> stale
+    fresh_run = _stall_abs_time({"stage": "train", "step": 6, "ts": 2000})  # newer ts -> real progress
+
+    assert stale_run == none_run, "a stale late heartbeat must be a no-op for progress"
+    assert fresh_run > none_run, "a genuinely newer heartbeat does reset progress (stalls later)"
+
+
+def test_poll_job_gapfill_step0_does_not_tighten(monkeypatch):
+    # The train-liveness gap-filler emits rl_step/sft_step at step=0 throughout the silent FIRST step
+    # (a cold vLLM rollout can run many minutes before global_step ticks to 1). That step=0 ping is a
+    # NON-setup stage but reports NO completed step, so it proves liveness without meaning training has
+    # started — it must keep the larger setup grace, not switch to the tight training window.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    hbs = iter([{"stage": "rl_step", "step": 0, "ts": 1}])  # gap-filler before the first real step
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs, None),
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail  # step=0 did NOT tighten
+    assert "limit 5000s" in res.detail
+    # Sanity: the SAME stage at step>=1 (a real completed step) DOES tighten to the training window.
+    clock2 = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock2))
+    hbs2 = iter([{"stage": "rl_step", "step": 1, "ts": 1}])
+    res2 = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs2, None),
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert res2.failure == "stalled"
+    assert "during training" in res2.detail
+
+
+def test_poll_job_malformed_step_does_not_crash(monkeypatch):
+    # A heartbeat whose `step` is missing or non-numeric must NOT raise inside the poll loop (there is
+    # no local handler — a ValueError would abort poll_job). The step is coerced like `attempt`, so an
+    # unparseable step is treated as 0 (keep setup grace, don't tighten).
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    hbs = iter([{"stage": "rl_step", "step": "not-a-number", "ts": 1}])  # malformed step
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs, None),
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert res.failure == "stalled"  # did NOT raise
+    assert "during setup" in res.detail  # unparseable step -> treated as 0 -> setup grace kept
+    assert "limit 5000s" in res.detail
+
+
+def test_poll_job_older_attempt_heartbeat_does_not_reset_progress(monkeypatch):
+    # Attempts (retries / preemptions) SHARE this run's HF heartbeat path. A prior attempt's worker,
+    # still shutting down, can upload a heartbeat with an ADVANCING ts but a LOWER attempt number. By
+    # ts alone that looks like progress, but it belongs to a dead attempt and must NOT buy a fresh
+    # stall window for the new attempt's stuck worker. Proven by ABSOLUTE simulated stall time: the
+    # older-attempt second heartbeat stalls at the SAME time as no second heartbeat (it's a no-op),
+    # while a same-attempt heartbeat with a newer ts resets progress (stalls strictly later).
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    def _stall_abs_time(second_hb):
+        state = {"t": 0.0}
+
+        def _time():
+            state["t"] += 100.0
+            return state["t"]
+
+        monkeypatch.setattr(jobs.time, "time", _time)
+        # First heartbeat is attempt 1 at ts=1000 (training started under the current attempt).
+        seq = [{"stage": "train", "step": 5, "ts": 1000, "attempt": 1}]
+        if second_hb is not None:
+            seq.append(second_hb)
+        hbs = iter(seq)
+        res = jobs.poll_job(
+            jobs.JobHandle("ep", "name", "job"),
+            interval_s=0,
+            heartbeat_reader=lambda: next(hbs, None),
+            stall_after_s=150.0,
+            setup_grace_s=5000.0,
+        )
+        assert res.failure == "stalled"
+        return state["t"]
+
+    none_run = _stall_abs_time(None)
+    # Attempt 0 (older than the current attempt 1) with an even NEWER ts -> a dead attempt's late
+    # heartbeat. Must be ignored -> same stall time as no second heartbeat.
+    older_run = _stall_abs_time({"stage": "train", "step": 9, "ts": 9999, "attempt": 0})
+    # Same attempt (1) with a newer ts -> real progress -> resets, stalls later.
+    same_run = _stall_abs_time({"stage": "train", "step": 6, "ts": 2000, "attempt": 1})
+
+    assert older_run == none_run, "an older attempt's late heartbeat must be a no-op for progress"
+    assert same_run > none_run, "a same-attempt newer heartbeat does reset progress (stalls later)"
+
+
+def test_poll_job_newer_attempt_regains_setup_grace(monkeypatch):
+    # A NEWER attempt is a fresh worker after a retry/preemption that restarts from cold setup. Even
+    # though the prior attempt had already tightened to the training window, the new attempt's first
+    # heartbeats are setup-stage pings (model load / vLLM init) and must regain the larger setup grace
+    # so the cold restart isn't killed by the tight training window.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    # Attempt 0 trains (tightens), then attempt 1 restarts cold with a setup-stage (boot) heartbeat.
+    hbs = iter(
+        [
+            {"stage": "train", "step": 3, "ts": 1, "attempt": 0},
+            {"stage": "boot", "step": None, "ts": 2, "attempt": 1},
+        ]
+    )
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs, None),
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail  # the new attempt's cold restart got the setup grace back
+    assert "limit 5000s" in res.detail
+
+
 def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
     # A worker stuck UNHEALTHY while IN_QUEUE (e.g. a mutable image tag republished mid-pull) won't
     # self-recover, so poll_job must fail fast on unhealthy_grace_s and NOT burn the full
@@ -851,6 +1045,62 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
             orch.submit_job(_spec("fail-fast"), dry_run=False, background=False)
         assert calls["n"] == 1
         assert orch.get_status("fail-fast").state == "failed"
+
+
+def test_supervisor_infra_failure_retries_up_to_floor(monkeypatch):
+    """A STREAK of infra-shaped failures (broken/busy GPU -> stalled/job_preempted) walks past up to
+    INFRA_RETRY_FLOOR hosts even though the spec's max_retries is only 2 — so a run of bad GPUs finds a
+    healthy host instead of dying on the small default budget. (Genuine worker errors still fail fast:
+    test_supervisor_does_not_retry_worker_code_errors.)"""
+    from flash.runner.lifecycle import INFRA_RETRY_FLOOR
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        calls = {"n": 0}
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            calls["n"] += 1
+            return jobs.PollResult(False, failure="stalled", detail="GPU never became ready")
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        with pytest.raises(RuntimeError):
+            orch.submit_job(_spec("infra-floor"), dry_run=False, background=False)  # max_retries=2
+        # floor=5 -> 6 attempts (walk 0..5), NOT the 3 the raw max_retries=2 would give.
+        assert calls["n"] == INFRA_RETRY_FLOOR + 1
+        assert orch.get_status("infra-floor").state == "failed"
+
+
+def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
+    """An explicit max_retries=0 (deliberate single-shot) is NOT forced to retry by the infra floor."""
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        calls = {"n": 0}
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            calls["n"] += 1
+            return jobs.PollResult(False, failure="stalled", detail="frozen")
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        spec = JobSpec(
+            run_id="no-retry", model="Qwen/Qwen3.5-0.8B", algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1), gpu=GpuSpec(type="RTX 4090", max_retries=0),
+        )
+        with pytest.raises(RuntimeError):
+            orch.submit_job(spec, dry_run=False, background=False)
+        assert calls["n"] == 1  # single shot — floor does not apply at max_retries=0
+        assert orch.get_status("no-retry").state == "failed"
 
 
 def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
@@ -1594,10 +1844,10 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
         {"id": "ep-other",     "name": "other-ep"},              # not flash-* → skip
     ]
 
-    def fake_list_endpoints():
-        return endpoints
+    def fake_list_by_key():
+        return {"k": endpoints}, []
 
-    def fake_health(eid):
+    def fake_health(eid, key):
         if eid in ("ep-live-idle", "ep-bare-idle"):
             return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
                     "jobs": {"inQueue": 0, "inProgress": 0}}
@@ -1614,13 +1864,13 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
 
     deleted = []
 
-    def fake_delete(eid):
+    def fake_delete(eid, key):
         deleted.append(eid)
         return True
 
-    monkeypatch.setattr(runpod_api, "list_endpoints", fake_list_endpoints)
-    monkeypatch.setattr(runpod_api, "endpoint_health", fake_health)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", fake_delete)
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", fake_list_by_key)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", fake_health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", fake_delete)
     jobs._idle_since.clear()
 
     count = jobs._sweep_idle_flash_endpoints(
@@ -1644,7 +1894,7 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
         {"id": "ep-zero", "name": "flash-a100-zero"},       # fully scaled to zero
     ]
 
-    def health(eid):
+    def health(eid, key):
         if eid == "ep-warm":
             return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
                     "jobs": {"inQueue": 0, "inProgress": 0}}
@@ -1652,9 +1902,9 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
                 "jobs": {"inQueue": 0, "inProgress": 0}}
 
     deleted = []
-    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: endpoints)
-    monkeypatch.setattr(runpod_api, "endpoint_health", health)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda: ({"k": endpoints}, []))
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
 
     # Deploy-path mode: warm endpoint is treated as busy and kept; only scaled-to-zero is reaped.
     jobs._idle_since.clear()
@@ -1675,16 +1925,18 @@ def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
     import flash.providers.runpod.jobs as jobs
 
     monkeypatch.setattr(
-        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"k": [{"id": "ep-x", "name": "flash-a100-x"}]}, []),
     )
     monkeypatch.setattr(
         runpod_api,
-        "endpoint_health",
-        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-                     "jobs": {"inQueue": 0, "inProgress": 0}},
+        "endpoint_health_for_fingerprint",
+        lambda eid, key: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                          "jobs": {"inQueue": 0, "inProgress": 0}},
     )
     deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
     jobs._idle_since.clear()
 
     clock = {"t": 1000.0}
@@ -1714,17 +1966,19 @@ def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
 
     state = {"busy": False}
     monkeypatch.setattr(
-        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"k": [{"id": "ep-x", "name": "flash-a100-x"}]}, []),
     )
 
-    def health(eid):
+    def health(eid, key):
         w = {"running": 1 if state["busy"] else 0, "ready": 0, "idle": 0, "initializing": 0}
         j = {"inQueue": 0, "inProgress": 1 if state["busy"] else 0}
         return {"workers": w, "jobs": j}
 
-    monkeypatch.setattr(runpod_api, "endpoint_health", health)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
     deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
     jobs._idle_since.clear()
     clock = {"t": 1000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -1752,14 +2006,18 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
     import flash.providers.runpod.api as runpod_api
     import flash.providers.runpod.jobs as jobs
 
-    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [{"id": "e", "name": "flash-a100-x"}])
     monkeypatch.setattr(
         runpod_api,
-        "endpoint_health",
-        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-                     "jobs": {"inQueue": 0, "inProgress": 0}},
+        "list_endpoints_by_key",
+        lambda: ({"k": [{"id": "e", "name": "flash-a100-x"}]}, []),
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: True)
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, key: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                          "jobs": {"inQueue": 0, "inProgress": 0}},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: True)
     jobs._idle_since.clear()
 
     done = threading.Event()

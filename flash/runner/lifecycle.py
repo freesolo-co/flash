@@ -17,6 +17,16 @@ import time
 
 from flash.spec import JobSpec
 
+# Floor on the GPU-walk budget for INFRA-shaped failures (broken/busy GPU, stall, preemption,
+# no-capacity) when the user left retries enabled. A broken/busy rented GPU (NVML-init fail /
+# cudaErrorDevicesUnavailable) is pure infra bad-luck and cheap to walk past, so a healthy host
+# should be found rather than a streak of bad ones killing the run. Matches the default
+# ``max_retries`` (5, see spec.GpuSpec); the floor still lifts an explicitly-LOWERED budget (e.g.
+# ``max_retries=1``) so infra bad-luck never kills a run that left retries enabled.
+# Genuine training errors are NON-infra and still fail fast (no retry). An explicit ``max_retries==0``
+# (single-shot, no retries) is respected — the floor only applies when retries are enabled.
+INFRA_RETRY_FLOOR = 5
+
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
@@ -89,10 +99,10 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     failed substrate *cross-provider* before walking classes within it:
 
       * a congested provider (RunPod queue timeout / no warm workers) is left for a DIFFERENT
-        provider (Hyperstack / Lambda) on retry instead of hopping to its next-cheapest class —
+        provider (Lambda) on retry instead of hopping to its next-cheapest class —
         which, when the whole provider is busy, is just as likely to time out (issue: A6000 queue
-        timeout retried onto another RunPod class while Hyperstack A6000 sat available); and
-      * a provider handing out a broken GPU (a Hyperstack VM whose CUDA never comes up ->
+        timeout retried onto another RunPod class while a Lambda A6000 sat available); and
+      * a provider handing out a broken GPU (an instance whose CUDA never comes up ->
         ``job_preempted``) is likewise escaped to another provider rather than re-rolling the same
         broken region.
 
@@ -122,14 +132,14 @@ def _submit_seed_supervised(
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
     Each attempt first ALLOCATES the GPU: the cheapest fitting class across every active provider
-    (RunPod's validated pool + any Lambda/Hyperstack class with live capacity), price-ranked. There
+    (RunPod's validated pool + any Lambda class with live capacity), price-ranked. There
     is no GPU pin — the cheapest fitting class wins the first attempt.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF checkpoint) when the
     failure looks infra-shaped: a stall (heartbeat frozen), no capacity, a client polling breakdown,
     or a platform TIMED_OUT/preemption/worker-loss. Each infra retry ESCAPES the provider that just
     failed cross-provider before walking classes within it (see ``_select_candidate``), so a
-    congested provider (RunPod queue timeout) or one handing out a broken GPU (a Hyperstack VM whose
+    congested provider (RunPod queue timeout) or one handing out a broken GPU (an instance whose
     CUDA never inits) is left for a healthy substrate rather than re-rolling the same failure.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately.
@@ -181,6 +191,10 @@ def _submit_seed_supervised(
                 runpod_api.delete_endpoint(eid)
 
     max_retries = int(spec.gpu.max_retries)
+    # The effective GPU-walk budget for infra-shaped failures: floored to INFRA_RETRY_FLOOR so a streak
+    # of broken/busy GPUs is walked past to a healthy host, but only when the user left retries enabled
+    # (max_retries==0 stays 0 — a deliberate single-shot run is never forced to retry).
+    infra_budget = max(max_retries, INFRA_RETRY_FLOOR) if max_retries else 0
     last_detail = None
     # Sticky: once a no-capacity failure shows the weight-cache datacenter set is starved, drop the
     # cache (volume) for every remaining attempt so they run on the unrestricted all-DC pool.
@@ -211,7 +225,7 @@ def _submit_seed_supervised(
     # (the fallback would silently steal the only user retry). ``walk_attempt`` = attempt index with the
     # cache-drop attempt(s) removed, so the GPU walk gets its full budget AFTER a cache drop.
     cache_drop_consumed = 0
-    for attempt in range(max_retries + 1 + cache_fallback_attempts):
+    for attempt in range(infra_budget + 1 + cache_fallback_attempts):
         walk_attempt = attempt - cache_drop_consumed
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
@@ -231,18 +245,18 @@ def _submit_seed_supervised(
                 except Exception:
                     # Logging the host-escape note is cosmetic; never let it abort the retry.
                     pass
-            elif last_handle.get("provider") in ("lambda", "hyperstack"):
+            elif last_handle.get("provider") == "lambda":
                 # An instance-based provider bills until terminated: tear the previous attempt's
                 # instance down so the retry lands on a fresh host (and we stop paying for the sick
                 # one). Dispatched generically through the handle's provider (destroy() knows the
-                # provider's own id field — instance_id for Lambda, vm_id for Hyperstack).
+                # provider's own id field — instance_id for Lambda).
                 with contextlib.suppress(Exception):
                     from flash.providers import get_provider
                     from flash.providers.base import JobHandle
 
                     _prov = last_handle["provider"]
                     get_provider(_prov).destroy(JobHandle.from_dict(last_handle))
-                    _iid = last_handle.get("instance_id") or last_handle.get("vm_id")
+                    _iid = last_handle.get("instance_id")
                     print(
                         f"retry {attempt}: terminated {_prov} instance {_iid} (escaping sick host)",
                         file=log,
@@ -317,7 +331,7 @@ def _submit_seed_supervised(
                 and chosen.provider == "runpod"
             )
             on_last_gpu = len(untried) <= 1 or (
-                walk_attempt >= max_retries and not cache_fallback_available
+                walk_attempt >= infra_budget and not cache_fallback_available
             )
             # Mirror into the closure cell so on_handle persists THIS attempt's value (see
             # current_on_last_gpu) for a recovery to reproduce the same stall tuning.
@@ -353,7 +367,7 @@ def _submit_seed_supervised(
                 # GraphQL "Something went wrong" x3 during a retry deploy). That must
                 # consume a retry, not kill the run — the budget exists precisely for flakes.
                 res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
-                if attempt < max_retries:
+                if attempt < infra_budget:
                     time.sleep(10 * (attempt + 1))  # let the transient clear
         if res.ok:
             # A best-effort cancel may fail to stop the worker, which then completes
@@ -393,7 +407,7 @@ def _submit_seed_supervised(
         # cross-region attempt instead of looping on the same volume-backed spec (the IN_QUEUE-forever /
         # persistent-volume-failure block). Sticky: once dropped it stays dropped. A non-volume flake
         # (stall/preempt) keeps the cache so the warm-weights benefit survives ordinary retries.
-        # Gate to RunPod: instance providers (Lambda/Hyperstack) already fall back to a cold run
+        # Gate to RunPod: instance providers (Lambda) already fall back to a cold run
         # per-region INSIDE the launch walk, so their no_capacity isn't cache-caused. Only the SHARED
         # platform cache triggers it (gate on the exact name); a non-shared per-org/custom volume is the
         # intended escape-hatch isolation (runner._assign_weight_cache_volume) and must NOT be stripped.
@@ -412,7 +426,7 @@ def _submit_seed_supervised(
         # continues with the reserved cache-less fallback attempt.
         print(
             f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < max_retries or first_cache_drop) else 'not retrying'}"
+            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < infra_budget or first_cache_drop) else 'not retrying'}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
@@ -423,7 +437,7 @@ def _submit_seed_supervised(
         # available. The bonus attempt granted above is reserved for exactly this transition; once the
         # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
         # and the loop cannot spin past its one extra cache-less attempt.
-        if walk_attempt >= max_retries and not first_cache_drop:
+        if walk_attempt >= infra_budget and not first_cache_drop:
             break
         if first_cache_drop:
             drop_weight_cache = True
@@ -576,48 +590,44 @@ def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
 
 def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
     """Bill a successfully completed external run without changing its training result."""
-    from flash.runner import _update, get_status
+    _charge_completed_run_by_id(spec.run_id, log)
+
+
+def _charge_completed_run_by_id(run_id: str, log) -> None:
+    """Bill a completed external run by run id, without changing its training result.
+
+    The charge reads everything it needs from the persisted ``RunStatus`` (``billing_context`` +
+    ``cost_usd`` + the raw ``spec`` dict), so a run id is the only input. The retry sweep calls this
+    directly so a legacy/stale persisted spec that ``JobSpec.from_dict`` would reject does NOT block
+    recovery of a real pending/failed charge."""
+    from flash.runner import get_status, record_billing_state
     from flash.server.auth import INTERNAL_KEY_ENV
     from flash.server.billing import BillingError, charge_completed_run
 
-    status = get_status(spec.run_id)
+    status = get_status(run_id)
     if not status.billing_context or status.billing_state == "charged":
         return
 
     internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
     if not internal_key:
         detail = f"{INTERNAL_KEY_ENV} is not configured; completed run was not billed"
-        _update(
-            spec.run_id,
-            get_status(spec.run_id).state,
-            billing_state="failed",
-            billing_error=detail,
-        )
+        # Field-only billing write that re-reads state under the lock: never overwrite a `deployed`
+        # that a concurrent /deploy may have written since we last read the run.
+        record_billing_state(run_id, billing_state="failed", billing_error=detail)
         print(f"billing failed: {detail}", file=log, flush=True)
         return
 
-    _update(
-        spec.run_id,
-        get_status(spec.run_id).state,
-        billing_state="charging",
-        billing_error=None,
-    )
-    status = get_status(spec.run_id)
+    record_billing_state(run_id, billing_state="charging", billing_error=None)
+    status = get_status(run_id)
     try:
         charge = charge_completed_run(internal_key=internal_key, status=status)
     except BillingError as exc:
-        _update(
-            spec.run_id,
-            get_status(spec.run_id).state,
-            billing_state="failed",
-            billing_error=exc.detail,
-        )
+        record_billing_state(run_id, billing_state="failed", billing_error=exc.detail)
         print(f"billing failed: {exc.detail}", file=log, flush=True)
         return
 
-    _update(
-        spec.run_id,
-        get_status(spec.run_id).state,
+    record_billing_state(
+        run_id,
         billing_state="charged",
         billing_error=None,
         billing_charge=charge,
@@ -660,13 +670,13 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
-    # Instance-based providers (Lambda, Hyperstack) bill until terminated: the runner's per-attempt
+    # Instance-based providers (Lambda) bill until terminated: the runner's per-attempt
     # `finally` already tears them down, but a crashed supervisor thread can leave one behind. Reap
     # any instance still named for this run via each configured provider's gc (best-effort).
     from flash.providers import available_providers, get_provider
 
     _avail = available_providers()
-    for _prov in ("lambda", "hyperstack"):
+    for _prov in ("lambda",):
         if _prov in _avail:
             with contextlib.suppress(Exception):
                 get_provider(_prov).gc(spec)

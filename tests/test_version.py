@@ -16,7 +16,7 @@ from flash import __version__
 
 def _run(args):
     return subprocess.run(
-        [sys.executable, "-m", "flash.cli.main", *args],
+        [sys.executable, "-m", "flash.cli", *args],
         cwd=ROOT,
         text=True,
         stdout=subprocess.PIPE,

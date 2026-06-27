@@ -94,12 +94,12 @@ def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
 def test_cold_start_calibrated_to_real_short_sft_run():
     # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
     # the recipe batch) was cold-start-dominated (a fresh worker spent ~12.5 min in model load).
-    # Static pricing picks the cheapest fitting class; with 24 GB as the floor (sub-24 GB classes
-    # dropped) that's the L4 ($0.39). 26 = ceil(391 / 32) * 2 epochs.
+    # Static pricing picks the cheapest fitting class; the cheapest managed card is the 48 GB
+    # RTX A6000 ($0.49). 26 = ceil(391 / 32) * 2 epochs.
     e = estimate_cost(RunConfig(SMALL, "sft", 26))
-    assert e.gpu == "L4"
-    assert e.gpu_hourly_usd == pytest.approx(0.39, abs=1e-3)
-    assert e.total_usd == pytest.approx(0.082, rel=0.10)
+    assert e.gpu == "RTX A6000"
+    assert e.gpu_hourly_usd == pytest.approx(0.49, abs=1e-3)
+    assert e.total_usd == pytest.approx(0.0773, rel=0.10)
     # Model load (not boot/deps) is the dominant cold-start term for a short job.
     assert e.setup_seconds > e.train_seconds  # cold start dominates this short run
 
@@ -183,6 +183,24 @@ def test_9b_bf16_grpo_needs_an_80gb_class():
     e = estimate_cost(RunConfig(BIG, "grpo", 100))
     assert e.required_vram_gb >= 80
     assert e.gpu_vram_gb >= 80
+
+
+def test_35b_moe_long_context_grpo_sized_past_the_b200():
+    # The 35B MoE colocated GRPO holds two ~70 GB weight copies + a KV pool on ONE 180 GB B200, so a
+    # long rollout context overflows it. The grpo_min_vram_gb floor engages the seq escalation, keyed
+    # on the ~3B ACTIVE params (not the 35B total): default/moderate GRPO stays on the B200, but a
+    # 32k-token run is sized PAST 180 GB so it's rejected at parse time rather than booted-then-OOM'd.
+    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+
+    moe = "Qwen/Qwen3.6-35B-A3B"
+    # default + moderate context fit the single B200 (<= 180 GB).
+    assert alloc_required_vram_gb(moe, "grpo", train={}, thinking=False) <= 180
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 8192}, thinking=False) <= 180
+    # a 32k-token rollout is sized ABOVE the 180 GB B200 (the biggest single card) -> nothing fits.
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 32768}, thinking=False) > 180
+    # The GRPO escalation is GRPO-only: default SFT stays at its 180 GB floor (fits the B200). (Long-
+    # context SFT has its OWN large-vocab fp32-logits growth, independent of this grpo escalation.)
+    assert alloc_required_vram_gb(moe, "sft", train={}, thinking=False) <= 180
 
 
 def test_invalid_config_rejected():

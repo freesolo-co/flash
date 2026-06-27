@@ -183,7 +183,7 @@ _VOCAB_DEFAULT = 248_320
 # (rl_per_device_comps spills the rest into grad-accum), so the estimator never reserves above it.
 _LOGITS_BUDGET_GB = 6.0
 
-# ---- SFT big-vocab logits: the SFT analog of the GRPO fp32-logits term above ----
+# SFT big-vocab logits: the SFT analog of the GRPO fp32-logits term above
 # When the worker's fused cross-entropy (Liger) is OFF, an SFT forward materializes the FULL-sequence
 # [per_device, seq_len, vocab] logits AND keeps their gradient live through the backward. At
 # Qwen3.5's ~248k vocab this is the documented big-vocab SFT OOM driver (a 0.8B SFT OOM'd a 24 GB
@@ -298,6 +298,7 @@ def estimate_vram_gb(
     use_vllm: bool = True,
     vocab: int = _VOCAB_DEFAULT,
     sleep_offload: bool = True,
+    active_params_b: float | None = None,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU, over the full knob matrix.
 
@@ -312,12 +313,21 @@ def estimate_vram_gb(
                    use_vllm is False (transformers generation, single copy)
         kv         vLLM KV pool ~ seq x sqrt(params)
         logits     fp32 logits [per_device_comps, completion, vocab]
-    """
+
+    MoE: ``active_params_b`` (params ACTIVE per token; set for an A-xB MoE) drives the terms that
+    scale with the dense BACKBONE / per-token compute -- activations, KV pool, and the
+    rank-linear LoRA optimizer (LoRA targets the attention/router backbone, not the fused experts).
+    The ``weights`` term stays on the FULL ``params_b`` (every expert is resident). So a 35B-A3B
+    sizes its activations/KV like a ~3B model while still reserving the full 70 GB of weights --
+    which is what lets it fit a much smaller card than its total size implies. ``None``/0 (dense)
+    falls back to ``params_b`` for every term (unchanged)."""
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp
+    # Backbone/compute scale: the active params for an MoE, else the full size.
+    eff_b = float(active_params_b) if active_params_b else params_b
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
-    width = math.sqrt(max(params_b, 0.1))
-    lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * params_b)
+    width = math.sqrt(max(eff_b, 0.1))
+    lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * eff_b)
     base = weights + _BASE_OVERHEAD_GB + lora_opt
     if algo == "grpo":
         # GRPO alternates two phases that DON'T peak together (sleep mode offloads the
@@ -336,7 +346,7 @@ def estimate_vram_gb(
                 # rollout context for the whole generation group) is held alongside training -- size it
                 # to the real context, matching colocate_kv_util's non-sleep budget, instead of the
                 # flat _KV_CAP (which let grpo_fits_resident wrongly admit long-context runs).
-                rollout = weights + _resident_kv_gb(params_b, seq_len, group_size)
+                rollout = weights + _resident_kv_gb(eff_b, seq_len, group_size)
         group_factor = max(1.0, (max(1, group_size) / 4.0) ** 0.5)
         think_factor = 1.3 if thinking else 1.0
         activations = _TRAIN_COEF * (seq_len / 1024.0) * width * group_factor * think_factor
@@ -475,6 +485,7 @@ def model_required_vram_gb(
         quant: str = "bf16",
         use_vllm: bool = True,
         vocab: int = _VOCAB_DEFAULT,
+        active_params_b: float | None = None,
     ) -> int:
         # estimate over the run's full knob matrix, then apply the safety headroom. Both the
         # catalog and open-model paths size through here so they stay in sync on the knob set.
@@ -490,6 +501,7 @@ def model_required_vram_gb(
             thinking=thinking,
             use_vllm=use_vllm,
             vocab=vocab,
+            active_params_b=active_params_b,
         )
         return math.ceil(est * headroom)
 
@@ -506,15 +518,36 @@ def model_required_vram_gb(
         # GRPO always runs the rollout on a colocated vLLM engine, so sizing must reserve room for
         # the 2nd (rollout) weight copy on the same card.
         use_vllm = True
-        need = _need(params_b or 4.0, algorithm, quant=quant, use_vllm=use_vllm, vocab=model_vocab)
+        # MoE: the curated active-per-token count sizes the backbone/compute terms (activations, KV,
+        # LoRA), while ``params_b`` still sizes the resident weights. 0/dense -> falls back to params_b.
+        active_b = float(getattr(info, "active_params_b", 0.0) or 0.0)
+        need = _need(
+            params_b or 4.0,
+            algorithm,
+            quant=quant,
+            use_vllm=use_vllm,
+            vocab=model_vocab,
+            active_params_b=active_b,
+        )
         # Hard floor the param-based matrix can't see: a curated GRPO floor.
         floor = 0
         if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
             floor = int(info.grpo_min_vram_gb)
-        # Big-model GRPO is TIGHT at its floor (2 weight copies + KV pool), so long context
-        # overflows it -> escalate to a bigger tier. See grpo_seq_escalation_gb.
+        # SFT analog: a curated SFT floor pins a very large checkpoint to a bigger card than its raw
+        # param estimate would pick (e.g. the 35B MoE's ~89 GB est would otherwise down-route to a
+        # 96 GB card with a thin margin over its 70 GB frozen weights -> floor it to the 180 GB B200).
+        if not is_grpo and getattr(info, "sft_min_vram_gb", 0):
+            floor = max(floor, int(info.sft_min_vram_gb))
+        # Big-model GRPO is TIGHT at its floor (2 weight copies + KV pool), so long context overflows
+        # it -> escalate to a bigger tier (or, when already on the biggest card, push the requirement
+        # PAST every GPU so the run is REJECTED at parse time instead of booting and OOMing in vLLM's
+        # KV alloc). The KV/colocate pressure scales with the ATTENTION width — the ACTIVE params — so
+        # escalate on active_params_b for an MoE; keying on the 35B TOTAL would over-reject (its dense
+        # ~1385-token threshold sits below the default GRPO rollout length, breaking ordinary GRPO),
+        # while the ~3B active gives ~16k tokens of headroom that still rejects a 32k run. Dense models
+        # leave active_params_b unset -> falls back to params_b, unchanged. See grpo_seq_escalation_gb.
         if is_grpo and floor:
-            floor += grpo_seq_escalation_gb(params_b, seq_len)
+            floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
         need = max(need, floor)
         # vLLM-colocate floor: the engine (CUDA context + KV pool sized to the CARD's VRAM +
         # framework) + the 2nd resident weight copy add a ~constant the param estimate misses,

@@ -321,12 +321,14 @@ def test_cache_bind_uses_returned_mount_point(monkeypatch):
     assert "/lambda/nfs/flash-weights" not in calls[0]["user_data"]
 
 
-def test_cache_payload_points_hf_home_at_the_bind(monkeypatch):
-    """The base64 payload's worker env redirects HF_HOME onto the bind (so the model download persists)."""
+def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
+    """The base64 payload points the base-model prefetch (FLASH_WEIGHT_CACHE_DIR) at the bind so the
+    model download persists — NOT a process-global HF_HOME, so env/reward downloads stay ephemeral (#252)."""
     from flash.providers.lambdalabs.jobs import build_payload
 
     payload = build_payload(_spec(network_volume="flash-weights"), 0, 0, cache_host_mount="/lambda/nfs/flash-weights")
-    assert payload["env"]["HF_HOME"] == "/weight-cache/hf-cache"
+    assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
+    assert "HF_HOME" not in payload["env"]
     assert payload["cache_host_mount"] == "/lambda/nfs/flash-weights"
     assert "cache_block_device" not in payload  # NFS: no format/mount preamble
 
@@ -512,11 +514,11 @@ def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boo
         def read(force=False):
             if path.endswith("/DONE"):
                 return done() if callable(done) else done
-            if "lambda_attempt" in path:
+            if "lambda_attempt" in path and path.endswith(".json"):  # not the _boot.log
                 return marker() if callable(marker) else marker
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
-            if path.endswith("lambda_boot.log"):
+            if path.endswith("_boot.log"):  # attempt-scoped: lambda_attempt<N>_boot.log
                 return boot() if callable(boot) else boot
             if "/error_" in path:
                 return error() if callable(error) else error
@@ -642,7 +644,10 @@ def test_poll_loading_timeout(monkeypatch):
 
 def test_poll_heartbeat_stall(monkeypatch):
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
-    frozen = {"stage": "rl", "step": 3, "ts": 1.0}
+    # A FRESH training heartbeat (ts >= launch 10_000) that then FROZE: it proves liveness (so the
+    # fast first-liveness failover is satisfied) AND arms the tight training stall window, so the
+    # subsequent no-progress gap past stall_after_s is the stall actually under test here.
+    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0}
     res = jobs.poll_lambda_job(
         _handle(),
         _spec(),
@@ -654,6 +659,204 @@ def test_poll_heartbeat_stall(monkeypatch):
     assert not res.ok
     assert res.failure == "stalled"
     assert "no worker progress" in res.detail
+
+
+def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
+    """The observed Lambda us-east-1 sick region: the instance reaches OS 'active' but the worker
+    NEVER starts — no host boot.log, no heartbeat, no marker. The first-liveness deadline fails it
+    over fast as a retriable 'stalled' (escaped cross-provider by the runner) instead of burning the
+    full ~50 min setup grace."""
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=500.0)
+    assert not res.ok
+    assert res.failure == "stalled"  # infra-shaped -> retried + escaped cross-provider (PR #241)
+    assert "no worker liveness" in res.detail
+    assert "limit 500s" in res.detail
+
+
+def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
+    """A HEALTHY box still in its long cold start (multi-GB image pull) emits the host boot.log but
+    no heartbeat yet — the first-liveness deadline must NOT fire (that would kill a good box). Modeled
+    by an active box whose attempt-scoped boot.log is present; it later dies, so the terminal result
+    is job_preempted, NOT the 'no worker liveness' stalled."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        boot="+ docker pull ... (still pulling the worker image)",
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert not res.ok
+    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):
+    """An empty ("") boot.log still proves cloud-init ran — its mere EXISTENCE is liveness. A bare
+    ``not boot_log_reader()`` would treat "" as absent and spuriously fail the box over; the fix uses
+    ``is None``. Box later dies as a host loss -> job_preempted, NOT the 'no worker liveness' stall."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        boot="",
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_boot_log_seen_once_survives_rate_limited_none(monkeypatch):
+    """Regression: make_hf_text_reader returns None for BOTH a missing boot.log AND a rate-limited
+    read, so a bare ``not boot_log_reader()`` re-checked each poll would spuriously stall a HEALTHY box
+    on the first throttled read after the log was already seen. The boot.log is read with force=True and
+    latched once observed, so a later None can't re-trigger failover. Modeled by a boot.log present on
+    the first read then None (rate-limited) after; the box later dies -> job_preempted, not stalled."""
+    calls = {"n": 0}
+
+    def boot_then_rate_limited():
+        calls["n"] += 1
+        return "+ docker pull ..." if calls["n"] == 1 else None  # seen once, then "rate-limited"
+
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[
+            {"status": "active"}, {"status": "active"}, {"status": "active"}, {"status": "terminated"}
+        ],
+        boot=boot_then_rate_limited,
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"  # NOT a spurious 'stalled' from the throttled None
+    assert "no worker liveness" not in (res.detail or "")
+    # Latched after the first observation: the liveness check reads the boot.log once (not once per
+    # poll); the only other read is the terminal-failure-detail surfacer when the box dies.
+    assert calls["n"] <= 2
+
+
+def test_poll_active_transient_boot_log_error_does_not_fail_over(monkeypatch):
+    """make_hf_text_reader returns None for a MISSING boot.log AND a momentary HF/Hub network error,
+    so a lone forced-read None at the first-liveness deadline must NOT immediately stall — a transient
+    blip clears on the next poll (the absence must persist BOOT_LOG_ABSENT_POLLS times to fail over).
+    Here the first forced read errors (None), the next returns the real boot.log -> latched, no
+    failover; the box later dies -> job_preempted, NOT a spurious 'stalled' from the one transient
+    None."""
+    calls = {"n": 0}
+
+    def transient_then_present():
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "+ docker pull ..."  # transient error first, then readable
+
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        boot=transient_then_present,
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"  # the single transient None did not trip a failover
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypatch):
+    """The genuine sick-region case: the boot.log is absent on EVERY forced read (cloud-init never
+    ran). After BOOT_LOG_ABSENT_POLLS consecutive absent reads the first-liveness check declares the
+    region 'stalled' (retriable, escaped cross-provider). Asserts the absence-count threshold is what
+    gates the failover, not a single read."""
+    from flash.providers._poll import BOOT_LOG_ABSENT_POLLS
+
+    calls = {"n": 0}
+
+    def always_absent():
+        calls["n"] += 1  # implicit None: every forced read comes back absent
+
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], boot=always_absent, step=100.0
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+    assert calls["n"] >= BOOT_LOG_ABSENT_POLLS  # required the absence to persist, not a lone None
+
+
+def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
+    """Any FRESH heartbeat (even the early 'boot' stage) proves the worker started, so the
+    first-liveness deadline is satisfied and must not fire."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        first_liveness_s=50.0,
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
+    )
+    assert res.failure == "job_preempted"
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_stale_heartbeat_does_not_satisfy_liveness(monkeypatch):
+    """A LEFTOVER heartbeat from a PRIOR attempt (ts < this launch; the heartbeat path is not
+    attempt-scoped) must NOT disarm the deadline — otherwise the retry INTO the sick region it must
+    catch would be let through. With no fresh boot.log either, first-liveness still fires."""
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=10_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        first_liveness_s=50.0,
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 1.0},  # < launch
+    )
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+
+
+def test_poll_reattach_already_active_anchors_liveness_to_launch(monkeypatch):
+    """On a reattach after a control-plane restart, the FIRST status read is already ACTIVE
+    (last_status starts None, so it is not a transition). active_since must stay anchored to LAUNCH,
+    so a box silent since before the restart fails over on the first tick rather than getting a fresh
+    full first-liveness window. (Clock starts 10_000; launch was 5_000s earlier.)
+
+    The box is silent for ~5_000s — already PAST the 3_000s setup grace — so the setup-grace stall
+    (which needs no boot.log read) fires immediately, before the first-liveness check accumulates its
+    BOOT_LOG_ABSENT_POLLS confirmations. Either way it's a retriable ``stalled`` and the reported
+    elapsed (~5_000s) is measured from LAUNCH, not the reattach (~0s) — which is what proves the
+    anchoring. A fresh launch (elapsed < setup grace) still fails over via the fast first-liveness
+    path well before the setup grace, so the FAST-failover guarantee is unaffected."""
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=500.0
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    # Elapsed counts from LAUNCH (~5_000s ago), not the reattach (~0s) — proves active_since stayed
+    # anchored. Asserted as a floor (not an exact tick) so the terminal-artifact force-read before the
+    # stall return can't make this brittle on the precise fake-clock count.
+    elapsed = int(res.detail.split("for ", 1)[1].split("s", 1)[0])
+    assert elapsed >= 5_000, res.detail
+
+
+def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
+    """The host boot-log uploader must run BEFORE the docker image pull (so a box that ran cloud-init
+    leaves an HF liveness artifact within ~2 min, well before the worker's first heartbeat), and its
+    HF path must be attempt-scoped so a prior attempt's boot.log can't falsely prove liveness."""
+    from flash.providers.lambdalabs.jobs import builders
+
+    monkeypatch.setenv("LAMBDA_API_KEY", "lk")
+    monkeypatch.setenv("HF_TOKEN", "hf")
+    payload = builders.build_payload(_spec(), seed=0, attempt=2)
+    script = builders.build_user_data(payload)
+    # the uploader INVOCATION precedes the image pull
+    assert "python3 /opt/flash/hostlog.py" in script
+    assert "docker pull" in script
+    assert script.index("python3 /opt/flash/hostlog.py") < script.index("docker pull")
+    # attempt-scoped boot.log path is emitted by the embedded uploader
+    assert '_attempt" + str(att) + "_boot.log' in script
 
 
 def test_poll_recovery_seeds_load_clock_from_launch(monkeypatch):
@@ -750,7 +953,12 @@ def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
     measured from launch. (Clock starts 10_000; launch 9000; old heartbeat ts 8000 < launch.)"""
     import re
 
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    # boot.log present: the box DID run cloud-init THIS attempt (so the fast first-liveness failover
+    # is satisfied), isolating the behavior under test — a STALE heartbeat must not arm the tighter
+    # training stall, leaving the longer SETUP grace to govern.
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
+    )
     stale = {"stage": "rl", "step": 2, "ts": 8000.0}  # training stage, but predates this launch
     res = jobs.poll_lambda_job(
         _handle(started_ts=9_000.0),
@@ -765,6 +973,36 @@ def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
     assert res.failure == "stalled"
     # Stalls on SETUP grace (3000s from launch), not the tighter 500s training window the stale
     # heartbeat would have armed -> the reported idle time exceeds the training budget.
+    assert "setup (pre-training)" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    assert int(m.group(1)) >= 3000, res.detail
+
+
+def test_poll_gapfill_step0_keeps_setup_grace(monkeypatch):
+    """The train-liveness gap-filler emits rl_step/sft_step at step=0 throughout the silent FIRST step
+    (a cold rollout can run minutes before global_step ticks to 1). That FRESH, non-setup but step-0
+    heartbeat proves liveness yet must NOT tighten to the training window before any step completed —
+    the larger SETUP grace must still govern (RunPod has the same step>=1 guard). (Clock starts
+    10_000; launch 9000; fresh gap-fill ts 9500 >= launch but step 0.)"""
+    import re
+
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
+    )
+    gapfill = {"stage": "rl_step", "step": 0, "ts": 9500.0}  # fresh, non-setup, but step 0
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: gapfill,
+        setup_grace_s=3000.0,
+        stall_after_s=500.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    # SETUP grace (3000s) governs, not the tighter 500s training window a step-0 ping would have armed.
     assert "setup (pre-training)" in res.detail
     m = re.search(r"for (\d+)s", res.detail)
     assert m is not None, res.detail
@@ -822,7 +1060,8 @@ def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
 
     captured = {}
 
-    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None):
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None,
+                  first_liveness_s=None, setup_grace_s=None):
         captured["deadline_s"] = deadline_s
         from flash.providers.base import PollResult
 
@@ -835,6 +1074,39 @@ def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
     handle = JobHandle.from_dict({"provider": "lambda", **_handle(started_ts=1.0).to_dict()})
     LambdaProvider().poll(handle, spec, seed=0)
     assert captured["deadline_s"] == max(60.0, 3600 + PROVISION_GRACE_S)
+
+
+def test_provider_poll_uses_uniform_wait_ignoring_on_last_gpu(monkeypatch):
+    """The instance recovery poll uses a UNIFORM per-GPU wait: a persisted on_last_gpu does NOT scale
+    first_liveness / setup grace — the poll relies on its unscaled defaults, matching the submit path.
+    (on_last_gpu stays a Provider-interface param for RunPod; the instance providers ignore it.)"""
+    from flash.providers.base import JobHandle
+    from flash.providers.lambdalabs import LambdaProvider
+
+    captured = {}
+
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None,
+                  first_liveness_s=None, setup_grace_s=None):
+        captured["first_liveness_s"] = first_liveness_s
+        captured["setup_grace_s"] = setup_grace_s
+        from flash.providers.base import PollResult
+
+        return PollResult(True)
+
+    monkeypatch.setattr("flash.providers.lambdalabs.jobs.poll_lambda_job", fake_poll)
+    monkeypatch.setattr("flash.providers.lambdalabs.api.terminate_instances", lambda ids: ids)
+    spec = _spec()
+    # on_last_gpu=True must NOT override the timing -> the poll's unscaled defaults apply.
+    handle = JobHandle.from_dict({**_handle().to_dict(), "provider": "lambda", "on_last_gpu": True})
+    LambdaProvider().poll(handle, spec, seed=0)
+    assert captured["first_liveness_s"] is None  # not overridden -> poll uses its uniform default
+    assert captured["setup_grace_s"] is None
+    # on_last_gpu absent/False -> identical uniform wait.
+    captured.clear()
+    handle2 = JobHandle.from_dict({**_handle().to_dict(), "provider": "lambda"})
+    LambdaProvider().poll(handle2, spec, seed=0)
+    assert captured["first_liveness_s"] is None
+    assert captured["setup_grace_s"] is None
 
 
 def test_poll_surfaces_worker_progress_in_log(monkeypatch):
@@ -937,6 +1209,41 @@ def test_instance_label_always_sweepable():
 
     assert instance_label("flash-1700-abcd", 0, 1) == "flash-1700-abcd-s0-a1"
     assert instance_label("fail-fast", 0, 0) == "flash-fail-fast-s0-a0"  # prefix forced
+
+
+def test_instance_label_bounds_seed_and_attempt():
+    """The seed/attempt suffix is the only caller-supplied text appended after the (already-bounded)
+    run prefix: an absurd seed OR attempt (or a non-int) must NOT push the name past the 60-char
+    provider cap, which would get the name silently truncated and desync it from the sweep-matched
+    prefix. BOTH numeric fields are bounded so the WHOLE suffix stays <= _SUFFIX_BUDGET."""
+    from flash.providers._instance import _MAX_NAME, _SUFFIX_BUDGET, run_label_prefix
+    from flash.providers.lambdalabs.jobs.builders import instance_label
+
+    def suffix_of(rid, label):
+        return label[len(run_label_prefix(rid)) :]
+
+    # Normal small ids: unchanged.
+    assert instance_label("flash-1700000000-abcd1234", 0, 0) == "flash-1700000000-abcd1234-s0-a0"
+    # Absurdly large seed: name stays within the cap (and keeps the -a boundary).
+    rid = "flash-1700000000-abcd1234"
+    huge = instance_label(rid, 123456789012345, 0)
+    assert len(huge) <= _MAX_NAME
+    assert len(suffix_of(rid, huge)) <= _SUFFIX_BUDGET
+    assert "-a0" in huge
+    # Absurdly large ATTEMPT (corrupt) alone: still bounded (the earlier fix only trimmed seed).
+    huge_att = instance_label(rid, 0, 999999999999)
+    assert len(huge_att) <= _MAX_NAME
+    assert len(suffix_of(rid, huge_att)) <= _SUFFIX_BUDGET
+    assert huge_att.startswith(rid + "-s")  # framing + prefix intact for sweep matching
+    # BOTH seed and attempt huge together: whole suffix bounded.
+    both_huge = instance_label(rid, 123456789, 987654321)
+    assert len(both_huge) <= _MAX_NAME
+    assert len(suffix_of(rid, both_huge)) <= _SUFFIX_BUDGET
+    # A long run id AND both fields huge together still fit.
+    both = instance_label("flash-" + "x" * 80, 99999999999, 7777777)
+    assert len(both) <= _MAX_NAME
+    # A non-int seed/attempt degrades to 0 instead of crashing / overflowing.
+    assert instance_label(rid, "weird", "bad").startswith(rid + "-s0-a0")
 
 
 def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
@@ -1358,7 +1665,11 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
     """Bug: a container that fast-fails on a real user/config error uploads its own ok=false marker,
     then the host's ~5s liveness check fires fail() and would CLOBBER it with a retriable host
     marker (relabeling the user error as job_preempted). The host failmark must SKIP the write when
-    a worker attempt marker already exists at the path (and stay conservative on a read error)."""
+    a worker attempt marker already exists at the path (and stay conservative on a read error).
+
+    Also covers the TOCTOU race: the worker can write its marker in the window BETWEEN the initial
+    existence check and the host upload, so the failmark RE-checks immediately before uploading and
+    still skips if the worker's marker has appeared."""
     import sys
     import types
 
@@ -1366,9 +1677,14 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
 
     payload = {"flash_arm": "lambda", "attempt": 0, "hf_prefix": "sft/x/seed0", "hf_repo": "o/r", "env": {}}
 
-    def run_failmark(worker_marker_exists, read_raises=False):
-        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads."""
+    def run_failmark(exists_seq=(False,), read_raises=False):
+        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads.
+
+        ``exists_seq`` is the sequence of file_exists() return values across the (up to two) checks
+        the script makes; the last value repeats once exhausted."""
         uploaded = []
+        seq = list(exists_seq)
+        calls = {"n": 0}
 
         class FakeApi:
             def __init__(self, token=None):
@@ -1377,7 +1693,9 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
             def file_exists(self, *, repo_id, filename, repo_type):
                 if read_raises:
                     raise RuntimeError("hf down")
-                return worker_marker_exists
+                i = min(calls["n"], len(seq) - 1)
+                calls["n"] += 1
+                return seq[i]
 
             def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
                 uploaded.append(path_in_repo)
@@ -1392,8 +1710,10 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
         return uploaded
 
     # Worker already wrote its marker -> host must NOT clobber it.
-    assert run_failmark(worker_marker_exists=True) == []
-    # No worker marker (never-started container) -> host failmark IS written.
-    assert run_failmark(worker_marker_exists=False) == ["sft/x/seed0/lambda_attempt0.json"]
+    assert run_failmark(exists_seq=(True,)) == []
+    # No worker marker at all (never-started container) -> host failmark IS written.
+    assert run_failmark(exists_seq=(False,)) == ["sft/x/seed0/lambda_attempt0.json"]
     # HF read error -> conservative: skip the write (never risk clobbering).
-    assert run_failmark(worker_marker_exists=False, read_raises=True) == []
+    assert run_failmark(exists_seq=(False,), read_raises=True) == []
+    # RACE: absent on the first check, present on the re-check (worker uploaded in the gap) -> SKIP.
+    assert run_failmark(exists_seq=(False, True)) == []
