@@ -1,20 +1,7 @@
-"""Pre-compile the worker's hot kernels on a real GPU and persist a portable mega-cache.
+"""Pre-compile hot worker kernels on a GPU builder and persist a portable mega-cache.
 
-Run this ON A GPU BUILDER (an image-build runner that actually has the target arch's GPU) to kill
-the ~10-15 min first-use JIT that #194 reintroduced on a cold worker. It warms the kernels the
-trainer hits early — FlashAttention fwd/bwd, the Liger fused cross-entropy, flash-linear-attention's
-Gated-DeltaNet (Qwen3.5/3.6 hybrid), and a representative ``torch.compile`` — then calls
-``torch.compiler.save_cache_artifacts()`` to write ONE portable mega-cache blob into the cache dir.
-``load_mega_cache`` (re-exported as ``flash.engine.worker.load_mega_cache``) loads it back at worker
-boot (``torch.compiler.load_cache_artifacts``); the Dockerfile bakes the produced ``build/kernel_cache/``
-into the image when built with ``--build-arg BUILD_KERNEL_CACHE=true``.
-
-Measured: cold compile ~124s -> warm load ~0.2s (537x).
-
-This module is import-safe WITHOUT torch installed (it must ``py_compile`` on the CPU-only CI image
-that builds the worker): every heavy import lives INSIDE a function. Everything is best-effort —
-each warm step is independently guarded so a missing/uncompilable kernel never aborts the bake; we
-save whatever did compile. CLI: ``python -m flash.engine.worker.kernel_warmup --arch <sm> --out <dir>``.
+Measured: cold compile ~124s -> warm load ~0.2s. Import-safe without torch (every heavy import is
+inside a function). CLI: ``python -m flash.engine.worker.kernel_warmup --arch <sm> --out <dir>``.
 """
 
 from __future__ import annotations
@@ -25,22 +12,16 @@ import os
 import tempfile
 import time
 
-# Default bake dir. Mirrors the Dockerfile's /opt/flash/kernelcache; the saved mega-cache file lands
-# directly under it so ``load_mega_cache`` (the boot-time reader below) finds it. ``load_mega_cache``
-# derives its read paths from these same constants, so the writer and reader can never drift.
 DEFAULT_CACHE_DIR = "/opt/flash/kernelcache"
 MEGA_CACHE_FILENAME = "mega_cache.bin"
 MEGA_CACHE_META_FILENAME = "mega_cache.json"
 
 
 def _log(msg: str) -> None:
-    """Single progress channel so the GPU builder's logs show each warm step."""
     print(f"[kernel-warmup] {msg}", flush=True)
 
 
 def _point_backends_at(cache_dir: str) -> None:
-    """Point Triton + TorchInductor at ``cache_dir`` so anything compiled below is content-addressed
-    under the same tree the worker reads (matches the Dockerfile ENV)."""
     os.makedirs(os.path.join(cache_dir, "triton"), exist_ok=True)
     os.makedirs(os.path.join(cache_dir, "inductor"), exist_ok=True)
     os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
@@ -53,11 +34,7 @@ def _torch_sm(torch) -> str:
 
 
 def _current_cuda_sm(torch) -> str | None:
-    """Guarded sm-detection for the BOOT-TIME cache load: returns the live GPU's arch (``smXY``) or
-    ``None`` when CUDA is unavailable / probing fails, so ``load_mega_cache`` never raises and refuses
-    to load a blob it cannot verify. (``_torch_sm`` above is the unguarded form used on the GPU builder
-    once a device is known live.)
-    """
+    """Guarded arch probe for boot-time cache load; returns None if unavailable."""
     try:
         if not torch.cuda.is_available():
             return None
@@ -68,11 +45,6 @@ def _current_cuda_sm(torch) -> str | None:
 
 
 def _require_gpu():
-    """Return the torch module if a CUDA GPU is live, else None (with a clear log).
-
-    The warm steps are only meaningful on a real GPU of the target arch — kernels are
-    content-addressed by arch + toolchain, so a CPU run would bake nothing usable.
-    """
     try:
         import torch
 
@@ -97,17 +69,14 @@ def warm_flash_attn(torch) -> bool:
             for _ in range(3)
         )
         out = flash_attn_func(q, k, v, causal=True)
-        out.sum().backward()  # exercise the bwd kernel too
+        out.sum().backward()
         torch.cuda.synchronize()
         _log("flash-attn (FA2) fwd/bwd compiled")
         warmed = True
     except Exception as e:
         _log(f"flash-attn (FA2) warm skipped: {e}")
-    # FA3 (flash_attn_interface) is HOPPER-ONLY: production selects attn_implementation="flash_attention_3"
-    # only on sm90. Launching it on any other arch runs a Hopper kernel that has no image there ->
-    # a "no kernel image" CUDA error that POISONS the context (a caught Python exception does NOT clear
-    # it), which then breaks save_cache_artifacts so the bake produces no mega_cache.bin. Only warm FA3
-    # on sm90; off-Hopper it is irrelevant anyway (the worker never selects it there).
+    # FA3 is Hopper-only: launching it on another arch produces a "no kernel image" CUDA error that
+    # POISONS the context (not cleared by Python exception) and breaks save_cache_artifacts.
     if _torch_sm(torch) == "sm90":
         try:
             import flash_attn_interface
@@ -163,16 +132,14 @@ def warm_liger_ce(torch) -> bool:
                 continue
         if loss_cls is None:
             raise ImportError("no fused-linear Liger loss class found")
-        # representative catalog vocab width (qwen3.5/3.6 lm_head ~248k); triton/liger specialize the
-        # fused-ce chunking to the vocab shape, so warm the production width, not a toy 4096.
+        # warm qwen3.5/3.6 production vocab width (~248k); triton/liger chunk specialization differs from toy 4096.
         vocab = 248_320
         hidden = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         weight = torch.randn(vocab, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         labels = torch.randint(0, vocab, (64,), device="cuda")
         loss_fn = loss_cls()
-        # upstream signature is forward(self, lin_weight, _input, target): weight first, then hidden.
-        # call the known-good form first so we never launch a mismatched shape (which would trigger a
-        # cuda illegal access and poison the context before a later attempt can run).
+        # upstream signature: forward(lin_weight, _input, target) — weight first; call known-good form
+        # first to avoid mismatched-shape CUDA illegal access that would poison the context.
         attempts = (
             lambda: loss_fn(weight, hidden, labels),
             lambda: loss_fn(weight, hidden, target=labels),
@@ -187,7 +154,7 @@ def warm_liger_ce(torch) -> bool:
                 torch.cuda.synchronize()
                 _log("liger fused-linear loss compiled")
                 warmed = True
-                break  # fall through to the model-layer warm below; don't exit the function
+                break
             except Exception:
                 continue
         else:
@@ -195,8 +162,6 @@ def warm_liger_ce(torch) -> bool:
     except Exception as e:
         _log(f"liger fused-linear warm skipped: {e}")
     try:
-        # model-layer liger kernels (rmsnorm + rope) that use_liger_kernel patches in besides the
-        # loss; these still jit on the first real forward/backward if only the ce loss was warmed.
         from liger_kernel.transformers.rms_norm import LigerRMSNorm
         from liger_kernel.transformers.rope import liger_rotary_pos_emb
 
@@ -220,9 +185,7 @@ def warm_liger_ce(torch) -> bool:
 def warm_fla_gdn(torch) -> bool:
     """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path)."""
     try:
-        # mirror the worker boot: on Hopper (sm90) the production path runs this first so fla's GDN
-        # chunk_bwd uses the CORRECT tilelang backend (fla #640: the Triton path miscomputes/raises).
-        # off-Hopper this is a no-op. bake the same backend the runtime will actually select.
+        # fla #640: GDN chunk_bwd needs tilelang on Hopper; Triton path miscomputes/raises there.
         try:
             from flash.engine.worker.perf import _ensure_fla_fastpath_on_hopper
 
@@ -243,12 +206,9 @@ def warm_fla_gdn(torch) -> bool:
         out.sum().backward()
         torch.cuda.synchronize()
         _log("flash-linear-attention GDN fwd/bwd compiled")
-        # also warm the varlen path SFT token-packing (#218) uses: BlockDiagonalCollator(emit_varlen=True)
-        # feeds cu_seq_lens into the fla DeltaNet so the recurrence resets per packed example, which
-        # compiles different chunk kernels than the equal-length call above. shape it like one packed
-        # block (batch flattened to 1) with two unequal segments.
+        # also warm varlen path (cu_seqlens) used by SFT token-packing; compiles different chunk kernels.
         try:
-            tv = 128 + 96  # two example lengths packed into one sequence
+            tv = 128 + 96
             qv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
             kv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
             vv = torch.randn(1, tv, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -279,8 +239,6 @@ def warm_chalk_kernels() -> bool:
 
         warmed = bool(install_qwen35_rope()) or warmed
         warmed = bool(install_fused_lora_delta()) or warmed
-        # embedding gather is chalk's third default gap-filler (chalk_kernels._KERNELS); import it
-        # separately so a name/version skew can't also drop the rope + lora-delta warms above.
         try:
             from chalk.transformers import install_fused_embedding
 
@@ -313,15 +271,12 @@ def warm_torch_compile(torch) -> bool:
 
 
 def save_mega_cache(torch, out_dir: str) -> bool:
-    """Persist everything compiled this session into one portable blob via
-    ``torch.compiler.save_cache_artifacts()`` so the worker can ``load_cache_artifacts`` it at boot.
-    """
+    """Persist compiled kernels into a portable blob via ``torch.compiler.save_cache_artifacts()``."""
     try:
         artifacts = torch.compiler.save_cache_artifacts()
         if not artifacts:
             _log("save_cache_artifacts returned nothing — no compiled kernels to persist")
             return False
-        # save_cache_artifacts returns (bytes, meta); persist the bytes payload.
         blob = artifacts[0] if isinstance(artifacts, tuple) else artifacts
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, MEGA_CACHE_FILENAME)
@@ -357,24 +312,12 @@ def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warm
 
 
 def load_mega_cache() -> bool:
-    """Best-effort: if a baked mega-cache blob exists, load it so the worker skips first-run JIT.
-
-    The boot-time read-side of ``save_mega_cache`` — loads the portable cache a GPU builder wrote via
-    ``torch.compiler.load_cache_artifacts()`` (measured cold compile ~124s -> warm load ~0.2s). Read
-    paths derive from ``DEFAULT_CACHE_DIR`` / ``MEGA_CACHE_FILENAME`` / ``MEGA_CACHE_META_FILENAME``,
-    the same constants the bake writes to, so reader and writer can never drift. OPT-IN: when no baked
-    cache is present (the default image build), this is a no-op and the worker JITs on first use
-    exactly as before (#163's init heartbeat covers that stall). Never raises: a missing torch /
-    missing file / unusable blob just logs and leaves the JIT path intact.
-    """
+    """Load a baked mega-cache at worker boot; no-op (returns False) if absent or wrong arch."""
     cache_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_FILENAME)
     meta_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_META_FILENAME)
 
     def _reject(reason: str) -> bool:
-        # a baked cache is present but unusable (no/garbled metadata or wrong arch): repoint
-        # triton/inductor OFF the baked trees (Dockerfile points them at /opt/flash/kernelcache)
-        # so the JIT fallback compiles fresh into scratch instead of reusing wrong-arch baked
-        # entries that would collide with this worker's arch.
+        # Repoint triton/inductor off baked trees so JIT compiles fresh; wrong-arch entries would collide.
         print(f"[kernel-cache] {reason} -> first-run JIT fallback")
         scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
         for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
@@ -399,7 +342,6 @@ def load_mega_cache() -> bool:
             return _reject(f"metadata unreadable ({e})")
         cached_sm = str(meta.get("sm") or "")
         if not current_sm:
-            # can't verify the worker's GPU arch -> don't risk loading a wrong-arch blob; JIT instead.
             return _reject("worker GPU arch undetermined")
         if cached_sm != current_sm:
             return _reject(
@@ -414,32 +356,22 @@ def load_mega_cache() -> bool:
         )
         return True
     except Exception as e:
-        # never block boot on a bad/absent cache: fall back to the normal JIT path. repoint off the
-        # baked trees too — if the mega blob was present + arch-matched but load raised, the on-disk
-        # triton/inductor entries may be partial/corrupt, so JIT fresh into scratch.
         return _reject(f"load skipped ({e})")
 
 
 def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
-    """Run every warm step then persist the mega-cache. Returns a process exit code.
-
-    Best-effort end to end: individual kernel failures are tolerated (we bake what compiled); only a
-    total absence of GPU/torch or a failed save is a non-zero exit so the builder surfaces it.
-    """
+    """Run every warm step then persist the mega-cache. Returns a process exit code."""
     t0 = time.time()
     _point_backends_at(out_dir)
     if arch:
-        # let the caller pin the compile target for source builds that read it (e.g. flash-attn)
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", arch)
         _log(f"target arch pinned: TORCH_CUDA_ARCH_LIST={arch}")
     torch = _require_gpu()
     if torch is None:
         return 1
     if arch:
-        # --arch pins the compile target but the JIT/source builds key off the LIVE GPU, and the
-        # saved metadata records the physical sm. a mismatch (e.g. the sm90 publish step mis-scheduled
-        # onto an sm89 runner) would bake a cu128-sm90 image whose metadata says sm89 -> every H100
-        # worker rejects it and cold-JITs. FAIL the bake rather than publish a mislabeled artifact.
+        # Fail if --arch doesn't match the live GPU: a mislabeled cache (e.g. sm90 image with sm89
+        # metadata) causes every matching worker to reject it and cold-JIT.
         want_sm = "sm" + arch.replace(".", "")
         live_sm = _torch_sm(torch)
         if want_sm != live_sm:

@@ -1,10 +1,4 @@
-"""Train-metadata + run-metrics finalize for the worker (writes train_meta.json then hands off
-to ``worker._finalize`` for metrics.json + the DONE sentinel).
-
-Run-scoped state (``JOB_SPEC``/``SEED``/``THINKING``) and the patchable ``require_active_env``/
-``hf_upload_file``/``heartbeat``/``_finalize`` are read THROUGH the worker package (``_w.<name>``)
-at CALL time.
-"""
+"""Train-metadata + run-metrics finalize for the worker."""
 
 from __future__ import annotations
 
@@ -38,12 +32,7 @@ def write_train_meta(
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
         gpu=gpu_diagnostics(),
     )
-    # Finalize directly from the training phase: build the run-metrics record (training
-    # metrics only — loss/reward are streamed by the trainer; reward_history is in notes)
-    # and write the completion sentinel. There is no separate eval phase.
     m = RunMetrics(
-        # Substrate the worker actually ran on. The RunPod launcher sets FLASH_ARM; default to
-        # "runpod" when unset so persisted metrics correctly attribute the compute backend.
         arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
         seed=_w.SEED,
