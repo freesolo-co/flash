@@ -36,7 +36,7 @@ def test_set_overrides_scalar_and_list():
         # GPU pinning is gone: a gpu.type override is parsed but IGNORED — the schema always
         # resolves the cheapest fitting VALIDATED class for the model (4B GRPO ~35 GB -> the 48 GB
         # RTX A6000, validated 2026-06-22 @ $0.49, cheaper than the 80 GB A100 PCIe), not the
-        # override. (A40 stays unvalidated.)
+        # override.
         assert spec.gpu.type == "RTX A6000"
 
 

@@ -7,15 +7,13 @@ fitting candidate by $/hr and pick the cheapest:
   runpod      every validated Flash-provisionable class (static $/hr)
   lambda      every fitting class that currently has LIVE regional capacity (live $/hr); opt-in,
               available only when LAMBDA_API_KEY is set on the control plane
-  hyperstack  every fitting class whose single-GPU flavor currently has STOCK (static $/hr); opt-in,
-              available only when HYPERSTACK_API_KEY is set on the control plane
 
-RunPod's cheaper static rates almost always win on price, so the instance providers (Lambda,
-Hyperstack) join the ranked list as capacity COMPLEMENTS: when RunPod's cheapest fitting class is
+RunPod's cheaper static rates almost always win on price, so the instance provider (Lambda)
+joins the ranked list as a capacity COMPLEMENT: when RunPod's cheapest fitting class is
 out of capacity (THROTTLED / queue backstop), the runner's gpu-walk steps down the ranked list and
-reaches an in-capacity instance class. Both instance providers are capacity-filtered up front
-(``_lambda_candidates`` / ``_hyperstack_candidates`` only offer a class a region/flavor can supply
-right now), so the walk never lands on a class that would just fail to launch.
+reaches an in-capacity instance class. The instance provider is capacity-filtered up front
+(``_lambda_candidates`` only offers a class a region can supply right now), so the walk never lands
+on a class that would just fail to launch.
 
 Allocation happens at SUBMIT time in the runner. The parse-time resolution in schema is a
 RunPod-static provisional for validation/dry-run display.
@@ -111,30 +109,6 @@ def _lambda_candidates(need: int) -> list[Candidate]:
     return out
 
 
-def _hyperstack_candidates(need: int) -> list[Candidate]:
-    """Hyperstack's fitting classes that currently have flavor STOCK, priced statically.
-
-    Capacity-aware, exactly like Lambda: a class with no in-stock flavor is excluded so the runner
-    never walks onto a class that would immediately fail to launch. A capacity-lookup failure
-    degrades to the other providers.
-    """
-    from flash.providers.hyperstack.jobs import usable_instances
-
-    provider = get_provider("hyperstack")
-    out: list[Candidate] = []
-    try:
-        for g in provider.gpu_classes():
-            if g.vram_gb < need:
-                continue
-            # usable_instances reads the cached /core/flavors, so only the first call hits the API.
-            if usable_instances(g.name):
-                out.append(Candidate("hyperstack", g.name, provider.hourly_rate(g.name), g.vram_gb))
-    except Exception as exc:
-        logger.warning("hyperstack capacity lookup failed (%s); allocating without hyperstack", exc)
-        return []
-    return out
-
-
 def allocate(
     model_id: str,
     algorithm: str,
@@ -146,10 +120,10 @@ def allocate(
 
     There is no GPU pin — every fitting class on every available provider is eligible, and the
     cheapest wins. RunPod is restricted to its validated pool (``GpuClass.validated``) because the
-    deployed control plane rejects a submit for any non-validated class; the instance providers
-    (Lambda via LAMBDA_API_KEY, Hyperstack via HYPERSTACK_API_KEY — both opt-in) each contribute
-    their fitting classes that currently have live capacity/stock. RunPod's cheaper static rates
-    usually win, with Lambda and Hyperstack joining as capacity complements lower in the ranked list.
+    deployed control plane rejects a submit for any non-validated class; the instance provider
+    (Lambda via LAMBDA_API_KEY — opt-in) contributes
+    its fitting classes that currently have live capacity. RunPod's cheaper static rates
+    usually win, with Lambda joining as a capacity complement lower in the ranked list.
     ``train``/``thinking`` size the requirement to the run's actual knobs (context, group, rank,
     batch) via the matrix.
     """
@@ -160,8 +134,6 @@ def allocate(
         candidates += _runpod_candidates(need)
     if "lambda" in available:
         candidates += _lambda_candidates(need)
-    if "hyperstack" in available:
-        candidates += _hyperstack_candidates(need)
     if not candidates:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "

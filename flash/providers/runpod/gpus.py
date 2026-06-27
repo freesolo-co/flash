@@ -39,8 +39,3 @@ def flash_gpu(name: str):
             f"{info.name} is not available on RunPod (providers: {', '.join(providers_for(name))})"
         )
     return getattr(_gpu_enum(), info.enum_member)
-
-
-def gpu_api_id(name: str) -> str:
-    """RunPod API GPU id (the ``GpuType`` enum value, e.g. 'NVIDIA GeForce RTX 4090')."""
-    return flash_gpu(name).value

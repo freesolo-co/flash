@@ -36,7 +36,6 @@ The allocator picks the cheapest validated RunPod GPU class that fits the run.
   and ready-to-run configs to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
   plane (run operator-side via the separate `flash-server` command)
-- `flash/mcp/` — stdio MCP bridge for coding agents
 - `Dockerfile` — the control-plane image (used by the repo docker-compose)
 - `tests/` — pytest suite (CPU-only; offline-by-default, no GPU/network)
 
@@ -57,6 +56,26 @@ The artifact repo is platform-managed and per-run (each run gets its own
 `Freesolo-Co/flashrun-<run_id>`, written by the operator `HF_TOKEN`); it is not a user
 knob and not an operator-wide env var. Clients authenticate with their freesolo API key
 (`flash login`).
+
+## Release channels
+
+Two channels are published to PyPI from the *same source*, distinguished by one line in
+`flash/_channel.py` (`CHANNEL`):
+
+| Channel | PyPI package | CLI | Default plane | Published from |
+| --- | --- | --- | --- | --- |
+| prod | `freesolo-flash` | `flash` | `flash.freesolo.co` | push to `main` that bumps `[project].version` (`.github/workflows/publish.yml`) |
+| dev | `freesolo-flash-dev` | `flash-dev` | `flash-dev.freesolo.co` | push to `dev` whose `[tool.flash-dev].version` isn't on PyPI yet (`.github/workflows/publish-dev.yml`) |
+
+Each environment holds exactly **one** channel: both packages ship the same import package
+(`flash/`) with one baked `CHANNEL` line, so installing both into the same environment makes the
+later install win for *both* CLIs. For side-by-side prod and staging, install each channel in its
+own virtualenv (or via `pipx`, which isolates per tool). The dev build is produced by
+`scripts/build_dev_dist.py`, which renames the package/CLI and flips `CHANNEL` to `dev` before
+`uv build`. Both channels ship at the **same version**: `[project].version` and
+`[tool.flash-dev].version` must match (CI enforces this via `.github/workflows/version-parity.yml`),
+so cutting a release means bumping both together. Either CLI still honours an explicit
+`FLASH_API_URL` / the `login --api-url` flag; the channel only sets the default.
 
 ## Serving From an API
 
