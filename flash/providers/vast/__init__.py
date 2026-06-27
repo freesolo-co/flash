@@ -106,10 +106,17 @@ class VastProvider:
             # Recovery (attach_run) has no submit_run_vast teardown ``finally``; destroy the reattached
             # instance here so a finished/abandoned recovered seed stops billing immediately. Best-effort
             # (warns on an unconfirmed teardown so a leak is visible now, not just at the next sweep).
-            from flash.providers.vast.jobs import _best_effort_destroy
+            from flash.providers.vast.jobs import _best_effort_destroy, destroy_run_instances
 
             with contextlib.suppress(Exception):
-                _best_effort_destroy(vh.instance_id, context="poll recovery teardown")
+                if not _best_effort_destroy(vh.instance_id, context="poll recovery teardown"):
+                    # Unconfirmed single-instance teardown on a recovered seed: while the run stays
+                    # ``running`` the active-run orphan sweep SHIELDS its label, so a successful multi-seed
+                    # ATTACH that clears ``remote`` and resumes the next seed could leave this box billing
+                    # unreaped with no persisted handle. Escalate to a run-scoped reap by label
+                    # (destroy_run_instances re-lists + retries and is NOT active-shielded), mirroring the
+                    # submit_run_vast teardown finally (Cursor).
+                    destroy_run_instances(spec.run_id)
 
     def cancel(self, handle: JobHandle) -> None:
         from flash.providers.vast.jobs import cancel

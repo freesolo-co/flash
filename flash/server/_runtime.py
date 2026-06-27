@@ -125,9 +125,16 @@ def _confirm_run_clear(spec) -> bool:
 
     A best-effort ``gc`` returns no error on an unconfirmed Vast teardown (``destroy_run_instances``
     yields an empty list, not a raise), so after the reap we ask each instance provider's optional
-    ``run_instances_remaining`` (``[]`` == confirmed clear; RAISES when it can't enumerate). Any instance
-    still present — or a provider that can't confirm — yields ``False`` so the caller does NOT resubmit a
-    second worker over a possibly-live box (Codex; mirrors the retry-loop MtzrH guard)."""
+    ``run_instances_remaining`` for positive proof: ``[]`` == confirmed clear; a non-empty list (an
+    instance is still present) or a RAISE (the provider can't ENUMERATE, so it can't prove clear) both
+    yield ``False`` — the caller must not resubmit a second worker over a possibly-live box (Codex;
+    mirrors the retry-loop MtzrH guard).
+
+    A provider that does NOT implement ``run_instances_remaining`` (RunPod serverless self-reaps; Lambda
+    today) is NOT a "can't confirm -> False" case: it has no standing-billing label to enumerate, so it
+    is skipped and the run stays eligible to resubmit on the other providers' verdicts. This guard is
+    therefore scoped to instance providers that DO expose the capability (Vast); only a provider that
+    HAS the method and can't return a clean ``[]`` blocks the resubmit (Copilot)."""
     from flash.providers import INSTANCE_PROVIDERS, configured_providers
 
     clear = True
