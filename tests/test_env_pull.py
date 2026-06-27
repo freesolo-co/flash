@@ -378,6 +378,62 @@ def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):
     assert (dest / "datasets" / "train.jsonl").is_file()
 
 
+def test_cmd_env_pull_single_file_refuses_dangling_symlink_without_force(monkeypatch, tmp_path):
+    # A dangling symlink output (exists()==False) must still be treated as occupied, so a pull does
+    # not proceed and write THROUGH the link to its target outside the requested path.
+    calls = {"n": 0}
+
+    def fake_download(env, path):
+        calls["n"] += 1
+        return b"x"
+
+    monkeypatch.setattr(adapter, "download_environment_file", fake_download)
+    target = tmp_path / "secret" / "train.jsonl"
+    out = tmp_path / "train.jsonl"
+    out.symlink_to(target)  # dangling: target does not exist
+    rc = cmd_env_pull(_args(path="datasets/train.jsonl", output=str(out)))
+    assert rc == 1
+    assert calls["n"] == 0  # refused before any download
+    assert not target.exists()  # nothing written through the link
+
+
+def test_cmd_env_pull_single_file_force_replaces_symlink_not_target(monkeypatch, tmp_path):
+    monkeypatch.setattr(adapter, "download_environment_file", lambda env, path: b"new\n")
+    target = tmp_path / "elsewhere.jsonl"
+    target.write_text("keep me")
+    out = tmp_path / "train.jsonl"
+    out.symlink_to(target)
+    rc = cmd_env_pull(_args(path="datasets/train.jsonl", output=str(out), force=True))
+    assert rc == 0
+    assert not out.is_symlink()  # link replaced by a real file
+    assert out.read_bytes() == b"new\n"
+    assert target.read_text() == "keep me"  # the link target was NOT written through
+
+
+def test_pull_environment_package_filters_hub_to_env_under_member_limit(monkeypatch, tmp_path):
+    # A small env pull from the shared hub must not fail just because UNRELATED sibling envs push the
+    # whole repo over the member limit — only the requested subtree is extracted and counted.
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_MEMBERS", 2)
+
+    def _big_hub_tarball() -> bytes:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            def add(name: str, data: bytes) -> None:
+                info = tarfile.TarInfo(f"{_TOP}/{name}")
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            add("david-freesolo-co/stuff/environment.py", b"# env\n")  # the wanted env: 1 member
+            for i in range(10):  # unrelated siblings that blow the (patched) member limit
+                add(f"other-org/env{i}/environment.py", b"# other\n")
+        return buf.getvalue()
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _big_hub_tarball())
+    dest = tmp_path / "out"
+    pull_environment_package("david-freesolo-co/stuff", dest)
+    assert (dest / "environment.py").is_file()
+    assert not (dest / "env0").exists()  # unrelated siblings not extracted
+
+
 def test_cmd_env_pull_rejects_bad_env_id(capsys):
     rc = cmd_env_pull(_args(env_id="!!!not-an-id!!!", path="x"))
     assert rc == 1
