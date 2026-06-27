@@ -85,6 +85,11 @@ RUN_REPO_PREFIX = "flashrun-"
 CODE_PATH = "code/flash"
 CHECKPOINTS_PATH = "checkpoints"
 ADAPTER_PATH = "adapter"
+# A PEFT adapter folder is only *deployable* when it carries adapter_config.json AND a weights file
+# — the exact signal serving / flash.runner.checkpoints.list_checkpoints use, so the GC agrees with
+# them on what counts as a servable artifact (a half-uploaded config-only folder is NOT one).
+_ADAPTER_CONFIG = "adapter_config.json"
+_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors", "adapter_model.bin"})
 
 
 class CleanupAborted(RuntimeError):
@@ -136,21 +141,34 @@ class RepoView:
         return sum(self.bytes_in(folder) for folder in self._artifact_folders(name))
 
     def adapter_folders(self) -> list[str]:
-        """Every deployable-adapter folder: the final ``<prefix>/adapter`` AND each checkpoint
-        ``<prefix>/checkpoints/step-N/adapter`` (both serve via ``flash deploy``)."""
+        """Every ``adapter`` folder: the final ``<prefix>/adapter`` AND each checkpoint
+        ``<prefix>/checkpoints/step-N/adapter``."""
         return self._artifact_folders(ADAPTER_PATH)
 
+    def _is_deployable_adapter(self, folder: str) -> bool:
+        """A folder is a *deployable* adapter only if it carries adapter_config.json AND a weights
+        file — matching serving / ``list_checkpoints``. A half-uploaded config-only folder is not
+        servable, so it must not stand in for a real adapter."""
+        names = {f.rsplit("/", 1)[-1] for f, _ in self._files_in(folder)}
+        return _ADAPTER_CONFIG in names and not names.isdisjoint(_ADAPTER_WEIGHT_FILES)
+
+    def deployable_adapter_folders(self) -> list[str]:
+        return [f for f in self.adapter_folders() if self._is_deployable_adapter(f)]
+
     def has_servable_adapter(self) -> bool:
-        """True if the repo holds ANY deployable adapter — final or per-checkpoint. A repo with
+        """True if the repo holds ANY *deployable* adapter — final or per-checkpoint. A repo with
         only checkpoint adapters (no final ``adapter/``) is still servable and must not be
         whole-deleted as 'unservable'."""
-        return bool(self.adapter_folders())
+        return bool(self.deployable_adapter_folders())
 
     def has_final_adapter(self) -> bool:
-        """True only for the final trained adapter at ``<prefix>/adapter`` — never an adapter
+        """True only for a *complete* final trained adapter at ``<prefix>/adapter`` — never one
         nested under ``checkpoints/``. T2 trims checkpoints only when this remains, so it never
-        strips a checkpoint-only repo's sole servable content."""
-        return any("checkpoints" not in folder.split("/") for folder in self.adapter_folders())
+        strips a checkpoint-only repo's sole servable content, nor trims when the final adapter
+        upload only partially landed (config without weights)."""
+        return any(
+            "checkpoints" not in folder.split("/") for folder in self.deployable_adapter_folders()
+        )
 
     def age_seconds(self, now: datetime) -> float:
         if self.last_modified is None:
