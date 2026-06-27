@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 from flash.providers._poll import (
     PollErrorTracker,
     _attempt_int,
+    heartbeat_progress_ts,
     is_training_heartbeat,
     make_say,
     surface_forced_heartbeat,
@@ -1052,13 +1053,30 @@ def make_hf_failure_detail_reader(
     return read
 
 
-def worker_flagged_retriable(heartbeat_reader) -> bool:
+def worker_flagged_retriable(
+    heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
+) -> bool:
     """True if the worker stamped ``retriable`` (a RetriableInfraError) in its last heartbeat — the
     structured worker<->poller contract that replaces failure-detail parsing: ``retriable`` means
-    retry on a fresh worker. Forces a fresh read past the rate limit."""
+    retry on a fresh worker. Forces a fresh read past the rate limit.
+
+    ``launch_ts`` / ``current_attempt``, when supplied, gate the flag to THIS attempt. The seed
+    heartbeat path is shared across retries, so a leftover ``retriable=True`` from attempt N-1 must
+    NOT override attempt N's own (non-retriable) failure marker — otherwise a deterministic
+    bootstrap/config error that fails BEFORE this attempt's worker emits any heartbeat would be
+    reported job_preempted and burn GPUs on an endless retry instead of failing fast. Same staleness
+    rule as ``heartbeat_progress_ts`` (ts predates launch OR an explicit attempt mismatch -> stale ->
+    ignored). With NEITHER arg the flag is honored ungated (back-compat for callers that don't date
+    heartbeats)."""
     if heartbeat_reader is None:
         return False
     hb = heartbeat_reader(force=True)
     if not isinstance(hb, dict):
         return False
-    return bool(hb.get("retriable"))
+    if not bool(hb.get("retriable")):
+        return False
+    if launch_ts is None and current_attempt is None:
+        return True  # ungated: caller can't date the heartbeat -> preserve prior behavior
+    hb_key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
+    _ts, fresh = heartbeat_progress_ts(hb_key, launch_ts, current_attempt)
+    return fresh

@@ -296,6 +296,34 @@ def test_poll_job_failed_without_retriable_heartbeat_is_job_failed(monkeypatch):
     assert res.failure == "job_failed"
 
 
+def test_worker_flagged_retriable_gates_stale_prior_attempt_heartbeat():
+    """Codex MtTLM: the seed heartbeat path is shared across retries, so a retriable=True left by
+    attempt N-1 must NOT count for attempt N — else a DETERMINISTIC attempt-N failure that fails
+    before its own worker emits a heartbeat is reported job_preempted and burns GPUs. With
+    launch_ts/current_attempt supplied, the flag is honored only for a heartbeat belonging to THIS
+    attempt; without them it stays ungated (back-compat)."""
+    from flash.providers.runpod.jobs import worker_flagged_retriable
+
+    def reader(hb):
+        return lambda force=False: hb
+
+    stale = {"stage": "rl_step", "step": 5, "ts": 9_000.0, "attempt": 0, "retriable": True}
+    # Back-compat: an ungated call honors the flag (caller can't date the heartbeat).
+    assert worker_flagged_retriable(reader(stale)) is True
+    # Gated: stale by ts (predates this attempt's launch) -> ignored.
+    assert worker_flagged_retriable(reader(stale), launch_ts=10_000.0, current_attempt=1) is False
+    # Gated: fresh ts (a prior worker still shutting down uploads AFTER launch) but a DIFFERENT
+    # attempt -> still ignored (the subtle case a ts-only check would miss).
+    late_prior = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "attempt": 0, "retriable": True}
+    assert worker_flagged_retriable(reader(late_prior), launch_ts=10_000.0, current_attempt=1) is False
+    # Gated: a genuine THIS-attempt retriable heartbeat is still honored.
+    fresh = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "attempt": 1, "retriable": True}
+    assert worker_flagged_retriable(reader(fresh), launch_ts=10_000.0, current_attempt=1) is True
+    # No retriable flag -> False regardless of gating.
+    no_flag = {"ts": 10_500.0, "attempt": 1}
+    assert worker_flagged_retriable(reader(no_flag), launch_ts=10_000.0, current_attempt=1) is False
+
+
 def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):
     # COMPLETED but the output decodes as an error (a handler exception). An infra failure can
     # surface here too, so poll_job must consult the worker heartbeat -> job_preempted when the

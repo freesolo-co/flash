@@ -420,8 +420,11 @@ def poll_vast_job(
         # A real worker error fails fast UNLESS flagged retriable (the worker stamps it in heartbeat
         # for a RetriableInfraError; the bootstrap sets retriable=True in the marker for an HF-side
         # failure) — either retries on a fresh host like a platform termination.
+        # Gate the heartbeat flag to THIS attempt: a stale retriable=True left by a prior attempt's
+        # worker must not override the current attempt's (non-retriable) marker and turn a fast-fail
+        # into a GPU-burning retry loop.
         retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(
-            heartbeat_reader
+            heartbeat_reader, launch_ts=launch_ts, current_attempt=handle.attempt
         )
         return PollResult(
             False,
@@ -522,8 +525,10 @@ def poll_vast_job(
             # left error_{phase}.txt (a bad env id, a config/code error, an OOM): that is DETERMINISTIC,
             # so fail FAST. A crash the worker flagged retriable still retries.
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
+            # Gate to THIS attempt: a prior attempt's stale retriable heartbeat must not mask the
+            # current attempt's deterministic crash (error_{phase}.txt) into a preemption-style retry.
             worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(
-                heartbeat_reader
+                heartbeat_reader, launch_ts=launch_ts, current_attempt=handle.attempt
             )
             return PollResult(
                 False,
