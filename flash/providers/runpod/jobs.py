@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 from flash.providers._poll import (
     PollErrorTracker,
+    _attempt_int,
+    is_training_heartbeat,
     make_say,
     surface_forced_heartbeat,
     surface_heartbeat,
@@ -77,15 +79,6 @@ TERMINAL_OK = {"COMPLETED"}
 # "FAILED" is the run dying on its own (real traceback) -> fails fast.
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
 TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
-
-# Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
-# training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
-# Receiving one proves the worker is alive but NOT that the slow setup (model download +
-# vLLM init) finished, so they must not flip stall detection to the tight training window.
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
-
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
@@ -657,7 +650,7 @@ def poll_job(
     """Poll a queue job to completion; resilient to transient API errors.
 
     Two stall windows: the cold-start phase (dep install, per-run env pip, model download,
-    vLLM init) is slow and only emits *setup* heartbeats (``_SETUP_HEARTBEAT_STAGES``).
+    vLLM init) is slow and only emits *setup* heartbeats (``SETUP_HEARTBEAT_STAGES``).
     Until a *training* heartbeat arrives we apply the larger ``setup_grace_s`` budget so a
     slow cold start isn't misread as a stall; after it we use the tight ``stall_after_s``.
     Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
@@ -691,6 +684,9 @@ def poll_job(
     start = time.time()
     last_status = None
     last_hb_key = None
+    last_hb_ts = 0.0  # the worker-ts of the last heartbeat we COUNTED as progress (monotonic gate)
+    last_hb_attempt = -1  # the worker-stamped attempt of that heartbeat (so an OLDER attempt's late
+    #                       heartbeat can't reset progress); -1 sentinel < any real attempt (0,1,...)
     last_progress = time.time()
     seen_heartbeat = False
     last_health_probe = 0.0
@@ -828,11 +824,47 @@ def poll_job(
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
-            last_progress = time.time()
-            # Only a training-phase heartbeat means cold-start setup is done and we
-            # can switch to the tight window; setup heartbeats keep the grace budget.
-            if stage not in _SETUP_HEARTBEAT_STAGES:
-                seen_heartbeat = True
+            # Gate progress on the heartbeat's OWN ts (key = (stage, step, ts, attempt)) ADVANCING: a
+            # stale heartbeat that lands late — a newer one skipped by the bounded _HB_UPLOAD_LOCK
+            # while an older slow upload finishes — carries an OLDER ts and must NOT buy a fresh stall
+            # window for a genuinely stuck worker. Unlike Lambda/Hyperstack we keep crediting the
+            # control-plane poll time to last_progress (RunPod's stall math stays in one clock, no
+            # worker/control-plane skew); only the DECISION to count it as progress is ts-monotonic.
+            hb_ts = new_key[2] if new_key else None
+            hb_step = new_key[1] if new_key else None
+            hb_attempt = _attempt_int(new_key[3]) if new_key else None
+            # Cold-start setup OVER -> tighten to the training window. Shared with lambdalabs: a setup
+            # stage never tightens; rl_step/sft_step tighten only at a COMPLETED step (step >= 1) so a
+            # step=0 gap-fill during the silent cold first step keeps setup grace; every other non-setup
+            # stage (POST-training rl_trained / *_train_done / metrics, no step field) tightens so a hung
+            # teardown falls under the tight window. See is_training_heartbeat for the full rationale.
+            is_training_hb = is_training_heartbeat(stage, hb_step)
+            if hb_attempt is not None and hb_attempt > last_hb_attempt:
+                # Newer attempt = a fresh worker after a retry/preemption. Attempts SHARE this run's HF
+                # heartbeat path, and the new worker restarts from cold setup, so reset the ts baseline
+                # and re-derive the latch from ITS heartbeat (regaining setup grace) rather than letting
+                # the prior attempt's training latch suppress the new cold start.
+                last_hb_attempt = hb_attempt
+                last_hb_ts = hb_ts or 0.0
+                last_progress = time.time()
+                seen_heartbeat = is_training_hb
+            elif (hb_attempt is None or hb_attempt == last_hb_attempt) and (
+                hb_ts is None or hb_ts > last_hb_ts
+            ):
+                # Same (or attempt-less) heartbeat stream: gate progress on the heartbeat's OWN ts
+                # ADVANCING (key = (stage, step, ts, attempt)). A stale heartbeat that lands late — a
+                # newer one skipped by the bounded _HB_UPLOAD_LOCK while an older slow upload finishes —
+                # carries an OLDER ts and must NOT buy a fresh stall window for a stuck worker. Unlike
+                # Lambda/Hyperstack we keep crediting the control-plane poll time to last_progress
+                # (RunPod's stall math stays in one clock, no worker/control-plane skew); only the
+                # DECISION to count it as progress is ts-monotonic.
+                if hb_ts is not None:
+                    last_hb_ts = hb_ts
+                last_progress = time.time()
+                if is_training_hb:
+                    seen_heartbeat = True
+            # else: an OLDER attempt's late heartbeat, or a stale ts within the current attempt — ignore
+            # it entirely (no progress credit, no latch change).
         # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
         # but only when a heartbeat_reader lets us tell setup from training; without one we
         # can't, so stay on stall_after_s (no regression).

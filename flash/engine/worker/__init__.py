@@ -191,10 +191,13 @@ PHASE = os.environ.get(
 # Heartbeat HF-commit throttle knobs (patched by tests; the heartbeat reader in ``heartbeat.py``
 # reads these as ``_w.<name>``). Each heartbeat() commits heartbeat.json to the HF artifact repo;
 # committing every training step blows HuggingFace's per-repo commit rate limit (128/hour), so the
-# per-step "rl_step" stage is throttled to once per _HB_MIN_INTERVAL_S; terminal stages always
-# commit. _HB_TERMINAL_ONLY (benchmark fan-out) throttles every non-terminal stage. The local file
-# + stdout line are always written regardless.
+# per-step "rl_step"/"sft_step" stages are throttled to once per _HB_MIN_INTERVAL_S; terminal stages
+# always commit. _HB_TERMINAL_ONLY (benchmark fan-out) throttles every non-terminal stage. The stdout
+# HEARTBEAT line is always printed regardless — heartbeats are HF-only; there is no worker-local file.
 _HB_LAST_UPLOAD = 0.0
+# Wall-clock of the last REAL (non-liveness) heartbeat — the liveness daemon dumps stacks if this
+# goes stale (the provider stalls off the same signal: it skips liveness pings).
+_HB_LAST_PROGRESS_TS = 0.0
 # The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
 # 128 commits/hour-per-repo limit when concurrent runs share one HF_REPO.
 _HB_MIN_INTERVAL_S = 60.0
@@ -474,6 +477,7 @@ __all__ = [
     "RUN_MODE",
     "SEED",
     "THINKING",
+    "_HB_LAST_PROGRESS_TS",
     "_HB_LAST_UPLOAD",
     "_HB_LOCK",
     "_HB_MIN_INTERVAL_S",
