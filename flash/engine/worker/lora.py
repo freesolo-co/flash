@@ -728,11 +728,20 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     def _load(d: str):
         cfg_path = os.path.join(d, "adapter_config.json")
         st_path = os.path.join(d, "adapter_model.safetensors")
-        if not os.path.isfile(st_path):
+        bin_path = os.path.join(d, "adapter_model.bin")
+        if os.path.isfile(st_path):
+            sd = load_file(st_path)
+        elif os.path.isfile(bin_path):
+            # Legacy PEFT save: a plain torch pickle of {name: tensor}. The warm-start INIT path
+            # (PeftModel.from_pretrained / _read_adapter_tensor_keys / remap_vl_adapter_dir) all
+            # accept .bin, so recombine must too — otherwise a loadable .bin warm-start trains a full
+            # paid GRPO run and only fails here at finalize. weights_only=True: pure tensor dicts.
+            sd = torch.load(bin_path, map_location="cpu", weights_only=True)
+        else:
             raise ValueError(
-                f"recombine: {d!r} has no adapter_model.safetensors "
+                f"recombine: {d!r} has no adapter_model.safetensors or adapter_model.bin "
                 f"(dir contents: {sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING'}); "
-                "only safetensors adapters can be recombined"
+                "only safetensors / .bin LoRA adapters can be recombined"
             )
         if not os.path.isfile(cfg_path):
             raise ValueError(
@@ -741,7 +750,7 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
                 "the adapter config is required to read its rank/alpha/scale"
             )
         with open(cfg_path) as f:
-            return json.load(f), load_file(st_path)
+            return json.load(f), sd
 
     sft_cfg, sft_sd = _load(sft_dir)
     grpo_cfg, grpo_sd = _load(grpo_dir)
