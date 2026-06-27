@@ -196,6 +196,45 @@ def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch)
     assert sorted(sdk_env.batch_sizes) == [1, 2]        # ex_a's two completions scored in ONE call
 
 
+def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
+    """Codex MtMlT: an env that opts out with reward_thread_safe = False must NOT have a group's
+    completions batched into one env-concurrent score_responses call (a scorer with mutable/thread-
+    bound state would be raced). reward_many must score each rollout with its OWN single-item call,
+    byte-identical and in input order — the pre-batching serial behavior."""
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _UnsafeCountingSingleTurnEnv(_FakeSingleTurnEnv):
+        reward_thread_safe = False  # scorer keeps mutable/thread-bound state -> never race it
+
+        def __init__(self):
+            self.batch_sizes = []
+
+        def score_responses(self, example, response_texts):
+            self.batch_sizes.append(len(response_texts))
+            return super().score_responses(example, response_texts)
+
+    sdk_env = _UnsafeCountingSingleTurnEnv()
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    assert env.reward_thread_safe is False
+
+    ex_a = {"id": "a", "input": "2+2?", "output": "4"}
+    ex_b = {"id": "b", "input": "3+3?", "output": "6"}
+    items = [
+        (ex_a, {"response_text": "the answer is 4"}),  # -> 1.0
+        (ex_b, {"response_text": "it is 6"}),           # -> 1.0
+        (ex_a, {"response_text": "nope"}),              # -> 0.0
+    ]
+    sdk_env.batch_sizes = []
+
+    out = env.reward_many(items)
+
+    assert out == [1.0, 1.0, 0.0]                        # correct + input order
+    # ex_a's two rollouts were NOT batched: every score_responses call carried exactly one response.
+    assert sdk_env.batch_sizes == [1, 1, 1]
+
+
 def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
