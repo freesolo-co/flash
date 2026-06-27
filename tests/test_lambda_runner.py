@@ -172,6 +172,8 @@ def test_bootstrap_train_success(monkeypatch):
 
 def test_bootstrap_fails_without_metrics(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
+    # A genuine crash: no local metrics AND nothing on HF (stub keeps the check offline + deterministic).
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
     assert lb.main() == 1
     ok, error, retriable = markers[0]
     assert not ok
@@ -179,6 +181,20 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
     # A genuine no-metrics crash (the worker never produced metrics) is a REAL failure, not infra:
     # it must NOT be flagged retriable (that would loop a deterministically-broken run).
     assert retriable is False
+
+
+def test_bootstrap_missing_local_metrics_but_remote_confirmed_is_retriable(monkeypatch):
+    """No local /tmp/metrics.json but the run IS complete on HF (DONE+metrics uploaded) — e.g. the
+    idempotency replay hit a transient HF read. This is a SUCCEEDED run; the bootstrap must consult
+    remote completion BEFORE the missing-local-file RuntimeError and surface a RETRIABLE marker so a
+    fresh worker re-fetches the persisted metrics, never fail a confirmed-complete run."""
+    lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
+    assert lb.main() == 1
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert "complete on HF" in error
+    assert retriable is True  # confirmed-complete -> reschedule to re-fetch, not a fatal job_failed
 
 
 def test_bootstrap_fetch_code_failure_is_retriable(monkeypatch):

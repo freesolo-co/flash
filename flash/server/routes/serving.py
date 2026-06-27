@@ -7,6 +7,7 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 from __future__ import annotations
 
 import contextlib
+import math
 import re
 from typing import Annotated
 
@@ -302,11 +303,17 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         temperature = float(payload.get("temperature") or 0.0)
         # Avoid `or 512`: that silently coerces an explicit 0 to 512.
         raw_max_tokens = payload.get("max_tokens")
+        # OverflowError (int(inf), an ArithmeticError) is NOT a TypeError/ValueError — catch it too so a
+        # JSON `Infinity`/`1e400` max_tokens is a clean 400, not an uncaught 500.
         max_tokens = 512 if raw_max_tokens is None else int(raw_max_tokens)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise HTTPException(
             status_code=400, detail=f"invalid temperature/max_tokens: {exc}"
         ) from exc
+    if not math.isfinite(temperature):
+        raise HTTPException(
+            status_code=400, detail=f"temperature must be a finite number, got {temperature}"
+        )
     if max_tokens <= 0:
         raise HTTPException(
             status_code=400,

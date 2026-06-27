@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import importlib
 import io
 import json
@@ -9,6 +10,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import tracemalloc
 import types
 from dataclasses import dataclass, field
 from typing import ClassVar
@@ -579,6 +581,50 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
         file_info.size = len(payload)
         handle.addfile(file_info, io.BytesIO(payload))
     assert _safe_extract_archive(tar.getvalue(), dest) == dest / "repo-root"
+
+
+def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
+    # A GNU LONGNAME header payload is consumed inside tarfile.next() and never yielded, so per-member
+    # accounting can't see it. A tiny gzip declaring a 400MB name must be rejected with memory bounded
+    # near the limit, not OOM the worker.
+    from flash.envs.adapter import _safe_extract_archive
+
+    def header(name: str, size: int, typeflag: str) -> bytes:
+        h = bytearray(512)
+        nb = name.encode()[:100]
+        h[0 : len(nb)] = nb
+        h[100:108] = b"0000644\0"
+        h[124 : 124 + 12] = f"{size:011o}\0".encode()
+        h[136:148] = b"00000000000\0"
+        h[156] = ord(typeflag)
+        h[257:263] = b"ustar\0"
+        h[263:265] = b"00"
+        chk = sum(h[:148]) + sum(h[156:]) + 32 * 8
+        h[148 : 148 + 8] = f"{chk:06o}\0 ".encode()
+        return bytes(h)
+
+    name_len = 400 * 1024 * 1024
+    raw = bytearray()
+    raw += header("././@LongLink", name_len, "L")
+    raw += b"A" * name_len + b"\0" * ((512 - name_len % 512) % 512)
+    raw += header("repo/environment.py", 1, "0") + b"x" + b"\0" * 511
+    raw += b"\0" * 1024
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as g:
+        g.write(bytes(raw))
+    bomb = buf.getvalue()
+    assert len(bomb) < 2 * 1024 * 1024
+
+    dest = tmp_path / "extract_bomb"
+    dest.mkdir()
+    tracemalloc.start()
+    try:
+        with pytest.raises(RuntimeError, match="too large"):
+            _safe_extract_archive(bomb, dest)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 600 * 1024 * 1024, f"peak memory {peak} not bounded by the limit"
 
 
 def test_install_manifest_and_worker_deps():
