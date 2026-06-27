@@ -89,3 +89,18 @@ def test_login_warns_when_env_key_will_override_saved_key(monkeypatch, tmp_path,
     assert "logged in to flash" in captured.out
     assert "FREESOLO_API_KEY is set and will override this saved login" in captured.err
     assert client_config.load_credentials()[1] == "fs-secret-env"
+
+
+def test_read_json_or_empty_returns_dict_for_non_object(tmp_path):
+    """read_json_or_empty honors its ``-> dict`` contract: valid-but-non-object JSON (list,
+    scalar, null) and unreadable/empty content all yield ``{}`` so config/credential callers
+    can ``.get(...)`` / item-assign without an AttributeError/TypeError bricking every command."""
+    from flash._fileio import read_json_or_empty
+
+    p = tmp_path / "config.json"
+    for content in ("[]", "5", '"x"', "null", "[1,2,3]", "not json at all", ""):
+        p.write_text(content)
+        assert read_json_or_empty(p) == {}, content
+    p.write_text('{"api_url": "https://x", "api_key": "k"}')
+    assert read_json_or_empty(p) == {"api_url": "https://x", "api_key": "k"}
+    assert read_json_or_empty(tmp_path / "missing.json") == {}

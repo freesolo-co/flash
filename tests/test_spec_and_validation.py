@@ -42,6 +42,13 @@ def _raw(**overrides) -> dict:
     ("overrides", "match"),
     [
         ({"train.seeds": []}, "at least one seed"),
+        # A scalar/str/bool seeds value used to raise an uncaught TypeError (HTTP 500) from
+        # ``tuple(int(s) for s in 0)``; it must be a clean ConfigError (400) like every other knob.
+        ({"train.seeds": 0}, "train.seeds must be a list of integers"),
+        ({"train.seeds": "01"}, "train.seeds must be a list of integers"),
+        ({"train.seeds": True}, "train.seeds must be a list of integers"),
+        ({"train.seeds": [1, "x"]}, "train.seeds entries must be integers"),
+        ({"train.seeds": [1, True]}, "train.seeds entries must be integers"),
         ({"train.steps": 0}, "steps must be >= 1"),
         # lora_rank/alpha now parse via _train_int(minimum=1), so out-of-range values
         # are rejected at parse time with the shared ">= 1" message (a non-positive int
@@ -65,6 +72,12 @@ def _raw(**overrides) -> dict:
 def test_spec_validation_rejections(overrides, match) -> None:
     with pytest.raises(ConfigError, match=match):
         spec_from_dict(_raw(**overrides))
+
+
+def test_seeds_are_deduped_preserving_order() -> None:
+    # Duplicate seeds break the positional ``list(seeds).index(seed)`` resume lookup (deploy.py),
+    # re-running (re-billing) a finished seed; dedupe while preserving order.
+    assert spec_from_dict(_raw(**{"train.seeds": [3, 0, 3, 1, 0]})).train.seeds == (3, 0, 1)
 
 
 def test_sft_epochs_must_be_positive() -> None:

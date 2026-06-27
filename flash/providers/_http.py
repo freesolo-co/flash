@@ -151,6 +151,14 @@ class RestClient:
                         f"{method} {target} -> HTTP {e.code}: {e.reason}{suffix}"
                     ) from e
                 last = e
+            except json.JSONDecodeError as e:
+                # A 2xx with a non-JSON body — e.g. a Cloudflare HTML challenge/interstitial in
+                # front of Lambda, or a truncated body. JSONDecodeError is a ValueError (not an
+                # OSError), so without this it would escape the retry loop AND `request_with_retries`
+                # (which only catches error_cls), surfacing a raw decode error past every caller's
+                # `except error_cls` / poll-loop `except *ApiError`. Treat it as transient: retry,
+                # then wrap in error_cls on the final attempt like any other failure.
+                last = e
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
                 last = e
             if attempt < retries:

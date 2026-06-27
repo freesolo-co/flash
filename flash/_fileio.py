@@ -9,11 +9,15 @@ from pathlib import Path
 
 
 def read_json_or_empty(path: Path) -> dict:
-    """Parse a JSON object file, returning ``{}`` if it's missing or unreadable."""
+    """Parse a JSON object file, returning ``{}`` if it's missing, unreadable, or not a JSON
+    object. The ``-> dict`` contract is unconditional: valid-but-non-object JSON (a list, scalar,
+    or ``null``) also yields ``{}`` so callers (credentials, env manifest, update cache) can rely
+    on ``.get(...)``/item-assignment without an ``AttributeError``/``TypeError``."""
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def secure_json_write(path: Path, data: dict) -> None:

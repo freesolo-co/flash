@@ -79,6 +79,30 @@ def _train_stops(train_raw: dict) -> tuple[str, ...]:
     return tuple(s for s in v if s)
 
 
+def _train_seeds(train_raw: dict) -> tuple[int, ...]:
+    """Validate the optional [train] seeds list -> ConfigError (HTTP 400).
+
+    Missing/None -> ``(0,)`` (the historical default). A scalar/bool/str is rejected (the only
+    [train] knob that was an un-guarded ``tuple(int(s) for s in ...)``, so ``seeds = 0`` used to
+    raise an uncaught ``TypeError`` -> 500). Entries are validated like ``_train_int`` and DEDUPED
+    while preserving order: a duplicate seed (``[0, 0, 1]``) would otherwise break the positional
+    ``list(seeds).index(seed)`` resume lookup and re-run (re-bill) a finished seed.
+    """
+    v = train_raw.get("seeds")
+    if v is None:
+        return (0,)
+    if isinstance(v, (str, bytes)) or not isinstance(v, (list, tuple)):
+        raise ConfigError("train.seeds must be a list of integers")
+    out: list[int] = []
+    for s in v:
+        if isinstance(s, bool) or not isinstance(s, (int, float)):
+            raise ConfigError("train.seeds entries must be integers")
+        if not math.isfinite(s) or float(s) != int(s):
+            raise ConfigError("train.seeds entries must be finite integers")
+        out.append(int(s))
+    return tuple(dict.fromkeys(out))
+
+
 class ConfigError(ValueError):
     pass
 

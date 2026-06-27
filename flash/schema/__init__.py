@@ -20,6 +20,7 @@ from flash.schema.fields import (
     _require_environment_ref,
     _train_float,
     _train_int,
+    _train_seeds,
     _train_stops,
     _wandb_spec,
     _worker_env,
@@ -293,7 +294,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=_train_int(train_raw, "lora_rank", minimum=1) or 32,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
-            seeds=tuple(int(s) for s in train_raw.get("seeds", (0,))),
+            seeds=_train_seeds(train_raw),
             init_from_adapter=_init_from_adapter_ref(train_raw),
             # hf_repo is assigned by the control plane (a per-run private dataset under the
             # operator's namespace, written by the operator HF_TOKEN); a user-supplied

@@ -62,6 +62,12 @@ STALL_AFTER_S = 1500.0
 # bound spend). Larger than RunPod's because of the on-host Docker pull.
 PROVISION_GRACE_S = 3000.0
 
+# A fresh DONE guarantees metrics.json was uploaded first, so a None read of it is a transient HF
+# blip: retry the forced read this many times (short backoff) before treating it as a retriable
+# poll_error rather than discarding a successful run.
+_METRICS_READ_RETRIES = 3
+_METRICS_READ_BACKOFF_S = 2.0
+
 # Lambda instance statuses that mean "the box is gone / will not progress".
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
 
@@ -389,9 +395,26 @@ def poll_lambda_job(
     )
 
     def finish_ok(done_content: str | None = None) -> PollResult:
+        # finish_ok is only reached once the worker DEFINITIVELY finished (fresh DONE or ok-marker),
+        # and the worker uploads metrics.json BEFORE DONE (both required-with-retries; see
+        # _instance_bootstrap). So a None read here is a transient poller-side HF blip — make_hf_text
+        # _reader swallows 429/network/propagation-lag and returns None — NOT a genuinely-absent file.
+        # Retry the forced read a few times; if still unreadable, return a RETRIABLE poll_error rather
+        # than the terminal job_failed, which is NOT in the runner's infra-retry set and would discard
+        # (while still billing) a successful run. A re-launch hits the worker's DONE-idempotency
+        # short-circuit and restores the persisted metrics without re-training.
         raw = metrics_reader(force=True)
+        for _ in range(_METRICS_READ_RETRIES):
+            if raw is not None:
+                break
+            time.sleep(_METRICS_READ_BACKOFF_S)
+            raw = metrics_reader(force=True)
         if raw is None:
-            return PollResult(False, failure="job_failed", detail="DONE without metrics.json")
+            return PollResult(
+                False,
+                failure="poll_error",
+                detail="DONE seen but metrics.json unreadable after retries (transient HF read)",
+            )
         metrics = json.loads(raw)
         # Prefer the worker's DONE timestamp when present and sane; fall back to now. On delayed
         # recovery the control plane may poll hours after the box wrote DONE, so billing to now
