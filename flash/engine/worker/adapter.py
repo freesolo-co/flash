@@ -8,10 +8,10 @@ import re
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.lora import (
+    adapter_is_vl_warmstart,
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
-    remap_vl_adapter_dir,
 )
 from flash.engine.worker.perf import optimal_attn_impl
 
@@ -69,22 +69,69 @@ def _init_adapter_model(model_id: str):
             "init_from_adapter to train a fresh LoRA."
         )
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM
 
     print(f"[init-adapter] initializing LoRA from {prefix}")
-    # VL adapters saved with .language_model. key infix must be remapped before PeftModel.from_pretrained
-    # or peft silently discards mismatched keys and trains a fresh LoRA from scratch.
-    remap_vl_adapter_dir(adir, model_id)
     _attn = optimal_attn_impl()
+    attn_kw = {"attn_implementation": _attn} if _attn else {}
+
+    if adapter_is_vl_warmstart(adir, model_id):
+        # VL checkpoints (Qwen3.5/3.6): MERGE the SFT into the base and train a FRESH LoRA on the
+        # merged weights, instead of continuing the live SFT LoRA. Continuing it makes the colocated
+        # vLLM rollout engine AND the KL reference key off the BARE base — the SFT only reaches vLLM
+        # through the text-trainer<->VL-vLLM weight-sync, which round-trips poorly for these
+        # `*ForConditionalGeneration` models, so GRPO rolls out base-verbose and collapses a working
+        # concise-thinking SFT back to base (observed: every Qwen3.5 GRPO reverts; non-VL MiniCPM
+        # does not). We merge into the FULL multimodal model (NOT the text-only tree) so the saved
+        # checkpoint keeps the VL config + ``language_model.*`` keys that BOTH the trainer reload and
+        # vLLM's VL loader (language_model_only skips the vision weights) expect — a text-only
+        # AutoModelForCausalLM merge saves a Qwen3_5TextConfig that vLLM's VL loader rejects. The SFT
+        # adapter was trained against the full VL model, so its keys match here WITHOUT the infix strip.
+        from transformers import AutoModelForImageTextToText
+
+        base = AutoModelForImageTextToText.from_pretrained(
+            model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
+        )
+        model = PeftModel.from_pretrained(base, adir, is_trainable=False)
+        key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+        load_result = model.load_adapter(
+            adir, adapter_name="default", is_trainable=False, key_mapping=key_mapping
+        )
+        assert_adapter_load_clean(load_result, model_id)
+        assert_lora_applied(model, model_id)
+        assert_adapter_delta_nonzero(model, model_id)
+        import gc
+        import tempfile
+
+        merged = model.merge_and_unload()
+        # UNIQUE per call (mkdtemp): a fixed /tmp/flash_sft_merged would let two GRPO warm-starts on
+        # the SAME host clobber each other's merged weights (or load a partially-written tree). The
+        # dir is the run's training base, so it persists for the run (the worker is ephemeral); the
+        # old fixed path never cleaned up either, so uniqueness adds no leak it didn't already have.
+        merged_dir = tempfile.mkdtemp(prefix="flash_sft_merged_")
+        merged.save_pretrained(merged_dir, safe_serialization=True)
+        from transformers import AutoProcessor
+
+        # processor (preferred for VL) so vLLM/loaders find tokenizer + image-processor config; fall
+        # back to the bare tokenizer if no processor is published.
+        try:
+            AutoProcessor.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
+        except Exception:
+            from transformers import AutoTokenizer
+
+            AutoTokenizer.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
+        del base, model, merged
+        gc.collect()
+        print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
+        return merged_dir, make_lora(merged_dir)
+
+    # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
+    # so keep it — TRL trains the LOADED adapter (peft_config=None).
+    from transformers import AutoModelForCausalLM
+
     base = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype="bfloat16",
-        trust_remote_code=True,
-        **({"attn_implementation": _attn} if _attn else {}),
+        model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
     )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
-    # from_pretrained uses strict=False and only warns on key mismatches; reload to catch silent discards.
-    # key_mapping must match from_pretrained's remapping for renamed-arch checkpoints.
     key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
     load_result = model.load_adapter(
         adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
