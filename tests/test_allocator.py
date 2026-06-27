@@ -407,3 +407,26 @@ def test_sft_estimate_includes_capped_logits_term():
     fused_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8)
     fused_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8)
     assert abs(fused_big - fused_small) < 1e-6
+
+
+def test_vast_candidates_searches_at_effective_disk(monkeypatch):
+    # Codex Mslml: the allocator's Vast capacity search must use the SAME effective disk floor
+    # (max(disk_gb, MIN_DISK_GB)) the submit path provisions with — else a high-disk run is advertised
+    # Vast capacity that only exists at the 60 GB floor and then can't actually rent (an impossible
+    # attempt a max_retries=0 run never escapes).
+    from flash.providers import allocator
+    from flash.providers.vast import jobs as vast_jobs
+
+    captured = {}
+
+    def fake_usable(vram_floor, disk_gb, *a, **k):
+        captured["disk_gb"] = disk_gb
+        return []
+
+    monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
+    allocator._vast_candidates(16)  # default -> floored at MIN_DISK_GB
+    assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB
+    allocator._vast_candidates(16, disk_gb=200.0)  # high-disk run searches at the request
+    assert captured["disk_gb"] == 200.0
+    allocator._vast_candidates(16, disk_gb=10.0)  # below the floor still clamps up
+    assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB

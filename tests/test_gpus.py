@@ -39,6 +39,18 @@ def test_providers_for():
     assert providers_for("A100 SXM 40GB") == ("lambda", "vast")  # instance-only 40 GB SXM4
 
 
+def test_vast_gpu_for_offer_accepts_h100_pcie_alias():
+    # Codex Mslmq: Vast lists PCIe H100s as "H100 PCIE" (distinct from the SXM "H100 SXM"). Both must
+    # map to the canonical H100 class, else a PCIe-only market is dropped as unknown capacity.
+    from flash.providers.base import vast_gpu_for_offer
+
+    h100_ram = 80 * 1024  # MB
+    assert vast_gpu_for_offer("H100 SXM", h100_ram) == "H100"
+    assert vast_gpu_for_offer("H100 PCIE", h100_ram) == "H100"
+    # an unmanaged name still maps to nothing (the Ampere+ floor / unknown-board guard holds)
+    assert vast_gpu_for_offer("Tesla T4", 16 * 1024) is None
+
+
 def test_expanded_gpu_table():
     from flash.providers.base import GPU_INFO, canonical_gpu, get_gpu_info, gpu_short
 

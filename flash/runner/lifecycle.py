@@ -292,6 +292,10 @@ def _submit_seed_supervised(
                 # and OOMs the card it picks.
                 train=spec.train,
                 thinking=spec.thinking,
+                # The run's requested disk, so the Vast capacity check searches at the SAME effective
+                # floor submit provisions with — else a high-disk run is advertised Vast capacity that
+                # only exists at 60 GB and then can't rent.
+                disk_gb=float(getattr(spec.gpu, "disk_gb", 0.0) or 0.0),
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError

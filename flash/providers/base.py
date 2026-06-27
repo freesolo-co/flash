@@ -54,6 +54,11 @@ class GpuClass:
     # (NOT the RunPod ``hourly_usd`` snapshot). Names are NOT unique across VRAM variants (40/80 GB SXM4
     # both report "A100 SXM4"); ``vast_gpu_for_offer`` disambiguates by the offer's actual ``gpu_ram``.
     vast_name: str | None = None
+    # Extra Vast offer ``gpu_name`` strings that ALSO map to this class — a board variant Vast lists
+    # separately but is the same managed class (e.g. "H100 PCIE" alongside the SXM ``vast_name``).
+    # ``vast_gpu_for_offer`` accepts these too, so the market's variant rows aren't dropped as unknown
+    # capacity (which would make the class look unavailable on Vast). Empty for classes with one name.
+    vast_aliases: tuple[str, ...] = ()
 
 
 # Static hourly rates are RunPod secure-cloud on-demand snapshots.
@@ -131,6 +136,10 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
         lambda_name="gpu_1x_h100_pcie",
         vast_name="H100 SXM",
+        # Vast lists PCIe H100s separately as "H100 PCIE"; accept them as H100 capacity (same sm90 / 80
+        # GB; for our single-GPU runs the SXM-vs-PCIe interconnect gap doesn't apply). Priced live off
+        # the actual offer, so a cheaper PCIe board just makes the class more available.
+        vast_aliases=("H100 PCIE",),
     ),
     # H200 (Hopper, sm90, 141 GB HBM3e) — same compute as the H100 with ~1.76x the VRAM. The
     # mid-tier for big checkpoints whose WEIGHTS dominate but whose compute is small: e.g. the
@@ -259,7 +268,8 @@ def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
     fitting = [
         g
         for g in GPU_INFO.values()
-        if g.vast_name == gpu_name and g.vram_gb <= gpu_ram_mb / 1024 + _VRAM_MATCH_TOLERANCE_GB
+        if (g.vast_name == gpu_name or gpu_name in g.vast_aliases)
+        and g.vram_gb <= gpu_ram_mb / 1024 + _VRAM_MATCH_TOLERANCE_GB
     ]
     if not fitting:
         return None
