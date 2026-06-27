@@ -98,6 +98,42 @@ def test_urlopen_does_not_retry_404(monkeypatch):
     assert len(calls) == 1
 
 
+def test_urlopen_retries_5xx_then_succeeds(monkeypatch):
+    # A transient GitHub 5xx (incident/codeload blip) is infra, same class as a TCP reset — retry it.
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        if len(calls) < 3:
+            raise _http_error(503, "service unavailable")
+        return io.BytesIO(b"ok")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    assert _urlopen(urllib.request.Request("https://api.github.com/test")) == b"ok"
+    assert len(calls) == 3
+
+
+def test_urlopen_persistent_5xx_becomes_retriable_signal(monkeypatch):
+    # A persistent 5xx must surface as the retriable GitHubRateLimitError (worker reschedules), NOT a
+    # fatal RuntimeError that permanently fails the run — mirroring the rate-limit/TCP-transient paths.
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        raise _http_error(502, "bad gateway")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    with pytest.raises(GitHubRateLimitError, match="server error"):
+        _urlopen(urllib.request.Request("https://api.github.com/test"))
+    assert len(calls) == 6  # initial + 5 retries
+
+
 def test_urlopen_retries_transient_url_error_then_succeeds(monkeypatch):
     # A connection-phase URLError (reset/DNS) is transient infra on the same cold-spawn wave as a
     # rate limit, so it must retry within the same budget rather than fail the run.
