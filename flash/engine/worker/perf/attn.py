@@ -29,9 +29,11 @@ def _attn_impl_for_capability(
         True; absent -> plain SDPA, same as every other arch.
       * Ampere (sm80 A100 / sm86 3090·A6000) + Ada (sm89 4090·L40S): "flash_attention_2" when the
         ``flash_attn`` wheel is importable (``fa2_available``) — FA3 does NOT support these archs.
-      * consumer Blackwell (sm120 5090 / RTX Pro): "sdpa" forced to the cuDNN backend. THE ONE arch
-        with no flash: FA3/FA4 need TMEM/tcgen05 that sm120 lacks, and the prebuilt FA2 CUDA wheel's
-        sm120 coverage is unverified, so cuDNN SDPA is the validated best here.
+      * Blackwell (consumer sm120 5090 / RTX Pro; datacenter sm100 B200): "sdpa" forced to the cuDNN
+        backend. The archs with no flash here: FA3/FA4 need TMEM/tcgen05 that sm120 lacks, and the
+        prebuilt FA2 CUDA wheel's sm120/sm100 coverage is unverified, so cuDNN SDPA is the validated
+        best. Returning "sdpa" (not None) keeps sm100 out of run_sft's FA2 packing fallback, which
+        would otherwise force a possibly-missing sm100 FA2 kernel; flip once FA is validated on sm100.
       * anything else / flash unavailable -> None: transformers picks SDPA (already flash-backed on
         Ampere/Ada/Hopper).
     Pure function (no torch / no imports) so it's unit-testable on CPU; ``fa2_available`` /
@@ -42,9 +44,14 @@ def _attn_impl_for_capability(
     if major == 8 and minor in (0, 6, 9) and fa2_available:  # Ampere 8.0/8.6 + Ada 8.9 ONLY: FA2
         # (gate the minor so an unsupported sm8x like sm87 Jetson Orin doesn't get FA2 forced on it)
         return "flash_attention_2"
-    if (
-        major == 12
-    ):  # consumer Blackwell: cuDNN SDPA (the one exception — FA3/FA4 need TMEM/tcgen05)
+    if major in (10, 12):
+        # Blackwell (datacenter sm100 B200 / consumer sm120 5090·RTX Pro): cuDNN SDPA, NOT flash.
+        # sm120: FA3/FA4 need TMEM/tcgen05 it lacks. sm100: FA3 isn't probed/selected here (only
+        # sm90), and the prebuilt FA2 wheel's sm100 SASS coverage is unverified. Returning "sdpa"
+        # (rather than None) also keeps sm100 OUT of run_sft's FA2 packing fallback — a bare None
+        # there forces ``flash_attention_2`` whenever the wheel merely imports, which crashes with a
+        # kernel-image error on a B200 image whose FA2 build has no sm100 kernels. SDPA-mask packing
+        # still applies for pure-attention models. Flip to a flash impl once FA is validated on sm100.
         return "sdpa"
     return None  # the arch's flash kernel is absent -> plain SDPA (the SAME fallback on every arch)
 
@@ -130,9 +137,11 @@ def optimal_attn_impl() -> str | None:
         # Hopper but FA3 not selected -> plain SDPA (uniform fallback). FA3 is baked into the worker
         # image by default, so this means flash_attn_interface is absent/broken — check the install.
         print(f"[attn] sm{major}{minor}: FA3 unavailable (flash_attn_interface absent) -> SDPA")
-    elif major == 12:  # the only arch that returns impl=="sdpa" -> this branch covers all of it
+    elif major in (10, 12):  # the archs that return impl=="sdpa" (Blackwell sm100/sm120)
+        _tier = "datacenter" if major == 10 else "consumer"
         print(
-            f"[attn] sm{major}{minor} (consumer Blackwell) -> SDPA/cuDNN (FA3/FA4 need TMEM; n/a on sm120)"
+            f"[attn] sm{major}{minor} ({_tier} Blackwell) -> SDPA/cuDNN "
+            "(FA3/FA4 need TMEM; FA2 Blackwell-SASS coverage unverified)"
         )
     elif not fa2:
         print(f"[attn] sm{major}{minor}: flash_attn wheel absent -> SDPA")
