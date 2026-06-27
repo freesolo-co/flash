@@ -195,6 +195,9 @@ PHASE = os.environ.get(
 # commit. _HB_TERMINAL_ONLY (benchmark fan-out) throttles every non-terminal stage. The local file
 # + stdout line are always written regardless.
 _HB_LAST_UPLOAD = 0.0
+# Wall-clock of the last REAL (non-liveness) heartbeat — the liveness daemon dumps stacks if this
+# goes stale (the provider stalls off the same signal: it skips liveness pings).
+_HB_LAST_PROGRESS_TS = 0.0
 # The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
 # 128 commits/hour-per-repo limit when concurrent runs share one HF_REPO.
 _HB_MIN_INTERVAL_S = 60.0
@@ -474,6 +477,7 @@ __all__ = [
     "RUN_MODE",
     "SEED",
     "THINKING",
+    "_HB_LAST_PROGRESS_TS",
     "_HB_LAST_UPLOAD",
     "_HB_LOCK",
     "_HB_MIN_INTERVAL_S",

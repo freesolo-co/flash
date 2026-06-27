@@ -133,221 +133,140 @@ def _liveness_env(monkeypatch, *, tick=0.01):
     return hb, w, diag
 
 
-def test_liveness_heartbeat_emits_while_alive_with_nvidia_smi_only(monkeypatch):
+def test_liveness_heartbeat_emits_liveness_pings_nvidia_smi_only(monkeypatch):
     hb, w, diag = _liveness_env(monkeypatch)
     emitted: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(s))
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(k.get("liveness")))
     with hb.liveness_heartbeat("init_stage"):
         time.sleep(0.2)
-    assert emitted, "must emit the stage while alive"
-    assert all(s == "init_stage" for s in emitted)
-    assert diag, "diagnostics must be collected"
+    assert emitted, "must emit while alive"
+    assert all(v is True for v in emitted), "bare liveness_heartbeat emits LIVENESS pings (liveness=True)"
+    assert diag, "diagnostics collected"
     assert all(it is False for it in diag), "must use gpu_diagnostics(include_torch=False)"
 
 
+def test_liveness_heartbeat_reports_progress_advance_as_real_heartbeat(monkeypatch):
+    hb, w, _ = _liveness_env(monkeypatch)
+    seen: list = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: seen.append(bool(k.get("liveness"))))
+    monkeypatch.setattr(w, "_HB_LAST_PROGRESS_TS", time.time())
+    vals = iter([1, 2, 2, 2, 2, 2, 2, 2])  # advances, then stalls
+    with hb.liveness_heartbeat("model_prefetching", progress=lambda: next(vals, 2)):
+        time.sleep(0.2)
+    assert False in seen, "a progress advance must emit a REAL (non-liveness) heartbeat"
+    assert True in seen, "no advance must emit a liveness ping"
+
+
+def test_liveness_heartbeat_dumps_stacks_once_when_progress_stale(monkeypatch):
+    """No REAL progress for _STALL_DUMP_S -> dump every thread's stack ONCE (operator trace); the
+    provider does the kill+retry off the same stale-progress signal."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: None)
+    monkeypatch.setattr(hb, "_STALL_DUMP_S", 0.05)
+    monkeypatch.setattr(w, "_HB_LAST_PROGRESS_TS", time.time() - 100)  # already stale
+    dumped: list = []
+    monkeypatch.setattr(hb, "_dump_thread_stacks", lambda reason: dumped.append(reason))
+    with hb.liveness_heartbeat("rl_step"):
+        time.sleep(0.2)
+    assert len(dumped) == 1, f"must dump exactly once on a stall, got {len(dumped)}"
+
+
 def test_liveness_heartbeat_join_is_bounded_even_if_emit_wedges(monkeypatch):
-    """The context manager's exit join must be BOUNDED: a wedged heartbeat() upload can never hang
-    the worker at the end of the wrapped block."""
+    """The exit join must be BOUNDED: a wedged heartbeat() upload can't hang the worker at block exit."""
     hb, w, _ = _liveness_env(monkeypatch)
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: time.sleep(30))  # a wedged upload
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: time.sleep(30))
+    monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.2)
     t0 = time.time()
-    with hb.liveness_heartbeat("init_stage", join_timeout=0.2):
-        time.sleep(0.1)  # let the daemon enter the wedged emit
-    assert time.time() - t0 < 5, "exit must be bounded by join_timeout, not wait on a wedged emit"
+    with hb.liveness_heartbeat("init_stage"):
+        time.sleep(0.1)
+    assert time.time() - t0 < 5, "exit must be bounded by the join timeout, not wait on a wedged emit"
 
 
-def test_liveness_heartbeat_default_join_covers_the_upload_lock_wait():
-    """The DEFAULT join_timeout is at least the upload-lock timeout, so the common 'daemon waiting for
-    the upload lock' case completes within the join instead of leaking a stale old-stage HF commit
-    after the context exits and a newer stage was emitted (which would regress the published stage)."""
-    import importlib
-    import inspect
-
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    default = inspect.signature(hb.liveness_heartbeat).parameters["join_timeout"].default
-    assert default >= hb._HB_UPLOAD_LOCK_TIMEOUT_S
-
-
-def test_liveness_heartbeat_quiet_gate_skips_when_channel_fresh(monkeypatch):
-    hb, w, _ = _liveness_env(monkeypatch)
-    emitted: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(s))
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", time.time())  # fresh -> nothing to gap-fill
-    with hb.liveness_heartbeat("rl_step", quiet_gate_s=1000.0):
-        time.sleep(0.2)
-    assert not emitted, "quiet_gate must suppress liveness while another heartbeat keeps it fresh"
-
-
-def test_liveness_heartbeat_quiet_gate_fills_when_channel_stale(monkeypatch):
-    hb, w, _ = _liveness_env(monkeypatch)
-    emitted: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(s))
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)  # ancient -> channel quiet -> gap-fill
-    with hb.liveness_heartbeat("rl_step", quiet_gate_s=1.0):
-        time.sleep(0.2)
-    assert emitted, "quiet_gate must gap-fill once the channel has gone quiet"
-
-
-def test_liveness_heartbeat_stops_when_progress_stalls(monkeypatch):
-    """progress + max_silence_s: a liveness ping keeps the provider stall path quiet, so it must STOP
-    once the progress counter stalls — handing a genuinely wedged call back to that path (anti-mask)."""
-    hb, w, _ = _liveness_env(monkeypatch)
-    emitted: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(time.time()))
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-    t0 = time.time()
-    with hb.liveness_heartbeat("rl_step", progress=lambda: 5, max_silence_s=0.15):
-        time.sleep(0.8)
-    assert emitted, "should cover the stall briefly before giving up"
-    assert max(emitted) - t0 < 0.6, "must STOP emitting after max_silence (not run to block end)"
-
-
-def test_liveness_heartbeat_stops_after_max_duration(monkeypatch):
-    """max_duration_s (no progress counter, e.g. cold *Trainer.__init__): the ping keeps the provider
-    setup-grace quiet, so a stuck-but-GIL-releasing init would mask the hang forever. The daemon must
-    STOP pinging once total lifetime exceeds the cap, handing off to the provider stall path."""
-    hb, w, _ = _liveness_env(monkeypatch)
-    emitted: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(time.time()))
-    t0 = time.time()
-    with hb.liveness_heartbeat("rl_initializing", max_duration_s=0.15):
-        time.sleep(0.8)
-    assert emitted, "should cover the init briefly before giving up"
-    assert max(emitted) - t0 < 0.6, "must STOP emitting after max_duration (not run to block end)"
-
-
-def test_liveness_heartbeat_keeps_covering_while_progress_advances(monkeypatch):
-    hb, w, _ = _liveness_env(monkeypatch)
-    emitted: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(time.time()))
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-    counter = {"n": 0}
-
-    def advancing():
-        counter["n"] += 1
-        return counter["n"]
-
-    t0 = time.time()
-    with hb.liveness_heartbeat("rl_step", progress=advancing, max_silence_s=0.1):
-        time.sleep(0.5)
-    assert emitted, "advancing progress must keep liveness alive"
-    assert max(emitted) - t0 > 0.3, "advancing progress must keep liveness alive"
-
-
-def test_liveness_heartbeat_rechecks_done_after_diagnostics(monkeypatch):
+def test_liveness_heartbeat_rechecks_done_after_diagnostics():
     """gpu_diagnostics shells out to nvidia-smi (seconds); the wrapped call can finish during it. The
-    daemon must re-check done BETWEEN diagnostics and the emit, so no stale stage lands after the
-    phase's terminal stage (e.g. a model_prefetching after model_prefetched)."""
+    daemon must re-check done BETWEEN diagnostics and the emit, so no stale stage lands afterward."""
     hb = importlib.import_module("flash.engine.worker.heartbeat")
     src = inspect.getsource(inspect.unwrap(hb.liveness_heartbeat))
     between = src[src.index("gpu_diagnostics(include_torch=False)") : src.index("_w.heartbeat(stage")]
     assert "done.is_set()" in between, "must re-check done.is_set() between diagnostics and emit"
 
 
-def test_liveness_silence_uses_monotonic_clock_not_wall_clock():
-    """The no-progress silence (max_silence_s) measures an ELAPSED interval, so it must use the
-    monotonic clock — a wall-clock jump (NTP step, VM suspend/resume) must not trip it early/late,
-    since it decides when liveness stops and hands off to the stall watchdog. The quiet_gate compares
-    against _HB_LAST_UPLOAD (a time.time() stamp), so that one stays on wall clock."""
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    src = inspect.getsource(inspect.unwrap(hb.liveness_heartbeat))
-    # The silence window between an advance and the max_silence_s check is the monotonic span.
-    silence = src[src.index("advanced_at =") : src.index("if quiet_gate_s is not None")]
-    assert "time.monotonic()" in silence, "silence/progress interval must use time.monotonic()"
-    assert "time.time()" not in silence, "silence/progress interval must NOT use wall-clock time.time()"
-    # The quiet-gate still pairs with the wall-clock _HB_LAST_UPLOAD stamp.
-    quiet = src[src.index("if quiet_gate_s is not None") : src.index("gpu = gpu_diagnostics")]
-    assert "time.time()" in quiet, "quiet_gate must stay on wall clock to match _HB_LAST_UPLOAD"
+def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
+    """heartbeat() bumps _HB_LAST_PROGRESS_TS for a real heartbeat but NOT a liveness ping, and stamps
+    liveness=True on the liveness payload so the provider can skip it."""
+    import json
 
+    import flash.engine.worker as ne
 
-def test_train_liveness_heartbeat_gap_fills_with_step(monkeypatch):
-    """train_liveness_heartbeat composes liveness_heartbeat for the train phase: gap-fill the per-step
-    stage when quiet, carrying the live global_step."""
-    hb, w, _ = _liveness_env(monkeypatch)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)  # quiet -> gap-fill fires
-    emitted: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append((s, k.get("step"))))
-    counter = {"n": 0}
+    seen: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
 
-    def step():
-        counter["n"] += 1
-        return counter["n"]
+    def _capture(local, *a, **k):
+        with open(local) as f:
+            seen.append(json.load(f))
 
-    with hb.train_liveness_heartbeat("sft_step", step):
-        time.sleep(0.2)
-    assert emitted
-    assert all(s == "sft_step" for s, _ in emitted)
-    assert any(st is not None for _, st in emitted), "train liveness must carry the step in the payload"
+    monkeypatch.setattr(ne, "hf_upload_file", _capture)
 
+    ne._HB_LAST_PROGRESS_TS = 0.0
+    ne.heartbeat("rl_step", step=1)  # real progress
+    after_real = ne._HB_LAST_PROGRESS_TS
+    assert after_real > 0, "a real heartbeat must mark progress"
+    assert seen[-1].get("liveness") is None, "a real heartbeat carries no liveness flag"
 
-def test_liveness_heartbeat_survives_raising_fields_callback(monkeypatch):
-    """The ``fields`` callback can re-read live state (train_liveness_heartbeat's lambda calls
-    get_step() again), so a raise there must NOT kill the gap-filler thread for the rest of the wrapped
-    block — same defensive contract as progress(). The daemon falls back to no extra fields and keeps
-    emitting the bare heartbeat (which still re-arms the watchdog)."""
-    hb, w, _ = _liveness_env(monkeypatch)
-    emitted: list = []
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append((s, k)))
-
-    def boom():
-        raise RuntimeError("get_step exploded mid-train")
-
-    with hb.liveness_heartbeat("rl_step", fields=boom):
-        time.sleep(0.2)
-    assert emitted, "a raising fields callback must not kill the daemon — it must keep emitting"
-    assert all(s == "rl_step" for s, _ in emitted)
-    assert all("step" not in k for _, k in emitted), "failed fields must fall back to no extra fields"
+    ne.heartbeat("rl_step", liveness=True, step=1)  # liveness ping
+    assert after_real == ne._HB_LAST_PROGRESS_TS, "a liveness ping must NOT advance progress"
+    assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
 
 
 # --------------------------------------------------------------------------------------------
-# _hf_cache_bytes feeds the prefetch progress gate: bytes downloaded, or None when the cache dir
-# doesn't exist yet (unmeasurable). liveness_heartbeat treats None as "no advancement", so the
-# unmeasurable pre-structure window is itself bounded by max_silence_s.
+# _hf_cache_bytes feeds the prefetch progress signal: bytes downloaded, or None when the cache dir
+# doesn't exist yet (unmeasurable) — a growth is reported by liveness_heartbeat as REAL progress.
 def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, monkeypatch):
     import huggingface_hub.constants as hconst
 
     from flash.engine.worker import hf
 
     monkeypatch.setattr(hconst, "HF_HUB_CACHE", str(tmp_path))
-    # No repo cache dir yet -> None (can't measure) -> never counts as progress (bounded by silence).
-    assert hf._hf_cache_bytes("org/model") is None
+    assert hf._hf_cache_bytes("org/model") is None  # no repo dir yet -> unmeasurable
     repo = tmp_path / "models--org--model"
     repo.mkdir(parents=True)
-    # Repo dir exists but blobs/ not written yet -> 0 (a real "0 bytes" measurement), NOT None: a
-    # download wedged before writing any blob must still let the silence timer trip.
-    assert hf._hf_cache_bytes("org/model") == 0
+    assert hf._hf_cache_bytes("org/model") == 0  # repo dir, no blobs -> 0 (measurable)
     blobs = repo / "blobs"
     blobs.mkdir()
     (blobs / "complete").write_bytes(b"x" * 100)
-    (blobs / "partial.incomplete").write_bytes(b"y" * 50)  # an in-flight download's growing partial
+    (blobs / "partial.incomplete").write_bytes(b"y" * 50)
     assert hf._hf_cache_bytes("org/model") == 150
 
 
 # --------------------------------------------------------------------------------------------
-# Wiring: every long blocking phase must run under the shared liveness_heartbeat helper with the
-# right stage / progress gate. (Behaviour is covered above; these pin the call sites so the coverage
-# can't silently regress.)
-def test_rl_init_wraps_trainer_build_in_init_liveness_heartbeat():
+# Provider: liveness pings must NOT count as progress (else a wedged worker pinging "alive" masks the
+# stall). surface_heartbeat — shared by every provider — returns no-advance for a liveness heartbeat.
+def test_provider_surface_heartbeat_skips_liveness_pings():
+    from flash.providers._poll import surface_heartbeat
+
+    real = {"stage": "rl_initializing", "step": 0, "ts": 100.0, "attempt": "1"}
+    key, stage = surface_heartbeat(lambda: real, None, lambda _m: None)
+    assert key is not None
+    assert stage == "rl_initializing"
+    live = {"stage": "rl_initializing", "step": 0, "ts": 200.0, "attempt": "1", "liveness": True}
+    key2, stage2 = surface_heartbeat(lambda: live, key, lambda _m: None)
+    assert key2 == key, "a liveness ping must not advance the stall key"
+    assert stage2 is None, "a liveness ping is not surfaced as progress"
+
+
+# --------------------------------------------------------------------------------------------
+# Wiring: each long blocking phase runs under the shared liveness_heartbeat helper (behaviour covered
+# above; these pin the call sites so coverage can't silently regress).
+def test_rl_init_wraps_trainer_build_in_liveness_heartbeat():
     from flash.engine.worker import rl
 
-    # init_liveness_heartbeat (NOT the bare liveness_heartbeat) so the cold init ping is bounded by
-    # max_duration and can't mask a stuck-but-GIL-releasing init to the wall-clock timeout.
-    assert 'init_liveness_heartbeat("rl_initializing")' in inspect.getsource(rl.run_rl)
+    assert 'liveness_heartbeat("rl_initializing")' in inspect.getsource(rl.run_rl)
 
 
-def test_sft_init_wraps_trainer_build_in_init_liveness_heartbeat():
+def test_sft_init_wraps_trainer_build_in_liveness_heartbeat():
     from flash.engine.worker import sft
 
-    assert 'init_liveness_heartbeat("sft_initializing")' in inspect.getsource(sft.run_sft)
-
-
-def test_init_liveness_heartbeat_is_bounded_by_max_duration():
-    """init_liveness_heartbeat must pass max_duration_s (init has no incremental progress counter, so
-    the bound is a duration cap) — pins the anti-mask wiring so it can't silently regress."""
-    hb = importlib.import_module("flash.engine.worker.heartbeat")
-    src = inspect.getsource(hb.init_liveness_heartbeat)
-    assert "max_duration_s=" in src, "init liveness must be bounded by a max_duration cap"
-    assert hb._INIT_LIVENESS_MAX_S > 0
+    assert 'liveness_heartbeat("sft_initializing")' in inspect.getsource(sft.run_sft)
 
 
 @pytest.mark.parametrize(
@@ -357,14 +276,13 @@ def test_init_liveness_heartbeat_is_bounded_by_max_duration():
         ("flash.engine.worker.sft", "run_sft", "sft_step"),
     ],
 )
-def test_train_phase_wraps_train_in_train_liveness_heartbeat(modname, outer, stage):
+def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
     mod = importlib.import_module(modname)
     src = inspect.getsource(getattr(mod, outer))
-    assert "train_liveness_heartbeat(" in src, (
-        f"{outer} must wrap trainer.train() in train_liveness_heartbeat — without a gap filler the "
-        "cold first step emits no heartbeat and looks like a hang"
+    assert f'liveness_heartbeat("{stage}")' in src, (
+        f"{outer} must wrap trainer.train() in liveness_heartbeat({stage!r}) — without it the cold "
+        "first step emits no real heartbeat and looks like a hang"
     )
-    assert f'"{stage}"' in src, f"{outer} must pass stage {stage!r}"
 
 
 def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
@@ -373,34 +291,7 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
     src = inspect.getsource(hf.prefetch_model)
     assert "liveness_heartbeat(" in src
     assert '"model_prefetching"' in src
-    # The ping MUST be gated on downloaded-byte growth + a silence bound. Without these a NON-raising
-    # wedge (stuck cache filelock / NFS I/O stall on the shared mount / endless retry) never returns
-    # from snapshot_download, so the ping would re-arm the watchdog AND — model_prefetching is a setup
-    # stage — the provider setup-grace forever, masking the stall until the wall-clock timeout.
-    assert "progress=" in src, "prefetch ping must gate on a progress counter"
-    assert "_hf_cache_bytes(" in src, "prefetch ping must gate on downloaded-byte growth"
-    assert "max_silence_s=" in src, "prefetch ping must stop after a wedge silence bound"
-
-
-# --------------------------------------------------------------------------------------------
-# Stall watchdog default. A true hang (no heartbeat for the window) must self-dump every thread's
-# stack and fail the run instead of wedging silently until the control-plane kill (the
-# "process wedged, no console upload" gap). This is safe-by-default because every heartbeat re-arms
-# the timer and the init/training heartbeats now keep ticking through slow-but-live phases.
-
-
-def test_liveness_give_up_dumps_thread_stacks(monkeypatch):
-    """When a liveness daemon gives up (progress stalled past its bound) it must dump every thread's
-    stack before stopping, so the hang leaves a root-cause trace; then it stops pinging and the
-    PROVIDER's stall detection (absent heartbeats) does the kill + retry."""
-    hb, w, _ = _liveness_env(monkeypatch)
-    monkeypatch.setattr(w, "heartbeat", lambda s, **k: None)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-    dumped: list = []
-    monkeypatch.setattr(hb, "_dump_thread_stacks", lambda reason: dumped.append(reason))
-    with hb.liveness_heartbeat("rl_step", progress=lambda: 5, max_silence_s=0.05):
-        time.sleep(0.3)
-    assert dumped, "give-up must dump thread stacks"
+    assert "_hf_cache_bytes(" in src, "prefetch must report downloaded-byte growth as real progress"
 
 
 def test_no_worker_side_stall_watchdog():

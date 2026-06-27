@@ -78,15 +78,22 @@ def _dump_thread_stacks(reason: str) -> None:
         faulthandler.dump_traceback(all_threads=True)
 
 
-def heartbeat(stage: str, **kw):
+def heartbeat(stage: str, *, liveness: bool = False, **kw):
     global _HB_CLAIM_SEQ
+    ts = time.time()
+    # A REAL (non-liveness) heartbeat marks worker PROGRESS; a liveness ping only proves the worker is
+    # alive. The provider stalls on the absence of real heartbeats (surface_heartbeat skips liveness
+    # pings), and the liveness daemon dumps stacks once _HB_LAST_PROGRESS_TS goes stale.
+    if not liveness:
+        _w._HB_LAST_PROGRESS_TS = ts
     payload = {
         "stage": stage,
-        "ts": time.time(),
+        "ts": ts,
         "run_id": _w.RUN_ID,
         "mode": _w.RUN_MODE,
         "seed": _w.SEED,
         "attempt": _w.ATTEMPT,
+        **({"liveness": True} if liveness else {}),
         **kw,
     }
     # The datacenter the worker actually landed in (RunPod serverless sets RUNPOD_DC_ID) — a
@@ -244,102 +251,51 @@ def make_sft_heartbeat_callback():
 
 # Liveness heartbeat for a long blocking call on the MAIN thread. A slow-but-LIVE phase — cold vLLM
 # build / *Trainer.__init__, a multi-GB model prefetch, the first GRPO step (vLLM rollout warmup +
-# backward, ~17 min observed) — emits no heartbeat while it runs and would look like a hang to the
-# provider's stall detection. ``liveness_heartbeat`` runs a daemon next to the call that pings
-# ``stage`` to prove the worker is alive.
-#
-# A liveness ping refreshes the provider's heartbeat timestamp, so emitting unconditionally would
-# mask a GENUINELY stuck call forever. When the phase exposes a monotonic
-# progress counter (downloaded bytes, optimizer ``global_step``), pass ``progress`` + ``max_silence_s``
-# and the daemon STOPS pinging once it hasn't advanced for that long, handing a real wedge back to the
-# stall path. ``quiet_gate_s`` makes it a pure gap-filler (ping only when nothing else committed for
-# that long) for a phase another heartbeat already covers in the normal case (rl_step/sft_step).
+# backward, ~17 min observed) — emits no REAL heartbeat while it runs and would look like a hang.
+# ``liveness_heartbeat`` runs a daemon that pings ``stage`` as a LIVENESS heartbeat: it advances the
+# alive ts (so the console / a human see the worker is alive) but the provider SKIPS liveness pings
+# for stall detection, so a wedge can't be masked by pinging and the worker needs no self-limit — the
+# provider catches the stall (no real heartbeat) and does the kill + retry. For the operator, the
+# daemon also dumps every thread's stack ONCE if no real progress lands for _STALL_DUMP_S (kept under
+# the provider's training stall so the dump beats the kill). ``progress`` is an optional monotonic
+# counter (e.g. downloaded bytes) whose advance the daemon reports as a REAL heartbeat — for a phase
+# like prefetch whose only progress signal is a side effect; phases with their own per-step heartbeat
+# (rl_step / sft_step) need nothing.
 _LIVENESS_TICK_S = 30.0
-_TRAIN_LIVENESS_QUIET_S = 90.0
-_TRAIN_LIVENESS_MAX_STEP_S = 1800.0
-# Cold *Trainer.__init__ (vLLM colocate build + weight load + CUDA-graph capture) exposes NO
-# incremental progress counter, so its liveness is bounded by a generous MAX DURATION instead of a
-# progress gate: any legitimate cold init finishes well within this, but a genuinely stuck init stops
-# pinging past it and hands off to the stall path (see init_liveness_heartbeat).
-_INIT_LIVENESS_MAX_S = 1800.0
+_STALL_DUMP_S = 1200.0
 
 
 @contextlib.contextmanager
-def liveness_heartbeat(
-    stage,
-    *,
-    progress=None,
-    max_silence_s=None,
-    max_duration_s=None,
-    quiet_gate_s=None,
-    fields=None,
-    join_timeout=_HB_UPLOAD_LOCK_TIMEOUT_S,
-):
-    """Keep a ``stage`` heartbeat alive while the wrapped block runs on the main thread.
+def liveness_heartbeat(stage, progress=None):
+    """Keep ``stage`` alive (liveness pings) while the wrapped block blocks the main thread.
 
-    - ``progress``: optional ``() -> float | None`` monotonic counter. With ``max_silence_s`` the
-      daemon STOPS pinging once it hasn't advanced for that long, so liveness can't mask a real wedge
-      (a ``None`` return — unmeasurable — never counts as advancement).
-    - ``max_duration_s``: hard cap on TOTAL ping lifetime, independent of progress — for a phase with
-      no incremental progress counter (cold ``*Trainer.__init__``). Past the cap the daemon stops
-      pinging and hands off to the provider stall path, so a stuck-but-GIL-releasing init (nvidia-smi
-      still answers, so the ping would otherwise refresh the provider timestamp forever) can't mask it.
-    - ``quiet_gate_s``: if set, ping only when no heartbeat has been uploaded for that long (gap-fill
-      a phase another heartbeat — e.g. ``rl_step`` — already covers in the normal case).
-    - ``fields``: optional ``dict`` or ``() -> dict`` merged into each heartbeat (e.g. step / model).
-
-    Diagnostics are nvidia-smi-only (``include_torch=False``): the main thread owns the CUDA/allocator
-    locks during these phases, so a side-thread ``torch.cuda`` query could block. The daemon is reaped
-    with a BOUNDED join so it can never wedge the worker if stuck inside an HF upload. The default
-    ``join_timeout`` is ``_HB_UPLOAD_LOCK_TIMEOUT_S`` so the COMMON "daemon is waiting for the upload
-    lock" case completes within the join — otherwise its in-flight commit for THIS (old) stage could
-    land after the context exits and a newer stage was emitted, regressing the published stage on HF.
-    Callers that need a tighter bound can still pass a smaller ``join_timeout``.
+    ``progress``: optional ``() -> float | None`` monotonic counter; each advance is reported as a
+    REAL heartbeat (keeps the provider's stall timer fresh), everything else is a liveness ping the
+    provider ignores. nvidia-smi-only diagnostics (the main thread owns the CUDA/allocator locks).
+    Reaped with a bounded join so a wedged HF upload can't hang the worker at block exit.
     """
     done = threading.Event()
 
     def _loop() -> None:
         last_val = None
-        # Measure intervals with the MONOTONIC clock: a wall-clock jump (NTP step, VM suspend/resume)
-        # must not make max_silence_s / max_duration_s trip early/late — they decide when liveness
-        # STOPS (dumps stacks + hands off to the provider stall path), so a spurious early stop
-        # would false-fail a healthy run.
-        started_at = time.monotonic()
-        advanced_at = time.monotonic()
+        dumped = False
         while not done.wait(_LIVENESS_TICK_S):
-            if max_duration_s and (time.monotonic() - started_at) > max_duration_s:
-                _dump_thread_stacks(f"{stage}: exceeded max_duration {max_duration_s:.0f}s")
-                return
+            made_progress = False
             if progress is not None:
-                val = None
                 with contextlib.suppress(Exception):
                     v = progress()
-                    val = None if v is None else float(v)
-                if val is not None and (last_val is None or val > last_val):
-                    last_val, advanced_at = val, time.monotonic()
-                if max_silence_s and (time.monotonic() - advanced_at) > max_silence_s:
-                    _dump_thread_stacks(f"{stage}: no progress for >{max_silence_s:.0f}s")
-                    return
-            if quiet_gate_s is not None:
-                # Wall-clock here on purpose: this compares against _HB_LAST_UPLOAD, a time.time()
-                # timestamp set in heartbeat(), so both ends must be the same (wall) clock.
-                quiet_for = 1e9
-                with contextlib.suppress(Exception):
-                    quiet_for = time.time() - float(getattr(_w, "_HB_LAST_UPLOAD", 0.0) or 0.0)
-                if quiet_for < quiet_gate_s:
-                    continue
+                    if v is not None and (last_val is None or float(v) > last_val):
+                        last_val, made_progress = float(v), True
             gpu = gpu_diagnostics(include_torch=False)
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
-            # Compute the merged fields defensively: ``fields`` may be a callback that re-reads live
-            # state (train_liveness_heartbeat's lambda calls get_step()), and an exception there must
-            # NOT kill this daemon for the rest of the wrapped block — same reason progress() above is
-            # suppressed. Fall back to no extra fields; the bare heartbeat still proves liveness.
-            extra = fields if isinstance(fields, dict) else {}
-            if callable(fields):
-                with contextlib.suppress(Exception):
-                    extra = fields() or {}
-            _w.heartbeat(stage, gpu=gpu, **extra)
+            _w.heartbeat(stage, liveness=not made_progress, gpu=gpu)
+            # Operator root-cause trace: dump every thread's stack ONCE if no REAL progress lands for
+            # the window (the provider does the kill + retry off the same stale-progress signal).
+            last_progress = float(getattr(_w, "_HB_LAST_PROGRESS_TS", 0.0) or 0.0)
+            if not dumped and last_progress and (time.time() - last_progress) > _STALL_DUMP_S:
+                _dump_thread_stacks(f"{stage}: no progress for >{_STALL_DUMP_S:.0f}s")
+                dumped = True
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
@@ -347,29 +303,4 @@ def liveness_heartbeat(
         yield
     finally:
         done.set()
-        t.join(timeout=join_timeout)
-
-
-def train_liveness_heartbeat(stage, get_step):
-    """``liveness_heartbeat`` configured for the training phase: gap-fill ``stage`` (rl_step/sft_step)
-    when the channel is quiet, gated on ``get_step`` advancement so a genuinely stuck ``train()`` still
-    trips the stall path. Shared by run_rl and run_sft."""
-    return liveness_heartbeat(
-        stage,
-        progress=get_step,
-        max_silence_s=_TRAIN_LIVENESS_MAX_STEP_S,
-        quiet_gate_s=_TRAIN_LIVENESS_QUIET_S,
-        fields=lambda: {"step": int(get_step() or 0)},
-    )
-
-
-def init_liveness_heartbeat(stage):
-    """``liveness_heartbeat`` configured for the cold ``*Trainer.__init__`` phase (rl_initializing /
-    sft_initializing). Trainer construction exposes no incremental progress counter, so it is bounded
-    by ``max_duration_s=_INIT_LIVENESS_MAX_S`` instead: a legitimate cold init (vLLM build + weight
-    load + CUDA-graph capture) finishes well within the cap, but a genuinely stuck init that still
-    releases the GIL — a vLLM/CUDA/socket wait where nvidia-smi keeps answering, so the ping would
-    otherwise refresh the provider setup-grace forever (init is a setup stage) — stops pinging past the
-    cap, dumping stacks and handing the hang to the provider setup-stall instead of masking it to the
-    wall-clock timeout. Shared by run_rl and run_sft."""
-    return liveness_heartbeat(stage, max_duration_s=_INIT_LIVENESS_MAX_S)
+        t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)

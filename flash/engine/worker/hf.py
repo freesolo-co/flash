@@ -231,16 +231,6 @@ def _link_base_model_into_ephemeral_cache(model_id: str, shared_hub: str) -> Non
         print("prefetch_model link warn:", e)
 
 
-# No new download bytes for this long => snapshot_download is WEDGED (not slow): the prefetch liveness
-# stops pinging (dumping stacks) so the provider setup-stall fires instead of masking a stuck transfer
-# to the job wall-clock. Generous — a live transfer moves SOME bytes well within this even on a slow
-# link. Needed because a NON-raising wedge (a stuck cache filelock, an NFS/bind-mount I/O stall on the
-# shared weight mount, an endless retry) never returns from snapshot_download, so the plain liveness
-# ping would refresh the provider setup-grace (model_prefetching ∈ SETUP_HEARTBEAT_STAGES) forever —
-# there is no other backstop short of the wall-clock timeout.
-_MAX_PREFETCH_SILENCE_S = 600.0
-
-
 def _hf_cache_bytes(model_id: str, cache_dir: str | None = None) -> int | None:
     """Downloaded-byte total for ``model_id`` under ``cache_dir`` (or the default HF hub cache): the
     sum of the repo's ``blobs/`` files (the data, incl. the ``.incomplete`` partials an in-flight
@@ -297,10 +287,7 @@ def prefetch_model(model_id: str) -> float:
     from flash.engine.worker.heartbeat import liveness_heartbeat
 
     with liveness_heartbeat(
-        "model_prefetching",
-        progress=lambda: _hf_cache_bytes(model_id, shared_hub),
-        max_silence_s=_MAX_PREFETCH_SILENCE_S,
-        fields=lambda: {"model": model_id, "elapsed_seconds": round(time.time() - t0, 1)},
+        "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
     ):
         try:
             snapshot_download(

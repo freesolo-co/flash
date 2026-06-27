@@ -16,7 +16,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import init_liveness_heartbeat, train_liveness_heartbeat
+from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     disable_liger_grpo_torch_compile,
@@ -703,8 +703,8 @@ def run_rl():
     # releases the GIL during the subprocess wait, so it keeps ticking through a CUDA-busy init. The
     # torch memory numbers are meaningless here anyway (the model isn't built yet). If even THIS
     # stops ticking, the main thread is holding the GIL in a C extension (a true wedge) -> no heartbeat
-    # lands at all and the provider's stall detection catches it (init_liveness_heartbeat, heartbeat.py).
-    with init_liveness_heartbeat("rl_initializing"):
+    # lands at all and the provider's stall detection catches it (liveness_heartbeat, heartbeat.py).
+    with liveness_heartbeat("rl_initializing"):
         trainer = GRPOTrainer(
             model=init_model,
             args=cfg,
@@ -766,13 +766,11 @@ def run_rl():
     _reset_peak_gpu()  # peak_gpu_gb reflects the train loop (verifies the micro-batch headroom)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. vLLM colocate + bnb pages
     t_train = time.time()
-    # Gap-filler liveness around the train loop: the cold FIRST GRPO step (vLLM rollout warmup +
-    # backward, ~17 min observed on a consumer GPU) emits no rl_step until it completes and would look
-    # like a hang. train_liveness_heartbeat fills the gap, gated on global_step so a genuinely stuck
-    # train() still trips the stall path. See heartbeat.liveness_heartbeat.
-    with train_liveness_heartbeat(
-        "rl_step", lambda: getattr(getattr(trainer, "state", None), "global_step", 0)
-    ), _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+    # Liveness around the train loop: the cold FIRST GRPO step (vLLM rollout warmup + backward,
+    # ~17 min observed on a consumer GPU) emits no real rl_step until it completes and would look like
+    # a hang. liveness_heartbeat pings "alive" (the provider skips those); the real per-step rl_step
+    # callback is the progress signal, so a genuinely stuck step still trips the provider stall path.
+    with liveness_heartbeat("rl_step"), _sdpa_cudnn_ctx(_attn):  # cuDNN SDPA on sm120 (no-op else)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     rl_peak_gpu_gb = _peak_gpu_gb()

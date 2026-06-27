@@ -322,6 +322,11 @@ def surface_heartbeat(
         hb = None
     if not hb:
         return last_hb_key, None
+    if hb.get("liveness"):
+        # A liveness ping proves the worker is alive (its alive ts is in the file for humans) but is
+        # NOT progress — it must not advance the stall key, else a wedged worker pinging "alive" would
+        # mask a stall. The provider stalls on the absence of REAL (non-liveness) heartbeats.
+        return last_hb_key, None
     key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
     if key == last_hb_key:
         return last_hb_key, None
