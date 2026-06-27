@@ -34,6 +34,9 @@ SERVING_PRICES: dict[str, ServingPrice] = {
     "Qwen/Qwen3.5-2B": ServingPrice("Qwen/Qwen3.5-2B", 0.10, 0.20),
     "Qwen/Qwen3.5-4B": ServingPrice("Qwen/Qwen3.5-4B", 0.20, 0.40),
     "Qwen/Qwen3.5-9B": ServingPrice("Qwen/Qwen3.5-9B", 0.50, 1.00),
+    # 35B-A3B MoE: ~3B active params keep inference cheap-ish, but it serves on the 180 GB B200, so
+    # priced ~4x the 9B (the next size tier up).
+    "Qwen/Qwen3.6-35B-A3B": ServingPrice("Qwen/Qwen3.6-35B-A3B", 2.00, 4.00),
 }
 
 

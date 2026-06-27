@@ -45,10 +45,17 @@ def test_apply_disk_gb_noops():
 
 
 def test_default_catalog_models_need_no_disk_bump():
-    """The dense Qwen3.5 catalog fits the platform's default container disk (min_disk_gb == 0)."""
+    """The dense Qwen3.5 catalog fits the platform's default container disk (min_disk_gb == 0).
+
+    The only exception is the Qwen3.6 35B-A3B MoE: its ~70 GB bf16 checkpoint + HF/Xet temp
+    overflow the 64 GB default, so it carries an explicit disk floor.
+    """
     from flash.catalog import MODELS
 
-    assert all(m.min_disk_gb == 0 for m in MODELS.values())
+    assert all(
+        m.min_disk_gb == 0 for m in MODELS.values() if m.id != "Qwen/Qwen3.6-35B-A3B"
+    )
+    assert MODELS["Qwen/Qwen3.6-35B-A3B"].min_disk_gb == 200
 
 
 def test_submit_raises_disk_to_model_min(monkeypatch):

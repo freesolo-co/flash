@@ -117,6 +117,15 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
         lambda_name="gpu_1x_h100_pcie",
     ),
+    # H200 (Hopper, sm90, 141 GB HBM3e) — same compute as the H100 with ~1.76x the VRAM. The
+    # mid-tier for big checkpoints whose WEIGHTS dominate but whose compute is small: e.g. the
+    # 35B-A3B MoE SFT (~70 GB resident weights + tiny active-3B compute) fits here, no need for the
+    # 180 GB B200. RunPod-only: Lambda offers only the GH200 (96 GB Grace-Hopper, a different SKU),
+    # and the Hyperstack image isn't wired. Hopper has SASS in the wheels -> CUDA 12.8, FA3 path.
+    GpuClass(
+        "H200", "NVIDIA_H200", 141, "h200", "sm90", 4.39,
+        validated=True,
+    ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
         "RTX Pro 6000",
@@ -127,6 +136,25 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         2.09,
         min_cuda_modern="13.0",
         validated=True,
+    ),
+    # Datacenter Blackwell (sm100, 180 GB HBM3e usable per SXM6 board — NVIDIA advertises 192 GB,
+    # but RunPod and Lambda both list 180 GB usable, so we size to the SAFE 180). The only managed
+    # class big enough for the Qwen3.6 35B-A3B MoE (~70 GB bf16 weights): SFT fits one card and
+    # colocated GRPO (two bf16 copies + KV + 248k-vocab fp32 logits) needs the full 180 GB. Like the
+    # other Blackwell cards it needs a CUDA-13 host driver to JIT the wheels' PTX.
+    # Offered as a SINGLE B200 by RunPod (serverless ``NVIDIA_B200``) and Lambda
+    # (``gpu_1x_b200_sxm6``). NOT on Hyperstack: its only B200 flavor is the 8-GPU node
+    # ``n3-B200-SXM6x8`` (no 1x flavor), so it can't back a single-GPU class.
+    GpuClass(
+        "B200",
+        "NVIDIA_B200",
+        180,
+        "b200",
+        "sm100",
+        5.89,
+        min_cuda_modern="13.0",
+        validated=True,
+        lambda_name="gpu_1x_b200_sxm6",
     ),
 )
 
@@ -174,6 +202,10 @@ _ALIASES.update(
         "h100 80gb hbm3": "H100",
         "rtx pro 6000 blackwell": "RTX Pro 6000",
         "nvidia rtx pro 6000 blackwell server edition": "RTX Pro 6000",
+        "nvidia b200": "B200",
+        "b200 sxm6": "B200",
+        "nvidia b200 180gb": "B200",
+        "nvidia b200 sxm6": "B200",
     }
 )
 
