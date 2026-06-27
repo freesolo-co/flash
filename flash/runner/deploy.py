@@ -57,6 +57,17 @@ def cancel_run(run_id: str) -> RunStatus:
     # `done` as an undeploy artifact (cancel wins), but a genuine training completion must not
     # be clobbered (cancel loses). The two races are mutually exclusive on entry state.
     _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
+    # A deploy can race in after the entry snapshot (running -> done -> deployed) and land before this
+    # write; `deployed` is non-terminal so the `cancelled` write still wins, but the entry-gated undeploy
+    # above never ran. Re-read and tear down any deployment still active so cancel never orphans one. (A
+    # deliberate post-cancel checkpoint deploy is a later request, after we return, so it is untouched.)
+    final = get_status(run_id)
+    if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
+        with contextlib.suppress(Exception):
+            from flash.serve.deploy import undeploy_adapter
+
+            undeploy_adapter(run_id)
+            mark_deployment_undeployed(run_id)
     with contextlib.suppress(Exception):
         from flash.server.checkpoints import register_checkpoints_best_effort
 
