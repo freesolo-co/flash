@@ -353,6 +353,80 @@ def test_train_body_has_no_prime_install_path():
     assert 'shutil.which("prime")' not in src
 
 
+def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
+    """Guard: completion-only loss is ON and every prior SFT optimization is still wired. The
+    completion-only change only touched the data representation + label masking — packing, Liger,
+    LoRA+, the large-vocab logits cap, grad-checkpointing, and the 8-bit optimizer must all survive."""
+    import inspect
+
+    from flash.engine.worker import sft
+
+    src = inspect.getsource(sft.run_sft)
+    # The {input_ids, completion_mask} representation is built by the extracted pre-tokenizer; inspect
+    # it for the boundary/representation, and run_sft for the wiring + surviving optimizations.
+    pre_src = inspect.getsource(sft._pretokenize_completion_only)
+
+    # completion-only loss is ON (and the old `False` literal for that key is gone)
+    assert '"completion_only_loss": True' in src
+    assert '"completion_only_loss": False' not in src
+    # the prompt boundary + pre-tokenized {input_ids, completion_mask} representation lives in the
+    # helper; run_sft consumes it and turns it into the dataset
+    assert "completion_mask_from_ids(" in pre_src
+    assert '"completion_mask":' in pre_src
+    assert "tokenize_for_packing(" in pre_src  # EOS-append parity tokenization
+    assert "_pretokenize_completion_only(" in src
+    assert "Dataset.from_list(_pretok)" in src
+    # both flash custom-packing paths thread the completion mask through the packer
+    assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
+
+    # --- every prior optimization still present ---
+    # example packing (all three backends: TRL bfd, SDPA 4D-mask, GDN varlen)
+    assert 'cfg_kwargs["packing"] = True' in src                  # TRL bfd (pure-attn FA2)
+    assert "BlockDiagonalCollator(pad_token_id=tok.pad_token_id)" in src  # SDPA 4D-mask
+    assert "emit_varlen=True" in src                              # GDN varlen
+    assert "model_is_pure_attention" in src
+    assert "gdn_packing_available" in src
+    # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
+    # Liger fused CE/RMSNorm/RoPE
+    assert 'cfg_kwargs["use_liger_kernel"] = True' in src
+    # LoRA+ (B-matrix LR ratio)
+    assert "create_loraplus_optimizer" in src
+    assert "_lp_ratio" in src
+    # large-vocab logits cap (per-device micro-batch sizing)
+    assert "sft_grad_accum(" in src
+    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer
+    assert '"gradient_checkpointing": grad_checkpointing_on(model_id, sft_max_len)' in src
+    assert '"use_reentrant": False' in src
+    assert '"optim": fused_optim_name()' in src
+
+
+def test_trl_collator_masks_prompt_from_pretokenized_rows():
+    """The UNPACKED / TRL-bfd path (not covered by BlockDiagonalCollator tests): feed TRL's real
+    DataCollatorForLanguageModeling pre-tokenized {input_ids, completion_mask} rows with
+    completion_only_loss=True and assert it masks exactly the prompt tokens (labels -100) and keeps
+    the completion — the same representation run_sft now builds."""
+    pytest.importorskip("torch")
+    pytest.importorskip("trl")
+    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+
+    col = DataCollatorForLanguageModeling(pad_token_id=0, completion_only_loss=True)
+    rows = [
+        {"input_ids": [10, 11, 12, 13, 14], "completion_mask": [0, 0, 0, 1, 1]},  # 3-tok prompt
+        {"input_ids": [20, 21, 22], "completion_mask": [0, 1, 1]},                # 2-tok prompt
+    ]
+    out = col(rows)
+    labels = out["labels"]
+    # row 0: first three (prompt) masked, last two kept
+    assert labels[0, :3].tolist() == [-100, -100, -100]
+    assert labels[0, 3:5].tolist() == [13, 14]
+    # row 1: first token (prompt) masked, last two kept; trailing pad masked
+    assert labels[1, 0].item() == -100
+    assert labels[1, 1:3].tolist() == [21, 22]
+    # every completion token is trained, every prompt/pad token is ignored
+    keep = labels != -100
+    assert keep.sum().item() == 4  # 2 + 2 completion tokens across the batch
+
+
 def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     """The 'crashed before finishing' path (no /tmp/metrics.json) MUST upload the captured console
     even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or

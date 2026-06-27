@@ -15,6 +15,7 @@ import pytest
 
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
+    completion_mask_from_ids,
     gdn_packing_available,
     model_is_gdn_hybrid,
     model_is_pure_attention,
@@ -425,3 +426,354 @@ def test_leaky_plain_causal_would_differ():
             position_ids=batch["position_ids"],
         ).logits[0]
     assert (leaky[:n_real] - sep).abs().max().item() > 1e-3
+
+
+# ---------------------------------------------------------------- completion-only loss masking
+def _mask(tok, prompt, full):
+    # Mirror the SFT path: tokenize the prompt the SAME way the full row is tokenized (one batched
+    # call, default add_special_tokens, no appended EOS) then derive the boundary from the ids.
+    prompt_ids = tok([prompt], truncation=True, max_length=100)["input_ids"][0]
+    return completion_mask_from_ids(prompt_ids, full)
+
+
+def test_completion_mask_clean_prefix():
+    # Non-thinking: the prompt render is a clean token prefix of the full row -> mask exactly the
+    # prompt, train on the completion (assistant turn + appended EOS).
+    tok = _FakeTok(eos="!")
+    full = tokenize_for_packing(["ABxy"], tok, max_length=100)[0]  # [1, A, B, x, y, !]
+    mask = _mask(tok, "AB", full)
+    assert len(mask) == len(full)
+    assert mask == [0, 0, 0, 1, 1, 1]  # BOS+A+B masked; xy! trained
+
+
+def test_completion_mask_robust_to_divergent_prompt_suffix():
+    # Thinking template: add_generation_prompt=True pre-opens a token (e.g. `<think>`) that the full
+    # render diverges from -> the LONGEST SHARED PREFIX is masked, the rest (reasoning + answer) is
+    # trained. Here the prompt ends with a token ('<') absent from the full row at that position.
+    tok = _FakeTok(eos="!")
+    full = tokenize_for_packing(["ABxy"], tok, max_length=100)[0]  # [1, A, B, x, y, !]
+    mask = _mask(tok, "AB<", full)  # prompt_ids [1,A,B,<]
+    assert mask == [0, 0, 0, 1, 1, 1]  # diverges at idx 3 -> only the shared AB prompt is masked
+
+
+def test_completion_mask_all_prompt_masks_everything():
+    # Degenerate: max_length truncation left the WHOLE row as prompt (no completion survived). The row
+    # is fully masked (all zeros) — NOT forced to keep the last PROMPT token as a trained target, which
+    # would teach the model to reproduce prompt text. A fully-masked row is a loss no-op instead.
+    tok = _FakeTok(eos="!")
+    full = tokenize_for_packing(["AB"], tok, max_length=100)[0]  # [1, A, B, !]
+    mask = _mask(tok, "AB!", full)  # prompt == full
+    assert mask == [0, 0, 0, 0]
+    assert sum(mask) == 0  # no token trained on -> the example contributes no (prompt) loss
+
+
+def test_completion_mask_from_ids_empty_full():
+    # Empty full row -> empty mask, regardless of prompt ids.
+    assert completion_mask_from_ids([1, 2, 3], []) == []
+
+
+def test_pretokenize_completion_only_drops_empty_and_keeps_lockstep():
+    # The SFT pre-tokenizer batches both tokenizations, builds the masks, and drops rows with no
+    # completion target — keeping texts and pretok in lockstep so downstream token accounting matches.
+    from flash.engine.worker.sft import _pretokenize_completion_only
+
+    tok = _FakeTok(eos="!")
+    texts = [
+        {"text": "ABxy", "prompt_text": "AB"},  # real completion -> kept
+        {"text": "AB", "prompt_text": "AB!"},  # prompt == full row -> all-zero mask -> dropped
+        {"text": "CDz", "prompt_text": "CD"},  # real completion -> kept
+    ]
+    kept_texts, pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)
+    assert n_dropped == 1
+    assert [t["text"] for t in kept_texts] == ["ABxy", "CDz"]  # lockstep: the dropped row is gone
+    assert len(pretok) == 2
+    assert all(any(r["completion_mask"]) for r in pretok)  # every kept row has a completion token
+    assert all(len(r["completion_mask"]) == len(r["input_ids"]) for r in pretok)
+
+
+def test_pretokenize_drops_content_free_completion():
+    # A completion whose only masked token is special (an empty assistant turn -> just EOS/turn-closer)
+    # has no REAL target and must be dropped — not train the model to emit EOS immediately. "Special" is
+    # the tokenizer's own all_special_ids, so the check is template-agnostic.
+    from flash.engine.worker.sft import _pretokenize_completion_only
+
+    class _TokWithSpecials(_FakeTok):
+        all_special_ids = (1, ord("!"))  # BOS + EOS marked special
+
+    tok = _TokWithSpecials(eos="!")
+    texts = [
+        {"text": "AB", "prompt_text": "AB"},  # full [1,A,B,!]; prompt [1,A,B] -> completion=[!] (EOS) -> dropped
+        {"text": "ABx", "prompt_text": "AB"},  # completion=[x,!] has real token x -> kept
+    ]
+    kept_texts, _pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)
+    assert n_dropped == 1
+    assert [t["text"] for t in kept_texts] == ["ABx"]
+    # Without special ids the filter degrades to "any masked token" (NaN guard only): the EOS-only row
+    # survives, confirming the special-id set is what distinguishes a content-free target.
+    kept2, _, dropped2 = _pretokenize_completion_only(texts, _FakeTok(eos="!"), max_length=100)
+    assert dropped2 == 0
+    assert [t["text"] for t in kept2] == ["AB", "ABx"]
+
+
+def test_pack_carries_completion_mask_aligned():
+    # The completion mask rides along with input_ids through the FFD reorder + truncation, staying
+    # token-aligned (sum(seq_lengths) == len(input_ids) == len(completion_mask)).
+    seqs = [[1, 2, 3], [4, 5]]
+    masks = [[0, 0, 1], [0, 1]]
+    rows = pack_token_ids(seqs, max_length=8, completion_masks=masks)
+    assert len(rows) == 1
+    r = rows[0]
+    assert len(r["completion_mask"]) == len(r["input_ids"]) == sum(r["seq_lengths"])
+    # FFD places the longer example ([1,2,3]) first, then [4,5]; masks follow the same order.
+    assert r["input_ids"] == [1, 2, 3, 4, 5]
+    assert r["completion_mask"] == [0, 0, 1, 0, 1]
+
+
+def test_pack_truncates_mask_in_lockstep():
+    rows = pack_token_ids([[1, 2, 3, 4, 5]], max_length=3, completion_masks=[[0, 0, 1, 1, 1]])
+    assert rows[0]["input_ids"] == [1, 2, 3]
+    assert rows[0]["completion_mask"] == [0, 0, 1]  # truncated identically to input_ids
+
+
+def test_pack_drops_empty_with_its_mask():
+    rows = pack_token_ids([[1, 2], [], [3]], max_length=8, completion_masks=[[0, 1], [9], [1]])
+    # the empty sequence (and its mask) is dropped; survivors stay aligned
+    flat_ids = [t for r in rows for t in r["input_ids"]]
+    flat_mask = [m for r in rows for m in r["completion_mask"]]
+    assert sorted(flat_ids) == [1, 2, 3]
+    assert len(flat_mask) == len(flat_ids)
+    assert 9 not in flat_mask  # the dropped row's mask never leaked in
+
+
+def test_pack_rejects_mismatched_mask_count():
+    with pytest.raises(ValueError, match="parallel"):
+        pack_token_ids([[1, 2], [3, 4]], max_length=8, completion_masks=[[0, 1]])
+
+
+def test_pack_rejects_mismatched_mask_length():
+    # Each mask must align 1:1 with ITS sequence (not just have the right count): a shorter/longer mask
+    # would desync from input_ids after truncation, masking the wrong tokens. Reject it up front.
+    with pytest.raises(ValueError, match="match its sequence length"):
+        pack_token_ids([[1, 2, 3]], max_length=8, completion_masks=[[0, 1]])  # len 2 != 3
+
+
+def test_pack_without_masks_omits_column():
+    # Back-compat: no completion_masks -> rows have no "completion_mask" key (collator stays in its
+    # original first-token/pad-only masking mode).
+    rows = pack_token_ids([[1, 2], [3, 4]], max_length=8)
+    assert all("completion_mask" not in r for r in rows)
+
+
+def test_collator_masks_prompt_tokens_via_completion_mask():
+    torch = pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)
+    # one example [5,6,7,8] with a 2-token prompt (completion_mask [0,0,1,1]). Base masking ignores
+    # only the first token; completion masking ADDITIONALLY ignores token 6 (the 2nd prompt token).
+    batch = col([{"input_ids": [5, 6, 7, 8], "seq_lengths": [4], "completion_mask": [0, 0, 1, 1]}])
+    assert batch["labels"][0].tolist() == [-100, -100, 7, 8]
+
+
+def test_collator_completion_mask_optional():
+    # Without a completion_mask key the labels are the original first-token-only masking (unchanged).
+    torch = pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)
+    batch = col([{"input_ids": [5, 6, 7, 8], "seq_lengths": [4]}])
+    assert batch["labels"][0].tolist() == [-100, 6, 7, 8]
+
+
+def test_collator_mixed_batch_keeps_unmasked_row_full_loss():
+    # In a MIXED batch (one row carries a completion_mask, one does not), the row WITHOUT a mask keeps
+    # full-transcript loss (only its first/pad tokens ignored) — it must NOT be silently zeroed to all
+    # -100 just because a sibling row in the batch carried a completion_mask.
+    torch = pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)
+    batch = col(
+        [
+            {"input_ids": [5, 6, 7, 8], "seq_lengths": [4], "completion_mask": [0, 0, 1, 1]},
+            {"input_ids": [9, 10, 11, 12], "seq_lengths": [4]},  # no mask -> full-transcript
+        ]
+    )
+    # masked row: first token + the 2nd prompt token ignored
+    assert batch["labels"][0].tolist() == [-100, -100, 7, 8]
+    # unmasked row: ONLY the first token ignored (full-transcript), not all -100
+    assert batch["labels"][1].tolist() == [-100, 10, 11, 12]
+
+
+def test_collator_rejects_misaligned_completion_mask():
+    # A present completion_mask must span the row's REAL tokens 1:1 (len == sum(seq_lengths) ==
+    # len(input_ids)). A mis-sized mask, if silently sliced, would shift the prompt/completion boundary
+    # and train on the wrong positions — so the collator fails loud instead of guessing.
+    pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)
+    with pytest.raises(ValueError, match="completion_mask length"):
+        col([{"input_ids": [5, 6, 7, 8], "seq_lengths": [4], "completion_mask": [0, 1]}])  # len 2 != 4
+
+
+def test_packed_completion_loss_matches_unpacked():
+    """End to end: the HF CE loss over a packed block whose prompt tokens are masked equals the
+    token-weighted average of the separate per-example losses computed ONLY on completion tokens —
+    so completion-only loss is preserved exactly through packing."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    cfg = transformers.Qwen3Config(
+        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+        attn_implementation="sdpa",
+    )
+    model = transformers.Qwen3ForCausalLM(cfg).eval()
+    examples = [[5, 6, 7, 8, 9], [10, 11, 12, 13]]
+    cmasks = [[0, 0, 1, 1, 1], [0, 1, 1, 1]]  # 2- and 1-token prompts
+    rows = pack_token_ids(examples, 32, completion_masks=cmasks)
+    batch = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)(rows)
+    packed_examples = _split_by_lengths(rows[0]["input_ids"], rows[0]["seq_lengths"])
+    packed_cmasks = _split_by_lengths(rows[0]["completion_mask"], rows[0]["seq_lengths"])
+
+    with torch.no_grad():
+        packed_loss = model(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"], labels=batch["labels"],
+        ).loss.item()
+        total, n = 0.0, 0
+        for e, m in zip(packed_examples, packed_cmasks, strict=True):
+            ids = torch.tensor([e])
+            labels = torch.tensor([[tid if keep else -100 for tid, keep in zip(e, m, strict=True)]])
+            out = model(input_ids=ids, position_ids=torch.arange(len(e))[None], labels=labels)
+            contrib = sum(1 for i in range(1, len(e)) if m[i])  # shifted, scored positions
+            total += out.loss.item() * contrib
+            n += contrib
+        unpacked_weighted = total / n
+
+    assert packed_loss == pytest.approx(unpacked_weighted, abs=1e-4), (
+        f"packed completion-loss {packed_loss} != token-weighted unpacked {unpacked_weighted}"
+    )
+
+
+# ------------------------------------------------ end-to-end across arches (Qwen3 + MiniCPM/Llama)
+def _tiny(arch, transformers):
+    """Tiny model per arch — qwen3 (pure-attn flagship tier) and llama (the MiniCPM5-1B tier, which
+    really is LlamaForCausalLM: verified model_is_pure_attention(openbmb/MiniCPM5-1B) is True)."""
+    common = {
+        "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "max_position_embeddings": 64,
+        "attn_implementation": "sdpa",
+    }
+    if arch == "qwen3":
+        return transformers.Qwen3ForCausalLM(transformers.Qwen3Config(**common)).train()
+    return transformers.LlamaForCausalLM(transformers.LlamaConfig(**common)).train()
+
+
+@pytest.mark.parametrize("arch", ["qwen3", "llama"])
+def test_e2e_completion_only_packing_per_arch(arch):
+    """The whole thing, per arch: pre-tokenized {input_ids, completion_mask} -> pack -> 4D-mask
+    collate -> real forward/backward, proving the prior packing optimization (boundary isolation)
+    AND the new completion-only masking hold together, and the model actually trains."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    model = _tiny(arch, transformers)
+
+    # examples = [prompt_len tokens (masked) || completion tokens (trained)]
+    raw = [
+        ([5, 6, 7], [8, 9, 10, 11]),        # 3-token prompt, 4-token completion
+        ([12, 13], [14, 15, 16]),           # 2-token prompt
+        ([17, 18, 19, 20], [21, 22]),       # 4-token prompt
+    ]
+    seqs = [p + c for p, c in raw]
+    cmasks = [[0] * len(p) + [1] * len(c) for p, c in raw]
+    rows = pack_token_ids(seqs, max_length=32, completion_masks=cmasks)
+    col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=8)
+    batch = col(rows)
+    packed_examples = _split_by_lengths(rows[0]["input_ids"], rows[0]["seq_lengths"])
+    packed_cmasks = _split_by_lengths(rows[0]["completion_mask"], rows[0]["seq_lengths"])
+
+    # (1) ISOLATION: packed per-token logits == each example run standalone (no cross-contamination).
+    with torch.no_grad():
+        packed_logits = model(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+        ).logits[0]
+        sep = torch.cat(
+            [model(input_ids=torch.tensor([e]), position_ids=torch.arange(len(e))[None]).logits[0]
+             for e in packed_examples],
+            dim=0,
+        )
+    n_real = sum(len(e) for e in packed_examples)
+    assert (packed_logits[:n_real] - sep).abs().max().item() < 1e-5, f"{arch}: packing leaked"
+
+    # (2) COMPLETION-ONLY LOSS == token-weighted per-example completion-only loss.
+    with torch.no_grad():
+        packed_loss = model(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"], labels=batch["labels"],
+        ).loss.item()
+        total, n = 0.0, 0
+        for e, m in zip(packed_examples, packed_cmasks, strict=True):
+            ids = torch.tensor([e])
+            labels = torch.tensor([[t if keep else -100 for t, keep in zip(e, m, strict=True)]])
+            out = model(input_ids=ids, position_ids=torch.arange(len(e))[None], labels=labels)
+            contrib = sum(1 for i in range(1, len(e)) if m[i])
+            total += out.loss.item() * contrib
+            n += contrib
+    assert packed_loss == pytest.approx(total / n, abs=1e-4), f"{arch}: completion loss wrong"
+
+    # (3) MASKING IS REAL (not a no-op): the completion-only loss differs from the full-sequence loss
+    # (same inputs, all-token labels) — proves the prompt is actually excluded.
+    full_labels = batch["input_ids"].clone()
+    full_labels[batch["position_ids"] == 0] = -100  # only first-token masked (the old behavior)
+    pad = batch["input_ids"] == 0
+    full_labels[pad & (batch["position_ids"] == 0)] = -100
+    with torch.no_grad():
+        full_loss = model(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"], labels=full_labels,
+        ).loss.item()
+    assert abs(full_loss - packed_loss) > 1e-4, f"{arch}: completion mask had no effect vs full-seq loss"
+
+    # (4) TRAINS: a few SGD steps reduce the completion-only loss on this batch.
+    opt = torch.optim.SGD(model.parameters(), lr=0.5)
+    losses = []
+    for _ in range(5):
+        opt.zero_grad(set_to_none=True)
+        out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                    position_ids=batch["position_ids"], labels=batch["labels"])
+        out.loss.backward()
+        opt.step()
+        losses.append(out.loss.item())
+    assert losses[-1] < losses[0], f"{arch}: loss did not decrease ({losses[0]:.3f} -> {losses[-1]:.3f})"
+
+
+@pytest.mark.parametrize("arch", ["qwen3", "llama"])
+def test_e2e_masked_prompt_positions_get_zero_gradient(arch):
+    """No leak through masked tokens: the gradient of the completion-only loss w.r.t. the LOGITS at
+    prompt/pad positions is exactly zero (HF's -100 ignore_index), while completion positions get a
+    non-zero gradient. This is the property that makes 'train only on the completion' real."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    model = _tiny(arch, transformers)
+    raw = [([5, 6, 7, 8], [9, 10, 11])]
+    seqs = [p + c for p, c in raw]
+    cmasks = [[0] * len(p) + [1] * len(c) for p, c in raw]
+    rows = pack_token_ids(seqs, max_length=16, completion_masks=cmasks)
+    batch = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=8)(rows)
+
+    # Forward to logits, then CE against our labels, and inspect d(loss)/d(logits) per position.
+    out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                position_ids=batch["position_ids"])
+    logits = out.logits
+    logits.retain_grad()
+    # HF shift: logits[:, :-1] predict labels[:, 1:]
+    shift_logits = logits[:, :-1].reshape(-1, logits.size(-1))
+    shift_labels = batch["labels"][:, 1:].reshape(-1)
+    loss = torch.nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+    loss.backward()
+    gnorm = logits.grad[0].norm(dim=-1)  # per-position grad magnitude (length T)
+    labels0 = batch["labels"][0]
+    # grad at position i comes from predicting token i+1; a position contributes iff labels[i+1] != -100
+    for i in range(len(labels0) - 1):
+        target_kept = labels0[i + 1].item() != -100
+        if target_kept:
+            assert gnorm[i] > 0, f"{arch}: completion position {i} should have gradient"
+        else:
+            assert gnorm[i].item() == pytest.approx(0.0, abs=1e-9), f"{arch}: masked position {i} leaked gradient"
