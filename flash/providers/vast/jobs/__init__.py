@@ -108,6 +108,14 @@ _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 _METRICS_AFTER_DONE_RETRIES = 6
 _METRICS_AFTER_DONE_WAIT_S = 5.0
 
+# A successful Vast container exits / self-destroys the instant it finishes — often BEFORE HF exposes
+# the just-written DONE / vast_attempt marker (read-after-write lag). The dead/missing-instance path
+# would then see no terminal artifact on a single read and mis-classify a FINISHED seed as host loss,
+# renting a retry that races the same seed's artifacts. Re-read the terminal artifacts this many times
+# (this far apart) before concluding loss, so a finished-then-self-destroyed seed is recognized.
+_TERMINAL_AFTER_DEAD_RETRIES = 6
+_TERMINAL_AFTER_DEAD_WAIT_S = 5.0
+
 
 def _effective_disk_gb(spec) -> float:
     """The disk size an instance is actually provisioned with (the create-time floor).
@@ -405,7 +413,7 @@ def poll_vast_job(
     )
     metrics_reader = _make_hf_file_reader(hf_repo, f"{prefix}/metrics.json")
 
-    def finish_ok(done_content: str | None = None) -> PollResult:
+    def finish_ok(done_content: str | None = None, fallback_end_ts: float | None = None) -> PollResult:
         # DONE and metrics.json are SEPARATE HF artifacts; the worker writes metrics.json BEFORE the
         # DONE sentinel, but HF read-after-write is eventually consistent, so a fresh DONE can be
         # visible before metrics.json is readable. Don't fail a SUCCESSFUL run on that transient gap:
@@ -431,6 +439,17 @@ def poll_vast_job(
                     end_ts = done_ts
             except ValueError:
                 pass
+        elif fallback_end_ts is not None:
+            # No usable DONE, but a terminal ok-marker carries the worker's OWN completion ts. After a
+            # control-plane outage / HF-propagation gap the worker may have finished (and self-destroyed)
+            # hours before this poll, so billing to now() would inflate cost_usd by the downtime — bill
+            # to the marker ts when it's sane (Codex).
+            try:
+                ts = float(fallback_end_ts)
+                if launch_ts <= ts <= end_ts:
+                    end_ts = ts
+            except (TypeError, ValueError):
+                pass
         wall_h = (end_ts - launch_ts) / 3600.0
         metrics["cost_usd"] = round(wall_h * handle.hourly_usd, 6)
         notes = metrics.get("notes") if isinstance(metrics.get("notes"), dict) else {}
@@ -453,11 +472,15 @@ def poll_vast_job(
         except ValueError:
             return False
 
-    def finish_from_ok_marker() -> PollResult:
+    def finish_from_ok_marker(marker: dict | None = None) -> PollResult:
         # An ok marker means the worker finished (it wrote metrics.json before the marker), even if the
-        # DONE sentinel is STALE — pass DONE only when genuinely fresh (so cost bills to it).
+        # DONE sentinel is STALE — pass DONE only when genuinely fresh (so cost bills to it). When DONE
+        # is absent/stale, fall back to the marker's own completion ts for pricing so a recovered success
+        # isn't billed to the (possibly much later) poll time (Codex).
         d = done_reader(force=True)
-        return finish_ok(d if (d is not None and done_is_fresh(d)) else None)
+        fresh = d is not None and done_is_fresh(d)
+        marker_ts = marker.get("ts") if isinstance(marker, dict) else None
+        return finish_ok(d if fresh else None, fallback_end_ts=None if fresh else marker_ts)
 
     def fail_from_marker(marker: dict | None) -> PollResult:
         # A real worker error fails fast UNLESS flagged retriable (the worker stamps it in heartbeat
@@ -486,7 +509,7 @@ def poll_vast_job(
             with contextlib.suppress(ValueError):
                 m = json.loads(raw)
                 if m.get("ok"):
-                    return finish_from_ok_marker()
+                    return finish_from_ok_marker(m)
                 return fail_from_marker(m)
         return None
 
@@ -568,9 +591,20 @@ def poll_vast_job(
             or (became_running and status == "unknown")
         )
         if dead:
-            # One forced final read: the worker may have finished right before the box self-destroyed
-            # (the normal success order on this substrate).
+            # The worker may have finished right before the box self-destroyed (the normal success order
+            # on this substrate), with its DONE/marker not yet visible on HF (read-after-write lag). A
+            # SINGLE read can miss it and mis-classify a finished seed as host loss, renting a retry that
+            # races the same seed's artifacts — so re-read the terminal artifacts a bounded number of
+            # times before concluding loss (Codex). time.sleep is mocked in tests, so this adds no test
+            # wall-time; on a genuine host loss (no artifacts ever) it costs a brief bounded wait before
+            # the (already non-billing) box fails over.
             terminal = terminal_artifact_result()
+            _terminal_tries = _TERMINAL_AFTER_DEAD_RETRIES
+            while terminal is None and _terminal_tries > 0:
+                say("instance gone; waiting for HF to expose any terminal DONE/marker before failover")
+                time.sleep(_TERMINAL_AFTER_DEAD_WAIT_S)
+                terminal = terminal_artifact_result()
+                _terminal_tries -= 1
             if terminal is not None:
                 return terminal
             # Dead host with no ok-marker/DONE. Distinguish a genuine host LOSS (retry on a fresh host)
@@ -616,7 +650,7 @@ def poll_vast_job(
             if marker and not marker.get("ok"):
                 return fail_from_marker(marker)
             if marker and marker.get("ok"):
-                return finish_from_ok_marker()
+                return finish_from_ok_marker(marker)
 
         if not became_running and time.time() - start > LOAD_TIMEOUT_S:
             return PollResult(
@@ -752,7 +786,18 @@ def submit_run_vast(
             deadline_s=deadline,
         )
     finally:
-        _best_effort_destroy(handle.instance_id, context="submit_run_vast teardown")
+        # The teardown can't raise here (it would mask the poll result / original exception). But an
+        # UNCONFIRMED single-instance destroy (success:false / breakdown) on a SUCCESSFUL seed is
+        # dangerous for a multi-seed run: the success propagates, _run_seed_loop clears ``remote`` and
+        # launches the next seed, and while the run stays ``running`` the active-run orphan sweep SHIELDS
+        # this run's label — so the previous seed's possibly-billing box can survive across every
+        # remaining seed with no persisted handle. Escalate to a run-scoped reap by label
+        # (destroy_run_instances re-lists + retries and is NOT active-shielded) so this seed's box is
+        # cleared before the next seed launches; the warning above stays for the operator if even that
+        # can't confirm (Codex).
+        if not _best_effort_destroy(handle.instance_id, context="submit_run_vast teardown"):
+            with contextlib.suppress(Exception):
+                destroy_run_instances(spec.run_id)
 
 
 def _best_effort_destroy(instance_id, *, context: str) -> bool:

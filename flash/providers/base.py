@@ -111,6 +111,13 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         # 40 and 80 GB SXM4 boards BOTH report Vast's "A100 SXM4"; vast_gpu_for_offer resolves an
         # offer to the largest class its actual gpu_ram covers, so a 40 GB board lands here.
         vast_name="A100 SXM4",
+        # Vast also lists 40 GB A100 PCIe boards as "A100 PCIE" (the 80 GB ``A100 PCIe`` class carries
+        # that vast_name): a 40 GB "A100 PCIE" offer fails the 80 GB class's VRAM gate and, without this
+        # alias, matched no 40 GB class -> real A100 capacity dropped for 35-40 GB runs. The largest-
+        # fitting-class resolution keeps an 80 GB "A100 PCIE" board on the 80 GB class; only a 40 GB one
+        # lands here. SXM-vs-PCIe interconnect is irrelevant for single-GPU runs (same precedent as the
+        # H100 "H100 PCIE" alias); priced live off the actual offer (Codex).
+        vast_aliases=("A100 PCIE",),
     ),
     # big-VRAM tier (9B bf16 GRPO, future >9B bf16)
     # Validated 2026-06-11: 0.6B SFT smoke (phase6).

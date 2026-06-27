@@ -112,6 +112,73 @@ def _append_run_log(run_id: str, message: str) -> None:
         f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
 
 
+# A handle-less recovery resubmit is DEFERRED when this run's instance teardown can't be confirmed (a
+# possibly-live Vast box that must not be raced by a second worker). The defer must not strand the run
+# until the next control-plane restart — schedule a bounded background retry so it resubmits as soon as
+# the phantom is gone / the listing recovers. After the budget it's left for the next restart.
+_DEFERRED_RECOVERY_RETRY_S = 120.0
+_DEFERRED_RECOVERY_MAX_RETRIES = 10
+
+
+def _confirm_run_clear(spec) -> bool:
+    """Force-reap this run's instance-provider label and report whether NO instance for it remains.
+
+    A best-effort ``gc`` returns no error on an unconfirmed Vast teardown (``destroy_run_instances``
+    yields an empty list, not a raise), so after the reap we ask each instance provider's optional
+    ``run_instances_remaining`` (``[]`` == confirmed clear; RAISES when it can't enumerate). Any instance
+    still present — or a provider that can't confirm — yields ``False`` so the caller does NOT resubmit a
+    second worker over a possibly-live box (Codex; mirrors the retry-loop MtzrH guard)."""
+    from flash.providers import INSTANCE_PROVIDERS, configured_providers
+
+    clear = True
+    for prov in configured_providers():
+        if getattr(prov, "name", None) not in INSTANCE_PROVIDERS:
+            continue
+        with contextlib.suppress(Exception):
+            prov.gc(spec)
+        check = getattr(prov, "run_instances_remaining", None)
+        if check is None:
+            continue  # provider exposes no confirmation -> preserve best-effort resubmit
+        try:
+            if check(spec.run_id):
+                clear = False  # an instance for this run is still present
+        except Exception:
+            clear = False  # couldn't list -> can't prove clear -> don't race
+    return clear
+
+
+def _start_resubmit(spec) -> None:
+    from flash.runner import _run_job_background
+
+    with contextlib.suppress(Exception):
+        _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
+    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+
+
+def _deferred_resubmit_loop(spec) -> None:
+    """Background retry for a DEFERRED handle-less resubmit: re-confirm the reap on a bounded schedule
+    and resubmit once it's clear, so a transient Vast listing failure / a phantom reaped by a later
+    sweep doesn't leave the run stranded until the next control-plane restart (Codex)."""
+    import time
+
+    from flash.runner import TERMINAL_STATES
+
+    for _ in range(_DEFERRED_RECOVERY_MAX_RETRIES):
+        time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+        with contextlib.suppress(Exception):
+            st = get_status(spec.run_id)
+            if st is not None and st.state in TERMINAL_STATES:
+                return  # cancelled / failed / done meanwhile -> nothing to resubmit
+        if _confirm_run_clear(spec):
+            _start_resubmit(spec)
+            return
+    _log.warning(
+        "giving up deferred resubmit of %s after %d retries; the next control-plane restart will retry",
+        spec.run_id,
+        _DEFERRED_RECOVERY_MAX_RETRIES,
+    )
+
+
 def _worker_artifacts(spec) -> dict[str, str]:
     """The run's train-subprocess stdout + traceback, fetched from its HF artifact repo.
 
@@ -158,7 +225,6 @@ def recover_runs() -> None:
     ``queued``/``provisioning`` runs that never reached a worker."""
     from flash.runner import (
         _gc_run_endpoints,
-        _run_job_background,
         _update,
         attach_run,
         resume_run,
@@ -237,55 +303,29 @@ def recover_runs() -> None:
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active, known_labels=known)
 
-    from flash.providers import INSTANCE_PROVIDERS
-
     for spec in resubmit:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
         # create (Vast's PUT /asks) may have been accepted while the response/handle was lost — a
         # phantom contract that bills and, worse, writes this run/seed's HF artifacts. The batch
-        # sweep_orphans above reaps it only if it was VISIBLE then; force-reap this run's label across
-        # the instance providers RIGHT BEFORE relaunching, so a phantom that surfaced in the
-        # sweep->resubmit gap (Vast's instance list is eventually consistent) is killed before the fresh
-        # worker starts writing the same seed-scoped artifacts. gc is run-scoped (by label) and not
-        # active-shielded; best-effort across configured instance providers (the spec's provider isn't
-        # committed until allocation, so reap all of them).
-        # Gate the resubmit on a CONFIRMED clear: a best-effort gc returns no error when a Vast DELETE
-        # is unconfirmed (success:false / network) — destroy_run_instances yields an empty list, not a
-        # raise — so a phantom that survives the reap would otherwise get a SECOND worker writing the
-        # same seed-scoped HF artifacts. After gc, ask each instance provider whether any instance for
-        # this run remains (run_instances_remaining: [] == confirmed clear, RAISES when it can't list);
-        # if any is present — or a provider can't confirm — DEFER this run to a later recovery / the
-        # periodic sweep rather than race a possibly-live box (Codex; mirrors the retry-loop MtzrH guard).
-        reaped_clear = True
-        for prov in configured_providers():
-            if getattr(prov, "name", None) not in INSTANCE_PROVIDERS:
-                continue
-            with contextlib.suppress(Exception):
-                prov.gc(spec)
-            check = getattr(prov, "run_instances_remaining", None)
-            if check is None:
-                continue  # provider exposes no confirmation -> preserve best-effort resubmit
-            try:
-                if check(spec.run_id):
-                    reaped_clear = False  # an instance for this run is still present
-            except Exception:
-                reaped_clear = False  # couldn't list -> can't prove clear -> don't race
-        if not reaped_clear:
-            _log.warning(
-                "deferring resubmit of %s: a possibly-live instance for this run could not be "
-                "confirmed reaped; leaving it for a later recovery/sweep",
-                spec.run_id,
-            )
-            with contextlib.suppress(Exception):
-                _append_run_log(
-                    spec.run_id,
-                    "control plane restart: instance teardown unconfirmed; "
-                    "deferring resubmit for reconciliation",
-                )
+        # sweep_orphans above reaps it only if it was VISIBLE then; _confirm_run_clear force-reaps this
+        # run's label across the instance providers RIGHT BEFORE relaunching and verifies nothing for the
+        # run remains, so a phantom that surfaced in the sweep->resubmit gap (Vast's instance list is
+        # eventually consistent) can't get a SECOND worker writing the same seed-scoped artifacts.
+        if _confirm_run_clear(spec):
+            _start_resubmit(spec)
             continue
+        # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer, and
+        # schedule a bounded background retry so the run resubmits as soon as the phantom is gone / the
+        # listing recovers — rather than stranding it until the next control-plane restart (Codex).
+        _log.warning(
+            "deferring resubmit of %s: instance teardown unconfirmed; scheduling background retry",
+            spec.run_id,
+        )
         with contextlib.suppress(Exception):
             _append_run_log(
-                spec.run_id, "control plane restarted before provisioning; resubmitting"
+                spec.run_id,
+                "control plane restart: instance teardown unconfirmed; "
+                "deferring resubmit for reconciliation",
             )
-        threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+        threading.Thread(target=_deferred_resubmit_loop, args=(spec,), daemon=True).start()

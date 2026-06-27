@@ -370,6 +370,44 @@ def test_poll_caps_recovered_cost_at_done_timestamp(monkeypatch):
     assert res.metrics["cost_usd"] == round((9100.0 - 9000.0) / 3600.0 * 0.47, 6)
 
 
+def test_poll_ok_marker_without_done_bills_to_marker_ts(monkeypatch):
+    # Codex: when the ok-marker is visible but DONE is absent/stale, finish_from_ok_marker must bill to
+    # the marker's OWN completion ts, not the (possibly much later) poll time — else a success recovered
+    # after an outage / HF-propagation gap inflates cost_usd by the downtime.
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        marker=json.dumps({"ok": True, "attempt": 0, "ts": 10_005.0}),
+        metrics=json.dumps({"wall_seconds": 5, "cost_usd": 0.0}),
+        # no DONE -> finish_from_ok_marker falls back to the marker ts for pricing
+    )
+    res = vast.poll_vast_job(_handle(started_ts=10_000.0), _spec(), seed=0, interval_s=0)
+    assert res.ok
+    # billed launch->marker_ts (5s), NOT launch->poll_time (which the advancing clock pushes higher)
+    assert res.metrics["cost_usd"] == round((10_005.0 - 10_000.0) / 3600.0 * 0.47, 6)
+
+
+def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
+    # Codex: a successful worker self-destroys the instant it finishes — often before HF exposes DONE
+    # (read-after-write lag). The dead/missing path must re-read terminal artifacts a few times before
+    # declaring host loss, or a FINISHED seed is mis-classified as preempted and a retry races its
+    # artifacts. Here DONE only becomes visible on the 5th read (needs the bounded retry loop).
+    seq = {"n": 0}
+
+    def done_seq():
+        seq["n"] += 1
+        return "10500.0" if seq["n"] >= 5 else None
+
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}, {"actual_status": "exited"}],
+        done=done_seq,
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+    )
+    res = vast.poll_vast_job(_handle(started_ts=10_000.0), _spec(), seed=0, interval_s=0)
+    assert res.ok  # late DONE recognized via the retry -> success, NOT job_preempted
+
+
 def test_poll_stale_done_is_ignored(monkeypatch):
     """A DONE from a PRIOR attempt (ts < this launch - skew) is not this attempt's completion; the
     instance later dies as a host loss -> job_preempted, NOT a false success."""
@@ -854,6 +892,54 @@ def test_submit_teardown_warns_on_unconfirmed_destroy_without_raising(monkeypatc
     assert any("teardown unconfirmed" in r.message for r in caplog.records), (
         "an unconfirmed teardown in the primary path must emit an operator-visible warning"
     )
+
+
+def test_submit_unconfirmed_teardown_escalates_to_run_scoped_reap(monkeypatch):
+    """Codex: on a SUCCESSFUL seed whose single-instance teardown is UNCONFIRMED (success:false /
+    breakdown), the success still propagates and _run_seed_loop clears `remote` + launches the next seed
+    — while the run stays `running` the active-run sweep SHIELDS this label, so the box could survive
+    across every remaining seed with no handle. The finally must escalate to a run-scoped reap by label
+    (destroy_run_instances, NOT active-shielded) so this seed's box is cleared before the next launches."""
+    from flash.providers.base import PollResult
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)  # unconfirmed single destroy
+    monkeypatch.setattr(
+        vast,
+        "deploy_and_submit",
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None: _handle(),
+    )
+    monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
+    monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
+    reaped = []
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
+
+    res = vast.submit_run_vast(_spec(), seed=0)
+    assert res.ok  # the successful seed still returns
+    assert reaped == [_spec().run_id], "an unconfirmed teardown must escalate to a run-scoped label reap"
+
+
+def test_submit_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
+    """The escalation fires ONLY on an unconfirmed teardown: a confirmed single-instance destroy needs no
+    extra run-scoped reap (avoids a redundant list+destroy on every normal seed completion)."""
+    from flash.providers.base import PollResult
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)  # confirmed
+    monkeypatch.setattr(
+        vast,
+        "deploy_and_submit",
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None: _handle(),
+    )
+    monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
+    monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
+    reaped = []
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
+
+    assert vast.submit_run_vast(_spec(), seed=0).ok
+    assert reaped == [], "a confirmed teardown must NOT trigger the run-scoped reap"
 
 
 def test_best_effort_destroy_returns_confirmation(monkeypatch):

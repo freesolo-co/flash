@@ -282,6 +282,12 @@ def list_instances(strict: bool = False) -> list[dict]:
         page = out.get("instances")
         if isinstance(page, list):
             instances.extend(page)
+        elif strict:
+            # A 200 whose body lacks an ``instances`` LIST (e.g. an error envelope like
+            # ``{"success": false}`` with no ``next_token``) would otherwise fall through as a COMPLETE
+            # empty page -> a strict caller would read it as "no instance remains" and act on that false
+            # clear. Treat a missing/non-list page as an incomplete listing (Codex).
+            raise VastApiError("vast instance listing page has no 'instances' list; listing incomplete")
         after_token = out.get("next_token")
         if not after_token:
             break

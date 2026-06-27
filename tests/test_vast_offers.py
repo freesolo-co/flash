@@ -46,6 +46,17 @@ FIXTURE = [
 ]
 
 
+def test_vast_a100_pcie_offer_resolves_by_vram():
+    # Codex: Vast lists 40 GB A100 PCIe boards as "A100 PCIE" (the vast_name of the 80 GB A100 PCIe
+    # class). A 40 GB "A100 PCIE" offer fails the 80 GB VRAM gate, so without aliasing it onto the 40 GB
+    # class it drops real A100 capacity for 35-40 GB runs. The largest-fitting-class rule keeps an 80 GB
+    # board on the 80 GB class; only a 40 GB one lands on the 40 GB class.
+    from flash.providers.base import vast_gpu_for_offer
+
+    assert vast_gpu_for_offer("A100 PCIE", 80 * 1024) == "A100 PCIe"  # 80 GB -> 80 GB class
+    assert vast_gpu_for_offer("A100 PCIE", 40 * 1024) == "A100 SXM 40GB"  # 40 GB -> 40 GB class (was dropped)
+
+
 def test_usable_offers_filters_and_order(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast

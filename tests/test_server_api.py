@@ -1110,14 +1110,81 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
             return []
 
     import flash.providers as providers_mod
+    import flash.server._runtime as rt
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
+    # Disable the background retry budget so the defer is a clean no-op for this assertion (no lingering
+    # daemon thread polling a torn-down tmp db); the reschedule behavior has its own test below.
+    monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_MAX_RETRIES", 0)
 
     app_mod.recover_runs()
 
     assert reaped == ["phantom-1"], "must still attempt the force-reap"
     assert resubmitted == [], "must NOT resubmit while an instance for the run may still be live"
     assert runner.get_status("phantom-1").state != "failed", "deferred, not failed (later recovery retries)"
+
+
+def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_path):
+    # Codex: a deferred handle-less resubmit must not be stranded until the next control-plane restart —
+    # a bounded background retry re-confirms the reap and resubmits once it becomes safe (the phantom is
+    # gone / the listing recovers). Here run_instances_remaining reports the box present on the first
+    # check, then clear -> the background loop resubmits on the retry.
+    import threading
+
+    import flash.runner as runner
+    import flash.server._runtime as rt
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+
+    spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "retry-1",
+    }
+    runner._save_status(
+        runner.RunStatus(run_id="retry-1", state="provisioning", spec=spec, remote=None)
+    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "retry-1"}])
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    resubmitted = []
+    done = threading.Event()
+    monkeypatch.setattr(
+        runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
+    )
+    monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_RETRY_S", 0.01)  # fast background retry
+
+    calls = {"n": 0}
+
+    class _FakeVast:
+        name = "vast"
+
+        def gc(self, s):
+            pass
+
+        def run_instances_remaining(self, run_id):
+            calls["n"] += 1
+            return [4242] if calls["n"] == 1 else []  # present once, then cleared
+
+        def sweep_orphans(self, **k):
+            return []
+
+    import flash.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
+
+    app_mod.recover_runs()  # first check sees the box -> defers + schedules the background retry
+
+    assert done.wait(timeout=5), "the background retry must resubmit once the run is confirmed clear"
+    assert resubmitted == ["retry-1"]
 
 
 def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_path):

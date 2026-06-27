@@ -401,3 +401,19 @@ def test_list_instances_strict_raises_on_truncated_listing(monkeypatch):
     # a COMPLETE listing (next_token exhausted) still returns normally under strict.
     _capture_urlopen(monkeypatch, [{"instances": [{"id": 1}], "next_token": None}])
     assert [i["id"] for i in vast_api.list_instances(strict=True)] == [1]
+
+
+def test_list_instances_strict_rejects_non_list_instances_page(monkeypatch):
+    """Codex: a 200 whose body lacks an `instances` LIST (e.g. an error envelope `{"success": false}`
+    with no `next_token`) must NOT fall through as a complete empty page in strict mode — a strict caller
+    would read it as 'no instance remains' and act on that false clear. strict raises; the lenient
+    default still treats it as an (empty) page so the best-effort sweeps are unchanged."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [{"success": False}])  # no 'instances' list, no next_token
+    with pytest.raises(vast_api.VastApiError):
+        vast_api.list_instances(strict=True)
+    # lenient default: a missing 'instances' list is just an empty page (prior best-effort behavior)
+    _capture_urlopen(monkeypatch, [{"success": False}])
+    assert vast_api.list_instances() == []
