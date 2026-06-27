@@ -9,6 +9,7 @@ import math
 from flash.providers.allocator import required_vram_gb, vram_headroom
 
 from .facts import (
+    active_params_b,
     download_weight_gb,
     gpu_hourly_usd,
     gpu_tflops,
@@ -76,7 +77,9 @@ def setup_seconds(config: RunConfig) -> float:
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
     """Steady-state wall time for one optimizer step on ``gpu``."""
     n = config.normalized()
-    params = total_params_b(n.model_id) * 1e9
+    # Per-token FLOPs scale with the ACTIVE params (an MoE token routes through only a subset of
+    # experts); for a dense model this equals the total. Memory/size terms below keep total_params_b.
+    params = active_params_b(n.model_id) * 1e9
     peak = gpu_tflops(gpu) * 1e12  # FLOP/s
 
     if not n.is_grpo:

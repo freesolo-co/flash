@@ -28,15 +28,13 @@ def test_providers_for():
     # Consumer cards are RunPod-only (datacenter clouds don't carry GeForce).
     assert providers_for("RTX 4090") == ("runpod",)
     assert providers_for("RTX 5090") == ("runpod",)
-    assert providers_for("L4") == ("runpod",)
     # Datacenter cards span the instance-based complements where the hardware exists.
-    assert providers_for("RTX A6000") == ("runpod", "lambda", "hyperstack")
-    assert providers_for("H100") == ("runpod", "lambda", "hyperstack")
-    assert providers_for("A100 PCIe") == ("runpod", "hyperstack")
-    assert providers_for("RTX Pro 6000") == ("runpod",)  # Hyperstack lacks a CUDA-13 image for Blackwell
+    assert providers_for("RTX A6000") == ("runpod", "lambda")
+    assert providers_for("H100") == ("runpod", "lambda")
+    assert providers_for("A100 PCIe") == ("runpod",)
+    assert providers_for("RTX Pro 6000") == ("runpod",)
     # Provider-exclusive classes.
     assert providers_for("A10") == ("lambda",)  # Lambda-only
-    assert providers_for("L40") == ("hyperstack",)  # Hyperstack-only
 
 
 def test_expanded_gpu_table():
@@ -45,10 +43,10 @@ def test_expanded_gpu_table():
     # Cheap-capacity classes the cheapest policy exists for are all mapped.
     assert canonical_gpu("A100") == "A100 PCIe"
     assert canonical_gpu("h100") == "H100"
-    assert get_gpu_info("A40").vram_gb == 48
+    assert get_gpu_info("RTX A6000").vram_gb == 48
     # endpoint-name tokens stay single-word safe
     assert gpu_short("A100 PCIe") == "a100pcie"
-    assert gpu_short("RTX 6000 Ada") == "6000ada"
+    assert gpu_short("A100 SXM 40GB") == "a100sxm40"
     # architecture floor: nothing below Ampere (sm80)
     assert all(int(g.sm.removeprefix("sm")) >= 80 for g in GPU_INFO.values())
 
@@ -122,6 +120,9 @@ def test_flash_gpu_enum_members():
 
     assert flash_gpu("RTX 5090").name == "NVIDIA_GEFORCE_RTX_5090"
     assert flash_gpu("4090").name == "NVIDIA_GEFORCE_RTX_4090"
+    # B200 is newly added; resolving it fails fast (AttributeError) if the installed runpod_flash SDK
+    # doesn't expose the NVIDIA_B200 enum member, so CI catches an SDK/version gap before a live run.
+    assert flash_gpu("B200").name == "NVIDIA_B200"
 
 
 def test_gpu_short():

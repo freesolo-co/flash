@@ -58,6 +58,8 @@ class LambdaProvider:
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
     ) -> PollResult:
+        # ``on_last_gpu`` is accepted for the shared Provider interface (RunPod stretches its grace on
+        # the last GPU); the instance providers use a UNIFORM per-GPU wait, so it is intentionally unused.
         from flash.providers.lambdalabs.jobs import submit_run_lambda
 
         return submit_run_lambda(
@@ -67,7 +69,6 @@ class LambdaProvider:
             on_handle=on_handle,
             attempt=attempt,
             runtime_secrets=runtime_secrets,
-            on_last_gpu=on_last_gpu,
         )
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
@@ -95,7 +96,16 @@ class LambdaProvider:
         # a still-valid instance the moment a recovered run is past half its window.
         deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S)
         try:
-            return poll_lambda_job(lh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
+            # Uniform per-GPU wait: poll_lambda_job uses its default FIRST_LIVENESS_S / SETUP_GRACE_S
+            # (no last-GPU scaling), matching the submit path.
+            return poll_lambda_job(
+                lh,
+                spec,
+                seed,
+                log=log,
+                heartbeat_reader=reader,
+                deadline_s=deadline,
+            )
         finally:
             # Recovery (attach_run) has no submit_run_lambda teardown ``finally``; terminate the
             # reattached instance here so a finished/abandoned recovered seed stops billing
@@ -125,15 +135,18 @@ class LambdaProvider:
         terminate_run_instances(spec.run_id)
 
     def sweep_orphans(
-        self, active_labels: set[str] | Callable[[], set[str]] | None = None
+        self,
+        active_labels: set[str] | Callable[[], set[str]] | None = None,
+        known_labels: set[str] | Callable[[], set[str]] | None = None,
     ) -> list[str]:
         """Lambda crash-recovery sweep (called via the provider object at startup).
 
         Lambda instance ids are opaque hex STRINGS (the ``base.Provider`` protocol widens the return
-        to ``list[int | str]`` to cover both substrates); the orchestrator only logs/counts them."""
+        to ``list[int | str]`` to cover both substrates); the orchestrator only logs/counts them.
+        ``known_labels`` scopes the sweep to this control plane's own runs (multi-plane safety)."""
         from flash.providers.lambdalabs.jobs import sweep_orphans
 
-        return sweep_orphans(active_labels=active_labels)
+        return sweep_orphans(active_labels=active_labels, known_labels=known_labels)
 
 
 PROVIDER: Provider = LambdaProvider()

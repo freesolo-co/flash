@@ -104,6 +104,9 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch):
         # pull from the dataset namespace (else snapshot_download 404s on the model namespace).
         "repoType": "dataset",
         "status": "ready",
+        # Per-adapter thinking default carried so serving can apply it as enable_thinking when a
+        # raw chat caller omits chat_template_kwargs (deploy_adapter defaults thinking=False).
+        "thinking": False,
     }
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     # Modal 303-redirects slow requests to an async-result poll URL, so registration follows them.
@@ -154,6 +157,52 @@ def test_deploy_includes_org_id_when_provided(monkeypatch):
         gpu_name="RTX 5090",
     )
     assert "orgId" not in seen["json"]
+
+
+def test_deploy_sends_thinking_default(monkeypatch):
+    """Registration carries the run's training `thinking` flag so serving can default
+    enable_thinking to it for raw chat callers (those that omit chat_template_kwargs). A
+    thinking=true run registers thinking=true; a thinking=false run registers thinking=false."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+        seen["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+
+    d.deploy_adapter(
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        gpu_name="RTX 5090",
+        thinking=True,
+    )
+    assert seen["json"]["thinking"] is True
+
+    # A non-thinking run registers thinking=false so serving renders enable_thinking=false by
+    # default (else Qwen3.5's template default thinking-ON emits a reasoning preamble).
+    d.deploy_adapter(
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        gpu_name="RTX 5090",
+        thinking=False,
+    )
+    assert seen["json"]["thinking"] is False
 
 
 def test_deploy_propagates_serving_error(monkeypatch):

@@ -8,6 +8,7 @@ whole-dict, last-writer-wins and therefore unreliable across processes).
 
 from __future__ import annotations
 
+import hashlib
 import urllib.error
 from typing import Any
 
@@ -16,6 +17,27 @@ from flash.providers.runpod import keys as _keys
 
 REST_BASE = "https://rest.runpod.io/v1"
 QUEUE_BASE = "https://api.runpod.ai/v2"
+
+
+def key_fingerprint(key: str) -> str:
+    """A stable, NON-secret identifier for a pool account key — safe to log, store, and return.
+
+    ``RUNPOD_API_KEY`` is a secret, so the raw key must never escape this module (a stray log of a
+    ``{key: ...}`` dict, an exception's ``args``, or a metrics tag would leak a live credential).
+    Callers that need to act account-scoped (the idle reaper) hold this opaque fingerprint instead
+    and pass it back to ``*_for_fingerprint`` helpers, which resolve it to the real key internally.
+    A truncated SHA-256 is collision-safe for a handful of pool keys and reveals nothing about the
+    secret."""
+    return "rpk-" + hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def _key_for_fingerprint(fingerprint: str) -> str:
+    """Resolve a ``key_fingerprint`` back to its raw pool key (kept inside this module)."""
+    pool = _keys.keys()
+    for key in pool:
+        if key_fingerprint(key) == fingerprint:
+            return key
+    raise RunpodApiError(f"no RunPod pool key matches fingerprint {fingerprint}")
 
 
 class RunpodApiError(RuntimeError):
@@ -52,9 +74,6 @@ def request_with_retries(
     )
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 def list_endpoints() -> list[dict]:
     # ``RUNPOD_API_KEY`` may be a comma-separated pool of per-account keys. RunPod
     # endpoints are account-scoped: a plain request_with_retries() call stops at the
@@ -89,6 +108,50 @@ def list_endpoints() -> list[dict]:
     return all_endpoints
 
 
+def list_endpoints_by_key() -> tuple[dict[str, list[dict]], list[str]]:
+    """Best-effort per-account endpoint listing for the idle reaper.
+
+    Unlike ``list_endpoints()`` — which is all-or-nothing: one pool key's failure aborts
+    the whole call so teardown / slot-reconcile never act on a partial fleet — this returns
+    ``({key_fingerprint: [endpoints]}, [failed_fingerprints])``: the endpoints for every pool
+    account that DID respond, plus the fingerprints of the keys whose ``/endpoints`` call failed
+    this cycle.
+
+    Accounts are identified by their NON-secret ``key_fingerprint`` — never the raw
+    ``RUNPOD_API_KEY`` — so the return value is safe to log and to persist in the reaper's idle
+    grace timers without leaking a live credential. The reaper passes a fingerprint back to
+    ``endpoint_health_for_fingerprint`` / ``delete_endpoint_for_fingerprint`` to act account-scoped
+    (no 404-failover waterfall); the raw key is resolved internally and never leaves this module.
+
+    The reaper reaps the accounts it can see and leaves the rest for the next sweep, so one
+    flaky/expired key can't starve cleanup of every OTHER account. (``list_endpoints``'s
+    abort-on-any-failure was exactly that footgun: a single rejected or rate-limited pool
+    key silently no-op'd the whole sweep, and idle orphans on healthy accounts piled up.)
+    """
+    pool = _keys.keys()
+    if not pool:
+        raise RunpodApiError(
+            "RUNPOD_API_KEY is not set; refusing to report an empty endpoint fleet"
+        )
+    by_fingerprint: dict[str, list[dict]] = {}
+    failed: list[str] = []
+    for key in pool:
+        fp = key_fingerprint(key)
+        try:
+            out = _CLIENT.request_with_retries_for_key(key, f"{REST_BASE}/endpoints", retries=2)
+        except RunpodApiError:
+            # This account is unreachable this cycle (rejected key, credit/quota, or a
+            # transient blip that outlasted the per-key retries). Record its fingerprint so the
+            # caller can WARN and preserve its in-flight idle grace, and move on to the others.
+            failed.append(fp)
+            continue
+        if not isinstance(out, list):
+            failed.append(fp)
+            continue
+        by_fingerprint[fp] = out
+    return by_fingerprint, failed
+
+
 def find_endpoints_by_name(substr: str) -> list[dict]:
     return [e for e in list_endpoints() if substr in (e.get("name") or "")]
 
@@ -102,6 +165,22 @@ def delete_endpoint(endpoint_id: str) -> bool:
         # saying the endpoint "does not exist") means the desired end state — no such
         # endpoint — already holds. Reporting False here makes undeploy_adapter surface a
         # misleading "may still be running" 502 for something that's provably gone.
+        return _is_not_found(e)
+
+
+def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
+    """Delete an endpoint using a SPECIFIC pool account's key (no failover waterfall).
+
+    The idle reaper already knows which account owns each endpoint (it listed per key), so
+    it deletes with that exact key — cheaper than the pool failover, and it avoids the
+    waterfall masking a real failure as a 404 'already gone' on the wrong account.
+    """
+    try:
+        _CLIENT.request_with_retries_for_key(
+            key, f"{REST_BASE}/endpoints/{endpoint_id}", method="DELETE", retries=2
+        )
+        return True
+    except RunpodApiError as e:
         return _is_not_found(e)
 
 
@@ -125,9 +204,24 @@ def endpoint_health(endpoint_id: str) -> dict:
     return request_with_retries(f"{QUEUE_BASE}/{endpoint_id}/health")
 
 
-# ---------------------------------------------------------------------------
-# Queue jobs
-# ---------------------------------------------------------------------------
+def endpoint_health_for_key(endpoint_id: str, key: str) -> dict:
+    """Endpoint health via a SPECIFIC pool account's key (no failover waterfall) — the
+    reaper's account-scoped counterpart of ``endpoint_health``."""
+    return _CLIENT.request_with_retries_for_key(key, f"{QUEUE_BASE}/{endpoint_id}/health")
+
+
+def delete_endpoint_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
+    """``delete_endpoint_for_key`` addressed by a non-secret ``key_fingerprint`` (resolved to the
+    raw key inside this module) — the reaper holds only fingerprints, never the credential."""
+    return delete_endpoint_for_key(endpoint_id, _key_for_fingerprint(fingerprint))
+
+
+def endpoint_health_for_fingerprint(endpoint_id: str, fingerprint: str) -> dict:
+    """``endpoint_health_for_key`` addressed by a non-secret ``key_fingerprint`` (resolved to the
+    raw key inside this module) — the reaper holds only fingerprints, never the credential."""
+    return endpoint_health_for_key(endpoint_id, _key_for_fingerprint(fingerprint))
+
+
 def submit_job(endpoint_id: str, input_payload: dict) -> str:
     """POST /run -> job id (async queue submission)."""
     out = request_with_retries(
@@ -150,9 +244,7 @@ def cancel_job(endpoint_id: str, job_id: str) -> dict:
     )
 
 
-# ---------------------------------------------------------------------------
 # Realized billing (COGS) -- what RunPod actually charged, for estimator accuracy.
-# ---------------------------------------------------------------------------
 def billing_endpoints(
     *,
     start_time: str,

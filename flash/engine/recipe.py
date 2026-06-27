@@ -9,9 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# ----------------------------------------------------------------------------
-# Model identity
-# ----------------------------------------------------------------------------
 # Recipe fallback base model. The worker resolves JOB_SPEC.model (carried by the full
 # JobSpec) first and only falls back to RECIPE.hf_model_id; this literal is the
 # last-resort default when the spec carries no model.
@@ -21,9 +18,6 @@ from dataclasses import dataclass, field
 HF_MODEL_ID = "Qwen/Qwen3.5-4B"  # catalog DEFAULT_MODEL
 
 
-# ----------------------------------------------------------------------------
-# LoRA (rank is the main user-controllable knob)
-# ----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class LoRAConfig:
     rank: int = 32
@@ -33,9 +27,6 @@ class LoRAConfig:
     # `rank`/`alpha` are the main user-controllable knobs here.
 
 
-# ----------------------------------------------------------------------------
-# SFT (Phase 1)
-# ----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class SFTConfig:
     max_seq_len: int = 1024
@@ -49,9 +40,6 @@ class SFTConfig:
     num_epochs: int = 2
 
 
-# ----------------------------------------------------------------------------
-# RL / GRPO (Phase 2)
-# ----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class RLConfig:
     learning_rate: float = 1e-5

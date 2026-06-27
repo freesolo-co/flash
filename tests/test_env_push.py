@@ -8,8 +8,8 @@ import io
 import sys
 import tarfile
 
-from flash.cli import main as cli
-from flash.cli.main.envpush import _human_bytes, _UploadProgress
+import flash.cli as cli
+from flash.cli.envpush import _human_bytes, _UploadProgress
 
 
 def _fake_client(capture: dict, *, slug: str = "acme/environment"):

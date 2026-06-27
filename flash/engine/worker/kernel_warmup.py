@@ -87,25 +87,30 @@ def warm_flash_attn(torch) -> bool:
         warmed = True
     except Exception as e:
         _log(f"flash-attn (FA2) warm skipped: {e}")
-    try:
-        # FA3: on Hopper (sm90) the worker selects attn_implementation="flash_attention_3" (the local
-        # flash_attn_interface build) for full-attention layers, so a baked H100 cache must cover it
-        # too. a no-op/skip off-Hopper (the kernel is Hopper-only; the wheel just rides along).
-        import flash_attn_interface
+    # FA3 (flash_attn_interface) is HOPPER-ONLY: production selects attn_implementation="flash_attention_3"
+    # only on sm90. Launching it on any other arch runs a Hopper kernel that has no image there ->
+    # a "no kernel image" CUDA error that POISONS the context (a caught Python exception does NOT clear
+    # it), which then breaks save_cache_artifacts so the bake produces no mega_cache.bin. Only warm FA3
+    # on sm90; off-Hopper it is irrelevant anyway (the worker never selects it there).
+    if _torch_sm(torch) == "sm90":
+        try:
+            import flash_attn_interface
 
-        q, k, v = (
-            torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            for _ in range(3)
-        )
-        out = flash_attn_interface.flash_attn_func(q, k, v, causal=True)
-        if isinstance(out, tuple):
-            out = out[0]
-        out.sum().backward()
-        torch.cuda.synchronize()
-        _log("flash-attn-3 (Hopper) fwd/bwd compiled")
-        warmed = True
-    except Exception as e:
-        _log(f"flash-attn-3 warm skipped (expected off-Hopper): {e}")
+            q, k, v = (
+                torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                for _ in range(3)
+            )
+            out = flash_attn_interface.flash_attn_func(q, k, v, causal=True)
+            if isinstance(out, tuple):
+                out = out[0]
+            out.sum().backward()
+            torch.cuda.synchronize()
+            _log("flash-attn-3 (Hopper) fwd/bwd compiled")
+            warmed = True
+        except Exception as e:
+            _log(f"flash-attn-3 warm skipped: {e}")
+    else:
+        _log("flash-attn-3 warm skipped (Hopper-only; not this arch)")
     return warmed
 
 

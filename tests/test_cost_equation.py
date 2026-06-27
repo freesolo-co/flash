@@ -29,7 +29,7 @@ def test_prices_at_static_rate():
     """Cost uses the static GPU registry rate directly."""
     from flash.providers.base import GPU_INFO
 
-    for cls in ("RTX 5090", "A100 PCIe", "RTX 4090", "A40", "H100"):
+    for cls in ("RTX 5090", "A100 PCIe", "RTX 4090", "RTX A6000", "H100"):
         assert gpu_hourly_usd(cls) == GPU_INFO[cls].hourly_usd
 
 
