@@ -157,6 +157,26 @@ def run_sft():
         {"input_ids": ids, "completion_mask": build_completion_mask(t["prompt_text"], ids, tok, sft_max_len)}
         for t, ids in zip(texts, _full_ids, strict=True)
     ]
+    # Drop rows with NO completion target (all-zero completion_mask). build_completion_mask returns an
+    # all-zero mask when sft_max_len truncation removed the entire assistant turn (an over-long prompt)
+    # or the completion was empty: such a row is all -100 labels. A micro-batch — or a packed block at
+    # per_device_train_batch_size==1 — made up solely of these has ZERO scored positions, and the
+    # default TRL 1.6 nll loss returns NaN (not a true no-op), poisoning the step. Filtering them up
+    # front guarantees every training row carries >=1 completion token, so no all-ignored batch/block
+    # can form regardless of how rows are micro-batched or packed.
+    _kept = [r for r in _pretok if any(r["completion_mask"])]
+    _dropped = len(_pretok) - len(_kept)
+    if _dropped:
+        print(
+            f"[sft] dropped {_dropped}/{len(_pretok)} rows with no completion target "
+            "(sft_max_len truncated away the whole completion, or an empty completion)"
+        )
+    _pretok = _kept
+    if not _pretok:
+        raise ValueError(
+            "every SFT example has an empty completion after sft_max_len truncation (nothing to "
+            "train on); increase sft_max_len or shorten the prompts"
+        )
     ds = Dataset.from_list(_pretok)
     _masked_tok = sum(m.count(0) for m in (r["completion_mask"] for r in _pretok))
     _total_tok = sum(len(r["input_ids"]) for r in _pretok)

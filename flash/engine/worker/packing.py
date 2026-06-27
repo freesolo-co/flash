@@ -299,10 +299,16 @@ def build_completion_mask(
     turn) and mask the LONGEST SHARED TOKEN PREFIX of the prompt and the full row. The shared-prefix
     (rather than ``len(prompt_ids)``) is what makes this robust to the thinking chat template, whose
     ``add_generation_prompt=True`` render pre-opens ``<think>\\n`` so the prompt diverges from the
-    full render by a token — we mask up to that divergence and train on everything after, and never
-    mask the whole row (>=1 completion token is always kept). This mirrors TRL's own prompt-completion
-    masking (it likewise derives the boundary from the prompt token length), but in flash's single
-    pre-tokenization pass so the unpacked and packed paths share one boundary.
+    full render by a token — we mask up to that divergence and train on everything after. This mirrors
+    TRL's own prompt-completion masking (it likewise derives the boundary from the prompt token
+    length), but in flash's single pre-tokenization pass so the unpacked and packed paths share one
+    boundary.
+
+    Returns an ALL-ZERO mask (the whole row is prompt) in the degenerate case where ``max_length``
+    truncation removed the entire completion — the full row's tokens are a prefix of, or equal to, the
+    prompt. That row carries no loss; :func:`run_sft <flash.engine.worker.sft.run_sft>` filters these
+    no-completion-target rows out before training, so a fully-masked (NaN) micro-batch/packed block
+    can't form. (Returns ``[]`` for an empty ``full_ids``.)
     """
     n_full = len(full_ids)
     if n_full == 0:
@@ -439,15 +445,26 @@ class BlockDiagonalCollator:
             keep = torch.zeros((bsz, total), dtype=torch.bool)  # True == contributes to the loss
             for b, f in enumerate(features):
                 cm = f.get("completion_mask")
-                if cm:
-                    cm = cm[:total]
-                    keep[b, : len(cm)] = torch.tensor([bool(x) for x in cm], dtype=torch.bool)
-                else:
+                if cm is None:
                     # A row WITHOUT a completion_mask in a mixed batch keeps ALL its tokens (full-
                     # transcript loss), rather than being silently zeroed out. Pad/boundary tokens were
                     # already set to -100 above and keep=True can't un-mask them (``labels[~keep]`` only
-                    # ADDS masking), so this just avoids dropping the loss for an unmasked row.
+                    # ADDS masking), so this just avoids dropping the loss for an unmasked row. An
+                    # explicit None is the ONLY "no mask" signal — an empty list on a real row is a bug
+                    # (caught by the length check below), not a silent "keep all".
                     keep[b, :] = True
+                    continue
+                # A present mask must align 1:1 with the row's REAL (pre-pad) tokens: the mask spans
+                # sum(seq_lengths) == len(input_ids) (the invariant asserted above). Silently slicing a
+                # mis-sized mask would shift the prompt/completion boundary and train on the wrong
+                # positions, so fail loud instead of guessing.
+                n_real = len(rows[b])
+                if len(cm) != n_real:
+                    raise ValueError(
+                        f"completion_mask length {len(cm)} != row real-token count {n_real} "
+                        "(mask must span sum(seq_lengths) == len(input_ids))"
+                    )
+                keep[b, :n_real] = torch.tensor([bool(x) for x in cm], dtype=torch.bool)
             labels[~keep] = self.label_pad_token_id
 
         batch = {

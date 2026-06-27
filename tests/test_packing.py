@@ -548,6 +548,16 @@ def test_collator_mixed_batch_keeps_unmasked_row_full_loss():
     assert batch["labels"][1].tolist() == [-100, 10, 11, 12]
 
 
+def test_collator_rejects_misaligned_completion_mask():
+    # A present completion_mask must span the row's REAL tokens 1:1 (len == sum(seq_lengths) ==
+    # len(input_ids)). A mis-sized mask, if silently sliced, would shift the prompt/completion boundary
+    # and train on the wrong positions — so the collator fails loud instead of guessing.
+    pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)
+    with pytest.raises(ValueError, match="completion_mask length"):
+        col([{"input_ids": [5, 6, 7, 8], "seq_lengths": [4], "completion_mask": [0, 1]}])  # len 2 != 4
+
+
 def test_packed_completion_loss_matches_unpacked():
     """End to end: the HF CE loss over a packed block whose prompt tokens are masked equals the
     token-weighted average of the separate per-example losses computed ONLY on completion tokens —
