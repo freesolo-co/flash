@@ -115,16 +115,28 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     assert "UNDECLARED_API_KEY" not in env
 
 
-def test_build_worker_env_forwards_upload_console(monkeypatch):
-    """FLASH_UPLOAD_CONSOLE (upload the worker console on SUCCESS, not just on crash) is read on the
-    worker by run_mode() from the forwarded env dict. It MUST be on the allowlist or the
-    success-console upload silently no-ops on every remote run."""
-    from flash.providers.runpod.train import build_worker_env
+def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
+    """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
+    when it exits — so every print reaches `flash status --logs`, not just a post-mortem tail on
+    crash. There is no FLASH_UPLOAD_CONSOLE flag to forget: it is NOT forwarded to the worker (even
+    if an operator sets it), and neither worker run_mode path gates the upload."""
+    import inspect
 
+    from flash.providers import _instance_bootstrap
+    from flash.providers.runpod.train import build_worker_env, endpoints
+
+    # the flag is gone — setting it in the control-plane env does not reach the worker
     monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")
-    assert build_worker_env(_spec(), 0).get("FLASH_UPLOAD_CONSOLE") == "1"
-    monkeypatch.delenv("FLASH_UPLOAD_CONSOLE", raising=False)
     assert "FLASH_UPLOAD_CONSOLE" not in build_worker_env(_spec(), 0)
+
+    # both worker run_mode paths upload unconditionally (no flag, no gating var)
+    for src in (
+        inspect.getsource(_instance_bootstrap.run_mode),
+        inspect.getsource(endpoints._train_body),
+    ):
+        assert "FLASH_UPLOAD_CONSOLE" not in src
+        assert "upload_enabled" not in src
+        assert "_force_console" not in src
 
 
 def _clear_chalk_flags(monkeypatch):
@@ -338,8 +350,9 @@ def test_train_body_imports_every_name_it_uses():
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
-    # Names that must be locally imported (regression: contextlib was missing).
-    for name in ("contextlib", "json", "os", "subprocess", "sys"):
+    # Names that must be locally imported (regression: contextlib was missing; threading is used by
+    # the always-on console uploader).
+    for name in ("contextlib", "json", "os", "subprocess", "sys", "threading"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
 
 
