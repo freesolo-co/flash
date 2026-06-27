@@ -183,15 +183,13 @@ def fetch_code(payload: dict) -> None:
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """One worker process; console teed to a file and streamed to the container log.
 
-    On failure/SUCCESS (FLASH_UPLOAD_CONSOLE) the console tail is uploaded as console_<mode>.txt.
-    On deadline the process is killed and we raise.
+    The console tail is ALWAYS uploaded as console_<mode>.txt — periodically while the worker runs
+    (so ``flash status --logs`` shows live progress) and once more when it exits — so every worker
+    print reaches the CLI, not just on failure. On deadline the process is killed and we raise.
     """
     console = f"/tmp/console_{mode}.txt"
     timed_out = False
-    upload_enabled = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
-        "", "0", "false", "no", "off",
-    )
-    upload_interval = max(5.0, float(env.get("FLASH_CONSOLE_UPLOAD_INTERVAL_S") or 30.0))
+    upload_interval = 30.0  # seconds between live console uploads (fixed; flash is fully managed)
 
     def upload_console_tail(extra: str = "") -> None:
         tail_path = console + ".tail"
@@ -218,7 +216,6 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             except Exception as exc:
                 print(f"console upload warn: {exc}", flush=True)
 
-    uploader = None
     with open(console, "w", buffering=1) as cf:
         proc = subprocess.Popen(
             [sys.executable, "-m", "flash.engine.worker"],
@@ -236,9 +233,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
 
         t = threading.Thread(target=pump, daemon=True)
         t.start()
-        if upload_enabled:
-            uploader = threading.Thread(target=upload_loop, daemon=True)
-            uploader.start()
+        # Always stream the console to HF while the worker runs — `flash status --logs` then shows
+        # live progress + every print, not just a post-mortem tail on crash.
+        uploader = threading.Thread(target=upload_loop, daemon=True)
+        uploader.start()
         try:
             # Honor the wall-clock deadline: wait only up to the time left (floored to a small
             # positive so the call never blocks forever on a 0/negative timeout). A prior ``max(10.0,
@@ -251,17 +249,16 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             proc.kill()
             proc.wait()
         t.join(timeout=10)
-        if uploader is not None:
-            stop_upload.set()
-            uploader.join(timeout=10)
-    if proc.returncode != 0 or timed_out or upload_enabled:
-        try:
-            extra = ""
-            if timed_out:
-                extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
-            upload_console_tail(extra)
-        except Exception as exc:
-            print(f"console upload warn: {exc}", flush=True)
+        stop_upload.set()
+        uploader.join(timeout=10)
+    # Always upload the final tail (success or failure) so the CLI has the complete console.
+    try:
+        extra = ""
+        if timed_out:
+            extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
+        upload_console_tail(extra)
+    except Exception as exc:
+        print(f"console upload warn: {exc}", flush=True)
     if timed_out:
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode

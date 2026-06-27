@@ -676,6 +676,31 @@ def remap_vl_adapter_dir(adir: str, model_id: str) -> int:
     return n
 
 
+def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
+    """Whether a warm-start adapter should take the VL merge-into-base path.
+
+    Robust to a transient ``is_vl_checkpoint`` config-probe failure (it calls
+    ``AutoConfig.from_pretrained`` and swallows EVERY exception to return False, so an HF
+    rate-limit / network hiccup / uncached config could silently route a genuine VL warm-start down
+    the text-only path and reintroduce the trainer<->vLLM mismatch — issue #286). An adapter that
+    actually carries ``.language_model.`` LoRA keys was saved against the full multimodal model and
+    IS a VL warm-start regardless of the probe (the SAME authoritative file-content signal
+    ``remap_vl_adapter_dir`` keys off). Falls back to the config probe only when the adapter can't be
+    read or carries no ``.language_model.`` LoRA keys (already-text-only / non-VL)."""
+    try:
+        keys = _read_adapter_tensor_keys(adir)
+        if keys and any(_LANGUAGE_MODEL_INFIX in k for k in keys if _is_lora_key(k)):
+            return True
+    except Exception as e:  # best-effort: never let a key-read failure abort the launch
+        # Name the adapter dir + model so a transient failure is tied to the specific warm-start
+        # when several workers log into the same stream.
+        print(
+            f"[init-adapter] adapter VL-key probe failed for adir={adir!r} model={model_id!r}; "
+            f"deferring to the config probe: {e}"
+        )
+    return is_vl_checkpoint(model_id)
+
+
 def assert_lora_applied(model, model_id: str) -> int:
     """After ``PeftModel.from_pretrained``, verify the adapter's LoRA actually loaded (non-empty)
     so a future key-mismatch regression fails LOUDLY instead of silently training a fresh LoRA.
