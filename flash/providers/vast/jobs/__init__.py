@@ -377,6 +377,14 @@ def poll_vast_job(
     # started_ts is coerced to 0.0 for an old/corrupt handle; 0.0 means "unknown launch" -> fall back
     # to now so the load/stall clocks and the cost stamp treat a recovered handle consistently.
     launch_ts = handle.started_ts or time.time()
+    # Heartbeat ATTEMPT-DATING (worker_flagged_retriable / heartbeat_is_stale_prior_attempt) must use
+    # the TRUE launch, NOT the now() fallback: those helpers read a falsy launch as "unknown -> can't
+    # date by ts" (every heartbeat is then fresh / non-prior). Passing now() here instead would make a
+    # normal heartbeat's ts (always < now) look like it predates launch, so a same-attempt crash with a
+    # shared error_<phase>.txt would be misread as a prior-attempt leftover -> wrong job_preempted
+    # (Cursor MtgwT). Keep `launch_ts` (now()-floored) for elapsed-time math (stall clock, DONE
+    # freshness, cost) where a concrete anchor is required; use this raw value only for dating.
+    _dating_launch = handle.started_ts or 0.0
 
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
@@ -437,7 +445,7 @@ def poll_vast_job(
         # worker must not override the current attempt's (non-retriable) marker and turn a fast-fail
         # into a GPU-burning retry loop.
         retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(
-            heartbeat_reader, launch_ts=launch_ts, current_attempt=handle.attempt
+            heartbeat_reader, launch_ts=_dating_launch, current_attempt=handle.attempt
         )
         return PollResult(
             False,
@@ -539,21 +547,26 @@ def poll_vast_job(
             # so fail FAST. A crash the worker flagged retriable still retries.
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
             # ``error_{phase}.txt`` and the heartbeat are BOTH seed-scoped (shared across this seed's
-            # retries), so a prior attempt can leave either behind. Treat the error as a CURRENT
-            # deterministic crash only when it is THIS attempt's evidence:
-            #  - if the latest heartbeat is a leftover from a PRIOR attempt, the co-located error is
-            #    presumed leftover too -> a host LOSS, not a crash (retry on a fresh host); AND
+            # retries), so a prior attempt can leave either behind. The worker's crash handler uploads
+            # the error file AND a heartbeat stamped with THIS attempt + ts together (and error-stage
+            # heartbeats are force-uploaded, never throttled), so a genuine current-attempt crash always
+            # leaves a fresh attempt-matching heartbeat next to the error. We therefore use heartbeat
+            # provenance to attribute the error: treat it as a CURRENT deterministic crash only when
+            #  - the latest heartbeat is NOT a leftover from a PRIOR attempt (else the co-located error
+            #    is presumed leftover too -> a host LOSS, retry on a fresh host); AND
             #  - the worker did not flag the failure retriable for THIS attempt.
-            # Without this first guard, gating only the retriable flag (the 1a28224 fix) flips a genuine
-            # retry-after-host-loss into a fail-fast job_failed once the stale flag is ignored.
+            # Without the first guard, gating only the retriable flag (the 1a28224 fix) flips a genuine
+            # retry-after-host-loss into a fail-fast job_failed once the stale flag is ignored. Dating
+            # uses _dating_launch (the TRUE launch, 0.0 == unknown) so a now()-fallback can't misjudge a
+            # normal heartbeat as prior-attempt (Cursor MtgwT).
             crash_evidence_is_current = not heartbeat_is_stale_prior_attempt(
-                heartbeat_reader, launch_ts=launch_ts, current_attempt=handle.attempt
+                heartbeat_reader, launch_ts=_dating_launch, current_attempt=handle.attempt
             )
             worker_crashed = (
                 bool(err and err.strip())
                 and crash_evidence_is_current
                 and not worker_flagged_retriable(
-                    heartbeat_reader, launch_ts=launch_ts, current_attempt=handle.attempt
+                    heartbeat_reader, launch_ts=_dating_launch, current_attempt=handle.attempt
                 )
             )
             return PollResult(

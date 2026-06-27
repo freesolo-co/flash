@@ -482,6 +482,31 @@ def test_poll_dead_host_current_attempt_error_is_job_failed(monkeypatch):
     assert "bad config" in res.detail
 
 
+def test_poll_dead_host_unknown_launch_same_attempt_error_is_job_failed(monkeypatch):
+    """Cursor MtgwT: with an unknown launch (started_ts=0.0) the dead-host path must NOT date the
+    heartbeat against the now()-fallback. The attempt-attribution helpers get the TRUE launch (0.0),
+    which disables ts-based staleness, so a same-attempt crash heartbeat (ts naturally < poll time) is
+    correctly read as CURRENT evidence -> job_failed, not a false job_preempted. (Before the fix,
+    launch_ts=now() made the normal heartbeat ts look pre-launch -> stale -> wrongly preempted.)"""
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}, {"actual_status": "exited"}],
+        error="Traceback (most recent call last):\nValueError: deterministic crash, unknown launch ...",
+    )
+    # attempt matches the handle (0); ts is a normal value below the poll clock (starts at 10_000).
+    cur_hb = {"stage": "error_sft", "ts": 9_500.0, "attempt": 0}
+    res = vast.poll_vast_job(
+        _handle(started_ts=0.0, attempt=0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: cur_hb,
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert "deterministic crash" in res.detail
+
+
 def test_poll_loading_timeout(monkeypatch):
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "loading"}], step=100.0)
     monkeypatch.setattr(vast, "LOAD_TIMEOUT_S", 300.0)
