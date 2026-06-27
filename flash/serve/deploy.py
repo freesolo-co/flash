@@ -251,10 +251,11 @@ def list_deployed_adapters() -> list[dict]:
     operator repo GC (``flash.server.repo_cleanup``) to know which per-run repos are currently
     serving traffic and must never be touched.
 
-    Raises ``ServingError`` if the serving backend is unreachable or returns non-200 — a caller
-    gating destructive cleanup on this set MUST treat that as "unknown, do not delete" rather than
-    "nothing deployed". The response is tolerated as either a bare list or an
-    ``{"adapters": [...]}`` / ``{"data": [...]}`` envelope.
+    Raises ``ServingError`` if the serving backend is unreachable, returns non-200, returns a
+    non-JSON body, or returns a 200 in an unrecognized shape — a caller gating destructive cleanup
+    on this set MUST treat any of those as "unknown, do not delete" rather than "nothing deployed".
+    The success body is tolerated as either a bare list or an ``{"adapters": [...]}`` /
+    ``{"data": [...]}`` envelope; an empty list (live set genuinely empty) returns ``[]``.
     """
     base = serving_base_url()
     url = f"{base}/adapters"
@@ -271,9 +272,29 @@ def list_deployed_adapters() -> list[dict]:
         raise _serving_status_error(url, exc) from exc
     except httpx.RequestError as exc:
         raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        # A 200 with an un-decodable body is NOT "nothing deployed" — surface it so the GC caller
+        # treats the live set as unknown and refuses to delete.
+        raise ServingError(f"serving backend returned a non-JSON adapter list from {url}: {exc}") from exc
     if isinstance(data, dict):
-        data = data.get("adapters") or data.get("data") or []
+        # Accept only the known envelopes. An unrecognized object must NOT silently degrade to an
+        # empty keep-set (that would green-light deleting live repos); fail closed instead.
+        if "adapters" in data:
+            data = data["adapters"]
+        elif "data" in data:
+            data = data["data"]
+        else:
+            raise ServingError(
+                f"serving backend returned an unrecognized adapter-list envelope from {url} "
+                f"(keys: {sorted(data)[:8]}); refusing to treat it as an empty live set"
+            )
+    if not isinstance(data, list):
+        raise ServingError(
+            f"serving backend returned a {type(data).__name__}, not an adapter list, from {url}; "
+            "refusing to treat it as an empty live set"
+        )
     return [rec for rec in data if isinstance(rec, dict)]
 
 
