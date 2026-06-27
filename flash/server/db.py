@@ -1,12 +1,4 @@
-"""SQLite store for the managed control plane: API keys + run ownership.
-
-Run *state* stays in the runner's JSON files (``runner.RUNS_DIR``) — the
-battle-tested submit/attach/cancel paths all read those. This database is only the
-key registry and the run -> key ownership index that makes the server multi-tenant.
-
-Connections are opened per operation (cheap for SQLite, avoids cross-thread state;
-the runner runs jobs in daemon threads inside the same process).
-"""
+"""SQLite store for the managed control plane: API keys + run ownership."""
 
 from __future__ import annotations
 
@@ -35,8 +27,7 @@ CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
 """
 
 
-# Fixed location for the keys/run-ownership SQLite DB (not operator-configurable). Tests
-# point it elsewhere with monkeypatch.setattr(db, "DB_PATH", tmp).
+# Tests override with monkeypatch.setattr(db, "DB_PATH", tmp).
 DB_PATH = str(Path.home() / ".flash" / "server.db")
 
 
@@ -56,22 +47,12 @@ def _connect() -> sqlite3.Connection:
 
 
 def hash_key(api_key: str) -> str:
-    # API keys are 192-bit random tokens (secrets.token_hex(24)), not passwords:
-    # brute-forcing the keyspace is infeasible, so an unsalted fast hash is the
-    # standard at-rest form and keeps O(1) lookup by hash. (CodeQL's
-    # password-hashing rule does not apply to high-entropy machine tokens.)
+    # High-entropy machine tokens — unsalted SHA-256 is fine; CodeQL password-hashing rule doesn't apply.
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
 def ensure_internal_key(api_key: str) -> dict:
-    """Provision a row for the shared freesolo internal/service key (idempotent).
-
-    The freesolo platform/SDK authenticate to the control plane with the same
-    ``FREESOLO_INTERNAL_KEY`` they already hold. Backing it with a real row
-    (inserted once, by hash) means run ownership and
-    the runs.key_id foreign key work exactly as for a normal key — all
-    internal-key runs share this single service identity (no per-user isolation;
-    the platform scopes users upstream)."""
+    """Provision a row for the shared freesolo internal/service key (idempotent)."""
     now = time.time()
     internal_email = "internal@freesolo.co"
     with _connect() as conn:
@@ -95,14 +76,7 @@ def ensure_external_key(
 ) -> dict | None:
     """Provision a per-token row for a verified external (freesolo USER) key (idempotent).
 
-    Unlike :func:`ensure_internal_key` (one shared service identity), this keys a distinct
-    row by the presented token's hash, so each freesolo user key gets its OWN run-ownership
-    identity (the runs.key_id foreign key then scopes runs per user). The full token is never
-    stored — only its sha256.
-
-    Returns ``None`` (not a row) when the token's row already exists but is DISABLED:
-    ``INSERT OR IGNORE`` won't revive it and ``lookup_key`` filters disabled rows, so a
-    revoked key is rejected (401) by the caller instead of surfacing as a 500."""
+    Returns None if the key exists but is disabled (revoked keys stay rejected, not revived)."""
     now = time.time()
     with _connect() as conn:
         conn.execute(

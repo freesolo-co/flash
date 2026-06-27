@@ -1,15 +1,4 @@
-"""Mirror a run's deployable RL checkpoints to the freesolo backend.
-
-The worker streams each step's LoRA adapter to the run's HF repo; HF is the source of truth
-for what's deployable. This module persists that list to the backend's ``run_checkpoints``
-store so the dashboard/SDK can enumerate a run's checkpoints without crawling HF, and so a
-cancelled run's checkpoints survive in one queryable place.
-
-Like ``flash.server.billing``, the POST is authenticated with the operator INTERNAL key (the
-control plane never persists a user's freesolo key) and carries the org id from the run's
-non-secret billing context. Unlike billing, checkpoint persistence is STRICTLY best-effort:
-a failure here must never disturb a run or a deploy, so the public entry point swallows
-everything."""
+"""Mirror a run's deployable RL checkpoints to the freesolo backend (best-effort)."""
 
 from __future__ import annotations
 
@@ -26,10 +15,7 @@ _RECORD_PATH = "/api/runs/internal/checkpoints"
 
 
 def _post_checkpoints(*, token: str, body: dict) -> dict:
-    """POST the checkpoint batch to the backend; raise on any non-2xx/unreachable.
-
-    Callers in this module always wrap this in a best-effort guard — the raise exists so the
-    one network boundary is easy for tests to stub/assert."""
+    """POST the checkpoint batch to the backend; raise on any non-2xx/unreachable."""
     req = build_internal_request(_RECORD_PATH, body, token=token)
     with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
         raw = resp.read()
@@ -40,12 +26,7 @@ def _post_checkpoints(*, token: str, body: dict) -> dict:
 
 
 def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dict]) -> dict:
-    """Upsert ``checkpoints`` for one run into the backend store (idempotent by run_id+step).
-
-    Pulls the org id from the run's persisted billing context (same source as billing). Raises
-    ``ValueError`` when there's nothing to record or no org id; raises ``urllib`` errors through
-    on a backend failure — ``register_checkpoints_best_effort`` is the guarded wrapper most
-    callers use."""
+    """Upsert checkpoints for one run into the backend store (idempotent by run_id+step)."""
     if not checkpoints:
         raise ValueError("no checkpoints to record")
     context = status.billing_context if isinstance(status.billing_context, dict) else {}
@@ -68,11 +49,7 @@ def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dic
 
 
 def register_checkpoints_best_effort(status, *, log=None) -> int:
-    """List ``status``'s deployable checkpoints from HF and mirror them to the backend.
-
-    Returns the number of checkpoints submitted (0 if none, or if persistence was skipped /
-    failed). Never raises: the HF copy remains the source of truth, so a persistence miss only
-    costs the convenience of a DB-backed listing — not correctness."""
+    """Mirror deployable checkpoints to the backend; returns count submitted, never raises."""
 
     def _log(msg: str) -> None:
         print(msg, file=log, flush=True) if log is not None else print(msg)

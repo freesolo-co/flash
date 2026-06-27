@@ -1,9 +1,4 @@
-"""Stdlib HTTP client for the Flash control plane (no extra dependencies).
-
-Every CLI operation maps to one method here. Server errors (FastAPI's
-``{"detail": ...}``) surface as ``ApiError`` with the server's message; connection
-problems surface as ``ClientError`` with an actionable hint.
-"""
+"""Stdlib HTTP client for the Flash control plane (no extra dependencies)."""
 
 from __future__ import annotations
 
@@ -18,8 +13,6 @@ from typing import Any
 
 from .config import load_credentials_with_source
 
-# Called as ``progress(bytes_sent, total_bytes)`` as a request body streams to the server, so
-# the CLI can draw an upload bar. ``total_bytes`` is the full Content-Length, fixed up front.
 ProgressCallback = Callable[[int, int], None]
 
 
@@ -33,9 +26,6 @@ class ApiError(ClientError):
         self.status = status
 
 
-# Login is handled by the freesolo backend (not the flash control plane): `flash login`
-# verifies the user's freesolo API key here. The same key authenticates the flash
-# control plane, which accepts freesolo-issued keys.
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
 
@@ -57,11 +47,7 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> str:
 
 
 def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
-    """Verify a freesolo API key against the freesolo backend's ``/api/auth/verify``.
-
-    Raises :class:`ClientError`/:class:`ApiError` if the key is rejected or the backend is
-    unreachable; returns ``None`` on success. Keys are issued from the freesolo sign-in page.
-    """
+    """Verify a freesolo API key; raises ClientError/ApiError on failure."""
     base = freesolo_base_url(base_url)
     url = f"{base}{FREESOLO_AUTH_VERIFY_PATH}"
     req = urllib.request.Request(
@@ -88,12 +74,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
 
 
 class _ProgressReader:
-    """A read()-only file-like over an in-memory payload that reports bytes consumed.
-
-    ``http.client`` sends a body exposing ``read()`` in blocksize chunks; we forward the running
-    total to ``progress(sent, total)`` for each chunk so the CLI can draw an upload bar. The
-    caller sets Content-Length from ``len(payload)``, so the request is NOT chunked-encoded and
-    the server reads it exactly as a plain bytes body."""
+    """File-like wrapper over in-memory bytes that fires a progress callback on each read()."""
 
     def __init__(self, data: bytes, progress: ProgressCallback):
         self._data = data
@@ -139,10 +120,7 @@ class ApiClient:
 
     @contextlib.contextmanager
     def _translate_http_errors(self) -> Iterator[None]:
-        """Map urllib transport errors to ApiError/ClientError, leaving everything else alone.
-
-        Catches ONLY urllib's HTTPError/URLError so unrelated exceptions (e.g. the GeneratorExit
-        raised into a closed :meth:`chat_stream`) propagate untouched."""
+        """Map urllib transport errors to ApiError/ClientError; other exceptions propagate."""
         try:
             yield
         except urllib.error.HTTPError as exc:
@@ -166,9 +144,6 @@ class ApiClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         if progress is not None:
-            # Stream the body through a _ProgressReader with an explicit Content-Length so the
-            # request is sent as a plain (non-chunked) bytes body the server reads exactly, while
-            # progress(sent, total) fires per chunk so the CLI can draw an upload bar.
             payload = json.dumps(body).encode()
             headers["Content-Length"] = str(len(payload))
             data: Any = _ProgressReader(payload, progress)
@@ -200,11 +175,7 @@ class ApiClient:
         package_b64: str,
         progress: ProgressCallback | None = None,
     ) -> dict:
-        """Upload a packaged Freesolo environment to the managed Environments Hub.
-
-        When ``progress`` is given the body streams to the server in chunks and
-        ``progress(bytes_sent, total_bytes)`` fires for each, so the CLI can render an upload
-        bar; otherwise the body is sent in one shot (the default, used off a TTY)."""
+        """Upload a packaged Freesolo environment to the managed Environments Hub."""
         body = {"name": name, "package_b64": package_b64}
         return self._request("POST", "/v1/envs", body=body, timeout=1800.0, progress=progress)
 
@@ -224,14 +195,8 @@ class ApiClient:
         return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
-        # The train-subprocess console/traceback ({console_<phase>.txt, error_<phase>.txt}) from the
-        # run's HF artifact repo, fetched server-side with the operator token — the real worker
-        # output the offset-paged log can't carry. Kept off the hot get_logs poll path. {} if none.
-        #
-        # Tolerate a managed server that predates the /worker route: a CLI upgraded ahead of the
-        # service rollout would otherwise hard-fail. FastAPI returns a bare 404 "Not Found" for an
-        # unmatched path -> treat ONLY that as "no worker output" ({}); real 404s still surface (an
-        # unknown run_id carries detail "unknown run_id: ...", not "Not Found").
+        # Tolerate servers that predate /worker: FastAPI returns bare 404 "Not Found" for unknown
+        # paths; real run-not-found 404s carry "unknown run_id: ..." so we can distinguish them.
         try:
             return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
         except ApiError as exc:
@@ -256,11 +221,7 @@ class ApiClient:
         deploy_timeout = 30 * 60 if not dry_run else None
         body: dict = {"dry_run": dry_run}
         if step is not None:
-            # Deploy a specific intermediate checkpoint instead of the run's final adapter.
-            # Reject a bool explicitly: `int(True)`/`int(False)` would silently coerce to step
-            # 1/0, but the server guard (_resolve_deploy_step) treats a bool as an invalid step
-            # and 400s — so fail fast here with a clear client-side error instead of sending a
-            # bogus 0/1 that the server rejects (or, worse, that hits a real checkpoint 0/1).
+            # int(True/False) silently coerces to 1/0 — fail fast before the server 400s.
             if isinstance(step, bool):
                 raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
             body["step"] = int(step)
@@ -280,21 +241,13 @@ class ApiClient:
         step: int | None = None,
         private: bool = True,
     ) -> dict:
-        """Export a run's trained adapter into a user-owned HuggingFace repo.
-
-        Copies the adapter (or a specific ``--step`` checkpoint) from the platform's private
-        artifact repo into ``repository``, authenticated with the user's ``hf_token`` (write
-        access to their own repo). The server downloads then re-uploads the adapter, which can
-        take a while for a large adapter, so the timeout matches deploy's."""
+        """Copy a run's adapter into a user-owned HuggingFace repo."""
         body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
         if step is not None:
-            # Reject a bool explicitly: int(True)/int(False) would silently coerce to step 1/0,
-            # but the server guard treats a bool as an invalid step and 400s — fail fast here
-            # with a clear client-side error instead (matches deploy()'s bool guard).
+            # int(True/False) silently coerces to 1/0 — fail fast before the server 400s.
             if isinstance(step, bool):
                 raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
-            # Reject a FRACTIONAL step before int() silently truncates it (e.g. 2.7 -> 2 would export
-            # the wrong checkpoint). An integral float (2.0) is fine.
+            # int() silently truncates floats (2.7 -> 2 exports the wrong checkpoint).
             if isinstance(step, float) and not step.is_integer():
                 raise ClientError(
                     f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
@@ -317,7 +270,6 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> dict:
-        # Serving warmup can take minutes; give inference a generous timeout.
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/chat",

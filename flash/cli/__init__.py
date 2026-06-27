@@ -1,10 +1,4 @@
-"""CLI for the managed Flash service.
-
-Every run-lifecycle command is a thin HTTP call to the Flash control plane —
-users authenticate with their freesolo API key (`flash login` verifies it against
-the freesolo backend), never with provider credentials. Config parsing/validation
-and `--dry-run` stay fully local.
-"""
+"""CLI for the managed Flash service."""
 
 from __future__ import annotations
 
@@ -15,10 +9,6 @@ from flash import __version__
 from flash._channel import CLI_NAME
 from flash._logging import configure_logging, get_logger
 from flash._update_check import emit_update_notice, maybe_start_update_check
-
-# Command handlers + the patched client surface live in submodules; re-export them so
-# `flash.cli` stays the single public import surface (and so monkeypatching
-# `flash.cli.commands` reaches the bare globals the handlers read).
 from flash.cli.commands import (  # noqa: F401
     _CLI_DONE_STATES,
     _OK_STATES,
@@ -238,14 +228,9 @@ def main(argv: list[str] | None = None) -> int:
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
 
-    # The control plane is operator-only and run as a separate one-off service via the
-    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
-
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
-    # Kick off a once-a-day PyPI version check in the background; the "new release available"
-    # notice (if any) prints to stderr after the command output (see emit_update_notice).
     update_check = maybe_start_update_check()
     try:
         return args.func(args)

@@ -17,8 +17,7 @@ _DEFAULT_HUB_REF = "main"
 
 
 def _post(path: str, body: dict, *, subject: str) -> bool:
-    """Best-effort internal POST: True on 2xx, False (with a warning under ``subject``) on any
-    failure. The shared write path for both registry endpoints."""
+    """Best-effort internal POST; returns True on 2xx, False on any failure."""
     key = internal_key()
     if not key:
         return False
@@ -37,12 +36,7 @@ def _post(path: str, body: dict, *, subject: str) -> bool:
 
 
 def record_published_environment(*, slug: str, name: str, key: dict) -> bool:
-    """Persist Hub metadata in the platform backend.
-
-    The GitHub publish is the source of truth for the environment package. This
-    metadata write exists so the web UI can list Flash environments, so it is
-    deliberately best-effort and never blocks `flash env push`.
-    """
+    """Persist Hub metadata in the platform backend; best-effort, never blocks env push."""
     org_id = org_id_of(key)
     if not org_id:
         return False

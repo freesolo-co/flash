@@ -1,14 +1,4 @@
-"""The TRAINING.md playbook scaffolded by `flash env setup`.
-
-This is the single source of truth for the TRAINING.md that lands in a user's
-project folder. It is written for the AI coding agent a user points at their
-environment: a finished run is not a run that worked, and most of the value is in
-how you design the signal, what you read, and how you decide a run is good.
-
-Keep it flash-accurate — every command, config field, and import below exists in
-this codebase (`flash <cmd>`, `[train]` fields in ``flash/spec.py``, and
-``freesolo.environments``). Update it here, not in a copy.
-"""
+"""The TRAINING.md playbook scaffolded by `flash env setup`. Update it here, not in a copy."""
 
 from __future__ import annotations
 

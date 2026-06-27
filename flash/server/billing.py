@@ -1,9 +1,4 @@
-"""Charge completed Flash training runs to the freesolo backend.
-
-The control plane records the submitting org id when a run is accepted, then POSTs the final
-``RunStatus.cost_usd`` after the run reaches ``done``. The call is authenticated with the
-operator internal key, so Flash never persists a user's freesolo API key while training runs.
-Tests stub the network boundary directly."""
+"""Charge completed Flash training runs to the freesolo backend."""
 
 from __future__ import annotations
 
@@ -18,8 +13,7 @@ _COMPLETION_CHARGE_PATH = "/api/billing/training-usage/internal"
 
 
 class BillingError(Exception):
-    """A run charge that didn't succeed. ``status_code`` (402 insufficient balance, 503 backend
-    unreachable) is surfaced to the client with ``detail``."""
+    """A run charge that didn't succeed."""
 
     def __init__(self, status_code: int, detail: str) -> None:
         super().__init__(detail)
@@ -28,21 +22,19 @@ class BillingError(Exception):
 
 
 def _cents(usd: float) -> int:
-    """Whole cents for a USD amount, round-HALF-UP (not Python's banker's rounding, which would
-    undercharge a half-cent tie), never negative."""
+    """Whole cents, ROUND_HALF_UP (not banker's rounding), never negative."""
     cents = Decimal(str(usd)).scaleb(2).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return max(0, int(cents))
 
 
 def _http_reason(exc: urllib.error.HTTPError) -> str:
-    """The backend's status reason phrase (``.reason``/``.msg``), else the bare code."""
+    """Return a human-readable reason string from an HTTPError."""
     reason = getattr(exc, "reason", None) or getattr(exc, "msg", None)
     return str(reason).strip() if reason else str(exc.code)
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
-    """Clean message from the backend's ``{"detail": {"error", "code"}}`` JSON error body, else
-    the status reason (never a bare code)."""
+    """Extract a clean error message from a backend HTTPError response."""
 
     def _fallback() -> str:
         return f"billing failed ({exc.code} {_http_reason(exc)})"
@@ -60,11 +52,7 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 
 
 def _post_billing(*, token: str, path: str, body: dict) -> dict:
-    """POST a JSON body to the backend billing ``path`` and return the parsed response.
-
-    Raises ``BillingError`` (the route's status + a clean detail) on a non-2xx, and ``503``
-    when the service is unreachable -- the same translation the charge and its reversal share.
-    """
+    """POST a JSON body to the backend billing path; raises BillingError on failure."""
     req = build_internal_request(path, body, token=token)
     try:
         with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
@@ -81,12 +69,7 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
 
 
 def charge_completed_run(*, internal_key: str, status) -> dict:
-    """Charge one completed external run using its persisted non-secret billing context.
-
-    The backend route is idempotent by ``runId``. Raises ``BillingError`` on a non-2xx or
-    unreachable backend; callers should record that billing failed without changing the run's
-    terminal training state.
-    """
+    """Charge one completed run; backend route is idempotent by runId."""
     context = status.billing_context if isinstance(status.billing_context, dict) else {}
     org_id = org_id_of(context)
     if not org_id:
