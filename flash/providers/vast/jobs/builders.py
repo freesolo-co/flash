@@ -87,8 +87,19 @@ class VastJobHandle:
 
     @classmethod
     def from_dict(cls, d: dict) -> VastJobHandle:
+        # instance_id IDENTIFIES the box (the poll/destroy target), so unlike the other fields it has no
+        # safe default — a 0/None would point teardown at a non-existent instance. But a corrupt/partial
+        # PERSISTED handle (reattach/recovery deserializes from disk) must fail with a CLEAR, actionable
+        # error, not a bare KeyError/ValueError that obscures the cause (Copilot MuX0a).
+        try:
+            instance_id = int(d["instance_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"corrupt vast handle: missing/non-numeric instance_id "
+                f"({d.get('instance_id')!r}) in persisted handle {d!r}"
+            ) from exc
         return cls(
-            instance_id=int(d["instance_id"]),
+            instance_id=instance_id,
             offer_id=int(d.get("offer_id") or 0),
             machine_id=int(d.get("machine_id") or 0),
             label=str(d.get("label") or ""),

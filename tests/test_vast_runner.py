@@ -930,6 +930,17 @@ def test_instance_label_and_handle_roundtrip():
     assert back.offer_id == h.offer_id
 
 
+def test_handle_from_dict_corrupt_instance_id_raises_clear_error():
+    """Copilot MuX0a: a corrupt/partial PERSISTED handle (reattach/recovery) must fail with a CLEAR,
+    actionable error naming the bad instance_id — not a bare KeyError/ValueError that crashes recovery
+    with an opaque cause. instance_id has no safe default (it's the poll/destroy target)."""
+    from flash.providers.vast.jobs.builders import VastJobHandle
+
+    for bad in ({}, {"instance_id": None}, {"instance_id": "not-a-number"}):
+        with pytest.raises(ValueError, match="corrupt vast handle"):
+            VastJobHandle.from_dict(bad)
+
+
 def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
