@@ -21,6 +21,7 @@ from flash.engine.worker.adapter import (
     _init_adapter_model,
     _resolve_adapter_ref,
     make_lora,
+    recombined_warmstart_adapter_dir,
     require_vllm_for_rollout_func,
 )
 from flash.engine.worker.decoding import (
@@ -85,6 +86,7 @@ from flash.engine.worker.lora import (
     patch_grpo_mask_aware_lm_head,
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
+    recombine_lora_adapters,
     remap_adapter_keys,
     remap_vl_adapter_dir,
     strip_language_model_infix,
@@ -167,6 +169,12 @@ def _load_active_env():
 
 
 ACTIVE_ENV = None
+
+# Set by ``_init_adapter_model`` to the SFT adapter dir ONLY when it takes the VL merge-into-base
+# warm-start path (#296): the SFT is merged into the training base and a FRESH GRPO LoRA is trained,
+# so the saved adapter is SFT-less and MUST be recombined with this SFT before deploy. Stays None for
+# fresh-LoRA and continued-adapter (non-VL) runs, whose saved adapter is already deployable as-is.
+_VL_WARMSTART_SFT_DIR: str | None = None
 
 
 def require_active_env():
@@ -378,6 +386,8 @@ __all__ = [
     "prefetch_model",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
+    "recombine_lora_adapters",
+    "recombined_warmstart_adapter_dir",
     "remap_adapter_keys",
     "remap_vl_adapter_dir",
     "render_prompt",
