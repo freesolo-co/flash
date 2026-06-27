@@ -16,9 +16,10 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
 
 
-def error_artifact_name(mode: str) -> str:
-    """Per-mode error filename (e.g. error_sft.txt) so run tracebacks upload under a stable name."""
-    return f"error_{mode}.txt"
+def error_artifact_name(mode: str, attempt=0) -> str:
+    """Per-mode, per-attempt error filename (e.g. error_sft_attempt0.txt). Attempt-scoped so a prior
+    attempt's stale traceback can't be mistaken for the current attempt's crash on a retry host-loss."""
+    return f"error_{mode}_attempt{int(attempt or 0)}.txt"
 
 
 def hf_api():

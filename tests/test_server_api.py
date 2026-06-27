@@ -622,6 +622,51 @@ def test_worker_output_route(api, monkeypatch):
     assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
 
 
+def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
+    """The logs fetcher resolves the newest attempt-scoped error file, so a retried-then-failed run
+    surfaces the FINAL attempt's traceback, not attempt0's stale one."""
+    import huggingface_hub
+
+    from flash.server._runtime import _latest_error_artifact_name
+
+    prefix = "sft/run-1/seed0"
+    listed = [
+        f"{prefix}/console_sft.txt",
+        f"{prefix}/error_sft_attempt0.txt",
+        f"{prefix}/error_sft_attempt2.txt",
+        f"{prefix}/error_sft_attempt1.txt",
+        f"{prefix}/heartbeat.json",
+        "other/run/error_sft_attempt9.txt",  # different prefix -> ignored
+    ]
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return listed
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    assert _latest_error_artifact_name("org/repo", prefix, "sft") == "error_sft_attempt2.txt"
+
+
+def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
+    """If the repo can't be listed, fall back to attempt0 rather than failing the logs fetch."""
+    import huggingface_hub
+
+    from flash.server._runtime import _latest_error_artifact_name
+
+    class _BoomApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            raise RuntimeError("HF down")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _BoomApi)
+    assert _latest_error_artifact_name("org/repo", "rl/r/seed0", "rl") == "error_rl_attempt0.txt"
+
+
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()

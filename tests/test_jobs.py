@@ -971,6 +971,32 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     assert res.metrics == {"acc": 1.0}
 
 
+def test_failure_detail_reader_is_attempt_scoped(monkeypatch, tmp_path):
+    """The failure-detail reader fetches error_<phase>_attempt<N>.txt (matching the worker's
+    error_artifact_name), so a retry can't surface a prior attempt's stale traceback as the crash."""
+    import huggingface_hub
+
+    from flash.providers.runpod.jobs import make_hf_failure_detail_reader
+
+    requested: list[str] = []
+    err_file = tmp_path / "err.txt"
+    err_file.write_text("BOOM traceback")
+
+    def fake_dl(repo, path_in_repo, **kw):
+        requested.append(path_in_repo)
+        if path_in_repo.endswith("error_sft_attempt2.txt"):
+            return str(err_file)
+        raise FileNotFoundError(path_in_repo)  # console + other attempts absent
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    reader = make_hf_failure_detail_reader("org/repo", "sft/run-1/seed0", "sft", attempt=2)
+    detail = reader(force=True)
+    assert "sft/run-1/seed0/error_sft_attempt2.txt" in requested
+    assert "sft/run-1/seed0/error_sft_attempt0.txt" not in requested
+    assert "--- error_sft_attempt2.txt ---" in detail
+    assert "BOOM traceback" in detail
+
+
 def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
     # Without a heartbeat_reader we can't tell setup from training, so the larger
     # setup_grace must NOT silently slow stall detection — stay on stall_after_s.
@@ -1064,6 +1090,45 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert st.state == "done"
         assert calls["n"] == 2
         assert st.remote["job_id"] == "j2"  # latest handle persisted
+
+
+def test_last_seed_clears_handle_in_gap_then_restores_on_done(monkeypatch):
+    """Bug A: the LAST (here only) seed must clear remote + advance resume_seed_index in the gap
+    before `done` is written, so a restart there resumes (empty -> done) instead of re-attaching and
+    re-billing the finished seed. The terminal `done` record then restores the winning handle."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j1"})
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        real_update = orch._update
+        seen: list[tuple[str, object, object]] = []
+
+        def spy_update(run_id, state, **kw):
+            applied = real_update(run_id, state, **kw)
+            if "remote" in kw or "resume_seed_index" in kw:
+                seen.append((state, kw.get("remote", "<unset>"), kw.get("resume_seed_index")))
+            return applied
+
+        monkeypatch.setattr(orch, "_update", spy_update)
+        orch.submit_job(_spec("gap-clear"), dry_run=False, background=False)
+
+        # The post-seed gap must clear the handle AND advance the resume marker, even on the last seed.
+        assert ("running", None, 1) in seen, seen
+        st = orch.get_status("gap-clear")
+        assert st.state == "done"
+        assert st.resume_seed_index is None
+        assert st.remote is not None  # handle restored on the terminal record
+        assert st.remote["job_id"] == "j1"
 
 
 def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):

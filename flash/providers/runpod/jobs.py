@@ -663,7 +663,9 @@ def submit_run(
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
     failure_reader = (
-        make_hf_failure_detail_reader(hf_repo, prefix, spec.phase) if hf_repo else None
+        make_hf_failure_detail_reader(hf_repo, prefix, spec.phase, attempt=int(attempt))
+        if hf_repo
+        else None
     )
     return poll_job(
         handle,
@@ -724,9 +726,12 @@ def make_hf_failure_detail_reader(
     prefix: str,
     phase: str,
     min_interval_s: float = 45.0,
+    attempt: int = 0,
 ):
     """Reader for worker-uploaded failure artifacts on HF (error/console txt); force-read after terminal failure."""
-    error_reader = make_hf_text_reader(hf_repo, f"{prefix}/error_{phase}.txt", min_interval_s)
+    # Attempt-scoped to match the worker's error_artifact_name(mode, attempt).
+    err_name = f"error_{phase}_attempt{int(attempt or 0)}.txt"
+    error_reader = make_hf_text_reader(hf_repo, f"{prefix}/{err_name}", min_interval_s)
     console_reader = make_hf_text_reader(
         hf_repo, f"{prefix}/console_{phase}.txt", min_interval_s
     )
@@ -735,7 +740,7 @@ def make_hf_failure_detail_reader(
         parts: list[str] = []
         error_text = error_reader(force=force)
         if error_text:
-            parts.append(f"--- error_{phase}.txt ---\n{error_text[-4000:]}")
+            parts.append(f"--- {err_name} ---\n{error_text[-4000:]}")
         console_text = console_reader(force=force)
         if console_text:
             parts.append(f"--- console_{phase}.txt ---\n{console_text[-4000:]}")
