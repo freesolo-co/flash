@@ -176,7 +176,7 @@ def test_non_flashrun_repos_are_ignored():
 
 def test_dry_run_makes_no_mutations(monkeypatch):
     api = FakeApi({f"{NS}/flashrun-f": (_days_ago(90), FAILED)})
-    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: set())
+    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
     plan = rc.run(_cfg(code=True, repos=True), dry_run=True, sleep=0, api=api)
     assert plan.actions
     assert plan.actions[0].kind == "delete_repo"
@@ -189,7 +189,7 @@ def test_apply_executes_planned_actions(monkeypatch):
         f"{NS}/flashrun-f": (_days_ago(90), FAILED),       # → delete_repo
         f"{NS}/flashrun-d": (_days_ago(90), SUCCEEDED),    # → trim checkpoints + code
     })
-    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: set())
+    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
     rc.run(_cfg(code=True, checkpoints=True, repos=True), dry_run=False, sleep=0, api=api)
     assert api.deleted_repos == [f"{NS}/flashrun-f"]
     assert (f"{NS}/flashrun-d", rc.CHECKPOINTS_PATH) in api.deleted_folders
@@ -300,7 +300,7 @@ def test_main_rejects_delete_with_adapter_without_repos(capsys):
 
 def test_main_accepts_delete_with_adapter_with_repos(monkeypatch):
     # Should pass validation and run (dry-run); we stub the live set + HF api.
-    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: set())
+    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
     monkeypatch.setattr(rc, "list_run_repos", lambda api, ns: [])
     rc_code = rc.main(["--repos", "--delete-with-adapter"])
     assert rc_code == 0
@@ -385,7 +385,7 @@ def test_apply_skips_repo_that_became_deployed_after_enumeration(monkeypatch):
 
     def fake_deployed():
         calls["n"] += 1
-        return set() if calls["n"] == 1 else {f"{NS}/flashrun-d"}
+        return (set(), True) if calls["n"] == 1 else ({f"{NS}/flashrun-d"}, True)
 
     monkeypatch.setattr(rc, "deployed_repo_ids", fake_deployed)
     rc.run(_cfg(code=True, checkpoints=True, repos=True), dry_run=False, sleep=0, api=api)
@@ -394,14 +394,19 @@ def test_apply_skips_repo_that_became_deployed_after_enumeration(monkeypatch):
     assert calls["n"] == 2  # sampled once, re-confirmed once before apply
 
 
-# ---- live keep-set extraction is fail-closed on schema drift ----------------------------------
+# ---- live keep-set extraction: best-effort set + completeness flag ----------------------------
 
-def test_deployed_repo_ids_raises_on_record_without_repo_id(monkeypatch):
+def test_deployed_repo_ids_flags_record_without_repo_id_as_incomplete(monkeypatch):
     from flash.serve import deploy
 
-    monkeypatch.setattr(deploy, "list_deployed_adapters", lambda: [{"adapterId": "x"}])  # no repoId
-    with pytest.raises(RuntimeError, match="repoId"):
-        rc.deployed_repo_ids()
+    # A record with no repo id can't be mapped; the set keeps the mappable ones but complete=False.
+    monkeypatch.setattr(
+        deploy, "list_deployed_adapters",
+        lambda: [{"repoId": "Freesolo-Co/flashrun-a"}, {"adapterId": "x"}],  # 2nd has no repoId
+    )
+    ids, complete = rc.deployed_repo_ids()
+    assert ids == {"Freesolo-Co/flashrun-a"}
+    assert complete is False
 
 
 def test_deployed_repo_ids_collects_repo_ids(monkeypatch):
@@ -411,4 +416,26 @@ def test_deployed_repo_ids_collects_repo_ids(monkeypatch):
         deploy, "list_deployed_adapters",
         lambda: [{"repoId": "Freesolo-Co/flashrun-a"}, {"repo_id": "Freesolo-Co/flashrun-b"}],
     )
-    assert rc.deployed_repo_ids() == {"Freesolo-Co/flashrun-a", "Freesolo-Co/flashrun-b"}
+    ids, complete = rc.deployed_repo_ids()
+    assert ids == {"Freesolo-Co/flashrun-a", "Freesolo-Co/flashrun-b"}
+    assert complete is True
+
+
+def test_incomplete_live_set_aborts_destructive_tier_but_not_code(monkeypatch):
+    # The WiB regression: an unmappable live record must NOT collapse the code-only keep-set to
+    # empty. Destructive tiers abort; --code proceeds with the best-effort (still-protective) set.
+    from flash.serve import deploy
+
+    monkeypatch.setattr(
+        deploy, "list_deployed_adapters",
+        lambda: [{"repoId": f"{NS}/flashrun-live"}, {"adapterId": "unmappable"}],
+    )
+    # destructive tier → abort
+    api = FakeApi({f"{NS}/flashrun-d": (_days_ago(90), SUCCEEDED)})
+    with pytest.raises(rc.CleanupAborted):
+        rc.run(_cfg(code=True, checkpoints=True), dry_run=True, sleep=0, api=api)
+    # code-only → proceeds, and the identifiable deployed repo is still protected (skipped)
+    api2 = FakeApi({f"{NS}/flashrun-live": (_days_ago(90), SUCCEEDED)})
+    plan = rc.run(_cfg(code=True, checkpoints=False, repos=False), dry_run=True, sleep=0, api=api2)
+    assert plan.actions == []  # flashrun-live is in the best-effort keep-set → not purged
+    assert any("deployed" in s.reason for s in plan.skips)
