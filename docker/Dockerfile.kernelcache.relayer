@@ -1,0 +1,27 @@
+# Cheap per-arch RE-LAYER: graft the EXISTING baked mega-cache onto a freshly rebuilt :cu128 base,
+# with NO GPU. Used by auto-rebake.yml when fp_cache is unchanged (the cache is still valid) but the
+# base moved (fp_base changed) -- e.g. an FA2/FA3/causal-conv1d/rp_handler bump. The valid cache
+# already lives inside the currently-published per-arch tag, so OLDCACHE IS the cache store; we just
+# re-stack it on the new base. This is what makes a base-only change free (vs a paid GPU re-warm).
+#
+# BASE and OLDCACHE are passed DIGEST-PINNED by the gate so a concurrent base/tag overwrite can't
+# graft the cache onto the wrong base.
+ARG BASE=ghcr.io/freesolo-co/flash-worker:cu128
+ARG OLDCACHE=ghcr.io/freesolo-co/flash-worker:cu128-sm89
+FROM ${OLDCACHE} AS oldcache
+FROM ${BASE}
+
+# Match Dockerfile.worker / Dockerfile.kernelcache so the layer is self-contained even on an older base.
+ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
+    TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor
+
+# Pull the warmed cache straight out of the old per-arch image -- no GPU, no external cache store.
+COPY --from=oldcache /opt/flash/kernelcache /opt/flash/kernelcache
+
+# Re-stamp with the CURRENT fingerprints (fp_cache unchanged, fp_base + revision are the new base's).
+ARG FP_CACHE=unknown
+ARG FP_BASE=unknown
+ARG BASE_REVISION=unknown
+LABEL co.freesolo.flash.kernelcache.fp_cache=$FP_CACHE \
+      co.freesolo.flash.kernelcache.fp_base=$FP_BASE \
+      org.opencontainers.image.revision=$BASE_REVISION
