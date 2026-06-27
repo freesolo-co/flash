@@ -35,14 +35,25 @@ def _gnu_longname_bomb(name_len: int) -> bytes:
         h[148 : 148 + 8] = f"{chk:06o}\0 ".encode()
         return bytes(h)
 
-    raw = bytearray()
-    raw += header("././@LongLink", name_len, "L")
-    raw += b"A" * name_len + b"\0" * ((512 - name_len % 512) % 512)
-    raw += header("pkg/environment.py", 1, "0") + b"x" + b"\0" * 511
-    raw += b"\0" * 1024
+    longlink = header("././@LongLink", name_len, "L")
+    pad = b"\0" * ((512 - name_len % 512) % 512)
+    tail = header("pkg/environment.py", 1, "0") + b"x" + b"\0" * 511 + b"\0" * 1024
     buf = io.BytesIO()
+    # Stream the LONGNAME payload into the gzip writer in fixed-size chunks rather than
+    # materializing all ``name_len`` bytes (plus a second copy via ``bytes(raw)``) in RAM — at
+    # 400 MB that peaks ~1 GB and can OOM/slow CI before the extraction code under test runs.
+    # Chunked writes feed one continuous zlib stream (no flushes between), so the gzip output is
+    # byte-identical to a single write of the concatenation.
+    block = b"A" * min(name_len, 1 << 20)
     with gzip.GzipFile(fileobj=buf, mode="wb") as g:
-        g.write(bytes(raw))
+        g.write(longlink)
+        remaining = name_len
+        while remaining > 0:
+            n = min(remaining, len(block))
+            g.write(block if n == len(block) else block[:n])
+            remaining -= n
+        g.write(pad)
+        g.write(tail)
     return buf.getvalue()
 
 _MINIMAL = {
