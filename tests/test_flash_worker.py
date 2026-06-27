@@ -413,6 +413,41 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert '"optim": fused_optim_name()' in src
 
 
+def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
+    """When TRL bfd packing stays ON, grad_accum must be re-derived from the ~ex/block estimate so
+    the effective batch stays in EXAMPLES — otherwise bfd bins ~ex_per_block examples per row and
+    inflates the effective batch ~ex_per_block-fold (undertraining). The SDPA/GDN packing paths
+    already do this; pin that the bfd path does too, AFTER the packing-finalization block."""
+    import ast
+    import inspect
+
+    from flash.engine.worker import sft
+
+    src = inspect.getsource(sft.run_sft)
+    # The re-derivation is guarded on packing still being ON post-finalization and uses a bfd ex/block
+    # estimate (a separate pack_token_ids call from the two SDPA/GDN ones).
+    assert "pack_token_ids(_bfd_ids, sft_max_len)" in src
+    assert "[sft] bfd packing:" in src
+    tree = ast.parse(src)
+
+    # The bfd-rederive block assigns cfg_kwargs["gradient_accumulation_steps"] guarded by a
+    # cfg_kwargs.get("packing") test — assert such a guarded assignment exists.
+    def _stores_grad_accum(node):
+        return any(
+            isinstance(sub, ast.Subscript)
+            and isinstance(sub.ctx, ast.Store)
+            and "gradient_accumulation_steps" in ast.dump(sub)
+            for sub in ast.walk(node)
+        )
+
+    assert any(
+        isinstance(node, ast.If)
+        and "packing" in ast.dump(node.test)
+        and _stores_grad_accum(node)
+        for node in ast.walk(tree)
+    ), "bfd path must re-derive gradient_accumulation_steps under a packing guard"
+
+
 def test_trl_collator_masks_prompt_from_pretokenized_rows():
     """The UNPACKED / TRL-bfd path (not covered by BlockDiagonalCollator tests): feed TRL's real
     DataCollatorForLanguageModeling pre-tokenized {input_ids, completion_mask} rows with

@@ -362,6 +362,18 @@ def run_sft():
         else:
             cfg_kwargs["packing"] = False
             print("[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA")
+    if cfg_kwargs.get("packing"):
+        # TRL bfd bins ~ex_per_block examples into each max_length row; re-derive grad_accum so the
+        # effective batch stays in EXAMPLES (the SDPA/GDN packing paths below do the same).
+        _bfd_ids = [r["input_ids"] for r in _pretok]
+        _bfd_ex = len(_bfd_ids) / max(1, len(pack_token_ids(_bfd_ids, sft_max_len)))
+        cfg_kwargs["gradient_accumulation_steps"] = max(
+            1, math.ceil(effective_batch / max(1.0, per_device_bs * _bfd_ex))
+        )
+        print(
+            f"[sft] bfd packing: ~{_bfd_ex:.1f} ex/block -> pd={per_device_bs} "
+            f"ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept ~{effective_batch} ex)"
+        )
 
     # --- True token packing via a 4D block-diagonal SDPA mask (no flash-attn / no flex) ---------
     # When the run lands on plain SDPA (no varlen flash backend) the block above left packing OFF —

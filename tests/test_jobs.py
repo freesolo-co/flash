@@ -556,6 +556,35 @@ def test_poll_job_ignores_prior_attempt_heartbeat_keeps_setup_grace(monkeypatch)
     assert "limit 5000s" in res.detail
 
 
+def test_reattach_legacy_handle_passes_current_attempt_none(monkeypatch):
+    # A handle persisted before the attempt field has no "attempt" key. Reattach must pass
+    # current_attempt=None (keep poll_job's relative logic); coercing to 0 would treat a live
+    # worker's attempt>=1 heartbeats as foreign and false-stall a healthy run. A round-3 handle
+    # carries the int and gates on it.
+    import types
+
+    from flash.providers import base
+    from flash.providers.runpod import RunpodProvider, jobs
+
+    captured = {}
+
+    def fake_poll_job(rh, **kw):
+        captured.clear()
+        captured.update(kw)
+        return base.PollResult(ok=True)
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+    spec = types.SimpleNamespace(phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None))
+
+    legacy = base.JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j"})
+    RunpodProvider().poll(legacy, spec, 0)
+    assert captured["current_attempt"] is None
+
+    fresh = base.JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j", "attempt": 2})
+    RunpodProvider().poll(fresh, spec, 0)
+    assert captured["current_attempt"] == 2
+
+
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
     # A cold-start (setup) heartbeat like "boot" proves liveness but must NOT switch to the
     # tight training window — the slow model-load/vLLM-init still has to fit setup_grace_s.

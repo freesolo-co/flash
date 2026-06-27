@@ -193,6 +193,22 @@ def test_bootstrap_sets_lambda_arm():
     assert build_payload(_spec(), 0, 0)["flash_arm"] == "lambda"
 
 
+def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
+    # The instance bootstrap must stamp ATTEMPT into the worker env (RunPod does it in jobs.py) — the
+    # worker reads it into every heartbeat, and the poller's stale-heartbeat rejection is dead without
+    # it (a prior attempt's leftover heartbeat would disarm the new attempt's fast failover).
+    from flash.providers import _instance_bootstrap as lb
+    from flash.providers.lambdalabs.jobs.builders import build_payload
+
+    base = {"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}
+    assert lb.build_worker_env({**base, "attempt": 3})["ATTEMPT"] == "3"
+    # First attempt + a missing key both stamp "0" (matching RunPod's str(int(attempt))).
+    assert lb.build_worker_env({**base, "attempt": 0})["ATTEMPT"] == "0"
+    assert lb.build_worker_env(base)["ATTEMPT"] == "0"
+    # And the producer end actually carries the launched attempt into the payload bootstrap reads.
+    assert build_payload(_spec(), seed=0, attempt=2)["attempt"] == 2
+
+
 # ---------------------------------------------------------------------------
 # launch_and_submit: capacity (region) walk
 # ---------------------------------------------------------------------------
