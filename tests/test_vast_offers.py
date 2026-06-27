@@ -172,6 +172,29 @@ def test_live_rates_gates_on_min_disk(monkeypatch):
     assert captured["disk_gb"] == vast.MIN_DISK_GB
 
 
+def test_live_rates_floors_query_at_smallest_managed_vram(monkeypatch):
+    # Copilot Mtugt: live pricing must floor the market query at the SMALLEST managed Vast class's VRAM,
+    # not 0 — min_vram_gb=0 lets tiny UNMANAGED low-VRAM offers fill the fixed-size price-sorted page and
+    # crowd managed classes off it, so hourly_rate() falls back to static rates even when live offers
+    # exist. The floor keeps it to one market query while making the page relevant.
+    from flash.providers.base import GPU_INFO
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast import pricing
+
+    captured = {}
+
+    def fake_usable(min_vram_gb, disk_gb, *a, **k):
+        captured["min_vram_gb"] = min_vram_gb
+        return []
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    pricing.live_rates(refresh=True)
+    expected = int(min(i.vram_gb for i in GPU_INFO.values() if i.vast_name))
+    assert captured["min_vram_gb"] == expected
+    assert captured["min_vram_gb"] > 0  # not the old crowding-prone 0
+
+
 def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
     # Copilot Msbs9: repeated live_rates() within the TTL must share ONE market fetch (the refresh
     # param was previously ignored); refresh=True forces a fresh query.

@@ -855,6 +855,24 @@ def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
     PROVIDER.destroy(JobHandle.from_dict({"provider": "vast"}))
 
 
+def test_provider_destroy_passes_raw_id_no_int_raise(monkeypatch):
+    """Copilot Mtugr: VastProvider.destroy must NOT int()-convert the id in the wrapper — a corrupt /
+    non-numeric handle would raise ValueError/TypeError and break the retry teardown. destroy_instance
+    does the int() inside its own try/except (-> False), so pass the id through raw and let the False ->
+    raise VastApiError path handle a bad id (no uncaught ValueError)."""
+    from flash.providers.base import JobHandle
+    from flash.providers.vast import PROVIDER
+    from flash.providers.vast import api as vast_api
+
+    seen = []
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: seen.append(iid) or False)
+    handle = JobHandle.from_dict({"provider": "vast", "instance_id": "not-a-number"})
+    # surfaces as VastApiError (unconfirmed), NOT a raw ValueError from int() in the wrapper
+    with pytest.raises(vast_api.VastApiError, match="unconfirmed"):
+        PROVIDER.destroy(handle)
+    assert seen == ["not-a-number"]  # passed through raw — destroy_instance owns the int()
+
+
 # ---------------------------------------------------------------------------
 # labels, handle, sweep, gc
 # ---------------------------------------------------------------------------

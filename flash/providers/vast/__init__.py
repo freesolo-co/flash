@@ -130,7 +130,11 @@ class VastProvider:
         # ``sweep_orphans`` backstop to notice. Surface it: warn here, then raise so the caller does not
         # record a FALSE success (the deploy/cancel callers catch it and still run their endpoint GC /
         # later sweep; a future non-suppressing caller sees the real failure instead of a clean return).
-        if not vast_api.destroy_instance(int(iid)):
+        # Pass ``iid`` THROUGH unconverted: ``destroy_instance`` does the ``int()`` inside its own
+        # try/except (-> False on a corrupt/non-numeric id), so an ``int(iid)`` HERE would raise
+        # ValueError/TypeError and break the retry teardown instead of surfacing as the False -> raise
+        # VastApiError path (Copilot Mtugr; mirrors the _best_effort_destroy fix).
+        if not vast_api.destroy_instance(iid):
             get_logger(__name__).warning(
                 "vast destroy_instance(%s) returned unconfirmed (success:false / breakdown); "
                 "instance may still be billing — relying on sweep_orphans backstop",

@@ -52,13 +52,22 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
     if not refresh and _rates_cache["data"] is not None and now - _rates_cache["ts"] < _RATES_TTL_S:
         return _rates_cache["data"]
     try:
+        from flash.providers.base import GPU_INFO
         from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
 
         rates: dict[str, float] = {}
+        # Floor the market query at the SMALLEST managed Vast class's VRAM, NOT 0: with min_vram_gb=0
+        # the server returns the cheapest offers across ALL sizes — a flood of tiny UNMANAGED low-VRAM
+        # cards fills the fixed-size price-sorted page and crowds the managed classes off it, so
+        # live_rates() misses them and hourly_rate() falls back to static (RunPod) rates even when live
+        # Vast offers exist. The floor keeps it to ONE market query while making the page relevant; no
+        # managed class is smaller than the floor, so none is excluded (Copilot Mtugt). 0 if nothing is
+        # managed (degrades to the old behavior).
+        vram_floor = int(min((i.vram_gb for i in GPU_INFO.values() if i.vast_name), default=0))
         # Gate on MIN_DISK_GB (what create() enforces): disk_gb=0 would disable disk filtering and
         # price the run off "cheapest" offers that aren't actually provisionable, making live pricing
         # optimistic and inconsistent with the allocator/submit paths (both pass MIN_DISK_GB).
-        for offer in usable_offers(0, MIN_DISK_GB):  # offers are price-sorted, cheapest first
+        for offer in usable_offers(vram_floor, MIN_DISK_GB):  # offers are price-sorted, cheapest first
             rates.setdefault(offer.gpu, offer.dph_total)
         merged = {**static, **rates}
         _rates_cache.update(ts=now, data=merged)
