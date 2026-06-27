@@ -216,6 +216,27 @@ def test_recombine_missing_safetensors_raises(tmp_path):
         recombine_lora_adapters(sft, grpo, out)
 
 
+def test_recombine_loads_legacy_bin_adapter(tmp_path):
+    # A legacy PEFT SFT adapter saved as adapter_model.bin (not safetensors) is loadable by the
+    # warm-start init path, so recombine must handle it too rather than fail late at finalize.
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    # Capture expected deltas while the SFT safetensors still exists, then convert it to a .bin.
+    want = {mt: _delta(sft, ms) + _delta(grpo, mt) for ms, mt in zip(MODULES, TEXT_MODULES, strict=True)}
+    st = os.path.join(sft, "adapter_model.safetensors")
+    torch.save(load_file(st), os.path.join(sft, "adapter_model.bin"))
+    os.remove(st)
+
+    assert recombine_lora_adapters(sft, grpo, out) == 8
+    out_sd = load_file(os.path.join(out, "adapter_model.safetensors"))  # output is safetensors
+    assert all(".language_model." not in k for k in out_sd)
+    for mt in TEXT_MODULES:
+        assert torch.allclose(_delta(out, mt), want[mt], atol=1e-6, rtol=1e-5)
+
+
 def test_recombine_missing_adapter_config_raises(tmp_path):
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
