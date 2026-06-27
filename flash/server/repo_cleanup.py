@@ -83,7 +83,11 @@ logger = get_logger(__name__)
 
 RUN_REPO_PREFIX = "flashrun-"
 CODE_PATH = "code/flash"
-CHECKPOINTS_PATH = "checkpoints"
+CHECKPOINTS_PATH = "checkpoints"  # plural: per-step DEPLOYABLE adapter snapshots
+# singular: the full-trainer resume checkpoint (optimizer/scheduler/rng + weights) the worker keeps
+# under <prefix>/checkpoint/checkpoint-N for resume-on-preemption (flash.engine.worker.hf). It is
+# never servable and far larger than a deployable adapter, so an old terminal run never needs it.
+RESUME_CHECKPOINT_PATH = "checkpoint"
 ADAPTER_PATH = "adapter"
 # A PEFT adapter folder is only *deployable* when it carries adapter_config.json AND a weights file
 # — the exact signal serving / flash.runner.checkpoints.list_checkpoints use, so the GC agrees with
@@ -317,12 +321,20 @@ def classify(view: RepoView, deployed: set[str], cfg: Config, now: datetime) -> 
             Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "training source snapshot")
             for folder in view._artifact_folders(CODE_PATH)
         )
-    if cfg.checkpoints and age >= cfg.trim_age_days * 86400 and view.has_final_adapter():
-        # Only trim checkpoints when a FINAL adapter remains to serve. A checkpoint-only repo's
-        # checkpoints ARE its sole servable content — trimming them would leave nothing deployable.
+    if cfg.checkpoints and age >= cfg.trim_age_days * 86400:
+        if view.has_final_adapter():
+            # Trim the plural DEPLOYABLE checkpoint snapshots only when a FINAL adapter remains to
+            # serve — a checkpoint-only repo's checkpoints ARE its sole servable content.
+            actions.extend(
+                Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "intermediate checkpoints (final adapter kept)")
+                for folder in view._artifact_folders(CHECKPOINTS_PATH)
+            )
+        # The singular full-trainer resume checkpoint is never servable (it exists only to resume a
+        # preempted run), so an old terminal run never needs it — trim it regardless of the final
+        # adapter. It's typically the largest reclaim of all.
         actions.extend(
-            Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "intermediate checkpoints (final adapter kept)")
-            for folder in view._artifact_folders(CHECKPOINTS_PATH)
+            Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "resume checkpoint (full trainer state)")
+            for folder in view._artifact_folders(RESUME_CHECKPOINT_PATH)
         )
 
     if not actions:
@@ -338,9 +350,18 @@ def build_plan(views: list[RepoView], deployed: set[str], cfg: Config, now: date
     return plan
 
 
-def apply_plan(api, plan: Plan, *, dry_run: bool, sleep: float) -> list[dict]:
-    """Execute (or, when ``dry_run``, only record) every action. Returns a manifest of results."""
+def apply_plan(api, plan: Plan, *, dry_run: bool, sleep: float, refresh_live=None, live_ttl: float = 30.0) -> list[dict]:
+    """Execute (or, when ``dry_run``, only record) every action. Returns a manifest of results.
+
+    ``refresh_live`` (used only for destructive tiers) returns the current ``(deployed_ids,
+    complete)``; it is consulted JUST BEFORE each mutation — TTL-cached so serving isn't hammered —
+    so a repo deployed mid-apply (after the pre-apply sample but before its own action runs, which
+    can be many seconds later with ``--sleep`` and a long plan) is skipped instead of deleted. If
+    that re-check can't be confirmed, the action is skipped to stay safe rather than risk a live
+    repo."""
     manifest: list[dict] = []
+    live: set[str] = set()
+    live_fetched_at: float | None = None
     for action in plan.actions:
         record = {
             "repo_id": action.repo_id,
@@ -353,6 +374,22 @@ def apply_plan(api, plan: Plan, *, dry_run: bool, sleep: float) -> list[dict]:
         if dry_run:
             manifest.append(record)
             continue
+        if refresh_live is not None:
+            now_t = time.monotonic()
+            if live_fetched_at is None or now_t - live_fetched_at >= live_ttl:
+                try:
+                    live, _complete = refresh_live()
+                    live_fetched_at = now_t
+                except Exception as exc:
+                    record["skipped"] = f"live re-check failed ({exc}); skipped to stay safe"
+                    logger.warning("skipping %s %s: live re-check failed: %s", action.kind, action.repo_id, exc)
+                    manifest.append(record)
+                    continue
+            if action.repo_id in live:
+                record["skipped"] = "repo became deployed during apply"
+                logger.warning("skipping %s %s: repo became deployed during apply", action.kind, action.repo_id)
+                manifest.append(record)
+                continue
         try:
             if action.kind == "delete_repo":
                 api.delete_repo(repo_id=action.repo_id, repo_type="dataset", missing_ok=True)
@@ -467,7 +504,11 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
                 plan.actions = kept
 
     _print_report(plan, cfg, dry_run=dry_run, live_set_known=live_set_known, live_set_complete=live_set_complete)
-    manifest = apply_plan(api, plan, dry_run=dry_run, sleep=sleep)
+    # For destructive tiers, re-check the live set just before each mutation (TTL-cached) so a repo
+    # deployed mid-apply is skipped — the pre-apply sample above only catches deploys up to this
+    # point. Code-only purge is serving-safe and needs no per-action re-check.
+    refresh_live = deployed_repo_ids if (not dry_run and cfg.needs_live_set) else None
+    manifest = apply_plan(api, plan, dry_run=dry_run, sleep=sleep, refresh_live=refresh_live)
     if manifest_path:
         with open(manifest_path, "w") as f:
             json.dump({"dry_run": dry_run, "actions": manifest}, f, indent=2)
