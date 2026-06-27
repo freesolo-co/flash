@@ -84,7 +84,8 @@ class RunpodProvider:
         failure_reader = (
             make_hf_failure_detail_reader(hf_repo, prefix, spec.phase) if hf_repo else None
         )
-        rh = RunpodJobHandle.from_dict(handle.to_dict())
+        hd = handle.to_dict()
+        rh = RunpodJobHandle.from_dict(hd)
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         # Same stall tuning as the submit path so a reattached run isn't judged differently:
@@ -92,13 +93,16 @@ class RunpodProvider:
         # on_handle), so reproduce its no-capacity grace here instead of defaulting to the
         # shorter non-last window. Absent (a pre-persist / non-runpod handle) => False, the
         # historical default.
-        on_last_gpu = bool(handle.to_dict().get("on_last_gpu", False))
+        on_last_gpu = bool(hd.get("on_last_gpu", False))
+        # A legacy handle (no "attempt" key) -> None so poll_job keeps its relative logic; coercing
+        # to 0 would discard a live worker's attempt>=1 heartbeats and false-stall a healthy run.
+        current_attempt = int(hd["attempt"]) if hd.get("attempt") is not None else None
         return poll_job(
             rh,
             log=log,
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
-            current_attempt=rh.attempt,
+            current_attempt=current_attempt,
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

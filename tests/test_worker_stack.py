@@ -261,7 +261,9 @@ def test_heartbeat_commit_is_throttled(monkeypatch):
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("stage", ["model_prefetching", "sft_initializing", "rl_initializing"])
+@pytest.mark.parametrize(
+    "stage", ["model_prefetching", "sft_pretokenizing", "sft_initializing", "rl_initializing"]
+)
 def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
     """The periodic setup pings run on a side thread every 30s through a long phase (a cold
     snapshot_download can pull tens of GB for ~40 min, and disaggregated workers share one HF_REPO),
