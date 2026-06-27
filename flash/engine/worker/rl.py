@@ -264,9 +264,17 @@ def run_rl():
         if isinstance(_p0, str):
             _rendered0 = _p0  # non-conversational: already the rendered prompt string
         else:
-            try:  # conversational: render the message list the same way the rollout does
+            # conversational: render the message list the SAME way the rollout / budget filter does,
+            # INCLUDING the tool schemas for a tool env (_oai_tools) — otherwise the rendered prompt
+            # (and whether the template pre-opened <think>) could differ from the actual rollout.
+            _tool_kw = {"tools": _oai_tools} if _oai_tools else {}
+            try:
                 _rendered0 = tok.apply_chat_template(
-                    _p0, add_generation_prompt=True, tokenize=False, enable_thinking=True
+                    _p0,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=True,
+                    **_tool_kw,
                 )
             except Exception:
                 _rendered0 = None
