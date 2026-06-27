@@ -164,19 +164,23 @@ def run_sft():
     # default TRL 1.6 nll loss returns NaN (not a true no-op), poisoning the step. Filtering them up
     # front guarantees every training row carries >=1 completion token, so no all-ignored batch/block
     # can form regardless of how rows are micro-batched or packed.
-    _kept = [r for r in _pretok if any(r["completion_mask"])]
-    _dropped = len(_pretok) - len(_kept)
+    # Filter ``texts`` in LOCKSTEP with ``_pretok`` (zip preserves their 1:1 index correspondence) so
+    # downstream token/cost accounting keyed off ``texts`` (train_tokens below) reflects what is
+    # ACTUALLY trained, not the dropped examples.
+    _kept_pairs = [(t, r) for t, r in zip(texts, _pretok, strict=True) if any(r["completion_mask"])]
+    _dropped = len(_pretok) - len(_kept_pairs)
     if _dropped:
         print(
             f"[sft] dropped {_dropped}/{len(_pretok)} rows with no completion target "
             "(sft_max_len truncated away the whole completion, or an empty completion)"
         )
-    _pretok = _kept
-    if not _pretok:
+    if not _kept_pairs:
         raise ValueError(
             "every SFT example has an empty completion after sft_max_len truncation (nothing to "
             "train on); increase sft_max_len or shorten the prompts"
         )
+    texts = [t for t, _ in _kept_pairs]
+    _pretok = [r for _, r in _kept_pairs]
     ds = Dataset.from_list(_pretok)
     _masked_tok = sum(m.count(0) for m in (r["completion_mask"] for r in _pretok))
     _total_tok = sum(len(r["input_ids"]) for r in _pretok)
