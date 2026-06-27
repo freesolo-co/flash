@@ -538,10 +538,16 @@ def model_required_vram_gb(
         # 96 GB card with a thin margin over its 70 GB frozen weights -> floor it to the 180 GB B200).
         if not is_grpo and getattr(info, "sft_min_vram_gb", 0):
             floor = max(floor, int(info.sft_min_vram_gb))
-        # Big-model GRPO is TIGHT at its floor (2 weight copies + KV pool), so long context
-        # overflows it -> escalate to a bigger tier. See grpo_seq_escalation_gb.
+        # Big-model GRPO is TIGHT at its floor (2 weight copies + KV pool), so long context overflows
+        # it -> escalate to a bigger tier (or, when already on the biggest card, push the requirement
+        # PAST every GPU so the run is REJECTED at parse time instead of booting and OOMing in vLLM's
+        # KV alloc). The KV/colocate pressure scales with the ATTENTION width — the ACTIVE params — so
+        # escalate on active_params_b for an MoE; keying on the 35B TOTAL would over-reject (its dense
+        # ~1385-token threshold sits below the default GRPO rollout length, breaking ordinary GRPO),
+        # while the ~3B active gives ~16k tokens of headroom that still rejects a 32k run. Dense models
+        # leave active_params_b unset -> falls back to params_b, unchanged. See grpo_seq_escalation_gb.
         if is_grpo and floor:
-            floor += grpo_seq_escalation_gb(params_b, seq_len)
+            floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
         need = max(need, floor)
         # vLLM-colocate floor: the engine (CUDA context + KV pool sized to the CARD's VRAM +
         # framework) + the 2nd resident weight copy add a ~constant the param estimate misses,

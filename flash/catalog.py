@@ -203,9 +203,16 @@ MODELS: dict[str, ModelInfo] = {
         # dominate; the active-3B activations/KV are tiny), which would otherwise down-route to the
         # 96 GB RTX Pro 6000 (consumer Blackwell, thin margin over the 70 GB base) or the 80 GB H100
         # (too tight). Floor to 100 GB so SFT lands on the 141 GB H200 — a datacenter card with wide
-        # margin, ~$1.50/hr cheaper than the B200 and not needed here. (GRPO's ~167 GB two-copy
-        # estimate already routes itself to the B200; H200 can't hold the trainer + vLLM rollout.)
+        # margin, ~$1.50/hr cheaper than the B200 and not needed here.
         sft_min_vram_gb=100,
+        # GRPO floor = the 180 GB B200 (colocated GRPO holds two ~70 GB weight copies + a KV pool; the
+        # 141 GB H200 can't hold the trainer + vLLM rollout). The base ~167 GB two-copy estimate already
+        # routes GRPO to the B200, but setting the floor ALSO ENGAGES the long-context escalation —
+        # model_required_vram_gb only adds grpo_seq_escalation_gb when a grpo floor is set. The
+        # escalation keys on the ~3B ACTIVE params, so default/moderate GRPO still fits the B200 but a
+        # long (>~16k-token, e.g. 32k) rollout is sized PAST 180 GB and rejected at parse time, instead
+        # of booting a B200 and OOMing in vLLM's KV allocation.
+        grpo_min_vram_gb=180,
         quant="bf16",
         recommended_gpu="H200",
         thinking="hybrid",
