@@ -7,7 +7,6 @@ import pytest
 from flash.serve.deploy import (
     Deployment,
     deploy_adapter,
-    serve_endpoint_name,
     serving_base_url,
     undeploy_adapter,
 )
@@ -123,11 +122,6 @@ def test_undeploy_404_is_clean(monkeypatch):
 
     monkeypatch.setattr(deploy_mod.httpx, "delete", lambda *a, **k: _Resp())
     assert undeploy_adapter("flash-1-gone") == []
-
-
-def test_serve_endpoint_name_is_cosmetic_label():
-    a = serve_endpoint_name("RTX 5090", "flash-123-abcd1234")
-    assert a.startswith("flash-serve-5090-")
 
 
 def test_deployment_roundtrip_dict():

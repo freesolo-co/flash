@@ -5,8 +5,8 @@ the ~10-15 min first-use JIT that #194 reintroduced on a cold worker. It warms t
 trainer hits early — FlashAttention fwd/bwd, the Liger fused cross-entropy, flash-linear-attention's
 Gated-DeltaNet (Qwen3.5/3.6 hybrid), and a representative ``torch.compile`` — then calls
 ``torch.compiler.save_cache_artifacts()`` to write ONE portable mega-cache blob into the cache dir.
-``flash.engine.worker._load_kernel_cache_if_present`` loads it back at worker boot
-(``torch.compiler.load_cache_artifacts``); the Dockerfile bakes the produced ``build/kernel_cache/``
+``load_mega_cache`` (re-exported as ``flash.engine.worker.load_mega_cache``) loads it back at worker
+boot (``torch.compiler.load_cache_artifacts``); the Dockerfile bakes the produced ``build/kernel_cache/``
 into the image when built with ``--build-arg BUILD_KERNEL_CACHE=true``.
 
 Measured: cold compile ~124s -> warm load ~0.2s (537x).
@@ -22,11 +22,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 import time
 
 # Default bake dir. Mirrors the Dockerfile's /opt/flash/kernelcache; the saved mega-cache file lands
-# directly under it so _load_kernel_cache_if_present finds it. Keep this name in lockstep with
-# engine.worker._KERNEL_CACHE_DIR / _KERNEL_CACHE_FILE.
+# directly under it so ``load_mega_cache`` (the boot-time reader below) finds it. ``load_mega_cache``
+# derives its read paths from these same constants, so the writer and reader can never drift.
 DEFAULT_CACHE_DIR = "/opt/flash/kernelcache"
 MEGA_CACHE_FILENAME = "mega_cache.bin"
 MEGA_CACHE_META_FILENAME = "mega_cache.json"
@@ -49,6 +50,21 @@ def _point_backends_at(cache_dir: str) -> None:
 def _torch_sm(torch) -> str:
     cap = torch.cuda.get_device_capability(0)
     return f"sm{cap[0]}{cap[1]}"
+
+
+def _current_cuda_sm(torch) -> str | None:
+    """Guarded sm-detection for the BOOT-TIME cache load: returns the live GPU's arch (``smXY``) or
+    ``None`` when CUDA is unavailable / probing fails, so ``load_mega_cache`` never raises and refuses
+    to load a blob it cannot verify. (``_torch_sm`` above is the unguarded form used on the GPU builder
+    once a device is known live.)
+    """
+    try:
+        if not torch.cuda.is_available():
+            return None
+        cap = torch.cuda.get_device_capability(0)
+        return f"sm{cap[0]}{cap[1]}"
+    except Exception:
+        return None
 
 
 def _require_gpu():
@@ -338,6 +354,70 @@ def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warm
     except Exception as e:
         _log(f"cache metadata save failed: {e}")
         return False
+
+
+def load_mega_cache() -> bool:
+    """Best-effort: if a baked mega-cache blob exists, load it so the worker skips first-run JIT.
+
+    The boot-time read-side of ``save_mega_cache`` — loads the portable cache a GPU builder wrote via
+    ``torch.compiler.load_cache_artifacts()`` (measured cold compile ~124s -> warm load ~0.2s). Read
+    paths derive from ``DEFAULT_CACHE_DIR`` / ``MEGA_CACHE_FILENAME`` / ``MEGA_CACHE_META_FILENAME``,
+    the same constants the bake writes to, so reader and writer can never drift. OPT-IN: when no baked
+    cache is present (the default image build), this is a no-op and the worker JITs on first use
+    exactly as before (#163's init heartbeat covers that stall). Never raises: a missing torch /
+    missing file / unusable blob just logs and leaves the JIT path intact.
+    """
+    cache_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_FILENAME)
+    meta_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_META_FILENAME)
+
+    def _reject(reason: str) -> bool:
+        # a baked cache is present but unusable (no/garbled metadata or wrong arch): repoint
+        # triton/inductor OFF the baked trees (Dockerfile points them at /opt/flash/kernelcache)
+        # so the JIT fallback compiles fresh into scratch instead of reusing wrong-arch baked
+        # entries that would collide with this worker's arch.
+        print(f"[kernel-cache] {reason} -> first-run JIT fallback")
+        scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
+        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
+            d = os.path.join(scratch, sub)
+            os.makedirs(d, exist_ok=True)
+            os.environ[var] = d
+        return False
+
+    if not os.path.isfile(cache_file):
+        print(f"[kernel-cache] no baked cache at {cache_file} -> first-run JIT (expected default)")
+        return False
+    try:
+        import torch
+
+        current_sm = _current_cuda_sm(torch)
+        try:
+            with open(meta_file) as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            return _reject("baked cache has no metadata")
+        except Exception as e:
+            return _reject(f"metadata unreadable ({e})")
+        cached_sm = str(meta.get("sm") or "")
+        if not current_sm:
+            # can't verify the worker's GPU arch -> don't risk loading a wrong-arch blob; JIT instead.
+            return _reject("worker GPU arch undetermined")
+        if cached_sm != current_sm:
+            return _reject(
+                f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
+            )
+        with open(cache_file, "rb") as f:
+            blob = f.read()
+        torch.compiler.load_cache_artifacts(blob)
+        print(
+            f"[kernel-cache] loaded baked mega-cache for {cached_sm or 'unknown'} "
+            f"({len(blob)} bytes) -> skipping first-run JIT"
+        )
+        return True
+    except Exception as e:
+        # never block boot on a bad/absent cache: fall back to the normal JIT path. repoint off the
+        # baked trees too — if the mega blob was present + arch-matched but load raised, the on-disk
+        # triton/inductor entries may be partial/corrupt, so JIT fresh into scratch.
+        return _reject(f"load skipped ({e})")
 
 
 def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:

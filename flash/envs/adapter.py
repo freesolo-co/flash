@@ -146,14 +146,10 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
         if not _is_safe_github_path_parts((ref,)):
             return None
         raw_path = "/".join(parts[4:])
-        if not _is_safe_environment_path(raw_path):
-            return None
         try:
             path = _normalize_env_path(raw_path)
         except ValueError:
             return None
-        if not raw_path:
-            path = _DEFAULT_ENVIRONMENT_PATH
         if parts[2] == "tree" and raw_path and not path.endswith(".py"):
             path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
     elif len(parts) == 2:
@@ -181,18 +177,6 @@ def _normalize_env_path(path: str | None) -> str:
     if any(part == ".." or part == "." for part in parts):
         raise ValueError(f"unsafe environment path: {path!r}")
     return "/".join(parts)
-
-
-def _is_safe_environment_path(path: str) -> bool:
-    if not path:
-        return True
-    raw = path.strip().replace("\\", "/")
-    if raw.startswith("/"):
-        return False
-    parts = [part for part in raw.split("/") if part]
-    if not parts:
-        return True
-    return not any(part in {".", ".."} for part in parts)
 
 
 def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
@@ -372,11 +356,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
-    # Only forward pinned_sha when set, so the unpatched _resolve_ref_sha(parsed) call shape stays
-    # single-arg (a test monkeypatch like ``lambda parsed: ...`` keeps working).
-    resolved_ref = (
-        _resolve_ref_sha(parsed, pinned_sha=pinned_sha) if pinned_sha else _resolve_ref_sha(parsed)
-    )
+    resolved_ref = _resolve_ref_sha(parsed, pinned_sha=pinned_sha)
     cache_key = hashlib.sha256(
         f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
@@ -643,20 +623,24 @@ class FreesoloEnvironment(BaseEnvironment):
             return [dict(m) for m in value["messages"]]
         return [{"role": "assistant", "content": "" if value is None else str(value)}]
 
+    def _single(self, results, method: str):
+        if len(results) != 1:
+            raise RuntimeError(f"Freesolo environment {method} returned the wrong length")
+        return results[0]
+
+    def _score_one(self, completion: str, example: dict, state: dict | None):
+        if state and self.multi_turn:
+            return self._score_episode(example, state)
+        rewards = self._env.score_responses(self._task_example(example), [completion])
+        return self._single(rewards, "score_responses")
+
     def scores_breakdown(
         self, completion: str, example: dict, state: dict | None = None
     ) -> dict[str, float]:
-        if state and self.multi_turn:
-            reward = self._score_episode(example, state)
-        else:
-            rewards = self._env.score_responses(self._task_example(example), [completion])
-            if len(rewards) != 1:
-                raise RuntimeError("Freesolo environment score_responses returned the wrong length")
-            reward = rewards[0]
-        return self._reward_to_breakdown(reward)
+        return self._reward_to_breakdown(self._score_one(completion, example, state))
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
-        return float(self.scores_breakdown(completion, example, state)["total"])
+        return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
     def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
         """Reward for many ``(example, state)`` rollouts at once, in input order.
@@ -707,14 +691,7 @@ class FreesoloEnvironment(BaseEnvironment):
         return bool(getattr(self._env, "reward_thread_safe", True))
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
-        if state and self.multi_turn:
-            reward = self._score_episode(example, state)
-        else:
-            rewards = self._env.score_responses(self._task_example(example), [completion])
-            if len(rewards) != 1:
-                raise RuntimeError("Freesolo environment score_responses returned the wrong length")
-            reward = rewards[0]
-        return bool(reward.resolved_success())
+        return bool(self._score_one(completion, example, state).resolved_success())
 
     def tools(self) -> list:
         return []
@@ -800,9 +777,7 @@ class FreesoloEnvironment(BaseEnvironment):
     def _score_episode(self, example: dict, state: dict):
         task = state.get("task") or self._task_example(example)
         rewards = self._env.score_episodes(task, [self._episode_from_state(state)])
-        if len(rewards) != 1:
-            raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
-        return rewards[0]
+        return self._single(rewards, "score_episodes")
 
     def reward_from_messages(
         self, completion_msgs: list[dict], example: dict, prompt_msgs: list[dict] | None = None
@@ -822,9 +797,7 @@ class FreesoloEnvironment(BaseEnvironment):
             turns=tuple(turns),
         )
         rewards = self._env.score_episodes(self._task_example(example), [episode])
-        if len(rewards) != 1:
-            raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
-        return float(rewards[0].score)
+        return float(self._single(rewards, "score_episodes").score)
 
 
 def load_freesolo_environment(

@@ -345,7 +345,9 @@ def _has_deployable_adapter(ckpt_dir: str) -> bool:
     )
 
 
-def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
+def publish_deployable_checkpoint(
+    ckpt_dir: str, step: int, *, retries: int = 1, backoff_s: float = 0.0
+) -> str | None:
     """Mirror a trainer checkpoint's LoRA adapter to a stable, NON-pruned per-step path so a
     run cancelled mid-RL is still one-command-deployable from its last good step.
 
@@ -354,28 +356,37 @@ def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
     (dropping optimizer/scheduler/rng state) to ``<prefix>/checkpoints/step-<step>/adapter``.
     Unlike the resume checkpoint (``checkpoint/**``, kept latest-only), these accumulate, so
     EVERY step stays deployable. Returns the deployable adapter subfolder, or ``None`` when
-    there's no adapter to publish. Best-effort: a failure here never fails a paid run.
+    there's no adapter to publish (or the upload failed). Best-effort: a failure here never
+    fails a paid run.
+
+    The adapter gate runs ONCE up front, so a missing-adapter step returns immediately with no
+    wasted retries. ``retries`` > 1 then loops ONLY the upload with linear ``backoff_s`` backoff —
+    the ``on_train_end`` flush uses this to ride out a transient concurrent-commit 409 from a
+    still-running daemon upload (a clean publish, the common case, never sleeps).
     """
     if not _w.HF_REPO:
         return None
     # Only publish a checkpoint that actually carries a loadable adapter — never advertise a
-    # non-deployable step.
+    # non-deployable step. Gated once here so the upload retry below is provably non-futile.
     if not _has_deployable_adapter(ckpt_dir):
         return None
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
-    try:
-        _w.hf_api().upload_folder(
-            folder_path=ckpt_dir,
-            path_in_repo=subfolder,
-            repo_id=_w.HF_REPO,
-            repo_type="dataset",
-            ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
-        )
-        _w.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
-        return subfolder
-    except Exception as e:
-        print(f"[ckpt] deployable publish warn (step {step}):", e)
-        return None
+    for attempt in range(retries):
+        try:
+            _w.hf_api().upload_folder(
+                folder_path=ckpt_dir,
+                path_in_repo=subfolder,
+                repo_id=_w.HF_REPO,
+                repo_type="dataset",
+                ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+            )
+            _w.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+            return subfolder
+        except Exception as e:
+            print(f"[ckpt] deployable publish warn (step {step}):", e)
+            if attempt + 1 < retries:
+                time.sleep(backoff_s * (attempt + 1))
+    return None
 
 
 # How long ``on_train_end`` waits to flush the final deployable checkpoint before the worker
@@ -391,23 +402,6 @@ _CKPT_FLUSH_TIMEOUT_S = 300.0
 # publish (the common case) adds zero latency to worker exit.
 _CKPT_FLUSH_RETRIES = 3
 _CKPT_FLUSH_BACKOFF_S = 1.0
-
-
-def _publish_deployable_with_retry(ckpt_dir: str, step: int) -> None:
-    """Best-effort publish of the final deployable when the flush couldn't hold the upload lock.
-
-    Gated on the adapter actually being present so the retry is provably non-futile:
-    ``publish_deployable_checkpoint`` returns ``None`` for BOTH "no adapter" and "upload failed", so
-    after this precheck a ``None`` can only mean a real (likely transient-409) failure worth a retry —
-    an empty step returns immediately with no wasted sleeps."""
-    if not _has_deployable_adapter(ckpt_dir):
-        return
-    for attempt in range(_CKPT_FLUSH_RETRIES):
-        if publish_deployable_checkpoint(ckpt_dir, step) is not None:
-            return
-        if attempt + 1 < _CKPT_FLUSH_RETRIES:
-            time.sleep(_CKPT_FLUSH_BACKOFF_S * (attempt + 1))
-    print(f"[ckpt] could not publish final deployable for step {step} before exit")
 
 
 def _latest_checkpoint_dir(output_dir: str) -> tuple[int, str] | None:
@@ -521,6 +515,10 @@ def make_checkpoint_upload_callback():
                     f"[ckpt] flush lock busy after {_CKPT_FLUSH_TIMEOUT_S:.0f}s; publishing final "
                     f"deployable (step {step}) without it"
                 )
-                _publish_deployable_with_retry(ckpt_dir, step)
+                published = publish_deployable_checkpoint(
+                    ckpt_dir, step, retries=_CKPT_FLUSH_RETRIES, backoff_s=_CKPT_FLUSH_BACKOFF_S
+                )
+                if published is None:
+                    print(f"[ckpt] could not publish final deployable for step {step} before exit")
 
     return _CheckpointUpload()

@@ -452,7 +452,7 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
     monkeypatch.setattr(
         adapter,
         "_resolve_ref_sha",
-        lambda parsed: "b" * 40,
+        lambda parsed, **_: "b" * 40,
     )
 
     downloads: list[str] = []
@@ -474,7 +474,7 @@ def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, 
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
 
     downloads: list[str] = []
 
@@ -494,7 +494,7 @@ def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path,
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
 
     downloads: list[str] = []
 
@@ -519,7 +519,7 @@ def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, mon
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
     monkeypatch.setattr(
         adapter,
         "_download_github_tarball",

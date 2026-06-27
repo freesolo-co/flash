@@ -9,10 +9,9 @@ whole-dict, last-writer-wins and therefore unreliable across processes).
 from __future__ import annotations
 
 import hashlib
-import urllib.error
 from typing import Any
 
-from flash.providers._http import RestClient
+from flash.providers._http import RestClient, is_not_found
 from flash.providers.runpod import keys as _keys
 
 REST_BASE = "https://rest.runpod.io/v1"
@@ -187,17 +186,14 @@ def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
 def _is_not_found(err: RunpodApiError) -> bool:
     """True only when a RunpodApiError represents a genuine 404 (endpoint already gone).
 
-    request_with_retries chains the original urllib HTTPError as ``__cause__`` for every
-    fast-failed 4xx (``raise ... from e``), so the status code is authoritative when a
-    cause is present: a 404 is "already gone", anything else (403/401/5xx) is a real
-    failure and must NOT be swallowed — a body that merely *mentions* "does not exist" on a
-    403 is still a 403. We only fall back to a text match when there is no HTTPError cause
-    (e.g. the "failed after N attempts" path), and even then only on an unambiguous 404.
+    Delegates to the shared ``_http.is_not_found``: the original urllib HTTPError is chained as
+    ``__cause__`` for every fast-failed 4xx (``raise ... from e``), so the status code is
+    authoritative when a cause is present — a 404 is "already gone", anything else (403/401/5xx) is a
+    real failure and must NOT be swallowed (a body that merely *mentions* "does not exist" on a 403 is
+    still a 403). The no-cause fallback (e.g. the "failed after N attempts" path) matches only an
+    unambiguous ``HTTP 404`` TOKEN, never a bare substring (so ``HTTP 4040`` can't be misread).
     """
-    cause = err.__cause__
-    if isinstance(cause, urllib.error.HTTPError):
-        return cause.code == 404
-    return "http 404" in str(err).lower()
+    return is_not_found(err)
 
 
 def endpoint_health(endpoint_id: str) -> dict:

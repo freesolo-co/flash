@@ -400,6 +400,96 @@ def remap_adapter_keys(keys):
     return out
 
 
+# A safetensors header is small even for huge models (a few hundred KB at most); 100 MB is a wildly
+# generous ceiling that still refuses a corrupt/hostile file declaring a multi-GB header length
+# before we allocate/read it.
+_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
+
+
+def _read_safetensors_header(path: str) -> tuple[dict, int]:
+    """Read and FULLY validate a ``.safetensors`` file's JSON header.
+
+    safetensors layout: 8-byte little-endian header length, then a JSON header mapping
+    ``name -> {dtype, shape, data_offsets}`` (plus an optional ``__metadata__`` entry), then the
+    raw tensor data. Returns ``(header, data_start)`` where ``data_start`` (``8 + hdr_len``) is the
+    byte offset of the tensor data section. Pure stdlib (no torch / safetensors) so this module stays
+    CPU-importable on the server venv.
+
+    Validates BEFORE allocating: the declared header length is bounded against the real file size and
+    an absolute ceiling (so a corrupt/hostile file can't trigger a huge allocation / long read), the
+    header must decode as UTF-8 JSON, and it must be a JSON object keyed by tensor name (a list/int
+    would otherwise blow up later with a confusing TypeError in ``_is_lora_key``). Every error names
+    ``path`` so a bad adapter download is diagnosable (#198).
+    """
+    import json
+    import os
+    import struct
+
+    # Bound the DECLARED header length against the real file size (and an absolute ceiling) BEFORE
+    # reading it, so a corrupt/hostile file can't trigger a huge allocation / long read.
+    file_size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        len_bytes = f.read(8)
+        if len(len_bytes) < 8:
+            raise ValueError(f"{path}: too small to be a safetensors file")
+        (hdr_len,) = struct.unpack("<Q", len_bytes)
+        if hdr_len > file_size - 8 or hdr_len > _MAX_SAFETENSORS_HEADER_BYTES:
+            raise ValueError(
+                f"{path}: declared safetensors header length {hdr_len} is implausible "
+                f"(file is {file_size} bytes) — refusing to read a corrupt/oversized header"
+            )
+        header_bytes = f.read(hdr_len)
+        if len(header_bytes) < hdr_len:
+            raise ValueError(f"{path}: truncated safetensors header")
+        try:
+            header = json.loads(header_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # A bare JSONDecodeError ("Expecting value: line 1 column 1") — or a UnicodeDecodeError
+            # from non-UTF8 header bytes — gives no clue WHICH adapter is corrupt. Re-raise with the
+            # file path so a bad download is diagnosable.
+            raise ValueError(
+                f"{path}: safetensors header is not valid JSON "
+                f"(corrupt or not a safetensors file): {exc}"
+            ) from exc
+    # The safetensors header MUST be a JSON object keyed by tensor name. A corrupt/hostile file could
+    # decode to a list/int/str, which would later blow up with a confusing TypeError in _is_lora_key
+    # (substring search on a non-str). (JSON object keys are always str, so only the container type
+    # needs checking.) Reject a non-object header early with a clear message.
+    if not isinstance(header, dict):
+        raise ValueError(
+            f"{path}: safetensors header is not a JSON object "
+            "(corrupt or not a safetensors file)"
+        )
+    return header, 8 + hdr_len
+
+
+def _rename_keys(mapping, rename, *, path: str, skip=()):
+    """Apply ``rename`` to every key of ``mapping`` -> ``(new_mapping, renamed_count)``.
+
+    Shared by the ``.safetensors`` header rewriter and the ``.bin`` ``state_dict`` rewriter. Raises
+    ``ValueError`` (naming ``path``) if a renamed key would collide with an existing or
+    already-renamed key — refusing to silently overwrite a tensor (the adapter is already remapped or
+    malformed). Keys in ``skip`` (e.g. safetensors ``__metadata__``) pass through unchanged and are
+    never renamed.
+    """
+    new_mapping = {}
+    renamed = 0
+    for k, v in mapping.items():
+        if k in skip:
+            new_mapping[k] = v
+            continue
+        nk = rename(k)
+        if nk != k:
+            if nk in mapping or nk in new_mapping:
+                raise ValueError(
+                    f"{path}: remapped key {nk!r} collides with an existing key; refusing to "
+                    f"overwrite (adapter may already be remapped or malformed)"
+                )
+            renamed += 1
+        new_mapping[nk] = v
+    return new_mapping, renamed
+
+
 def _rewrite_safetensors_header_keys(path: str, rename) -> int:
     """Rename tensor keys in a ``.safetensors`` file IN PLACE, editing only the header.
 
@@ -416,42 +506,8 @@ def _rewrite_safetensors_header_keys(path: str, rename) -> int:
     import shutil
     import struct
 
-    with open(path, "rb") as f:
-        len_bytes = f.read(8)
-        if len(len_bytes) < 8:
-            raise ValueError(f"{path}: too small to be a safetensors file")
-        (hdr_len,) = struct.unpack("<Q", len_bytes)
-        header_bytes = f.read(hdr_len)
-        if len(header_bytes) < hdr_len:
-            raise ValueError(f"{path}: truncated safetensors header")
-        try:
-            header = json.loads(header_bytes)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            # Re-raise with the file path so a corrupt adapter being rewritten is diagnosable
-            # (a bare JSONDecodeError/UnicodeDecodeError names no file). Non-UTF8 header bytes
-            # raise UnicodeDecodeError, not JSONDecodeError, so catch both to keep the context.
-            raise ValueError(
-                f"{path}: safetensors header is not valid JSON "
-                f"(corrupt or not a safetensors file): {exc}"
-            ) from exc
-    data_start = 8 + hdr_len
-
-    new_header = {}
-    renamed = 0
-    for k, v in header.items():
-        if k == "__metadata__":
-            new_header[k] = v
-            continue
-        nk = rename(k)
-        if nk != k:
-            if nk in header or nk in new_header:
-                raise ValueError(
-                    f"{path}: remapped key {nk!r} collides with an existing key; refusing to "
-                    f"overwrite (adapter may already be remapped or malformed)"
-                )
-            renamed += 1
-        new_header[nk] = v
-
+    header, data_start = _read_safetensors_header(path)
+    new_header, renamed = _rename_keys(header, rename, path=path, skip=("__metadata__",))
     if renamed == 0:
         return 0
 
@@ -485,18 +541,7 @@ def _rewrite_bin_keys(path: str, rename) -> int:
     import torch
 
     sd = torch.load(path, map_location="cpu", weights_only=True)
-    new_sd = {}
-    renamed = 0
-    for k, v in sd.items():
-        nk = rename(k)
-        if nk != k:
-            if nk in sd or nk in new_sd:
-                raise ValueError(
-                    f"{path}: remapped key {nk!r} collides with an existing key; refusing to "
-                    f"overwrite (adapter may already be remapped or malformed)"
-                )
-            renamed += 1
-        new_sd[nk] = v
+    new_sd, renamed = _rename_keys(sd, rename, path=path)
     if renamed == 0:
         return 0
     torch.save(new_sd, path)
@@ -512,12 +557,6 @@ def _is_lora_key(key: str) -> bool:
     return any(m in key for m in _LORA_KEY_MARKERS)
 
 
-# A safetensors header is small even for huge models (a few hundred KB at most); 100 MB is a wildly
-# generous ceiling that still refuses a corrupt/hostile file declaring a multi-GB header length
-# before we allocate/read it.
-_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
-
-
 def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
     """Tensor key names in the downloaded adapter.
 
@@ -527,49 +566,12 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
     unpickling the tensor payloads — GPU-worker only). Returns ``None`` when neither weight file
     exists in ``adir``.
     """
-    import json
     import os
-    import struct
 
     st_path = os.path.join(adir, "adapter_model.safetensors")
     bin_path = os.path.join(adir, "adapter_model.bin")
     if os.path.isfile(st_path):
-        # safetensors layout: 8-byte LE header length, then the JSON header, then the tensor data.
-        # Bound the DECLARED header length against the real file size (and an absolute ceiling)
-        # BEFORE reading it, so a corrupt/hostile file can't trigger a huge allocation / long read.
-        file_size = os.path.getsize(st_path)
-        with open(st_path, "rb") as f:
-            len_bytes = f.read(8)
-            if len(len_bytes) < 8:
-                raise ValueError(f"{st_path}: too small to be a safetensors file")
-            (hdr_len,) = struct.unpack("<Q", len_bytes)
-            if hdr_len > file_size - 8 or hdr_len > _MAX_SAFETENSORS_HEADER_BYTES:
-                raise ValueError(
-                    f"{st_path}: declared safetensors header length {hdr_len} is implausible "
-                    f"(file is {file_size} bytes) — refusing to read a corrupt/oversized header"
-                )
-            header_bytes = f.read(hdr_len)
-            if len(header_bytes) < hdr_len:
-                raise ValueError(f"{st_path}: truncated safetensors header")
-            try:
-                header = json.loads(header_bytes)
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                # A bare JSONDecodeError ("Expecting value: line 1 column 1") — or a
-                # UnicodeDecodeError from non-UTF8 header bytes — gives no clue WHICH adapter is
-                # corrupt. Re-raise with the file path so a bad download is diagnosable.
-                raise ValueError(
-                    f"{st_path}: safetensors header is not valid JSON "
-                    f"(corrupt or not a safetensors file): {exc}"
-                ) from exc
-        # The safetensors header MUST be a JSON object keyed by tensor name. A corrupt/hostile file
-        # could decode to a list/int/str, which would later blow up with a confusing TypeError in
-        # _is_lora_key (substring search on a non-str). (JSON object keys are always str, so only the
-        # container type needs checking.) Reject a non-object header early with a clear message.
-        if not isinstance(header, dict):
-            raise ValueError(
-                f"{st_path}: safetensors header is not a JSON object "
-                "(corrupt or not a safetensors file)"
-            )
+        header, _ = _read_safetensors_header(st_path)
         return [k for k in header if k != "__metadata__"]
     if os.path.isfile(bin_path):
         import torch

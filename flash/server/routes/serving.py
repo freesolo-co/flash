@@ -24,7 +24,7 @@ from flash.runner.checkpoints import checkpoint_adapter_prefix
 from flash.serve.deploy import ServingError
 from flash.server import app as _app
 from flash.server import db
-from flash.server._deps import owned_run, require_key
+from flash.server._deps import _require_bool, owned_run, require_key
 from flash.spec import JobSpec
 
 router = APIRouter()
@@ -92,6 +92,41 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
     )
 
 
+def _resolve_deployable_target(
+    run_id: str, spec, status, raw_step, *, action: str, enforce_state: bool
+) -> tuple[int | None, bool, str]:
+    """Shared deploy/export target resolution: resolve an optional checkpoint ``step`` against the
+    run's published checkpoints, gate on the run's training state, and compute the adapter prefix.
+
+    Returns ``(checkpoint_step, is_checkpoint, prefix)``. ``action`` ("deploy"/"export") only tunes
+    the 409 wording; ``enforce_state`` is ``False`` for a deploy dry-run (which validates/shapes
+    without the state gate). The legacy hf_repo 409 guard stays at each handler's call-site (its
+    precedence differs between deploy and export), so it is intentionally NOT done here."""
+    checkpoint_step = _resolve_deploy_step(run_id, spec, raw_step)
+    is_checkpoint = checkpoint_step is not None
+    # A final adapter exists only once a run finished; a per-step checkpoint also survives a run
+    # that stopped mid-RL (cancelled/failed).
+    allowed_states = (
+        _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
+    )
+    if enforce_state and status.state not in allowed_states:
+        detail = (
+            f"run {run_id} is {status.state!r}; {action} a checkpoint only once the run "
+            "has finished, failed, or been cancelled"
+            if is_checkpoint
+            else f"run {run_id} is {status.state!r}; only finished runs with "
+            f"trained adapter artifacts can be {'deployed' if action == 'deploy' else 'exported'}"
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    # A checkpoint serves/exports the per-step adapter; otherwise the run's final adapter.
+    prefix = (
+        checkpoint_adapter_prefix(spec, checkpoint_step)
+        if is_checkpoint
+        else adapter_prefix(spec)
+    )
+    return checkpoint_step, is_checkpoint, prefix
+
+
 @router.post("/v1/runs/{run_id}/deploy")
 def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
     payload = payload or {}
@@ -101,32 +136,18 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
-        # Validate ``dry_run`` is an actual JSON boolean — never ``bool(...)`` a truthy non-bool
-        # (e.g. the string "false" would coerce to True and silently change deploy behavior).
-        dry_run_raw = payload.get("dry_run", False)
-        if not isinstance(dry_run_raw, bool):
-            raise HTTPException(status_code=400, detail="dry_run must be a boolean")
-        dry_run = dry_run_raw
+        dry_run = _require_bool(payload, "dry_run", False)
         # Optional `step`: deploy a specific intermediate checkpoint instead of the run's
         # final adapter. We resolve it against what's actually on HF (the source of truth),
-        # so a missing step 404s with the available list rather than 500ing at serve time.
-        checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
-        is_checkpoint = checkpoint_step is not None
-        allowed_states = (
-            _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
+        # so a missing step 404s with the available list rather than 500ing at serve time. The
+        # shared helper also runs the state gate (skipped for a dry run) and the prefix selection.
+        checkpoint_step, is_checkpoint, deploy_prefix = _resolve_deployable_target(
+            run_id, spec, status, payload.get("step"), action="deploy", enforce_state=not dry_run
         )
-        if not dry_run and status.state not in allowed_states:
-            detail = (
-                f"run {run_id} is {status.state!r}; deploy a checkpoint only once the run "
-                "has finished or been cancelled"
-                if is_checkpoint
-                else f"run {run_id} is {status.state!r}; only finished runs with "
-                "trained adapter artifacts can be deployed"
-            )
-            raise HTTPException(status_code=409, detail=detail)
         # Legacy runs persisted before [train].hf_repo was mandatory rehydrate with an
         # empty hf_repo; without this guard freesolo serving cannot locate the adapter
-        # artifacts (the per-run HF dataset repo). Reject early with a clear 409.
+        # artifacts (the per-run HF dataset repo). Reject early with a clear 409. Kept at this
+        # call-site (out of the shared helper) so deploy's error precedence is unchanged.
         if not dry_run and not spec.train.hf_repo:
             raise HTTPException(
                 status_code=409,
@@ -135,12 +156,6 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                     "cannot be located, so it cannot be deployed"
                 ),
             )
-        # A checkpoint deploy serves the per-step adapter; otherwise the run's final adapter.
-        deploy_prefix = (
-            checkpoint_adapter_prefix(spec, checkpoint_step)
-            if is_checkpoint
-            else adapter_prefix(spec)
-        )
         # The state the run must still be in for this deploy to finalize — a CAS guard so
         # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't be
         # silently overwritten by the deployment record.
@@ -271,15 +286,14 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             status_code=400,
             detail="hf_token is required: a HuggingFace token with write access to the destination repo",
         )
-    # Validate ``private`` is an actual JSON boolean (mirrors deploy's ``dry_run`` guard): a
-    # truthy non-bool like "false" must not silently flip the destination's visibility.
-    private = payload.get("private", True)
-    if not isinstance(private, bool):
-        raise HTTPException(status_code=400, detail="private must be a boolean")
+    # private is a JSON boolean (mirrors deploy's dry_run guard): a truthy non-bool like "false"
+    # must not silently flip the destination's visibility.
+    private = _require_bool(payload, "private", True)
 
     status = owned_run(run_id, key)
     spec = JobSpec.from_dict(status.spec)
     # Legacy runs with no artifact repo (mirrors the /deploy guard): the adapter can't be located.
+    # Kept FIRST (out of the shared helper) so export's error precedence is unchanged.
     if not spec.train.hf_repo:
         raise HTTPException(
             status_code=409,
@@ -289,28 +303,10 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             ),
         )
     # Optional `step`: export a specific intermediate checkpoint instead of the final adapter,
-    # validated against what's actually on HF (a missing step 404s with the available list).
-    checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
-    is_checkpoint = checkpoint_step is not None
-    # Same state gate as deploy: a final adapter exists only once a run finished; a per-step
-    # checkpoint also survives a run that stopped mid-RL (cancelled/failed).
-    allowed_states = (
-        _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
-    )
-    if status.state not in allowed_states:
-        detail = (
-            f"run {run_id} is {status.state!r}; export a checkpoint only once the run "
-            "has finished, been cancelled, or failed"
-            if is_checkpoint
-            else f"run {run_id} is {status.state!r}; only finished runs with "
-            "trained adapter artifacts can be exported"
-        )
-        raise HTTPException(status_code=409, detail=detail)
-    # The per-step adapter folder for a checkpoint, otherwise the run's final adapter folder.
-    prefix = (
-        checkpoint_adapter_prefix(spec, checkpoint_step)
-        if is_checkpoint
-        else adapter_prefix(spec)
+    # validated against what's actually on HF (a missing step 404s with the available list). The
+    # shared helper also runs the same state gate as deploy and the prefix selection.
+    checkpoint_step, is_checkpoint, prefix = _resolve_deployable_target(
+        run_id, spec, status, payload.get("step"), action="export", enforce_state=True
     )
     subfolder = f"{prefix}/adapter"
     try:

@@ -394,6 +394,18 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
+def _run_where(spec: dict, remote: dict) -> tuple[str, str]:
+    """The ``(gpu, provider)`` a run actually ran on, returned as components so each call site
+    keeps its own ``@`` join/format. The remote handle knows what actually ran (a present-but-
+    unlabeled handle means RunPod, the original sole provider); the spec is the parse-time pick we
+    fall back to before the run lands on a box."""
+    provider = remote.get("provider") or (
+        "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
+    )
+    gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+    return gpu, provider
+
+
 def runs_table(runs: list[dict]) -> str:
     """Runs list: state badges + cost, newest first."""
     body = []
@@ -401,11 +413,7 @@ def runs_table(runs: list[dict]) -> str:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        remote = r.get("remote") or {}
-        provider = remote.get("provider") or (
-            "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
-        )
-        gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+        gpu, provider = _run_where(spec, r.get("remote") or {})
         where = f"{gpu}@{provider}" if provider else gpu
         color, uni, ascii_dot = _STATE_STYLE.get(str(r.get("state", "")).lower(), (_GRAY, "•", "-"))
         body.append(
@@ -458,10 +466,8 @@ def _humanize_ts(value) -> str | None:
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
-    remote = obj.get("remote") or {}
-    gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type")
-    provider = remote.get("provider")
-    where = f"{gpu} @ {provider}" if gpu and provider else gpu
+    gpu, provider = _run_where(spec, obj.get("remote") or {})
+    where = f"{gpu} @ {provider}" if gpu and provider else (gpu or None)
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),

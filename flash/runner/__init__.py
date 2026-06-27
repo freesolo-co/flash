@@ -350,39 +350,33 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     """
     is_catalog = getattr(spec, "model_policy", "catalog") == "catalog"
     existing = getattr(spec.gpu, "network_volume", None)
-    # CONFIDENTIALITY: an open-model run must NEVER ride the SHARED cross-tenant cache — even if the
-    # spec already pinned it. Strip the shared name (force cache-less); a non-shared per-org volume is
-    # the intended escape hatch and is left intact. This is checked BEFORE the "honor an existing
-    # volume" no-op so a pre-set flash-weights can't bypass the gate.
-    if not is_catalog:
-        if existing == WEIGHT_CACHE_VOLUME_NAME:
-            d = spec.to_dict()
-            d["gpu"] = {**d["gpu"], "network_volume": None}
-            return JobSpec.from_dict(d)
-        return spec  # no shared cache to strip (cache-less already, or a non-shared escape-hatch volume)
-    if existing:
-        # A pre-set volume is normally honored as an explicit/test assignment. EXCEPTION: the SIZE
-        # GATE also applies to a pre-set SHARED-cache name — a programmatic or stale spec that already
-        # pinned ``flash-weights`` must NOT let an oversized model (the 35B MoE) bypass the gate below
-        # and redirect HF_HOME onto the fixed mount, overflowing it mid-download. Strip it (force
-        # cache-less) in that case. A non-shared (per-org / custom) volume is left intact — the caller
-        # owns its sizing — so only the managed shared name is re-gated here.
-        if existing == WEIGHT_CACHE_VOLUME_NAME and info is not None and not _fits_weight_cache(info):
-            d = spec.to_dict()
-            d["gpu"] = {**d["gpu"], "network_volume": None}
-            return JobSpec.from_dict(d)
-        return spec  # catalog run with an explicit/test volume already assigned — honor it
-    # SIZE GATE: don't pin a model whose cold download won't fit the fixed shared cache — HF_HOME would
-    # redirect onto the undersized mount and snapshot_download would fill it ("No space left"). Such a
-    # model stays cache-less so HF_HOME stays on the container disk (sized by the catalog min_disk_gb).
-    if info is not None and not _fits_weight_cache(info):
+    # A pre-set NON-shared (per-org / custom) volume is always honored as-is — it's the escape-hatch
+    # isolation for an open run, or a caller-owned/sized volume on a catalog run. Only the ABSENCE of a
+    # volume or the managed SHARED name itself is subject to the attach/strip decision below (checked
+    # BEFORE it so a non-shared pin is never re-gated, and a pre-set flash-weights can't bypass it).
+    if existing and existing != WEIGHT_CACHE_VOLUME_NAME:
+        return spec
+    # Attach the shared cache iff the run is a PUBLIC catalog run (CONFIDENTIALITY GATE — an open/"allow"
+    # run may target a private/gated repo whose weights must never reach the shared cross-tenant mount)
+    # whose cold download fits the fixed mount (SIZE GATE — ``_fits_weight_cache``; an oversized model
+    # would redirect HF_HOME onto the undersized mount and overflow it mid-``snapshot_download``).
+    # ``info=None`` skips the size gate, preserving the legacy attach-by-policy behavior.
+    attach = is_catalog and (info is None or _fits_weight_cache(info))
+    # ``existing == WEIGHT_CACHE_VOLUME_NAME`` is the current shared-cache state. When it already matches
+    # the desired ``attach`` state there is nothing to do (covers a fitting catalog spec that already
+    # pins the cache, and any run that is correctly cache-less). Otherwise flip it — attach the shared
+    # cache, or strip a pre-set/stale ``flash-weights`` the gates now forbid (open- or oversized-model).
+    if attach == (existing == WEIGHT_CACHE_VOLUME_NAME):
         return spec
     d = spec.to_dict()
-    d["gpu"] = {
-        **d["gpu"],
-        "network_volume": WEIGHT_CACHE_VOLUME_NAME,
-        "network_volume_gb": WEIGHT_CACHE_VOLUME_GB,
-    }
+    if attach:
+        d["gpu"] = {
+            **d["gpu"],
+            "network_volume": WEIGHT_CACHE_VOLUME_NAME,
+            "network_volume_gb": WEIGHT_CACHE_VOLUME_GB,
+        }
+    else:
+        d["gpu"] = {**d["gpu"], "network_volume": None}
     return JobSpec.from_dict(d)
 
 
