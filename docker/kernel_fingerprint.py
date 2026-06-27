@@ -25,14 +25,17 @@ ignores a mismatched blob), never a crash. So a missing or wrong input here is i
 time, which is why every parse below FAILS LOUD rather than hashing a None.
 
 Known limitations (deliberately scoped -- each only ever costs a recoverable cold-JIT, never
-correctness, and the alternatives over-fire the approval-gated paid GPU bake):
-  * We hash the Dockerfile REQUIREMENT STRINGS, not pip-resolved versions. A cache-affecting range
+correctness, and the alternatives over-fire the paid GPU bake):
+  * fp_cache hashes the Dockerfile dep PINS, not pip-resolved versions. A cache-affecting range
     (liger-kernel>=, the chalk spec) could resolve a newer build on a later worker-image rebuild with
-    no text change, leaving the fingerprint unmoved. Pin those exactly if you want airtight coverage.
-  * fp_cache hashes kernel_warmup.py but not its transitive flash imports (e.g. perf's Hopper
-    fla/tilelang setup). The kernel-DETERMINING inputs (tilelang/tvm-ffi/fla versions) are captured
-    here; perf code is fetched fresh at runtime, so a perf change only risks a stale sm90 cache that
-    cold-JITs. Hashing all of perf would re-warm 5 GPUs on every unrelated perf edit.
+    no text change, leaving fp_cache unmoved. Pin those exactly for airtight coverage. (fp_base DOES
+    hash the whole Dockerfile.worker, so arbitrary base edits -- apt/ENV/CMD/cache-dir -- still
+    trigger a free re-layer; only a cache-affecting change that isn't a parsed pin slips through.)
+  * fp_cache hashes kernel_warmup.py but not its transitive cache-production deps (perf's Hopper
+    fla/tilelang setup, docker/bake_pod_entry.py's pod-side install/invoke). The kernel-DETERMINING
+    versions (tilelang/tvm-ffi/fla) ARE captured here; that code is otherwise stable or fetched fresh
+    at runtime, so a change there only risks a stale (mostly sm90) cache that cold-JITs. Hashing all
+    of perf / bake_pod_entry would re-warm 5 GPUs on every unrelated edit.
 
 stdlib only, no flash/torch import, so it runs under a bare python3 in CI (no uv sync needed).
 """
@@ -144,7 +147,9 @@ def collect_inputs(
     # and these fingerprint inputs). CI passes the resolved values via --fa{2,3}-spec; for a manual
     # bake / the tests we read those env defaults here.
     if fa2_spec is None:
-        fa2_spec = _search(r"(?m)^\s*FA2_SPEC:\s*(\S+)", worker_image_yml, "worker-image.yml FA2_SPEC")
+        fa2_spec = _search(
+            r"(?m)^\s*FA2_SPEC:\s*(\S+)", worker_image_yml, "worker-image.yml FA2_SPEC"
+        )
     if fa3_spec is None:
         # FA3_SPEC: ${{ github.event.inputs.flash_attn_3_spec || '<default wheel>' }} -> the default.
         fa3_spec = _search(
@@ -163,6 +168,9 @@ def collect_inputs(
         "fa3": fa3_spec,
         "causal_conv1d": causal_conv1d,
         "pip_base": pip_base,
+        # whole-Dockerfile hash catches ANY base change the parsed fields miss (apt/ENV/CMD/cache-dir);
+        # it lives in fp_base, so such a change triggers only the FREE re-layer, never a paid re-warm.
+        "dockerfile_sha256": _sha256_file(root / "Dockerfile.worker"),
         "endpoints_sha256": _sha256_file(
             root / "flash" / "providers" / "runpod" / "train" / "endpoints.py"
         ),

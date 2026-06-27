@@ -29,8 +29,11 @@ permissions:
   actions: read
   issues: write
 
+# Scope the group to the triggering base build's commit so a no-op completion (e.g. a tag=cu128-test
+# worker-image run, whose head_sha differs) can't cancel an in-flight real bake. The revision guard
+# already neutralizes superseded runs, so a global cancel-in-progress isn't needed.
 concurrency:
-  group: auto-rebake
+  group: auto-rebake-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 
 env:

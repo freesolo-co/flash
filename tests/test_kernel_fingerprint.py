@@ -74,6 +74,7 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         "fa3",
         "causal_conv1d",
         "pip_base",
+        "dockerfile_sha256",
         "endpoints_sha256",
         "make_rp_handler_sha256",
     ):
@@ -85,6 +86,17 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     assert sha in cache_inputs["fla"]
     # the cache toolchain must NOT leak into the base pip list (else a liger bump would fire a re-layer)
     assert not any("liger-kernel" in s or "tilelang" in s for s in base_partial["pip_base"])
+
+
+def test_dockerfile_only_change_is_a_free_relayer():
+    """A Dockerfile.worker edit that isn't a parsed pin (apt/ENV/CMD/cache-dir) must move fp_base
+    (a free re-layer) but NOT fp_cache (no paid GPU re-warm). dockerfile_sha256 lives in fp_base."""
+    cache_inputs, base_partial = kf.collect_inputs(ROOT)
+    fc0, fb0, _ = kf.compute_fingerprints(cache_inputs, base_partial)
+    bumped = {**base_partial, "dockerfile_sha256": base_partial["dockerfile_sha256"] + "x"}
+    fc1, fb1, _ = kf.compute_fingerprints(cache_inputs, bumped)
+    assert fc1 == fc0, "a Dockerfile-only change must NOT move fp_cache (no GPU re-warm)"
+    assert fb1 != fb0, "a Dockerfile-only change MUST move fp_base (free re-layer)"
 
 
 def test_fa3_default_is_in_lockstep():
