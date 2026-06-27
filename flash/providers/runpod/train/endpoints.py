@@ -231,6 +231,7 @@ def _train_body(input_data: dict) -> dict:
     import os
     import subprocess
     import sys
+    import threading
 
     from huggingface_hub import snapshot_download
 
@@ -392,13 +393,23 @@ def _train_body(input_data: dict) -> dict:
             print("console upload warn:", up_err)
 
     def run_mode(mode: str, check: bool) -> int:
-        """Run one worker process, tee its console to a file, and upload the tail to HF as
-        console_<mode>.txt on failure — the engine-core root cause of crashes like vLLM
-        EngineDeadError only ever appears on the subprocess console, never in the Python
-        traceback. With FLASH_UPLOAD_CONSOLE=1 (forwarded via build_worker_env) the console
-        is also uploaded on SUCCESS, so an operator can verify which optimizations engaged."""
+        """Run one worker process, tee its console to a file, and ALWAYS upload the tail to HF as
+        console_<mode>.txt — periodically while the worker runs (so `flash status --logs` shows
+        live progress) and once more when it exits. Every worker print reaches the CLI, not just a
+        post-mortem tail on crash: the engine-core root cause of crashes like vLLM EngineDeadError
+        only ever appears on the subprocess console (never in the Python traceback), and on SUCCESS
+        the same stream shows which optimizations engaged (LoRA+/8-bit-AdamW/Liger/PiSSA/rsLoRA/fla/
+        chalk each log engagement or fallback)."""
         console = f"/tmp/console_{mode}.txt"
-        with open(console, "w") as cf:
+        interval = 30.0  # seconds between live console uploads (fixed; flash is fully managed)
+        stop_upload = threading.Event()
+
+        def _upload_loop() -> None:
+            while not stop_upload.wait(interval):
+                _upload_console(mode)  # best-effort; swallows its own errors
+
+        # buffering=1 (line-buffered) so the periodic uploader sees each line as it is written.
+        with open(console, "w", buffering=1) as cf:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "flash.engine.worker"],
                 cwd=code_dir,
@@ -407,18 +418,18 @@ def _train_body(input_data: dict) -> dict:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            for line in proc.stdout:
-                print(line, end="")  # keep streaming to the platform console
-                cf.write(line)
-            proc.wait()
-        # Console is uploaded on FAILURE (crash root-cause). FLASH_UPLOAD_CONSOLE=1 also uploads it
-        # on SUCCESS so an operator can verify which optimizations engaged — LoRA+/8-bit-AdamW/
-        # Liger/PiSSA/rsLoRA/fla/chalk all log their engagement (or fallback) to the console.
-        _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
-            "", "0", "false", "no", "off",
-        )
-        if proc.returncode != 0 or _force_console:
-            _upload_console(mode)
+            uploader = threading.Thread(target=_upload_loop, daemon=True)
+            uploader.start()
+            try:
+                for line in proc.stdout:
+                    print(line, end="")  # keep streaming to the platform console
+                    cf.write(line)
+                proc.wait()
+            finally:
+                stop_upload.set()
+                uploader.join(timeout=10)
+        # Always upload the final tail (success or failure) so the CLI has the complete console.
+        _upload_console(mode)
         if proc.returncode != 0 and check:
             raise RuntimeError(
                 f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
@@ -441,10 +452,9 @@ def _train_body(input_data: dict) -> dict:
     # cause (full traceback in error_<phase>.txt / console_<phase>.txt in the HF repo).
     if not os.path.exists("/tmp/metrics.json"):
         phase = input_data["phase"]
-        # run_mode skips the console upload when the worker exits 0 (and a hard OOM/segfault kill
-        # may have raced it), so force it here — otherwise this exact "crashed before finishing"
-        # failure is undebuggable: no metrics.json, often no error_<phase>.txt, and the message
-        # below points operators at a console_<phase>.txt that was never uploaded.
+        # run_mode already uploaded the final console; re-upload once more in case a hard
+        # OOM/segfault kill raced its in-loop write — this "crashed before finishing" path (no
+        # metrics.json, often no error_<phase>.txt) is otherwise undebuggable.
         _upload_console(phase)
         raise RuntimeError(
             f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
@@ -535,11 +545,11 @@ def _patch_runpod_backoff() -> None:
 def min_cuda_for(friendly_gpu: str) -> str:
     """Minimum host CUDA (driver) version for this GPU class on the active stack.
 
-    Blackwell classes (sm_120 — RTX 5090, RTX Pro 6000): pypi wheels for
-    the modern stack (vllm 0.19) ship no Blackwell SASS, so every custom CUDA kernel
-    is PTX-JIT'd by the driver — and their PTX is built with a newer toolchain than
-    CUDA-12.8-era drivers can JIT (observed: "the provided PTX was compiled with an
-    unsupported toolchain" on driver 570.x). CUDA-13 drivers JIT it fine, so those
+    Blackwell classes (consumer sm_120 — RTX 5090, RTX Pro 6000; datacenter sm_100 —
+    B200): pypi wheels for the modern stack (vllm 0.19) ship no Blackwell SASS, so every
+    custom CUDA kernel is PTX-JIT'd by the driver — and their PTX is built with a newer
+    toolchain than CUDA-12.8-era drivers can JIT (observed: "the provided PTX was compiled
+    with an unsupported toolchain" on driver 570.x). CUDA-13 drivers JIT it fine, so those
     classes are pinned to >=13.0 on the modern stack (per-GPU ``min_cuda_modern`` in
     providers.base.GPU_INFO). Ampere/Ada/Hopper have SASS in the wheels and run on 12.8.
     Fully managed per-GPU (no override).

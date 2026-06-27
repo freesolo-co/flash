@@ -111,6 +111,14 @@ WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 WORKER_IMAGE_TEMPLATE_ENV = "FLASH_WORKER_IMAGE_TEMPLATE"
 WORKER_IMAGE_PER_SM_ENV = "FLASH_WORKER_IMAGE_PER_SM"
 
+# SM arches for which a per-SM kernel-cache image is actually published. MUST mirror the bake
+# matrix default in .github/workflows/bake-kernel-cache.yml. ``worker_image_for_gpu`` only appends a
+# ``-smXX`` suffix for an arch in this set; an arch with no baked image (e.g. B200 / sm100 today)
+# falls back to the base ``WORKER_IMAGE`` so an allocation can't fail at ``docker pull`` on a tag
+# that was never built (it cold-JITs kernels instead — slower first run, but it runs). Add an arch
+# here in lockstep with adding it to the bake workflow.
+BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120"})
+
 
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -150,8 +158,10 @@ def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True
                 sm=info.sm,
                 sm_num=info.sm.removeprefix("sm"),
             )
-        if _truthy(os.environ.get(WORKER_IMAGE_PER_SM_ENV)):
+        if _truthy(os.environ.get(WORKER_IMAGE_PER_SM_ENV)) and info.sm in BAKED_PER_SM_ARCHES:
             return _append_tag_suffix(WORKER_IMAGE, info.sm)
+        # else (PER_SM set but this arch has no baked per-SM image, e.g. B200/sm100): fall through to
+        # the base WORKER_IMAGE rather than selecting a `-smXX` tag `docker pull` would 404 on.
     return WORKER_IMAGE if allow_default else None
 
 
@@ -326,7 +336,7 @@ def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dic
 def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
     """Remove the RunPod weight-cache redirect from an env bound for a NON-RunPod worker (mutates).
 
-    Instance providers (Lambda/Hyperstack) reuse this module's shared ``build_worker_env``, which
+    Instance providers (e.g. Lambda) reuse this module's shared ``build_worker_env``, which
     points ``FLASH_WEIGHT_CACHE_DIR`` at the RunPod network-volume mount (``/runpod-volume``) whenever
     the run carries a weight-cache volume. That mount exists ONLY on RunPod serverless — on a rented
     instance it is a nonexistent path with no cross-run persistence — so the instance submit path
@@ -413,11 +423,6 @@ def build_worker_env(
     for k in (
         "SFT_PER_DEVICE_BS",
         "VLLM_USE_V1",
-        # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
-        # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
-        # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a
-        # control-plane `FLASH_UPLOAD_CONSOLE=1` only reaches run_mode if it's forwarded here.
-        "FLASH_UPLOAD_CONSOLE",
         # The chalk install SOURCE (an exact version / git URL / wheel). Kernel SELECTION is fixed
         # in engine.chalk_kernels (no env flags); this only points install_chalk_kernels at a
         # specific chalk build, and is also consumed at submit time to add chalk to extra_pip.

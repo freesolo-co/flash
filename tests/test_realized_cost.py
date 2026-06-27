@@ -191,7 +191,7 @@ def test_reconcile_run_falls_back_to_created_at_when_started_ts_missing_or_zero(
 
 
 def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(monkeypatch):
-    """A Lambda/Hyperstack run deployed AFTER completion has updated_at moved to the deploy time;
+    """A Lambda run deployed AFTER completion has updated_at moved to the deploy time;
     reconciliation must pass the FROZEN training-teardown (finished_at) as the instance run_end,
     not that later deploy time, or it over-reports COGS (flat $/hr from launch until deployment)."""
     now = 1_000_000.0

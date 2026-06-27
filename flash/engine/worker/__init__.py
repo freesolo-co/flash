@@ -64,6 +64,7 @@ from flash.engine.worker.adapter import (
 )
 from flash.engine.worker.decoding import (
     graded_text,
+    prompt_opens_thinking,
     render_prompt,
     strip_think,
     think_token_count,
@@ -191,10 +192,13 @@ PHASE = os.environ.get(
 # Heartbeat HF-commit throttle knobs (patched by tests; the heartbeat reader in ``heartbeat.py``
 # reads these as ``_w.<name>``). Each heartbeat() commits heartbeat.json to the HF artifact repo;
 # committing every training step blows HuggingFace's per-repo commit rate limit (128/hour), so the
-# per-step "rl_step" stage is throttled to once per _HB_MIN_INTERVAL_S; terminal stages always
-# commit. _HB_TERMINAL_ONLY (benchmark fan-out) throttles every non-terminal stage. The local file
-# + stdout line are always written regardless.
+# per-step "rl_step"/"sft_step" stages are throttled to once per _HB_MIN_INTERVAL_S; terminal stages
+# always commit. _HB_TERMINAL_ONLY (benchmark fan-out) throttles every non-terminal stage. The stdout
+# HEARTBEAT line is always printed regardless — heartbeats are HF-only; there is no worker-local file.
 _HB_LAST_UPLOAD = 0.0
+# Wall-clock of the last REAL (non-liveness) heartbeat — the liveness daemon dumps stacks if this
+# goes stale (the provider stalls off the same signal: it skips liveness pings).
+_HB_LAST_PROGRESS_TS = 0.0
 # The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
 # 128 commits/hour-per-repo limit when concurrent runs share one HF_REPO.
 _HB_MIN_INTERVAL_S = 60.0
@@ -463,10 +467,14 @@ def main():
         raise
 
 
+# A single flat, alphabetically-sorted list (enforced by ruff RUF022). It re-exports the worker's
+# own public names plus the leaf-module symbols pulled in above. We deliberately do NOT carry
+# semantic section headers ("# decoding", "# heartbeat", ...) here: RUF022 sorts the whole list
+# alphabetically, which scatters each semantic group across the alphabet, so any such header ends up
+# mislabeling whatever happens to sort beneath it (and silently rots as names are added/removed).
 __all__ = [
     "ACTIVE_ENV",
     "ATTEMPT",
-    # run-scoped STATE
     "HF_REPO",
     "JOB_SPEC",
     "PHASE",
@@ -474,6 +482,7 @@ __all__ = [
     "RUN_MODE",
     "SEED",
     "THINKING",
+    "_HB_LAST_PROGRESS_TS",
     "_HB_LAST_UPLOAD",
     "_HB_LOCK",
     "_HB_MIN_INTERVAL_S",
@@ -482,14 +491,12 @@ __all__ = [
     "_HB_TERMINAL_STAGES",
     "_HB_THROTTLED_STAGES",
     "_HB_UPLOAD_LOCK",
-    # leaf lora re-exports
     "_LM_SYNC_REMAP_ON",
     "_SFT_HEARTBEAT_INTERVAL_S",
     "_STEP_GPU_DIAG_INTERVAL_S",
     "_VL_EXCLUDE_SEGMENTS",
     "_WANDB_FINISH_FAIL_WAIT_S",
     "_WANDB_FINISH_WAIT_S",
-    # leaf perf re-exports
     "RetriableInfraError",
     "_GpuPeakSampler",
     "_attn_impl_for_capability",
@@ -505,7 +512,6 @@ __all__ = [
     "_init_adapter_model",
     "_latest_checkpoint_dir",
     "_liger_default_for_model",
-    # env + entry + finalize (defined here)
     "_load_active_env",
     "_memory_mode",
     "_metric_curve",
@@ -519,14 +525,11 @@ __all__ = [
     "assert_adapter_delta_nonzero",
     "assert_adapter_load_clean",
     "assert_lora_applied",
-    # grpo batching / no-op guards
     "build_grpo_prompt_dataset",
     "compute_grpo_batching",
     "disable_liger_grpo_torch_compile",
-    # hf artifact channel
     "error_artifact_name",
     "finalize_alloc_conf_for_sleep",
-    # gpu/backend setup
     "force_vllm_backend_for_sm120",
     "free_gpu",
     "fused_optim_name",
@@ -536,7 +539,6 @@ __all__ = [
     "grpo_mask_truncated_completions",
     "grpo_overrides",
     "grpo_sleep_mode",
-    # heartbeat
     "heartbeat",
     "hf_api",
     "hf_prefix",
@@ -549,7 +551,6 @@ __all__ = [
     "loraplus_optimizer_cls",
     "main",
     "make_checkpoint_upload_callback",
-    # lora / adapter
     "make_lora",
     "make_reward_heartbeat_callback",
     "make_sft_heartbeat_callback",
@@ -558,17 +559,16 @@ __all__ = [
     "patch_vllm_language_model_only",
     "patch_vllm_lm_weight_sync",
     "prefetch_model",
+    "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "remap_adapter_keys",
     "remap_vl_adapter_dir",
-    # decoding
     "render_prompt",
     "require_active_env",
     "require_vllm_for_rollout_func",
     "resolve_grpo_prompts_per_step",
     "rl_per_device_comps",
     "run_rl",
-    # training entrypoints
     "run_sft",
     "setup_perf_backends",
     "strip_language_model_infix",
@@ -577,12 +577,10 @@ __all__ = [
     "upload_debug_jsonl",
     "vllm_language_model_only_kwargs",
     "wait_for_gpu",
-    # wandb
     "wandb_finish",
     "wandb_report_to",
     "wandb_run_info",
     "wandb_run_name",
-    # finalize / meta
     "write_train_meta",
 ]
 

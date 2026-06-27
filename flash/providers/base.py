@@ -39,7 +39,7 @@ class GpuClass:
     # card). The deployed control plane REJECTS a submit for a non-validated class ("gpu type 'X'
     # has not passed Flash's live validation smoke"), so client-side allocation restricts to the
     # validated pool by default (see ``validated_classes`` / allocator) — otherwise a default
-    # `flash train` could pick the absolute-cheapest fitting class (e.g. "L4") that the
+    # `flash train` could pick the absolute-cheapest fitting class (e.g. a newly-added, not-yet-validated one) that the
     # server then refuses, and the run never submits. Exactly the smoke-validated members below
     # are marked True.
     validated: bool = False
@@ -48,10 +48,6 @@ class GpuClass:
     # ``lambda_name`` is provisionable on Lambda (capacity permitting), priced from Lambda's own
     # live ``/instance-types`` rate (NOT the RunPod ``hourly_usd`` snapshot above).
     lambda_name: str | None = None
-    # Hyperstack single-GPU flavor name for this class (e.g. "n3-L40x1"); None -> not on Hyperstack.
-    # Same instance-based model as Lambda (cloud-init -> Docker); a class with a ``hyperstack_name``
-    # is provisionable on Hyperstack when its flavor has stock, priced from Hyperstack's static map.
-    hyperstack_name: str | None = None
 
 
 # Static hourly rates are RunPod secure-cloud on-demand snapshots.
@@ -79,35 +75,25 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     # 24 GB is the floor: the sub-24 GB tiers (16 GB RTX A4000 / RTX 2000 Ada, 20 GB RTX A4500 /
     # RTX 4000 Ada) were dropped — the 24 GB classes below are the smallest managed cards.
     # (RTX 3090 was removed from the catalog — see git history.)
-    GpuClass("L4", "NVIDIA_L4", 24, "l4", "sm89", 0.39),
     # Lambda-only 24 GB Ampere datacenter card (RunPod has no A10). Instance-based capacity
-    # complement: chosen by the allocator only when the cheaper RunPod 24 GB classes are out of
-    # capacity, so it never undercuts RunPod on price.
-    GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10"),
+    # complement: the price-sorted allocator only reaches it once every cheaper FITTING RunPod class is
+    # out of capacity — not just the 24 GB tiers but e.g. the $0.49 48 GB RTX A6000 — so it never
+    # undercuts RunPod on price.
+    # Live-validated 2026-06-27: Qwen3.5-0.8B SFT train smoke (Lambda gpu_1x_a10, us-east-1).
+    GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
     # Live-validated 2026-06-22: Qwen3.5-0.8B/9B SFT+GRPO train smokes (RunPod). The 48 GB tier that
     # fills the 32->80 GB gap (e.g. 4B GRPO @ 35 GB) ~55% cheaper than the A100.
     GpuClass(
         "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
         validated=True,
         lambda_name="gpu_1x_a6000",
-        hyperstack_name="n3-RTX-A6000x1",
     ),
-    GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44),
-    GpuClass(
-        "RTX 6000 Ada",
-        "NVIDIA_RTX_6000_ADA_GENERATION",
-        48,
-        "6000ada",
-        "sm89",
-        0.77,
-    ),
-    # L40 48 GB (Ada, sm89): datacenter card on Hyperstack (+ Nebius/DO/Vultr/Scaleway), NOT on
-    # RunPod or Lambda. Hyperstack-only here. hourly_usd is the Hyperstack list price.
-    GpuClass("L40", None, 48, "l40", "sm89", 1.00, hyperstack_name="n3-L40x1"),
     # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
     # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
+    # Live-validated 2026-06-27: Qwen3.5-0.8B SFT train smoke (Lambda gpu_1x_a100_sxm4, us-east-1).
     GpuClass(
-        "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99, lambda_name="gpu_1x_a100_sxm4"
+        "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99,
+        lambda_name="gpu_1x_a100_sxm4", validated=True,
     ),
     # big-VRAM tier (9B bf16 GRPO, future >9B bf16)
     # Validated 2026-06-11: 0.6B SFT smoke (phase6).
@@ -119,7 +105,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm80",
         1.39,
         validated=True,
-        hyperstack_name="n3-A100x1",
     ),
     # Live-validated 2026-06-22: Qwen3.5 0.8B/MiniCPM/2B/9B SFT+GRPO train smokes (RunPod).
     GpuClass(
@@ -131,7 +116,15 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29,
         validated=True,
         lambda_name="gpu_1x_h100_pcie",
-        hyperstack_name="n3-H100x1",
+    ),
+    # H200 (Hopper, sm90, 141 GB HBM3e) — same compute as the H100 with ~1.76x the VRAM. The
+    # mid-tier for big checkpoints whose WEIGHTS dominate but whose compute is small: e.g. the
+    # 35B-A3B MoE SFT (~70 GB resident weights + tiny active-3B compute) fits here, no need for the
+    # 180 GB B200. RunPod-only: Lambda offers only the GH200 (96 GB Grace-Hopper, a different SKU),
+    # and the Hyperstack image isn't wired. Hopper has SASS in the wheels -> CUDA 12.8, FA3 path.
+    GpuClass(
+        "H200", "NVIDIA_H200", 141, "h200", "sm90", 4.39,
+        validated=True,
     ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
@@ -143,9 +136,25 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         2.09,
         min_cuda_modern="13.0",
         validated=True,
-        # NOT mapped to Hyperstack: this Blackwell class needs a CUDA-13 host driver, but Hyperstack
-        # only ships up to CUDA-12.8 (R570) images — it would boot then fail at worker setup. Re-add
-        # ``hyperstack_name="n3-RTX-PRO6000-SEx1"`` once a CUDA-13 Hyperstack image is available.
+    ),
+    # Datacenter Blackwell (sm100, 180 GB HBM3e usable per SXM6 board — NVIDIA advertises 192 GB,
+    # but RunPod and Lambda both list 180 GB usable, so we size to the SAFE 180). The only managed
+    # class big enough for the Qwen3.6 35B-A3B MoE (~70 GB bf16 weights): SFT fits one card and
+    # colocated GRPO (two bf16 copies + KV + 248k-vocab fp32 logits) needs the full 180 GB. Like the
+    # other Blackwell cards it needs a CUDA-13 host driver to JIT the wheels' PTX.
+    # Offered as a SINGLE B200 by RunPod (serverless ``NVIDIA_B200``) and Lambda
+    # (``gpu_1x_b200_sxm6``). NOT on Hyperstack: its only B200 flavor is the 8-GPU node
+    # ``n3-B200-SXM6x8`` (no 1x flavor), so it can't back a single-GPU class.
+    GpuClass(
+        "B200",
+        "NVIDIA_B200",
+        180,
+        "b200",
+        "sm100",
+        5.89,
+        min_cuda_modern="13.0",
+        validated=True,
+        lambda_name="gpu_1x_b200_sxm6",
     ),
 )
 
@@ -183,10 +192,6 @@ _ALIASES.update(
     {
         "nvidia geforce rtx 4090": "RTX 4090",
         "nvidia geforce rtx 5090": "RTX 5090",
-        "nvidia l4": "L4",
-        "nvidia a40": "A40",
-        "nvidia rtx 6000 ada generation": "RTX 6000 Ada",
-        "rtx 6000 ada generation": "RTX 6000 Ada",
         "nvidia a100 80gb pcie": "A100 PCIe",
         "a100 80gb pcie": "A100 PCIe",
         "a100-80g-pcie": "A100 PCIe",
@@ -197,6 +202,10 @@ _ALIASES.update(
         "h100 80gb hbm3": "H100",
         "rtx pro 6000 blackwell": "RTX Pro 6000",
         "nvidia rtx pro 6000 blackwell server edition": "RTX Pro 6000",
+        "nvidia b200": "B200",
+        "b200 sxm6": "B200",
+        "nvidia b200 180gb": "B200",
+        "nvidia b200 sxm6": "B200",
     }
 )
 
@@ -227,8 +236,6 @@ def providers_for(name: str) -> tuple[str, ...]:
         out.append("runpod")
     if info.lambda_name:
         out.append("lambda")
-    if info.hyperstack_name:
-        out.append("hyperstack")
     return tuple(out)
 
 
@@ -407,7 +414,9 @@ class Provider(Protocol):
         ...
 
     def sweep_orphans(
-        self, active_labels: set[str] | Callable[[], set[str]] | None = None
+        self,
+        active_labels: set[str] | Callable[[], set[str]] | None = None,
+        known_labels: set[str] | Callable[[], set[str]] | None = None,
     ) -> list[int | str]:
         """Destroy any billable resource this provider owns that no live run claims.
 
@@ -416,7 +425,18 @@ class Provider(Protocol):
         prefix from them via ``run_label_prefix`` and reaps anything matching none of them. It may
         instead be a CALLABLE returning that set, which the instance providers resolve AFTER listing
         their resources (the periodic in-lifetime sweep passes one to close the launch race — see the
-        instance ``sweep_orphans``). Returns the destroyed resource ids (RunPod uses int ids; the
-        instance providers use opaque string ids). Providers without a standing-billing substrate
-        (RunPod's serverless endpoints self-reap) implement this as a no-op."""
+        instance ``sweep_orphans``).
+
+        ``known_labels`` is the (optional) set of RAW run ids this control plane has ANY record of —
+        the universe of resources it may attribute to itself. When supplied, a resource is reaped
+        ONLY if it maps to a run in this set (and is not in ``active_labels``); a resource whose run
+        id is absent is left alone. This is the multi-plane safety guard: two control planes sharing
+        one provider account each only reap their OWN orphans, so neither executes the other's live
+        instances. ``None`` (the default) preserves the legacy unscoped behavior (reap every unowned
+        ``flash-`` resource), which is correct for the single-control-plane production setup. Like
+        ``active_labels`` it may be a CALLABLE, resolved after listing.
+
+        Returns the destroyed resource ids (RunPod uses int ids; the instance providers use opaque
+        string ids). Providers without a standing-billing substrate (RunPod's serverless endpoints
+        self-reap) implement this as a no-op."""
         ...
