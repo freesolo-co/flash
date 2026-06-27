@@ -166,17 +166,21 @@ MODELS: dict[str, ModelInfo] = {
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
     ),
-    # ---- Qwen3.6 MoE: the single-big-card (B200) tier ----
+    # ---- Qwen3.6 MoE: the big-checkpoint tier (H200 for SFT, B200 for GRPO) ----
     # 35B-A3B is a Mixture-of-Experts checkpoint: ~3B parameters are ACTIVE per token, but all 35B
-    # are materialized on the GPU, so every memory/disk/download term sizes the FULL 35B (~70 GB
-    # bf16). bf16 LoRA, NOT QLoRA — same reason as the 9B: 4-bit rounding diverges the rollout from
-    # the trainer. Both SFT and GRPO fit the 180 GB B200 (Blackwell datacenter), live-validated on a
-    # real B200:
-    #   * SFT loads one ~70 GB bf16 copy + LoRA + activations + the fp32 logits (~90 GB est).
-    #   * GRPO colocates the vLLM rollout; the default sleep-offload recipe keeps only ONE 70 GB
-    #     weight copy resident at a time (~170 GB peak). The MoE rollout weight-sync needed a
-    #     fused-expert name fix (engine.worker.lora._remap_vl_sync_weights passes the multimodal
-    #     ``model.language_model.*`` names through to vLLM's own mapper instead of double-prefixing).
+    # are materialized on the GPU, so the MEMORY/disk/download terms size the FULL 35B (~70 GB bf16)
+    # while the COMPUTE terms (activations, KV pool, rank-linear LoRA) size the ~3B active backbone
+    # (engine.vram is MoE-aware via active_params_b). bf16 LoRA, NOT QLoRA — same reason as the 9B.
+    # Because the resident weights dominate and the active compute is tiny, the GPU tier is set by
+    # how many weight copies each algorithm holds, NOT by context length:
+    #   * SFT — ONE ~70 GB copy + small active-compute (~82 GB peak, ~flat in context) -> fits the
+    #     141 GB H200 with wide margin (context ~unbounded by VRAM). Live-validated on a B200; the
+    #     H200 down-tier is the MoE-aware win (cheaper, plentiful stock).
+    #   * GRPO — colocates the vLLM rollout, so TWO ~70 GB copies (trainer + engine) are resident at
+    #     the rollout peak (~167 GB) -> needs the 180 GB B200; the H200 can't hold both. The MoE
+    #     rollout weight-sync needed a fused-expert name fix (engine.worker.lora._remap_vl_sync_weights
+    #     passes the multimodal ``model.language_model.*`` names through to vLLM's own mapper). Both
+    #     single- and multi-turn GRPO live-validated on a B200.
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
         display_name="Qwen3.6 35B-A3B (MoE)",
@@ -194,21 +198,24 @@ MODELS: dict[str, ModelInfo] = {
         active_params_b=3.0,
         vocab_size=248_320,
         algos=("sft", "grpo"),
-        min_vram_gb=180,
-        # Hard SFT floor: the raw ~90 GB SFT estimate would otherwise let the allocator pick the 96 GB
-        # RTX Pro 6000 — too thin a margin over the 70 GB frozen base for a 35B MoE — so pin this big
-        # checkpoint to the 180 GB B200. (GRPO's ~170 GB estimate already lands on the B200 on its own.)
-        sft_min_vram_gb=180,
+        min_vram_gb=141,
+        # Hard SFT floor: with MoE-aware sizing the SFT estimate is ~82 GB (the 70 GB resident weights
+        # dominate; the active-3B activations/KV are tiny), which would otherwise down-route to the
+        # 96 GB RTX Pro 6000 (consumer Blackwell, thin margin over the 70 GB base) or the 80 GB H100
+        # (too tight). Floor to 100 GB so SFT lands on the 141 GB H200 — a datacenter card with wide
+        # margin, ~$1.50/hr cheaper than the B200 and not needed here. (GRPO's ~167 GB two-copy
+        # estimate already routes itself to the B200; H200 can't hold the trainer + vLLM rollout.)
+        sft_min_vram_gb=100,
         quant="bf16",
-        recommended_gpu="B200",
+        recommended_gpu="H200",
         thinking="hybrid",
         # ~70 GB bf16 checkpoint. Peak disk = HF download (~70 GB) + Xet temp (~70 GB) + per-step
-        # deployable-checkpoint saves; floor to 200 GB so a B200 rent doesn't hit "No space left on
+        # deployable-checkpoint saves; floor to 200 GB so the rent doesn't hit "No space left on
         # device" (the runner raises gpu.disk_gb to this out of the box).
         min_disk_gb=200,
-        notes="MoE (35B total / ~3B active), bf16 LoRA. The only catalog model that needs the 180 GB "
-        "B200: SFT loads one ~70 GB bf16 copy; colocated GRPO fits via sleep-offload (~170 GB peak) "
-        "with the fused-MoE-expert weight-sync fix.",
+        notes="MoE (35B total / ~3B active), bf16 LoRA. SFT runs on the 141 GB H200 (the ~70 GB "
+        "weights dominate; active-3B compute keeps activations/KV tiny, so context is ~unbounded by "
+        "VRAM); colocated GRPO needs the 180 GB B200 (trainer + vLLM rollout = two 70 GB copies).",
     ),
 }
 

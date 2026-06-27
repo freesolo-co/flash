@@ -297,10 +297,14 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
 
     validated = [g.vram_gb for g in GPU_INFO.values() if getattr(g, "validated", False)]
 
-    def honest_peak(pb, seq, vocab, quant, rank, bs):
+    def honest_peak(pb, seq, vocab, quant, rank, bs, active_b=None):
+        # MoE: the activations + rank-linear LoRA optimizer scale with the ACTIVE backbone width
+        # (a token routes through ~active_b params), while the resident ``weights`` term stays on the
+        # full ``pb``. Mirrors engine.vram.estimate_vram_gb's eff_b. Dense -> active_b == pb.
         bpp = vram._BYTES_PER_PARAM.get(quant, 2.0)
-        width = math.sqrt(max(pb, 0.1))
-        base = pb * bpp + vram._BASE_OVERHEAD_GB + (rank / 16.0) * (0.3 + 0.04 * pb)
+        eff = float(active_b) if active_b else pb
+        width = math.sqrt(max(eff, 0.1))
+        base = pb * bpp + vram._BASE_OVERHEAD_GB + (rank / 16.0) * (0.3 + 0.04 * eff)
         fused = sft_logits_fused(pb, seq)
         pd = sft_per_device(bs, seq_len=seq, vocab=vocab, fused=fused)
         act = vram._ACT_COEF * pd * (seq / 1024.0) * width
@@ -311,26 +315,20 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
         if "sft" not in info.algos:
             continue
         pb = info.params_b or params_b_from_str(info.params) or 0.0
+        active_b = float(getattr(info, "active_params_b", 0.0) or 0.0)
         vocab, quant = vocab_size_for(mid), getattr(info, "quant", "bf16") or "bf16"
         for seq in (512, 1024, 1536, 2047, 2048, 4096, 32768):
             for bs in (1, 4, 8, 32):
                 for rank in (8, 32, 128):
                     tr = {"max_length": seq, "batch_size": bs, "lora_rank": rank}
                     need = required_vram_gb(mid, "sft", train=tr)
-                    peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs) * 1.1)
+                    peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs, active_b) * 1.1)
                     # The conservative estimate must always cover the honest peak (universal).
                     assert need >= peak, (mid, seq, bs, rank, need, peak)
-                    if any(gb >= need for gb in validated):
-                        continue
-                    # Too big for ANY single validated card. Only the 35B-A3B MoE hits this, and
-                    # only at the extreme 32k context (its 70 GB frozen base + 32k activations
-                    # exceed the 180 GB B200). The allocator must REJECT it cleanly at submit
-                    # (cheapest_gpu raises), never silently mis-place onto a too-small card.
-                    from flash.providers.base import UnsupportedGpuError, cheapest_gpu
-
-                    assert mid == "Qwen/Qwen3.6-35B-A3B", (mid, seq, bs, rank, need)
-                    with pytest.raises(UnsupportedGpuError):
-                        cheapest_gpu(need)
+                    # Every catalog SFT model must fit some validated card at every (seq,bs,rank).
+                    # The 35B-A3B MoE included: with MoE-aware sizing its SFT is ~82 GB flat (active-3B
+                    # activations/KV are tiny, so even 32k context fits), landing on the 141 GB H200.
+                    assert any(gb >= need for gb in validated), (mid, seq, bs, rank, need)
 
 
 # ---------------------------------------------------------------------------

@@ -133,6 +133,15 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         lambda_name="gpu_1x_h100_pcie",
         hyperstack_name="n3-H100x1",
     ),
+    # H200 (Hopper, sm90, 141 GB HBM3e) — same compute as the H100 with ~1.76x the VRAM. The
+    # mid-tier for big checkpoints whose WEIGHTS dominate but whose compute is small: e.g. the
+    # 35B-A3B MoE SFT (~70 GB resident weights + tiny active-3B compute) fits here, no need for the
+    # 180 GB B200. RunPod-only: Lambda offers only the GH200 (96 GB Grace-Hopper, a different SKU),
+    # and the Hyperstack image isn't wired. Hopper has SASS in the wheels -> CUDA 12.8, FA3 path.
+    GpuClass(
+        "H200", "NVIDIA_H200", 141, "h200", "sm90", 4.39,
+        validated=True,
+    ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
         "RTX Pro 6000",
