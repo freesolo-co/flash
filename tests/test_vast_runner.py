@@ -95,6 +95,23 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
     assert "torch==" not in script
 
 
+def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch):
+    """Copilot MsGxp/MsGxy: the heredoc terminators must start on their own line (a bootstrap
+    source without a trailing newline would otherwise swallow the rest of the script), and the
+    python-interpreter resolution must fall back past python3 to python with a clear diagnostic."""
+    from flash.providers.vast.jobs import builders
+
+    monkeypatch.setenv("VAST_API_KEY", "vk")
+    monkeypatch.setenv("HF_TOKEN", "hf")
+    script = builders.build_onstart(builders.build_payload(_spec(), seed=0, attempt=1))
+    # Each closing terminator is preceded by a newline (own line), regardless of payload/src content.
+    for term in ("FLASH_PAYLOAD_EOF", "FLASH_BOOTSTRAP_EOF"):
+        assert f"\n{term}\n" in script, f"{term} terminator must be on its own line"
+    # PYBIN never silently empty: python fallback + a diagnostic when nothing resolves.
+    assert "command -v python3 || command -v python" in script
+    assert "no python interpreter" in script
+
+
 def test_build_payload_sets_vast_arm():
     """build_payload stamps flash_arm='vast' so the metrics record attributes the substrate, and the
     shared bootstrap turns it into FLASH_ARM."""
