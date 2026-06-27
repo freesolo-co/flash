@@ -745,6 +745,18 @@ def _best_effort_destroy(instance_id, *, context: str) -> bool:
     return ok
 
 
+def _coerce_instance_id(raw) -> int | None:
+    """Best-effort ``int()`` for a Vast instance id from a ``list_instances()`` payload: the int, or
+    ``None`` for a missing / non-intable id (unexpected API shape / partial response). The best-effort
+    cleanup loops (``destroy_run_instances`` / ``sweep_orphans``, both documented "never raises") use
+    this to SKIP a bad id instead of letting a bare ``int(iid)`` raise and abort the whole loop —
+    leaving the remaining reapable instances billing (Copilot)."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def cancel(remote: dict) -> None:
     """Cross-process cancel: destroy the persisted instance (stops billing)."""
     instance_id = remote.get("instance_id")
@@ -767,7 +779,7 @@ def destroy_run_instances(run_id: str) -> list[int]:
         return destroyed
     prefix = run_label_prefix(run_id)
     for inst in instances:
-        iid = inst.get("id")
+        iid = _coerce_instance_id(inst.get("id"))  # skip a non-intable id, don't abort the loop
         label = str(inst.get("label") or "")
         # Match on the label boundary, not a raw string prefix: a label is
         # ``f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"``, so a run's prefix must equal the label
@@ -775,9 +787,9 @@ def destroy_run_instances(run_id: str) -> list[int]:
         if (
             iid
             and (label == prefix or label.startswith(prefix + "-s"))
-            and vast_api.destroy_instance(int(iid))
+            and vast_api.destroy_instance(iid)
         ):
-            destroyed.append(int(iid))
+            destroyed.append(iid)
     return destroyed
 
 
@@ -831,8 +843,8 @@ def sweep_orphans(
         # Multi-plane guard: with a known set, only reap boxes attributable to one of THIS plane's runs.
         if known_prefixes is not None and not _matches(known_prefixes, label):
             continue
-        iid = inst.get("id")
-        if iid and vast_api.destroy_instance(int(iid)):
-            destroyed.append(int(iid))
+        iid = _coerce_instance_id(inst.get("id"))  # skip a non-intable id, don't abort the sweep
+        if iid and vast_api.destroy_instance(iid):
+            destroyed.append(iid)
             logger.warning("destroyed orphaned vast instance %s (label %s)", iid, label)
     return destroyed

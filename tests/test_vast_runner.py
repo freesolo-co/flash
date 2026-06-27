@@ -866,7 +866,30 @@ def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
     assert destroyed == [1]
 
 
-def test_sweep_orphans_label_safety_and_active_protection(monkeypatch):
+def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
+    """Copilot Mtnjw/Mtnj2: destroy_run_instances and sweep_orphans are documented "never raises", but
+    a bare int(iid) on a non-intable id (unexpected Vast API shape) would raise mid-loop and abort the
+    cleanup, leaving the remaining reapable boxes billing. A bad id must be SKIPPED, the GOOD ones still
+    destroyed."""
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    instances = [
+        {"id": None, "label": "flash-run1-s0-a0"},  # missing id -> skip
+        {"id": "not-an-int", "label": "flash-run1-s1-a0"},  # non-intable -> skip, must NOT raise
+        {"id": 7, "label": "flash-run1-s2-a0"},  # good -> destroyed
+    ]
+    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    destroyed = []
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+
+    assert vast.destroy_run_instances("run1") == [7]  # bad ids skipped, good one reaped, no raise
+    assert destroyed == [7]
+
+    # sweep_orphans walks the same list (no active/known protection here) and must behave the same.
+    destroyed.clear()
+    assert vast.sweep_orphans(active_labels=set()) == [7]
+    assert destroyed == [7]
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
