@@ -102,3 +102,41 @@ def test_usable_offers_exclude_machines(monkeypatch):
     rows = [_offer(id=1, machine_id=7, dph_total=0.25), _offer(id=2, machine_id=8, dph_total=0.30)]
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: rows)
     assert [o.offer_id for o in vast.usable_offers(24, 60, exclude_machine_ids={7})] == [2]
+
+
+def test_usable_offers_search_page_spans_all_classes(monkeypatch):
+    # Codex Mr5nO: the price-sorted search page must be wide enough to span EVERY managed class
+    # (callers bucket by class); the old limit=64 let a flood of one cheap class hide a larger fitting
+    # class with usable offers just past the page.
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_search(min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, limit=64, extra_q=None):
+        captured["limit"] = limit
+        return []
+
+    monkeypatch.setattr(vast_api, "search_offers", fake_search)
+    vast.usable_offers(24, disk_gb=60)
+    assert captured["limit"] >= 256  # wide default page (was 64)
+    vast.usable_offers(24, disk_gb=60, limit=512)
+    assert captured["limit"] == 512  # explicit override honored
+
+
+def test_live_rates_gates_on_min_disk(monkeypatch):
+    # Codex Mr4re: live pricing must gate on MIN_DISK_GB (what create() enforces), not disk_gb=0 —
+    # otherwise it prices off "cheapest" offers that aren't actually provisionable.
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast import pricing
+
+    captured = {}
+
+    def fake_usable(min_vram_gb, disk_gb, *a, **k):
+        captured["disk_gb"] = disk_gb
+        return []
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    pricing.live_rates(refresh=True)
+    assert captured["disk_gb"] == vast.MIN_DISK_GB

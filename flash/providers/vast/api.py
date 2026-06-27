@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from flash.providers._http import RestClient
+from flash.providers._http import RestClient, is_not_found
 
 VAST_BASE = "https://console.vast.ai/api"
 
@@ -154,7 +154,9 @@ def get_instance(instance_id: int) -> dict | None:
     try:
         out = request_with_retries(f"/v0/instances/{int(instance_id)}/")
     except VastApiError as e:
-        if "404" in str(e):
+        # Status-CODE-authoritative (the chained HTTPError), NOT a bare "404" substring: a non-404
+        # 4xx whose body embeds an id like "4040" must not be misread as a disappearance/preemption.
+        if is_not_found(e):
             return None
         raise
     if isinstance(out, dict):

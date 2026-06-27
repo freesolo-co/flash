@@ -103,16 +103,25 @@ def usable_offers(
     min_vram_gb: int,
     disk_gb: float,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+    limit: int = 256,
 ) -> list[VastOffer]:
     """Verified-datacenter offers able to run the job, cheapest first.
 
     Server-side filters do the heavy lifting; everything load-bearing is re-checked client-side (belt
     and suspenders — the result rows carry the proof fields).
+
+    ``limit`` is the price-sorted search page size. Callers bucket the rows BY GPU CLASS (cheapest per
+    class for the allocator / pricing), so the page must be wide enough to span EVERY fitting managed
+    class — at the old 64 a flood of cheap offers from one class could fill the page and silently hide
+    a larger fitting class that has usable offers just past the limit. 256 comfortably covers the
+    verified-datacenter market across the managed GPU classes; a specific-class caller still filters
+    down client-side (a wider page only gives it more candidates).
     """
     rows = vast_api.search_offers(
         int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
+        limit=int(limit),
     )
     out: list[VastOffer] = []
     for r in rows:
@@ -473,7 +482,11 @@ def poll_vast_job(
             # which must not arm the tighter training window before this attempt overwrites the file.
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
             if fresh:
-                last_progress = hb_ts
+                # MONOTONIC: never let the progress clock regress. An older heartbeat.json upload can
+                # land AFTER a newer one was already credited (object-store eventual consistency), and a
+                # backwards step would make the setup/training stall timer fire early and tear down a
+                # healthy instance under the tight STALL_AFTER_S window.
+                last_progress = max(last_progress, hb_ts)
                 seen_fresh_hb = True
                 # Tighten setup_grace -> stall window only once setup is genuinely OVER; the shared
                 # helper keeps cold-start pings (incl. the silent step=0 first rollout) under setup

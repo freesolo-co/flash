@@ -167,6 +167,18 @@ def test_get_instance_none_on_404(monkeypatch):
     assert vast_api.get_instance(777) is None
 
 
+def test_get_instance_reraises_non_404_with_404ish_body(monkeypatch):
+    # Codex Mr4sO: a non-404 4xx whose body embeds an id like "4040" must NOT be misread as a
+    # disappearance/preemption. get_instance keys off the chained HTTPError status (is_not_found),
+    # not a bare "404" substring, so this raises instead of returning None.
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [_http_error(400, b'{"error":"bad request for instance 4040"}')])
+    with pytest.raises(vast_api.VastApiError):
+        vast_api.get_instance(4040)
+
+
 def test_destroy_instance_never_raises(monkeypatch):
     from flash.providers.vast import api as vast_api
 

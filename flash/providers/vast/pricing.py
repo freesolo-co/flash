@@ -32,10 +32,13 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
     if not os.environ.get("VAST_API_KEY"):
         return static
     try:
-        from flash.providers.vast.jobs import usable_offers
+        from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
 
         rates: dict[str, float] = {}
-        for offer in usable_offers(0, 0):  # offers are price-sorted, cheapest first
+        # Gate on MIN_DISK_GB (what create() enforces): disk_gb=0 would disable disk filtering and
+        # price the run off "cheapest" offers that aren't actually provisionable, making live pricing
+        # optimistic and inconsistent with the allocator/submit paths (both pass MIN_DISK_GB).
+        for offer in usable_offers(0, MIN_DISK_GB):  # offers are price-sorted, cheapest first
             rates.setdefault(offer.gpu, offer.dph_total)
         return {**static, **rates}
     except Exception as exc:
