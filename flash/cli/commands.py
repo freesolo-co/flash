@@ -611,7 +611,9 @@ def cmd_export(args) -> int:
         private=not args.public,
     )
     if render.styled():
-        print(render.exported(result))
+        # the control-plane result carries no `private` key, so reflect the privacy we requested
+        # (the server applies exactly this) rather than mislabeling a private export as public.
+        print(render.exported({**result, "private": not args.public}))
     else:
         print(json.dumps(result, indent=2))
     url = result.get("url", args.repository)

@@ -174,6 +174,61 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     assert "{" not in exp
 
 
+def test_cancel_noop_on_terminal_run_is_not_a_false_confirmation(monkeypatch) -> None:
+    """`flash cancel` against an already-terminal run is a server-side no-op that returns the
+    unchanged state. The themed card must not flash a green "cancel requested" for that case —
+    only a real transition to `cancelled` earns the confirmation; otherwise it stays honest."""
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    # a genuine cancel transition keeps the green confirmation
+    live = render.cancelled({"run_id": "flash-1", "state": "cancelled"})
+    assert "cancel requested for flash-1" in live
+    # a no-op against a finished run: no false confirmation, just an honest "already done" + badge
+    noop = render.cancelled({"run_id": "flash-1", "state": "done"})
+    assert "cancel requested" not in noop
+    assert "already done" in noop
+    assert "done" in noop  # the real terminal state is still surfaced via the badge
+
+
+def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
+    """The control-plane export result carries no `private` field, so the styled card must read the
+    privacy from the request (exports are private unless `--public`) instead of always saying
+    `public` — otherwise a private adapter is misreported as world-readable."""
+    import argparse
+
+    import flash.client.runtime_secrets as runtime_secrets
+
+    class _ExportClient:
+        def export(self, adapter_id, *, repository, hf_token, step, private):
+            # mirror the real server response shape, which has NO `private` key
+            return {
+                "run_id": adapter_id,
+                "adapter_id": adapter_id,
+                "repository": repository,
+                "url": f"https://huggingface.co/{repository}",
+                "source": "src:adapter",
+            }
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(runtime_secrets, "resolve_hf_token", lambda *a, **k: "hf_x")
+    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _ExportClient())
+
+    # default export (no --public) is private; the card must say so, not "public"
+    args = argparse.Namespace(
+        adapter_id="flash-1", repository="acme/x", step=None, public=False, api_key=None
+    )
+    assert cli.commands.cmd_export(args) == 0
+    out = capsys.readouterr().out
+    assert "private" in out
+    assert "public" not in out
+
+    # an explicit --public export is reported as public
+    args.public = True
+    assert cli.commands.cmd_export(args) == 0
+    assert "public" in capsys.readouterr().out
+
+
 def test_error_path_themed_on_tty_plain_on_machine(monkeypatch, capsys) -> None:
     """main()'s catch-all error is the red ✗ idiom on a styled terminal, but stays the plain
     `error: {exc}` prefix on the machine path (what scripts and test_cli_errors.py match on)."""

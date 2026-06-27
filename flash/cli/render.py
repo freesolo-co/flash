@@ -547,11 +547,16 @@ def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
 
 
 def cancelled(payload: dict) -> str:
-    """`flash cancel`: the run id + a state badge (cancelled, or cancelling while it winds down)."""
+    """`flash cancel`: a green confirmation only when the run actually flips to `cancelled`. A
+    no-op cancel of an already-terminal run (done/failed/dry_run) shows a neutral "already ..."
+    line instead, so a finished or failed run is never dressed up as a fresh cancellation."""
+    state = payload.get("state", "cancelled")
     rid = _paint(payload.get("run_id", ""), _ACCENT2)
-    return _safe(
-        f"{ok(f'cancel requested for {rid}')}\n  {badge(payload.get('state', 'cancelled'))}"
-    )
+    if state == "cancelled":
+        head = ok(f"cancel requested for {rid}")
+    else:
+        head = note(f"{payload.get('run_id', '')} already {state} — nothing to cancel")
+    return _safe(f"{head}\n  {badge(state)}")
 
 
 def deployed(dep: dict) -> str:
