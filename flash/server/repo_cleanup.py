@@ -322,16 +322,22 @@ def classify(view: RepoView, deployed: set[str], cfg: Config, now: datetime) -> 
             for folder in view._artifact_folders(CODE_PATH)
         )
     if cfg.checkpoints and age >= cfg.trim_age_days * 86400:
-        if view.has_final_adapter():
-            # Trim the plural DEPLOYABLE checkpoint snapshots only when a FINAL adapter remains to
-            # serve — a checkpoint-only repo's checkpoints ARE its sole servable content.
-            actions.extend(
-                Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "intermediate checkpoints (final adapter kept)")
-                for folder in view._artifact_folders(CHECKPOINTS_PATH)
-            )
-        # The singular full-trainer resume checkpoint is never servable (it exists only to resume a
-        # preempted run), so an old terminal run never needs it — trim it regardless of the final
-        # adapter. It's typically the largest reclaim of all.
+        # Trim a prefix's plural DEPLOYABLE checkpoint snapshots only when THAT prefix has its own
+        # complete final ``adapter/`` to keep serving. A repo can mix prefixes (multi-seed): seed0
+        # may have a final adapter while seed1 only has deployable checkpoint adapters — a repo-wide
+        # gate would wrongly strip seed1's only servable content. Match each ``<prefix>/checkpoints``
+        # against ``<prefix>/adapter``.
+        deployable = set(view.deployable_adapter_folders())
+        for cp in view._artifact_folders(CHECKPOINTS_PATH):
+            prefix = cp.rsplit("/", 1)[0] if "/" in cp else ""
+            final_adapter = f"{prefix}/{ADAPTER_PATH}" if prefix else ADAPTER_PATH
+            if final_adapter in deployable:
+                actions.append(Action(view.repo_id, "delete_folder", cp, view.bytes_in(cp), "intermediate checkpoints (final adapter kept)"))
+    if cfg.checkpoints and age >= cfg.delete_age_days * 86400:
+        # The singular full-trainer resume checkpoint is what ``hf_resume_checkpoint`` re-downloads
+        # for a REPLACEMENT worker after preemption. A retry/recovery can be delayed well past
+        # ``--trim-age-days`` (e.g. waiting for capacity), so — like the shared code snapshot — only
+        # purge it once the repo is delete-age old (provably abandoned, no retry can still be pending).
         actions.extend(
             Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "resume checkpoint (full trainer state)")
             for folder in view._artifact_folders(RESUME_CHECKPOINT_PATH)
@@ -350,18 +356,15 @@ def build_plan(views: list[RepoView], deployed: set[str], cfg: Config, now: date
     return plan
 
 
-def apply_plan(api, plan: Plan, *, dry_run: bool, sleep: float, refresh_live=None, live_ttl: float = 30.0) -> list[dict]:
+def apply_plan(api, plan: Plan, *, dry_run: bool, sleep: float, refresh_live=None) -> list[dict]:
     """Execute (or, when ``dry_run``, only record) every action. Returns a manifest of results.
 
     ``refresh_live`` (used only for destructive tiers) returns the current ``(deployed_ids,
-    complete)``; it is consulted JUST BEFORE each mutation — TTL-cached so serving isn't hammered —
-    so a repo deployed mid-apply (after the pre-apply sample but before its own action runs, which
-    can be many seconds later with ``--sleep`` and a long plan) is skipped instead of deleted. If
-    that re-check can't be confirmed, the action is skipped to stay safe rather than risk a live
-    repo."""
+    complete)``; it is consulted JUST BEFORE EVERY mutation so a repo deployed mid-apply — at any
+    instant after the pre-apply sample — is skipped instead of deleted. If the re-check fails or is
+    incomplete, the action is skipped to stay safe rather than risk a live repo."""
     manifest: list[dict] = []
     live: set[str] = set()
-    live_fetched_at: float | None = None
     for action in plan.actions:
         record = {
             "repo_id": action.repo_id,
@@ -375,27 +378,23 @@ def apply_plan(api, plan: Plan, *, dry_run: bool, sleep: float, refresh_live=Non
             manifest.append(record)
             continue
         if refresh_live is not None:
-            now_t = time.monotonic()
-            if live_fetched_at is None or now_t - live_fetched_at >= live_ttl:
-                try:
-                    live, live_complete = refresh_live()
-                except Exception as exc:
-                    # Don't retain the stale cache — force a re-fetch on the next action (and skip
-                    # again if serving stays down) rather than deleting against an old keep-set.
-                    live_fetched_at = None
-                    record["skipped"] = f"live re-check failed ({exc}); skipped to stay safe"
-                    logger.warning("skipping %s %s: live re-check failed: %s", action.kind, action.repo_id, exc)
-                    manifest.append(record)
-                    continue
-                if not live_complete:
-                    # An unmappable live record means an unidentifiable live repo could be the one
-                    # we're about to delete. Fail closed: skip, and don't cache the incomplete set.
-                    live_fetched_at = None
-                    record["skipped"] = "live set incomplete on re-check (a record lacked a repo id); skipped to stay safe"
-                    logger.warning("skipping %s %s: live set incomplete on re-check", action.kind, action.repo_id)
-                    manifest.append(record)
-                    continue
-                live_fetched_at = now_t  # cache only a successful, COMPLETE fetch
+            # Re-fetch the live set for EVERY destructive action (no caching): a repo can be deployed
+            # at any instant during apply, so the only fully-safe check is immediately before each
+            # mutation. Mutations are already paced by ``--sleep`` and the read is lightweight.
+            try:
+                live, live_complete = refresh_live()
+            except Exception as exc:
+                record["skipped"] = f"live re-check failed ({exc}); skipped to stay safe"
+                logger.warning("skipping %s %s: live re-check failed: %s", action.kind, action.repo_id, exc)
+                manifest.append(record)
+                continue
+            if not live_complete:
+                # An unmappable live record means an unidentifiable live repo could be the one we're
+                # about to delete. Fail closed: skip.
+                record["skipped"] = "live set incomplete on re-check (a record lacked a repo id); skipped to stay safe"
+                logger.warning("skipping %s %s: live set incomplete on re-check", action.kind, action.repo_id)
+                manifest.append(record)
+                continue
             if action.repo_id in live:
                 record["skipped"] = "repo became deployed during apply"
                 logger.warning("skipping %s %s: repo became deployed during apply", action.kind, action.repo_id)
