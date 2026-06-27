@@ -498,3 +498,69 @@ def test_main_rejects_negative_retention_windows(capsys):
     assert "--delete-age-days must be >= 0" in capsys.readouterr().err
     assert rc.main(["--checkpoints", "--trim-age-days", "-5"]) == 2
     assert "--trim-age-days must be >= 0" in capsys.readouterr().err
+
+
+# ---- T2 also trims the singular resume checkpoint; per-action live re-check --------------------
+
+# A successful run that also left the full-trainer resume checkpoint under the singular path.
+SUCCEEDED_WITH_RESUME = [
+    *SUCCEEDED,
+    ("checkpoint/checkpoint-5/optimizer.pt", 80_000_000),
+    ("checkpoint/checkpoint-5/adapter_model.safetensors", 50_000_000),
+]
+
+
+def test_checkpoint_trim_also_removes_singular_resume_checkpoint():
+    v = _view(f"{NS}/flashrun-rs", _days_ago(30), SUCCEEDED_WITH_RESUME)
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=False, checkpoints=True), now=NOW)
+    paths = {(a.kind, a.path) for a in actions}
+    assert ("delete_folder", rc.CHECKPOINTS_PATH) in paths  # plural deployable snapshots
+    assert ("delete_folder", rc.RESUME_CHECKPOINT_PATH) in paths  # singular resume state
+    assert ("delete_folder", rc.ADAPTER_PATH) not in paths  # final adapter kept
+
+
+def test_resume_checkpoint_trimmed_even_without_final_adapter():
+    # The singular resume checkpoint is never servable, so trim it even for a checkpoint-only repo.
+    files = [*CHECKPOINT_ONLY, ("rl/flash-9-ck/seed0/checkpoint/checkpoint-3/optimizer.pt", 80_000_000)]
+    v = _view(f"{NS}/flashrun-rs2", _days_ago(30), files)
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=False, checkpoints=True), now=NOW)
+    paths = {(a.kind, a.path) for a in actions}
+    assert ("delete_folder", "rl/flash-9-ck/seed0/checkpoint") in paths  # resume state trimmed
+    # the deployable plural checkpoints are NOT trimmed (no final adapter to fall back to)
+    assert not any(a.path and a.path.endswith("checkpoints") for a in actions)
+
+
+def test_apply_per_action_recheck_skips_repo_deployed_mid_apply(monkeypatch):
+    # A repo not deployed at the pre-apply sample but deployed by the time its action runs must be
+    # skipped (per-action just-in-time re-check), not deleted.
+    api = FakeApi({
+        f"{NS}/flashrun-f": (_days_ago(90), FAILED),   # → delete_repo
+        f"{NS}/flashrun-d": (_days_ago(90), SUCCEEDED),  # → checkpoint trim + code purge
+    })
+    calls = {"n": 0}
+
+    def fake_deployed():
+        calls["n"] += 1
+        # samples 1 (initial) and 2 (pre-apply bulk) see nothing; from the per-action re-check on,
+        # flashrun-f is live.
+        return (set(), True) if calls["n"] <= 2 else ({f"{NS}/flashrun-f"}, True)
+
+    monkeypatch.setattr(rc, "deployed_repo_ids", fake_deployed)
+    rc.run(_cfg(code=True, checkpoints=True, repos=True), dry_run=False, sleep=0, api=api)
+    assert api.deleted_repos == []  # flashrun-f was skipped by the per-action re-check
+    assert all(r != f"{NS}/flashrun-f" for r, _ in api.deleted_folders)
+
+
+def test_apply_per_action_recheck_failure_skips_to_stay_safe(monkeypatch):
+    api = FakeApi({f"{NS}/flashrun-f": (_days_ago(90), FAILED)})
+    calls = {"n": 0}
+
+    def fake_deployed():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return (set(), True)  # initial + pre-apply bulk succeed
+        raise RuntimeError("serving down mid-apply")  # per-action re-check fails
+
+    monkeypatch.setattr(rc, "deployed_repo_ids", fake_deployed)
+    rc.run(_cfg(repos=True), dry_run=False, sleep=0, api=api)
+    assert api.deleted_repos == []  # skipped to stay safe, not deleted
