@@ -604,14 +604,24 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
         return bytes(h)
 
     name_len = 400 * 1024 * 1024
-    raw = bytearray()
-    raw += header("././@LongLink", name_len, "L")
-    raw += b"A" * name_len + b"\0" * ((512 - name_len % 512) % 512)
-    raw += header("repo/environment.py", 1, "0") + b"x" + b"\0" * 511
-    raw += b"\0" * 1024
+    longlink = header("././@LongLink", name_len, "L")
+    pad = b"\0" * ((512 - name_len % 512) % 512)
+    tail = header("repo/environment.py", 1, "0") + b"x" + b"\0" * 511 + b"\0" * 1024
     buf = io.BytesIO()
+    # Stream the 400 MB LONGNAME payload into gzip in fixed-size chunks instead of building it in
+    # RAM twice (once as b"A"*name_len, once via bytes(raw)) — that peaks ~1 GB and can OOM CI. The
+    # construction here also runs BEFORE tracemalloc.start() below, so it's pure setup overhead the
+    # peak-memory assertion never covers. Chunked writes feed one zlib stream, so output is identical.
+    block = b"A" * min(name_len, 1 << 20)
     with gzip.GzipFile(fileobj=buf, mode="wb") as g:
-        g.write(bytes(raw))
+        g.write(longlink)
+        remaining = name_len
+        while remaining > 0:
+            n = min(remaining, len(block))
+            g.write(block if n == len(block) else block[:n])
+            remaining -= n
+        g.write(pad)
+        g.write(tail)
     bomb = buf.getvalue()
     assert len(bomb) < 2 * 1024 * 1024
 
