@@ -13,10 +13,10 @@ import re
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.lora import (
+    adapter_is_vl_warmstart,
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
-    is_vl_checkpoint,
 )
 from flash.engine.worker.perf import optimal_attn_impl
 
@@ -111,7 +111,7 @@ def _init_adapter_model(model_id: str):
     _attn = optimal_attn_impl()
     attn_kw = {"attn_implementation": _attn} if _attn else {}
 
-    if is_vl_checkpoint(model_id):
+    if adapter_is_vl_warmstart(adir, model_id):
         # VL checkpoints (Qwen3.5/3.6): MERGE the SFT into the base and train a FRESH LoRA on the
         # merged weights, instead of continuing the live SFT LoRA. Continuing it makes the colocated
         # vLLM rollout engine AND the KL reference key off the BARE base — the SFT only reaches vLLM
