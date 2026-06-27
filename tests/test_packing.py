@@ -15,7 +15,6 @@ import pytest
 
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
-    build_completion_mask,
     completion_mask_from_ids,
     gdn_packing_available,
     model_is_gdn_hybrid,
@@ -430,53 +429,45 @@ def test_leaky_plain_causal_would_differ():
 
 
 # ---------------------------------------------------------------- completion-only loss masking
-def test_build_completion_mask_clean_prefix():
+def _mask(tok, prompt, full):
+    # Mirror the SFT path: tokenize the prompt the SAME way the full row is tokenized (one batched
+    # call, default add_special_tokens, no appended EOS) then derive the boundary from the ids.
+    prompt_ids = tok([prompt], truncation=True, max_length=100)["input_ids"][0]
+    return completion_mask_from_ids(prompt_ids, full)
+
+
+def test_completion_mask_clean_prefix():
     # Non-thinking: the prompt render is a clean token prefix of the full row -> mask exactly the
     # prompt, train on the completion (assistant turn + appended EOS).
     tok = _FakeTok(eos="!")
     full = tokenize_for_packing(["ABxy"], tok, max_length=100)[0]  # [1, A, B, x, y, !]
-    mask = build_completion_mask("AB", full, tok, max_length=100)
+    mask = _mask(tok, "AB", full)
     assert len(mask) == len(full)
     assert mask == [0, 0, 0, 1, 1, 1]  # BOS+A+B masked; xy! trained
 
 
-def test_build_completion_mask_robust_to_divergent_prompt_suffix():
+def test_completion_mask_robust_to_divergent_prompt_suffix():
     # Thinking template: add_generation_prompt=True pre-opens a token (e.g. `<think>`) that the full
     # render diverges from -> the LONGEST SHARED PREFIX is masked, the rest (reasoning + answer) is
     # trained. Here the prompt ends with a token ('<') absent from the full row at that position.
     tok = _FakeTok(eos="!")
     full = tokenize_for_packing(["ABxy"], tok, max_length=100)[0]  # [1, A, B, x, y, !]
-    mask = build_completion_mask("AB<", full, tok, max_length=100)  # prompt_ids [1,A,B,<]
+    mask = _mask(tok, "AB<", full)  # prompt_ids [1,A,B,<]
     assert mask == [0, 0, 0, 1, 1, 1]  # diverges at idx 3 -> only the shared AB prompt is masked
 
 
-def test_build_completion_mask_all_prompt_masks_everything():
+def test_completion_mask_all_prompt_masks_everything():
     # Degenerate: max_length truncation left the WHOLE row as prompt (no completion survived). The row
     # is fully masked (all zeros) — NOT forced to keep the last PROMPT token as a trained target, which
     # would teach the model to reproduce prompt text. A fully-masked row is a loss no-op instead.
     tok = _FakeTok(eos="!")
     full = tokenize_for_packing(["AB"], tok, max_length=100)[0]  # [1, A, B, !]
-    mask = build_completion_mask("AB!", full, tok, max_length=100)  # prompt == full
+    mask = _mask(tok, "AB!", full)  # prompt == full
     assert mask == [0, 0, 0, 0]
     assert sum(mask) == 0  # no token trained on -> the example contributes no (prompt) loss
 
 
-def test_build_completion_mask_empty_full():
-    assert build_completion_mask("anything", [], _FakeTok("!"), max_length=100) == []
-
-
-def test_completion_mask_from_ids_matches_wrapper():
-    # The batched SFT path tokenizes all prompts in one call and feeds prompt_ids straight into
-    # completion_mask_from_ids; it must produce the SAME mask the per-row build_completion_mask wrapper
-    # does (which tokenizes prompt_text internally). Equivalence holds because batched tokenization is
-    # per-sequence identical to single-row tokenization (no padding requested).
-    tok = _FakeTok(eos="!")
-    for prompt, full_text in [("AB", "ABxy"), ("AB<", "ABxy"), ("AB!", "AB")]:
-        full = tokenize_for_packing([full_text], tok, max_length=100)[0]
-        prompt_ids = tok([prompt], truncation=True, max_length=100)["input_ids"][0]
-        assert completion_mask_from_ids(prompt_ids, full) == build_completion_mask(
-            prompt, full, tok, max_length=100
-        )
+def test_completion_mask_from_ids_empty_full():
     # Empty full row -> empty mask, regardless of prompt ids.
     assert completion_mask_from_ids([1, 2, 3], []) == []
 

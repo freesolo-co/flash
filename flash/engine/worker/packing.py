@@ -287,12 +287,21 @@ def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[l
 
 
 def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list[int]:
-    """Completion mask from ALREADY-tokenized prompt + full-row ids: ``0`` over the shared prompt
-    prefix, ``1`` over the surviving completion. This is the core of :func:`build_completion_mask`,
-    split out so the SFT pre-tokenizer can batch ALL prompt tokenizations into one call (instead of an
-    O(N) per-row tokenize) and feed the ids in directly. Both ``prompt_ids`` and ``full_ids`` must be
-    tokenized the SAME way (default ``add_special_tokens``, same truncation; NO appended EOS on the
-    prompt) so they line up token-for-token over the shared prefix.
+    """Token-level completion mask for completion-only SFT loss from ALREADY-tokenized prompt +
+    full-row ids: ``0`` over the shared prompt prefix, ``1`` over the surviving completion (the
+    assistant turn(s) the model must learn to generate). ``full_ids`` are the example's tokens from
+    :func:`tokenize_for_packing` (the SAME tokens the trainer sees); ``prompt_ids`` is the
+    chat-templated prompt (``add_generation_prompt=True``) tokenized the SAME way (default
+    ``add_special_tokens``, same truncation; NO appended EOS — the prompt never ends a turn), so the
+    two line up token-for-token over the shared prefix. The SFT pre-tokenizer batches ALL prompt
+    tokenizations into one call (no O(N) per-row tokenize) and feeds the ids straight in.
+
+    We mask the LONGEST SHARED TOKEN PREFIX rather than ``len(prompt_ids)`` so the boundary is robust
+    to the thinking chat template, whose ``add_generation_prompt=True`` render pre-opens ``<think>\\n``
+    — the prompt then diverges from the full render by a token; we mask up to that divergence and train
+    on everything after. This mirrors TRL's own prompt-completion masking (it likewise derives the
+    boundary from the prompt token length) but in flash's single pre-tokenization pass, so the unpacked
+    and packed paths share one boundary.
 
     Returns ``[]`` for empty ``full_ids`` and an ALL-ZERO mask when the full row is entirely prompt
     (``max_length`` truncation removed the whole completion); :func:`run_sft
@@ -316,37 +325,6 @@ def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list
     # A real completion survived truncation: mask the shared prompt prefix, train on the rest (the
     # ``n < n_full`` guarantees at least one completion token).
     return [0] * n + [1] * (n_full - n)
-
-
-def build_completion_mask(
-    prompt_text: str, full_ids: list[int], tokenizer, max_length: int
-) -> list[int]:
-    """Token-level completion mask for completion-only SFT loss: ``0`` for the prompt tokens, ``1``
-    for the completion (the assistant turn(s) the model must learn to generate). ``full_ids`` are the
-    example's tokens from :func:`tokenize_for_packing` (the SAME tokens the trainer sees);
-    ``prompt_text`` is the chat-templated prompt rendered with ``add_generation_prompt=True``.
-
-    We tokenize the prompt the SAME way :func:`tokenize_for_packing` tokenizes the full row (default
-    ``add_special_tokens``, truncate to ``max_length``; NO appended EOS — the prompt never ends a
-    turn) and mask the LONGEST SHARED TOKEN PREFIX of the prompt and the full row (see
-    :func:`completion_mask_from_ids`). The shared-prefix (rather than ``len(prompt_ids)``) is what
-    makes this robust to the thinking chat template, whose ``add_generation_prompt=True`` render
-    pre-opens ``<think>\\n`` so the prompt diverges from the full render by a token — we mask up to
-    that divergence and train on everything after. This mirrors TRL's own prompt-completion masking
-    (it likewise derives the boundary from the prompt token length), but in flash's single
-    pre-tokenization pass so the unpacked and packed paths share one boundary.
-
-    Single-row convenience wrapper that tokenizes ``prompt_text`` then delegates to
-    :func:`completion_mask_from_ids`; the SFT path tokenizes all prompts in ONE batched call and calls
-    that helper directly. Returns an ALL-ZERO mask when ``max_length`` truncation removed the entire
-    completion (``run_sft`` drops those rows), and ``[]`` for empty ``full_ids``.
-    """
-    if not full_ids:
-        return []
-    # List form mirrors tokenize_for_packing's call EXACTLY (default add_special_tokens, same
-    # truncation), so the prompt tokens line up with the full row's prefix token-for-token.
-    prompt_ids = tokenizer([prompt_text], truncation=True, max_length=max_length)["input_ids"][0]
-    return completion_mask_from_ids(prompt_ids, full_ids)
 
 
 # Process-local cache of the lower-triangular causal matrix: the collator runs on every batch, and
