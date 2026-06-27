@@ -416,8 +416,27 @@ def test_register_run_checkpoints_requires_org():
 
     with pytest.raises(ValueError, match="org id"):
         ck.register_run_checkpoints(
-            internal_key="k", status=_status(billing_context={}), checkpoints=_CKPTS
+            internal_key="k",
+            status=_status(billing_context={}, platform_context=None),
+            checkpoints=_CKPTS,
         )
+
+
+def test_register_run_checkpoints_falls_back_to_platform_context(monkeypatch):
+    # Internal/operator runs carry org only in platform_context (billing_context is None):
+    # registration must still scope rows to that org, mirroring serving.py / run_registry.
+    import flash.server.checkpoints as ck
+
+    captured = {}
+    monkeypatch.setattr(
+        ck, "_post_checkpoints", lambda *, token, body: captured.update(body=body) or {}
+    )
+    ck.register_run_checkpoints(
+        internal_key="int-key",
+        status=_status(billing_context=None, platform_context={"org_id": "org-plat"}),
+        checkpoints=_CKPTS,
+    )
+    assert captured["body"]["orgId"] == "org-plat"
 
 
 def test_best_effort_noop_without_internal_key(monkeypatch):
@@ -442,6 +461,7 @@ def test_best_effort_registers(monkeypatch):
 
 
 def test_best_effort_swallows_backend_failure(monkeypatch):
+    import io
     import urllib.error
 
     import flash.server.checkpoints as ck
@@ -453,7 +473,30 @@ def test_best_effort_swallows_backend_failure(monkeypatch):
         raise urllib.error.URLError("backend down")
 
     monkeypatch.setattr(ck, "_post_checkpoints", boom)
-    assert ck.register_checkpoints_best_effort(_status()) == 0  # never raises
+    log = io.StringIO()
+    assert ck.register_checkpoints_best_effort(_status(), log=log) == 0  # never raises
+    # A genuine backend failure MUST stay visible.
+    assert "warn" in log.getvalue()
+
+
+def test_best_effort_skips_silently_when_no_org(monkeypatch):
+    # Internal/operator run with no org in either context: skip quietly, do NOT warn and do NOT
+    # hit the backend. Regression guard for the noisy "missing org id" log.
+    import io
+
+    import flash.server.checkpoints as ck
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
+    monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
+
+    def fail(*, token, body):  # pragma: no cover - must never be called
+        raise AssertionError("_post_checkpoints must not be called without an org")
+
+    monkeypatch.setattr(ck, "_post_checkpoints", fail)
+    log = io.StringIO()
+    status = _status(billing_context={}, platform_context=None)
+    assert ck.register_checkpoints_best_effort(status, log=log) == 0
+    assert "warn" not in log.getvalue()
 
 
 def test_best_effort_no_checkpoints(monkeypatch):

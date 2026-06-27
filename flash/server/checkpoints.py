@@ -6,10 +6,12 @@ store so the dashboard/SDK can enumerate a run's checkpoints without crawling HF
 cancelled run's checkpoints survive in one queryable place.
 
 Like ``flash.server.billing``, the POST is authenticated with the operator INTERNAL key (the
-control plane never persists a user's freesolo key) and carries the org id from the run's
-non-secret billing context. Unlike billing, checkpoint persistence is STRICTLY best-effort:
-a failure here must never disturb a run or a deploy, so the public entry point swallows
-everything."""
+control plane never persists a user's freesolo key) and carries the org id persisted WITH the
+run — ``billing_context`` for user runs, ``platform_context`` for internal/operator runs (see
+the submit path; mirrors ``serving.py`` / ``run_registry.py``). Unlike billing, checkpoint
+persistence is STRICTLY best-effort: a failure here must never disturb a run or a deploy, so the
+public entry point swallows everything. Internal/operator runs with no org attribution at all
+are skipped quietly (HF stays the source of truth) — only genuine backend failures warn."""
 
 from __future__ import annotations
 
@@ -25,6 +27,21 @@ from .auth import INTERNAL_KEY_ENV, freesolo_base_url
 
 _TIMEOUT_S = 10.0
 _RECORD_PATH = "/api/runs/internal/checkpoints"
+
+
+def _run_org_id(status) -> str:
+    """Org that owns the run, or "" if none.
+
+    Prefers the org persisted WITH the run — ``billing_context`` for user runs, then
+    ``platform_context`` for internal/operator runs (see the submit path). Mirrors
+    ``serving.py::_run_org`` / ``run_registry._context_from_status``. Each context is
+    isinstance-guarded against a non-dict legacy value."""
+    for ctx in (getattr(status, "billing_context", None), getattr(status, "platform_context", None)):
+        if isinstance(ctx, dict):
+            org = str(ctx.get("org_id") or "").strip()
+            if org:
+                return org
+    return ""
 
 
 def _post_checkpoints(*, token: str, body: dict) -> dict:
@@ -53,14 +70,13 @@ def _post_checkpoints(*, token: str, body: dict) -> dict:
 def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dict]) -> dict:
     """Upsert ``checkpoints`` for one run into the backend store (idempotent by run_id+step).
 
-    Pulls the org id from the run's persisted billing context (same source as billing). Raises
-    ``ValueError`` when there's nothing to record or no org id; raises ``urllib`` errors through
-    on a backend failure — ``register_checkpoints_best_effort`` is the guarded wrapper most
-    callers use."""
+    Pulls the org id from the run's persisted context (``billing_context`` then
+    ``platform_context``, via :func:`_run_org_id`). Raises ``ValueError`` when there's nothing
+    to record or no org id; raises ``urllib`` errors through on a backend failure —
+    ``register_checkpoints_best_effort`` is the guarded wrapper most callers use."""
     if not checkpoints:
         raise ValueError("no checkpoints to record")
-    context = status.billing_context if isinstance(status.billing_context, dict) else {}
-    org_id = str(context.get("org_id") or "").strip()
+    org_id = _run_org_id(status)
     if not org_id:
         raise ValueError("missing org id for run checkpoints")
     spec = status.spec or {}
@@ -98,6 +114,10 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
         return 0
     checkpoints = list_checkpoints(spec)
     if not checkpoints:
+        return 0
+    if not _run_org_id(status):
+        # Internal/operator run with no org attribution: nothing to scope the rows to. Skip
+        # quietly — HF stays the source of truth — rather than warn on this expected condition.
         return 0
     try:
         register_run_checkpoints(
