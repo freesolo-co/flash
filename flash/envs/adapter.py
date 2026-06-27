@@ -232,7 +232,10 @@ def _urlopen(
             is_rate_limit = exc.code == 429 or (
                 exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
             )
-            if is_rate_limit and attempt < max_rate_limit_retries:
+            # A 5xx (502/503/504 GitHub incident or codeload blip) is transient infra, same class as a
+            # TCP reset below — retry, then surface as retriable, instead of fatally failing the run.
+            is_transient = is_rate_limit or exc.code >= 500
+            if is_transient and attempt < max_rate_limit_retries:
                 delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
                 time.sleep(delay)
                 attempt += 1
@@ -240,6 +243,10 @@ def _urlopen(
             if is_rate_limit:
                 raise GitHubRateLimitError(
                     f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
+                ) from exc
+            if exc.code >= 500:
+                raise GitHubRateLimitError(
+                    f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
                 ) from exc
             raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
