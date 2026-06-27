@@ -540,3 +540,11 @@ def test_list_deployed_adapters_raises_on_non_list_body(monkeypatch):
     d = _patch_get(monkeypatch, _GetResp("a string, somehow"))
     with pytest.raises(d.ServingError):
         d.list_deployed_adapters()
+
+
+def test_list_deployed_adapters_raises_on_non_dict_item(monkeypatch):
+    # A list containing non-record items (strings/None) must fail closed, not be filtered to a
+    # smaller/empty keep-set that could green-light deleting live repos.
+    d = _patch_get(monkeypatch, _GetResp([{"repoId": "org/a"}, "not-a-record"]))
+    with pytest.raises(d.ServingError):
+        d.list_deployed_adapters()

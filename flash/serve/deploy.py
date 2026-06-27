@@ -295,7 +295,14 @@ def list_deployed_adapters() -> list[dict]:
             f"serving backend returned a {type(data).__name__}, not an adapter list, from {url}; "
             "refusing to treat it as an empty live set"
         )
-    return [rec for rec in data if isinstance(rec, dict)]
+    # Every item must be a record. Silently dropping non-dict items (strings/None) would shrink the
+    # keep-set toward empty — and this set gates destructive GC — so a malformed item fails closed.
+    if any(not isinstance(rec, dict) for rec in data):
+        raise ServingError(
+            f"serving backend returned a non-record item in the adapter list from {url}; "
+            "refusing to treat it as the live set"
+        )
+    return list(data)
 
 
 def chat(

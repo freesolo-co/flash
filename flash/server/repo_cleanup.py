@@ -31,12 +31,14 @@ Every repo is classified from three self-contained signals — no backend DB req
 
 Tiers (conservative defaults; each opt-in beyond ``--code``)
 -----------------------------------------------------------
-* ``--code``        (default ON)  T1: delete ``code/flash`` from repos that have BOOTED (produced
-                                  any output beyond the pre-boot code snapshot). Deployed repos are
-                                  skipped wholesale before any tier runs, and serving never reads
-                                  ``code/flash`` regardless. A code-only repo (no run output) may be
-                                  a run still queued for capacity that needs the code to boot, so its
-                                  code is held until ``--delete-age-days``. Reclaims little; safe.
+* ``--code``        (default ON)  T1: delete ``code/flash`` from repos older than
+                                  ``--delete-age-days``. The single ``code/flash`` snapshot is
+                                  uploaded once per run (pre-boot) and shared by EVERY seed and by
+                                  ``resume_run`` (no re-upload), so it must survive until the whole
+                                  run is provably finished — a later seed or a resume after a long
+                                  inter-seed capacity gap still needs it. Deployed repos are skipped
+                                  wholesale, and serving never reads ``code/flash`` regardless.
+                                  Reclaims little; safe.
 * ``--checkpoints`` (default off) T2: on terminal + undeployed + older than ``--trim-age-days`` and
                                   carrying a FINAL ``adapter/``, delete ``checkpoints/`` while
                                   **keeping** that final adapter. The big byte win; you lose only
@@ -146,16 +148,6 @@ class RepoView:
         strips a checkpoint-only repo's sole servable content."""
         return any("checkpoints" not in folder.split("/") for folder in self.adapter_folders())
 
-    def has_run_output(self) -> bool:
-        """True once the run actually booted and wrote something beyond the pre-boot ``code/flash``
-        snapshot (adapter / checkpoints / metrics / heartbeat / console / DONE). A repo holding
-        ONLY ``code/flash`` has not booted yet — it may be a run still queued for GPU capacity that
-        needs that code to boot — so its code must not be purged on the short inactive-age gate."""
-        code_dirs = self._artifact_folders(CODE_PATH)
-        return any(
-            not any(f == d or f.startswith(d + "/") for d in code_dirs) for f, _ in self.files
-        )
-
     def age_seconds(self, now: datetime) -> float:
         if self.last_modified is None:
             # No timestamp → treat as "very old" so the age gate never *protects* it; the deployed
@@ -244,8 +236,15 @@ def deployed_repo_ids() -> set[str]:
     ids: set[str] = set()
     for rec in deploy.list_deployed_adapters():
         repo = rec.get("repoId") or rec.get("repo_id")
-        if repo:
-            ids.add(str(repo))
+        if not repo:
+            # A deployed adapter record always carries the HF repo serving pulls from. A record
+            # missing it means the schema drifted — fail closed (the caller aborts destructive
+            # tiers) rather than silently dropping it and shrinking the do-not-delete keep-set.
+            raise RuntimeError(
+                f"deployed adapter record has no repoId/repo_id (keys: {sorted(rec)[:8]}); "
+                "refusing to trust an incomplete serving live set"
+            )
+        ids.add(str(repo))
     return ids
 
 
@@ -273,11 +272,12 @@ def classify(view: RepoView, deployed: set[str], cfg: Config, now: datetime) -> 
             return [Action(view.repo_id, "delete_repo", None, view.total_bytes, "old undeployed adapter (--delete-with-adapter)")]
 
     actions: list[Action] = []
-    if cfg.code and (view.has_run_output() or age >= cfg.delete_age_days * 86400):
-        # Emit one delete per *actual* folder (root ``code/flash`` and/or nested
-        # ``<phase>/<run>/seed<N>/code/flash``). Skip a repo that holds ONLY code/flash and is not
-        # yet delete-age old: it may be a run still queued for capacity whose worker needs that code
-        # to boot — purging it on the short inactive-age gate would break the pending run.
+    if cfg.code and age >= cfg.delete_age_days * 86400:
+        # The single ``code/flash`` snapshot is uploaded ONCE per run (control plane, pre-boot) and
+        # is shared by EVERY seed and by ``resume_run`` (which re-downloads it with no re-upload). A
+        # repo-wide signal can't prove the whole run is finished — a later seed or a resume after a
+        # long inter-seed capacity gap still needs that code — so the shared snapshot is only purged
+        # once the repo is delete-age old (provably abandoned, no seed/resume can still be pending).
         actions.extend(
             Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "training source snapshot")
             for folder in view._artifact_folders(CODE_PATH)
@@ -380,12 +380,12 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
     now = datetime.now(UTC)
     views = list_run_repos(api, cfg.namespace)
     plan = build_plan(views, deployed, cfg, now)
-    _print_report(plan, cfg, dry_run=dry_run, live_set_known=live_set_known)
 
     # The live set was sampled before enumeration; a deploy may have landed during enumeration +
-    # classification (minutes, for a large namespace). Re-confirm it immediately before mutating
-    # and drop any action now targeting a live repo, so we never write to a repo that became
-    # deployed in that window. (Dry-run reports the pre-check plan and mutates nothing.)
+    # classification (minutes, for a large namespace). Re-confirm it immediately before mutating and
+    # drop any action now targeting a live repo, so we never write to a repo that became deployed in
+    # that window. Done BEFORE the report so --apply output reflects what is actually applied (the
+    # dry-run path skips this and reports the full preview plan, mutating nothing).
     if not dry_run and plan.actions and live_set_known:
         try:
             fresh = deployed_repo_ids()
@@ -404,6 +404,7 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
                 logger.warning("dropping %d planned action(s) against repos deployed since enumeration", dropped)
                 plan.actions = kept
 
+    _print_report(plan, cfg, dry_run=dry_run, live_set_known=live_set_known)
     manifest = apply_plan(api, plan, dry_run=dry_run, sleep=sleep)
     if manifest_path:
         with open(manifest_path, "w") as f:
