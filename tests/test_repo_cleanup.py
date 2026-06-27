@@ -439,3 +439,26 @@ def test_incomplete_live_set_aborts_destructive_tier_but_not_code(monkeypatch):
     plan = rc.run(_cfg(code=True, checkpoints=False, repos=False), dry_run=True, sleep=0, api=api2)
     assert plan.actions == []  # flashrun-live is in the best-effort keep-set → not purged
     assert any("deployed" in s.reason for s in plan.skips)
+
+
+# ---- unknown age + invalid retention windows --------------------------------------------------
+
+def test_repo_with_no_last_modified_is_skipped_for_safety():
+    # HF returning last_modified=None (fresh/queued repo) must not look "infinitely old" and become
+    # eligible for deletion. It's left untouched.
+    v = _view(f"{NS}/flashrun-u", None, FAILED)  # no adapter, but unknown age
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=True, checkpoints=True, repos=True), now=NOW)
+    assert len(actions) == 1
+    assert actions[0].skipped
+    assert "unknown age" in actions[0].reason
+
+
+def test_age_seconds_treats_missing_timestamp_as_just_written():
+    assert _view("x", None, FAILED).age_seconds(NOW) == 0.0
+
+
+def test_main_rejects_negative_retention_windows(capsys):
+    assert rc.main(["--delete-age-days", "-1"]) == 2
+    assert "--delete-age-days must be >= 0" in capsys.readouterr().err
+    assert rc.main(["--checkpoints", "--trim-age-days", "-5"]) == 2
+    assert "--trim-age-days must be >= 0" in capsys.readouterr().err

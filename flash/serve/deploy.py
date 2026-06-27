@@ -246,10 +246,12 @@ def undeploy_adapter(run_id: str) -> list[str]:
 def list_deployed_adapters() -> list[dict]:
     """Return the serving app's live adapter registry — the authoritative DO-NOT-DELETE set.
 
-    Each record carries at least ``adapterId`` (== run_id), ``repoId`` (the HF dataset repo
-    serving pulls weights from), and the ``subfolder``/``adapter_hf_prefix`` it loads. Used by
-    operator repo GC (``flash.server.repo_cleanup``) to know which per-run repos are currently
-    serving traffic and must never be touched.
+    A record normally carries ``adapterId`` (== run_id), ``repoId`` (the HF dataset repo serving
+    pulls weights from), and the ``subfolder``/``adapter_hf_prefix`` it loads, but this function
+    only validates that the body is a list of dict records — it does NOT enforce those keys, so
+    callers must tolerate a record missing them (e.g. on schema drift). Used by operator repo GC
+    (``flash.server.repo_cleanup``), whose ``deployed_repo_ids`` flags an unmappable record rather
+    than trusting an incomplete keep-set, to know which per-run repos are serving traffic.
 
     Raises ``ServingError`` if the serving backend is unreachable, returns non-200, returns a
     non-JSON body, or returns a 200 in an unrecognized shape — a caller gating destructive cleanup
