@@ -65,8 +65,9 @@ class FakeApi:
 
 # ---- fixtures: a few representative repo shapes -----------------------------------------------
 
-SUCCEEDED = (  # has final adapter + code + checkpoints, old, not deployed
-    [("code/flash/__init__.py", 700_000), ("adapter/adapter_model.safetensors", 50_000_000),
+SUCCEEDED = (  # has a COMPLETE final adapter (config+weights) + code + checkpoints, old, not deployed
+    [("code/flash/__init__.py", 700_000),
+     ("adapter/adapter_config.json", 500), ("adapter/adapter_model.safetensors", 50_000_000),
      ("checkpoints/step-1/adapter/adapter_model.safetensors", 50_000_000),
      ("checkpoints/step-2/adapter/adapter_model.safetensors", 50_000_000), ("metrics.json", 2_000)]
 )
@@ -225,6 +226,7 @@ def test_code_only_tier_proceeds_when_live_set_unavailable(monkeypatch):
 # under hf_prefix(). A root-anchored matcher would silently match nothing and the GC would no-op.
 NESTED_SUCCEEDED = [
     ("rl/flash-9-zzzz/seed0/code/flash/__init__.py", 700_000),
+    ("rl/flash-9-zzzz/seed0/adapter/adapter_config.json", 500),
     ("rl/flash-9-zzzz/seed0/adapter/adapter_model.safetensors", 50_000_000),
     ("rl/flash-9-zzzz/seed0/checkpoints/step-1/adapter/adapter_model.safetensors", 50_000_000),
     ("rl/flash-9-zzzz/seed0/checkpoints/step-2/adapter/adapter_model.safetensors", 50_000_000),
@@ -337,11 +339,30 @@ def test_code_only_queued_repo_is_held_before_delete_age():
 
 # ---- checkpoint-only repos are servable (deployable via `flash deploy --step N`) ---------------
 
-CHECKPOINT_ONLY = [  # no final adapter/, but a deployable per-step checkpoint adapter
+CHECKPOINT_ONLY = [  # no final adapter/, but a COMPLETE (config+weights) per-step checkpoint adapter
     ("rl/flash-9-ck/seed0/code/flash/__init__.py", 700_000),
+    ("rl/flash-9-ck/seed0/checkpoints/step-1/adapter/adapter_config.json", 500),
     ("rl/flash-9-ck/seed0/checkpoints/step-1/adapter/adapter_model.safetensors", 50_000_000),
     ("rl/flash-9-ck/seed0/metrics.json", 2_000),
 ]
+
+
+PARTIAL_FINAL_ADAPTER = [  # final adapter upload only partially landed (config, NO weights) + ckpts
+    ("rl/flash-9-pf/seed0/adapter/adapter_config.json", 500),  # no adapter_model.* → not deployable
+    ("rl/flash-9-pf/seed0/checkpoints/step-1/adapter/adapter_config.json", 500),
+    ("rl/flash-9-pf/seed0/checkpoints/step-1/adapter/adapter_model.safetensors", 50_000_000),
+    ("rl/flash-9-pf/seed0/metrics.json", 2_000),
+]
+
+
+def test_incomplete_final_adapter_does_not_trigger_checkpoint_trim():
+    # The final adapter is config-only (weights upload failed). Trimming checkpoints would leave NO
+    # deployable artifact, so T2 must not fire — the checkpoint adapter is the only servable one.
+    v = _view(f"{NS}/flashrun-pf", _days_ago(30), PARTIAL_FINAL_ADAPTER)
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=False, checkpoints=True), now=NOW)
+    assert "delete_folder" not in {a.kind for a in actions}  # no checkpoint trim
+    assert not v.has_final_adapter()  # config-only final adapter is not "complete"
+    assert v.has_servable_adapter()  # the complete checkpoint adapter still makes the repo servable
 
 
 def test_checkpoint_only_repo_is_not_whole_deleted_as_unservable():
