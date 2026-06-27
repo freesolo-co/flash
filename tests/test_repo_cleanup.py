@@ -15,6 +15,19 @@ NS = "Freesolo-Co"
 NOW = datetime(2026, 6, 27, 12, 0, 0, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _frozen_now(monkeypatch):
+    # run()/main() compute age from datetime.now(UTC); freeze it to NOW so the fixtures' relative
+    # ages are deterministic and never depend on the wall clock (classify tests pass now=NOW
+    # explicitly and are unaffected).
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+
+    monkeypatch.setattr(rc, "datetime", _Frozen)
+
+
 def _days_ago(d: float) -> datetime:
     return NOW - timedelta(days=d)
 
@@ -564,3 +577,44 @@ def test_apply_per_action_recheck_failure_skips_to_stay_safe(monkeypatch):
     monkeypatch.setattr(rc, "deployed_repo_ids", fake_deployed)
     rc.run(_cfg(repos=True), dry_run=False, sleep=0, api=api)
     assert api.deleted_repos == []  # skipped to stay safe, not deleted
+
+
+def test_apply_per_action_recheck_incomplete_set_skips(monkeypatch):
+    # An incomplete keep-set on the per-action re-check must fail closed (don't delete against a
+    # best-effort set during a destructive apply).
+    api = FakeApi({f"{NS}/flashrun-f": (_days_ago(90), FAILED)})
+    calls = {"n": 0}
+
+    def fake_deployed():
+        calls["n"] += 1
+        # initial + pre-apply bulk are complete; the per-action re-check returns an incomplete set
+        return (set(), True) if calls["n"] <= 2 else (set(), False)
+
+    monkeypatch.setattr(rc, "deployed_repo_ids", fake_deployed)
+    rc.run(_cfg(repos=True), dry_run=False, sleep=0, api=api)
+    assert api.deleted_repos == []  # incomplete set → skipped, not deleted
+
+
+def test_apply_recheck_failure_invalidates_cache_so_next_action_refetches(monkeypatch):
+    # After a failed re-check, the TTL cache must be invalidated so a LATER action re-fetches
+    # instead of deleting against a stale/empty set within the 30s window.
+    api = FakeApi({
+        f"{NS}/flashrun-f1": (_days_ago(90), FAILED),
+        f"{NS}/flashrun-f2": (_days_ago(90), FAILED),
+    })
+    calls = {"n": 0}
+
+    def fake_deployed():
+        calls["n"] += 1
+        # 1=initial, 2=pre-apply bulk; 3=first action's re-check FAILS; 4=second action re-fetches
+        # (proving the cache was invalidated) and reports f2 as now-live.
+        if calls["n"] == 3:
+            raise RuntimeError("transient serving blip")
+        if calls["n"] >= 4:
+            return ({f"{NS}/flashrun-f2"}, True)
+        return (set(), True)
+
+    monkeypatch.setattr(rc, "deployed_repo_ids", fake_deployed)
+    rc.run(_cfg(repos=True), dry_run=False, sleep=0, api=api)
+    assert api.deleted_repos == []  # f1 skipped (re-check failed), f2 skipped (re-fetched → live)
+    assert calls["n"] >= 4  # the 2nd action re-fetched rather than trusting the stale cache
