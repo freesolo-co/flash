@@ -154,6 +154,7 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        source_token="hf_operator",
     )
     # Static, adapter-scoped delete patterns: ``adapter_model*`` clears a stale ``.bin`` (and sharded /
     # index variants); ``adapter_config.json`` clears the old config. A hypothetical ``extra_weights.pt``
@@ -197,6 +198,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        source_token="hf_operator",
         private=False,
     )
     # Created private, uploaded, THEN made public — never public before the content lands.
@@ -236,6 +238,7 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        source_token="hf_operator",
         private=True,
     )
     # Locked private BEFORE the upload (no post-upload visibility flip needed for a private export).
@@ -296,6 +299,7 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
             source_subfolder="rl/run-x/seed0/adapter",
             dest_repo="me/adapters",
             dest_token="hf_user",
+            source_token="hf_operator",
         )
 
 
@@ -318,6 +322,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
             source_subfolder="rl/run-x/seed0/adapter",
             dest_repo="me/adapters",
             dest_token="hf_user",
+            source_token="hf_operator",
         )
 
 
@@ -372,3 +377,25 @@ def test_hf_api_missing_extra_raises_runtime_error_not_serving_error(monkeypatch
         export._hf_api()
     assert not isinstance(ei.value, ServingError)  # NOT the 502 path
     assert "huggingface_hub" in str(ei.value)
+
+
+def test_export_missing_operator_token_raises_runtime_error_not_serving_error(monkeypatch):
+    # No operator read token (neither source_token nor HF_TOKEN) is an internal server
+    # misconfiguration (-> 500), NOT an upstream auth failure (ServingError -> 502). export_adapter
+    # must raise a plain RuntimeError BEFORE snapshot_download, rather than passing token=None and
+    # wrapping the resulting auth error as ServingError.
+    from flash.serve import export
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError) as ei:
+        export.export_adapter(
+            source_repo="op/ds",
+            source_subfolder="runs/r/adapter",
+            dest_repo="me/out",
+            dest_token="hf_dest",
+            source_token=None,
+        )
+    assert not isinstance(ei.value, ServingError)  # NOT the 502 path
+    assert "HF_TOKEN" in str(ei.value)

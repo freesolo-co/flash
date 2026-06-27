@@ -69,12 +69,24 @@ def export_adapter(
     does not already exist. The copy is a download-then-upload so the bytes pass through the
     control plane and the user never needs read access to the internal source.
 
-    Raises :class:`ValueError` when the source has no adapter artifacts (nothing to export) and
-    :class:`~flash.serve.deploy.ServingError` on an HF transport/permission failure, so the route
-    can map them to a clean 404 / 502.
+    Raises :class:`ValueError` when the source has no adapter artifacts (nothing to export),
+    :class:`~flash.serve.deploy.ServingError` on an HF transport/permission failure (route -> 502),
+    and :class:`RuntimeError` when no operator read token is configured — an internal
+    misconfiguration the route surfaces as a 500, not a 502.
     """
     HfApi, snapshot_download = _hf_api()
     read_token = source_token or os.environ.get("HF_TOKEN")
+    if not read_token:
+        # The operator token to READ the private source artifact repo is an internal server invariant
+        # (the control plane always supplies HF_TOKEN). Its absence is a MISCONFIGURATION, not an
+        # upstream HF transport/permission failure — raise a plain RuntimeError (the route maps it to a
+        # 500, like _hf_api's missing-extra case) NOT ServingError, which becomes a 502 and looks like
+        # an upstream gateway issue. Surfacing it HERE, before snapshot_download, also keeps the real
+        # cause from being buried under a generic token=None auth error wrapped as ServingError.
+        raise RuntimeError(
+            "no operator HF token available to read the source adapter; set HF_TOKEN on the "
+            "server (or pass source_token)"
+        )
     with tempfile.TemporaryDirectory(prefix="flash-export-") as tmp:
         try:
             # Pull ONLY this adapter's folder (not the whole multi-run/-checkpoint dataset repo).
