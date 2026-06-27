@@ -217,19 +217,26 @@ def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
     from flash.engine.worker.hf import _CHECKPOINT_TRAINER_STATE
 
     out_dir = tempfile.mkdtemp(prefix="flash_recomb_adapter_")
-    rank = recombine_lora_adapters(sft_adir, src_adapter_dir, out_dir)
-    # Carry tokenizer/aux files from the raw save (serving uses the base tokenizer, but keep the
-    # deployed dir at parity with the un-recombined save); the recombined config+weights stay. Skip
-    # trainer state — for the per-step path src is a `checkpoint-<n>` dir carrying optimizer/scheduler
-    # state that the deployable adapter must not duplicate.
-    for name in os.listdir(src_adapter_dir):
-        if name in ("adapter_model.safetensors", "adapter_config.json", "adapter_model.bin"):
-            continue
-        if any(fnmatch.fnmatch(name, pat) for pat in _CHECKPOINT_TRAINER_STATE):
-            continue
-        src = os.path.join(src_adapter_dir, name)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(out_dir, name))
+    try:
+        rank = recombine_lora_adapters(sft_adir, src_adapter_dir, out_dir)
+        # Carry tokenizer/aux files from the raw save (serving uses the base tokenizer, but keep the
+        # deployed dir at parity with the un-recombined save); the recombined config+weights stay.
+        # Skip trainer state — for the per-step path src is a `checkpoint-<n>` dir carrying optimizer/
+        # scheduler state that the deployable adapter must not duplicate.
+        for name in os.listdir(src_adapter_dir):
+            if name in ("adapter_model.safetensors", "adapter_config.json", "adapter_model.bin"):
+                continue
+            if any(fnmatch.fnmatch(name, pat) for pat in _CHECKPOINT_TRAINER_STATE):
+                continue
+            src = os.path.join(src_adapter_dir, name)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(out_dir, name))
+    except Exception:
+        # recombine (or the aux copy) raised — remove the just-created temp dir so a caller that
+        # catches and continues (the per-step publish in hf.py) doesn't accumulate
+        # flash_recomb_adapter_* dirs under /tmp across repeated failures.
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
     print(
         f"[recombine] VL warm-start: stacked SFT⊕GRPO -> rank-{rank} deployable adapter at "
         f"{out_dir} (reproduces base+SFT+GRPO on the catalog base)"
