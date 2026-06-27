@@ -203,6 +203,45 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
     assert order == [("create_repo", True), ("upload", None), ("update_settings", False)]
 
 
+def test_export_private_is_enforced_before_upload(monkeypatch):
+    """``private=True`` (default) into a PRE-EXISTING public repo must lock it down BEFORE the upload:
+    create_repo(exist_ok=True) won't change an existing repo's visibility, so the weights would
+    otherwise commit while the repo is still public. Visibility private must be set before upload."""
+    order: list = []
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, *, repo_id, repo_type, private, exist_ok):
+            order.append(("create_repo", private))
+
+        def update_repo_settings(self, *, repo_id, repo_type, private):
+            order.append(("update_settings", private))
+
+        def upload_folder(self, **kw):
+            order.append(("upload", None))
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        private=True,
+    )
+    # Locked private BEFORE the upload (no post-upload visibility flip needed for a private export).
+    assert order == [("create_repo", True), ("update_settings", True), ("upload", None)]
+
+
 def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_from_env")
     seen: dict = {}

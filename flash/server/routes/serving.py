@@ -230,6 +230,10 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             status_code=400,
             detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
         )
+    # Use the CANONICAL ``owner/name`` form downstream (and in the echoed URL), not the raw input: a
+    # value like ``/owner/name`` or ``owner/name/`` passes validation but would otherwise reach HF and
+    # the returned url with stray slashes.
+    repository = "/".join(parts)
     hf_token = str(payload.get("hf_token") or "").strip()
     if not hf_token:
         raise HTTPException(

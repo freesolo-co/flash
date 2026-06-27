@@ -106,10 +106,16 @@ def export_adapter(
         try:
             # Always create/ensure the repo PRIVATE first: a brand-new public repo would otherwise be
             # exposed (empty, then partial) for the whole upload, and a failed upload would leave an
-            # empty PUBLIC repo behind. Visibility is enforced AFTER the upload succeeds (below).
+            # empty PUBLIC repo behind.
             api.create_repo(
                 repo_id=dest_repo, repo_type="model", private=True, exist_ok=True
             )
+            # If the caller wants PRIVATE, enforce it BEFORE the upload: create_repo(exist_ok=True)
+            # won't change a PRE-EXISTING public repo's visibility, so without this the new weights
+            # would commit while that repo is still public. A PUBLIC export instead defers the flip to
+            # AFTER the upload (below) so an empty/partial repo is never exposed.
+            if private:
+                api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=True)
             # Upload this adapter's files and, in the SAME atomic commit, delete only the STALE ADAPTER
             # artifacts of a prior export (see _STALE_ADAPTER_DELETE_PATTERNS) so old weights can't
             # linger — without touching the user's unrelated repo files. delete_patterns runs against
@@ -122,12 +128,10 @@ def export_adapter(
                 commit_message=f"Export Freesolo adapter ({source_subfolder})",
                 delete_patterns=_STALE_ADAPTER_DELETE_PATTERNS,
             )
-            # Now that the adapter is committed, enforce the requested visibility. We created/ensured
-            # the repo private above and create_repo(exist_ok=True) never changes an existing repo's
-            # visibility, so this single call covers both a public export (exposed only now that it has
-            # content) and a re-export into a pre-existing repo whose visibility differs from the
-            # request.
-            api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=private)
+            # PUBLIC export: flip to public only now that the adapter is committed, so the repo is never
+            # exposed empty/partial.
+            if not private:
+                api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=False)
         except Exception as exc:
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc
     logger.info(
