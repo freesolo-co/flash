@@ -17,7 +17,6 @@ from flash.engine.worker.lora import (
     assert_adapter_load_clean,
     assert_lora_applied,
     is_vl_checkpoint,
-    remap_vl_adapter_dir,
 )
 from flash.engine.worker.perf import optimal_attn_impl
 
@@ -141,7 +140,11 @@ def _init_adapter_model(model_id: str):
         import tempfile
 
         merged = model.merge_and_unload()
-        merged_dir = os.path.join(tempfile.gettempdir(), "flash_sft_merged")
+        # UNIQUE per call (mkdtemp): a fixed /tmp/flash_sft_merged would let two GRPO warm-starts on
+        # the SAME host clobber each other's merged weights (or load a partially-written tree). The
+        # dir is the run's training base, so it persists for the run (the worker is ephemeral); the
+        # old fixed path never cleaned up either, so uniqueness adds no leak it didn't already have.
+        merged_dir = tempfile.mkdtemp(prefix="flash_sft_merged_")
         merged.save_pretrained(merged_dir, safe_serialization=True)
         from transformers import AutoProcessor
 
@@ -149,7 +152,7 @@ def _init_adapter_model(model_id: str):
         # back to the bare tokenizer if no processor is published.
         try:
             AutoProcessor.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
-        except Exception:  # noqa: BLE001
+        except Exception:
             from transformers import AutoTokenizer
 
             AutoTokenizer.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
