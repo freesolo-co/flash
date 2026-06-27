@@ -20,12 +20,7 @@ def _iso(ts: float) -> str:
 
 
 def shape_endpoint_cost(rows: list[Any], *, endpoint_id: str | None) -> RealizedCost:
-    """Sum realized USD across the billing rows for ``endpoint_id``.
-
-    Each row is {endpointId, amount (USD), timeBilledMs, ...}. When ``endpoint_id`` is given we
-    keep only its rows (the response may be grouped/unfiltered); otherwise we sum everything
-    returned. RunPod's ``amount`` already includes disk, so it's reported as a single resource.
-    """
+    """Sum realized USD across billing rows; ``amount`` already includes disk."""
     total = 0.0
     billed_ms = 0
     for row in rows:

@@ -1,33 +1,8 @@
 """True token packing with a block-diagonal SDPA attention mask.
 
-Concatenate short SFT examples into ``max_length`` blocks and feed the trainer a 4D
-**block-diagonal causal** attention mask so packed examples never attend across their
-boundaries. Crucially this is boundary-correct under PLAIN SDPA — it needs neither
-``flash_attn`` (no prebuilt wheel for torch 2.10 / no sm120 kernel) nor ``flex_attention``
-(unsupported on the Qwen3.5/3.6 arch). It is exactly what lets packing run on flash's DEFAULT
-RTX 5090 (sm120), where the FA2/FA3 varlen path the worker otherwise relies on is unavailable,
-and on any arch whose flash-attn build did not land.
-
-Why packing is a win: instruction targets are far shorter than ``max_seq_len``, so an unpacked
-batch spends most of its FLOPs on padding. Concatenating examples into full blocks removes that
-waste (PR #174 measured 4.4-10.7x on the FA2 path; the SDPA-mask path keeps the same packing win
-minus the block-sparse-attention speedup FA2 varlen gives, so ~1.5-2x in practice). The dense
-[T,T] mask is O(T^2) memory, but attention is a small fraction of total FLOPs for these models,
-so the masked-attention overhead is dwarfed by the pad-removal win.
-
-GATING — pure full-attention only. A 4D mask isolates examples only in layers that READ the
-attention mask. Hybrid GatedDeltaNet models (Qwen3.5/3.6) interleave linear-attention layers
-whose recurrence + short causal conv1d carry state ACROSS example boundaries regardless of any
-mask — their boundaries reset only via the ``fla`` kernel's ``cu_seq_lens_q/k`` and
-``causal_conv1d``'s ``seq_idx``. So a pure full-attention arch (``model_is_pure_attention``) packs with the 4D mask
-alone, while a GDN hybrid ALSO needs the varlen path: ``BlockDiagonalCollator(emit_varlen=True)``
-emits ``cu_seq_lens_q/k`` + ``seq_idx``, gated on both kernels being importable + arch-correct
-(``gdn_packing_available`` + ``model_is_gdn_hybrid``). Without those kernels the hybrid tier stays
-unpacked.
-
-This is a leaf module: torch is imported lazily inside the collator so it stays CPU-importable
-(the arch probe needs only ``transformers.AutoConfig``). ``flash.engine.worker`` re-exports the
-public names.
+Works under plain SDPA (no flash-attn required), so it runs on sm120/RTX 5090.
+GDN hybrids (Qwen3.5/3.6) additionally need ``emit_varlen=True`` to reset linear-attention
+recurrence and causal conv across example boundaries.
 """
 
 from __future__ import annotations
@@ -36,26 +11,13 @@ from dataclasses import dataclass
 
 
 def _text_config(cfg):
-    """The decoder/LM sub-config. Multimodal checkpoints (Qwen3.5-VL) keep the LM dims under
-    ``text_config``; read it when present so the layer-type probe sees the real decoder."""
+    """Return the decoder sub-config (multimodal checkpoints nest it under ``text_config``)."""
     return getattr(cfg, "text_config", None) or cfg
 
 
 def model_is_pure_attention(model_id: str) -> bool:
-    """True only when EVERY decoder layer is full softmax attention, so a 4D block-diagonal mask
-    fully isolates packed examples under SDPA. Config-only probe (no weights, no CUDA). Returns
-    safe-False on any error or on a hybrid / linear-attention / sliding-window arch.
-
-    Excluded (return False):
-      * GatedDeltaNet hybrids (Qwen3.5/3.6): ``layer_types`` contains ``"linear_attention"`` (their
-        recurrence/conv cross boundaries a mask can't reset), or the config declares linear-attn
-        dims directly.
-      * Sliding-window models (e.g. Gemma): a layer typed ``"sliding_attention"`` applies a window
-        the model builds itself — passing a pre-built 4D mask BYPASSES that window (wrong
-        semantics), so exclude them too. Only ``"full_attention"`` everywhere is safe.
-
-    Included (return True): standard dense decoders (Llama/MiniCPM5, Qwen2/Qwen3) that expose no
-    per-layer ``layer_types`` and no linear-attn dims — every layer reads the mask.
+    """True when every decoder layer is full softmax attention (safe for 4D block-diagonal mask).
+    Returns False for GDN hybrids, sliding-window arches, and on any config error.
     """
     try:
         from transformers import AutoConfig
@@ -64,18 +26,11 @@ def model_is_pure_attention(model_id: str) -> bool:
         layer_types = getattr(cfg, "layer_types", None)
         if layer_types:
             return all(t == "full_attention" for t in layer_types)
-        # No per-layer types: still exclude anything that advertises a linear-attention (DeltaNet)
-        # block via its dims — a hybrid arch can omit layer_types but always sets these.
         for attr in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim"):
             if getattr(cfg, attr, None):
                 return False
-        # A GLOBALLY sliding-window model (no per-layer layer_types, e.g. Mistral / Qwen2 configs)
-        # builds its own LOCAL-attention causal mask; a pre-built full block-diagonal mask would
-        # BYPASS the window and train with global attention instead of the checkpoint's intended
-        # local attention. Exclude when a window is configured AND active: honor use_sliding_window
-        # when the config exposes it (Qwen2.5 ships a sliding_window value but DISABLES it via
-        # use_sliding_window=False -> still packs), else assume a configured window is active
-        # (Mistral-style configs have no such flag).
+        # Qwen2.5 has sliding_window but disables it via use_sliding_window=False -> still packs.
+        # Mistral-style has no use_sliding_window flag -> assume window is active.
         sliding = getattr(cfg, "sliding_window", None)
         return not (sliding and getattr(cfg, "use_sliding_window", True))
     except Exception as e:  # network/parse/arch failure -> do NOT pack (boundary-safe default)
@@ -84,11 +39,7 @@ def model_is_pure_attention(model_id: str) -> bool:
 
 
 def model_is_gdn_hybrid(model_id: str) -> bool:
-    """True for a GatedDeltaNet *hybrid* (Qwen3.5/3.6): the config interleaves ``"linear_attention"``
-    layers with full attention. These need the varlen GDN path (cu_seqlens + seq_idx) to pack
-    boundary-correctly — a 4D mask alone can't reset their recurrent/conv state. Distinct from the
-    sliding-window case (also non-pure, but NOT packable this way). Config-only; safe-False on error.
-    """
+    """True for a GatedDeltaNet hybrid (Qwen3.5/3.6) that needs cu_seqlens + seq_idx to pack."""
     try:
         from transformers import AutoConfig
 
@@ -96,7 +47,6 @@ def model_is_gdn_hybrid(model_id: str) -> bool:
         layer_types = getattr(cfg, "layer_types", None)
         if layer_types and any(t == "linear_attention" for t in layer_types):
             return True
-        # No layer_types but linear-attn dims declared -> still a GDN hybrid.
         return any(
             getattr(cfg, a, None)
             for a in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim")
@@ -107,12 +57,7 @@ def model_is_gdn_hybrid(model_id: str) -> bool:
 
 
 def _gdn_forward_threads_reset_kwargs(model_id: str | None) -> bool:
-    """Does THIS model's GatedDeltaNet forward actually thread cu_seq_lens_q AND seq_idx? Different GDN
-    families live in different modeling modules (qwen3_5 -> modeling_qwen3_5.Qwen3_5GatedDeltaNet, a
-    future qwen3_6 -> modeling_qwen3_6.Qwen3_6GatedDeltaNet), so resolve the ACTUAL arch from the
-    model's config and probe ITS DeltaNet class — a hardcoded qwen3_5 probe would wrongly pass for an
-    arch that drops the kwargs (or whose layer hard-codes seq_idx=None on an older transformers).
-    Falls back to qwen3_5 when no model_id is given. Safe-False on any failure."""
+    """Check that THIS arch's GDN forward actually accepts cu_seq_lens_q and seq_idx (varies by transformers version)."""
     try:
         import importlib
         import inspect
@@ -138,21 +83,9 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None) -> bool:
 
 
 def gdn_packing_available(model_id: str | None = None) -> bool:
-    """True only when BOTH varlen kernels a GatedDeltaNet hybrid needs to pack boundary-correctly are
-    importable: ``flash-linear-attention`` (resets the DeltaNet recurrence via ``cu_seq_lens_q/k`` — the
-    pure-torch fallback IGNORES it) AND ``causal_conv1d`` (resets the short causal conv via
-    ``seq_idx``). Without both, a packed GDN run would cross-contaminate across example boundaries,
-    so packing must stay off. GPU-validated (RTX 5090, Qwen3.5-0.8B): with both present, a packed
-    example's outputs are byte-identical regardless of its neighbors' content (zero information
-    leakage); the only difference vs unpacked is benign bf16 kernel-tiling numerics (~0.3 on logits,
-    the same order as flash-attn-vs-SDPA drift).
-
-    Two guards beyond the find_spec probes: (a) REALLY import causal_conv1d — its availability check
-    is find_spec-based, so a built-but-broken wheel (ABI/symbol mismatch) would pass it and then crash
-    at model load; (b) verify the INSTALLED Qwen3.5 DeltaNet forward actually threads cu_seq_lens_q AND
-    seq_idx — transformers 5.6-5.8 hard-coded seq_idx=None / dropped cu_seq_lens_q, so on those builds
-    the collator's reset kwargs are silently ignored and packed examples would still leak. Either
-    guard failing -> packing stays off (the model trains unpacked, safely)."""
+    """True when flash-linear-attention and causal_conv1d are both present, functional, and the
+    GDN forward actually threads cu_seq_lens_q + seq_idx (varies by transformers version).
+    """
     try:
         import importlib
 
@@ -163,14 +96,11 @@ def gdn_packing_available(model_id: str | None = None) -> bool:
 
         if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
             return False
-        importlib.import_module("causal_conv1d")  # (a) fail a built-but-broken wheel here, not at load
-        if not _gdn_forward_threads_reset_kwargs(model_id):  # (b) version/API gate, per ACTUAL arch
+        importlib.import_module("causal_conv1d")  # fail a built-but-broken ABI here, not at model load
+        if not _gdn_forward_threads_reset_kwargs(model_id):
             return False
-        # (c) RUN the conv kernel on the LIVE GPU: a causal_conv1d wheel compiled WITHOUT this device's
-        # arch imports fine but raises "CUDA error: no kernel image is available for execution on the
-        # device" at the FIRST forward — which would crash the run mid-train. A tiny conv here surfaces
-        # that now so packing stays off and the model trains unpacked instead. (fla's kernels are
-        # Triton-JIT — always compiled for the present arch — so they need no such smoke.)
+        # causal_conv1d compiled without the current GPU arch imports fine but raises at first forward;
+        # smoke it now so we fall back to unpacked rather than crashing mid-train.
         import torch
 
         if torch.cuda.is_available():
@@ -190,19 +120,10 @@ def pack_token_ids(
     max_length: int,
     completion_masks: list[list[int]] | None = None,
 ) -> list[dict]:
-    """Greedily bin-pack tokenized examples into blocks of at most ``max_length`` tokens WITHOUT
-    splitting an example (first-fit-decreasing, like TRL's ``bfd``: tighter blocks = less padding).
+    """First-fit-decreasing bin-pack into blocks of at most ``max_length`` tokens.
 
-    An example longer than ``max_length`` is truncated to a single full-length block (matches the
-    unpacked trainer's right-truncation). Empty sequences are dropped. Returns rows shaped
-    ``{"input_ids": [...], "seq_lengths": [l1, l2, ...]}`` where ``sum(seq_lengths) == len(input_ids)``
-    — the collator turns ``seq_lengths`` into the block-diagonal mask + per-example position_ids.
-
-    ``completion_masks`` (optional, parallel to ``sequences``): per-token completion flags (1 = a
-    completion token trained on, 0 = a prompt token masked from the loss). When provided, each packed
-    row additionally carries a ``"completion_mask"`` aligned with its ``"input_ids"`` so completion-
-    only SFT loss survives packing (the collator turns it into per-token label masking). Each mask is
-    truncated to ``max_length`` in lockstep with its sequence, so the per-example invariant holds.
+    Returns rows ``{"input_ids": [...], "seq_lengths": [...]}`` where ``sum(seq_lengths) == len(input_ids)``.
+    If ``completion_masks`` is provided, each row also carries ``"completion_mask"`` aligned with its ids.
     """
     if max_length <= 0:
         raise ValueError(f"max_length must be positive, got {max_length}")
@@ -210,16 +131,10 @@ def pack_token_ids(
         raise ValueError(
             f"completion_masks must be parallel to sequences: {len(completion_masks)} != {len(sequences)}"
         )
-    # Keep each sequence with its completion mask (if any) so truncation + the FFD reorder can't
-    # desync them. Drop empty sequences (and their masks) exactly as the no-mask path does.
     if completion_masks is None:
         items = [(s[:max_length], None) for s in sequences if s]
     else:
-        # Each SURVIVING (non-empty) mask must align 1:1 with its (pre-truncation) sequence — otherwise
-        # the lockstep ``m[:max_length]`` truncation below would leave a packed row whose
-        # completion_mask is misaligned with its input_ids, silently masking (or training on) the WRONG
-        # tokens. Validate up front so a caller bug fails loud here instead of corrupting the loss
-        # target. Empty sequences are dropped below regardless, so their mask length is irrelevant.
+        # Validate mask/sequence alignment before truncation so a mismatch fails loud here.
         for s, m in zip(sequences, completion_masks, strict=True):
             if s and len(m) != len(s):
                 raise ValueError(
@@ -230,9 +145,8 @@ def pack_token_ids(
             for s, m in zip(sequences, completion_masks, strict=True)
             if s
         ]
-    # First-fit-decreasing: place the longest examples first so the small ones fill the gaps.
     order = sorted(range(len(items)), key=lambda i: len(items[i][0]), reverse=True)
-    bins: list[dict] = []  # each: {"input_ids": [...], "seq_lengths": [...], "completion_mask"?, "free": int}
+    bins: list[dict] = []
     for i in order:
         s, m = items[i]
         need = len(s)
@@ -244,7 +158,7 @@ def pack_token_ids(
                     b["completion_mask"].extend(m)
                 b["free"] -= need
                 break
-        else:  # no open bin fits -> start a new one
+        else:
             nb = {"input_ids": list(s), "seq_lengths": [need], "free": max_length - need}
             if m is not None:
                 nb["completion_mask"] = list(m)
@@ -267,19 +181,7 @@ def packing_efficiency(rows: list[dict], max_length: int) -> float:
 
 
 def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[list[int]]:
-    """Tokenize chat-templated ``text`` rows for packing, MATCHING TRL's non-packed SFT prep EXACTLY
-    so a packed run trains on the SAME token sequences as the unpacked/FA2 path (no quality drift):
-      * append the EOS token to any row that doesn't already end with it — TRL's add_eos step does
-        this for the language-modeling ``text`` case, and skipping it would stop teaching the model
-        the final stop token (it'd never learn to halt);
-      * tokenize with the tokenizer's DEFAULT add_special_tokens — TRL's ``_tokenize`` for a non-
-        conversational ``text`` field calls ``processing_class(text=input)`` with no override, so for
-        Llama-family tokenizers (e.g. the MiniCPM pure-attention tier) it prepends BOS. Forcing
-        add_special_tokens=False here would drop that BOS and diverge from the unpacked path. (Qwen
-        tokenizers have no BOS, so the Qwen3.x / GDN tier is unaffected either way.)
-      * truncate to ``max_length`` (same cap pack_token_ids would apply) so a pathological long row
-        never materializes a huge id list; batched (one call) for speed.
-    """
+    """Tokenize texts for packing, matching TRL's non-packed SFT prep (EOS appended, default add_special_tokens)."""
     eos = tokenizer.eos_token or ""
     rows = [t if (eos and t.endswith(eos)) else t + eos for t in texts]
     enc = tokenizer(rows, truncation=True, max_length=max_length)  # default add_special_tokens (TRL parity)
@@ -287,27 +189,11 @@ def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[l
 
 
 def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list[int]:
-    """Token-level completion mask for completion-only SFT loss from ALREADY-tokenized prompt +
-    full-row ids: ``0`` over the shared prompt prefix, ``1`` over the surviving completion (the
-    assistant turn(s) the model must learn to generate). ``full_ids`` are the example's tokens from
-    :func:`tokenize_for_packing` (the SAME tokens the trainer sees); ``prompt_ids`` is the
-    chat-templated prompt (``add_generation_prompt=True``) tokenized the SAME way (default
-    ``add_special_tokens``, same truncation; NO appended EOS — the prompt never ends a turn), so the
-    two line up token-for-token over the shared prefix. The SFT pre-tokenizer batches ALL prompt
-    tokenizations into one call (no O(N) per-row tokenize) and feeds the ids straight in.
+    """Return per-token mask: 0 over the shared prompt prefix, 1 over the completion.
 
-    We mask the LONGEST SHARED TOKEN PREFIX rather than ``len(prompt_ids)`` so the boundary is robust
-    to the thinking chat template, whose ``add_generation_prompt=True`` render pre-opens ``<think>\\n``
-    — the prompt then diverges from the full render by a token; we mask up to that divergence and train
-    on everything after. This serves the same goal as TRL's own prompt-completion masking — mask the
-    prompt, train the completion — but is MORE robust: TRL keys the boundary off the prompt token
-    length, whereas we use the shared prefix, so a divergent prompt suffix (the pre-opened ``<think>``)
-    can't mis-place it. Done in flash's single pre-tokenization pass, so the unpacked and packed paths
-    share one boundary.
-
-    Returns ``[]`` for empty ``full_ids`` and an ALL-ZERO mask when the full row is entirely prompt
-    (``max_length`` truncation removed the whole completion); :func:`run_sft
-    <flash.engine.worker.sft.run_sft>` drops those no-completion-target rows before training.
+    Uses the longest shared token prefix rather than len(prompt_ids) so the boundary is robust to
+    the thinking template's pre-opened ``<think>\\n`` (which diverges from the full render by a token).
+    Returns ``[]`` for empty full_ids; all-zero when truncation removed the entire completion.
     """
     n_full = len(full_ids)
     if n_full == 0:
@@ -318,21 +204,11 @@ def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list
             break
         n += 1
     if n >= n_full:
-        # The full row's tokens are a prefix of / equal to the prompt: max_length truncation removed
-        # the ENTIRE completion. Mask the WHOLE row (all-prompt, no loss). The old ``min(n, n_full-1)``
-        # clamp instead forced the last PROMPT token to be a trainable "completion" target, teaching
-        # the model to reproduce prompt text; a packed bin still trains on its OTHER examples, and an
-        # unpacked all-prompt row simply becomes a no-op (all labels -100), dropped by run_sft.
         return [0] * n_full
-    # A real completion survived truncation: mask the shared prompt prefix, train on the rest (the
-    # ``n < n_full`` guarantees at least one completion token).
     return [0] * n + [1] * (n_full - n)
 
 
-# Process-local cache of the lower-triangular causal matrix: the collator runs on every batch, and
-# torch.tril(torch.ones(T, T)) is a non-trivial CPU alloc at T=2048+. Keep the LARGEST one seen and
-# slice it for smaller T (it's read-only). Dataloader workers are separate processes, so each holds
-# its own copy — no cross-thread race.
+# Cache the largest causal lower-triangular seen; slice for smaller T (read-only, per-process).
 _CAUSAL_TRIL: dict = {}
 
 
@@ -346,31 +222,13 @@ def _causal_lower_triangular(total: int, torch):
 
 @dataclass
 class BlockDiagonalCollator:
-    """Collate pre-packed rows (from :func:`pack_token_ids`) into a batch whose 4D **block-diagonal
-    causal** attention mask keeps packed examples from attending across their boundaries under
-    PLAIN SDPA — no flash-attn, no flex_attention.
+    """Collate pre-packed rows into a batch with a 4D block-diagonal causal attention mask (plain SDPA).
 
-    Emits per batch:
-      * ``input_ids``      ``[B, T]`` (right-padded with ``pad_token_id``)
-      * ``attention_mask`` ``[B, 1, T, T]`` BOOL — ``True`` = query may attend key. Block-diagonal
-        (same example) AND causal (key <= query). A bool mask is dtype-agnostic, so it composes
-        with bf16/fp16 runs without an ``-inf`` dtype mismatch. Pad tokens form their own segment
-        so no query row is all-False (which would NaN the softmax); pad rows never contribute to
-        loss (their labels are -100) and real tokens never attend pad keys.
-      * ``position_ids``   ``[B, T]`` reset to 0 at each example start (RoPE per example)
-      * ``labels``         ``[B, T]`` = ``input_ids`` for real tokens, with each example's FIRST
-        token set to -100 (so the cross-boundary next-token pair is never scored — matches the
-        unpacked trainer, whose first token is also never a target after HF's internal shift) and
-        pad set to -100.
+    Emits ``input_ids [B,T]``, ``attention_mask [B,1,T,T]`` bool, ``position_ids [B,T]`` (reset per
+    example), and ``labels [B,T]`` (-100 at boundaries and pad).
 
-    ``pad_to_multiple_of`` rounds T up (tensor-core friendliness); the extra positions are pad.
-
-    ``emit_varlen`` (GatedDeltaNet hybrids, e.g. Qwen3.5/3.6): additionally emit ``cu_seq_lens_q/k``
-    (resets the DeltaNet recurrence per example in the fla kernel) and ``seq_idx`` (resets the causal
-    conv in causal_conv1d) so the LINEAR-attention layers are boundary-correct too — the 4D mask only
-    fixes the full-attention layers. This path requires ``per_device_train_batch_size == 1`` (one
-    packed block per step; cu_seqlens spans that block) and does NOT pad (cu_seqlens must cover the
-    whole row), so set ``pad_to_multiple_of`` irrelevant here.
+    ``emit_varlen=True`` (GDN hybrids): also emits ``cu_seq_lens_q/k`` and ``seq_idx`` to reset
+    linear-attention recurrence and causal conv. Requires batch size == 1 and no padding.
     """
 
     pad_token_id: int
@@ -386,8 +244,6 @@ class BlockDiagonalCollator:
         bsz = len(rows)
         if self.emit_varlen and bsz != 1:
             raise ValueError("emit_varlen packing requires per_device_train_batch_size == 1")
-        # Fail fast on a broken row rather than silently mis-tag tokens as pad (or vice versa): the
-        # whole mask/labels/cu_seqlens construction assumes sum(seq_lengths) == len(input_ids).
         for ids, lens in zip(rows, seglens, strict=True):
             if sum(lens) != len(ids):
                 raise ValueError(
@@ -396,15 +252,13 @@ class BlockDiagonalCollator:
                 )
         longest = max((len(r) for r in rows), default=0)
         m = self.pad_to_multiple_of
-        # No padding on the varlen path: cu_seqlens must cover the whole sequence (a trailing pad
-        # region not spanned by cu_seqlens would break the fla varlen kernel).
+        # No padding on the varlen path: trailing pad not covered by cu_seqlens breaks the fla kernel.
         total = longest if self.emit_varlen else (((longest + m - 1) // m) * m if m and m > 1 else longest)
         total = max(total, 1)
 
         input_ids = torch.full((bsz, total), self.pad_token_id, dtype=torch.long)
         position_ids = torch.zeros((bsz, total), dtype=torch.long)
-        # segment id per token: 0..k-1 for the k examples in the block, -1 for trailing pad.
-        seg = torch.full((bsz, total), -1, dtype=torch.long)
+        seg = torch.full((bsz, total), -1, dtype=torch.long)  # -1 for pad, 0..k-1 per example
 
         for b, (ids, lens) in enumerate(zip(rows, seglens, strict=True)):
             n = len(ids)
@@ -416,51 +270,28 @@ class BlockDiagonalCollator:
                 seg[b, start:end] = ex_idx
                 start = end
 
-        # Block-diagonal causal mask, fully vectorized:
-        #   same-example: seg[q] == seg[k]   (pad shares segment -1, so pad rows attend pad -> no
-        #                 all-False row; real tokens never attend pad because real seg != -1)
-        #   causal:       k <= q
+        # Pad shares segment -1 so no query row is all-False (which would NaN softmax).
         same = seg.unsqueeze(2) == seg.unsqueeze(1)  # [B, T, T]
-        causal = _causal_lower_triangular(total, torch)  # cached + sliced (not rebuilt per batch)
+        causal = _causal_lower_triangular(total, torch)
         attention_mask = (same & causal).unsqueeze(1)  # [B, 1, T, T]
 
-        # Labels: real tokens predict their own continuation; first token of each example (and all
-        # pad) -> ignore. position_ids == 0 marks exactly each example's first token (pad is 0 too,
-        # and pad is already excluded below), so the boundary next-token pair is never scored.
         labels = input_ids.clone()
         labels[seg < 0] = self.label_pad_token_id
-        labels[position_ids == 0] = self.label_pad_token_id
+        labels[position_ids == 0] = self.label_pad_token_id  # first token of each example
 
-        # Completion-only loss under packing: when the packed rows carry per-token completion masks
-        # (1 = completion token trained on, 0 = prompt token), additionally ignore every prompt token
-        # so the loss matches the unpacked completion_only_loss path. Each mask spans only its row's
-        # REAL tokens (sum(seq_lengths)); trailing pad keeps its already-ignored label. Prompt-start
-        # tokens are mask 0 here AND position_ids == 0 above, so the two masks agree at boundaries.
         if any("completion_mask" in f for f in features):
-            keep = torch.zeros((bsz, total), dtype=torch.bool)  # True == contributes to the loss
+            keep = torch.zeros((bsz, total), dtype=torch.bool)
             for b, f in enumerate(features):
                 cm = f.get("completion_mask")
                 if cm is None:
-                    # A row WITHOUT a completion_mask in a mixed batch keeps ALL its tokens (full-
-                    # transcript loss), rather than being silently zeroed out. Pad/boundary tokens were
-                    # already set to -100 above and keep=True can't un-mask them (``labels[~keep]`` only
-                    # ADDS masking), so this just avoids dropping the loss for an unmasked row. An
-                    # explicit None is the ONLY "no mask" signal — an empty list on a real row is a bug
-                    # (caught by the length check below), not a silent "keep all".
-                    keep[b, :] = True
+                    keep[b, :] = True  # no mask -> full-transcript loss
                     continue
-                # A present mask must align 1:1 with the row's REAL (pre-pad) tokens: the mask spans
-                # sum(seq_lengths) == len(input_ids) (the invariant asserted above). Silently slicing a
-                # mis-sized mask would shift the prompt/completion boundary and train on the wrong
-                # positions, so fail loud instead of guessing.
                 n_real = len(rows[b])
                 if len(cm) != n_real:
                     raise ValueError(
                         f"completion_mask length {len(cm)} != row real-token count {n_real} "
                         "(mask must span sum(seq_lengths) == len(input_ids))"
                     )
-                # completion_mask is 0/1 ints -> a direct bool tensor (non-zero == True) avoids a
-                # per-token Python list comprehension on every batch.
                 keep[b, :n_real] = torch.tensor(cm, dtype=torch.bool)
             labels[~keep] = self.label_pad_token_id
 
@@ -471,10 +302,6 @@ class BlockDiagonalCollator:
             "labels": labels,
         }
         if self.emit_varlen:
-            # bsz == 1 (asserted above): cu_seqlens covers this one block's examples, and seq_idx is
-            # the per-token segment id (no pad on this path, so seg has no -1). These reach the
-            # linear-attention layers via model(**batch) -> the fla chunk kernel (cu_seq_lens_q) and
-            # causal_conv1d (seq_idx), resetting their state at each example boundary.
             lens = seglens[0]
             cu = torch.zeros(len(lens) + 1, dtype=torch.int32)
             cu[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
