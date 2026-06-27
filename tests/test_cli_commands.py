@@ -95,6 +95,24 @@ class _FakeClient:
         yield "4"
         yield "2"
 
+    def export(
+        self,
+        run_id: str,
+        *,
+        repository: str,
+        hf_token: str,
+        step: int | None = None,
+        private: bool = True,
+    ) -> dict:
+        self.calls.append(("export", run_id, repository, hf_token, step, private))
+        return {
+            "run_id": run_id,
+            "adapter_id": run_id,
+            "repository": repository,
+            "url": f"https://huggingface.co/{repository}",
+            "source": "org/runs:rl/x/seed0/adapter",
+        }
+
 
 @pytest.fixture
 def fake_client(monkeypatch) -> _FakeClient:
@@ -355,3 +373,48 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
         ),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
+
+
+def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:
+    # The --api-key flag is the destination HF token; --step and --public are forwarded.
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    assert (
+        _run(
+            [
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "me/adapters",
+                "--api-key",
+                "hf_flag",
+                "--step",
+                "40",
+                "--public",
+            ]
+        )
+        == 0
+    )
+    assert ("export", "flash-1", "me/adapters", "hf_flag", 40, False) in fake_client.calls
+    # The destination repo / url are reported back to the user.
+    out = capsys.readouterr().out
+    assert "me/adapters" in out
+
+
+def test_export_reads_hf_token_from_env_and_defaults_private(fake_client, monkeypatch) -> None:
+    # No --api-key: the token resolves from HF_TOKEN, and the repo defaults to private.
+    monkeypatch.setenv("HF_TOKEN", "hf_env")
+    assert _run(["export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 0
+    assert ("export", "flash-1", "me/adapters", "hf_env", None, True) in fake_client.calls
+
+
+def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, tmp_path) -> None:
+    for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    # A clean cwd so a stray local .env can't supply a token.
+    monkeypatch.chdir(tmp_path)
+    assert _run(["export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 1
+    err = capsys.readouterr().err
+    assert "HuggingFace token" in err
+    # The control plane is never contacted when there's no token to send.
+    assert not any(call[0] == "export" for call in fake_client.calls)

@@ -535,11 +535,11 @@ def _patch_runpod_backoff() -> None:
 def min_cuda_for(friendly_gpu: str) -> str:
     """Minimum host CUDA (driver) version for this GPU class on the active stack.
 
-    Blackwell classes (sm_120 — RTX 5090, RTX Pro 6000): pypi wheels for
-    the modern stack (vllm 0.19) ship no Blackwell SASS, so every custom CUDA kernel
-    is PTX-JIT'd by the driver — and their PTX is built with a newer toolchain than
-    CUDA-12.8-era drivers can JIT (observed: "the provided PTX was compiled with an
-    unsupported toolchain" on driver 570.x). CUDA-13 drivers JIT it fine, so those
+    Blackwell classes (consumer sm_120 — RTX 5090, RTX Pro 6000; datacenter sm_100 —
+    B200): pypi wheels for the modern stack (vllm 0.19) ship no Blackwell SASS, so every
+    custom CUDA kernel is PTX-JIT'd by the driver — and their PTX is built with a newer
+    toolchain than CUDA-12.8-era drivers can JIT (observed: "the provided PTX was compiled
+    with an unsupported toolchain" on driver 570.x). CUDA-13 drivers JIT it fine, so those
     classes are pinned to >=13.0 on the modern stack (per-GPU ``min_cuda_modern`` in
     providers.base.GPU_INFO). Ampere/Ada/Hopper have SASS in the wheels and run on 12.8.
     Fully managed per-GPU (no override).

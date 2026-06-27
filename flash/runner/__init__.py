@@ -117,9 +117,7 @@ class RunStatus:
     def to_dict(self) -> dict:
         data = asdict(self)
         data["adapter_ref"] = (
-            _adapter_ref_from_status_spec(self.spec)
-            if self.state in {"done", "deployed"}
-            else None
+            _adapter_ref_from_status_spec(self.spec) if self.state in {"done", "deployed"} else None
         )
         return data
 
@@ -285,8 +283,28 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 WEIGHT_CACHE_VOLUME_GB = 100
 
+# Peak HF footprint during a cold download ~= the persisted bf16 checkpoint + Xet/incremental temp
+# ~= 2x the bf16 download. (This is exactly why the 35B MoE's catalog ``min_disk_gb`` is 200, not the
+# cache size — see its catalog comment.) A model whose peak doesn't fit the fixed cache volume must
+# stay cache-less, or HF_HOME would redirect onto the undersized mount and snapshot_download fills it.
+_WEIGHT_CACHE_PEAK_FACTOR = 2.0
 
-def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
+
+def _fits_weight_cache(info: ModelInfo) -> bool:
+    """Whether a model's cold HF download fits the fixed shared weight-cache volume WITH temp headroom.
+
+    Attaching the shared cache redirects HF_HOME onto a fixed ``WEIGHT_CACHE_VOLUME_GB`` mount, so the
+    download's PEAK footprint (checkpoint + Xet temp, ~= ``_WEIGHT_CACHE_PEAK_FACTOR`` x the bf16
+    download) must fit. A model that doesn't fit (e.g. the ~70 GB Qwen3.6-35B-A3B, whose peak ~140 GB
+    exceeds the 100 GB cache) is left cache-less so HF_HOME stays on the larger container disk (sized
+    by the catalog ``min_disk_gb``) instead of overflowing the mount mid-download."""
+    if not info.params_b:
+        return True  # unknown size -> keep the (attach) default; curated catalog models always set it
+    download_gb = info.params_b * 2.0  # bf16: 2 bytes/param (mirrors cost.facts.download_weight_gb)
+    return _WEIGHT_CACHE_PEAK_FACTOR * download_gb <= WEIGHT_CACHE_VOLUME_GB
+
+
+def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:
     """Attach the shared, platform-managed weight-cache volume — ONLY for PUBLIC catalog models.
 
     Platform-managed (never user config), exactly like the managed HF repo: assigned here, not
@@ -313,9 +331,19 @@ def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
     mount. A different (per-org / custom) volume name on an open run is left intact: that's the
     escape-hatch isolation, not the shared cache.
 
+    SIZE GATE: the cache is a FIXED ``WEIGHT_CACHE_VOLUME_GB`` mount and attaching it redirects HF_HOME
+    onto it, so a model whose cold download wouldn't fit (``_fits_weight_cache``, e.g. the ~70 GB 35B
+    MoE on a 100 GB cache) is left cache-less — HF_HOME stays on the larger container disk instead of
+    overflowing the mount mid-``snapshot_download``. Requires ``info`` (the resolved ``ModelInfo``); a
+    bare ``info=None`` call skips the size gate (preserves the legacy attach-by-policy behavior).
+
     Outcomes: (a) open-model run -> never on the SHARED cache (strip it if pre-set; keep a non-shared
-    volume); (b) catalog run with a pre-set volume -> left as-is (explicit/test assignment honored);
-    (c) catalog run with no volume -> attach the shared cache.
+    volume); (b) catalog run with a pre-set NON-shared volume -> left as-is (explicit/test assignment
+    honored); (b') catalog run with a pre-set SHARED-cache name whose download EXCEEDS the cache ->
+    stripped to cache-less (the size gate re-applies so a stale/programmatic ``flash-weights`` pin
+    can't overflow the mount); (c) catalog run with no volume that FITS the cache -> attach the shared
+    cache; (d) catalog run with no volume whose download exceeds the cache -> left cache-less (download
+    to the container disk instead).
 
     See the module-level TRUST MODEL note above for the shared-cache integrity tradeoff (a run's env
     code has write access to the shared mount; RO mount isn't SDK-expressible yet).
@@ -333,7 +361,22 @@ def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
             return JobSpec.from_dict(d)
         return spec  # no shared cache to strip (cache-less already, or a non-shared escape-hatch volume)
     if existing:
+        # A pre-set volume is normally honored as an explicit/test assignment. EXCEPTION: the SIZE
+        # GATE also applies to a pre-set SHARED-cache name — a programmatic or stale spec that already
+        # pinned ``flash-weights`` must NOT let an oversized model (the 35B MoE) bypass the gate below
+        # and redirect HF_HOME onto the fixed mount, overflowing it mid-download. Strip it (force
+        # cache-less) in that case. A non-shared (per-org / custom) volume is left intact — the caller
+        # owns its sizing — so only the managed shared name is re-gated here.
+        if existing == WEIGHT_CACHE_VOLUME_NAME and info is not None and not _fits_weight_cache(info):
+            d = spec.to_dict()
+            d["gpu"] = {**d["gpu"], "network_volume": None}
+            return JobSpec.from_dict(d)
         return spec  # catalog run with an explicit/test volume already assigned — honor it
+    # SIZE GATE: don't pin a model whose cold download won't fit the fixed shared cache — HF_HOME would
+    # redirect onto the undersized mount and snapshot_download would fill it ("No space left"). Such a
+    # model stays cache-less so HF_HOME stays on the container disk (sized by the catalog min_disk_gb).
+    if info is not None and not _fits_weight_cache(info):
+        return spec
     d = spec.to_dict()
     d["gpu"] = {
         **d["gpu"],
@@ -415,8 +458,10 @@ def submit_job(
     spec = _assign_managed_hf_repo(spec)
     # Attach the shared model-weight cache (platform-managed). Before the RunStatus build so a
     # dry-run spec carries it too (the dry-run short-circuits below) — keeps the assignment testable
-    # without a real provision and visible in `flash status`.
-    spec = _assign_weight_cache_volume(spec)
+    # without a real provision and visible in `flash status`. ``info`` (the resolved ModelInfo) lets
+    # the size gate leave an oversized model (e.g. the 35B MoE) cache-less rather than overflow the
+    # fixed-size mount.
+    spec = _assign_weight_cache_volume(spec, info)
     # NB: the env ref->sha pin (_assign_resolved_env_sha) makes a GitHub commits-API call, so it is
     # deliberately NOT done here, on the run-creation critical path. The status is created + saved +
     # reported FIRST (below) so creation never blocks/delays on a slow or rate-limited GitHub — the
@@ -475,6 +520,17 @@ def list_runs() -> list[RunStatus]:
             with open(os.path.join(RUNS_DIR, name)) as f:
                 runs.append(RunStatus(**json.load(f)))
     return runs
+
+
+def list_run_ids() -> list[str]:
+    """Run ids from RUNS_DIR by FILENAME only (no JSON parse), so a single corrupt or legacy
+    status file can't make the listing itself raise. A caller that must tolerate bad records --
+    e.g. the billing-charge recovery sweep, which has to keep charging every other eligible run --
+    pairs this with ``get_status(id)`` under its own per-run error handling."""
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    return [
+        name[: -len(".json")] for name in sorted(os.listdir(RUNS_DIR)) if name.endswith(".json")
+    ]
 
 
 def get_logs(run_id: str) -> str:
@@ -632,6 +688,75 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
             return
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
+        status.updated_at = time.time()
+        _save_status(status)
+    _report_status(status)
+
+
+# Billing fields that are field-only metadata, never a run-state transition.
+_BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
+
+# States whose `finished_at` (training-teardown time) must be preserved across a later field-only
+# write that bumps `updated_at`. This is exactly the set reconciliation costs by run end: the terminal
+# states PLUS `deployed` -- a deployed run is non-terminal but its training is finished and its cost is
+# final, so reconcile treats it as reconcilable and falls back to `updated_at` when `finished_at` is
+# missing (flash/server/reconcile.py: _RECONCILABLE_STATES / _terminal_ts). `dry_run` is terminal but
+# free, so preserving its timestamp is harmless and keeps this aligned with TERMINAL_STATES. Mirrored
+# here (not imported) because reconcile imports runner, not the reverse.
+_FINISHED_AT_PRESERVED_STATES = TERMINAL_STATES | {"deployed"}
+
+
+def record_billing_state(run_id: str, **fields) -> None:
+    """Persist the customer-billing fields (billing_state/billing_error/billing_charge) WITHOUT
+    touching the run's state. Like ``record_realized_cost``, it re-reads the run UNDER the lock and
+    writes only the billing columns, so a run that advanced (e.g. ``done`` -> ``deployed`` via a
+    concurrent ``mark_deployed``) keeps its current state. The completion-charge hook must use this
+    rather than ``_update(run_id, get_status(run_id).state, ...)``: that read-state-then-write pattern
+    samples the state OUTSIDE the lock, so a deploy landing between the read and ``_update`` taking the
+    lock would let the stale state clobber ``deployed``. No-ops if the run vanished.
+
+    Two race-correctness guards, both decided under the lock:
+    - NEVER downgrade an already-``charged`` run: if the persisted billing_state is ``charged`` and
+      this write would set it to anything else (a racing duplicate attempt that timed out / hit a
+      transient BillingError after another attempt already landed the charge), the whole write is a
+      no-op. The backend is idempotent by runId, so the charge stands; the local state must not be
+      flipped back to ``failed``/``charging`` and re-retried.
+    - PRESERVE the teardown timestamp: a legacy run in a RECONCILED state with ``finished_at is None``
+      must backfill it from the PRE-update ``updated_at`` (the prior persisted teardown time) before
+      this write bumps ``updated_at``. This covers the terminal states AND ``deployed`` (non-terminal
+      but reconciled -- see _FINISHED_AT_PRESERVED_STATES). Otherwise reconcile._terminal_ts (which
+      falls back to updated_at when finished_at is missing) would treat this billing-retry time as the
+      run end, delaying/windowing reconciliation and over-billing flat-rate remotes. Skipped once
+      ``reconciled_at`` is set (matching mark_deployed): by then ``updated_at`` is the reconcile time,
+      not teardown, so freezing it would be wrong -- and a reconciled run is never re-billed anyway."""
+    bad = set(fields) - _BILLING_FIELDS
+    if bad:
+        raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
+    with _STATUS_LOCK:
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        # Don't let a racing failed/charging write downgrade a charge another attempt already landed.
+        new_billing_state = fields.get("billing_state")
+        if (
+            status.billing_state == "charged"
+            and "billing_state" in fields
+            and new_billing_state != "charged"
+        ):
+            return
+        # Freeze the prior teardown time before this field-only write advances updated_at, so a
+        # billing retry never shifts the run end reconcile reads. Covers terminal states AND the
+        # reconciled-but-non-terminal `deployed` (see _FINISHED_AT_PRESERVED_STATES); skipped once
+        # reconciled (updated_at is then the reconcile time, not teardown).
+        if (
+            status.state in _FINISHED_AT_PRESERVED_STATES
+            and status.finished_at is None
+            and not status.reconciled_at
+        ):
+            status.finished_at = status.updated_at
+        for key, value in fields.items():
+            setattr(status, key, value)
         status.updated_at = time.time()
         _save_status(status)
     _report_status(status)

@@ -120,10 +120,16 @@ class RunpodProvider:
 
         terminate_endpoint(spec.gpu.type, spec.run_id)
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
+    def sweep_orphans(
+        self,
+        active_labels: set[str] | None = None,
+        known_labels: set[str] | None = None,
+    ) -> list[int]:
         # No-op: RunPod serverless endpoints have no standing per-run billing to reap on
         # crash recovery (a failed-before-submit endpoint is GC'd by reconstructed name in
-        # recover_runs). Present for the ``base.Provider`` protocol.
+        # recover_runs). Idle/orphaned endpoints are handled by the server's run-aware idle reaper
+        # (`_sweep_idle_flash_endpoints`), which has its own multi-plane scoping. ``known_labels`` is
+        # accepted for protocol parity. Present for the ``base.Provider`` protocol.
         return []
 
 

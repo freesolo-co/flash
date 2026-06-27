@@ -66,6 +66,16 @@ jobs:
               gpu_type_id: "NVIDIA RTX PRO 6000 Blackwell Server Edition",
               allowed_cuda: "13.0",
             }
+          # Datacenter Blackwell (sm100, distinct from the sm120 RTX Pro 6000). B200 has 180 GB and
+          # good secure-cloud capacity. CUDA-13 host like the other Blackwell parts. NOT in the default
+          # `sms` list yet (B200 is unvalidated) -- bake it explicitly via `sms=sm100` until a smoke
+          # passes, then add it to the default.
+          - {
+              sm: sm100,
+              arch: "10.0",
+              gpu_type_id: "NVIDIA B200",
+              allowed_cuda: "13.0",
+            }
     steps:
       - uses: actions/checkout@v6
 

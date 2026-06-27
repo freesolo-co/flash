@@ -31,10 +31,18 @@ from flash.runner.checkpoints import list_checkpoints
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.serve.deploy import deploy_adapter, undeploy_adapter
+from flash.serve.export import export_adapter
 
 from . import db
 from ._locks import _DEPLOY_LOCKS, _deploy_lock
-from ._runtime import _RECOVERABLE, _reconcile_cost_loop, _worker_artifacts, recover_runs
+from ._runtime import (
+    _RECOVERABLE,
+    _charge_retry_loop,
+    _charge_retry_startup,
+    _reconcile_cost_loop,
+    _worker_artifacts,
+    recover_runs,
+)
 
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
@@ -52,11 +60,14 @@ _log = logging.getLogger("flash.server")
 __all__ = [
     "_DEPLOY_LOCKS",
     "_RECOVERABLE",
+    "_charge_retry_loop",
+    "_charge_retry_startup",
     "_deploy_lock",
     "_reconcile_cost_loop",
     "_worker_artifacts",
     "create_app",
     "deploy_adapter",
+    "export_adapter",
     "get_status",
     "list_checkpoints",
     "recover_runs",
@@ -68,45 +79,61 @@ __all__ = [
 ]
 
 
-def _protected_train_endpoint_names() -> set[str]:
-    """Training-endpoint names that must NEVER be reaped: every endpoint tied to a LIVE
-    (non-terminal) run, in both the bare ``flash-...`` and SDK ``live-flash-...`` forms.
+def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
+    """Training-endpoint names derived from the run registry, in the CANONICAL (bare ``flash-...``)
+    form — the reaper canonicalizes the ``live-flash-...`` names RunPod lists before comparing, so
+    one form per name suffices. Includes both the run's persisted handle name and the name re-derived
+    from its spec, so a run is covered even in the submit -> handle-persisted window.
 
-    Derived from the run registry so the reaper can't delete a run that's merely idle between
-    jobs/seeds. Includes both the run's persisted handle name and the name re-derived from its
-    spec, so a run is protected even in the submit -> handle-persisted provisioning window.
-    """
+    ``include_terminal=False`` yields the PROTECTED set (live, non-terminal runs only) — endpoints
+    the reaper must never delete, even when momentarily idle between seeds. ``include_terminal=True``
+    yields the KNOWN set (every run this plane has a record of) — used to SCOPE the reaper to this
+    plane's own endpoints (multi-plane safety; see ``_sweep_idle_flash_endpoints``)."""
     from flash.providers.base import canonical_gpu
+    from flash.providers.runpod.jobs import canonical_endpoint_name
     from flash.providers.runpod.train import _run_suffix, endpoint_name
     from flash.runner import TERMINAL_STATES
 
     names: set[str] = set()
 
-    def _protect(name: str | None) -> None:
+    def _add(name: str | None) -> None:
         if name:
-            names.add(name)
-            names.add(f"live-{name}")
+            names.add(canonical_endpoint_name(name))
 
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
         except FileNotFoundError:
             continue
-        if status.state in TERMINAL_STATES:
+        if not include_terminal and status.state in TERMINAL_STATES:
             continue
-        _protect((status.remote or {}).get("endpoint_name"))
+        _add((status.remote or {}).get("endpoint_name"))
         gpu = ((status.spec or {}).get("gpu") or {}).get("type")
         if gpu:
             with contextlib.suppress(Exception):
-                _protect(endpoint_name(canonical_gpu(gpu), _run_suffix(status.run_id)))
+                _add(endpoint_name(canonical_gpu(gpu), _run_suffix(status.run_id)))
     return names
+
+
+def _protected_train_endpoint_names() -> set[str]:
+    """Endpoint names tied to a LIVE (non-terminal) run — never reaped (see ``_train_endpoint_names``)."""
+    return _train_endpoint_names(include_terminal=False)
+
+
+def _known_train_endpoint_names() -> set[str]:
+    """Endpoint names for EVERY run this plane has a record of — the reaper's multi-plane scope."""
+    return _train_endpoint_names(include_terminal=True)
 
 
 def _reap_idle_endpoints_once(min_idle_s: float) -> int:
     """One run-aware sweep of idle, orphaned RunPod training endpoints. Returns count deleted."""
     from flash.providers.runpod.jobs import _sweep_idle_flash_endpoints
 
-    return _sweep_idle_flash_endpoints(_protected_train_endpoint_names(), min_idle_s=min_idle_s)
+    return _sweep_idle_flash_endpoints(
+        _protected_train_endpoint_names(),
+        min_idle_s=min_idle_s,
+        known=_known_train_endpoint_names(),
+    )
 
 
 async def _reap_idle_endpoints_loop() -> None:
@@ -176,6 +203,27 @@ def _active_run_ids() -> set[str]:
     return ids
 
 
+def _known_run_ids() -> set[str]:
+    """Every run id THIS control plane has a record of, in ANY state — the universe of instances it
+    may attribute to itself. Passed to the instance providers' ``sweep_orphans`` as ``known_labels``
+    so the sweep reaps only boxes whose label maps to one of our own runs.
+
+    This is the multi-plane safety guard. Two control planes sharing one provider account carry
+    DISJOINT run ids (server-assigned ``flash-<ts>-<rand>``). Without it, each plane's sweep sees the
+    OTHER's live boxes, finds their run ids absent from its ``_active_run_ids``, and reaps them — the
+    two planes mutually execute each other's running training instances every sweep. Scoping the reap
+    to ``known_labels`` makes a plane skip any box whose run id it has never issued. Read straight off
+    the run registry (no ``get_status`` per row needed — only the id matters), and like
+    ``_active_run_ids`` it is passed as a CALLABLE so it is resolved AFTER the provider lists.
+
+    Trade-off (deliberate): a box whose run record this plane has fully LOST (e.g. a wiped state dir)
+    is no longer auto-reaped — it is indistinguishable from another plane's box, so erring toward not
+    destroying it is the safe choice; reclaim such strays out of band. Single-plane production is
+    unaffected: the durable registry holds every run it launched, so every genuine orphan stays
+    reapable."""
+    return {row["run_id"] for row in db.all_runs()}
+
+
 def _sweep_orphan_instances_once() -> int:
     """One run-aware sweep of orphaned instance-provider workers — Lambda instances whose run
     finished or crashed without the per-run ``finally`` tearing them down. Returns the count torn
@@ -194,7 +242,9 @@ def _sweep_orphan_instances_once() -> int:
     torn = 0
     for prov in configured_providers():
         try:
-            deleted = prov.sweep_orphans(active_labels=_active_run_ids)
+            deleted = prov.sweep_orphans(
+                active_labels=_active_run_ids, known_labels=_known_run_ids
+            )
         except Exception:
             # One provider's API blip / outage must not skip the others — and must NOT be silent
             # (the loop docstring promises failures are logged + retried next cycle), so a
@@ -251,10 +301,21 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         from flash.providers.preflight import check_run_preflight
+        from flash.server.billing_retry import charge_retry_enabled
         from flash.server.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
+        # Recover completion-time customer charges left pending/failed by a transient blip or a
+        # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
+        # `done`, so those would otherwise leak revenue; this startup sweep catches them promptly.
+        # Idempotent by runId on the backend, so it can't double-charge. Scheduled as a BACKGROUND
+        # task (not awaited before `yield`): with a backlog of pending charges and a slow/down billing
+        # backend, each charge can wait the full billing timeout, so awaiting it inline would delay
+        # accepting traffic by minutes. Best-effort; cancelled cleanly at shutdown below.
+        startup_charge_task = (
+            asyncio.create_task(_charge_retry_startup()) if charge_retry_enabled() else None
+        )
         # Reconcile the shared RunPod endpoint-slot quota against the live endpoint list so a
         # crash can't leak slots permanently (no-op without an internal key). Best-effort.
         with contextlib.suppress(Exception):
@@ -264,6 +325,11 @@ def create_app():
         # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
         # internal key is configured.
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
+        # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
+        # so it can't leak revenue. Same internal-key gate as the charge itself.
+        charge_task = (
+            asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
+        )
         # Periodic idle-endpoint reaper: proactively delete RunPod training endpoints doing
         # nothing (orphans from finished/crashed runs) so workers don't linger holding quota.
         # Only when this plane manages RunPod (its API key is configured).
@@ -283,7 +349,7 @@ def create_app():
         try:
             yield
         finally:
-            for task in (cost_task, reap_task, sweep_task):
+            for task in (startup_charge_task, cost_task, charge_task, reap_task, sweep_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
