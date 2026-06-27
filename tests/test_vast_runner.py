@@ -978,6 +978,33 @@ def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
     assert destroyed == [1]
 
 
+def test_run_instances_remaining_confirms_clear_and_raises_on_listing_failure(monkeypatch):
+    # Codex: the handle-less recovery resubmit gates on this. [] == CONFIRMED no instance for the run
+    # remains; a survivor (e.g. after an unconfirmed DELETE) is reported by id; it matches on the SAME
+    # label boundary as destroy_run_instances (run1 must not match run10). A listing failure RAISES so
+    # the caller can't mistake "couldn't list" for "clear".
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    instances = [
+        {"id": 9, "label": "flash-run1-s0-a0"},  # ours -> remaining
+        {"id": 10, "label": "flash-run10-s0-a0"},  # different run (boundary) -> NOT ours
+        {"id": 11, "label": "someone-else"},  # not ours
+    ]
+    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    assert vast.run_instances_remaining("run1") == [9]
+
+    monkeypatch.setattr(vast_api, "list_instances", lambda: [])
+    assert vast.run_instances_remaining("run1") == []  # confirmed clear
+
+    def boom():
+        raise vast_api.VastApiError("list failed")
+
+    monkeypatch.setattr(vast_api, "list_instances", boom)
+    with pytest.raises(vast_api.VastApiError):
+        vast.run_instances_remaining("run1")  # cannot confirm clear -> RAISE (caller defers)
+
+
 def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
     """Copilot Mtnjw/Mtnj2: destroy_run_instances and sweep_orphans are documented "never raises", but
     a bare int(iid) on a non-intable id (unexpected Vast API shape) would raise mid-loop and abort the

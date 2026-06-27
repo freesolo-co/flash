@@ -474,6 +474,16 @@ class Provider(Protocol):
         """Best-effort: reap any resource this run may have left registered."""
         ...
 
+    def run_instances_remaining(self, run_id: str) -> list[int]:
+        """Optional (instance providers): ids of billable resources STILL carrying this run's label,
+        after a ``gc``. Empty == CONFIRMED clear; non-empty == a possibly-live resource survives (e.g.
+        an unconfirmed teardown, or a phantom from a non-idempotent create). RAISES on a listing
+        failure so a caller can't mistake "couldn't list" for "clear". The handle-less recovery
+        resubmit uses this to require a confirmed reap before launching a second worker, because a
+        best-effort ``gc`` returns no error on an unconfirmed teardown. Providers without a
+        standing-billing substrate (RunPod) need not implement it."""
+        ...
+
     def sweep_orphans(
         self,
         active_labels: set[str] | Callable[[], set[str]] | None = None,

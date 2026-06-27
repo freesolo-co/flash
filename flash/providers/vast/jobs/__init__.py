@@ -825,6 +825,30 @@ def destroy_run_instances(run_id: str) -> list[int]:
     return destroyed
 
 
+def run_instances_remaining(run_id: str) -> list[int]:
+    """Instance ids that STILL carry ``run_id``'s label right now.
+
+    An empty list is the CONFIRMED-clear signal: no instance for this run remains. A non-empty list
+    means a possibly-live instance survives — e.g. ``destroy_run_instances`` hit a ``success:false`` /
+    network breakdown (``destroy_instance`` returns False, so the box is not reaped yet) or a phantom
+    from a non-idempotent create surfaced via Vast's eventually-consistent instance list. Unlike
+    ``destroy_run_instances`` this RAISES on a listing failure (the caller cannot prove the run is
+    clear, so it must treat that as not-clear). Used to gate the handle-less recovery resubmit: never
+    launch a second worker for a run while an instance for it might still be writing its HF artifacts.
+    """
+    if not run_id:
+        return []
+    instances = vast_api.list_instances()  # may raise -> caller treats as "could not confirm clear"
+    prefix = run_label_prefix(run_id)
+    remaining: list[int] = []
+    for inst in instances:
+        iid = _coerce_instance_id(inst.get("id"))
+        label = str(inst.get("label") or "")
+        if iid and (label == prefix or label.startswith(prefix + "-s")):
+            remaining.append(iid)
+    return remaining
+
+
 def sweep_orphans(
     active_labels: set[str] | Callable[[], set[str]] | None = None,
     known_labels: set[str] | Callable[[], set[str]] | None = None,

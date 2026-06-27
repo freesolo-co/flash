@@ -12,6 +12,11 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "RTX A6000": 155.0,
     "A100 PCIe": 312.0,
     "A100 SXM": 312.0,
+    # A100 SXM4 40 GB: same SMs/tensor cores as the 80 GB SXM (just less HBM) -> identical bf16 dense
+    # TFLOPS. Without this exact-name entry gpu_tflops() falls to the 100-TFLOPS default and inflates
+    # this class's seconds_per_step / quoted cost ~3x (Codex) — reachable now that a Vast live-offer
+    # quote can select the 40 GB A100 when it is the only duration-valid offer for a 35-40 GB run.
+    "A100 SXM 40GB": 312.0,
     "H100": 990.0,
     # H200 is a Hopper part (same SMs/tensor cores as H100, more HBM) -> same bf16 dense TFLOPS.
     "H200": 990.0,

@@ -250,10 +250,40 @@ def recover_runs() -> None:
         # worker starts writing the same seed-scoped artifacts. gc is run-scoped (by label) and not
         # active-shielded; best-effort across configured instance providers (the spec's provider isn't
         # committed until allocation, so reap all of them).
+        # Gate the resubmit on a CONFIRMED clear: a best-effort gc returns no error when a Vast DELETE
+        # is unconfirmed (success:false / network) — destroy_run_instances yields an empty list, not a
+        # raise — so a phantom that survives the reap would otherwise get a SECOND worker writing the
+        # same seed-scoped HF artifacts. After gc, ask each instance provider whether any instance for
+        # this run remains (run_instances_remaining: [] == confirmed clear, RAISES when it can't list);
+        # if any is present — or a provider can't confirm — DEFER this run to a later recovery / the
+        # periodic sweep rather than race a possibly-live box (Codex; mirrors the retry-loop MtzrH guard).
+        reaped_clear = True
         for prov in configured_providers():
+            if getattr(prov, "name", None) not in INSTANCE_PROVIDERS:
+                continue
             with contextlib.suppress(Exception):
-                if getattr(prov, "name", None) in INSTANCE_PROVIDERS:
-                    prov.gc(spec)
+                prov.gc(spec)
+            check = getattr(prov, "run_instances_remaining", None)
+            if check is None:
+                continue  # provider exposes no confirmation -> preserve best-effort resubmit
+            try:
+                if check(spec.run_id):
+                    reaped_clear = False  # an instance for this run is still present
+            except Exception:
+                reaped_clear = False  # couldn't list -> can't prove clear -> don't race
+        if not reaped_clear:
+            _log.warning(
+                "deferring resubmit of %s: a possibly-live instance for this run could not be "
+                "confirmed reaped; leaving it for a later recovery/sweep",
+                spec.run_id,
+            )
+            with contextlib.suppress(Exception):
+                _append_run_log(
+                    spec.run_id,
+                    "control plane restart: instance teardown unconfirmed; "
+                    "deferring resubmit for reconciliation",
+                )
+            continue
         with contextlib.suppress(Exception):
             _append_run_log(
                 spec.run_id, "control plane restarted before provisioning; resubmitting"

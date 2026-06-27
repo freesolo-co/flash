@@ -159,6 +159,16 @@ def test_pick_gpu_vast_skips_classes_without_a_live_offer(monkeypatch):
     assert gpu == "A100 SXM"  # the only class with a rentable offer, NOT the cheaper-static 4090
 
 
+def test_a100_sxm_40gb_has_real_tflops_not_default():
+    # Codex: the 40 GB A100 SXM4 class (selectable for Lambda/Vast) must carry a real TFLOPS entry, or
+    # gpu_tflops() falls to the 100-default and inflates its seconds_per_step / quoted cost ~3x. It has
+    # the same SMs as the 80 GB SXM, so its compute equals the other A100 entries.
+    from flash.cost.facts import _DEFAULT_TFLOPS, gpu_tflops
+
+    assert gpu_tflops("A100 SXM 40GB") == gpu_tflops("A100 SXM")
+    assert gpu_tflops("A100 SXM 40GB") != _DEFAULT_TFLOPS
+
+
 def test_pick_gpu_vast_offline_falls_back_to_static(monkeypatch):
     # When the market is unreachable (no VAST_API_KEY -> live_offer_rates returns {}), selection must
     # stay offline-safe: rank ALL fitting classes by their static rate rather than crash or pick nothing.

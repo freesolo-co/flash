@@ -149,6 +149,16 @@ class VastProvider:
 
         destroy_run_instances(spec.run_id)
 
+    def run_instances_remaining(self, run_id: str) -> list[int]:
+        """Instance ids still carrying ``run_id``'s label (after any ``gc``). Empty == CONFIRMED clear;
+        non-empty == a possibly-live instance survives. RAISES on a listing failure so the caller can't
+        mistake "couldn't list" for "clear". Lets the handle-less recovery resubmit verify a CONFIRMED
+        reap before launching a second worker, since ``gc``/``destroy_run_instances`` returns an empty
+        list (not an error) on an unconfirmed DELETE."""
+        from flash.providers.vast.jobs import run_instances_remaining
+
+        return run_instances_remaining(run_id)
+
     def sweep_orphans(
         self,
         active_labels: set[str] | Callable[[], set[str]] | None = None,
