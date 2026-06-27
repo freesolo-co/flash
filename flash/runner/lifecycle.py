@@ -129,6 +129,13 @@ def _submit_seed_supervised(
             with contextlib.suppress(Exception):
                 runpod_api.delete_endpoint(eid)
 
+    def _cancel() -> _RunCancelled:
+        """Reap this seed's tracked endpoints before unwinding on cancel — a handle whose `running`
+        write loses the terminal-stickiness race never lands in status.remote, so only seen_endpoints
+        (rN walk endpoints _gc_run_endpoints can't name) can free it."""
+        _gc_seen_endpoints()
+        return _RunCancelled(f"run {spec.run_id} was cancelled")
+
     max_retries = int(spec.gpu.max_retries)
     infra_budget = max(max_retries, INFRA_RETRY_FLOOR) if max_retries else 0
     last_detail = None
@@ -187,7 +194,7 @@ def _submit_seed_supervised(
         # Re-check cancel right before paid provisioning — no handle exists yet for cancel_run() to see.
         with contextlib.suppress(FileNotFoundError):
             if get_status(spec.run_id).state == "cancelled":
-                raise _RunCancelled(f"run {spec.run_id} was cancelled")
+                raise _cancel()
         try:
             alloc = allocate(
                 spec.model,
@@ -204,7 +211,7 @@ def _submit_seed_supervised(
         if alloc is not None:
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
-                    raise _RunCancelled(f"run {spec.run_id} was cancelled")
+                    raise _cancel()
             chosen = _select_candidate(alloc.candidates, failed_providers, tried_classes)
             untried = [c for c in alloc.candidates if (c.provider, c.gpu) not in tried_classes]
             # Don't let the budget clause mark last-GPU when a cache-drop fallback is still available;
@@ -250,7 +257,7 @@ def _submit_seed_supervised(
             # A late worker success must not resurrect a cancelled run.
             try:
                 if get_status(spec.run_id).state == "cancelled":
-                    raise _RunCancelled(f"run {spec.run_id} was cancelled")
+                    raise _cancel()
             except FileNotFoundError:
                 pass
             _gc_seen_endpoints()
@@ -262,7 +269,7 @@ def _submit_seed_supervised(
         # A cancel deletes the endpoint, which the poller sees as infra-shaped; cancel wins.
         try:
             if get_status(spec.run_id).state == "cancelled":
-                raise _RunCancelled(f"run {spec.run_id} was cancelled")
+                raise _cancel()
         except FileNotFoundError:
             pass
         # Drop the shared weight-cache volume on no_capacity/poll_error so the retry runs unrestricted.

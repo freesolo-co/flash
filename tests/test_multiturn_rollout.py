@@ -76,6 +76,13 @@ class FakeEnv:
         return 1.0 if any(m.get("content") == "GOOD" for m in msgs) else 0.0
 
 
+def realistic_env_glue(env_messages):
+    """Mirror build_rollout_func's REAL glue: it is the rendered text AFTER the probe assistant
+    CONTENT, so it LEADS with the assistant turn's terminator (END). The simpler fake env_glue above
+    omits that leading close; this one reproduces the double-terminator condition the dedup must fix."""
+    return [END, *render(env_messages, True)]
+
+
 def _generator(turn_texts):
     """generate() that yields one assistant turn per call: content token + END."""
     seq = iter(turn_texts)
@@ -158,6 +165,35 @@ def test_rollout_one_interleaves_and_masks_env_tokens():
     assert all(out["logprobs"][i] == 0.0 for i, m in enumerate(out["env_mask"]) if m == 0)
     # reward came from the transcript rubric
     assert out["reward"] == 1.0
+
+
+def test_rollout_dedups_duplicate_turn_terminator_at_glue_seam():
+    # With a real-shaped glue (leads with END) and a model turn that also ends in END, the seam must
+    # keep EXACTLY ONE terminator (the assistant's own, env_mask=1), not a <END><END> pair that would
+    # push every later turn off-distribution and mismatch the single-terminator SFT transcripts.
+    out = rollout_one(
+        example={"answer": "GOOD"},
+        active_env=FakeEnv(),
+        render=render,
+        generate=_generator(["a1", "GOOD"]),
+        env_glue=realistic_env_glue,
+        max_turns=10,
+        per_turn_max_tokens=64,
+    )
+    assert out["completion_ids"] == [
+        CONTENT["a1"],
+        END,
+        HDR["user"],
+        CONTENT["u2"],
+        END,
+        HDR["assistant"],
+        CONTENT["GOOD"],
+        END,
+    ]
+    assert out["env_mask"] == [1, 1, 0, 0, 0, 0, 1, 1]
+    ids = out["completion_ids"]
+    assert not any(ids[i] == END and ids[i + 1] == END for i in range(len(ids) - 1))
+    assert len(out["completion_ids"]) == len(out["logprobs"]) == len(out["env_mask"])
 
 
 def test_rollout_one_respects_max_turns():

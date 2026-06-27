@@ -334,7 +334,12 @@ def main() -> int:
         extra_pip = payload.get("extra_pip") or []
         if extra_pip:
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
-        fetch_code(payload)
+        # Pre-worker HF fetch of the run's own code (control plane uploaded it before submit), same
+        # infra-shaped class as fetch_spec_from_hf above: a transient HF blip must retry, not fail.
+        try:
+            fetch_code(payload)
+        except Exception as e:
+            raise RetriableBootstrapError(f"failed to fetch run code from HF: {e}") from e
         env = build_worker_env(payload)
         deadline = time.time() + float(payload.get("max_wall_s") or 24 * 3600)
         phase = payload["phase"]

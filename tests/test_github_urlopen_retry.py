@@ -98,6 +98,45 @@ def test_urlopen_does_not_retry_404(monkeypatch):
     assert len(calls) == 1
 
 
+def test_urlopen_retries_transient_url_error_then_succeeds(monkeypatch):
+    # A connection-phase URLError (reset/DNS) is transient infra on the same cold-spawn wave as a
+    # rate limit, so it must retry within the same budget rather than fail the run.
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        if len(calls) < 3:
+            raise urllib.error.URLError("connection reset by peer")
+        return io.BytesIO(b"ok")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+    assert _urlopen(urllib.request.Request("https://api.github.com/test")) == b"ok"
+    assert len(calls) == 3
+
+
+def test_urlopen_transient_network_becomes_retriable_signal(monkeypatch):
+    # A persistent transient failure (URLError every attempt, or a read-phase TimeoutError that is
+    # NEITHER an HTTPError NOR a URLError) must surface as the typed retriable GitHubRateLimitError
+    # — NOT a plain RuntimeError/bare TimeoutError that the worker would classify as a fatal crash.
+    for exc in (urllib.error.URLError("dns failure"), TimeoutError("read timed out")):
+        calls = []
+
+        def fake_urlopen(req, timeout, _exc=exc, _calls=calls):
+            _calls.append(1)
+            raise _exc
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(time, "sleep", lambda _: None)
+        monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
+
+        with pytest.raises(GitHubRateLimitError, match="transient network"):
+            _urlopen(urllib.request.Request("https://api.github.com/test"))
+        assert len(calls) == 6  # initial + 5 retries
+
+
 def test_urlopen_sleep_called_with_jitter(monkeypatch):
     sleep_calls = []
     attempt_count = []
