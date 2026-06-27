@@ -140,13 +140,25 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
 
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost calculation."""
-    # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced. Computed
-    # BEFORE GPU selection/pricing so the Vast live market is queried for offers that outlast the run's
-    # wall cap — a duration-bound quote must not be set (or its class chosen) by a short-lived offer
-    # that the launch-time duration filter would reject (Codex MtzrI).
+    # Billing cap: mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
-    gpu, need = select_gpu(config, max_wall_seconds=cap_s)
-    hourly = gpu_hourly_usd(gpu, provider=config.provider, max_wall_seconds=cap_s)
+    # Vast MARKET duration filter: query offers that outlast the run so a long-run quote isn't set (or
+    # its class chosen) by a short-lived offer the launch-time filter rejects (Codex MtzrI) — but it
+    # must use the SAME duration semantics ``usable_offers`` applies at LAUNCH, NOT the 60s-floored
+    # billing cap_s (Cursor MuXiS): launch passes ``spec.gpu.max_wall_seconds or 0.0`` and treats a
+    # NON-POSITIVE wall as "no duration filter" (and floors a positive one at 60s itself). So an
+    # explicit 0/negative wall must price with NO filter, not the 60s one the run never uses.
+    #   None  -> the 24h spec default the run actually runs under (== DEFAULT_WALL_CAP_S);
+    #   > 0   -> that wall (usable_offers floors it at 60s);
+    #   <= 0  -> 0.0 (no duration filter, exactly like launch).
+    if config.max_wall_seconds is None:
+        market_wall_s = wall_cap_s
+    elif config.max_wall_seconds > 0:
+        market_wall_s = float(config.max_wall_seconds)
+    else:
+        market_wall_s = 0.0
+    gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
+    hourly = gpu_hourly_usd(gpu, provider=config.provider, max_wall_seconds=market_wall_s)
 
     # Each seed is its own job (own cold start + own wall cap): price one seed, clamp, x seeds.
     seeds = config.setup_repeats

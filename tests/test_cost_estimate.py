@@ -77,3 +77,37 @@ def test_estimate_reports_the_runs_provider():
         estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="runpod")).provider
         == "runpod"
     )
+
+
+def test_estimate_cost_vast_market_duration_mirrors_launch(monkeypatch):
+    # Cursor MuXiS: the Vast market duration filter used for pricing/GPU-selection must mirror
+    # usable_offers at LAUNCH, NOT the 60s-floored billing cap. Launch passes
+    # `spec.gpu.max_wall_seconds or 0.0` and treats a NON-POSITIVE wall as "no duration filter"; a
+    # positive one is floored at 60s inside usable_offers. So an explicit 0 must price with NO filter
+    # (0.0), not 60. Capture what reaches usable_offers for explicit-0 vs a positive wall.
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast import pricing
+
+    seen: list[float] = []
+
+    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
+        seen.append(max_wall_seconds)
+        return []
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+
+    def market_walls(cfg) -> set[float]:
+        seen.clear()
+        monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})  # isolate cache
+        estimate_cost(cfg)
+        return set(seen)
+
+    # explicit 0 -> usable_offers gets 0.0 (NO duration filter), NOT the 60s-floored cap
+    assert market_walls(
+        RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="vast", max_wall_seconds=0)
+    ) == {0.0}
+    # a positive wall -> that wall reaches the market query (usable_offers floors at 60s itself)
+    assert market_walls(
+        RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="vast", max_wall_seconds=7200)
+    ) == {7200.0}
