@@ -219,3 +219,40 @@ def test_destroy_instance_never_raises(monkeypatch):
     assert vast_api.destroy_instance(777) is True
     _capture_urlopen(monkeypatch, [_http_error(500)] * 3)
     assert vast_api.destroy_instance(777) is False
+
+
+def test_destroy_instance_respects_success_flag(monkeypatch):
+    """Codex MsXoJ: Vast's 200 DELETE carries a `success` bool — `success: false` means the box is
+    still billable, so it must NOT be reported destroyed (destroy_run_instances/sweep_orphans would
+    count it reaped and stop the immediate cleanup). A body without the key stays success (prior shape)."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [{"success": True}])
+    assert vast_api.destroy_instance(5) is True
+    _capture_urlopen(monkeypatch, [{"success": False}])
+    assert vast_api.destroy_instance(5) is False
+    _capture_urlopen(monkeypatch, [{"detail": "ok, no success key"}])
+    assert vast_api.destroy_instance(5) is True
+
+
+def test_list_instances_paginates_every_page(monkeypatch):
+    """Codex MsXoI: the v1 instances list is keyset-paginated (limit max 25; pass the prior page's
+    `next_token` as `after_token`; `next_token` is null on the last page). list_instances must walk
+    EVERY page — a flash orphan on a later page would otherwise never be seen by adoption / destroy /
+    sweep and bill forever."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    calls = _capture_urlopen(
+        monkeypatch,
+        [
+            {"instances": [{"id": 1}, {"id": 2}], "next_token": "tok2"},
+            {"instances": [{"id": 3}], "next_token": None},
+        ],
+    )
+    out = vast_api.list_instances()
+    assert [i["id"] for i in out] == [1, 2, 3]  # both pages collected
+    assert len(calls) == 2  # stopped once next_token went null
+    assert calls[0][1].endswith("/v1/instances/")  # page 1 is the bare path
+    assert "after_token=tok2" in calls[1][1]  # page 2 carries the cursor

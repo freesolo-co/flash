@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -196,11 +197,28 @@ def get_instance(instance_id: int) -> dict | None:
 
 
 def list_instances() -> list[dict]:
-    # The v0 list route is deprecated (410 "use /api/v1/instances/", verified live);
-    # detail/destroy remain on v0.
-    out = request_with_retries("/v1/instances/")
-    inst = out.get("instances") if isinstance(out, dict) else None
-    return inst if isinstance(inst, list) else []
+    # The v0 list route is deprecated (410 "use /api/v1/instances/", verified live); detail/destroy
+    # remain on v0. The v1 list is KEYSET-PAGINATED (limit default/max 25; pass the prior page's
+    # ``next_token`` as ``after_token``; ``next_token`` is null on the last page). A single read would
+    # cap at 25 and MISS flash-labeled orphans on later pages — and EVERY label-keyed path
+    # (_adopt_instance_by_label / destroy_run_instances / sweep_orphans) reads this list, so an
+    # unseen orphan bills forever. Walk every page until next_token is exhausted.
+    instances: list[dict] = []
+    after_token: str | None = None
+    for _ in range(200):  # runaway guard: 200 pages x 25 = 5000 instances, far beyond any real account
+        path = "/v1/instances/"
+        if after_token:
+            path += f"?after_token={urllib.parse.quote(str(after_token))}"
+        out = request_with_retries(path)
+        if not isinstance(out, dict):
+            break
+        page = out.get("instances")
+        if isinstance(page, list):
+            instances.extend(page)
+        after_token = out.get("next_token")
+        if not after_token:
+            break
+    return instances
 
 
 def instance_logs(instance_id: int) -> str | None:
@@ -237,9 +255,17 @@ def instance_logs(instance_id: int) -> str | None:
 
 
 def destroy_instance(instance_id: int) -> bool:
-    """Destroy (and stop billing for) an instance. Best-effort: never raises."""
+    """Destroy (and stop billing for) an instance. Best-effort: never raises.
+
+    Vast's 200 DELETE carries a ``success`` bool — a ``success: false`` means the box is STILL
+    billable, so we must not report it destroyed (``destroy_run_instances``/``sweep_orphans`` would
+    count it reaped and stop the immediate cleanup). An older/empty body shape (no ``success`` key) on
+    a non-error response is treated as success, preserving prior behavior.
+    """
     try:
-        request_with_retries(f"/v0/instances/{int(instance_id)}/", method="DELETE", retries=2)
+        out = request_with_retries(f"/v0/instances/{int(instance_id)}/", method="DELETE", retries=2)
+        if isinstance(out, dict) and "success" in out:
+            return bool(out.get("success"))
         return True
     except Exception:
         return False
