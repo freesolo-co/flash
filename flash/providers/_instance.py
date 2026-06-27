@@ -1,4 +1,4 @@
-"""Shared building blocks for the instance-based providers (Lambda, Hyperstack).
+"""Shared building blocks for the instance-based providers (e.g. Lambda).
 
 Both rent a single-GPU instance and bootstrap it identically: ship a cloud-init ``user_data`` that
 runs the prebuilt ``WORKER_IMAGE`` via Docker on the host, detect completion from the worker's HF
@@ -7,8 +7,8 @@ REST API (launch/list/terminate) and the capacity model; everything below — th
 sweep-matchable label, the bootstrap payload, and the cloud-init script — is identical, so it lives
 here (single source of truth, parameterized by the substrate ``arm`` and the run's image).
 
-The shipped bootstrap is the sibling ``_instance_bootstrap.py``; ``arm`` (e.g. ``lambda`` /
-``hyperstack``) travels in ``payload["flash_arm"]`` and decides FLASH_ARM + the ``<arm>_attempt<N>``
+The shipped bootstrap is the sibling ``_instance_bootstrap.py``; ``arm`` (e.g. ``lambda``)
+travels in ``payload["flash_arm"]`` and decides FLASH_ARM + the ``<arm>_attempt<N>``
 marker name.
 """
 
@@ -20,13 +20,14 @@ import io
 import json
 from pathlib import Path
 
-# Lambda/Hyperstack cap an instance/VM ``name`` at 64 chars. We keep the label at or under this so
+# Lambda caps an instance ``name`` at 64 chars. We keep the label at or under this so
 # the name is NEVER silently truncated at launch — truncation would desync the stored name from the
 # ``run_label_prefix`` the orphan-sweep matches on, which could fail to protect (or wrongly reap) a
-# live run. The seed/attempt suffix ``-s{seed}-a{attempt}`` is bounded (<=12 chars), so the prefix
-# is bounded to leave room for it.
+# live run. The seed/attempt suffix ``-s{seed}-a{attempt}`` is held to ``_SUFFIX_BUDGET`` chars (see
+# ``instance_label``), so the prefix budget leaves exactly that much room.
 _MAX_NAME = 60
-_PREFIX_BUDGET = _MAX_NAME - 12
+_SUFFIX_BUDGET = 12
+_PREFIX_BUDGET = _MAX_NAME - _SUFFIX_BUDGET
 
 # Above this many chars, the serialized job spec is spilled OUT of the inline cloud-init user_data
 # (uploaded to HF; the bootstrap fetches it) so a large inline spec can't overflow the provider's
@@ -55,13 +56,37 @@ def run_label_prefix(run_id: str) -> str:
 
 def instance_label(run_id: str, seed: int, attempt: int) -> str:
     """Instance name: run-derived so ``sweep_orphans`` can tell ours from anything else on the
-    account, and bounded (via ``run_label_prefix``) so the provider never truncates it."""
-    return f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"
+    account, and bounded (via ``run_label_prefix``) so the provider never truncates it.
+
+    ``seed``/``attempt`` are coerced to ints and the WHOLE ``-s{seed}-a{attempt}`` suffix is held to
+    ``_SUFFIX_BUDGET`` chars: a caller-supplied spec could carry an absurdly large (or corrupt) seed
+    OR attempt whose unbounded text would push the name past the provider's cap and get it silently
+    truncated — desyncing the stored name from the ``run_label_prefix`` the orphan-sweep matches on
+    (the same failure the prefix bounding already guards against). BOTH numeric fields are unbounded
+    inputs, so both are trimmed (attempt first — it is normally tiny, so a long attempt is the
+    corrupt case — then seed), always keeping the ``-s``/``-a`` framing and the run-id prefix intact
+    so sweep prefix-matching still works."""
+    try:
+        seed_i = int(seed)
+    except (TypeError, ValueError):
+        seed_i = 0
+    try:
+        attempt_i = int(attempt)
+    except (TypeError, ValueError):
+        attempt_i = 0
+    seed_s, attempt_s = str(seed_i), str(attempt_i)
+    # Fixed framing ``-s`` + ``-a`` (4 chars) always survives; the remaining budget is the digit
+    # space, split between attempt (kept short — usually 1 digit) and seed (gets the rest). This
+    # bounds the WHOLE suffix to _SUFFIX_BUDGET regardless of how large either field is.
+    digit_budget = _SUFFIX_BUDGET - len("-s-a")
+    attempt_s = attempt_s[: max(1, min(len(attempt_s), max(1, digit_budget - 1)))]
+    seed_s = seed_s[: max(0, digit_budget - len(attempt_s))]
+    return f"{run_label_prefix(run_id)}-s{seed_s}-a{attempt_s}"
 
 
 # The worker container path the per-region cache is bind-mounted at, and the HF cache under it. The
-# host mount differs per provider (Lambda NFS /lambda/nfs/<name>; Hyperstack block /mnt/flash-weights)
-# but the CONTAINER path is fixed, so HF_HOME is uniform regardless of substrate.
+# host mount differs per provider (e.g. Lambda NFS /lambda/nfs/<name>; a block-volume provider
+# /mnt/flash-weights) but the CONTAINER path is fixed, so HF_HOME is uniform regardless of substrate.
 CACHE_CONTAINER_MOUNT = "/weight-cache"
 CACHE_HF_HOME = f"{CACHE_CONTAINER_MOUNT}/hf-cache"
 # Sentinel file written onto a SUCCESSFULLY-mounted block-volume cache (by the cloud-init preamble),
@@ -71,7 +96,7 @@ CACHE_MOUNT_MARKER = ".flash-cache-mounted"
 
 
 def _cache_block_device_setup(payload: dict) -> str:
-    """Cloud-init preamble (block-volume providers, e.g. Hyperstack): wait for the attached volume's
+    """Cloud-init preamble (block-volume providers): wait for the attached volume's
     block device, format it ONCE if it has no filesystem (NEVER reformat a populated cache — guarded
     by ``blkid``), and mount it at the host ``cache_host_mount``. No-op for NFS providers (Lambda
     auto-mounts) and for cold runs. Best-effort: if the device never appears / mount fails, the bind
@@ -161,9 +186,10 @@ def build_payload(
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
     ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name).
 
-    ``cache_host_mount`` (set by the provider when it attaches a per-region weight cache) points
-    HF_HOME at the bind-mounted cache (``/weight-cache/hf-cache``) instead of stripping the
-    RunPod redirect; ``cache_block_device`` adds the format/mount preamble for block-volume providers.
+    ``cache_host_mount`` (set by the provider when it attaches a per-region weight cache) points the
+    BASE-MODEL prefetch (``FLASH_WEIGHT_CACHE_DIR``) at the bind-mounted cache
+    (``/weight-cache/hf-cache/hub``) instead of stripping the RunPod redirect; ``cache_block_device``
+    adds the format/mount preamble for block-volume providers.
     """
     from flash.envs.registry import worker_pip_for_env
     from flash.providers.runpod.train import (
@@ -173,15 +199,17 @@ def build_payload(
     )
 
     # Start from the shared env with the RunPod /runpod-volume redirect stripped (that mount is
-    # RunPod-only). If THIS provider attached a cache, point HF_HOME at the instance cache mount —
-    # but DON'T clobber a per-run [worker_env].HF_HOME the user set on purpose. build_worker_env
-    # merges [worker_env] LAST, so a user override survives the strip above (only /runpod-volume-
-    # rooted vars are stripped); on RunPod that override wins, so honor it here too for parity. We
-    # only install the cache path when HF_HOME is absent (i.e. the platform redirect was stripped and
-    # the user set nothing).
+    # RunPod-only). If THIS provider attached a cache, point the base-model prefetch
+    # (FLASH_WEIGHT_CACHE_DIR) at the instance cache mount — but DON'T clobber a per-run [worker_env]
+    # override the user set on purpose. build_worker_env merges [worker_env] LAST, so a user override
+    # survives the strip above (only /runpod-volume-rooted vars are stripped); on RunPod that override
+    # wins, so honor it here too for parity. We only install the cache path when the user set neither a
+    # FLASH_WEIGHT_CACHE_DIR nor an HF_HOME of their own. BASE-MODEL-SCOPED, not a global HF_HOME: the
+    # worker downloads only the trusted public base model onto the shared per-region cache and keeps
+    # the run's env/reward HF downloads on ephemeral disk (issue #252), same as the RunPod path.
     env = strip_runpod_volume_env(build_worker_env(spec, seed, runtime_secrets=runtime_secrets))
-    if cache_host_mount and not env.get("HF_HOME"):
-        env["HF_HOME"] = CACHE_HF_HOME
+    if cache_host_mount and not env.get("FLASH_WEIGHT_CACHE_DIR") and not env.get("HF_HOME"):
+        env["FLASH_WEIGHT_CACHE_DIR"] = f"{CACHE_HF_HOME}/hub"
     payload = {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
@@ -225,18 +253,24 @@ def build_payload(
     return payload
 
 
-# Host helper: best-effort upload of the consolidated boot log to HF. Neither Lambda nor Hyperstack
-# exposes an instance console/log API, so the box pushes its own boot log to HF — the only window
+# Host helper: best-effort upload of the consolidated boot log to HF. Lambda does not
+# expose an instance console/log API, so the box pushes its own boot log to HF — the only window
 # into a failure BEFORE the worker container can write its own artifacts (docker/GPU not ready,
 # image pull failure). Reads creds from the on-box payload.json. Never raises.
+#
+# The HF path is ATTEMPT-SCOPED (``<arm>_attempt<N>_boot.log``): the poller's fast first-liveness
+# failover keys on this file's presence to tell a box that actually ran cloud-init from a silently
+# dead one, and a retry reuses the SAME run HF prefix — a non-attempt-scoped path would leave a prior
+# attempt's boot.log behind to falsely "prove" liveness for a later attempt whose cloud-init never ran.
 _HOSTLOG_PY = """\
 import json
 try:
     p = json.load(open("/opt/flash/payload.json"))
+    arm = p.get("flash_arm", "instance"); att = int(p.get("attempt") or 0)
     from huggingface_hub import HfApi
     HfApi(token=(p.get("env") or {}).get("HF_TOKEN")).upload_file(
         path_or_fileobj="/opt/flash/host_boot.log",
-        path_in_repo=p["hf_prefix"] + "/" + p.get("flash_arm", "instance") + "_boot.log",
+        path_in_repo=p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + "_boot.log",
         repo_id=p["hf_repo"],
         repo_type="dataset",
     )
@@ -257,6 +291,13 @@ except Exception:
 # retry / hide the root cause. So this writes the host marker ONLY when no worker attempt marker
 # yet exists at the path (i.e. the container never got far enough to write one). The check is
 # best-effort: on a read error it stays conservative and SKIPS the write (never clobbers).
+#
+# RACE: the existence check and the upload are not atomic — the worker could finish and upload its
+# own marker in the window BETWEEN them, and the host upload would then clobber it. We narrow that
+# window to near-zero by RE-CHECKING immediately before the upload (so the worker's marker has to
+# land inside a sub-second gap to be lost). HF itself offers no compare-and-set, so the residual gap
+# is irreducible; the double check makes a clobber practically impossible while keeping the helper a
+# tiny self-contained snippet. On any read error we stay conservative and SKIP (never clobber).
 _FAILMARK_PY = """\
 import json, sys
 try:
@@ -266,17 +307,21 @@ try:
     marker_path = p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + ".json"
     from huggingface_hub import HfApi
     api = HfApi(token=(p.get("env") or {}).get("HF_TOKEN"))
-    try:
-        worker_marker_exists = api.file_exists(repo_id=p["hf_repo"], filename=marker_path, repo_type="dataset")
-    except Exception:
-        worker_marker_exists = True  # conservative: on a read error, never risk clobbering
-    if not worker_marker_exists:
+    def worker_marker_present():
+        try:
+            return api.file_exists(repo_id=p["hf_repo"], filename=marker_path, repo_type="dataset")
+        except Exception:
+            return True  # conservative: on a read error, never risk clobbering
+    if not worker_marker_present():
         open("/opt/flash/fm.json", "w").write(json.dumps({"ok": False, "attempt": att, "retriable": True, "error": "host: " + reason}))
-        api.upload_file(
-            path_or_fileobj="/opt/flash/fm.json",
-            path_in_repo=marker_path,
-            repo_id=p["hf_repo"], repo_type="dataset",
-        )
+        # Re-check right before the upload: the worker may have written its own ok=false marker in
+        # the gap since the first check; honor it instead of clobbering with the retriable host one.
+        if not worker_marker_present():
+            api.upload_file(
+                path_or_fileobj="/opt/flash/fm.json",
+                path_in_repo=marker_path,
+                repo_id=p["hf_repo"], repo_type="dataset",
+            )
 except Exception:
     pass
 """
@@ -334,10 +379,11 @@ def build_user_data(payload: dict, *, image: str) -> str:
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "_instance_bootstrap.py").read_text()
     # Weight cache: the provider mounts its region-scoped persistent storage on the HOST at
-    # ``cache_host_mount`` (Lambda auto-mounts its NFS filesystem there; Hyperstack's preamble below
-    # formats+mounts the attached block device there). Bind it into the worker container at the FIXED
-    # ``/weight-cache`` so the worker's HF_HOME=/weight-cache/hf-cache (set in build_payload) persists
-    # the model download across runs in this region. Absent -> no bind (cold run).
+    # ``cache_host_mount`` (Lambda auto-mounts its NFS filesystem there; a block-volume provider's
+    # preamble below formats+mounts the attached block device there). Bind it into the worker container at the FIXED
+    # ``/weight-cache`` so the worker's base-model prefetch (FLASH_WEIGHT_CACHE_DIR=/weight-cache/
+    # hf-cache/hub, set in build_payload) persists the model download across runs in this region.
+    # Absent -> no bind (cold run).
     cache_host_mount = payload.get("cache_host_mount")
     # Single-quote the host path in the docker -v (defensive; the path is a controlled constant).
     cache_bind = f"-v '{cache_host_mount}':{CACHE_CONTAINER_MOUNT} \\\n  " if cache_host_mount else ""
@@ -363,6 +409,26 @@ IMAGE={image!r}
 pip3 install -q huggingface_hub >/dev/null 2>&1 \\
   || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
 fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/failmark.py "$1" >/dev/null 2>&1 || true; exit 1; }}
+# Host->HF boot-log uploader, STARTED EARLY — BEFORE the docker-readiness wait and the (large, slow)
+# image pull — so a box that actually executed cloud-init leaves a liveness artifact on HF within
+# ~2 min. The control plane's poller keys its fast "instance active but the worker never started"
+# failover on this artifact's PRESENCE: it tells a healthy box still pulling the multi-GB image
+# (boot.log present, no heartbeat yet) from a silently dead one (cloud-init never ran -> no boot.log),
+# so the latter fails over in ~15 min instead of burning the full ~50 min setup grace. THROTTLED to
+# 120s and bounded (~30 min) to respect HF's per-repo hourly commit cap; it self-stops once the
+# worker container has STARTED and then exited (inspect succeeds + not running). The `docker inspect`
+# guard is what lets it keep emitting THROUGH the pull/start window: before the container exists the
+# inspect fails, so it does not mistake "not started yet" for "started then exited".
+( for i in $(seq 1 15); do
+    python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true
+    if docker inspect flashrun >/dev/null 2>&1 \\
+       && ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
+      python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 120
+  done ) &
+disown || true
 # The provider's default image ships Docker + the NVIDIA Container Toolkit, but cloud-init can run
 # before they finish initializing — wait for both (up to ~10 min) before launching the worker.
 for i in $(seq 1 100); do
@@ -400,17 +466,8 @@ if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; th
   [ "$EXIT" = "0" ] || fail "worker container did not start (exit ${{EXIT}})"
 fi
 # Mirror the container's stdout into the host boot log (detached) so an early in-container crash is
-# visible on HF even if it dies before uploading its own console artifact.
+# visible on HF even if it dies before uploading its own console artifact (the early boot-log
+# uploader above keeps shipping host_boot.log to HF and self-stops once this container exits).
 ( docker logs -f flashrun >>/opt/flash/host_boot.log 2>&1 || true ) &
-disown || true
-# Host->HF boot-log uploader: THROTTLED to 120s and STOPPED once the container exits (bounded ~30
-# min). The worker itself uploads rate-limited heartbeats/console once running, so a 30s diagnostic
-# loop for the whole run would risk Hugging Face's per-repo hourly commit cap and starve the
-# required metrics/DONE commits.
-( for i in $(seq 1 15); do
-    python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true
-    docker ps --filter name=flashrun --filter status=running -q | grep -q . || break
-    sleep 120
-  done ) &
 disown || true
 """

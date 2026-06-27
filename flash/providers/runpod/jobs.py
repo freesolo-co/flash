@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 from flash.providers._poll import (
     PollErrorTracker,
+    _attempt_int,
+    is_training_heartbeat,
     make_say,
     surface_forced_heartbeat,
     surface_heartbeat,
@@ -77,15 +79,6 @@ TERMINAL_OK = {"COMPLETED"}
 # "FAILED" is the run dying on its own (real traceback) -> fails fast.
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
 TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
-
-# Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
-# training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
-# Receiving one proves the worker is alive but NOT that the slow setup (model download +
-# vLLM init) finished, so they must not flip stall detection to the tight training window.
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
-
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
@@ -261,28 +254,48 @@ def _is_workers_quota_error(exc: Exception) -> bool:
     return "max workers across all endpoints" in msg
 
 
-# Per-endpoint "first observed idle" timestamps, so a candidate must STAY idle across sweeps for
-# ``min_idle_s`` before deletion (a cold-starting / between-jobs endpoint reports a transient zero
-# we must not act on). Pruned each sweep to the still-idle set, so it can't grow unbounded.
+# Per-endpoint grace state: ``{endpoint_id: (first_observed_idle_ts, owning_key_fingerprint)}``, so a
+# candidate must STAY idle across sweeps for ``min_idle_s`` before deletion (a cold-starting /
+# between-jobs endpoint reports a transient zero we must not act on). The owning account's
+# (non-secret) fingerprint is stored alongside the timestamp so the prune can drop a stale timer as
+# soon as THAT account responds again — even while OTHER accounts are failing to list — without it
+# growing unbounded during a partial outage.
 #
 # Two threads can run a sweep at once — the periodic control-plane reaper (via asyncio.to_thread)
 # and a deploy-time quota sweep — so every read/write of ``_idle_since`` is serialized by this lock
 # (a dedicated lock, NOT FLASH_SDK_LOCK, since the sweep uses the REST API, not the Flash SDK).
 # Holding it across the sweep also prevents a concurrent sweep's prune from disturbing this one's
 # grace timers; contention is negligible (the reaper runs every 10 min, deploy sweeps are rare).
-_idle_since: dict[str, float] = {}
+_idle_since: dict[str, tuple[float, str]] = {}
 _idle_since_lock = threading.Lock()
 
 
+def canonical_endpoint_name(name: str) -> str:
+    """The bare ``flash-<gpu>-<run>`` endpoint name, with the ``runpod-flash`` SDK's live-provisioned
+    ``live-`` prefix stripped.
+
+    One RunPod endpoint has TWO names: flash computes and stores the bare ``flash-...`` form (the
+    name it asks the SDK to deploy), but the SDK registers the live resource as ``live-flash-...`` so
+    it can't collide with the same-named template — so the RunPod account *lists* it as
+    ``live-flash-...``. Canonicalizing on the boundary (every set we build AND every listed name we
+    test) means the rest of the code only ever deals with the single bare form, instead of every call
+    site re-deriving both. Idempotent; safe on non-flash names. Actual RunPod ops are keyed by
+    endpoint *id*, never the name, so this normalization only affects matching."""
+    return (name or "").removeprefix("live-")
+
+
 def _is_flash_endpoint(name: str) -> bool:
-    """True for a flash training endpoint this sweep may reap (matches the SDK's ``live-`` form).
+    """True for a flash training endpoint this sweep may reap (in either registered form).
     Serving runs on freesolo's Modal app, not RunPod, so the only flash-* RunPod endpoints are
     training endpoints."""
-    return name.removeprefix("live-").startswith("flash-")
+    return canonical_endpoint_name(name).startswith("flash-")
 
 
 def _sweep_idle_flash_endpoints(
-    protected: set[str], min_idle_s: float = 0.0, reap_warm: bool = True
+    protected: set[str],
+    min_idle_s: float = 0.0,
+    reap_warm: bool = True,
+    known: set[str] | None = None,
 ) -> int:
     """Delete idle, ORPHANED flash training endpoints — workers doing nothing that still hold
     RunPod worker quota (runs that finished/crashed without tearing their endpoint down). Returns
@@ -290,6 +303,11 @@ def _sweep_idle_flash_endpoints(
 
     Safe by construction:
 
+    - ``known`` — when supplied, the endpoint names for EVERY run THIS control plane has a record
+      of. Only endpoints in this set are reapable; one whose name this plane has never issued
+      belongs to ANOTHER control plane sharing the account and is left alone (multi-plane safety).
+      ``None`` keeps the legacy unscoped behavior. Unlike ``protected`` this guards a second plane's
+      *idle/between-jobs* endpoint — a busy one is already safe (it never reads as idle).
     - ``protected`` — endpoint names tied to a LIVE run (both the bare ``flash-...`` and the SDK's
       ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between seeds).
     - ``reap_warm`` — when True (the run-aware periodic reaper, which protects EVERY live run),
@@ -300,60 +318,105 @@ def _sweep_idle_flash_endpoints(
       scaled to zero — it must not delete another live run's between-seeds warm endpoint.
     - ``min_idle_s`` requires the idle reading to PERSIST across sweeps, so a single transient
       zero (cold start / between jobs) never triggers a delete.
+
+    Resilient to a partial pool: ``RUNPOD_API_KEY`` may be a multi-account pool, and we list each
+    account independently (``list_endpoints_by_key``). An account that fails to list this cycle
+    (rejected/expired key, credit/quota, transient blip) is WARNed and SKIPPED — the accounts that
+    DID respond are still reaped, and the skipped account's grace timers are preserved for the next
+    sweep. (Before, the sweep listed via the all-or-nothing ``list_endpoints``: one unhealthy pool
+    key aborted the WHOLE sweep, so idle orphans on healthy accounts piled up indefinitely while the
+    failure was logged only at DEBUG — the bug this guards against.)
     """
     deleted = 0
     try:
-        endpoints = runpod_api.list_endpoints()
+        by_fp, failed_fps = runpod_api.list_endpoints_by_key()
     except Exception:
-        logger.debug("idle-sweep: failed to list endpoints", exc_info=True)
+        # Only reached when the pool itself is unusable (no key configured) — a per-account
+        # failure is captured in failed_fps, not raised. WARN (not DEBUG): a reaper that can't
+        # list anything is exactly the silent stall we want visible in the logs.
+        logger.warning("idle-sweep: could not list any RunPod pool account; skipping sweep", exc_info=True)
         return 0
+    if failed_fps:
+        # A flaky/expired account must NOT silently no-op cleanup of the others (the orphan-pile-up
+        # bug). Surface it loudly and carry on with whatever accounts responded.
+        logger.warning(
+            "idle-sweep: %d of %d RunPod pool account(s) failed to list this cycle; reaping the %d "
+            "that responded and retrying the rest next sweep",
+            len(failed_fps),
+            len(by_fp) + len(failed_fps),
+            len(by_fp),
+        )
+    # The (non-secret) fingerprints of the accounts that DID list this cycle. A grace timer is only
+    # safe to prune once its OWNING account responded — then we know its endpoint's true state (still
+    # idle, or genuinely gone). Timers owned by an account that failed this cycle are left untouched.
+    responded_fps = set(by_fp)
     now = time.time()
     still_idle: set[str] = set()
     # Serialize all _idle_since access (see the lock's definition): a concurrent sweep must not
     # mutate the dict mid-iteration (the prune below would raise) or disturb these grace timers.
     with _idle_since_lock:
-        for ep in endpoints:
-            ep_name = ep.get("name") or ""
-            eid = ep.get("id")
-            if not (eid and _is_flash_endpoint(ep_name)):
-                continue
-            # Protect the run's endpoint in either registered form.
-            if ep_name in protected or ep_name.removeprefix("live-") in protected:
-                continue
-            try:
-                health = runpod_api.endpoint_health(eid) or {}
-                workers = health.get("workers")
-                jobs_info = health.get("jobs")
-                # Require non-empty dicts: a missing/empty workers section means the health
-                # response is incomplete and we can't confirm the endpoint is idle.
-                if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
+        for fp, endpoints in by_fp.items():
+            for ep in endpoints:
+                ep_name = ep.get("name") or ""
+                eid = ep.get("id")
+                if not (eid and _is_flash_endpoint(ep_name)):
                     continue
-                # "Busy" = a worker actually working or spinning up, OR a job queued/in progress.
-                # With reap_warm, a warm idle/ready worker with no pending work is NOT busy — it is
-                # the leftover we reclaim (the protected set + grace keep it safe). Without it, a
-                # warm worker counts as busy so only fully-scaled-to-zero endpoints are reaped.
-                busy_workers = (workers.get("running") or 0) + (workers.get("initializing") or 0)
-                if not reap_warm:
-                    busy_workers += (workers.get("ready") or 0) + (workers.get("idle") or 0)
-                in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
-                if busy_workers != 0 or in_flight != 0:
-                    _idle_since.pop(eid, None)  # busy again -> reset the grace timer
+                # Compare against the bare form: ``protected``/``known`` are canonical, and RunPod
+                # lists endpoints under the SDK's ``live-flash-...`` form (see canonical_endpoint_name).
+                canon = canonical_endpoint_name(ep_name)
+                if canon in protected:
                     continue
-                still_idle.add(eid)
-                first_idle = _idle_since.setdefault(eid, now)
-                if now - first_idle < min_idle_s:
-                    continue  # idle, but not for long enough yet — wait for the next sweep
-                if runpod_api.delete_endpoint(eid):
-                    deleted += 1
-                    _idle_since.pop(eid, None)
-                    logger.info("idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
-            except Exception:
-                logger.debug(
-                    "idle-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True
-                )
-                continue
-        # Drop grace timers for endpoints no longer idle/present (busy, deleted, gone, protected).
-        for stale in set(_idle_since) - still_idle:
+                # Multi-plane scope: only reap endpoints this plane has a record of. One whose name
+                # is unknown here belongs to another control plane on the same account — leave it.
+                if known is not None and canon not in known:
+                    continue
+                try:
+                    # Account-scoped: we know which pool account owns this endpoint (its non-secret
+                    # fingerprint), so query/delete with that exact key (resolved inside runpod_api,
+                    # no 404-failover waterfall across the other accounts).
+                    health = runpod_api.endpoint_health_for_fingerprint(eid, fp) or {}
+                    workers = health.get("workers")
+                    jobs_info = health.get("jobs")
+                    # Require non-empty dicts: a missing/empty workers section means the health
+                    # response is incomplete and we can't confirm the endpoint is idle.
+                    if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
+                        continue
+                    # "Busy" = a worker actually working or spinning up, OR a job queued/in progress.
+                    # With reap_warm, a warm idle/ready worker with no pending work is NOT busy — it
+                    # is the leftover we reclaim (the protected set + grace keep it safe). Without it,
+                    # a warm worker counts as busy so only fully-scaled-to-zero endpoints are reaped.
+                    busy_workers = (workers.get("running") or 0) + (workers.get("initializing") or 0)
+                    if not reap_warm:
+                        busy_workers += (workers.get("ready") or 0) + (workers.get("idle") or 0)
+                    in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
+                    if busy_workers != 0 or in_flight != 0:
+                        _idle_since.pop(eid, None)  # busy again -> reset the grace timer
+                        continue
+                    still_idle.add(eid)
+                    first_idle, _owner = _idle_since.setdefault(eid, (now, fp))
+                    if now - first_idle < min_idle_s:
+                        continue  # idle, but not for long enough yet — wait for the next sweep
+                    if runpod_api.delete_endpoint_for_fingerprint(eid, fp):
+                        deleted += 1
+                        _idle_since.pop(eid, None)
+                        logger.info("idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
+                except Exception:
+                    logger.debug(
+                        "idle-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True
+                    )
+                    continue
+        # Drop grace timers for endpoints no longer idle/present, but ONLY for timers whose owning
+        # account responded this cycle. For those accounts we have an authoritative view: an endpoint
+        # that's still listed-and-idle is in ``still_idle``; one that's gone (busy again, or deleted)
+        # is not, so its timer is stale and safe to drop. A timer owned by an account that FAILED to
+        # list this cycle is left untouched — we can't tell if its endpoint went busy or vanished, so
+        # resetting it would restart the grace every time that account flakes and the orphan would
+        # never age out. (Full view => every owner responded => every non-still-idle timer is pruned,
+        # the original behavior; this only changes the partial-outage case, where keying the prune on
+        # the owning account — not on "ids seen this cycle" — lets a vanished endpoint from a HEALTHY
+        # account age out instead of leaking its timer until the unrelated failing account recovers.)
+        prunable = {eid for eid, (_ts, owner_fp) in _idle_since.items() if owner_fp in responded_fps}
+        for stale in prunable - still_idle:
             _idle_since.pop(stale, None)
     return deleted
 
@@ -435,10 +498,13 @@ def deploy_train_endpoint(
 
     _QUOTA_MAX_RETRIES = 3
     resource = None
-    # One pass over the pool: advance_key() WRAPS (always True for a multi-key pool, even after the
-    # last account), so without a bound an all-exhausted pool would fail over forever here. Cap the
-    # failovers at "every OTHER account once" and then raise — the lifecycle retry budget handles
-    # waiting for quota to recover and re-enters this with a fresh attempt.
+    # One pass over the pool, bounded purely by a COUNT — NOT by advance_key()'s return value.
+    # advance_key() wraps (so it can't itself report "all accounts tried" — that depends on where
+    # THIS failover started, which it can't know; a prior run may have left _idx mid-pool). Exactly
+    # key_count()-1 advances visit every OTHER account once from any starting account, then we raise
+    # — the lifecycle retry budget handles waiting for quota to recover and re-enters with a fresh
+    # attempt. Relying on advance_key()'s boolean here would skip the wrapped-over accounts when the
+    # loop starts on a non-first key.
     failovers_left = max(0, rp_keys.key_count() - 1)
     while resource is None:
         ensure_auth()  # collapse RUNPOD_API_KEY to the (possibly failed-over) active account key
@@ -451,7 +517,7 @@ def deploy_train_endpoint(
                 # to zero, never another live run's between-seeds WARM endpoint. The control-plane
                 # periodic reaper does the run-aware, graced warm-idle sweep across all live runs.
                 swept = _sweep_idle_flash_endpoints(
-                    protected={name, f"live-{name}"}, min_idle_s=0.0, reap_warm=False
+                    protected={canonical_endpoint_name(name)}, min_idle_s=0.0, reap_warm=False
                 )
                 wait_s = 30 * quota_attempt
                 logger.warning(
@@ -470,9 +536,12 @@ def deploy_train_endpoint(
         if resource is not None:
             break
         # Quota still exhausted after sweeping this account dry — fail over to the next one, but only
-        # until every account has been tried once (failovers_left). advance_key() wraps and always
-        # returns True for a multi-key pool, so the count — not its return value — is what stops us.
-        if failovers_left > 0 and rp_keys.advance_key():
+        # until every other account has been tried once (the key_count()-based failovers_left bound).
+        # The COUNT is the sole exhaustion signal: advance_key() always advances (wrapping) for a
+        # multi-key pool, so a failover that started mid-pool still visits each remaining account
+        # exactly once before this budget runs out and we raise.
+        if failovers_left > 0:
+            rp_keys.advance_key()
             failovers_left -= 1
             logger.warning(
                 "RunPod worker quota exhausted on this account after sweeping; failing over to "
@@ -581,7 +650,7 @@ def poll_job(
     """Poll a queue job to completion; resilient to transient API errors.
 
     Two stall windows: the cold-start phase (dep install, per-run env pip, model download,
-    vLLM init) is slow and only emits *setup* heartbeats (``_SETUP_HEARTBEAT_STAGES``).
+    vLLM init) is slow and only emits *setup* heartbeats (``SETUP_HEARTBEAT_STAGES``).
     Until a *training* heartbeat arrives we apply the larger ``setup_grace_s`` budget so a
     slow cold start isn't misread as a stall; after it we use the tight ``stall_after_s``.
     Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
@@ -615,6 +684,9 @@ def poll_job(
     start = time.time()
     last_status = None
     last_hb_key = None
+    last_hb_ts = 0.0  # the worker-ts of the last heartbeat we COUNTED as progress (monotonic gate)
+    last_hb_attempt = -1  # the worker-stamped attempt of that heartbeat (so an OLDER attempt's late
+    #                       heartbeat can't reset progress); -1 sentinel < any real attempt (0,1,...)
     last_progress = time.time()
     seen_heartbeat = False
     last_health_probe = 0.0
@@ -752,11 +824,47 @@ def poll_job(
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
-            last_progress = time.time()
-            # Only a training-phase heartbeat means cold-start setup is done and we
-            # can switch to the tight window; setup heartbeats keep the grace budget.
-            if stage not in _SETUP_HEARTBEAT_STAGES:
-                seen_heartbeat = True
+            # Gate progress on the heartbeat's OWN ts (key = (stage, step, ts, attempt)) ADVANCING: a
+            # stale heartbeat that lands late — a newer one skipped by the bounded _HB_UPLOAD_LOCK
+            # while an older slow upload finishes — carries an OLDER ts and must NOT buy a fresh stall
+            # window for a genuinely stuck worker. Unlike Lambda/Hyperstack we keep crediting the
+            # control-plane poll time to last_progress (RunPod's stall math stays in one clock, no
+            # worker/control-plane skew); only the DECISION to count it as progress is ts-monotonic.
+            hb_ts = new_key[2] if new_key else None
+            hb_step = new_key[1] if new_key else None
+            hb_attempt = _attempt_int(new_key[3]) if new_key else None
+            # Cold-start setup OVER -> tighten to the training window. Shared with lambdalabs: a setup
+            # stage never tightens; rl_step/sft_step tighten only at a COMPLETED step (step >= 1) so a
+            # step=0 gap-fill during the silent cold first step keeps setup grace; every other non-setup
+            # stage (POST-training rl_trained / *_train_done / metrics, no step field) tightens so a hung
+            # teardown falls under the tight window. See is_training_heartbeat for the full rationale.
+            is_training_hb = is_training_heartbeat(stage, hb_step)
+            if hb_attempt is not None and hb_attempt > last_hb_attempt:
+                # Newer attempt = a fresh worker after a retry/preemption. Attempts SHARE this run's HF
+                # heartbeat path, and the new worker restarts from cold setup, so reset the ts baseline
+                # and re-derive the latch from ITS heartbeat (regaining setup grace) rather than letting
+                # the prior attempt's training latch suppress the new cold start.
+                last_hb_attempt = hb_attempt
+                last_hb_ts = hb_ts or 0.0
+                last_progress = time.time()
+                seen_heartbeat = is_training_hb
+            elif (hb_attempt is None or hb_attempt == last_hb_attempt) and (
+                hb_ts is None or hb_ts > last_hb_ts
+            ):
+                # Same (or attempt-less) heartbeat stream: gate progress on the heartbeat's OWN ts
+                # ADVANCING (key = (stage, step, ts, attempt)). A stale heartbeat that lands late — a
+                # newer one skipped by the bounded _HB_UPLOAD_LOCK while an older slow upload finishes —
+                # carries an OLDER ts and must NOT buy a fresh stall window for a stuck worker. Unlike
+                # Lambda/Hyperstack we keep crediting the control-plane poll time to last_progress
+                # (RunPod's stall math stays in one clock, no worker/control-plane skew); only the
+                # DECISION to count it as progress is ts-monotonic.
+                if hb_ts is not None:
+                    last_hb_ts = hb_ts
+                last_progress = time.time()
+                if is_training_hb:
+                    seen_heartbeat = True
+            # else: an OLDER attempt's late heartbeat, or a stale ts within the current attempt — ignore
+            # it entirely (no progress credit, no latch change).
         # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
         # but only when a heartbeat_reader lets us tell setup from training; without one we
         # can't, so stay on stall_after_s (no regression).

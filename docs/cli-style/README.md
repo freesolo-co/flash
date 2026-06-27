@@ -16,8 +16,8 @@ A standardized, production-grade output theme for every `flash` command.
   disable the themed layout with `FLASH_STYLE=0`. `NO_COLOR` keeps the layout but drops ANSI color.
 - **No new dependencies:** pure standard library, like the rest of the client CLI.
 
-The rendering lives in `flash/cli/main/render.py`; the command wiring is in
-`flash/cli/main/commands.py` and `envpush.py`.
+The rendering lives in `flash/cli/render.py`; the command wiring is in
+`flash/cli/commands.py` and `envpush.py`.
 
 ## Preview
 

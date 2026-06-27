@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "0.2.25"
+version = "0.2.26"
 description = "Flash — managed LoRA post-training (SFT/GRPO) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -87,7 +87,7 @@ Homepage = "https://github.com/freesolo-co/flash"
 Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
-flash = "flash.cli.main:main"
+flash = "flash.cli:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
 flash-server = "flash.server.__main__:main"
@@ -100,6 +100,16 @@ build-backend = "hatchling.build"
 packages = ["flash"]
 # Ship the PEP 561 marker so downstream type checkers pick up Flash's type hints.
 artifacts = ["flash/py.typed"]
+
+[tool.flash-dev]
+# Version of the dev-channel package `freesolo-flash-dev` (the `flash-dev` CLI, which defaults to
+# the staging plane flash-dev.freesolo.co). It MUST equal [project].version above (the prod
+# `freesolo-flash`) — the two channels ship in lockstep; .github/workflows/version-parity.yml fails
+# CI if they diverge. The dev channel is built from this same source by scripts/build_dev_dist.py and
+# auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
+# PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
+# dev-channel release = bump this (and [project].version) and merge to `dev`.
+version = "0.2.26"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

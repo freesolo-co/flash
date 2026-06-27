@@ -192,8 +192,9 @@ class GpuSpec:
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
-    # each retry resumes from the latest streamed checkpoint.
-    max_retries: int = 2
+    # each retry resumes from the latest streamed checkpoint. Matches INFRA_RETRY_FLOOR
+    # (runner.lifecycle) so a streak of broken/busy GPUs walks to a healthy host before giving up.
+    max_retries: int = 5
     # Persistent RunPod network-volume weight cache (platform-managed, NOT user config). When set,
     # the RunPod provider attaches a same-named volume in EVERY datacenter in the cache fleet and
     # allows the endpoint across all of them (no single-DC pin), and the worker points HF_HOME at
@@ -298,7 +299,7 @@ class JobSpec:
                 type=gpu.get("type", DEFAULT_GPU),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
-                max_retries=int(gpu.get("max_retries", 2)),
+                max_retries=int(gpu.get("max_retries", 5)),
                 # network_volume/network_volume_gb round-trip so the runner-assigned weight cache
                 # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
                 # _assign_managed_hf_repo before deploy. A legacy ``datacenter`` key (from the

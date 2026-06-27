@@ -121,6 +121,172 @@ def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------------------------
+# Worker: make_checkpoint_upload_callback — durable flush of the final deployable checkpoint
+# --------------------------------------------------------------------------------------------
+def _make_ckpt_dir(parent, step):
+    ckpt = parent / f"checkpoint-{step}"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
+    (ckpt / "optimizer.pt").write_bytes(b"opt")
+    return ckpt
+
+
+@pytest.fixture
+def fake_trainer_callback(monkeypatch):
+    """make_checkpoint_upload_callback does ``from transformers import TrainerCallback`` at call
+    time; the offline CI env has no transformers, so stub a minimal base class (we invoke our
+    own on_save/on_train_end overrides directly, so the base is just a placeholder)."""
+    import sys
+    import types
+
+    mod = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    mod.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", mod)
+    return mod
+
+
+def test_latest_checkpoint_dir_picks_highest_step(tmp_path):
+    import flash.engine.worker as worker
+
+    _make_ckpt_dir(tmp_path, 4)
+    _make_ckpt_dir(tmp_path, 12)
+    _make_ckpt_dir(tmp_path, 8)
+    (tmp_path / "checkpoint-notanumber").mkdir()  # ignored
+    (tmp_path / "checkpoint-99").write_text("a file, not a dir")  # ignored
+    step, path = worker._latest_checkpoint_dir(str(tmp_path))
+    assert step == 12
+    assert path.endswith("checkpoint-12")
+    assert worker._latest_checkpoint_dir(str(tmp_path / "missing")) is None
+
+
+def test_on_train_end_flushes_final_deployable_checkpoint(tmp_path, monkeypatch, fake_trainer_callback):
+    """A fast RL run can exit before its last save's async (daemon) upload finishes, so
+    on_train_end must SYNCHRONOUSLY publish the latest on-disk checkpoint as a deployable
+    snapshot — otherwise `flash checkpoints` is empty even though the run trained fine."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 8)  # last save the trainer wrote locally; its async upload was "lost"
+    cb = worker.make_checkpoint_upload_callback()
+
+    # No on_save uploads recorded (simulating their daemon threads being killed at exit).
+    cb.on_train_end(SimpleNamespace(output_dir=str(out)), None, None)
+
+    deployable = [u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-8/adapter")]
+    assert len(deployable) == 1, "on_train_end must publish the final deployable checkpoint"
+    assert "optimizer.pt" in deployable[0]["ignore_patterns"]
+
+
+def test_on_train_end_publishes_final_deployable_when_lock_is_held(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """Regression: a slow on_save upload can still hold the upload lock at run end (and the final
+    step's own on_save may have been skipped on that busy lock). on_train_end must then publish the
+    final deployable WITHOUT the lock instead of timing out and skipping it — otherwise the worker
+    exits, kills the daemon mid-upload, and `flash checkpoints` is empty despite a successful run."""
+    import threading
+
+    from flash.engine.worker import hf as worker_hf
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(worker_hf, "_CKPT_FLUSH_TIMEOUT_S", 0.05)  # give up on the held lock fast
+
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)  # earlier step; its on_save upload will block, holding the lock
+    _make_ckpt_dir(out, 8)  # the FINAL step (its on_save was skipped on the busy lock)
+
+    holding = threading.Event()
+    release = threading.Event()
+    base_upload = rec.upload_folder
+
+    def upload(**kwargs):
+        base_upload(**kwargs)
+        if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
+            holding.set()  # the resume upload now holds the lock...
+            release.wait(5)  # ...keep holding it across the on_train_end flush
+
+    rec.upload_folder = upload
+
+    started: list = []
+    real_thread = threading.Thread
+    monkeypatch.setattr(
+        worker.threading,
+        "Thread",
+        lambda *a, **k: started.append(real_thread(*a, **k)) or started[-1],
+    )
+
+    cb = worker.make_checkpoint_upload_callback()
+    try:
+        cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+        assert holding.wait(5), "the step-4 upload should be holding the lock"
+        cb.on_train_end(SimpleNamespace(output_dir=str(out)), None, None)
+        deployable = [
+            u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-8/adapter")
+        ]
+        assert len(deployable) == 1, "final deployable must publish even when the lock is held"
+    finally:
+        release.set()
+        for t in started:
+            t.join(5)
+
+
+def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch, fake_trainer_callback):
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    out = tmp_path / "out"
+    out.mkdir()
+    worker.make_checkpoint_upload_callback().on_train_end(
+        SimpleNamespace(output_dir=str(out)), None, None
+    )
+    assert rec.uploads == []
+
+
+def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_trainer_callback):
+    """The durable, accumulating deployable adapter must be uploaded BEFORE the larger
+    latest-only resume checkpoint, so it lands first if the worker is torn down mid-upload."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+
+    class _SyncThread:  # run the upload body inline so the unit test is deterministic
+        def __init__(self, target=None, daemon=None, **kw):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr(worker.threading, "Thread", _SyncThread)
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)
+    cb = worker.make_checkpoint_upload_callback()
+    cb.on_save(
+        SimpleNamespace(output_dir=str(out)),
+        SimpleNamespace(global_step=4),
+        None,
+    )
+    paths = [u["path_in_repo"] for u in rec.uploads]
+    assert paths == [
+        "rl/flash-ckpt-1/seed0/checkpoints/step-4/adapter",  # deployable first
+        "rl/flash-ckpt-1/seed0/checkpoint/checkpoint-4",  # resume second
+    ]
+
+
+# --------------------------------------------------------------------------------------------
 # Control plane: list_checkpoints
 # --------------------------------------------------------------------------------------------
 class _FakeHfApiFiles:
@@ -296,3 +462,34 @@ def test_best_effort_no_checkpoints(monkeypatch):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: [])
     assert ck.register_checkpoints_best_effort(_status()) == 0
+
+
+# ---------------------------------------------------------------------------
+# Finalize wiring: the FINAL training step is always published as a deployable
+# checkpoint (not only when it lands on a save_steps boundary). The per-save
+# callback / on_train_end publish at/near save boundaries; an unaligned last
+# step would otherwise have no `--step` entry even though it IS the served
+# default `<prefix>/adapter`. run_rl/run_sft must close that gap after saving
+# the final adapter. Source-wiring (a runtime test would need a full trainer).
+# ---------------------------------------------------------------------------
+def _finalize_src(module_name: str, fn_name: str) -> str:
+    import importlib
+    import inspect
+
+    mod = importlib.import_module(module_name)
+    return inspect.getsource(getattr(mod, fn_name))
+
+
+def test_run_rl_publishes_final_step_as_deployable_checkpoint():
+    src = _finalize_src("flash.engine.worker.rl", "run_rl")
+    # Final adapter is saved, then published as a deployable checkpoint keyed by the final step.
+    assert 'save_pretrained(adapter_dir)' in src
+    assert 'publish_deployable_checkpoint(adapter_dir, _steps_run)' in src
+
+
+def test_run_sft_publishes_final_step_as_deployable_checkpoint():
+    src = _finalize_src("flash.engine.worker.sft", "run_sft")
+    assert 'save_pretrained(adapter_dir)' in src
+    # SFT derives the final step from trainer state (no _steps_run var) and publishes it.
+    assert 'global_step' in src
+    assert 'publish_deployable_checkpoint(adapter_dir, _final_step)' in src

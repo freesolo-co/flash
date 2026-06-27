@@ -93,17 +93,23 @@ def select_active() -> str | None:
 
 
 def advance_key() -> bool:
-    """Cycle to the next account for new provisioning. False only for a single-key pool.
+    """Cycle the active account to the next key for new provisioning. True iff it advanced.
 
     Wraps around after the last key so quota recovered on earlier accounts is reused
-    (e.g. key1 → key2 → key1 → ...). With a single key there is nowhere to advance —
-    the caller's quota-sweep retry loop handles the wait in that case.
+    (e.g. key1 → key2 → key1 → ...). The pointer ALWAYS advances for a multi-key pool, so this
+    returns:
 
-    Contract caveat: because it WRAPS, a multi-key pool ALWAYS returns True — a True return
-    does NOT mean "a fresh, untried account is now active". A `True` never means "more accounts
-    remain", so callers must NOT loop on ``while advance_key(): ...`` to drain the pool (that
-    spins forever when every account is exhausted); bound the number of failovers by
-    ``key_count()`` instead (see ``deploy_train_endpoint``).
+    * ``True``  — a multi-key pool: the pointer moved to the next account (possibly wrapping).
+    * ``False`` — a single-key pool: there is nowhere to advance (no failover possible).
+
+    IMPORTANT — the return value is NOT an exhaustion signal. Because the pointer wraps, a True
+    does NOT mean "a fresh, untried account is now active", and there is deliberately no
+    "every account tried" boolean: that depends on where a given failover loop STARTED (a prior
+    run may have already advanced ``_idx``), which this function can't know. A wrap-to-index-0
+    heuristic is wrong for a loop that starts mid-pool — it would stop before the wrapped-over
+    accounts are tried. So callers must NOT loop on ``while advance_key(): ...`` to drain the
+    pool; bound the number of failovers by ``key_count()`` instead — exactly ``key_count() - 1``
+    advances visit every OTHER account once from any start (see ``deploy_train_endpoint``).
 
     Also collapses ``RUNPOD_API_KEY`` to the newly-active key so the SDK and the
     preferred-first REST ordering both follow the failover.

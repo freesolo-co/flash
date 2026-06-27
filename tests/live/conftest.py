@@ -15,13 +15,13 @@ import os
 
 import pytest
 
-# The root ``tests/conftest._offline`` autouse fixture DELETES LAMBDA_API_KEY / HYPERSTACK_API_KEY
+# The root ``tests/conftest._offline`` autouse fixture DELETES LAMBDA_API_KEY
 # so the offline suite stays hermetic. Snapshot them at import time (before any fixture runs) so the
 # live fixture below can restore them — otherwise every instance-provider live smoke would skip even
 # with the keys sourced into the shell.
 _KEY_SNAPSHOT = {
     k: os.environ.get(k)
-    for k in ("LAMBDA_API_KEY", "HYPERSTACK_API_KEY", "RUNPOD_API_KEY")
+    for k in ("LAMBDA_API_KEY", "RUNPOD_API_KEY")
 }
 
 

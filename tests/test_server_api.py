@@ -60,9 +60,18 @@ def _identity_for_token(token: str) -> dict[str, str]:
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
+    # the shared tokens + the internal key); see tests/test_preflight.py for the gate.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
+    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
+    import flash.providers.runpod.keys as runpod_keys
+
+    runpod_keys.reset()
     import flash.runner as runner
     import flash.server.auth as auth_mod
     import flash.server.db as db_mod
@@ -76,6 +85,26 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
+    # The new preflight requires the Lambda key above, which also makes
+    # `configured_providers()` treat it as live — so the startup lifespan's `recover_runs()` and
+    # the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda list calls) and
+    # break test hermeticity. These API tests don't exercise orphan reaping, so stub the provider set
+    # to empty: preflight still passes on the keys, but startup stays CPU-only with no network. (Both
+    # call sites do a function-local `from flash.providers import configured_providers`, so patching
+    # the package attribute covers them.)
+    import flash.providers as providers_mod
+    import flash.providers.runpod.train.endpoints as rp_endpoints
+    import flash.server.run_registry as run_registry
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    # The dummy FREESOLO_INTERNAL_KEY also enables the best-effort backend reporting path: a dry-run
+    # /v1/runs submit carries an org_id, so runner.submit_job() -> _report_status() ->
+    # run_registry._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
+    # single network choke-point so these offline tests stay hermetic (same as the billing fixture).
+    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    # ...and that same key makes create_app() startup run the RunPod slot-store reconcile
+    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
+    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
@@ -607,6 +636,35 @@ def test_bad_spec_is_400(api):
     r = api.post("/v1/runs", json={"spec": {"algorithm": "grpo"}}, headers=_bearer(key))
     assert r.status_code == 400
     assert "model" in r.json()["detail"]
+
+
+def test_non_object_spec_fields_get_targeted_400(api):
+    # A falsy NON-object JSON value (""/0/[]/false) for spec / spec.environment / runtime_secrets
+    # must 400 with the intended "must be a JSON object" message, not get coerced to {} (which
+    # would surface a misleading downstream error like "config must set [environment] id").
+    key = _login()
+    for bad_spec in ("", 0, [], False):
+        r = api.post("/v1/runs", json={"spec": bad_spec}, headers=_bearer(key))
+        assert r.status_code == 400, (bad_spec, r.text)
+        assert "spec must be a JSON object" in r.json()["detail"], (bad_spec, r.text)
+
+    for bad_env in ("", 0, [], False):
+        r = api.post(
+            "/v1/runs",
+            json={"spec": {**SPEC, "environment": bad_env}},
+            headers=_bearer(key),
+        )
+        assert r.status_code == 400, (bad_env, r.text)
+        assert "spec.environment must be a JSON object" in r.json()["detail"], (bad_env, r.text)
+
+    for bad_secrets in ("", 0, [], False):
+        r = api.post(
+            "/v1/runs",
+            json={"spec": SPEC, "dry_run": True, "runtime_secrets": bad_secrets},
+            headers=_bearer(key),
+        )
+        assert r.status_code == 400, (bad_secrets, r.text)
+        assert "runtime_secrets must be a JSON object" in r.json()["detail"], (bad_secrets, r.text)
 
 
 def test_deploy_dry_run(api):
@@ -1365,3 +1423,233 @@ def test_create_run_records_flash_training_run(api, monkeypatch):
     # Org attribution rides on the persisted platform_context (org_id/user_id/api_key_id),
     # which submit_job reports for us — create_run no longer double-POSTs with an explicit key.
     assert last["status"].platform_context["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
+
+
+# --- export: copy a trained adapter to a user-owned HuggingFace repo ----------------------
+
+
+def _finished_run(api, key) -> str:
+    """Submit a run and flip it to `done` (a finished run with a trained final adapter)."""
+    import flash.runner as runner
+
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    return run_id
+
+
+def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
+    """A finished run's final adapter is read from its private artifact repo (operator side) and
+    re-uploaded to the user's repo with the user's token; the response reports the source path."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    # The platform auto-assigns each run a per-run HF dataset repo under the OPERATOR's org, so
+    # only the control plane (operator token) can read the source — read it back from the run.
+    src_repo = runner.get_status(run_id).spec["train"]["hf_repo"]
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return "https://huggingface.co/me/adapters"
+
+    monkeypatch.setattr(app_mod, "export_adapter", capture)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/adapters", "hf_token": "hf_user"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["repository"] == "me/adapters"
+    assert body["url"] == "https://huggingface.co/me/adapters"
+    assert body["source"] == f"{src_repo}:rl/{run_id}/seed0/adapter"
+    assert "step" not in body
+    # Source = the run's private dataset repo + final-adapter subfolder; dest = the user's repo.
+    assert seen["source_repo"] == src_repo
+    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/adapter"
+    assert seen["dest_repo"] == "me/adapters"
+    assert seen["dest_token"] == "hf_user"
+    assert seen["private"] is True  # private by default
+
+
+def test_export_public_flag_sets_private_false(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    seen: dict = {}
+    monkeypatch.setattr(
+        app_mod,
+        "export_adapter",
+        lambda **kw: (seen.update(kw), "https://huggingface.co/me/a")[1],
+    )
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf", "private": False},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["private"] is False
+
+
+def test_export_validates_repository_and_token(api):
+    key = _login()
+    run_id = _finished_run(api, key)
+    missing_repo = api.post(
+        f"/v1/runs/{run_id}/export", json={"hf_token": "hf"}, headers=_bearer(key)
+    )
+    assert missing_repo.status_code == 400
+    assert "repository" in missing_repo.json()["detail"]
+    missing_token = api.post(
+        f"/v1/runs/{run_id}/export", json={"repository": "me/a"}, headers=_bearer(key)
+    )
+    assert missing_token.status_code == 400
+    assert "hf_token" in missing_token.json()["detail"]
+    # SHAPE check: a HF repo id is EXACTLY two non-empty segments — reject no-slash AND the over-/
+    # under-segmented forms that the old "at least one '/'" check let through (which would 404/400 deep
+    # in hf_hub). These produce the "owner/name" shape error.
+    for bad_repo in ("noslash", "owner/name/extra", "owner//name", "/name", "name/"):
+        malformed = api.post(
+            f"/v1/runs/{run_id}/export",
+            json={"repository": bad_repo, "hf_token": "hf"},
+            headers=_bearer(key),
+        )
+        assert malformed.status_code == 400, bad_repo
+        assert "owner/name" in malformed.json()["detail"]
+    # GRAMMAR check: two segments but NOT a valid HF repo id — embedded whitespace, a segment that
+    # starts/ends with '-' or '.', a '--'/'..' run, or a >96-char name. The full Hub grammar
+    # (huggingface_hub.validate_repo_id) must reject these FAST with a 400, not let export_adapter
+    # download the private source adapter first and hit a wrapped 502 from create_repo.
+    for bad_repo in (
+        "owner/ name",
+        "own er/name",
+        "owner/na\tme",
+        "owner/na me",
+        "owner/-bad",
+        "owner/bad-",
+        "owner/.bad",
+        "owner/bad--name",
+        "owner/ba..d",
+        "owner/" + "x" * 97,
+    ):
+        malformed = api.post(
+            f"/v1/runs/{run_id}/export",
+            json={"repository": bad_repo, "hf_token": "hf"},
+            headers=_bearer(key),
+        )
+        assert malformed.status_code == 400, bad_repo
+        assert "valid HuggingFace repo id" in malformed.json()["detail"], bad_repo
+
+
+def test_export_unfinished_run_is_409(api, monkeypatch):
+    """A run with no trained final adapter (never finished) can't be exported — and the HF copy
+    is never attempted."""
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+
+    def must_not_run(**kw):
+        raise AssertionError("export_adapter must not run for an unfinished run")
+
+    monkeypatch.setattr(app_mod, "export_adapter", must_not_run)
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 409, resp.text
+
+
+def test_export_missing_artifacts_is_404(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    def boom(**kw):
+        raise ValueError("no adapter artifacts found at org/test-runs:... (nothing to export)")
+
+    monkeypatch.setattr(app_mod, "export_adapter", boom)
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 404, resp.text
+    assert "no adapter artifacts" in resp.json()["detail"]
+
+
+def test_export_hf_failure_is_clean_502(api, monkeypatch):
+    """An HF transport/permission failure (download or upload) surfaces as a clean 502 carrying the
+    real reason — not an unhandled 500 (mirrors the deploy/undeploy ServingError handling)."""
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    def boom(**kw):
+        raise ServingError("could not upload adapter to me/a: 403 Forbidden")
+
+    monkeypatch.setattr(app_mod, "export_adapter", boom)
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 502, resp.text
+    assert "could not upload" in resp.json()["detail"]
+
+
+def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
+    """`--step N` exports the exact per-step checkpoint `flash deploy --step N` would serve; an
+    unknown step 404s with the available list (resolved against published checkpoints)."""
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    monkeypatch.setattr(
+        app_mod,
+        "list_checkpoints",
+        lambda spec: [
+            {
+                "step": 40,
+                "subfolder": f"rl/{run_id}/seed0/checkpoints/step-40/adapter",
+                "repo_id": "org/test-runs",
+                "repo_type": "dataset",
+            }
+        ],
+    )
+    seen: dict = {}
+    monkeypatch.setattr(
+        app_mod,
+        "export_adapter",
+        lambda **kw: (seen.update(kw), "https://huggingface.co/me/a")[1],
+    )
+    ok = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf", "step": 40},
+        headers=_bearer(key),
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["step"] == 40
+    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/checkpoints/step-40/adapter"
+
+    bad = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf", "step": 99},
+        headers=_bearer(key),
+    )
+    assert bad.status_code == 404, bad.text
+    assert "step 99" in bad.json()["detail"]
