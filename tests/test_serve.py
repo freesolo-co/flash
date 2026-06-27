@@ -436,41 +436,30 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
 
 
 def test_chat_stream_accepts_json_fallback(monkeypatch):
-    """A new Flash server can still talk to an older serving app that ignores stream=true."""
+    """A new Flash server can still talk to an older serving app that ignores stream=true.
+
+    Drives a REAL httpx streaming response (MockTransport) so the read-before-.json() contract is
+    actually exercised — a stub with a bare .json() would mask the ResponseNotRead bug.
+    """
+    import httpx
+
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
 
-    class _JsonResp:
-        def __init__(self):
-            self.headers = {"content-type": "application/json"}
+    def handler(request):
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "full reply"}}]}
+        )  # httpx sets content-type: application/json
 
-        def __enter__(self):
-            return self
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.Client
 
-        def __exit__(self, *exc):
-            return False
+    def _client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
 
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"choices": [{"message": {"content": "full reply"}}]}
-
-    class _FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def stream(self, method, url, json=None, headers=None):
-            return _JsonResp()
-
-    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
+    monkeypatch.setattr(d.httpx, "Client", _client)
 
     assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
         "full reply"

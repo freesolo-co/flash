@@ -232,6 +232,11 @@ class JobHandle:
     endpoint_id: str
     endpoint_name: str
     job_id: str
+    # The retry attempt this handle was submitted on. Persisted so a cross-process reattach can tell
+    # poll_job which attempt's heartbeats are current: attempts SHARE the seed's HF heartbeat path,
+    # so a retry must reject a prior attempt's leftover training heartbeat (else it loses cold-start
+    # grace). Old handles persisted before this field default to 0 (see from_dict).
+    attempt: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -239,13 +244,16 @@ class JobHandle:
             "endpoint_id": self.endpoint_id,
             "endpoint_name": self.endpoint_name,
             "job_id": self.job_id,
+            "attempt": self.attempt,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> JobHandle:
         # `provider` is routing metadata consumed upstream (runner); handles
         # persisted before it existed default to runpod there.
-        return cls(d["endpoint_id"], d.get("endpoint_name", ""), d["job_id"])
+        return cls(
+            d["endpoint_id"], d.get("endpoint_name", ""), d["job_id"], int(d.get("attempt", 0) or 0)
+        )
 
 
 def _is_workers_quota_error(exc: Exception) -> bool:
@@ -667,6 +675,7 @@ def poll_job(
     throttled_grace_s: float = 300.0,
     queue_grace_s: float = 300.0,
     deadline_s: float | None = None,
+    current_attempt: int | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
 
@@ -853,7 +862,22 @@ def poll_job(
             # stage (POST-training rl_trained / *_train_done / metrics, no step field) tightens so a hung
             # teardown falls under the tight window. See is_training_heartbeat for the full rationale.
             is_training_hb = is_training_heartbeat(stage, hb_step)
-            if hb_attempt is not None and hb_attempt > last_hb_attempt:
+            if (
+                current_attempt is not None
+                and hb_attempt is not None
+                and hb_attempt != current_attempt
+            ):
+                # A heartbeat stamped for a DIFFERENT attempt than the one we're polling. Attempts
+                # SHARE this seed's HF heartbeat path, so on a retry the first read is the PRIOR
+                # attempt's leftover file (the first read bypasses the rate-limiter). Counting it would
+                # latch the dead attempt's training heartbeat (seen_heartbeat=True) and drop THIS cold
+                # start from setup_grace_s to the tight stall_after_s — a healthy-but-slow retry cold
+                # start (image pull + tens-of-GB snapshot_download) could then false-stall. Ignore it
+                # entirely until this attempt's own heartbeat lands. Mirrors the Lambda poller's
+                # attempt gating (heartbeat_progress_ts(..., handle.attempt)). When current_attempt is
+                # unknown (None — pre-attempt handle / direct caller) we keep the prior relative logic.
+                pass
+            elif hb_attempt is not None and hb_attempt > last_hb_attempt:
                 # Newer attempt = a fresh worker after a retry/preemption. Attempts SHARE this run's HF
                 # heartbeat path, and the new worker restarts from cold setup, so reset the ts baseline
                 # and re-derive the latch from ITS heartbeat (regaining setup grace) rather than letting
@@ -958,7 +982,7 @@ def submit_run(
         with contextlib.suppress(Exception):
             runpod_api.delete_endpoint(endpoint_id)
         raise
-    handle = JobHandle(endpoint_id, name, job_id)
+    handle = JobHandle(endpoint_id, name, job_id, int(attempt))
     if log is not None:
         print(
             f"submitted job: endpoint={name} ({endpoint_id}) job={job_id} "
@@ -979,6 +1003,7 @@ def submit_run(
         log=log,
         heartbeat_reader=reader,
         failure_detail_reader=failure_reader,
+        current_attempt=int(attempt),
         **stall_kwargs(on_last_gpu=on_last_gpu),
     )
 

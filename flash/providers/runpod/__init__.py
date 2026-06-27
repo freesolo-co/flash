@@ -98,6 +98,7 @@ class RunpodProvider:
             log=log,
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
+            current_attempt=rh.attempt,
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

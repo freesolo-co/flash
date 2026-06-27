@@ -579,13 +579,24 @@ class FreesoloEnvironment(BaseEnvironment):
         records = []
         for example in examples:
             raw = dict(getattr(example, "record", {}) or {})
-            task = getattr(example, "task", None)
+            # freesolo>=0.2.49 TaskExample exposes input/id/output; read those first and fall back
+            # to the pre-0.2.49 task/task_id/expected_output names. Reading only the legacy names
+            # (as before) silently returned None on the pinned SDK, so an inline-dataset env whose
+            # TaskExample carried an empty .record built an empty canonical record and crashed at
+            # startup with "records must contain an input field".
+            task = getattr(example, "input", None)
+            if task is None:
+                task = getattr(example, "task", None)
             if _CANONICAL_INPUT_KEY not in raw and task is not None:
                 raw[_CANONICAL_INPUT_KEY] = task
-            task_id = getattr(example, "task_id", None)
+            task_id = getattr(example, "id", None)
+            if task_id is None:
+                task_id = getattr(example, "task_id", None)
             if task_id is not None:
                 raw.setdefault("id", task_id)
-            expected = getattr(example, "expected_output", None)
+            expected = getattr(example, "output", None)
+            if expected is None:
+                expected = getattr(example, "expected_output", None)
             if expected is not None:
                 raw.setdefault(_CANONICAL_OUTPUT_KEY, _json_safe(expected))
             metadata = getattr(example, "metadata", None)

@@ -322,6 +322,10 @@ def chat_stream(
     ):
         resp.raise_for_status()
         if "application/json" in resp.headers.get("content-type", ""):
+            # The request was opened with client.stream(), so the body is unread; httpx raises
+            # ResponseNotRead on .json()/.content until it's pulled. Read it before parsing the
+            # buffered (non-SSE) fallback an older serving app returns for stream=true.
+            resp.read()
             payload = resp.json()
             content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
             if content:
