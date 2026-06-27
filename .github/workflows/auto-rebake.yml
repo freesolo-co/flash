@@ -151,7 +151,9 @@ jobs:
         run: |
           title="kernel-cache: per-arch GPU re-bake pending approval"
           body=$(printf 'The kernel toolchain changed (fp_cache), so these per-arch images need a PAID GPU re-warm and are waiting on the **gpu-bake** environment approval:\n\n- arches: `%s`\n- base rev: `%s`\n\nApprove the gpu-warm job in the run: %s' "$GPU_SMS" "$REV" "$RUN_URL")
-          # best-effort: a labeling/permission hiccup must never fail the gate.
+          # best-effort: a labeling/permission hiccup must never fail the gate. self-heal the label so
+          # no manual setup is needed, then reuse one open issue (comment) instead of spamming new ones.
+          gh label create kernel-rebake-pending --color B60205 --description "per-arch kernel cache awaiting GPU re-bake" 2>/dev/null || true
           existing=$(gh issue list --label kernel-rebake-pending --state open --json number -q '.[0].number' 2>/dev/null || true)
           if [ -n "${existing:-}" ]; then
             gh issue comment "$existing" --body "$body" || true
