@@ -475,9 +475,11 @@ def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 1
     Uses GitHub's ``application/vnd.github.raw`` media type, which streams the file's bytes
     directly. The JSON "contents" API (what ``gh api contents`` hits) instead base64-encodes the
     body and returns an EMPTY ``content`` for blobs over 1 MB — so dataset files like
-    ``datasets/train.jsonl`` silently come back empty. The raw media type serves files up to
-    100 MB, sidestepping that limit. ``rel_path`` is relative to the environment directory.
-    A ``GITHUB_TOKEN`` is required for private/internal environment repos.
+    ``datasets/train.jsonl`` silently come back empty. The raw media type streams the blob's bytes
+    directly (GitHub caps raw blobs around 100 MB), sidestepping that 1 MB limit; this helper
+    additionally rejects any response over ``_MAX_ARCHIVE_BYTES`` (256 MiB). ``rel_path`` is
+    relative to the environment directory. A ``GITHUB_TOKEN`` is required for private/internal
+    environment repos.
     """
     ref = _coerce_environment_github_ref(env_ref)
     safe_rel = _safe_repo_relative_path(rel_path)
@@ -510,6 +512,16 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
     """
     ref = _coerce_environment_github_ref(env_ref)
     env_dir = ref.path.rpartition("/")[0]
+    # A managed slug always expands to ``<namespace>/<name>/environment.py`` (a subdir), so env_dir
+    # is non-empty for managed ids. An empty env_dir only arises from an explicit github ref to a
+    # repo-ROOT environment.py — a dedicated single-env repo, where copying the whole repo is
+    # intended. Guard the one case where that would dump the entire SHARED hub: a root-level ref that
+    # resolves to the managed environment-hub repo. Pull a specific ``namespace/name`` id instead.
+    if not env_dir and ref.repo_full_name == _DEFAULT_MANAGED_ENV_REPO:
+        raise ValueError(
+            f"refusing to pull the whole shared environment hub ({_DEFAULT_MANAGED_ENV_REPO}); "
+            "specify a managed environment id (namespace/name) or a github ref to its subdirectory"
+        )
     dest_path = Path(dest)
     # "occupied" = a file, or a non-empty directory; an empty dir is fine to populate in place.
     occupied = dest_path.exists() and (not dest_path.is_dir() or any(dest_path.iterdir()))
@@ -525,11 +537,32 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             raise FileNotFoundError(
                 f"environment directory {env_dir or '.'!r} not found in {ref.repo_full_name}@{ref.ref}"
             )
-        if dest_path.is_dir():
-            shutil.rmtree(dest_path)
-        elif dest_path.exists():
+        # Create any missing parent dirs (mirrors the single-file download) so a nested output path
+        # works.
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # A symlink at the destination (even a broken one) is unlinked, never rmtree'd (shutil
+        # refuses) or followed — we write a real directory and leave any symlink target untouched.
+        if dest_path.is_symlink():
             dest_path.unlink()
-        shutil.copytree(source, dest_path)
+        if not dest_path.exists():
+            shutil.copytree(source, dest_path)
+        elif dest_path.is_dir() and not any(dest_path.iterdir()):
+            # Populate an existing EMPTY dir in place, preserving its own perms/metadata.
+            shutil.copytree(source, dest_path, dirs_exist_ok=True)
+        else:
+            # Overwriting an OCCUPIED destination: build the new tree in a sibling staging dir and
+            # atomically swap it in, so a mid-copy failure never destroys the existing data.
+            staging_parent = Path(tempfile.mkdtemp(prefix=".flash-env-pull-", dir=dest_path.parent))
+            try:
+                staging = staging_parent / dest_path.name
+                shutil.copytree(source, staging)
+                if dest_path.is_dir():
+                    shutil.rmtree(dest_path)
+                else:
+                    dest_path.unlink()
+                os.replace(staging, dest_path)
+            finally:
+                shutil.rmtree(staging_parent, ignore_errors=True)
         return dest_path
     finally:
         shutil.rmtree(tmp_parent, ignore_errors=True)
