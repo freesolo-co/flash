@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import io
 import os
 import re
@@ -63,10 +64,36 @@ def _sanitize_name(name: str) -> str:
     return slug or "env"
 
 
+class _LimitedReader:
+    """Bounds total bytes read from a *decompressed* tar stream. A GNU LONGNAME/LONGLINK or PAX header
+    payload is consumed inside ``tarfile.next()`` and never yielded as a member, so per-member size
+    accounting can't see it — a tiny gzip can declare a multi-GB header and OOM the process. Reads are
+    clamped to the remaining budget so a single oversized header read allocates at most the limit, then
+    raises ``EnvPublishError``."""
+
+    def __init__(self, raw, limit: int):
+        self._raw = raw
+        self._remaining = limit
+
+    def read(self, size: int = -1) -> bytes:
+        want = self._remaining + 1 if size is None or size < 0 else min(size, self._remaining + 1)
+        chunk = self._raw.read(want)
+        self._remaining -= len(chunk)
+        if self._remaining < 0:
+            raise EnvPublishError(
+                f"env package is too large uncompressed (limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})"
+            )
+        return chunk
+
+
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     root = dest.resolve()
+    # Stream backstop > the per-member content cap by the max header+padding overhead (<=1KB/member),
+    # so it never false-rejects a legitimate package but still bounds an oversized header payload.
+    stream_cap = _MAX_UNCOMPRESSED_BYTES + _MAX_MEMBERS * 1024 + (1 << 20)
     try:
-        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+        reader = _LimitedReader(gzip.GzipFile(fileobj=io.BytesIO(tar_bytes)), stream_cap)
+        with tarfile.open(fileobj=reader, mode="r|") as tar:
             total = 0
             for count, member in enumerate(tar, start=1):
                 if count > _MAX_MEMBERS:

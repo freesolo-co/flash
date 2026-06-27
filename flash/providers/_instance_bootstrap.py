@@ -348,6 +348,14 @@ def main() -> int:
                 os.remove(stale)
         rc = run_mode(payload, env, phase, deadline)
         if not os.path.exists("/tmp/metrics.json"):
+            # Missing local metrics but the run is confirmed complete on HF (DONE+metrics uploaded) —
+            # e.g. the idempotency replay hit a transient HF read. The run SUCCEEDED; retry so a fresh
+            # worker re-fetches the metrics, never fail a confirmed-complete run as a crash.
+            if remote_completion_confirmed(payload):
+                raise RetriableBootstrapError(
+                    f"train phase '{phase}' is complete on HF but its local metrics.json is missing "
+                    f"(transient HF read); retrying to re-fetch the persisted metrics"
+                )
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
