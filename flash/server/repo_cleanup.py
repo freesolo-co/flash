@@ -374,14 +374,20 @@ def apply_plan(api, plan: Plan, *, dry_run: bool, sleep: float) -> list[dict]:
     return manifest
 
 
-def _print_report(plan: Plan, cfg: Config, *, dry_run: bool, live_set_known: bool) -> None:
+def _print_report(plan: Plan, cfg: Config, *, dry_run: bool, live_set_known: bool, live_set_complete: bool = True) -> None:
     out = sys.stdout
     by_kind: dict[str, int] = {}
     for a in plan.actions:
         by_kind[a.kind if a.path is None else f"{a.kind}:{a.path}"] = by_kind.get(a.kind if a.path is None else f"{a.kind}:{a.path}", 0) + 1
+    if not live_set_known:
+        live_set_status = "UNAVAILABLE (code-only tier)"
+    elif not live_set_complete:
+        live_set_status = "INCOMPLETE — a live record had no repo id (code-only tier)"
+    else:
+        live_set_status = "confirmed"
     print(f"\n=== flashrun-* repo cleanup ({'DRY-RUN' if dry_run else 'APPLY'}) ===", file=out)
     print(f"namespace={cfg.namespace}  tiers: code={cfg.code} checkpoints={cfg.checkpoints} repos={cfg.repos}", file=out)
-    print(f"serving live set: {'confirmed' if live_set_known else 'UNAVAILABLE (code-only tier)'}", file=out)
+    print(f"serving live set: {live_set_status}", file=out)
     print(f"skipped (untouched): {len(plan.skips)}   planned actions: {len(plan.actions)}", file=out)
     for label, n in sorted(by_kind.items()):
         print(f"  {label}: {n}", file=out)
@@ -400,10 +406,12 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
     # Resolve the live serving keep-set first. Tiers that remove servable content REQUIRE it; if it
     # can't be confirmed they abort. The code-only tier is serving-safe and may proceed without it.
     live_set_known = True
+    live_set_complete = True
     try:
         deployed, complete = deployed_repo_ids()
     except Exception as exc:
         live_set_known = False
+        live_set_complete = False
         deployed = set()
         if cfg.needs_live_set:
             raise CleanupAborted(
@@ -416,6 +424,8 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
             # Serving answered, but a live record couldn't be mapped to a repo id. Destructive tiers
             # abort (an unidentifiable live repo could be deleted); code-only proceeds with the
             # best-effort set (still protects every identifiable deployed repo; code is serving-safe).
+            # Report it as incomplete (NOT "confirmed") so operators aren't given false assurance.
+            live_set_complete = False
             if cfg.needs_live_set:
                 raise CleanupAborted(
                     "serving returned a live adapter record with no repo id; refusing checkpoint/repo "
@@ -456,7 +466,7 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
                 logger.warning("dropping %d planned action(s) against repos deployed since enumeration", dropped)
                 plan.actions = kept
 
-    _print_report(plan, cfg, dry_run=dry_run, live_set_known=live_set_known)
+    _print_report(plan, cfg, dry_run=dry_run, live_set_known=live_set_known, live_set_complete=live_set_complete)
     manifest = apply_plan(api, plan, dry_run=dry_run, sleep=sleep)
     if manifest_path:
         with open(manifest_path, "w") as f:
