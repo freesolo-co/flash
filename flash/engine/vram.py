@@ -407,6 +407,13 @@ def grpo_fits_resident(
     if params_b <= 0:
         return False  # unknown size (open-model path) -> keep the safe default
     quant = (getattr(info, "quant", "bf16") or "bf16") if info else "bf16"
+    # MoE: size the resident peak's COMPUTE terms (KV pool, activations, rank-linear LoRA) on the ~3B
+    # ACTIVE backbone, exactly as model_required_vram_gb does — keying them on the 35B TOTAL inflates
+    # the resident estimate above the card and wrongly forces vLLM sleep mode on a B200 MoE GRPO run,
+    # where the sleep/wake cycle stalls the colocated rollout (the very failure this gate exists to
+    # avoid). The ``weights`` term still sizes the full params_b. Dense models leave active_params_b
+    # unset -> estimate_vram_gb falls back to params_b for every term (unchanged).
+    active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
     resident = estimate_vram_gb(
         params_b,
         "grpo",
@@ -419,6 +426,7 @@ def grpo_fits_resident(
         use_vllm=True,
         vocab=vocab_size_for(model_id),
         sleep_offload=False,
+        active_params_b=active_b,
     )
     return resident * margin <= card_vram_gb
 
@@ -513,7 +521,13 @@ def model_required_vram_gb(
     model_vocab = vocab_size_for(model_id)
     is_grpo = (algorithm or "").lower() in ("grpo", "rl")
     if info is not None:
-        params_b = params_b_from_str(info.params)
+        # Total weight size comes from the CURATED ``params_b`` (the single source of truth
+        # resolve_params_b and the cost model read directly), falling back to the ``params`` display
+        # string only when it's unset. Re-parsing the string is fragile for an MoE whose string lists
+        # BOTH the total and the ~3B active count ("35B total / ~3B active"): a reordering could make
+        # params_b_from_str pick up the active count and size the resident weights ~10x too small,
+        # under-provisioning the card. The calibrated params_b (the MoE's 35.0) is authoritative.
+        params_b = float(getattr(info, "params_b", 0.0) or 0.0) or params_b_from_str(info.params)
         quant = getattr(info, "quant", "bf16") or "bf16"
         # GRPO always runs the rollout on a colocated vLLM engine, so sizing must reserve room for
         # the 2nd (rollout) weight copy on the same card.
