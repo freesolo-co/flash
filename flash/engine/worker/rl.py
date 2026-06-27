@@ -265,8 +265,9 @@ def run_rl():
     # enable_thinking (thinking="unknown") would otherwise have its normal tagless answers treated as
     # unterminated reasoning — over-penalized AND mis-graded toward terse/truncated outputs. The pre-
     # open is a template-level generation-prompt suffix (identical across examples), so ONE render of a
-    # kept prompt decides it — through the SAME _render_for_budget path the filter already ran on this
-    # prompt, so we neither re-derive the render nor silently swallow its errors back into the no-op.
+    # kept prompt decides it. It re-renders through the SAME _render_for_budget path the filter used —
+    # a second call, NOT a cached result, but identical logic so the text can't drift from the filter's
+    # — and lets a render error fail fast rather than swallowing it into a silent no-op.
     _prompt_opens_thinking = (
         bool(_w.THINKING)
         and bool(prompts)
