@@ -30,6 +30,32 @@ from flash.spec import JobSpec
 router = APIRouter()
 
 
+def _validate_hf_repo_id(repository: str) -> None:
+    """Reject a destination repo id that violates the HuggingFace repo-name grammar — FAST, before any
+    export work touches HF. Delegates to huggingface_hub's own ``validate_repo_id`` (the canonical Hub
+    rules: charset ``[A-Za-z0-9._-]``, no leading/trailing ``-``/``.``, no ``--``/``..``, length <= 96)
+    so this never drifts from the Hub. Without it a malformed id (e.g. ``owner/-bad``,
+    ``owner/bad--name``, a >96-char name, embedded whitespace) is accepted here and only fails LATER as
+    a wrapped 502 inside ``create_repo`` — after ``export_adapter`` already downloaded the private
+    source adapter. Raises ``HTTPException(400)`` on a bad id.
+
+    If the ``huggingface_hub`` server extra is somehow absent the grammar check is skipped (the export
+    path itself surfaces the missing extra as a 500); the cheap ``owner/name`` shape check upstream
+    still runs regardless.
+    """
+    try:
+        from huggingface_hub.utils import HFValidationError, validate_repo_id
+    except ModuleNotFoundError:
+        return
+    try:
+        validate_repo_id(repository)
+    except HFValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"repository is not a valid HuggingFace repo id: {exc}",
+        ) from exc
+
+
 def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
     """Validate an optional deploy ``step`` against the run's published checkpoints.
 
@@ -204,6 +230,114 @@ def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
         if status.deployment:
             mark_undeployed(run_id)
         return {"run_id": run_id, "deleted_endpoints": deleted}
+
+
+@router.post("/v1/runs/{run_id}/export")
+def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
+    """Copy a run's trained adapter into a user-owned HuggingFace repo.
+
+    Reads the adapter from the run's private artifact repo with the operator token and
+    re-uploads it to ``repository`` with the user-supplied ``hf_token`` (write access to their
+    own repo). ``step`` selects an intermediate checkpoint — resolved against the same published
+    checkpoints as ``flash deploy --step`` — instead of the run's final adapter.
+    """
+    payload = payload or {}
+    repository = str(payload.get("repository") or "").strip()
+    if not repository:
+        raise HTTPException(
+            status_code=400,
+            detail="repository is required: the destination HuggingFace repo 'owner/name'",
+        )
+    # A HF repo id is EXACTLY two non-empty segments (``owner/name``). "at least one '/'" wrongly
+    # accepted ``owner/name/extra``, ``owner//name``, ``/name``, ``name/`` — which would 404/400 deep
+    # in huggingface_hub. Strip surrounding slashes, then require precisely two non-empty parts.
+    if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
+        raise HTTPException(
+            status_code=400,
+            detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
+        )
+    # Use the CANONICAL ``owner/name`` form downstream (and in the echoed URL), not the raw input: a
+    # value like ``/owner/name`` or ``owner/name/`` passes the shape check but would otherwise reach HF
+    # and the returned url with stray slashes.
+    repository = "/".join(parts)
+    # Counting parts is not enough: ``owner/ name``, ``owner/-bad``, ``owner/bad--name`` or a >96-char
+    # name all have two segments but are NOT valid HF repo ids — they'd be accepted here and only blow
+    # up DEEP inside huggingface_hub (a wrapped 502) AFTER export_adapter downloaded the private source
+    # adapter. Validate the FULL Hub repo-name grammar up front so a malformed id fails fast with a 400.
+    _validate_hf_repo_id(repository)
+    hf_token = str(payload.get("hf_token") or "").strip()
+    if not hf_token:
+        raise HTTPException(
+            status_code=400,
+            detail="hf_token is required: a HuggingFace token with write access to the destination repo",
+        )
+    # Validate ``private`` is an actual JSON boolean (mirrors deploy's ``dry_run`` guard): a
+    # truthy non-bool like "false" must not silently flip the destination's visibility.
+    private = payload.get("private", True)
+    if not isinstance(private, bool):
+        raise HTTPException(status_code=400, detail="private must be a boolean")
+
+    status = owned_run(run_id, key)
+    spec = JobSpec.from_dict(status.spec)
+    # Legacy runs with no artifact repo (mirrors the /deploy guard): the adapter can't be located.
+    if not spec.train.hf_repo:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
+                "cannot be located, so it cannot be exported"
+            ),
+        )
+    # Optional `step`: export a specific intermediate checkpoint instead of the final adapter,
+    # validated against what's actually on HF (a missing step 404s with the available list).
+    checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
+    is_checkpoint = checkpoint_step is not None
+    # Same state gate as deploy: a final adapter exists only once a run finished; a per-step
+    # checkpoint also survives a run that stopped mid-RL (cancelled/failed).
+    allowed_states = (
+        _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
+    )
+    if status.state not in allowed_states:
+        detail = (
+            f"run {run_id} is {status.state!r}; export a checkpoint only once the run "
+            "has finished, been cancelled, or failed"
+            if is_checkpoint
+            else f"run {run_id} is {status.state!r}; only finished runs with "
+            "trained adapter artifacts can be exported"
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    # The per-step adapter folder for a checkpoint, otherwise the run's final adapter folder.
+    prefix = (
+        checkpoint_adapter_prefix(spec, checkpoint_step)
+        if is_checkpoint
+        else adapter_prefix(spec)
+    )
+    subfolder = f"{prefix}/adapter"
+    try:
+        url = _app.export_adapter(
+            source_repo=spec.train.hf_repo,
+            source_subfolder=subfolder,
+            dest_repo=repository,
+            dest_token=hf_token,
+            private=private,
+        )
+    except ValueError as exc:
+        # The source has no adapter artifacts at that path — nothing to export.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ServingError as exc:
+        # An HF transport/permission failure (download or upload) — an upstream problem, not a
+        # flash bug, so surface a clean 502 with the real reason (mirrors deploy/undeploy).
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    result = {
+        "run_id": run_id,
+        "adapter_id": run_id,
+        "repository": repository,
+        "url": url,
+        "source": f"{spec.train.hf_repo}:{subfolder}",
+    }
+    if is_checkpoint:
+        result["step"] = checkpoint_step
+    return result
 
 
 @router.get("/v1/deployments")

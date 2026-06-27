@@ -7,16 +7,19 @@ from flash.catalog import MODELS
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
-    "L4": 60.0,
     "RTX 4090": 165.0,
     "RTX 5090": 210.0,
     "RTX A6000": 155.0,
-    "A40": 150.0,
-    "RTX 6000 Ada": 182.0,
     "A100 PCIe": 312.0,
     "A100 SXM": 312.0,
     "H100": 990.0,
+    # H200 is a Hopper part (same SMs/tensor cores as H100, more HBM) -> same bf16 dense TFLOPS.
+    "H200": 990.0,
     "RTX Pro 6000": 250.0,
+    # B200 (Blackwell datacenter, sm100): NVIDIA spec 2.25 PFLOPS bf16 dense tensor (no sparsity),
+    # listed like H100's 990 dense number so the cost estimator doesn't fall back to the 100-TFLOPS
+    # default and wildly over-estimate the 35B's train time.
+    "B200": 2250.0,
 }
 _DEFAULT_TFLOPS = 100.0
 
@@ -31,7 +34,7 @@ def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
 
     The nominal ``GpuClass.hourly_usd`` is the RunPod rate, which is WRONG for a provider-specific
     quote (e.g. a Lambda RTX A6000 is $1.09/hr, not RunPod's $0.49). When ``provider`` is
-    ``lambda``/``hyperstack`` and the class is offered there, price it through that provider's
+    ``lambda`` and the class is offered there, price it through that provider's
     pricing module (live with a static fallback); otherwise (runpod/auto/None) use the nominal rate.
     """
     info = GPU_INFO.get(name)
@@ -40,10 +43,6 @@ def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
     p = (provider or "").strip().lower()
     if p == "lambda" and info.lambda_name:
         from flash.providers.lambdalabs.pricing import hourly_rate
-
-        return hourly_rate(name)
-    if p == "hyperstack" and info.hyperstack_name:
-        from flash.providers.hyperstack.pricing import hourly_rate
 
         return hourly_rate(name)
     return info.hourly_usd
@@ -87,6 +86,22 @@ def total_params_b(model_id: str) -> float:
             f"({', '.join(MODELS)})"
         )
     return info.params_b
+
+
+def active_params_b(model_id: str) -> float:
+    """Parameters ACTIVE per token (billions) — the per-token FLOPs/step-time size.
+
+    For an MoE this is the curated ``active_params_b`` (a token routes through only a subset of
+    experts); for a dense model (``active_params_b`` unset / 0) it falls back to the total
+    ``params_b``. Use this for compute (FLOPs) terms; use ``total_params_b`` for memory/size terms
+    (VRAM, disk, download), which always size the full checkpoint."""
+    info = MODELS.get(model_id)
+    if info is None:
+        raise ValueError(
+            f"unknown model {model_id!r}; cost estimation supports catalog models only "
+            f"({', '.join(MODELS)})"
+        )
+    return info.active_params_b or info.params_b
 
 
 def model_quant(model_id: str) -> str:

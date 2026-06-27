@@ -22,6 +22,7 @@ _STATIC_RATES: dict[str, float] = {
     "RTX A6000": 1.09,
     "A100 SXM 40GB": 1.99,
     "H100": 3.29,
+    "B200": 6.99,
 }
 
 

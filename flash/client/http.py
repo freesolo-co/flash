@@ -287,6 +287,39 @@ class ApiClient:
             timeout=deploy_timeout,
         )
 
+    def export(
+        self,
+        run_id: str,
+        *,
+        repository: str,
+        hf_token: str,
+        step: int | None = None,
+        private: bool = True,
+    ) -> dict:
+        """Export a run's trained adapter into a user-owned HuggingFace repo.
+
+        Copies the adapter (or a specific ``--step`` checkpoint) from the platform's private
+        artifact repo into ``repository``, authenticated with the user's ``hf_token`` (write
+        access to their own repo). The server downloads then re-uploads the adapter, which can
+        take a while for a large adapter, so the timeout matches deploy's."""
+        body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
+        if step is not None:
+            # Reject a bool explicitly: int(True)/int(False) would silently coerce to step 1/0,
+            # but the server guard treats a bool as an invalid step and 400s — fail fast here
+            # with a clear client-side error instead (matches deploy()'s bool guard).
+            if isinstance(step, bool):
+                raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
+            # Reject a FRACTIONAL step before int() silently truncates it (e.g. 2.7 -> 2 would export
+            # the wrong checkpoint). An integral float (2.0) is fine.
+            if isinstance(step, float) and not step.is_integer():
+                raise ClientError(
+                    f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
+                )
+            body["step"] = int(step)
+        return self._request(
+            "POST", f"/v1/runs/{run_id}/export", body=body, timeout=30 * 60
+        )
+
     def undeploy(self, run_id: str) -> dict:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
 

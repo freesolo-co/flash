@@ -30,6 +30,7 @@ from flash.providers._poll import (
     FIRST_LIVENESS_S,
     PollErrorTracker,
     heartbeat_progress_ts,
+    is_training_heartbeat,
     make_say,
     preload_box_reap_due,
     surface_heartbeat,
@@ -60,12 +61,6 @@ STALL_AFTER_S = 1500.0
 # (Lambda has no server-side execution timeout, so the client deadline + the bootstrap's own cap
 # bound spend). Larger than RunPod's because of the on-host Docker pull.
 PROVISION_GRACE_S = 3000.0
-
-# Heartbeat stages emitted DURING cold start, before the training loop begins. Receiving one proves
-# the worker is alive but NOT that setup finished, so they keep the larger setup grace (cf. RunPod).
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
 
 # Lambda instance statuses that mean "the box is gone / will not progress".
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
@@ -611,9 +606,19 @@ def poll_lambda_job(
             # shared seed path with ts > this launch) can't satisfy this attempt's first-liveness.
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
             if fresh:
-                last_progress = hb_ts
+                # MONOTONIC: never let progress REGRESS. A newer heartbeat whose bounded upload-lock
+                # acquire timed out can be skipped while an older, slow upload eventually lands as the
+                # latest heartbeat.json — so a later poll may read an OLDER ts. Clamp to the max so a
+                # delayed stale upload can't move progress backward and trip the stall clock early.
+                last_progress = max(last_progress, hb_ts)
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
-                if stage not in _SETUP_HEARTBEAT_STAGES:
+                # Tighten to the training window when cold-start setup is OVER (shared with runpod):
+                # a setup stage never tightens; rl_step/sft_step tighten only at a COMPLETED step
+                # (step >= 1) so a step=0 gap-fill during the silent cold first step keeps setup grace;
+                # every other non-setup stage (POST-training rl_trained / *_train_done / metrics, no
+                # step field) tightens so a hung teardown falls under the tight window. See
+                # is_training_heartbeat for the full rationale (new_key[1] is the heartbeat's step).
+                if is_training_heartbeat(stage, new_key[1]):
                     seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
@@ -737,6 +742,7 @@ def terminate_run_instances(run_id: str) -> list[str]:
 
 def sweep_orphans(
     active_labels: set[str] | Callable[[], set[str]] | None = None,
+    known_labels: set[str] | Callable[[], set[str]] | None = None,
 ) -> list[str]:
     """Terminate Flash-named instances that no live run owns; return terminated ids.
 
@@ -751,6 +757,15 @@ def sweep_orphans(
     the instance was launched (hence before this list call), so resolving the live set now is
     guaranteed to include it — closing the launch race where a run started after a pre-captured set
     could have its fresh worker reaped as a phantom orphan.
+
+    ``known_labels`` (optional, RAW run ids or a callable) is the universe of runs THIS control
+    plane has a record of. When supplied, an instance is reaped only if its name maps to one of
+    them — instances whose run id this plane has never seen are left ALONE. This is the multi-plane
+    guard: two control planes sharing one Lambda account each carry disjoint run ids, so without it
+    each plane's sweep treats the OTHER's live instances as orphans (their run ids are absent from
+    this plane's ``active_labels``) and terminates them — they mutually reap each other every sweep.
+    ``None`` keeps the legacy unscoped behavior (reap every non-active ``flash-`` box), correct for
+    the single-plane production setup. Resolving it (like ``active_labels``) failing skips the sweep.
     """
     try:
         instances = lambda_api.list_instances()
@@ -759,13 +774,24 @@ def sweep_orphans(
         return []
     try:
         labels = active_labels() if callable(active_labels) else active_labels
+        known = known_labels() if callable(known_labels) else known_labels
     except Exception as exc:
-        # Resolving the protection set failed (e.g. a db/status read error in the callable). SKIP the
-        # sweep — never fall through to an empty set, which would treat every live run's instance as
-        # an orphan and reap it. Honors the "never raises" contract.
-        logger.warning("lambda orphan sweep skipped: could not resolve active set: %s", exc)
+        # Resolving a protection/known set failed (e.g. a db/status read error in the callable). SKIP
+        # the sweep — never fall through to an empty set, which would treat every live run's instance
+        # as an orphan and reap it. Honors the "never raises" contract.
+        logger.warning("lambda orphan sweep skipped: could not resolve run sets: %s", exc)
         return []
     active = {run_label_prefix(a) for a in (labels or set())}
+    # None => unscoped (legacy reap-all); a set => only instances attributable to one of THIS
+    # plane's known runs are reapable (multi-plane safety). An empty known set means this plane
+    # owns no runs at all -> it reaps nothing, never another plane's live boxes.
+    known_prefixes = None if known_labels is None else {run_label_prefix(a) for a in (known or set())}
+
+    def _matches(prefixes: set[str]) -> bool:
+        # Name-boundary match (EQUAL or followed by the ``-s`` seed boundary) so ``flash-100`` can't
+        # shield/claim ``flash-1000-...`` (or vice versa).
+        return any(name == p or name.startswith(p + "-s") for p in prefixes)
+
     now = time.time()
     orphans: list[str] = []
     for inst in instances:
@@ -789,10 +815,12 @@ def sweep_orphans(
                         "reaping orphaned lambda preload box %s (outlived its wall deadline + grace; "
                         "driver lost)", name)
             continue
-        # Match on the name boundary, not a raw string prefix: a live run's prefix must EQUAL the
-        # name or be followed by the ``-s`` seed boundary, so ``flash-100`` can't shield
-        # ``flash-1000-...`` (or vice versa).
-        if any(name == a or name.startswith(a + "-s") for a in active):
+        if _matches(active):
+            continue  # a live run owns this box — protected
+        # Multi-plane guard: with a known set, only reap boxes attributable to one of THIS plane's
+        # runs. A box whose run id is absent belongs to ANOTHER control plane on the same account
+        # (or predates this plane's registry) — never ours to terminate.
+        if known_prefixes is not None and not _matches(known_prefixes):
             continue
         iid = inst.get("id")
         if iid:

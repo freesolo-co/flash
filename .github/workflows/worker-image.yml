@@ -83,3 +83,15 @@ jobs:
           build-args: |
             FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
             FLASH_ATTN_3_SPEC=${{ github.event.inputs.flash_attn_3_spec || 'https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl' }}
+
+      # The per-arch baked images (cu128-<sm>) are rebaked MANUALLY (bake-kernel-cache.yml). When this
+      # rebuilds :cu128, those tags go stale -> prompt a rebake. Only when the cu128 tag was (re)built.
+      - name: Remind to rebake per-SM kernel-cache images
+        if: ${{ success() && (github.event.inputs.tag || 'cu128') == 'cu128' }}
+        run: |
+          echo "::warning title=Rebake per-SM images::A new :cu128 base was published. If FLASH_WORKER_IMAGE_PER_SM=1 is enabled, run bake-kernel-cache.yml to refresh cu128-sm{80,86,89,90,120}, else workers run stale baked deps."
+          {
+            echo "### ⚠️ Per-SM kernel-cache images may now be stale"
+            echo ""
+            echo "A fresh \`:cu128\` base was just published. If \`FLASH_WORKER_IMAGE_PER_SM=1\` is enabled, re-run **bake-kernel-cache.yml** to refresh the per-arch \`cu128-sm*\` tags, or workers will run the previous baked deps."
+          } >> "$GITHUB_STEP_SUMMARY"

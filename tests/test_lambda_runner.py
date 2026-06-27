@@ -979,6 +979,36 @@ def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
     assert int(m.group(1)) >= 3000, res.detail
 
 
+def test_poll_gapfill_step0_keeps_setup_grace(monkeypatch):
+    """The train-liveness gap-filler emits rl_step/sft_step at step=0 throughout the silent FIRST step
+    (a cold rollout can run minutes before global_step ticks to 1). That FRESH, non-setup but step-0
+    heartbeat proves liveness yet must NOT tighten to the training window before any step completed —
+    the larger SETUP grace must still govern (RunPod has the same step>=1 guard). (Clock starts
+    10_000; launch 9000; fresh gap-fill ts 9500 >= launch but step 0.)"""
+    import re
+
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
+    )
+    gapfill = {"stage": "rl_step", "step": 0, "ts": 9500.0}  # fresh, non-setup, but step 0
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: gapfill,
+        setup_grace_s=3000.0,
+        stall_after_s=500.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    # SETUP grace (3000s) governs, not the tighter 500s training window a step-0 ping would have armed.
+    assert "setup (pre-training)" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    assert int(m.group(1)) >= 3000, res.detail
+
+
 def test_poll_client_deadline(monkeypatch):
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
     res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, deadline_s=250.0)

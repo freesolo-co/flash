@@ -34,8 +34,8 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
     # The deployed control plane rejects a submit for any non-validated class, so client-side
     # allocation must only ever pick a class in the validated pool — across ALL candidates,
     # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
-    # whose cheapest VALIDATED RunPod class is RTX A6000 @ $0.49 (cheaper unvalidated 24 GB classes
-    # like L4 are excluded). 24 GB is the floor — sub-24 GB classes were dropped.
+    # whose cheapest VALIDATED RunPod class is RTX A6000 @ $0.49. 24 GB is the floor — sub-24 GB
+    # classes were dropped.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert all(c.gpu in VALIDATED for c in a.candidates), [
@@ -45,23 +45,29 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
 
 
 def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
-    """A small SFT down-routes below 24 GB; the absolute-cheapest fitting class (L4 @ $0.39, 24 GB)
-    is UNVALIDATED and must be skipped for the cheapest VALIDATED one (RTX A6000 @ $0.49), so the
-    run actually submits (the live `flash train` default-submit failure this fixes)."""
+    """The allocator must skip a cheaper UNVALIDATED class for the cheapest VALIDATED one (so the
+    deployed control plane accepts the submit). The managed catalog is now fully validated, so
+    inject a synthetic unvalidated RunPod class cheaper than any real one and confirm it is
+    excluded from the candidate set."""
     from flash.providers import allocator
-    from flash.providers.base import GPU_INFO, VALIDATED
+    from flash.providers.base import GPU_INFO, VALIDATED, GpuClass
+
+    fake = GpuClass("FAKE Cheap", "NVIDIA_FAKE", 24, "fakecheap", "sm80", 0.10)
+    assert not fake.validated
+    monkeypatch.setitem(GPU_INFO, "FAKE Cheap", fake)
 
     # 4B SFT (seq 1024, rank 8) down-routes below 24 GB in the matrix (see test_required_vram_*).
     a = allocator.allocate(
         "Qwen/Qwen3.5-4B", "sft", train={"max_length": 1024, "lora_rank": 8}
     )
-    assert a.min_vram_gb < 24  # a sub-24 GB run where unvalidated cheap cards exist
-    assert all(c.gpu in VALIDATED for c in a.candidates)
-    # The cheapest fitting UNVALIDATED RunPod class would have been chosen without the gate.
+    assert a.min_vram_gb < 24  # a sub-24 GB run the synthetic unvalidated card also fits
+    # The synthetic class is cheaper and fits, yet is excluded because it is unvalidated.
     assert any(
         (not g.validated) and g.enum_member and g.vram_gb >= a.min_vram_gb
         for g in GPU_INFO.values()
     )
+    assert all(c.gpu in VALIDATED for c in a.candidates)
+    assert "FAKE Cheap" not in [c.gpu for c in a.candidates]
 
 
 def test_runpod_allocation_lands_on_full_validated_cards(monkeypatch):
@@ -301,10 +307,14 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
 
     validated = [g.vram_gb for g in GPU_INFO.values() if getattr(g, "validated", False)]
 
-    def honest_peak(pb, seq, vocab, quant, rank, bs):
+    def honest_peak(pb, seq, vocab, quant, rank, bs, active_b=None):
+        # MoE: the activations + rank-linear LoRA optimizer scale with the ACTIVE backbone width
+        # (a token routes through ~active_b params), while the resident ``weights`` term stays on the
+        # full ``pb``. Mirrors engine.vram.estimate_vram_gb's eff_b. Dense -> active_b == pb.
         bpp = vram._BYTES_PER_PARAM.get(quant, 2.0)
-        width = math.sqrt(max(pb, 0.1))
-        base = pb * bpp + vram._BASE_OVERHEAD_GB + (rank / 16.0) * (0.3 + 0.04 * pb)
+        eff = float(active_b) if active_b else pb
+        width = math.sqrt(max(eff, 0.1))
+        base = pb * bpp + vram._BASE_OVERHEAD_GB + (rank / 16.0) * (0.3 + 0.04 * eff)
         fused = sft_logits_fused(pb, seq)
         pd = sft_per_device(bs, seq_len=seq, vocab=vocab, fused=fused)
         act = vram._ACT_COEF * pd * (seq / 1024.0) * width
@@ -315,14 +325,19 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
         if "sft" not in info.algos:
             continue
         pb = info.params_b or params_b_from_str(info.params) or 0.0
+        active_b = float(getattr(info, "active_params_b", 0.0) or 0.0)
         vocab, quant = vocab_size_for(mid), getattr(info, "quant", "bf16") or "bf16"
         for seq in (512, 1024, 1536, 2047, 2048, 4096, 32768):
             for bs in (1, 4, 8, 32):
                 for rank in (8, 32, 128):
                     tr = {"max_length": seq, "batch_size": bs, "lora_rank": rank}
                     need = required_vram_gb(mid, "sft", train=tr)
-                    peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs) * 1.1)
+                    peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs, active_b) * 1.1)
+                    # The conservative estimate must always cover the honest peak (universal).
                     assert need >= peak, (mid, seq, bs, rank, need, peak)
+                    # Every catalog SFT model must fit some validated card at every (seq,bs,rank).
+                    # The 35B-A3B MoE included: with MoE-aware sizing its SFT is ~82 GB flat (active-3B
+                    # activations/KV are tiny, so even 32k context fits), landing on the 141 GB H200.
                     assert any(gb >= need for gb in validated), (mid, seq, bs, rank, need)
 
 
