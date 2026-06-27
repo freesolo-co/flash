@@ -30,6 +30,7 @@ from flash.providers._poll import (
     FIRST_LIVENESS_S,
     SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
+    _attempt_int,
     heartbeat_progress_ts,
     make_say,
     preload_box_reap_due,
@@ -612,7 +613,13 @@ def poll_lambda_job(
                 # delayed stale upload can't move progress backward and trip the stall clock early.
                 last_progress = max(last_progress, hb_ts)
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
-                if stage not in SETUP_HEARTBEAT_STAGES:
+                # Tighten to the training window only on a heartbeat reporting a COMPLETED step
+                # (step >= 1), not merely a non-setup stage: the train-liveness gap-filler emits
+                # rl_step/sft_step at step=0 throughout the silent FIRST step (a cold rollout can run
+                # minutes before global_step ticks to 1), and treating that as "training started"
+                # would drop the larger setup grace before any real step ran. Step coerced like the
+                # attempt (a malformed/missing step must not raise in the poll loop) -> treat as 0.
+                if stage not in SETUP_HEARTBEAT_STAGES and (_attempt_int(new_key[1]) or 0) >= 1:
                     seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
