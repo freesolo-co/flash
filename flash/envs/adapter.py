@@ -288,7 +288,10 @@ def _urlopen(
                 exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
             )
             if is_rate_limit and attempt < max_rate_limit_retries:
-                delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
+                delay = max(
+                    _RATE_LIMIT_BASE_DELAY,
+                    min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
+                )
                 time.sleep(delay)
                 attempt += 1
                 continue
@@ -297,7 +300,9 @@ def _urlopen(
                 raise GitHubRateLimitError(
                     f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
                 ) from exc
-            raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+            raise RuntimeError(
+                f"GitHub environment request failed ({exc.code}): {body[:500]}"
+            ) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
@@ -426,6 +431,108 @@ def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) 
             return str(path)
         return env_ref
     return str(_resolve_github_environment_file(env_ref, pinned_sha))
+
+
+def _coerce_environment_github_ref(env_ref: str) -> GitHubEnvironmentRef:
+    """Resolve a Freesolo slug / ``github:`` ref / github.com URL to a ``GitHubEnvironmentRef``.
+
+    A managed slug (``owner/name``) is first expanded to its environment-hub ref, so the same pull
+    path serves both managed environments and raw GitHub references.
+    """
+    candidate = env_ref
+    if is_managed_environment_slug(candidate):
+        candidate = managed_slug_to_github_ref(candidate)
+    parsed = _parse_github_environment_ref(candidate)
+    if parsed is None:
+        raise ValueError(f"not a Freesolo or GitHub environment reference: {env_ref!r}")
+    return parsed
+
+
+def _safe_repo_relative_path(path: str) -> str:
+    """Validate a user-supplied file path inside an environment (reject absolute / ``..`` escapes)."""
+    raw = (path or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("/"):
+        raise ValueError(f"invalid environment file path: {path!r}")
+    parts = [part for part in raw.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"invalid environment file path: {path!r}")
+    return "/".join(parts)
+
+
+def environment_local_dirname(env_ref: str) -> str:
+    """A sensible local directory name for a pulled environment (used as the default output dir)."""
+    slug = _parse_managed_environment_slug(env_ref)
+    if slug is not None:
+        return slug[1]
+    ref = _coerce_environment_github_ref(env_ref)
+    env_dir = ref.path.rpartition("/")[0]
+    return env_dir.rsplit("/", 1)[-1] if env_dir else ref.repo
+
+
+def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 120.0) -> bytes:
+    """Download a single file from a published environment as raw bytes.
+
+    Uses GitHub's ``application/vnd.github.raw`` media type, which streams the file's bytes
+    directly. The JSON "contents" API (what ``gh api contents`` hits) instead base64-encodes the
+    body and returns an EMPTY ``content`` for blobs over 1 MB — so dataset files like
+    ``datasets/train.jsonl`` silently come back empty. The raw media type serves files up to
+    100 MB, sidestepping that limit. ``rel_path`` is relative to the environment directory.
+    A ``GITHUB_TOKEN`` is required for private/internal environment repos.
+    """
+    ref = _coerce_environment_github_ref(env_ref)
+    safe_rel = _safe_repo_relative_path(rel_path)
+    env_dir = ref.path.rpartition("/")[0]
+    full_path = f"{env_dir}/{safe_rel}" if env_dir else safe_rel
+    quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in full_path.split("/"))
+    url = (
+        f"https://api.github.com/repos/{ref.repo_full_name}/contents/{quoted_path}"
+        f"?ref={urllib.parse.quote(ref.ref, safe='')}"
+    )
+    headers = {"Accept": "application/vnd.github.raw", "User-Agent": "freesolo-flash"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+    if len(data) > _MAX_ARCHIVE_BYTES:
+        raise RuntimeError(
+            f"environment file is too large ({len(data)} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+        )
+    return data
+
+
+def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool = False) -> Path:
+    """Download a published environment's whole directory to ``dest`` and return it.
+
+    Fetches the repository tarball (not the per-file contents API), so it is unaffected by the
+    1 MB JSON-contents limit and pulls every shipped file — ``environment.py`` plus sidecars such
+    as ``datasets/train.jsonl``. Only the environment's own subdirectory is written to ``dest``,
+    never the rest of the (shared) environment-hub repo.
+    """
+    ref = _coerce_environment_github_ref(env_ref)
+    env_dir = ref.path.rpartition("/")[0]
+    dest_path = Path(dest)
+    # "occupied" = a file, or a non-empty directory; an empty dir is fine to populate in place.
+    occupied = dest_path.exists() and (not dest_path.is_dir() or any(dest_path.iterdir()))
+    if occupied and not overwrite:
+        raise FileExistsError(
+            f"destination {dest_path} already exists (pass overwrite=True to replace)"
+        )
+    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
+    try:
+        extracted = _safe_extract_archive(_download_github_tarball(ref), tmp_parent)
+        source = extracted / env_dir if env_dir else extracted
+        if not source.is_dir():
+            raise FileNotFoundError(
+                f"environment directory {env_dir or '.'!r} not found in {ref.repo_full_name}@{ref.ref}"
+            )
+        if dest_path.is_dir():
+            shutil.rmtree(dest_path)
+        elif dest_path.exists():
+            dest_path.unlink()
+        shutil.copytree(source, dest_path)
+        return dest_path
+    finally:
+        shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
 def _resolve_path_arg(value: object, base_dir: Path) -> object:
@@ -639,7 +746,11 @@ class FreesoloEnvironment(BaseEnvironment):
         value = example.get(_CANONICAL_OUTPUT_KEY)
         if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
             return [dict(m) for m in value]
-        if isinstance(value, dict) and list(value) == ["messages"] and isinstance(value["messages"], list):
+        if (
+            isinstance(value, dict)
+            and list(value) == ["messages"]
+            and isinstance(value["messages"], list)
+        ):
             return [dict(m) for m in value["messages"]]
         return [{"role": "assistant", "content": "" if value is None else str(value)}]
 
@@ -697,7 +808,11 @@ class FreesoloEnvironment(BaseEnvironment):
                 key = json.dumps(ex, sort_keys=True, default=str)
                 grp = groups.get(key)
                 if grp is None:
-                    grp = groups[key] = {"task": self._task_example(ex), "idxs": [], "responses": []}
+                    grp = groups[key] = {
+                        "task": self._task_example(ex),
+                        "idxs": [],
+                        "responses": [],
+                    }
                     order.append(key)
                 grp["idxs"].append(i)
                 grp["responses"].append(str(st.get("response_text") or ""))
@@ -706,7 +821,9 @@ class FreesoloEnvironment(BaseEnvironment):
                 grp = groups[key]
                 rewards = self._env.score_responses(grp["task"], grp["responses"])
                 if len(rewards) != len(grp["responses"]):
-                    raise RuntimeError("Freesolo environment score_responses returned the wrong length")
+                    raise RuntimeError(
+                        "Freesolo environment score_responses returned the wrong length"
+                    )
                 for idx, rw in zip(grp["idxs"], rewards, strict=True):
                     out[idx] = float(rw.score)
             return out

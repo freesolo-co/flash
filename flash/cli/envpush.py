@@ -7,6 +7,7 @@ managed Flash control plane.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -35,6 +36,74 @@ def cmd_env_install(args) -> int:
         print(f"installed {env_id}; recorded in {INSTALLED_MANIFEST}")
         print(f'use it via:  [environment]\\nid = "{env_id}"')
     return 0
+
+
+def cmd_env_pull(args) -> int:
+    """Download a published Freesolo environment (or a single file from it) to local disk.
+
+    Pulls via GitHub's tarball / raw media type rather than the JSON "contents" API, so files
+    larger than 1 MB (e.g. ``datasets/train.jsonl``) come back intact instead of empty.
+    """
+    from flash.envs.adapter import (
+        download_environment_file,
+        environment_local_dirname,
+        is_freesolo_environment_id,
+        pull_environment_package,
+    )
+
+    env_id = args.env_id
+    if not is_freesolo_environment_id(env_id):
+        print(
+            f'env id must be a Freesolo environment id, e.g. "your-name/your-env" (got {env_id!r})',
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        if args.path:
+            out = Path(args.output) if args.output else Path(Path(args.path).name)
+            if out.is_dir():
+                # a single file can't replace a directory; refuse instead of crashing on write.
+                print(
+                    f"refusing to overwrite directory {out} with a file (pass an explicit -o path)",
+                    file=sys.stderr,
+                )
+                return 1
+            if out.exists() and not args.force:
+                print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
+                return 1
+            data = download_environment_file(env_id, args.path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+            if render.styled():
+                print(render.env_pulled(str(out), f"{args.path} · {len(data):,} bytes"))
+            else:
+                print(f"pulled {args.path} from {env_id} -> {out} ({len(data):,} bytes)")
+        else:
+            out = Path(args.output) if args.output else Path(environment_local_dirname(env_id))
+            pull_environment_package(env_id, out, overwrite=args.force)
+            if render.styled():
+                print(render.env_pulled(f"{out}/", env_id))
+            else:
+                print(f"pulled {env_id} -> {out}/")
+        return 0
+    except FileExistsError:
+        print(
+            f"refusing to overwrite existing {args.output or environment_local_dirname(env_id)!r} "
+            "(pass --force)",
+            file=sys.stderr,
+        )
+        return 1
+    except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+        print(f"env pull failed: {exc}", file=sys.stderr)
+        # GitHub request failures surface as RuntimeError; a missing token is the usual cause for a
+        # private/internal env. Skip the hint for local filesystem errors (OSError/FileNotFoundError).
+        if isinstance(exc, RuntimeError) and not os.environ.get("GITHUB_TOKEN"):
+            print(
+                "hint: private/internal environments need a GitHub token; set GITHUB_TOKEN "
+                "(e.g. `export GITHUB_TOKEN=$(gh auth token)`).",
+                file=sys.stderr,
+            )
+        return 1
 
 
 _ENV_ENTRYPOINT = "environment.py"
