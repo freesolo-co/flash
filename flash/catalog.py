@@ -166,19 +166,17 @@ MODELS: dict[str, ModelInfo] = {
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
     ),
-    # ---- Qwen3.6 MoE: the single-big-card (B200) SFT tier ----
+    # ---- Qwen3.6 MoE: the single-big-card (B200) tier ----
     # 35B-A3B is a Mixture-of-Experts checkpoint: ~3B parameters are ACTIVE per token, but all 35B
     # are materialized on the GPU, so every memory/disk/download term sizes the FULL 35B (~70 GB
     # bf16). bf16 LoRA, NOT QLoRA — same reason as the 9B: 4-bit rounding diverges the rollout from
-    # the trainer. SFT loads one ~70 GB bf16 copy + LoRA + activations + the fp32 logits (~90 GB est)
-    # and fits the 180 GB B200 (Blackwell datacenter) — live-validated end-to-end on a real B200.
-    # GRPO is intentionally NOT advertised yet: the VRAM fits (sleep-offload keeps one 70 GB copy
-    # resident → ~170 GB peak, and a live B200 run confirmed the colocated vLLM engine boots), BUT
-    # the TRL→vLLM weight-sync crashes on the MoE FUSED-EXPERT weights — vLLM's
-    # ``load_fused_expert_weights`` raises ``KeyError: '…mlp.experts.w13_weight'`` because the worker's
-    # weight-sync remap (engine.worker.lora) handles the dense Qwen3.5 names but not the fused MoE
-    # experts. Re-add ``"grpo"`` once that MoE weight-sync gap is fixed (tracked as the MoE-specific
-    # follow-up).
+    # the trainer. Both SFT and GRPO fit the 180 GB B200 (Blackwell datacenter), live-validated on a
+    # real B200:
+    #   * SFT loads one ~70 GB bf16 copy + LoRA + activations + the fp32 logits (~90 GB est).
+    #   * GRPO colocates the vLLM rollout; the default sleep-offload recipe keeps only ONE 70 GB
+    #     weight copy resident at a time (~170 GB peak). The MoE rollout weight-sync needed a
+    #     fused-expert name fix (engine.worker.lora._remap_vl_sync_weights passes the multimodal
+    #     ``model.language_model.*`` names through to vLLM's own mapper instead of double-prefixing).
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
         display_name="Qwen3.6 35B-A3B (MoE)",
@@ -195,11 +193,11 @@ MODELS: dict[str, ModelInfo] = {
         # estimator would price SFT as if every token exercised all 35B params — ~10x too slow/costly.
         active_params_b=3.0,
         vocab_size=248_320,
-        algos=("sft",),
+        algos=("sft", "grpo"),
         min_vram_gb=180,
         # Hard SFT floor: the raw ~90 GB SFT estimate would otherwise let the allocator pick the 96 GB
         # RTX Pro 6000 — too thin a margin over the 70 GB frozen base for a 35B MoE — so pin this big
-        # checkpoint to the 180 GB B200.
+        # checkpoint to the 180 GB B200. (GRPO's ~170 GB estimate already lands on the B200 on its own.)
         sft_min_vram_gb=180,
         quant="bf16",
         recommended_gpu="B200",
@@ -208,9 +206,9 @@ MODELS: dict[str, ModelInfo] = {
         # deployable-checkpoint saves; floor to 200 GB so a B200 rent doesn't hit "No space left on
         # device" (the runner raises gpu.disk_gb to this out of the box).
         min_disk_gb=200,
-        notes="MoE (35B total / ~3B active), bf16 LoRA, SFT-only (live-validated on a real B200). "
-        "GRPO fits the B200 on VRAM but is held back by a MoE fused-expert weight-sync gap in the "
-        "colocated vLLM rollout — re-enable once fixed.",
+        notes="MoE (35B total / ~3B active), bf16 LoRA. The only catalog model that needs the 180 GB "
+        "B200: SFT loads one ~70 GB bf16 copy; colocated GRPO fits via sleep-offload (~170 GB peak) "
+        "with the fused-MoE-expert weight-sync fix.",
     ),
 }
 
