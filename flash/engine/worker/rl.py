@@ -854,18 +854,28 @@ def run_rl():
     # the default `<prefix>/adapter` upload and the `--step <final>` deployable below ship the
     # recombined adapter; the resume checkpoints (`checkpoint/**`) are untouched — they reattach to
     # the re-merged base on resume.
-    deploy_dir = _w.recombined_warmstart_adapter_dir(adapter_dir) or adapter_dir
-    _w.hf_upload_folder(deploy_dir, "adapter", required=True)
-    # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
-    # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
-    # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
-    # doesn't land on one would have NO `flash deploy --step` entry even though it IS the served
-    # default adapter. Publish the just-saved final adapter here, keyed by the true final
-    # global_step: same bytes as `<prefix>/adapter`, so `--step <final>` always resolves to exactly
-    # the deployed default. Idempotent (content-addressed path) when the step already aligned, and
-    # best-effort (never fails a paid run).
-    if _steps_run:
-        _w.publish_deployable_checkpoint(deploy_dir, _steps_run)
+    recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
+    deploy_dir = recombined or adapter_dir
+    try:
+        _w.hf_upload_folder(deploy_dir, "adapter", required=True)
+        # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
+        # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
+        # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
+        # doesn't land on one would have NO `flash deploy --step` entry even though it IS the served
+        # default adapter. Publish the just-saved final adapter here, keyed by the true final
+        # global_step: same bytes as `<prefix>/adapter`, so `--step <final>` always resolves to
+        # exactly the deployed default. Idempotent (content-addressed path) when the step already
+        # aligned, and best-effort (never fails a paid run).
+        if _steps_run:
+            _w.publish_deployable_checkpoint(deploy_dir, _steps_run)
+    finally:
+        # recombined_warmstart_adapter_dir returns a fresh temp dir (flash_recomb_adapter_*); remove
+        # it after the uploads so a finalize that runs more than once per process (tests/refactors)
+        # doesn't grow /tmp. adapter_dir (the real save) is untouched. Mirrors the per-step cleanup.
+        if recombined:
+            import shutil
+
+            shutil.rmtree(recombined, ignore_errors=True)
     _w.heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens: completions actually optimized (the intended
