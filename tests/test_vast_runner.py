@@ -190,6 +190,27 @@ def test_deploy_walks_taken_offers(monkeypatch):
     assert h.label == "flash-1700000000-abcd1234-s0-a2"
 
 
+def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
+    # Codex: once create_instance rents the box (billing), a raising SUCCESS log (closed stream / disk
+    # error) BEFORE the handle is returned would skip submit_run_vast's teardown finally and leak the
+    # instance while the runner retries the "deploy error". The success say is suppressed, so the handle
+    # is ALWAYS returned once the instance exists.
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    monkeypatch.setattr(vast_api, "create_instance", lambda offer_id, **kw: 4242)
+
+    def raising_say(_log):
+        def _say(_msg):
+            raise OSError("log stream closed")
+
+        return _say
+
+    monkeypatch.setattr(vast, "make_say", raising_say)
+    h = vast.deploy_and_submit(_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+    assert h.instance_id == 4242  # handle still returned despite the logging failure
+
+
 def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
@@ -1130,6 +1151,27 @@ def test_run_instances_remaining_confirms_clear_and_raises_on_listing_failure(mo
     monkeypatch.setattr(vast_api, "list_instances", boom)
     with pytest.raises(vast_api.VastApiError):
         vast.run_instances_remaining("run1")  # cannot confirm clear -> RAISE (caller defers)
+
+
+def test_run_instances_remaining_raises_on_label_match_with_unparseable_id(monkeypatch):
+    # Codex: a strict page can carry a row with THIS run's label but a missing/non-numeric id. Silently
+    # skipping it (as the best-effort destroy_run_instances does) would let run_instances_remaining
+    # report a FALSE clear and resubmit a handle-less run over a visible box it can't destroy. A
+    # label-matching row with an unparseable id must be treated as NOT clear -> raise.
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    # a matching label, but the id is non-numeric -> can't enumerate/destroy -> not clear
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda strict=False: [{"id": "not-an-int", "label": "flash-run1-s0-a0"}]
+    )
+    with pytest.raises(vast_api.VastApiError, match="unparseable id"):
+        vast.run_instances_remaining("run1")
+    # an unparseable id on a NON-matching label is irrelevant -> still a confirmed clear
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda strict=False: [{"id": None, "label": "someone-else"}]
+    )
+    assert vast.run_instances_remaining("run1") == []
 
 
 def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):

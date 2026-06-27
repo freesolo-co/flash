@@ -160,6 +160,13 @@ def build_worker_env(payload: dict) -> dict:
         env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
+    # The worker stamps every heartbeat with ATTEMPT (engine.worker reads os.environ["ATTEMPT"]); the
+    # control-plane pollers date a heartbeat / accept-or-reject a retriable flag by comparing that
+    # attempt to the handle's. Without exporting it here the instance worker's heartbeats carry an empty
+    # attempt, so a prior attempt's retriable heartbeat that lands after the new launch (clock skew /
+    # late still-running upload) can't be rejected by attempt mismatch and could flip the current
+    # attempt's deterministic marker to job_preempted (Codex). The marker already reads payload attempt.
+    env["ATTEMPT"] = str(int(payload.get("attempt") or 0))
     # Compute substrate for the RunMetrics record (engine.worker reads FLASH_ARM). The payload env
     # was built by the shared runpod env builder, which stamps "runpod"; this bootstrap runs on the
     # rented instance, so override it to the real backend carried in the payload.

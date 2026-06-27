@@ -275,10 +275,14 @@ def deploy_and_submit(
                     # realized cost + liveness/stall/deadline timing align with its actual runtime, not
                     # the later reconciliation moment. Fall back to now if the field is absent.
                     started = float(adopted.get("start_date") or 0.0) or time.time()
-                    say(
-                        f"adopted vast instance {iid} from an ambiguous create "
-                        f"(label={label}, offer {offer.offer_id}, {offer.gpu})"
-                    )
+                    # SUCCESS log must NOT throw: the instance is already rented/billing, so a raising
+                    # ``say`` (closed log stream / disk error) before we return the handle would skip
+                    # submit_run_vast's teardown finally and leak the box while the run retries (Codex).
+                    with contextlib.suppress(Exception):
+                        say(
+                            f"adopted vast instance {iid} from an ambiguous create "
+                            f"(label={label}, offer {offer.offer_id}, {offer.gpu})"
+                        )
                     return VastJobHandle(
                         instance_id=iid,
                         offer_id=offer.offer_id,
@@ -326,11 +330,15 @@ def deploy_and_submit(
                     if o.gpu in allowed
                 ][:5]
             continue
-        say(
-            f"rented vast instance {instance_id}: {offer.gpu} ${offer.dph_total:.2f}/hr "
-            f"(offer {offer.offer_id}, {offer.geolocation}, reliability "
-            f"{offer.reliability:.3f}) attempt={attempt} seed={seed}"
-        )
+        # SUCCESS log must NOT throw: the box is rented/billing, so a raising ``say`` here (closed log
+        # stream / disk error) before the handle is returned would skip submit_run_vast's teardown
+        # finally and leak the instance while the runner retries the "deploy error" (Codex).
+        with contextlib.suppress(Exception):
+            say(
+                f"rented vast instance {instance_id}: {offer.gpu} ${offer.dph_total:.2f}/hr "
+                f"(offer {offer.offer_id}, {offer.geolocation}, reliability "
+                f"{offer.reliability:.3f}) attempt={attempt} seed={seed}"
+            )
         return VastJobHandle(
             instance_id=instance_id,
             offer_id=offer.offer_id,
@@ -892,10 +900,22 @@ def run_instances_remaining(run_id: str) -> list[int]:
     prefix = run_label_prefix(run_id)
     remaining: list[int] = []
     for inst in instances:
-        iid = _coerce_instance_id(inst.get("id"))
         label = str(inst.get("label") or "")
-        if iid and (label == prefix or label.startswith(prefix + "-s")):
-            remaining.append(iid)
+        if not (label == prefix or label.startswith(prefix + "-s")):
+            continue
+        iid = _coerce_instance_id(inst.get("id"))
+        if iid is None:
+            # A row carrying THIS run's label but a missing/non-numeric id is a possibly-live instance
+            # we can neither enumerate as a concrete target nor destroy. Silently skipping it (as the
+            # best-effort destroy_run_instances does) would let this confirmation report a FALSE clear
+            # and resubmit a handle-less run over a visible box — so RAISE; the caller treats it as
+            # not-clear and defers (Codex). (destroy_run_instances stays lenient: it only attempts
+            # reaps and the next sweep retries the unparseable row.)
+            raise vast_api.VastApiError(
+                f"vast instance for run {run_id!r} carries the run label but an unparseable id "
+                f"({inst.get('id')!r}); cannot confirm the run is clear"
+            )
+        remaining.append(iid)
     return remaining
 
 
