@@ -36,10 +36,21 @@ _ROLLOUT_FIELDS: tuple[str, ...] = (
 )
 
 
+def _strip_none(obj):
+    """Drop None-valued dict entries recursively. Dataset.from_list unifies a list<struct> schema and
+    materializes ``key: null`` on rows that lacked a key another row added (e.g. a `name`/`tool_calls`
+    message field); stripping those nulls keys an Arrow-materialized prompt identically to the raw row."""
+    if isinstance(obj, dict):
+        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip_none(v) for v in obj]
+    return obj
+
+
 def _prompt_key(prompt) -> str:
-    """Stable string key for a dataset ``prompt`` value."""
+    """Stable string key for a dataset ``prompt`` value (insensitive to Arrow null-injection)."""
     try:
-        return json.dumps(prompt, sort_keys=True, default=str)
+        return json.dumps(_strip_none(prompt), sort_keys=True, default=str)
     except (TypeError, ValueError):
         return str(prompt)
 
