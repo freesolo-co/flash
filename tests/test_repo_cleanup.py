@@ -271,6 +271,7 @@ def test_multiple_seeds_each_get_their_own_delete_folder():
     files = [
         ("rl/flash-9-multi/seed0/code/flash/a.py", 100),
         ("rl/flash-9-multi/seed1/code/flash/a.py", 200),
+        ("rl/flash-9-multi/seed0/metrics.json", 5),  # booted → run output present, code purge runs
     ]
     v = _view(f"{NS}/flashrun-n5", _days_ago(30), files)
     actions = rc.classify(v, deployed=set(), cfg=_cfg(code=True), now=NOW)
@@ -304,3 +305,91 @@ def test_main_accepts_delete_with_adapter_with_repos(monkeypatch):
     monkeypatch.setattr(rc, "list_run_repos", lambda api, ns: [])
     rc_code = rc.main(["--repos", "--delete-with-adapter"])
     assert rc_code == 0
+
+
+# ---- queued-run protection: don't purge code from a repo that hasn't booted -------------------
+
+CODE_ONLY = [("code/flash/__init__.py", 700_000)]  # control plane uploaded code; worker not booted
+CODE_ONLY_NESTED_NONE = [("code/flash/a.py", 1), ("code/flash/b.py", 2)]
+
+
+def test_code_only_repo_is_not_purged_before_delete_age():
+    # A repo with ONLY code/flash may be a run queued for capacity; its worker still needs the code.
+    v = _view(f"{NS}/flashrun-q", _days_ago(30), CODE_ONLY)  # past inactive window, < 60d delete age
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=True), now=NOW)
+    assert len(actions) == 1
+    assert actions[0].skipped
+
+
+def test_code_only_repo_is_purged_once_provably_abandoned():
+    v = _view(f"{NS}/flashrun-q2", _days_ago(90), CODE_ONLY)  # > 60d delete age → clearly abandoned
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=True), now=NOW)
+    assert [(a.kind, a.path) for a in actions] == [("delete_folder", rc.CODE_PATH)]
+
+
+def test_booted_repo_code_is_purged_on_inactive_age():
+    # SUCCEEDED has adapter+metrics → it booted and is terminal → code purge on the short gate.
+    v = _view(f"{NS}/flashrun-q3", _days_ago(30), SUCCEEDED)
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=True), now=NOW)
+    assert ("delete_folder", rc.CODE_PATH) in [(a.kind, a.path) for a in actions]
+
+
+# ---- checkpoint-only repos are servable (deployable via `flash deploy --step N`) ---------------
+
+CHECKPOINT_ONLY = [  # no final adapter/, but a deployable per-step checkpoint adapter
+    ("rl/flash-9-ck/seed0/code/flash/__init__.py", 700_000),
+    ("rl/flash-9-ck/seed0/checkpoints/step-1/adapter/adapter_model.safetensors", 50_000_000),
+    ("rl/flash-9-ck/seed0/metrics.json", 2_000),
+]
+
+
+def test_checkpoint_only_repo_is_not_whole_deleted_as_unservable():
+    v = _view(f"{NS}/flashrun-ck", _days_ago(90), CHECKPOINT_ONLY)
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=True, repos=True), now=NOW)
+    assert "delete_repo" not in {a.kind for a in actions}  # checkpoint adapter is servable → kept
+
+
+def test_checkpoint_only_repo_is_not_checkpoint_trimmed():
+    # Trimming a checkpoint-only repo's checkpoints would strip its sole servable content.
+    v = _view(f"{NS}/flashrun-ck2", _days_ago(30), CHECKPOINT_ONLY)
+    actions = rc.classify(v, deployed=set(), cfg=_cfg(code=False, checkpoints=True), now=NOW)
+    assert "delete_folder" not in {a.kind for a in actions}
+
+
+def test_checkpoint_only_repo_whole_deleted_under_delete_with_adapter():
+    v = _view(f"{NS}/flashrun-ck3", _days_ago(90), CHECKPOINT_ONLY)
+    cfg = _cfg(code=True, repos=True, delete_with_adapter=True)
+    actions = rc.classify(v, deployed=set(), cfg=cfg, now=NOW)
+    assert [(a.kind, a.path) for a in actions] == [("delete_repo", None)]
+
+
+def test_repoview_adapter_helpers():
+    final = _view("x", NOW, SUCCEEDED)
+    assert final.has_servable_adapter()
+    assert final.has_final_adapter()
+    assert final.has_run_output()
+    ckpt = _view("x", NOW, CHECKPOINT_ONLY)
+    assert ckpt.has_servable_adapter()
+    assert not ckpt.has_final_adapter()  # only a checkpoint adapter, no final adapter/
+    bare = _view("x", NOW, CODE_ONLY)
+    assert not bare.has_servable_adapter()
+    assert not bare.has_final_adapter()
+    assert not bare.has_run_output()  # code/flash only → not booted
+
+
+# ---- NqG: re-confirm the live set right before applying destructive actions --------------------
+
+def test_apply_skips_repo_that_became_deployed_after_enumeration(monkeypatch):
+    # First sample (enumeration) sees nothing deployed; the pre-apply re-check sees flashrun-d live.
+    api = FakeApi({f"{NS}/flashrun-d": (_days_ago(30), SUCCEEDED)})
+    calls = {"n": 0}
+
+    def fake_deployed():
+        calls["n"] += 1
+        return set() if calls["n"] == 1 else {f"{NS}/flashrun-d"}
+
+    monkeypatch.setattr(rc, "deployed_repo_ids", fake_deployed)
+    rc.run(_cfg(code=True, checkpoints=True, repos=True), dry_run=False, sleep=0, api=api)
+    assert api.deleted_folders == []  # the now-deployed repo's actions were dropped
+    assert api.deleted_repos == []
+    assert calls["n"] == 2  # sampled once, re-confirmed once before apply
