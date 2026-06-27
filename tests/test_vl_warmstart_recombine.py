@@ -134,6 +134,43 @@ def test_recombine_rejects_modules_to_save(tmp_path):
         recombine_lora_adapters(sft, grpo, out)
 
 
+def _patch_cfg(adir: str, **extra) -> None:
+    """Merge ``extra`` into an already-written adapter_config.json (to inject unsupported fields)."""
+    p = os.path.join(adir, "adapter_config.json")
+    with open(p) as f:
+        cfg = json.load(f)
+    cfg.update(extra)
+    with open(p, "w") as f:
+        json.dump(cfg, f)
+
+
+def test_recombine_rejects_non_lora_peft_type(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
+    _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2)
+    # AdaLoRA (or any non-plain peft_type) has different scale/tensor semantics the cat-recombine
+    # math doesn't model — it must fail loudly up front, not silently mis-deploy.
+    _patch_cfg(grpo, peft_type="ADALORA")
+    with pytest.raises(ValueError, match=r"peft_type"):
+        recombine_lora_adapters(sft, grpo, out)
+
+
+def test_recombine_rejects_per_module_rank_alpha_patterns(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    # A non-empty rank_pattern/alpha_pattern breaks the uniform-(r, alpha) assumption and would be
+    # silently dropped by out_cfg — reject both rather than emit an incorrectly-scaled adapter.
+    for bad in ({"rank_pattern": {"q_proj": 8}}, {"alpha_pattern": {"q_proj": 16}}):
+        _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
+        _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2)
+        _patch_cfg(sft, **bad)
+        with pytest.raises(ValueError, match=r"rank_pattern|alpha_pattern"):
+            recombine_lora_adapters(sft, grpo, out)
+
+
 def test_recombine_missing_safetensors_raises(tmp_path):
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
