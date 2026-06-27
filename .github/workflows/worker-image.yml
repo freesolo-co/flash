@@ -41,11 +41,29 @@ permissions:
   contents: read
   packages: write
 
+# A newer base build supersedes an older one: cancel the in-flight run so auto-rebake (which triggers
+# on this workflow's completion) only ever reasons about the latest :cu128.
+concurrency:
+  group: worker-image-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-24.04-8core
+    # Single source for the FlashAttention wheels: used BOTH as build-args and as fingerprint inputs
+    # (so a wheel bump moves fp_base). Keep FA3_SPEC in sync with Dockerfile.worker's ARG default.
+    env:
+      FA2_SPEC: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
+      FA3_SPEC: ${{ github.event.inputs.flash_attn_3_spec || 'https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl' }}
     steps:
       - uses: actions/checkout@v6
+
+      # Compute the kernel-cache fingerprints (stdlib-only, no uv sync) and stamp them as labels on
+      # :cu128 below, so auto-rebake.yml can read what this base was built from. Fails the build if a
+      # pin can't be parsed -- a silent miss would let a stale per-arch cache ship as a cold-JIT.
+      - name: Compute kernel fingerprints
+        id: fp
+        run: python3 docker/kernel_fingerprint.py --format github --fa2-spec "$FA2_SPEC" --fa3-spec "$FA3_SPEC" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
         run: |
@@ -77,21 +95,20 @@ jobs:
           # so a fork run must not push to its own owner namespace and leave the real image stale.
           tags: ghcr.io/freesolo-co/flash-worker:${{ github.event.inputs.tag || 'cu128' }}
           provenance: false
+          # Stamp the kernel-cache fingerprints + the source commit so auto-rebake.yml can read what
+          # this base was built from (docker/kernel_fingerprint.py is the source of truth).
+          labels: |
+            co.freesolo.flash.kernelcache.fp_cache=${{ steps.fp.outputs.fp_cache }}
+            co.freesolo.flash.kernelcache.fp_base=${{ steps.fp.outputs.fp_base }}
+            org.opencontainers.image.revision=${{ github.sha }}
           # Install a PREBUILT flash-attn wheel instead of compiling from source (a multi-arch
           # source compile is huge and OOM-kills the runner). The wheel matches the base exactly
-          # (cu128 / torch2.10 / cp312).
+          # (cu128 / torch2.10 / cp312). FA specs come from the job-level env (single source).
           build-args: |
-            FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
-            FLASH_ATTN_3_SPEC=${{ github.event.inputs.flash_attn_3_spec || 'https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl' }}
+            FLASH_ATTN_SPEC=${{ env.FA2_SPEC }}
+            FLASH_ATTN_3_SPEC=${{ env.FA3_SPEC }}
 
-      # The per-arch baked images (cu128-<sm>) are rebaked MANUALLY (bake-kernel-cache.yml). When this
-      # rebuilds :cu128, those tags go stale -> prompt a rebake. Only when the cu128 tag was (re)built.
-      - name: Remind to rebake per-SM kernel-cache images
-        if: ${{ success() && (github.event.inputs.tag || 'cu128') == 'cu128' }}
-        run: |
-          echo "::warning title=Rebake per-SM images::A new :cu128 base was published. If FLASH_WORKER_IMAGE_PER_SM=1 is enabled, run bake-kernel-cache.yml to refresh cu128-sm{80,86,89,90,120}, else workers run stale baked deps."
-          {
-            echo "### ⚠️ Per-SM kernel-cache images may now be stale"
-            echo ""
-            echo "A fresh \`:cu128\` base was just published. If \`FLASH_WORKER_IMAGE_PER_SM=1\` is enabled, re-run **bake-kernel-cache.yml** to refresh the per-arch \`cu128-sm*\` tags, or workers will run the previous baked deps."
-          } >> "$GITHUB_STEP_SUMMARY"
+      # When :cu128 is republished the per-arch cu128-sm* tags go stale. auto-rebake.yml now handles
+      # that automatically on this workflow's completion: a free re-layer when only the base moved, or
+      # a one-click GPU re-warm when the kernel toolchain changed (it reads the fp_cache/fp_base labels
+      # stamped above vs each published per-arch tag). The old manual reminder is gone.
