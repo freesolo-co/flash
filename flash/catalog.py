@@ -53,6 +53,15 @@ class ModelInfo:
     # whose ~param-est margin over the frozen-weights floor is too thin on the next card down.
     # Consumed by engine.vram.model_required_vram_gb (the SFT analog of ``grpo_min_vram_gb``).
     sft_min_vram_gb: int = 0
+    # Curated, LIVE-MEASURED authoritative SFT VRAM tier (GB). 0 => SFT sizes from the param
+    # estimate + safety headroom (the default). Set it when that estimate is conservative for a
+    # validated model and would force an unnecessarily large card: the 35B-A3B SFT MEASURED ~71 GB
+    # peak on an 80 GB A100, but the param estimate x1.1 (~83) would pin it to the 141 GB H200. When
+    # set, model_required_vram_gb uses this tier AS LONG AS the raw (no-headroom) estimate still fits
+    # it — once the raw estimate genuinely exceeds it (very long context), it falls back to the
+    # headroom'd estimate and escalates. So it down-tiers the common case without unsafely capping a
+    # long-context run. Consumed by engine.vram.model_required_vram_gb (SFT path only; GRPO ignores).
+    sft_vram_gb: int = 0
     notes: str = ""
     # Worker container disk this model needs (GB). 0 = the platform default (64 GB)
     # suffices. The runner raises gpu.disk_gb to at least this, so big-checkpoint
@@ -199,12 +208,14 @@ MODELS: dict[str, ModelInfo] = {
         vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=141,
-        # Hard SFT floor: with MoE-aware sizing the SFT estimate is ~82 GB (the 70 GB resident weights
-        # dominate; the active-3B activations/KV are tiny), which would otherwise down-route to the
-        # 96 GB RTX Pro 6000 (consumer Blackwell, thin margin over the 70 GB base) or the 80 GB H100
-        # (too tight). Floor to 100 GB so SFT lands on the 141 GB H200 — a datacenter card with wide
-        # margin, ~$1.50/hr cheaper than the B200 and not needed here.
-        sft_min_vram_gb=100,
+        # SFT tier = an 80 GB A100/H100, LIVE-MEASURED. The MoE-aware estimate is ~75 GB (the 70 GB
+        # resident weights dominate; the active-3B activations are tiny + Liger FLCE fuses the 248k
+        # logits), and a real A100-80GB SFT run peaked at ~71 GB / 80 GB (~9 GB headroom, train_wall
+        # 424 s, $0.16). The param estimate x1.1 (~83) would have forced the 141 GB H200, so curate the
+        # measured 80 GB tier: model_required_vram_gb uses it while the raw estimate still fits 80 GB
+        # and escalates past it at very long context. Routes SFT to the cheapest 80 GB class (A100 PCIe
+        # $1.39/hr) — ~68% cheaper than the H200 ($4.39) and far more available. NO quantization (bf16).
+        sft_vram_gb=80,
         # GRPO floor = the 180 GB B200 (colocated GRPO holds two ~70 GB weight copies + a KV pool; the
         # 141 GB H200 can't hold the trainer + vLLM rollout). The base ~167 GB two-copy estimate already
         # routes GRPO to the B200, but setting the floor ALSO ENGAGES the long-context escalation —
@@ -214,15 +225,16 @@ MODELS: dict[str, ModelInfo] = {
         # of booting a B200 and OOMing in vLLM's KV allocation.
         grpo_min_vram_gb=180,
         quant="bf16",
-        recommended_gpu="H200",
+        recommended_gpu="A100 PCIe",
         thinking="hybrid",
         # ~70 GB bf16 checkpoint. Peak disk = HF download (~70 GB) + Xet temp (~70 GB) + per-step
         # deployable-checkpoint saves; floor to 200 GB so the rent doesn't hit "No space left on
         # device" (the runner raises gpu.disk_gb to this out of the box).
         min_disk_gb=200,
-        notes="MoE (35B total / ~3B active), bf16 LoRA. SFT runs on the 141 GB H200 (the ~70 GB "
-        "weights dominate; active-3B compute keeps activations/KV tiny, so context is ~unbounded by "
-        "VRAM); colocated GRPO needs the 180 GB B200 (trainer + vLLM rollout = two 70 GB copies).",
+        notes="MoE (35B total / ~3B active), bf16 LoRA (no quantization). SFT fits an 80 GB A100/H100 "
+        "(measured ~71 GB peak — the ~70 GB weights dominate; active-3B compute + Liger-fused logits "
+        "keep the rest tiny); colocated GRPO needs the 180 GB B200 (trainer + vLLM rollout = two 70 GB "
+        "copies). Longer-context SFT escalates to the H200.",
     ),
 }
 

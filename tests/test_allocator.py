@@ -332,13 +332,49 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
                 for rank in (8, 32, 128):
                     tr = {"max_length": seq, "batch_size": bs, "lora_rank": rank}
                     need = required_vram_gb(mid, "sft", train=tr)
-                    peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs, active_b) * 1.1)
-                    # The conservative estimate must always cover the honest peak (universal).
-                    assert need >= peak, (mid, seq, bs, rank, need, peak)
+                    peak_raw = honest_peak(pb, seq, vocab, quant, rank, bs, active_b)
+                    peak = math.ceil(peak_raw * 1.1)
+                    sft_tier = int(getattr(info, "sft_vram_gb", 0) or 0)
+                    if sft_tier and peak_raw <= sft_tier:
+                        # Curated, LIVE-MEASURED SFT tier: the conservative x1.1 heuristic is replaced
+                        # by a real measurement (the 35B-A3B SFT peaked ~71 GB on an 80 GB A100, vs the
+                        # ~75 GB estimate). The tier must still COVER the raw honest peak (it does:
+                        # 80 >= ~75); the 10% heuristic margin is intentionally traded for the
+                        # measurement so SFT routes to the validated 80 GB card instead of the H200.
+                        assert need == sft_tier and need >= math.ceil(peak_raw), (
+                            mid, seq, bs, rank, need, peak_raw,
+                        )
+                    else:
+                        # The conservative estimate must always cover the honest peak (universal).
+                        assert need >= peak, (mid, seq, bs, rank, need, peak)
                     # Every catalog SFT model must fit some validated card at every (seq,bs,rank).
-                    # The 35B-A3B MoE included: with MoE-aware sizing its SFT is ~82 GB flat (active-3B
-                    # activations/KV are tiny, so even 32k context fits), landing on the 141 GB H200.
+                    # The 35B-A3B MoE: SFT routes to an 80 GB A100/H100 (measured ~71 GB peak) at
+                    # moderate context, escalating to a larger card (RTX Pro 6000 -> H200) as the raw
+                    # estimate grows past the curated 80 GB tier at long context.
                     assert any(gb >= need for gb in validated), (mid, seq, bs, rank, need)
+
+
+def test_35b_moe_sft_routes_to_80gb_a100_grpo_stays_b200(monkeypatch):
+    """The 35B-A3B MoE SFT fits an 80 GB A100 (curated, LIVE-MEASURED sft_vram_gb=80: a real run
+    peaked ~71 GB) -> moderate-context SFT routes to the cheapest 80 GB class (A100 PCIe), while
+    GRPO (two ~70 GB weight copies + KV) is untouched and stays on the 180 GB B200. Long-context SFT
+    escalates past the 80 GB tier (the raw estimate grows beyond it)."""
+    import flash.providers.allocator as _a
+
+    # Pin to RunPod via monkeypatch (auto-restored) so this can't leak into other tests.
+    monkeypatch.setattr(_a, "available_providers", lambda: ("runpod",))
+    mid = "Qwen/Qwen3.6-35B-A3B"
+    # SFT at moderate context -> 80 GB A100 (cheapest fit), NOT the H200/B200.
+    for seq in (1024, 2048, 4096):
+        a = _a.allocate(mid, "sft", train={"max_length": seq})
+        assert a.min_vram_gb == 80, (seq, a.min_vram_gb)
+        assert a.gpu in ("A100 PCIe", "A100 SXM", "H100"), (seq, a.gpu)
+    # GRPO must stay on the B200 (the curated SFT tier does NOT touch the colocate-GRPO sizing).
+    g = _a.allocate(mid, "grpo")
+    assert g.gpu == "B200" and g.min_vram_gb >= 180, (g.gpu, g.min_vram_gb)
+    # Very long-context SFT escalates OFF the 80 GB tier (no unsafe cap).
+    long_need = _a.required_vram_gb(mid, "sft", train={"max_length": 32768})
+    assert long_need > 80, long_need
 
 
 # ---------------------------------------------------------------------------

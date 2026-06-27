@@ -559,6 +559,31 @@ def model_required_vram_gb(
         if is_grpo and use_vllm:
             floor_gb = 24 if (params_b or 0.0) <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
             need = max(need, floor_gb)
+        # Curated, LIVE-MEASURED SFT tier (down-tier the conservative estimate). The param estimate +
+        # x1.1 safety headroom is calibrated to be memory-SAFE, which is conservative for a validated
+        # model: the 35B-A3B SFT estimate x1.1 (~83) would force the 141 GB H200, but a real A100-80GB
+        # run peaked ~71 GB. When the catalog curates ``sft_vram_gb`` AND the RAW (no-headroom)
+        # estimate still fits that tier, use the measured tier so SFT routes to the validated card.
+        # Once the raw estimate genuinely EXCEEDS the tier (very long context grows activations past
+        # it), keep the headroom'd ``need`` so the run still escalates -> context-aware, never an
+        # unsafe cap. SFT-only; GRPO is untouched (it returned above via its own floors).
+        if not is_grpo and getattr(info, "sft_vram_gb", 0):
+            raw_est = estimate_vram_gb(
+                params_b or 4.0,
+                algorithm,
+                quant,
+                seq_len=seq_len,
+                max_tokens=max_tokens,
+                lora_rank=lora_rank,
+                batch_size=batch_size,
+                group_size=group_size,
+                thinking=thinking,
+                use_vllm=use_vllm,
+                vocab=model_vocab,
+                active_params_b=active_b,
+            )
+            if raw_est <= int(info.sft_vram_gb):
+                need = int(info.sft_vram_gb)
         return need
     # Unlisted open model: size from HF metadata (GRPO is the heavier phase).
     params_b = fetch_hf_params_b(model_id)
