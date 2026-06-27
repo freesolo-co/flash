@@ -216,6 +216,32 @@ def test_recombine_missing_safetensors_raises(tmp_path):
         recombine_lora_adapters(sft, grpo, out)
 
 
+def test_recombine_missing_adapter_config_raises(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    os.remove(os.path.join(grpo, "adapter_config.json"))  # weights present, config gone
+    with pytest.raises(ValueError, match=r"no adapter_config\.json"):
+        recombine_lora_adapters(sft, grpo, out)
+
+
+def test_recombine_rejects_unpaired_lora_tensors(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    # Both adapters carry a lora_A with NO paired lora_B (same key set, so the module-set check
+    # passes) — recombine must name the missing B key rather than throw a bare KeyError.
+    for adir in (sft, grpo):
+        _write_adapter(adir, modules=TEXT_MODULES, r=4, alpha=8, seed=1)
+        st = os.path.join(adir, "adapter_model.safetensors")
+        sd = {k: v for k, v in load_file(st).items() if ".lora_B." not in k}
+        save_file(sd, st, metadata={"format": "pt"})
+    with pytest.raises(ValueError, match=r"no matching lora_B"):
+        recombine_lora_adapters(sft, grpo, out)
+
+
 # --- orchestrator gating: recombined_warmstart_adapter_dir(src) ---------------------------------
 # Gated on the `_VL_WARMSTART_SFT_DIR` marker that _init_adapter_model sets ONLY on the VL merge path.
 import flash.engine.worker as W
