@@ -740,6 +740,29 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     sft_cfg, sft_sd = _load(sft_dir)
     grpo_cfg, grpo_sd = _load(grpo_dir)
 
+    # Normalize the ``.language_model.`` infix on BOTH adapters' keys before comparing/stacking.
+    # The VL merge warm-start (#296) trains the SFT against the FULL multimodal model, so the SFT
+    # adapter's keys carry the infix (``base_model.model.model.language_model.layers...``), while the
+    # fresh GRPO LoRA is saved by the text-only ``AutoModelForCausalLM`` trainer with no infix
+    # (``base_model.model.model.layers...`` — see _remap_vl_sync_weights / the warm-start remap note).
+    # Without this, the equivalent LM modules compare as DIFFERENT targets and the recombine wrongly
+    # aborts for the default Qwen3.5 warm-start path. Stripping is idempotent (a no-op for an already
+    # text-only adapter) and emits the text-only key form serving deploys on the catalog base.
+    def _normalize_infix(sd, which):
+        norm: dict = {}
+        for k, v in sd.items():
+            nk = strip_language_model_infix(k)
+            if nk in norm and nk != k:
+                raise ValueError(
+                    f"recombine: {which} adapter key {k!r} collides with another after stripping "
+                    "the '.language_model.' infix — cannot normalize"
+                )
+            norm[nk] = v
+        return norm
+
+    sft_sd = _normalize_infix(sft_sd, "SFT")
+    grpo_sd = _normalize_infix(grpo_sd, "GRPO")
+
     for name, cfg in (("SFT", sft_cfg), ("GRPO", grpo_cfg)):
         # peft_type defaults to LORA for older configs that omit it; anything else (e.g. ADALORA)
         # has different tensor/scale semantics the cat-recombine math doesn't model.
