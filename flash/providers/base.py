@@ -48,6 +48,12 @@ class GpuClass:
     # ``lambda_name`` is provisionable on Lambda (capacity permitting), priced from Lambda's own
     # live ``/instance-types`` rate (NOT the RunPod ``hourly_usd`` snapshot above).
     lambda_name: str | None = None
+    # Vast.ai offer ``gpu_name`` for this class (e.g. "RTX 4090", "A100 SXM4"); None -> not on Vast.
+    # Vast is the verified-datacenter live-market instance complement: a class with a ``vast_name`` is
+    # provisionable on Vast (capacity permitting), priced from the cheapest live verified-DC offer
+    # (NOT the RunPod ``hourly_usd`` snapshot). Names are NOT unique across VRAM variants (40/80 GB SXM4
+    # both report "A100 SXM4"); ``vast_gpu_for_offer`` disambiguates by the offer's actual ``gpu_ram``.
+    vast_name: str | None = None
 
 
 # Static hourly rates are RunPod secure-cloud on-demand snapshots.
@@ -60,6 +66,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.69,
         validated=True,
+        vast_name="RTX 4090",
     ),
     GpuClass(
         "RTX 5090",
@@ -70,6 +77,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         0.99,
         min_cuda_modern="13.0",
         validated=True,
+        vast_name="RTX 5090",
     ),
     # Ampere/Ada workstation + datacenter cards (cheap capacity pools)
     # 24 GB is the floor: the sub-24 GB tiers (16 GB RTX A4000 / RTX 2000 Ada, 20 GB RTX A4500 /
@@ -87,6 +95,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
         validated=True,
         lambda_name="gpu_1x_a6000",
+        vast_name="RTX A6000",
     ),
     # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
     # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
@@ -94,6 +103,9 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     GpuClass(
         "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99,
         lambda_name="gpu_1x_a100_sxm4", validated=True,
+        # 40 and 80 GB SXM4 boards BOTH report Vast's "A100 SXM4"; vast_gpu_for_offer resolves an
+        # offer to the largest class its actual gpu_ram covers, so a 40 GB board lands here.
+        vast_name="A100 SXM4",
     ),
     # big-VRAM tier (9B bf16 GRPO, future >9B bf16)
     # Validated 2026-06-11: 0.6B SFT smoke (phase6).
@@ -105,17 +117,20 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm80",
         1.39,
         validated=True,
+        vast_name="A100 PCIE",
     ),
     # Live-validated 2026-06-22: Qwen3.5 0.8B/MiniCPM/2B/9B SFT+GRPO train smokes (RunPod).
     GpuClass(
         "A100 SXM", "NVIDIA_A100_SXM4_80GB", 80, "a100sxm", "sm80", 1.49,
         validated=True,
+        vast_name="A100 SXM4",
     ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod).
     GpuClass(
         "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29,
         validated=True,
         lambda_name="gpu_1x_h100_pcie",
+        vast_name="H100 SXM",
     ),
     # H200 (Hopper, sm90, 141 GB HBM3e) — same compute as the H100 with ~1.76x the VRAM. The
     # mid-tier for big checkpoints whose WEIGHTS dominate but whose compute is small: e.g. the
@@ -228,6 +243,29 @@ def get_gpu_info(name: str) -> GpuClass:
     return GPU_INFO[canonical_gpu(name)]
 
 
+# Slack between a board's REPORTED VRAM and its class nominal (boards under-report: an A100 SXM4 40 GB
+# reports ~40960 MB, an A40 ~46068 MB / 48 GB). vast_gpu_for_offer allows a class whose nominal is at
+# most this far ABOVE the offer's reported RAM, so a real board still matches its class.
+_VRAM_MATCH_TOLERANCE_GB = 3.5
+
+
+def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
+    """Map a Vast offer (``gpu_name`` + ``gpu_ram`` MB) to a canonical managed GPU class.
+
+    Returns None for anything not in the managed table — the hard Ampere+ floor (T4 / 2080 Ti /
+    Quadro RTX offers never match). Names shared across VRAM variants ("A100 SXM4" = 40/80 GB) resolve
+    to the LARGEST class the board's actual RAM covers.
+    """
+    fitting = [
+        g
+        for g in GPU_INFO.values()
+        if g.vast_name == gpu_name and g.vram_gb <= gpu_ram_mb / 1024 + _VRAM_MATCH_TOLERANCE_GB
+    ]
+    if not fitting:
+        return None
+    return max(fitting, key=lambda g: g.vram_gb).name
+
+
 def providers_for(name: str) -> tuple[str, ...]:
     """Providers that can provision this GPU class."""
     info = get_gpu_info(name)
@@ -236,6 +274,8 @@ def providers_for(name: str) -> tuple[str, ...]:
         out.append("runpod")
     if info.lambda_name:
         out.append("lambda")
+    if info.vast_name:
+        out.append("vast")
     return tuple(out)
 
 

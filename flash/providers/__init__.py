@@ -6,11 +6,12 @@ owns pricing, provisioning, polling, cancellation, and teardown.
 
   runpod      serverless Flash endpoints (always on)
   lambda      Lambda Cloud GPU instances (instance-based complement; iff LAMBDA_API_KEY set)
+  vast        Vast.ai verified-datacenter containers (live-market complement; iff VAST_API_KEY set)
 
 This module is the registry: ``get_provider(name)`` / ``PROVIDER_NAMES``.
 ``allocator.allocate`` iterates the active provider list below; ``available_providers`` narrows
-it to the ones configured on THIS control plane (Lambda is opt-in via its operator
-key, so a box without it silently behaves exactly as the RunPod-only setup).
+it to the ones configured on THIS control plane (Lambda/Vast are opt-in via their operator
+keys, so a box without them silently behaves exactly as the RunPod-only setup).
 """
 
 from __future__ import annotations
@@ -19,8 +20,8 @@ from functools import cache
 
 from flash.providers.base import Provider
 
-# Active provider order is also the tie-break preference (RunPod wins price ties, then Lambda).
-PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda")
+# Active provider order is also the tie-break preference (RunPod wins price ties, then Lambda, Vast).
+PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "vast")
 
 
 def get_provider(name: str) -> Provider:
@@ -37,6 +38,10 @@ def _get_provider(key: str) -> Provider:
         return PROVIDER
     if key == "lambda":
         from flash.providers.lambdalabs import PROVIDER
+
+        return PROVIDER
+    if key == "vast":
+        from flash.providers.vast import PROVIDER
 
         return PROVIDER
     raise KeyError(f"unknown provider {key!r} (known: {', '.join(PROVIDER_NAMES)})")

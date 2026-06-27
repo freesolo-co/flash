@@ -48,7 +48,9 @@ def realized_cost_for_remote(
         from flash.providers.runpod.cost import realized_cost as runpod_realized
 
         return runpod_realized(remote.get("endpoint_id"), start=start, end=end)
-    if provider == "lambda":
+    if provider in ("lambda", "vast"):
+        # Both instance-billed providers: realized COGS == wall-clock x the instance's flat $/hr
+        # (Vast's $/hr is the offer's live rate stamped on the handle as ``hourly_usd``).
         return _instance_realized_cost(remote, start=start, end=run_end if run_end is not None else end)
     return None
 

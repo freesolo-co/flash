@@ -281,12 +281,12 @@ async def _sweep_orphan_instances_loop() -> None:
 
 
 def _instance_providers_configured() -> bool:
-    """True when an instance-based provider (Lambda) is configured on this plane, so the
+    """True when an instance-based provider (Lambda or Vast) is configured on this plane, so the
     periodic instance orphan sweep is worth running. RunPod-only planes skip it — RunPod has no
     standing per-run billing to reap between restarts (its idle reaper covers warm endpoints)."""
     from flash.providers import available_providers
 
-    return any(name in ("lambda",) for name in available_providers())
+    return any(name in ("lambda", "vast") for name in available_providers())
 
 
 def create_app():

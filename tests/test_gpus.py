@@ -25,16 +25,18 @@ def test_unknown_gpu_rejected():
 def test_providers_for():
     from flash.providers.base import providers_for
 
-    # Consumer cards are RunPod-only (datacenter clouds don't carry GeForce).
-    assert providers_for("RTX 4090") == ("runpod",)
-    assert providers_for("RTX 5090") == ("runpod",)
+    # Consumer GeForce cards are RunPod + Vast (Vast's verified-datacenter market carries GeForce;
+    # Lambda's datacenter fleet does not). Order follows the registry: runpod, lambda, vast.
+    assert providers_for("RTX 4090") == ("runpod", "vast")
+    assert providers_for("RTX 5090") == ("runpod", "vast")
     # Datacenter cards span the instance-based complements where the hardware exists.
-    assert providers_for("RTX A6000") == ("runpod", "lambda")
-    assert providers_for("H100") == ("runpod", "lambda")
-    assert providers_for("A100 PCIe") == ("runpod",)
-    assert providers_for("RTX Pro 6000") == ("runpod",)
-    # Provider-exclusive classes.
-    assert providers_for("A10") == ("lambda",)  # Lambda-only
+    assert providers_for("RTX A6000") == ("runpod", "lambda", "vast")
+    assert providers_for("H100") == ("runpod", "lambda", "vast")
+    assert providers_for("A100 PCIe") == ("runpod", "vast")
+    assert providers_for("RTX Pro 6000") == ("runpod",)  # no vast_name (RunPod-only)
+    # Provider-exclusive / mixed instance classes.
+    assert providers_for("A10") == ("lambda",)  # Lambda-only (no RunPod A10, no Vast A10)
+    assert providers_for("A100 SXM 40GB") == ("lambda", "vast")  # instance-only 40 GB SXM4
 
 
 def test_expanded_gpu_table():

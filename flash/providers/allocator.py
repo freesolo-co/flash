@@ -109,6 +109,41 @@ def _lambda_candidates(need: int) -> list[Candidate]:
     return out
 
 
+def _vast_candidates(need: int) -> list[Candidate]:
+    """Vast's fitting classes that currently have a LIVE verified-datacenter offer, priced live.
+
+    Capacity-aware like Lambda: a Vast class with no fitting offer on the market right now is EXCLUDED,
+    so the allocator never hands the runner a Vast class that would immediately fail to rent. ONE market
+    search covers every class (offers carry their own gpu_name -> class), so we search once at the
+    smallest fitting class's VRAM and bucket the returned offers by class. A capacity-lookup failure
+    (no key / network blip) degrades to the other providers — non-fatal as long as another can supply.
+    """
+    from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
+
+    provider = get_provider("vast")
+    fitting = [g for g in provider.gpu_classes() if g.vram_gb >= need]
+    if not fitting:
+        return []
+    try:
+        # Search once at the smallest fitting class's VRAM floor; usable_offers returns every managed
+        # class at/above it, which we then restrict to the fitting set.
+        floor = min(g.vram_gb for g in fitting)
+        offers = usable_offers(floor, MIN_DISK_GB)
+    except Exception as exc:
+        logger.warning("vast capacity lookup failed (%s); allocating without vast", exc)
+        return []
+    # Cheapest live offer per class (offers are price-sorted, so the first seen per class is cheapest).
+    cheapest: dict[str, float] = {}
+    for o in offers:
+        cheapest.setdefault(o.gpu, o.dph_total)
+    fitting_names = {g.name: g.vram_gb for g in fitting}
+    return [
+        Candidate("vast", name, rate, fitting_names[name])
+        for name, rate in cheapest.items()
+        if name in fitting_names
+    ]
+
+
 def allocate(
     model_id: str,
     algorithm: str,
@@ -134,6 +169,8 @@ def allocate(
         candidates += _runpod_candidates(need)
     if "lambda" in available:
         candidates += _lambda_candidates(need)
+    if "vast" in available:
+        candidates += _vast_candidates(need)
     if not candidates:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
