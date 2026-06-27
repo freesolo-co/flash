@@ -741,6 +741,14 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     grpo_cfg, grpo_sd = _load(grpo_dir)
 
     for name, cfg in (("SFT", sft_cfg), ("GRPO", grpo_cfg)):
+        # peft_type defaults to LORA for older configs that omit it; anything else (e.g. ADALORA)
+        # has different tensor/scale semantics the cat-recombine math doesn't model.
+        peft_type = (cfg.get("peft_type") or "LORA").upper()
+        if peft_type != "LORA":
+            raise ValueError(
+                f"recombine: {name} adapter peft_type={peft_type!r} (not plain LORA) — "
+                "cat-recombine is unsupported"
+            )
         if cfg.get("use_dora"):
             raise ValueError(f"recombine: {name} adapter uses DoRA — cat-recombine is unsupported")
         if cfg.get("modules_to_save"):
@@ -748,6 +756,14 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
                 f"recombine: {name} adapter has modules_to_save={cfg['modules_to_save']!r} "
                 "(full-weight tensors) — cat-recombine is unsupported"
             )
+        # Per-module rank/alpha overrides break the single-(r, alpha) assumption _scale() and the
+        # rank-stacking below rely on — and out_cfg blanks both, which would SILENTLY drop them.
+        for key in ("rank_pattern", "alpha_pattern"):
+            if cfg.get(key):
+                raise ValueError(
+                    f"recombine: {name} adapter has a non-empty {key}={cfg[key]!r} (per-module "
+                    "rank/alpha) — cat-recombine assumes a uniform rank and is unsupported"
+                )
 
     def _ab(sd):
         return {k for k in sd if k.endswith((".lora_A.weight", ".lora_B.weight"))}
@@ -776,7 +792,10 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     r_out = r_sft + r_grpo
 
     out: dict[str, torch.Tensor] = {}
-    for ak in (k for k in sft_ab if k.endswith(".lora_A.weight")):
+    # Sorted so ``out``'s insertion order — and thus the serialized safetensors byte layout — is
+    # deterministic across runs (``sft_ab`` is a set; its iteration order is not). Stable output
+    # keeps the recombined adapter content-addressable for uploads/caching.
+    for ak in sorted(k for k in sft_ab if k.endswith(".lora_A.weight")):
         bk = ak[: -len("lora_A.weight")] + "lora_B.weight"
         # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
         out[ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
