@@ -31,9 +31,9 @@ Every repo is classified from three self-contained signals — no backend DB req
 
 Tiers (conservative defaults; each opt-in beyond ``--code``)
 -----------------------------------------------------------
-* ``--code``        (default ON)  T1: delete ``code/flash`` from terminal repos. Serving never reads
-                                  it, so this is safe even for deployed repos; reclaims little but is
-                                  the safe default.
+* ``--code``        (default ON)  T1: delete ``code/flash`` from terminal repos. Deployed repos are
+                                  skipped wholesale before any tier runs, and serving never reads
+                                  ``code/flash`` regardless; reclaims little but is the safe default.
 * ``--checkpoints`` (default off) T2: on terminal + undeployed + older than ``--trim-age-days``,
                                   delete ``checkpoints/`` while **keeping** ``adapter/``. The big
                                   byte win; you lose only ``flash deploy --step N`` for old runs.
@@ -89,14 +89,35 @@ class RepoView:
     def total_bytes(self) -> int:
         return sum(size for _, size in self.files)
 
-    def _under(self, prefix: str) -> list[tuple[str, int]]:
-        return [(f, s) for f, s in self.files if f == prefix or f.startswith(prefix + "/")]
+    def _artifact_folders(self, name: str) -> list[str]:
+        """Actual folder paths whose trailing path segments are ``name``, found *anywhere* in the
+        tree. Worker uploads nest every artifact under ``hf_prefix() = {phase}/{run_id}/seed{N}/``
+        (``flash.engine.worker.hf.hf_prefix``), so ``adapter``/``code/flash``/``checkpoints`` are
+        never at the repo root — a root-anchored match would silently find nothing. A folder is
+        only reported when at least one file lives beneath it (a bare file *named* ``adapter`` is
+        not a folder)."""
+        segs = name.split("/")
+        n = len(segs)
+        folders: set[str] = set()
+        for f, _ in self.files:
+            parts = f.split("/")
+            # leave >=1 trailing component so the match is a folder containing this file
+            for i in range(len(parts) - n):
+                if parts[i : i + n] == segs:
+                    folders.add("/".join(parts[: i + n]))
+        return sorted(folders)
 
-    def has(self, prefix: str) -> bool:
-        return bool(self._under(prefix))
+    def _files_in(self, folder: str) -> list[tuple[str, int]]:
+        return [(f, s) for f, s in self.files if f == folder or f.startswith(folder + "/")]
 
-    def bytes_under(self, prefix: str) -> int:
-        return sum(s for _, s in self._under(prefix))
+    def has(self, name: str) -> bool:
+        return bool(self._artifact_folders(name))
+
+    def bytes_in(self, folder: str) -> int:
+        return sum(s for _, s in self._files_in(folder))
+
+    def bytes_under(self, name: str) -> int:
+        return sum(self.bytes_in(folder) for folder in self._artifact_folders(name))
 
     def age_seconds(self, now: datetime) -> float:
         if self.last_modified is None:
@@ -141,8 +162,13 @@ class Config:
 
     @property
     def needs_live_set(self) -> bool:
-        """Tiers that remove servable content require the live serving set to be confirmed."""
-        return self.checkpoints or self.repos or self.delete_with_adapter
+        """Tiers that remove servable content require the live serving set to be confirmed.
+
+        Only the tiers that actually *act* count: ``--checkpoints`` (T2) and ``--repos`` (T3).
+        ``--delete-with-adapter`` is a *modifier* of T3 — on its own it deletes nothing, so it
+        must not by itself force the live-set requirement (and is rejected without ``--repos`` in
+        ``main``)."""
+        return self.checkpoints or self.repos
 
 
 def _human_bytes(n: int) -> str:
@@ -207,10 +233,18 @@ def classify(view: RepoView, deployed: set[str], cfg: Config, now: datetime) -> 
             return [Action(view.repo_id, "delete_repo", None, view.total_bytes, "old undeployed adapter (--delete-with-adapter)")]
 
     actions: list[Action] = []
-    if cfg.code and view.has(CODE_PATH):
-        actions.append(Action(view.repo_id, "delete_folder", CODE_PATH, view.bytes_under(CODE_PATH), "training source snapshot"))
-    if cfg.checkpoints and age >= cfg.trim_age_days * 86400 and view.has(CHECKPOINTS_PATH):
-        actions.append(Action(view.repo_id, "delete_folder", CHECKPOINTS_PATH, view.bytes_under(CHECKPOINTS_PATH), "intermediate checkpoints (final adapter kept)"))
+    if cfg.code:
+        # Emit one delete per *actual* nested folder (e.g. ``rl/<run>/seed0/code/flash``); a single
+        # root-anchored ``code/flash`` path would never match the real upload layout.
+        actions.extend(
+            Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "training source snapshot")
+            for folder in view._artifact_folders(CODE_PATH)
+        )
+    if cfg.checkpoints and age >= cfg.trim_age_days * 86400:
+        actions.extend(
+            Action(view.repo_id, "delete_folder", folder, view.bytes_in(folder), "intermediate checkpoints (final adapter kept)")
+            for folder in view._artifact_folders(CHECKPOINTS_PATH)
+        )
 
     if not actions:
         return [Action(view.repo_id, "skip", None, 0, "nothing eligible", skipped=True)]
@@ -334,6 +368,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.delete_with_adapter and not args.repos:
+        print(
+            "--delete-with-adapter only widens T3 (whole-repo deletion) and does nothing on its "
+            "own; pass --repos as well, or drop it.",
+            file=sys.stderr,
+        )
+        return 2
     cfg = Config(
         namespace=args.namespace,
         code=args.code,
