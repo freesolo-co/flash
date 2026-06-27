@@ -26,13 +26,18 @@ DEFAULT_TIMEOUT_S = 10.0
 
 
 def internal_key() -> str | None:
-    """The operator INTERNAL key, or ``None`` when unset (which disables internal reporting)."""
-    return os.environ.get(INTERNAL_KEY_ENV)
+    """The operator INTERNAL key (whitespace-stripped), or ``None`` when unset OR blank (which
+    disables internal reporting). Normalizing here means a stray trailing newline or a
+    whitespace-only value can't masquerade as 'enabled' and emit an invalid
+    ``Authorization: Bearer <whitespace>`` header — every internal reporter shares this gate."""
+    key = (os.environ.get(INTERNAL_KEY_ENV) or "").strip()
+    return key or None
 
 
 def enabled() -> bool:
-    """Internal-backend reporting is on only when the operator INTERNAL key is set."""
-    return bool(os.environ.get(INTERNAL_KEY_ENV))
+    """Internal-backend reporting is on only when the operator INTERNAL key is set and non-blank.
+    Derives from ``internal_key()`` so every call site shares ONE definition of 'enabled'."""
+    return internal_key() is not None
 
 
 def org_id_of(context: dict[str, Any] | None) -> str:
