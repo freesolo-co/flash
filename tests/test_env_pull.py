@@ -207,6 +207,38 @@ def test_pull_environment_package_refuses_whole_hub_root(monkeypatch, tmp_path):
         )
 
 
+def test_pull_environment_package_into_cwd_merges_without_nuking(monkeypatch, tmp_path):
+    # Pulling into '.' (the cwd) must merge in place, never rmtree the directory itself — that would
+    # delete unrelated files before the copy (shutil.rmtree('.') removes contents then raises).
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "unrelated.txt").write_text("keep me")
+    pull_environment_package("david-freesolo-co/stuff", ".", overwrite=True)
+    assert (tmp_path / "unrelated.txt").read_text() == "keep me"  # not nuked
+    assert (tmp_path / "environment.py").is_file()  # env merged in
+
+
+def test_pull_environment_package_accepts_directory_ref(monkeypatch, tmp_path):
+    # A github ref naming the environment DIRECTORY (no trailing environment.py) resolves to that
+    # dir, not its parent.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    dest = tmp_path / "out"
+    pull_environment_package("github:freesolo-co/environment-hub@main:david-freesolo-co/stuff", dest)
+    assert (dest / "environment.py").is_file()
+    assert (dest / "datasets" / "train.jsonl").is_file()
+    assert not (dest / "other-org").exists()  # the env's own dir, not the parent
+
+
+def test_pull_environment_package_rejects_dir_without_entrypoint(monkeypatch, tmp_path):
+    # A dir that exists but lacks environment.py must error, not report a successful pull.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    with pytest.raises(FileNotFoundError, match="entrypoint"):
+        pull_environment_package(
+            "github:freesolo-co/environment-hub@main:david-freesolo-co/stuff/datasets",
+            tmp_path / "out",
+        )
+
+
 # --- helpers ----------------------------------------------------------------
 
 
