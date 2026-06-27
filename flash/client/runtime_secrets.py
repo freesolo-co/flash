@@ -63,3 +63,24 @@ def runtime_secrets_from_local_env(
             "do not put secret values in TOML."
         )
     return secrets
+
+
+def resolve_hf_token(explicit: str | None = None) -> str | None:
+    """Resolve the HuggingFace token `flash export` writes the destination repo with.
+
+    Order: an explicit value (the ``--api-key`` flag) > the process environment (HF_TOKEN) > a local
+    ``.env`` / ``.env.local`` in the cwd. Only HF_TOKEN is accepted — the convention the rest of flash
+    uses — not the huggingface_hub aliases, so the token source is unambiguous.
+    Returns ``None`` when none is set. Read on the user's machine and sent only with the export
+    request — never persisted in the run spec (same contract as the run secrets above).
+    """
+    if explicit and explicit.strip():
+        return explicit.strip()
+    value = os.environ.get("HF_TOKEN")
+    if value and value.strip():
+        return value.strip()
+    for path in (Path.cwd() / ".env", Path.cwd() / ".env.local"):
+        found = _read_env_file(path, {"HF_TOKEN"})
+        if found.get("HF_TOKEN"):
+            return found["HF_TOKEN"]
+    return None
