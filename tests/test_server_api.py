@@ -60,9 +60,18 @@ def _identity_for_token(token: str) -> dict[str, str]:
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
+    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
+    # the shared tokens + the internal key); see tests/test_preflight.py for the gate.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
+    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
+    # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
+    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
+    import flash.providers.runpod.keys as runpod_keys
+
+    runpod_keys.reset()
     import flash.runner as runner
     import flash.server.auth as auth_mod
     import flash.server.db as db_mod
@@ -76,6 +85,26 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
+    # The new preflight requires the Lambda key above, which also makes
+    # `configured_providers()` treat it as live — so the startup lifespan's `recover_runs()` and
+    # the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda list calls) and
+    # break test hermeticity. These API tests don't exercise orphan reaping, so stub the provider set
+    # to empty: preflight still passes on the keys, but startup stays CPU-only with no network. (Both
+    # call sites do a function-local `from flash.providers import configured_providers`, so patching
+    # the package attribute covers them.)
+    import flash.providers as providers_mod
+    import flash.providers.runpod.train.endpoints as rp_endpoints
+    import flash.server.run_registry as run_registry
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [], raising=False)
+    # The dummy FREESOLO_INTERNAL_KEY also enables the best-effort backend reporting path: a dry-run
+    # /v1/runs submit carries an org_id, so runner.submit_job() -> _report_status() ->
+    # run_registry._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
+    # single network choke-point so these offline tests stay hermetic (same as the billing fixture).
+    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    # ...and that same key makes create_app() startup run the RunPod slot-store reconcile
+    # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
+    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()

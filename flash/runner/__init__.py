@@ -117,9 +117,7 @@ class RunStatus:
     def to_dict(self) -> dict:
         data = asdict(self)
         data["adapter_ref"] = (
-            _adapter_ref_from_status_spec(self.spec)
-            if self.state in {"done", "deployed"}
-            else None
+            _adapter_ref_from_status_spec(self.spec) if self.state in {"done", "deployed"} else None
         )
         return data
 
@@ -257,22 +255,21 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # fleet: (#storage DCs) x 100 GB of PERMANENT billed storage (~11 x 100 GB ~= 1.1 TB ~= $77/mo today;
 # grows by one volume if the SDK adds a storage region). RunPod never auto-deletes network volumes;
 # reclaim the fleet with ``python -m flash.providers.runpod.preload --teardown`` (also reclaims the
-# Lambda/Hyperstack caches). Lambda filesystems + Hyperstack volumes are likewise pre-created in every
-# region/environment by ``preload --provision`` (pure control-plane API, no GPU).
+# Lambda caches). Lambda filesystems are likewise pre-created in every
+# region by ``preload --provision`` (pure control-plane API, no GPU).
 #
 # TRUST MODEL (shared multi-tenant cache). The catalog gate makes the run's SPEC model public:
 # ``_assign_weight_cache_volume`` attaches the cache only for ``model_policy == "catalog"`` runs
 # (always public; resolve_model validates catalog membership) and leaves open-model ("allow") runs
 # cache-less, so a spec that NAMES a private/gated model never persists it onto the shared mount.
-# CONFIDENTIALITY CAVEAT (not fully closed): the redirect is process-global (``weight_cache_env`` sets
-# ``HF_HOME`` onto the mount), so it scopes the SPEC model but NOT additional HF repos the run's
-# environment/reward code may fetch at execution time with the forwarded platform HF_TOKEN — those
-# would also land on the shared mount and be readable by a later tenant in the region. The residual is
-# bounded by (a) the catalog gate on the base model, (b) the scope of the platform HF_TOKEN, and (c)
-# flash environments being published/reviewed Hub/GitHub artifacts (not anonymous code) — but it is a
-# real limitation. The proper hardening (scope the mount to the trusted base-model prefetch via an
-# explicit ``cache_dir`` while env/reward code uses an ephemeral HF cache, or a READ-ONLY mount
-# populated only by preload) is worker-side and tracked as a follow-up.
+# CONFIDENTIALITY (issue #252, closed): the redirect is BASE-MODEL-SCOPED, not a process-global
+# HF_HOME. ``weight_cache_env`` exports ``FLASH_WEIGHT_CACHE_DIR`` (not HF_HOME), and the worker
+# (engine.worker.hf.prefetch_model) downloads ONLY the trusted public base model onto the shared mount
+# via an explicit ``cache_dir`` and symlinks it into the per-worker EPHEMERAL cache for the trainer/
+# vLLM. Every OTHER HF repo the run's environment/reward code fetches at execution time with the
+# forwarded platform HF_TOKEN lands in that ephemeral cache, NOT the shared multi-tenant mount, so it
+# is not readable by a later tenant in the region. (The catalog gate below still confines the cache to
+# PUBLIC base models, so even the one repo written to the mount is never private/gated.)
 # A second residual is INTEGRITY: the mount is read-WRITE on every run and a run executes
 # its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a cached
 # public model's content-addressed blobs and poison a later run loading that same model in the region.
@@ -313,11 +310,12 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     Platform-managed (never user config), exactly like the managed HF repo: assigned here, not
     surfaced in the config schema. The provider builds the per-region volume fleet + the cross-DC
     endpoint at deploy time (jobs.weight_cache_endpoint_kwargs) off this name, and the worker env
-    redirects HF_HOME onto the mount whenever the volume is attached.
+    points the base-model prefetch (FLASH_WEIGHT_CACHE_DIR) at the mount whenever the volume is attached.
 
-    CONFIDENTIALITY GATE: the cache is SHARED cross-tenant, and attaching it redirects HF_HOME onto
-    the shared mount, so a model's downloaded weights persist there for every later run in the region.
-    That is only safe for PUBLIC weights. Managed config runs are always catalog-only (the schema
+    CONFIDENTIALITY GATE: the cache is SHARED cross-tenant, and attaching it persists the run's
+    base-model weights onto the shared mount for every later run in the region (env/reward downloads
+    stay off the mount — see the module TRUST MODEL note / issue #252). That is only safe for PUBLIC
+    weights. Managed config runs are always catalog-only (the schema
     hardcodes model_policy="catalog"), and ``submit_job`` runs ``resolve_model`` BEFORE this — so a
     ``catalog``-policy spec is already guaranteed to be a curated PUBLIC catalog model (resolve_model
     raises otherwise). The ONLY way to reach a non-catalog, possibly PRIVATE/GATED HF repo is
@@ -524,6 +522,17 @@ def list_runs() -> list[RunStatus]:
     return runs
 
 
+def list_run_ids() -> list[str]:
+    """Run ids from RUNS_DIR by FILENAME only (no JSON parse), so a single corrupt or legacy
+    status file can't make the listing itself raise. A caller that must tolerate bad records --
+    e.g. the billing-charge recovery sweep, which has to keep charging every other eligible run --
+    pairs this with ``get_status(id)`` under its own per-run error handling."""
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    return [
+        name[: -len(".json")] for name in sorted(os.listdir(RUNS_DIR)) if name.endswith(".json")
+    ]
+
+
 def get_logs(run_id: str) -> str:
     log_path = runs_file_path(run_id, ".log")
     if not os.path.exists(log_path):
@@ -679,6 +688,75 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
             return
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
+        status.updated_at = time.time()
+        _save_status(status)
+    _report_status(status)
+
+
+# Billing fields that are field-only metadata, never a run-state transition.
+_BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
+
+# States whose `finished_at` (training-teardown time) must be preserved across a later field-only
+# write that bumps `updated_at`. This is exactly the set reconciliation costs by run end: the terminal
+# states PLUS `deployed` -- a deployed run is non-terminal but its training is finished and its cost is
+# final, so reconcile treats it as reconcilable and falls back to `updated_at` when `finished_at` is
+# missing (flash/server/reconcile.py: _RECONCILABLE_STATES / _terminal_ts). `dry_run` is terminal but
+# free, so preserving its timestamp is harmless and keeps this aligned with TERMINAL_STATES. Mirrored
+# here (not imported) because reconcile imports runner, not the reverse.
+_FINISHED_AT_PRESERVED_STATES = TERMINAL_STATES | {"deployed"}
+
+
+def record_billing_state(run_id: str, **fields) -> None:
+    """Persist the customer-billing fields (billing_state/billing_error/billing_charge) WITHOUT
+    touching the run's state. Like ``record_realized_cost``, it re-reads the run UNDER the lock and
+    writes only the billing columns, so a run that advanced (e.g. ``done`` -> ``deployed`` via a
+    concurrent ``mark_deployed``) keeps its current state. The completion-charge hook must use this
+    rather than ``_update(run_id, get_status(run_id).state, ...)``: that read-state-then-write pattern
+    samples the state OUTSIDE the lock, so a deploy landing between the read and ``_update`` taking the
+    lock would let the stale state clobber ``deployed``. No-ops if the run vanished.
+
+    Two race-correctness guards, both decided under the lock:
+    - NEVER downgrade an already-``charged`` run: if the persisted billing_state is ``charged`` and
+      this write would set it to anything else (a racing duplicate attempt that timed out / hit a
+      transient BillingError after another attempt already landed the charge), the whole write is a
+      no-op. The backend is idempotent by runId, so the charge stands; the local state must not be
+      flipped back to ``failed``/``charging`` and re-retried.
+    - PRESERVE the teardown timestamp: a legacy run in a RECONCILED state with ``finished_at is None``
+      must backfill it from the PRE-update ``updated_at`` (the prior persisted teardown time) before
+      this write bumps ``updated_at``. This covers the terminal states AND ``deployed`` (non-terminal
+      but reconciled -- see _FINISHED_AT_PRESERVED_STATES). Otherwise reconcile._terminal_ts (which
+      falls back to updated_at when finished_at is missing) would treat this billing-retry time as the
+      run end, delaying/windowing reconciliation and over-billing flat-rate remotes. Skipped once
+      ``reconciled_at`` is set (matching mark_deployed): by then ``updated_at`` is the reconcile time,
+      not teardown, so freezing it would be wrong -- and a reconciled run is never re-billed anyway."""
+    bad = set(fields) - _BILLING_FIELDS
+    if bad:
+        raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
+    with _STATUS_LOCK:
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        # Don't let a racing failed/charging write downgrade a charge another attempt already landed.
+        new_billing_state = fields.get("billing_state")
+        if (
+            status.billing_state == "charged"
+            and "billing_state" in fields
+            and new_billing_state != "charged"
+        ):
+            return
+        # Freeze the prior teardown time before this field-only write advances updated_at, so a
+        # billing retry never shifts the run end reconcile reads. Covers terminal states AND the
+        # reconciled-but-non-terminal `deployed` (see _FINISHED_AT_PRESERVED_STATES); skipped once
+        # reconciled (updated_at is then the reconcile time, not teardown).
+        if (
+            status.state in _FINISHED_AT_PRESERVED_STATES
+            and status.finished_at is None
+            and not status.reconciled_at
+        ):
+            status.finished_at = status.updated_at
+        for key, value in fields.items():
+            setattr(status, key, value)
         status.updated_at = time.time()
         _save_status(status)
     _report_status(status)

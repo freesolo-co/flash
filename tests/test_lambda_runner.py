@@ -321,12 +321,14 @@ def test_cache_bind_uses_returned_mount_point(monkeypatch):
     assert "/lambda/nfs/flash-weights" not in calls[0]["user_data"]
 
 
-def test_cache_payload_points_hf_home_at_the_bind(monkeypatch):
-    """The base64 payload's worker env redirects HF_HOME onto the bind (so the model download persists)."""
+def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
+    """The base64 payload points the base-model prefetch (FLASH_WEIGHT_CACHE_DIR) at the bind so the
+    model download persists — NOT a process-global HF_HOME, so env/reward downloads stay ephemeral (#252)."""
     from flash.providers.lambdalabs.jobs import build_payload
 
     payload = build_payload(_spec(network_volume="flash-weights"), 0, 0, cache_host_mount="/lambda/nfs/flash-weights")
-    assert payload["env"]["HF_HOME"] == "/weight-cache/hf-cache"
+    assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
+    assert "HF_HOME" not in payload["env"]
     assert payload["cache_host_mount"] == "/lambda/nfs/flash-weights"
     assert "cache_block_device" not in payload  # NFS: no format/mount preamble
 
@@ -971,6 +973,36 @@ def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
     assert res.failure == "stalled"
     # Stalls on SETUP grace (3000s from launch), not the tighter 500s training window the stale
     # heartbeat would have armed -> the reported idle time exceeds the training budget.
+    assert "setup (pre-training)" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    assert int(m.group(1)) >= 3000, res.detail
+
+
+def test_poll_gapfill_step0_keeps_setup_grace(monkeypatch):
+    """The train-liveness gap-filler emits rl_step/sft_step at step=0 throughout the silent FIRST step
+    (a cold rollout can run minutes before global_step ticks to 1). That FRESH, non-setup but step-0
+    heartbeat proves liveness yet must NOT tighten to the training window before any step completed —
+    the larger SETUP grace must still govern (RunPod has the same step>=1 guard). (Clock starts
+    10_000; launch 9000; fresh gap-fill ts 9500 >= launch but step 0.)"""
+    import re
+
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
+    )
+    gapfill = {"stage": "rl_step", "step": 0, "ts": 9500.0}  # fresh, non-setup, but step 0
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: gapfill,
+        setup_grace_s=3000.0,
+        stall_after_s=500.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    # SETUP grace (3000s) governs, not the tighter 500s training window a step-0 ping would have armed.
     assert "setup (pre-training)" in res.detail
     m = re.search(r"for (\d+)s", res.detail)
     assert m is not None, res.detail

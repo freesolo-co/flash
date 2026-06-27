@@ -2,8 +2,8 @@
 
 The Lambda-specific leaf of ``flash.providers.lambdalabs.jobs``: the normalized dataclasses
 (``LambdaInstance``, ``LambdaJobHandle``) and the image accessor. The cross-provider pieces — the
-run-derived sweep label, the bootstrap payload, and the cloud-init ``user_data`` — are shared with
-Hyperstack in ``flash.providers._instance`` and re-exported here so the import path is unchanged.
+run-derived sweep label, the bootstrap payload, and the cloud-init ``user_data`` — live in the
+shared ``flash.providers._instance`` and are re-exported here so the import path is unchanged.
 
 This module MUST NOT import the ``jobs`` package ``__init__`` (it is imported BY it).
 """
@@ -105,7 +105,8 @@ def build_payload(
     mode: str | None = None, models: list | None = None,
 ) -> dict:
     """The Lambda bootstrap payload (shared builder, arm='lambda'). ``cache_host_mount`` (the host
-    NFS mount of the attached weight-cache filesystem, /lambda/nfs/<name>) points HF_HOME at it.
+    NFS mount of the attached weight-cache filesystem, /lambda/nfs/<name>) points the base-model
+    prefetch (FLASH_WEIGHT_CACHE_DIR) at it.
     ``mode='preload'`` + ``models`` makes it a download-only warm payload (no worker)."""
     return _shared_build_payload(
         spec, seed, attempt, arm="lambda", runtime_secrets=runtime_secrets,

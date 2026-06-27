@@ -284,36 +284,47 @@ _WEIGHT_CACHE_MOUNT = "/runpod-volume"
 
 
 def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
-    """Worker env that points the HF cache at the persistent volume mount.
+    """Worker env pointing the BASE-MODEL prefetch at the persistent volume mount.
 
-    Only used when a weight-cache volume is attached (jobs.weight_cache_endpoint_kwargs). ``HF_HOME``
-    is the whole feature — the model download becomes a one-time cost per region instead of per run
+    Only used when a weight-cache volume is attached (jobs.weight_cache_endpoint_kwargs). This is the
+    whole feature — the base-model download becomes a one-time cost per region instead of per run
     (hf_transfer already saturates the NIC; this just makes it land somewhere persistent).
 
-    DELIBERATELY HF-only. The volume is SHARED platform-wide (multi-tenant), and HF snapshots are
-    inert DATA. We do NOT redirect the executable kernel-JIT caches (Triton/Inductor/tilelang/
-    torch-extensions) onto it: those are compiled artifacts the worker *executes*, so sharing them
-    across tenants on one volume would let a buggy/hostile run's environment code poison a later
-    unrelated run in the same region. JIT caches stay per-worker/ephemeral (the ~10-15 min first-use
-    compile is paid per cold worker, as before).
+    BASE-MODEL-SCOPED, not a global HF_HOME redirect. We export ``FLASH_WEIGHT_CACHE_DIR`` (the HF hub
+    layout under the mount) and leave HF_HOME unset, so the worker's DEFAULT (per-worker, ephemeral)
+    HF cache stays the global cache. The worker (engine.worker.hf.prefetch_model) downloads ONLY the
+    trusted public base model onto the shared mount via an explicit ``cache_dir`` and symlinks it into
+    the ephemeral cache for the trainer/vLLM. Every OTHER HF download a run makes at execution time —
+    its environment/reward code fetching datasets/models with the forwarded platform HF_TOKEN — lands
+    in the ephemeral cache, never the SHARED multi-tenant mount where a later tenant in the region
+    could read it. (Previously this set HF_HOME onto the mount process-globally, so those env/reward
+    downloads leaked onto the shared volume — issue #252.)
+
+    DELIBERATELY does NOT redirect the executable kernel-JIT caches (Triton/Inductor/tilelang/
+    torch-extensions): those are compiled artifacts the worker *executes*, so sharing them across
+    tenants on one volume would let a buggy/hostile run's environment code poison a later unrelated
+    run in the same region. JIT caches stay per-worker/ephemeral (the ~10-15 min first-use compile is
+    paid per cold worker, as before).
 
     Concurrent writes: two cold runs landing in the same region before it is warm both
-    snapshot_download the model onto this shared mount. huggingface_hub guards this with a per-blob
-    file lock + atomic rename (content-addressed blobs), so the worst case is duplicated download
-    work, not a corrupt snapshot. The preload step (flash/providers/runpod/preload.py) pre-warms each
-    region precisely so real runs hit a populated cache and the cold-concurrent case is rare.
+    snapshot_download the base model onto this shared mount. huggingface_hub guards this with a
+    per-blob file lock + atomic rename (content-addressed blobs), so the worst case is duplicated
+    download work, not a corrupt snapshot. The preload step (flash/providers/runpod/preload.py)
+    pre-warms each region precisely so real runs hit a populated cache and the cold-concurrent case is
+    rare.
     """
-    return {"HF_HOME": f"{mount}/hf-cache"}
+    return {"FLASH_WEIGHT_CACHE_DIR": f"{mount}/hf-cache/hub"}
 
 
 def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
     """Strip any ``mount``-rooted cache vars when the volume isn't actually mounted (mutates+returns).
 
     Defense-in-depth for the cold/no-volume fallback: if the cache attach degraded to ``{}`` (an SDK
-    error) or the worker simply has no volume, ``HF_HOME`` would otherwise point at a non-existent
-    ``/runpod-volume`` path. Dropping it lets HF fall back to the default ephemeral cache (a correct
-    cold run) instead of writing under a missing/ephemeral mount. Reads the real filesystem
-    (``os.path.isdir``) but takes the env as an argument, so tests drive it by monkeypatching isdir.
+    error) or the worker simply has no volume, ``FLASH_WEIGHT_CACHE_DIR`` would otherwise point at a
+    non-existent ``/runpod-volume`` path. Dropping it lets the base-model prefetch fall back to the
+    default ephemeral cache (a correct cold run) instead of writing under a missing/ephemeral mount.
+    Reads the real filesystem (``os.path.isdir``) but takes the env as an argument, so tests drive it
+    by monkeypatching isdir.
     """
     if os.path.isdir(mount):
         return env
@@ -325,12 +336,13 @@ def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dic
 def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
     """Remove the RunPod weight-cache redirect from an env bound for a NON-RunPod worker (mutates).
 
-    Instance providers (Lambda/Hyperstack) reuse this module's shared ``build_worker_env``, which
-    redirects ``HF_HOME`` onto the RunPod network-volume mount (``/runpod-volume``) whenever the run
-    carries a weight-cache volume. That mount exists ONLY on RunPod serverless — on a rented instance
-    it is a nonexistent path with no cross-run persistence — so the instance submit path strips any
-    ``/runpod-volume``-rooted cache var here (unconditionally: instance providers never mount it). A
-    user ``[worker_env]`` ``HF_HOME`` override is not ``/runpod-volume``-rooted, so it is preserved.
+    Instance providers (e.g. Lambda) reuse this module's shared ``build_worker_env``, which
+    points ``FLASH_WEIGHT_CACHE_DIR`` at the RunPod network-volume mount (``/runpod-volume``) whenever
+    the run carries a weight-cache volume. That mount exists ONLY on RunPod serverless — on a rented
+    instance it is a nonexistent path with no cross-run persistence — so the instance submit path
+    strips any ``/runpod-volume``-rooted cache var here (unconditionally: instance providers never
+    mount it). A user ``[worker_env]`` ``HF_HOME`` override is not ``/runpod-volume``-rooted, so it is
+    preserved.
     """
     for k in [k for k, v in env.items() if str(v).startswith(mount)]:
         env.pop(k, None)
@@ -371,19 +383,16 @@ def build_worker_env(
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }
-    # HF artifact creds + managed environment hub creds + optional reward-judge creds: a Freesolo
-    # environment whose reward calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
-    # where the reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env
-    # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
-    # control-plane override so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
-    # back to the env's generated default. Forward any that the operator has set; absent ones are
-    # simply not passed (the env then uses its own default model).
+    # Platform creds only: HF artifact creds (HF_TOKEN) + managed environment hub creds
+    # (GITHUB_TOKEN). flash is fully managed — there are no per-run env knobs and no hardcoded
+    # reward-judge creds. A Freesolo environment whose reward calls an LLM judge declares the
+    # provider key it needs (e.g. OPENROUTER_API_KEY / OPENAI_API_KEY) as an [environment].secrets
+    # entry, which is forwarded via runtime_secrets at submit time to the worker where the reward
+    # runs; the judge model id is the env's own default. Forward any platform cred below that the
+    # operator has set; absent ones are simply not passed.
     for key in (
         "HF_TOKEN",
         "GITHUB_TOKEN",
-        "OPENROUTER_API_KEY",
-        "OPENAI_API_KEY",
-        "FLASH_JUDGE_MODEL",
     ):
         if os.environ.get(key):
             env[key] = os.environ[key]
@@ -391,18 +400,17 @@ def build_worker_env(
     # code storage + heartbeats). The worker reads HF_REPO from its own process env; that env
     # is now sourced from the spec, not the operator's HF_REPO.
     env["HF_REPO"] = spec.train.hf_repo
-    # When the shared weight-cache volume is attached, redirect HF_HOME onto the mount so model
-    # weights persist across runs (HF blobs only — NOT the executable kernel-JIT caches; see
-    # weight_cache_env). Gated on a volume being assigned: without one the mount doesn't exist, so
-    # pointing HF_HOME there would just break the worker (the worker also self-corrects at runtime
-    # if /runpod-volume isn't mounted — see _train_body). A per-run [worker_env] override still wins
-    # (merged last, below).
-    # CONFIDENTIALITY: HF_HOME here is process-global, so the run's environment/reward code's runtime
-    # HF downloads ALSO land on this SHARED mount — the catalog gate (runner._assign_weight_cache_volume)
-    # scopes only the spec model, not assets fetched at execution time with the forwarded HF_TOKEN. See
-    # the TRUST MODEL note in flash/runner/__init__.py; proper base-model-only scoping (explicit
-    # cache_dir for prefetch + ephemeral HF cache for env code, or a read-only mount) is a worker-side
-    # follow-up.
+    # When the shared weight-cache volume is attached, point the BASE-MODEL prefetch at the mount so
+    # the public base-model weights persist across runs (HF blobs only — NOT the executable kernel-JIT
+    # caches; see weight_cache_env). Gated on a volume being assigned: without one the mount doesn't
+    # exist, so pointing the cache dir there would just break the worker (the worker also self-corrects
+    # at runtime if /runpod-volume isn't mounted — see _train_body / hf.prefetch_model). A per-run
+    # [worker_env] override still wins (merged last, below).
+    # CONFIDENTIALITY (issue #252, closed): this is FLASH_WEIGHT_CACHE_DIR, NOT a process-global HF_HOME.
+    # The worker downloads ONLY the trusted public base model onto the shared mount (explicit cache_dir)
+    # and symlinks it into the per-worker EPHEMERAL cache for the trainer/vLLM; the run's environment/
+    # reward code's runtime HF downloads (fetched with the forwarded HF_TOKEN) land in that ephemeral
+    # cache, never the shared multi-tenant mount. See the TRUST MODEL note in flash/runner/__init__.py.
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
     if spec.train.steps is not None:

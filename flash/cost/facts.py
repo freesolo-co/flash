@@ -7,12 +7,9 @@ from flash.catalog import MODELS
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
-    "L4": 60.0,
     "RTX 4090": 165.0,
     "RTX 5090": 210.0,
     "RTX A6000": 155.0,
-    "A40": 150.0,
-    "RTX 6000 Ada": 182.0,
     "A100 PCIe": 312.0,
     "A100 SXM": 312.0,
     "H100": 990.0,
@@ -37,7 +34,7 @@ def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
 
     The nominal ``GpuClass.hourly_usd`` is the RunPod rate, which is WRONG for a provider-specific
     quote (e.g. a Lambda RTX A6000 is $1.09/hr, not RunPod's $0.49). When ``provider`` is
-    ``lambda``/``hyperstack`` and the class is offered there, price it through that provider's
+    ``lambda`` and the class is offered there, price it through that provider's
     pricing module (live with a static fallback); otherwise (runpod/auto/None) use the nominal rate.
     """
     info = GPU_INFO.get(name)
@@ -46,10 +43,6 @@ def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
     p = (provider or "").strip().lower()
     if p == "lambda" and info.lambda_name:
         from flash.providers.lambdalabs.pricing import hourly_rate
-
-        return hourly_rate(name)
-    if p == "hyperstack" and info.hyperstack_name:
-        from flash.providers.hyperstack.pricing import hourly_rate
 
         return hourly_rate(name)
     return info.hourly_usd

@@ -31,7 +31,7 @@ def preload_instance_run_id(provider: str, region: str, reap_deadline_epoch: int
 
     The epoch is placed RIGHT AFTER ``flash-preload-`` (before provider/region) on purpose: the launched
     instance NAME is bounded to the provider name budget by ``run_label_prefix``, which truncates the
-    TAIL and appends a hash. A long provider+region (e.g. hyperstack + a long region) would otherwise
+    TAIL and appends a hash. A long provider+region (e.g. a provider name + a long region) would otherwise
     push the deadline token past the cut and the reap parser would never see it — front-loading keeps
     ``-d<epoch>-`` inside the surviving prefix."""
     return f"flash-preload-d{int(reap_deadline_epoch)}-{provider}-{region.lower()}-{suffix}"
@@ -41,7 +41,7 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
     """True when a ``flash-preload-*`` instance name carries an embedded reap deadline (``-d<epoch>-``,
     written by ``preload_instance_run_id``) that elapsed more than ``grace_s`` ago.
 
-    Used by the Lambda/Hyperstack orphan sweeps: warm boxes are normally driver-owned and exempt, but a
+    Used by the Lambda orphan sweep: warm boxes are normally driver-owned and exempt, but a
     driver that died before its ``terminate_run_instances`` finally would leave one billing forever.
     Reaping past deadline+grace bounds that leak. Names WITHOUT a parseable deadline (legacy launches)
     return False — the unconditional driver-owned exemption still applies to them. The 10+ digit guard
@@ -52,7 +52,7 @@ def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GR
     return float(m.group(1)) + grace_s < now
 
 
-# First-liveness deadline for the instance providers (Lambda / Hyperstack). Once an instance reaches
+# First-liveness deadline for the instance providers (e.g. Lambda). Once an instance reaches
 # OS-level ``active`` a healthy box that actually ran cloud-init pushes its ``<arm>_attempt<N>_boot.log``
 # to HF within ~2 min (the uploader starts BEFORE the image pull) and a live worker soon heartbeats.
 # So if a box is active for this long with NO attempt-scoped boot.log AND no fresh heartbeat, cloud-
@@ -268,6 +268,72 @@ def _record_heartbeat(hb: dict) -> None:
         pass
 
 
+# Heartbeat stages the worker emits DURING cold start, BEFORE the training loop begins. Receiving
+# one proves the worker is alive but NOT that the slow setup finished, so a poller must NOT let them
+# flip its stall detection from the wide setup grace to the tight training-stall window. The setup
+# timeline is:
+#   boot -> sft_start/rl_start -> model_prefetching/model_prefetched (snapshot_download, can pull
+#   tens of GB) -> sft_model_load/rl_train_start -> sft_initializing/rl_initializing (vLLM build +
+#   *Trainer.__init__) -> [dataset render/tokenize over the full -- possibly uncapped -- dataset,
+#   silent] -> first sft_step/rl_step (training has actually begun).
+# This set is specifically the COLD-START timeline above — it is what the first COMPLETED-step
+# sft_step/rl_step heartbeat flips OUT of into the tight training window. The POST-training stages
+# (*_trained / *_train_done / metrics) are non-setup too and ALSO tighten the window (see
+# STEP_GATED_STAGES) so a hung teardown / DONE upload is caught by the tight training stall, not the
+# wide setup grace. The prefetch + init pings were added so a long-but-LIVE cold start keeps re-arming
+# liveness, but they are still setup: omitting them here would latch the poller into the training stall
+# the moment the first one lands, then false-kill a healthy run whose silent dataset tokenization
+# outlives that tighter window. Canonical here so all three providers (runpod / lambdalabs /
+# hyperstack) share ONE definition.
+SETUP_HEARTBEAT_STAGES = frozenset(
+    {
+        "boot",
+        "sft_start",
+        "rl_start",
+        "model_prefetching",
+        "model_prefetched",
+        "sft_model_load",
+        "rl_train_start",
+        "sft_initializing",
+        "rl_initializing",
+    }
+)
+
+# The per-step TRAINING heartbeats. These are the ONLY stages gated on a COMPLETED step (step >= 1)
+# before they tighten the stall window from setup grace: the train-loop daemon / reward callback can
+# emit rl_step/sft_step at step=0 throughout the silent cold FIRST step (a cold rollout runs minutes
+# before global_step ticks to 1), and tightening there would false-kill a healthy cold start. Every
+# OTHER non-setup stage — the POST-training rl_trained / sft_trained / <phase>_train_done + metrics/
+# upload pings, which carry no step field — means training is finished, so they tighten the window
+# immediately (a hung teardown/DONE upload should fall under the tight window, not the wide setup
+# grace). Canonical here so runpod / lambdalabs share ONE definition.
+STEP_GATED_STAGES = frozenset({"rl_step", "sft_step"})
+
+
+def is_training_heartbeat(stage: str | None, step: Any) -> bool:
+    """Whether a just-surfaced heartbeat means cold-start setup is OVER — i.e. the poller should
+    tighten its stall detection from the wide ``setup_grace_s`` to the tight training window.
+
+    - a SETUP stage (``SETUP_HEARTBEAT_STAGES``) or no stage -> False (still the cold start).
+    - a per-step training ping (``STEP_GATED_STAGES``: rl_step/sft_step) -> True ONLY at a COMPLETED
+      step (``step >= 1``). The train-loop daemon / reward callback can emit step=0 throughout the
+      silent cold FIRST step (a cold vLLM rollout runs many minutes before global_step ticks to 1);
+      tightening there would false-kill a healthy cold start, so step=0 keeps the setup grace.
+    - any OTHER non-setup stage -> True. These are the POST-training stages (rl_trained / sft_trained /
+      ``<phase>_train_done`` + metrics/DONE), which carry no ``step`` field; training has FINISHED, so a
+      hung teardown/upload must fall under the tight window, not the wide setup grace.
+
+    ``step`` is coerced via ``_attempt_int`` (a malformed/missing/non-numeric step must never raise
+    inside the poll loop, where no local handler would abort it) and treated as 0. Shared by runpod and
+    lambdalabs so their setup-vs-training transition stays identical.
+    """
+    if not stage or stage in SETUP_HEARTBEAT_STAGES:
+        return False
+    if stage in STEP_GATED_STAGES:
+        return (_attempt_int(step) or 0) >= 1
+    return True
+
+
 def surface_heartbeat(
     heartbeat_reader: Callable[[], Any] | None,
     last_hb_key: tuple | None,
@@ -291,6 +357,11 @@ def surface_heartbeat(
     except Exception:
         hb = None
     if not hb:
+        return last_hb_key, None
+    if hb.get("liveness"):
+        # A liveness ping proves the worker is alive (its alive ts is in the file for humans) but is
+        # NOT progress — it must not advance the stall key, else a wedged worker pinging "alive" would
+        # mask a stall. The provider stalls on the absence of REAL (non-liveness) heartbeats.
         return last_hb_key, None
     key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
     if key == last_hb_key:

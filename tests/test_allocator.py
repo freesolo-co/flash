@@ -34,8 +34,8 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
     # The deployed control plane rejects a submit for any non-validated class, so client-side
     # allocation must only ever pick a class in the validated pool — across ALL candidates,
     # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
-    # whose cheapest VALIDATED RunPod class is RTX A6000 @ $0.49 (cheaper unvalidated 24 GB classes
-    # like L4 are excluded). 24 GB is the floor — sub-24 GB classes were dropped.
+    # whose cheapest VALIDATED RunPod class is RTX A6000 @ $0.49. 24 GB is the floor — sub-24 GB
+    # classes were dropped.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert all(c.gpu in VALIDATED for c in a.candidates), [
@@ -45,23 +45,29 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
 
 
 def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
-    """A small SFT down-routes below 24 GB; the absolute-cheapest fitting class (L4 @ $0.39, 24 GB)
-    is UNVALIDATED and must be skipped for the cheapest VALIDATED one (RTX A6000 @ $0.49), so the
-    run actually submits (the live `flash train` default-submit failure this fixes)."""
+    """The allocator must skip a cheaper UNVALIDATED class for the cheapest VALIDATED one (so the
+    deployed control plane accepts the submit). The managed catalog is now fully validated, so
+    inject a synthetic unvalidated RunPod class cheaper than any real one and confirm it is
+    excluded from the candidate set."""
     from flash.providers import allocator
-    from flash.providers.base import GPU_INFO, VALIDATED
+    from flash.providers.base import GPU_INFO, VALIDATED, GpuClass
+
+    fake = GpuClass("FAKE Cheap", "NVIDIA_FAKE", 24, "fakecheap", "sm80", 0.10)
+    assert not fake.validated
+    monkeypatch.setitem(GPU_INFO, "FAKE Cheap", fake)
 
     # 4B SFT (seq 1024, rank 8) down-routes below 24 GB in the matrix (see test_required_vram_*).
     a = allocator.allocate(
         "Qwen/Qwen3.5-4B", "sft", train={"max_length": 1024, "lora_rank": 8}
     )
-    assert a.min_vram_gb < 24  # a sub-24 GB run where unvalidated cheap cards exist
-    assert all(c.gpu in VALIDATED for c in a.candidates)
-    # The cheapest fitting UNVALIDATED RunPod class would have been chosen without the gate.
+    assert a.min_vram_gb < 24  # a sub-24 GB run the synthetic unvalidated card also fits
+    # The synthetic class is cheaper and fits, yet is excluded because it is unvalidated.
     assert any(
         (not g.validated) and g.enum_member and g.vram_gb >= a.min_vram_gb
         for g in GPU_INFO.values()
     )
+    assert all(c.gpu in VALIDATED for c in a.candidates)
+    assert "FAKE Cheap" not in [c.gpu for c in a.candidates]
 
 
 def test_runpod_allocation_lands_on_full_validated_cards(monkeypatch):
@@ -78,13 +84,17 @@ def test_runpod_allocation_lands_on_full_validated_cards(monkeypatch):
 
 
 def test_default_max_retries():
-    """The GPU retry budget default (2) covers infra-shaped flakes (worker loss / stall / timeout).
-    Covers both the GpuSpec default and the JobSpec.from_dict default (the worker payload path)."""
+    """The GPU retry budget default (5) covers infra-shaped flakes (worker loss / stall / timeout)
+    and matches INFRA_RETRY_FLOOR (runner.lifecycle), which the runner already floored the effective
+    budget to — so the declared default now reflects the real GPU-walk budget. Covers both the
+    GpuSpec default and the JobSpec.from_dict default (the worker payload path)."""
+    from flash.runner.lifecycle import INFRA_RETRY_FLOOR
     from flash.spec import GpuSpec, JobSpec
 
-    assert GpuSpec().max_retries == 2
-    assert JobSpec.from_dict({}).gpu.max_retries == 2
-    assert JobSpec.from_dict({"gpu": {}}).gpu.max_retries == 2
+    assert GpuSpec().max_retries == 5
+    assert GpuSpec().max_retries == INFRA_RETRY_FLOOR  # default tracks the runner's infra floor
+    assert JobSpec.from_dict({}).gpu.max_retries == 5
+    assert JobSpec.from_dict({"gpu": {}}).gpu.max_retries == 5
     # An explicit value still wins (the default is only the fallback).
     assert JobSpec.from_dict({"gpu": {"max_retries": 3}}).gpu.max_retries == 3
 

@@ -94,12 +94,12 @@ def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
 def test_cold_start_calibrated_to_real_short_sft_run():
     # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
     # the recipe batch) was cold-start-dominated (a fresh worker spent ~12.5 min in model load).
-    # Static pricing picks the cheapest fitting class; with 24 GB as the floor (sub-24 GB classes
-    # dropped) that's the L4 ($0.39). 26 = ceil(391 / 32) * 2 epochs.
+    # Static pricing picks the cheapest fitting class; the cheapest managed card is the 48 GB
+    # RTX A6000 ($0.49). 26 = ceil(391 / 32) * 2 epochs.
     e = estimate_cost(RunConfig(SMALL, "sft", 26))
-    assert e.gpu == "L4"
-    assert e.gpu_hourly_usd == pytest.approx(0.39, abs=1e-3)
-    assert e.total_usd == pytest.approx(0.082, rel=0.10)
+    assert e.gpu == "RTX A6000"
+    assert e.gpu_hourly_usd == pytest.approx(0.49, abs=1e-3)
+    assert e.total_usd == pytest.approx(0.0773, rel=0.10)
     # Model load (not boot/deps) is the dominant cold-start term for a short job.
     assert e.setup_seconds > e.train_seconds  # cold start dominates this short run
 

@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import os
 import random
-import threading
 import time
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     disable_liger_grpo_torch_compile,
@@ -690,15 +690,21 @@ def run_rl():
         print("[rl] multi-turn env: driving the turn loop via rollout_func")
     # GRPOTrainer.__init__ blocks during model/vLLM init + FA2 kernel compilation (can be
     # 10-20 min on first use). Background heartbeats keep the stall detector quiet.
-    _rl_init_done = threading.Event()
-
-    def _rl_init_heartbeat() -> None:
-        while not _rl_init_done.wait(30.0):
-            _w.heartbeat("rl_initializing", gpu=gpu_diagnostics())
-
-    _rl_init_hb = threading.Thread(target=_rl_init_heartbeat, daemon=True)
-    _rl_init_hb.start()
-    try:
+    #
+    # CRITICAL: this heartbeat runs on a SIDE THREAD while the main thread is deep inside the
+    # blocking GRPOTrainer.__init__ (vLLM colocate engine build + weight load) — a long, CUDA- and
+    # allocator-busy section. gpu_diagnostics(include_torch=True) makes torch.cuda calls
+    # (mem_get_info / memory_allocated / memory_reserved / get_device_name) that serialize on the
+    # CUDA driver lock and PyTorch's caching-allocator mutex, both held by the init thread. Those
+    # calls can then BLOCK for the whole init -> the heartbeat thread freezes -> the control plane
+    # sees no heartbeat and false-flags a HANG on a run that is merely doing a slow (but live) cold
+    # init (observed on consumer GPUs: RTX 4090/5090/A6000, where cold init is longest). Use the
+    # nvidia-smi-only path (include_torch=False): it runs out-of-process with an 8s timeout and
+    # releases the GIL during the subprocess wait, so it keeps ticking through a CUDA-busy init. The
+    # torch memory numbers are meaningless here anyway (the model isn't built yet). If even THIS
+    # stops ticking, the main thread is holding the GIL in a C extension (a true wedge) -> no heartbeat
+    # lands at all and the provider's stall detection catches it (liveness_heartbeat, heartbeat.py).
+    with liveness_heartbeat("rl_initializing"):
         trainer = GRPOTrainer(
             model=init_model,
             args=cfg,
@@ -709,8 +715,6 @@ def run_rl():
             callbacks=[hb_cb, _w.make_checkpoint_upload_callback()],
             **extra_trainer_kwargs,
         )
-    finally:
-        _rl_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
     # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
@@ -762,7 +766,11 @@ def run_rl():
     _reset_peak_gpu()  # peak_gpu_gb reflects the train loop (verifies the micro-batch headroom)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. vLLM colocate + bnb pages
     t_train = time.time()
-    with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+    # Liveness around the train loop: the cold FIRST GRPO step (vLLM rollout warmup + backward,
+    # ~17 min observed on a consumer GPU) emits no real rl_step until it completes and would look like
+    # a hang. liveness_heartbeat pings "alive" (the provider skips those); the real per-step rl_step
+    # callback is the progress signal, so a genuinely stuck step still trips the provider stall path.
+    with liveness_heartbeat("rl_step"), _sdpa_cudnn_ctx(_attn):  # cuDNN SDPA on sm120 (no-op else)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     rl_peak_gpu_gb = _peak_gpu_gb()
@@ -806,6 +814,16 @@ def run_rl():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+    # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
+    # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
+    # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
+    # doesn't land on one would have NO `flash deploy --step` entry even though it IS the served
+    # default adapter. Publish the just-saved final adapter here, keyed by the true final
+    # global_step: same bytes as `<prefix>/adapter`, so `--step <final>` always resolves to exactly
+    # the deployed default. Idempotent (content-addressed path) when the step already aligned, and
+    # best-effort (never fails a paid run).
+    if _steps_run:
+        _w.publish_deployable_checkpoint(adapter_dir, _steps_run)
     _w.heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens: completions actually optimized (the intended
