@@ -73,9 +73,9 @@ RUN pip install --no-cache-dir \
 ARG FLASH_ATTN_SPEC=flash-attn
 # Source-build fallback only (ignored when FLASH_ATTN_SPEC is a wheel): bound the compile so it
 # doesn't OOM. TORCH_CUDA_ARCH_LIST restricts to the catalog's arches — Ampere (8.0 A100 / 8.6
-# 3090/A40), Ada (8.9 4090), Hopper (9.0 H100), Blackwell (12.0 RTX 5090; sm120); MAX_JOBS bounds
+# 3090/A40), Ada (8.9 4090), Hopper (9.0 H100), Blackwell datacenter (10.0 B200; sm100) + workstation (12.0 RTX 5090/Pro 6000; sm120); MAX_JOBS bounds
 # peak compile memory. (A from-source build still needs a big-RAM host; the wheel avoids all of it.)
-RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" MAX_JOBS=4 \
+RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
     pip install --no-cache-dir "${FLASH_ATTN_SPEC}" --no-build-isolation \
     && echo "flash-attn: installed (${FLASH_ATTN_SPEC})" || echo "flash-attn: build failed, SDPA fallback"
 
@@ -119,7 +119,7 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
 # import fine but raise "no kernel image is available for execution on the device" at the first conv
 # forward on sm120 — GPU-verified. engine.worker.packing.gdn_packing_available runs a conv smoke too,
 # so even a wrong-arch build can't crash a run (it just keeps GDN packing off).
-RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
     pip install --no-cache-dir "causal-conv1d==1.6.2.post1" --no-build-isolation \
     && python -c "import causal_conv1d" \
     && echo "causal_conv1d: installed (GDN packing enabled)" \

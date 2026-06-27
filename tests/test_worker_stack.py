@@ -519,8 +519,8 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
 
 def test_attn_impl_for_capability_per_arch(monkeypatch):
     """Pure capability -> best-per-arch flash policy (no CUDA needed): flash on every arch EXCEPT
-    consumer Blackwell sm120. Hopper(sm90): FA3, else a UNIFORM fall back to plain SDPA (NO FA3->FA2
-    chain). Ampere(sm80/86)+Ada(sm89): FA2. sm120: cuDNN SDPA (FA3/FA4 can't run)."""
+    Blackwell (datacenter sm100 + consumer sm120). Hopper(sm90): FA3, else a UNIFORM fall back to
+    plain SDPA (NO FA3->FA2 chain). Ampere(sm80/86)+Ada(sm89): FA2. sm100/sm120: cuDNN SDPA."""
     w = _import_worker(monkeypatch)
     f = w._attn_impl_for_capability
     # Hopper sm90: FA3 is the arch's best flash; absent -> plain SDPA (uniform fallback, NOT FA2).
@@ -533,8 +533,12 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     assert f(8, 9, fa2_available=True) == "flash_attention_2"  # Ada 4090
     assert f(8, 7, fa2_available=True) is None  # sm87 Jetson Orin: NOT a validated FA2 arch -> SDPA
     assert f(8, 0, fa2_available=False) is None
-    # consumer Blackwell sm120: cuDNN SDPA regardless of flash availability (the one exception).
+    # consumer Blackwell sm120: cuDNN SDPA regardless of flash availability.
     assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
+    # datacenter Blackwell sm100 (B200): cuDNN SDPA too — NOT None (a bare None would let run_sft's
+    # FA2 packing fallback force a possibly-missing sm100 FA2 kernel). Holds even when fa2 imports.
+    assert f(10, 0, fa2_available=True) == "sdpa"
+    assert f(10, 0, fa2_available=False) == "sdpa"
 
 
 def test_flash_attn_probes_false_in_ci(monkeypatch):
