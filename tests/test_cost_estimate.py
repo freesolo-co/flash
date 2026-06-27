@@ -111,3 +111,28 @@ def test_estimate_cost_vast_market_duration_mirrors_launch(monkeypatch):
     assert market_walls(
         RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="vast", max_wall_seconds=7200)
     ) == {7200.0}
+
+
+def test_pick_gpu_vast_duration_bound_fetches_market_once(monkeypatch):
+    # Copilot: pick_gpu ranks every fitting class by $/hr. A duration-bound Vast query bypasses the
+    # per-call rate cache (Codex MtzrI), so pricing each candidate individually inside min(key=...)
+    # would fire one identical full market fetch PER fitting class. pick_gpu must fetch the live rate
+    # map ONCE and rank from it -> exactly one usable_offers call no matter how many classes fit.
+    from flash.cost.facts import pick_gpu
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast import pricing
+
+    calls = {"n": 0}
+
+    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})  # isolate cache
+
+    # A tiny VRAM floor leaves MANY fitting Vast classes -> per-candidate pricing would fetch many times.
+    gpu = pick_gpu(8, provider="vast", max_wall_seconds=7200.0)
+    assert gpu  # a class was chosen
+    assert calls["n"] == 1  # ONE market fetch despite multiple fitting candidates (was N)

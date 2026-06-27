@@ -85,15 +85,25 @@ def pick_gpu(
     if not candidates:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
     # Rank by the rate on the REQUESTED provider so a provider-specific quote picks that provider's
-    # cheapest fit (not the cheapest by the RunPod nominal rate).
-    best = min(
-        candidates,
-        key=lambda g: (
-            gpu_hourly_usd(g.name, provider=provider, max_wall_seconds=max_wall_seconds),
-            g.vram_gb,
-            g.name,
-        ),
-    )
+    # cheapest fit (not the cheapest by the RunPod nominal rate). For Vast, fetch the whole live rate
+    # map ONCE rather than calling gpu_hourly_usd() per candidate inside the key: a duration-bound Vast
+    # query bypasses the per-call cache (Codex MtzrI), so per-candidate pricing would fire one identical
+    # full market fetch per fitting class — N redundant Vast queries (latency/rate-limit) per estimate.
+    # live_rates() returns merged live+static keyed by class name, so a single fetch ranks them all
+    # (Copilot). Other providers price statically/cheaply, so per-candidate lookup is fine there.
+    if (provider or "").strip().lower() == "vast":
+        from flash.providers.vast.pricing import live_rates
+
+        vast_rates = live_rates(max_wall_seconds=max_wall_seconds)
+
+        def _rate(g: GpuClass) -> float:
+            return vast_rates.get(g.name) or g.hourly_usd
+    else:
+
+        def _rate(g: GpuClass) -> float:
+            return gpu_hourly_usd(g.name, provider=provider, max_wall_seconds=max_wall_seconds)
+
+    best = min(candidates, key=lambda g: (_rate(g), g.vram_gb, g.name))
     return best.name
 
 
