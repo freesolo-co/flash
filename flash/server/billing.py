@@ -12,10 +12,8 @@ import urllib.error
 import urllib.request
 from decimal import ROUND_HALF_UP, Decimal
 
-from .auth import freesolo_base_url
+from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, org_id_of
 
-# A charge does more than a verify; allow a bit more than auth's 5s but stay bounded.
-_CHARGE_TIMEOUT_S = 10.0
 _COMPLETION_CHARGE_PATH = "/api/billing/training-usage/internal"
 
 
@@ -67,18 +65,9 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
     Raises ``BillingError`` (the route's status + a clean detail) on a non-2xx, and ``503``
     when the service is unreachable -- the same translation the charge and its reversal share.
     """
-    url = f"{freesolo_base_url()}{path}"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
+    req = build_internal_request(path, body, token=token)
     try:
-        with urllib.request.urlopen(req, timeout=_CHARGE_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raise BillingError(exc.code, _http_error_detail(exc)) from exc
@@ -99,7 +88,7 @@ def charge_completed_run(*, internal_key: str, status) -> dict:
     terminal training state.
     """
     context = status.billing_context if isinstance(status.billing_context, dict) else {}
-    org_id = str(context.get("org_id") or "").strip()
+    org_id = org_id_of(context)
     if not org_id:
         raise BillingError(400, "missing billing org id for completed training run")
     spec = status.spec or {}

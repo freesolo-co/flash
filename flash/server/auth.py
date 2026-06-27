@@ -43,12 +43,13 @@ _VERIFY_CACHE_NEG_TTL_S = 30.0
 # raw token) or produce an oversized outbound Authorization header.
 _MAX_TOKEN_LEN = 256
 
-# In-process verify cache: token -> (verified_bool, expires_at). Caches positives AND
-# negatives so a burst of requests for the same token hits the backend at most once per TTL.
-# Bounded: pruned of expired entries on every write and capped at _VERIFY_CACHE_MAX so a
-# stream of unique bearer tokens can't grow it without bound (each token is a distinct key).
-_verify_cache: dict[str, tuple[bool, float]] = {}
-_identity_cache: dict[str, tuple[dict[str, Any], float]] = {}
+# In-process verify cache: token -> (verified_bool, identity_if_verified_else_{}, expires_at).
+# Caches positives AND negatives so a burst of requests for the same token hits the backend at
+# most once per TTL; the identity is carried alongside the verdict (one structure keyed by the
+# token, one shared TTL) so a verified key's identity is served from the same entry. Bounded:
+# pruned of expired entries on every write and capped at _VERIFY_CACHE_MAX so a stream of unique
+# bearer tokens can't grow it without bound (each token is a distinct key).
+_verify_cache: dict[str, tuple[bool, dict[str, Any], float]] = {}
 _verify_cache_lock = threading.Lock()
 _VERIFY_CACHE_MAX = 1024
 
@@ -59,19 +60,15 @@ def _prune_verify_cache_locked(now: float) -> None:
     Caller must hold ``_verify_cache_lock``. Keeps the cache from growing unbounded as
     many distinct bearer tokens are verified over time.
     """
-    for tok in [t for t, (_v, exp) in _verify_cache.items() if exp <= now]:
+    for tok in [t for t, entry in _verify_cache.items() if entry[2] <= now]:
         del _verify_cache[tok]
-        _identity_cache.pop(tok, None)
-    for tok in [t for t, (_v, exp) in _identity_cache.items() if exp <= now]:
-        del _identity_cache[tok]
     if len(_verify_cache) >= _VERIFY_CACHE_MAX:
         # Still over the cap after dropping expired entries: evict the soonest-to-expire
         # (oldest) entries until we're back under the cap.
-        for tok, _exp in sorted(_verify_cache.items(), key=lambda kv: kv[1][1])[
+        for tok, _entry in sorted(_verify_cache.items(), key=lambda kv: kv[1][2])[
             : len(_verify_cache) - _VERIFY_CACHE_MAX + 1
         ]:
             del _verify_cache[tok]
-            _identity_cache.pop(tok, None)
 
 
 def _freesolo_key_prefix(token: str) -> str:
@@ -151,9 +148,9 @@ def _response_body(resp: Any) -> bytes:
 def _cached_identity(token: str) -> dict[str, Any]:
     now = time.time()
     with _verify_cache_lock:
-        cached = _identity_cache.get(token)
-        if cached is not None and cached[1] > now:
-            return dict(cached[0])
+        cached = _verify_cache.get(token)
+        if cached is not None and cached[2] > now:
+            return dict(cached[1])
     return {}
 
 
@@ -191,7 +188,7 @@ def _freesolo_verify(token: str) -> bool:
     now = time.time()
     with _verify_cache_lock:
         cached = _verify_cache.get(token)
-        if cached is not None and cached[1] > now:
+        if cached is not None and cached[2] > now:
             return cached[0]
     url = f"{freesolo_base_url()}/api/auth/verify"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
@@ -219,13 +216,10 @@ def _freesolo_verify(token: str) -> bool:
         _prune_verify_cache_locked(now)
         # Pick the TTL by verdict: positives last the full TTL; a negative (which may be a
         # transient backend 401 rather than a real rejection) expires quickly so a valid key
-        # isn't locked out for 5 minutes after the backend recovers.
+        # isn't locked out for 5 minutes after the backend recovers. The identity rides in the
+        # same entry — present only on a positive verdict, {} otherwise.
         ttl = _VERIFY_CACHE_TTL_S if verified else _VERIFY_CACHE_NEG_TTL_S
-        _verify_cache[token] = (verified, now + ttl)
-        if verified:
-            _identity_cache[token] = (identity, now + ttl)
-        else:
-            _identity_cache.pop(token, None)
+        _verify_cache[token] = (verified, identity if verified else {}, now + ttl)
     return verified
 
 

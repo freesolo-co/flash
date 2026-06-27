@@ -137,69 +137,55 @@ class ApiClient:
             "`flash login`. Unset FREESOLO_API_KEY or update it to a valid freesolo API key."
         )
 
+    @contextlib.contextmanager
+    def _translate_http_errors(self) -> Iterator[None]:
+        """Map urllib transport errors to ApiError/ClientError, leaving everything else alone.
+
+        Catches ONLY urllib's HTTPError/URLError so unrelated exceptions (e.g. the GeneratorExit
+        raised into a closed :meth:`chat_stream`) propagate untouched."""
+        try:
+            yield
+        except urllib.error.HTTPError as exc:
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise ClientError(
+                f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
+                "check your network connection and FLASH_API_URL"
+            ) from exc
+
     def _request(
         self,
         method: str,
         path: str,
         body: dict | None = None,
         timeout: float | None = None,
+        progress: ProgressCallback | None = None,
     ) -> Any:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if progress is not None:
+            # Stream the body through a _ProgressReader with an explicit Content-Length so the
+            # request is sent as a plain (non-chunked) bytes body the server reads exactly, while
+            # progress(sent, total) fires per chunk so the CLI can draw an upload bar.
+            payload = json.dumps(body).encode()
+            headers["Content-Length"] = str(len(payload))
+            data: Any = _ProgressReader(payload, progress)
+        else:
+            data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(
             f"{self.api_url}{path}",
             method=method,
-            data=json.dumps(body).encode() if body is not None else None,
+            data=data,
             headers=headers,
         )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
-                raw = resp.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
-            raise ApiError(exc.code, detail) from exc
-        except urllib.error.URLError as exc:
-            raise ClientError(
-                f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
-                "check your network connection and FLASH_API_URL"
-            ) from exc
-
-    def _post_with_progress(
-        self,
-        path: str,
-        body: dict,
-        *,
-        progress: ProgressCallback,
-        timeout: float,
-    ) -> Any:
-        """POST a JSON body while reporting upload progress (see :class:`_ProgressReader`).
-
-        Same error mapping as :meth:`_request`; kept separate because the body is a streaming
-        reader with an explicit Content-Length rather than a one-shot bytes payload."""
-        payload = json.dumps(body).encode()
-        headers = {"Content-Type": "application/json", "Content-Length": str(len(payload))}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        req = urllib.request.Request(
-            f"{self.api_url}{path}",
-            method="POST",
-            data=_ProgressReader(payload, progress),
-            headers=headers,
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
-            raise ApiError(exc.code, detail) from exc
-        except urllib.error.URLError as exc:
-            raise ClientError(
-                f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
-                "check your network connection and FLASH_API_URL"
-            ) from exc
+        with (
+            self._translate_http_errors(),
+            urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
+        ):
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
 
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
@@ -220,9 +206,7 @@ class ApiClient:
         ``progress(bytes_sent, total_bytes)`` fires for each, so the CLI can render an upload
         bar; otherwise the body is sent in one shot (the default, used off a TTY)."""
         body = {"name": name, "package_b64": package_b64}
-        if progress is None:
-            return self._request("POST", "/v1/envs", body=body, timeout=1800.0)
-        return self._post_with_progress("/v1/envs", body, progress=progress, timeout=1800.0)
+        return self._request("POST", "/v1/envs", body=body, timeout=1800.0, progress=progress)
 
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
@@ -365,30 +349,24 @@ class ApiClient:
             headers=headers,
         )
         decoder = codecs.getincrementaldecoder("utf-8")()
-        try:
-            with urllib.request.urlopen(req, timeout=30 * 60) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                if "application/json" in content_type:
-                    payload = json.loads(resp.read() or b"{}")
-                    content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
-                    if content:
-                        yield str(content)
-                    return
-                while raw := resp.read(1):
-                    chunk = decoder.decode(raw)
-                    if chunk:
-                        yield chunk
-                tail = decoder.decode(b"", final=True)
-                if tail:
-                    yield tail
-        except urllib.error.HTTPError as exc:
-            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
-            raise ApiError(exc.code, detail) from exc
-        except urllib.error.URLError as exc:
-            raise ClientError(
-                f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
-                "check your network connection and FLASH_API_URL"
-            ) from exc
+        with (
+            self._translate_http_errors(),
+            urllib.request.urlopen(req, timeout=30 * 60) as resp,
+        ):
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                payload = json.loads(resp.read() or b"{}")
+                content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+                if content:
+                    yield str(content)
+                return
+            while raw := resp.read(1):
+                chunk = decoder.decode(raw)
+                if chunk:
+                    yield chunk
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                yield tail
 
 
 def client_from_config(require_key: bool = True) -> ApiClient:

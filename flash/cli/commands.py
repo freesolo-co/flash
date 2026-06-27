@@ -518,12 +518,7 @@ def cmd_runs(args) -> int:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        remote = r.get("remote") or {}
-        # the remote handle knows what actually ran; the spec is the parse-time pick
-        provider = remote.get("provider") or (
-            "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
-        )
-        gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+        gpu, provider = render._run_where(spec, r.get("remote") or {})
         where = f"{gpu}@{provider}" if provider else gpu
         print(
             f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "

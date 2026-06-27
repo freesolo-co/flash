@@ -43,6 +43,16 @@ def owned_run(run_id: str, key: dict):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+def _require_bool(payload: dict, field: str, default: bool) -> bool:
+    """Read ``payload[field]`` as a real JSON boolean (``default`` when the field is missing), 400
+    otherwise. Never ``bool(...)`` a truthy non-bool — e.g. the string "false" would coerce to True
+    and silently flip the flag's meaning."""
+    value = payload.get(field, default)
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"{field} must be a boolean")
+    return value
+
+
 def _parse_spec(payload: dict, run_id: str) -> JobSpec:
     # Default to {} ONLY when the field is missing/None — never `or {}`, which would coerce a
     # falsy non-object (``""``/``0``/``[]``/``false``) to {} and bypass the type check below,

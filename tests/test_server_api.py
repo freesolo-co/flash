@@ -345,7 +345,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # Negative (401) -> cached with the SHORT negative TTL.
     now = time.time()
     assert auth_mod._freesolo_verify("neg") is False
-    neg_exp = auth_mod._verify_cache["neg"][1]
+    neg_exp = auth_mod._verify_cache["neg"][2]
     assert neg_exp <= now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
     # ...and definitely shorter than the long TTL.
     assert neg_exp < now + auth_mod._VERIFY_CACHE_TTL_S
@@ -355,7 +355,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     state["code"] = 200
     now = time.time()
     assert auth_mod._freesolo_verify("pos") is True
-    pos_exp = auth_mod._verify_cache["pos"][1]
+    pos_exp = auth_mod._verify_cache["pos"][2]
     assert pos_exp > now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
     assert pos_exp <= now + auth_mod._VERIFY_CACHE_TTL_S + 1
 
@@ -364,11 +364,11 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # expired while a same-age positive would still be live.
     auth_mod._verify_cache.clear()
     base = time.time()
-    auth_mod._verify_cache["neg"] = (False, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
-    auth_mod._verify_cache["pos"] = (True, base + auth_mod._VERIFY_CACHE_TTL_S)
+    auth_mod._verify_cache["neg"] = (False, {}, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
+    auth_mod._verify_cache["pos"] = (True, {}, base + auth_mod._VERIFY_CACHE_TTL_S)
     later = base + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1.0  # past neg TTL, well under pos TTL
-    assert auth_mod._verify_cache["neg"][1] <= later  # negative entry has expired
-    assert auth_mod._verify_cache["pos"][1] > later  # positive entry is still live
+    assert auth_mod._verify_cache["neg"][2] <= later  # negative entry has expired
+    assert auth_mod._verify_cache["pos"][2] > later  # positive entry is still live
 
 
 def test_freesolo_verify_rejects_oversized_token(monkeypatch):
@@ -466,7 +466,7 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
 
     # An already-expired entry must be removed on the next write (no longer reachable).
-    auth_mod._verify_cache["stale"] = (True, time.time() - 1)
+    auth_mod._verify_cache["stale"] = (True, {}, time.time() - 1)
     auth_mod._freesolo_verify("fresh-token")
     assert "stale" not in auth_mod._verify_cache
     assert "fresh-token" in auth_mod._verify_cache

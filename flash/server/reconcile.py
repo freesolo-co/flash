@@ -20,18 +20,20 @@ persisting every seed's resource id.
 from __future__ import annotations
 
 import contextlib
-import json
-import os
 import time
 import urllib.error
 import urllib.request
 
 from flash import runner
 from flash.providers.realized import realized_cost_for_remote
-from flash.server.auth import INTERNAL_KEY_ENV, freesolo_base_url
+from flash.server._internal_client import (
+    DEFAULT_TIMEOUT_S,
+    build_internal_request,
+    enabled,
+    internal_key,
+)
 
 _REPORT_PATH = "/api/billing/training-cost"
-_REPORT_TIMEOUT_S = 10.0
 # Provider billing lags; wait this long after a run goes terminal before pulling (so the
 # invoice has settled) and stop retrying once a run is older than the window.
 _SETTLE_SECONDS = 3600.0  # 1h
@@ -49,24 +51,19 @@ _RECONCILABLE_STATES = (runner.TERMINAL_STATES | {"deployed"}) - _FREE_TERMINAL_
 
 def reconcile_enabled() -> bool:
     """Reconciliation (and its reporting) is on only when the operator internal key is set."""
-    return bool(os.environ.get(INTERNAL_KEY_ENV))
+    return enabled()
 
 
 def _report(body: dict) -> bool:
     """POST realized cost to the backend with the internal key (Bearer). Best-effort: returns
     True on a 2xx, False on any failure (never raises). Mirrors ``billing._post_billing`` but
     swallows errors -- a metering report must never affect anything."""
-    key = os.environ.get(INTERNAL_KEY_ENV)
+    key = internal_key()
     if not key:
         return False
-    req = urllib.request.Request(
-        f"{freesolo_base_url()}{_REPORT_PATH}",
-        data=json.dumps(body).encode("utf-8"),
-        method="POST",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
+    req = build_internal_request(_REPORT_PATH, body, token=key)
     try:
-        with urllib.request.urlopen(req, timeout=_REPORT_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
             resp.read()
         return True
     except (urllib.error.URLError, OSError):
