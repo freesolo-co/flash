@@ -239,6 +239,12 @@ def run_sft():
         # instruction-tuning SFT: the model isn't graded on reproducing its own prompt, so the
         # gradient signal concentrates on the assistant turn it must learn to generate.
         "completion_only_loss": True,
+        # Keep our pre-tokenized ``completion_mask`` column alive for ALL paths. HF Trainer defaults
+        # remove_unused_columns=True, which prunes any column not in the model's forward signature —
+        # i.e. it would DROP completion_mask before collation, silently reverting the unpacked and
+        # TRL-bfd paths to full-transcript loss (only the flash-packing branches re-set this). Pin it
+        # False here so completion-only masking survives regardless of which path the run takes.
+        "remove_unused_columns": False,
         # Optimizer: 8-bit paged AdamW (int8 state paged to host RAM -> fits a smaller GPU).
         "optim": fused_optim_name(),
     }
@@ -333,12 +339,12 @@ def run_sft():
             print(f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)")
         _attn = "sdpa"
         cfg_kwargs["packing"] = False  # we own the packing; TRL must not also pack
-        # Hand TRL pre-tokenized, pre-packed rows + our collator: skip its dataset prep and stop the
-        # signature-based column pruning from dropping our seq_lengths column before collation.
+        # Hand TRL pre-tokenized, pre-packed rows + our collator: skip its dataset prep so TRL doesn't
+        # re-tokenize/re-pack them. (Column pruning is already disabled in the base config above, so
+        # our seq_lengths / completion_mask columns reach the collator.)
         _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
-        cfg_kwargs["remove_unused_columns"] = False
 
         # Reuse the single pre-tokenization (_pretok) — the SAME input_ids the unpacked path sees
         # (EOS-append parity, truncated to max_length) — and bin-pack into <= max_length blocks. The
@@ -392,7 +398,7 @@ def run_sft():
         _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
-        cfg_kwargs["remove_unused_columns"] = False
+        # (remove_unused_columns is disabled in the base config above, covering this path too.)
         # Reuse the single pre-tokenization (_pretok, same input_ids as the unpacked path), then pack;
         # the parallel completion_mask rides along so completion-only loss survives packing.
         _ids = [r["input_ids"] for r in _pretok]

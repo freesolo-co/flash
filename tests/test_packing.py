@@ -449,14 +449,15 @@ def test_build_completion_mask_robust_to_divergent_prompt_suffix():
     assert mask == [0, 0, 0, 1, 1, 1]  # diverges at idx 3 -> only the shared AB prompt is masked
 
 
-def test_build_completion_mask_keeps_at_least_one_completion_token():
-    # Degenerate: the prompt render covers the WHOLE row (no completion). Never mask everything —
-    # keep >=1 trained token so the step has a gradient.
+def test_build_completion_mask_all_prompt_masks_everything():
+    # Degenerate: max_length truncation left the WHOLE row as prompt (no completion survived). The row
+    # is fully masked (all zeros) — NOT forced to keep the last PROMPT token as a trained target, which
+    # would teach the model to reproduce prompt text. A fully-masked row is a loss no-op instead.
     tok = _FakeTok(eos="!")
     full = tokenize_for_packing(["AB"], tok, max_length=100)[0]  # [1, A, B, !]
     mask = build_completion_mask("AB!", full, tok, max_length=100)  # prompt == full
-    assert mask == [0, 0, 0, 1]
-    assert sum(mask) >= 1
+    assert mask == [0, 0, 0, 0]
+    assert sum(mask) == 0  # no token trained on -> the example contributes no (prompt) loss
 
 
 def test_build_completion_mask_empty_full():
@@ -498,6 +499,13 @@ def test_pack_rejects_mismatched_mask_count():
         pack_token_ids([[1, 2], [3, 4]], max_length=8, completion_masks=[[0, 1]])
 
 
+def test_pack_rejects_mismatched_mask_length():
+    # Each mask must align 1:1 with ITS sequence (not just have the right count): a shorter/longer mask
+    # would desync from input_ids after truncation, masking the wrong tokens. Reject it up front.
+    with pytest.raises(ValueError, match="match its sequence length"):
+        pack_token_ids([[1, 2, 3]], max_length=8, completion_masks=[[0, 1]])  # len 2 != 3
+
+
 def test_pack_without_masks_omits_column():
     # Back-compat: no completion_masks -> rows have no "completion_mask" key (collator stays in its
     # original first-token/pad-only masking mode).
@@ -520,6 +528,24 @@ def test_collator_completion_mask_optional():
     col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)
     batch = col([{"input_ids": [5, 6, 7, 8], "seq_lengths": [4]}])
     assert batch["labels"][0].tolist() == [-100, 6, 7, 8]
+
+
+def test_collator_mixed_batch_keeps_unmasked_row_full_loss():
+    # In a MIXED batch (one row carries a completion_mask, one does not), the row WITHOUT a mask keeps
+    # full-transcript loss (only its first/pad tokens ignored) — it must NOT be silently zeroed to all
+    # -100 just because a sibling row in the batch carried a completion_mask.
+    torch = pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0, pad_to_multiple_of=1)
+    batch = col(
+        [
+            {"input_ids": [5, 6, 7, 8], "seq_lengths": [4], "completion_mask": [0, 0, 1, 1]},
+            {"input_ids": [9, 10, 11, 12], "seq_lengths": [4]},  # no mask -> full-transcript
+        ]
+    )
+    # masked row: first token + the 2nd prompt token ignored
+    assert batch["labels"][0].tolist() == [-100, -100, 7, 8]
+    # unmasked row: ONLY the first token ignored (full-transcript), not all -100
+    assert batch["labels"][1].tolist() == [-100, 10, 11, 12]
 
 
 def test_packed_completion_loss_matches_unpacked():

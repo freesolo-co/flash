@@ -215,6 +215,16 @@ def pack_token_ids(
     if completion_masks is None:
         items = [(s[:max_length], None) for s in sequences if s]
     else:
+        # Each SURVIVING (non-empty) mask must align 1:1 with its (pre-truncation) sequence — otherwise
+        # the lockstep ``m[:max_length]`` truncation below would leave a packed row whose
+        # completion_mask is misaligned with its input_ids, silently masking (or training on) the WRONG
+        # tokens. Validate up front so a caller bug fails loud here instead of corrupting the loss
+        # target. Empty sequences are dropped below regardless, so their mask length is irrelevant.
+        for s, m in zip(sequences, completion_masks, strict=True):
+            if s and len(m) != len(s):
+                raise ValueError(
+                    f"each completion_mask must match its sequence length: {len(m)} != {len(s)}"
+                )
         items = [
             (s[:max_length], m[:max_length])
             for s, m in zip(sequences, completion_masks, strict=True)
@@ -305,7 +315,16 @@ def build_completion_mask(
         if a != b:
             break
         n += 1
-    n = max(0, min(n, n_full - 1))  # keep at least one completion token to train on
+    if n >= n_full:
+        # max_length truncation removed the ENTIRE completion: the full row is all prompt (its tokens
+        # are a prefix of, or equal to, the prompt). Mask the WHOLE row — a row that contributes no
+        # loss is correct here. The old ``min(n, n_full - 1)`` clamp instead forced the last PROMPT
+        # token to be a trainable "completion" target, training the model to reproduce prompt text for
+        # long-prompt examples where nothing survived. A packed bin still trains on its OTHER examples;
+        # an unpacked all-prompt row simply becomes a no-op (all labels -100).
+        return [0] * n_full
+    # A real completion survived truncation: mask the shared prompt prefix, train on the rest (the
+    # ``n < n_full`` guarantees at least one completion token).
     return [0] * n + [1] * (n_full - n)
 
 
@@ -423,6 +442,12 @@ class BlockDiagonalCollator:
                 if cm:
                     cm = cm[:total]
                     keep[b, : len(cm)] = torch.tensor([bool(x) for x in cm], dtype=torch.bool)
+                else:
+                    # A row WITHOUT a completion_mask in a mixed batch keeps ALL its tokens (full-
+                    # transcript loss), rather than being silently zeroed out. Pad/boundary tokens were
+                    # already set to -100 above and keep=True can't un-mask them (``labels[~keep]`` only
+                    # ADDS masking), so this just avoids dropping the loss for an unmasked row.
+                    keep[b, :] = True
             labels[~keep] = self.label_pad_token_id
 
         batch = {
