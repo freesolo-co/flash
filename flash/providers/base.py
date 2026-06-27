@@ -76,8 +76,9 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     # RTX 4000 Ada) were dropped — the 24 GB classes below are the smallest managed cards.
     # (RTX 3090 was removed from the catalog — see git history.)
     # Lambda-only 24 GB Ampere datacenter card (RunPod has no A10). Instance-based capacity
-    # complement: chosen by the allocator only when the cheaper RunPod 24 GB classes are out of
-    # capacity, so it never undercuts RunPod on price.
+    # complement: the price-sorted allocator only reaches it once every cheaper FITTING RunPod class is
+    # out of capacity — not just the 24 GB tiers but e.g. the $0.49 48 GB RTX A6000 — so it never
+    # undercuts RunPod on price.
     # Live-validated 2026-06-27: Qwen3.5-0.8B SFT train smoke (Lambda gpu_1x_a10, us-east-1).
     GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
     # Live-validated 2026-06-22: Qwen3.5-0.8B/9B SFT+GRPO train smokes (RunPod). The 48 GB tier that
