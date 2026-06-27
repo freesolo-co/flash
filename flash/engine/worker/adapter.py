@@ -159,7 +159,7 @@ def _init_adapter_model(model_id: str):
         del base, model, merged
         gc.collect()
         print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
-        return merged_dir, make_lora(model_id)
+        return merged_dir, make_lora(merged_dir)
 
     # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
     # so keep it — TRL trains the LOADED adapter (peft_config=None).
