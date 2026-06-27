@@ -15,7 +15,10 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from flash._logging import get_logger
 from flash.providers._http import RestClient, is_not_found
+
+logger = get_logger(__name__)
 
 VAST_BASE = "https://console.vast.ai/api"
 
@@ -205,11 +208,28 @@ def list_instances() -> list[dict]:
     # unseen orphan bills forever. Walk every page until next_token is exhausted.
     instances: list[dict] = []
     after_token: str | None = None
-    for _ in range(200):  # runaway guard: 200 pages x 25 = 5000 instances, far beyond any real account
+    for page_no in range(200):  # runaway guard: 200 pages x 25 = 5000 instances, beyond any real account
         path = "/v1/instances/"
         if after_token:
             path += f"?after_token={urllib.parse.quote(str(after_token))}"
-        out = request_with_retries(path)
+        try:
+            out = request_with_retries(path)
+        except Exception:
+            # A LATER page failed after earlier pages succeeded: return what we already have rather than
+            # discarding it. A partial list is safe for every consumer — destroy_run_instances /
+            # sweep_orphans only act on instances they SEE (guarded per-instance by the active/known
+            # sets), and _adopt_instance_by_label missing a target leads to destroy-by-label + abort,
+            # never a double-provision; the next sweep retries the unfetched pages. If the FIRST page
+            # failed we have nothing useful -> re-raise so callers' existing try/except treats a total
+            # listing outage exactly as before (skip the sweep).
+            if instances:
+                logger.warning(
+                    "vast instance listing truncated at page %d (using %d instance(s) collected so far)",
+                    page_no,
+                    len(instances),
+                )
+                return instances
+            raise
         if not isinstance(out, dict):
             break
         page = out.get("instances")

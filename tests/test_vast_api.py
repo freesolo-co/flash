@@ -256,3 +256,22 @@ def test_list_instances_paginates_every_page(monkeypatch):
     assert len(calls) == 2  # stopped once next_token went null
     assert calls[0][1].endswith("/v1/instances/")  # page 1 is the bare path
     assert "after_token=tok2" in calls[1][1]  # page 2 carries the cursor
+
+
+def test_list_instances_returns_partial_on_later_page_error(monkeypatch):
+    """Cursor MsaAk: a LATER page failing must not discard pages already fetched — adoption/teardown/
+    sweep should still act on what we saw (a single-page list would have). A FIRST-page failure has
+    nothing useful, so it re-raises and the callers' existing try/except skips, exactly as before."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    # page 1 ok, page 2 errors after exhausting retries -> partial list of page 1
+    _capture_urlopen(
+        monkeypatch,
+        [{"instances": [{"id": 1}], "next_token": "tok2"}] + [_http_error(500)] * 5,
+    )
+    assert [i["id"] for i in vast_api.list_instances()] == [1]
+    # first page errors -> nothing collected -> propagates (callers catch and skip)
+    _capture_urlopen(monkeypatch, [_http_error(500)] * 5)
+    with pytest.raises(vast_api.VastApiError):
+        vast_api.list_instances()
