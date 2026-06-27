@@ -95,14 +95,25 @@ _LM_SYNC_REMAP_ON = {"on": False}
 def _remap_vl_sync_weights(weights):
     """Rewrite TRL's trainer weight names to vLLM's VL-engine names for the train-time sync.
 
-    The trainer (built via ``AutoModelForCausalLM``) names its LM params ``model.layers.*`` /
-    ``model.norm`` / ``model.embed_tokens`` / ``lm_head.*``; the colocated vLLM engine loaded the
-    same checkpoint as ``Qwen3_5ForConditionalGeneration`` whose LM params live under
-    ``language_model.*``. Prefix incoming ``model.``/``lm_head.`` names with ``language_model.`` so
-    they resolve. Also tolerate a peft ``base_model.model.`` prefix (a merged-adapter sync can yield
-    base-model names through that wrapper) by stripping it before the language_model. prefix is
-    added. Names that already start with ``language_model.`` (or anything else) pass through
-    untouched. A generator so vLLM's loader still streams one (name, tensor) at a time.
+    The trainer (built via ``AutoModelForCausalLM``) names its LM params under ``model.*`` while the
+    colocated vLLM engine loaded the same checkpoint as ``Qwen3_5ForConditionalGeneration`` whose LM
+    params live under ``language_model.*``. Each incoming ``(name, tensor)`` is remapped per the form
+    the trainer's checkpoint class produced:
+
+    - peft wrapper: a ``base_model.model.`` prefix (a continued/merged-adapter sync surfacing
+      base-model names through the PeftModel wrapper) is STRIPPED first, so the rules below apply to
+      the unwrapped name.
+    - multimodal-named trainer (``model.language_model.*`` / ``model.visual.*`` / ``lm_head.*`` — what
+      ``AutoModelForCausalLM`` yields when it resolves the FULL ``*ForConditionalGeneration``, e.g. the
+      Qwen3.6-35B-A3B MoE): passed through UNTOUCHED, because vLLM's own ``hf_to_vllm_mapper`` already
+      maps these. Prepending ``language_model.`` here would double the prefix and crash the fused-MoE
+      expert lookup (see the inline comment).
+    - text-only dense trainer (bare ``model.*`` — the dense Qwen3.5 family's ``Qwen3_5ForCausalLM``,
+      no infix, no vision tower): prefixed with ``language_model.`` so it lands under
+      ``language_model.model.*``.
+    - anything already ``language_model.*`` (or otherwise unmatched): passed through untouched.
+
+    A generator so vLLM's loader still streams one (name, tensor) at a time.
     """
     for name, tensor in weights:
         # A continued-adapter (PeftModel) sync can surface names through the peft wrapper as
