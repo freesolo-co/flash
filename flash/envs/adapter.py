@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -282,11 +283,35 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     return data
 
 
+class _LimitedReader:
+    """Bounds total bytes read from a *decompressed* tar stream so a GNU LONGNAME/PAX header payload —
+    consumed inside ``tarfile.next()`` before any member is yielded, hence invisible to per-member size
+    accounting — can't allocate gigabytes and OOM the worker. Reads clamp to the remaining budget."""
+
+    def __init__(self, raw, limit: int):
+        self._raw = raw
+        self._remaining = limit
+
+    def read(self, size: int = -1) -> bytes:
+        want = self._remaining + 1 if size is None or size < 0 else min(size, self._remaining + 1)
+        chunk = self._raw.read(want)
+        self._remaining -= len(chunk)
+        if self._remaining < 0:
+            raise RuntimeError(
+                f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
+            )
+        return chunk
+
+
 def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
     root = dest.resolve()
     top_dirs: set[str] = set()
     total = 0
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+    # Stream backstop > the per-member content cap by the max header+padding overhead (<=1KB/member),
+    # so it never false-rejects a legitimate archive but still bounds an oversized header payload.
+    stream_cap = _MAX_ARCHIVE_BYTES + _MAX_ARCHIVE_MEMBERS * 1024 + (1 << 20)
+    reader = _LimitedReader(gzip.GzipFile(fileobj=io.BytesIO(tar_bytes)), stream_cap)
+    with tarfile.open(fileobj=reader, mode="r|") as tar:
         for count, member in enumerate(tar, start=1):
             if count > _MAX_ARCHIVE_MEMBERS:
                 raise RuntimeError(

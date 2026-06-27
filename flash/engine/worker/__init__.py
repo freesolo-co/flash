@@ -221,20 +221,30 @@ def main():
             if done:
                 print("Run already complete (DONE present); returning persisted metrics.")
                 heartbeat("already_done", gpu=gpu_diagnostics(include_torch=False))
-                try:
-                    got = hf_hub_download(
-                        repo_id=HF_REPO,
-                        repo_type="dataset",
-                        filename=f"{hf_prefix()}/metrics.json",
-                        token=os.environ.get("HF_TOKEN"),
-                    )
-                    import shutil
+                # DONE is written only AFTER metrics.json uploads (required=True), so a failed read here
+                # is a transient HF blip, never a missing file. Retry, then signal RETRIABLE (reschedule)
+                # rather than SystemExit — a BaseException that bypasses the retriable-stamping handler
+                # below and would report a genuinely-succeeded run as a fatal failure.
+                last_err: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        got = hf_hub_download(
+                            repo_id=HF_REPO,
+                            repo_type="dataset",
+                            filename=f"{hf_prefix()}/metrics.json",
+                            token=os.environ.get("HF_TOKEN"),
+                        )
+                        import shutil
 
-                    shutil.copy(got, "/tmp/metrics.json")
-                    sys.stdout.flush()
-                    os._exit(0)
-                except Exception as e:
-                    raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
+                        shutil.copy(got, "/tmp/metrics.json")
+                        sys.stdout.flush()
+                        os._exit(0)
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(5 * (attempt + 1))
+                raise RetriableInfraError(
+                    f"DONE present but metrics.json unreadable after retries (transient HF): {last_err}"
+                )
         _ensure_fla_fastpath_on_hopper()
         # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
         _neutralize_tilelang_cudart_stub()
