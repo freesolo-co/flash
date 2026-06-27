@@ -46,15 +46,16 @@ _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr, far under the 128/hr cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
 
-# Serializes heartbeat.json writes and _HB_LAST_UPLOAD reads/updates. During GRPO,
-# heartbeat() is called concurrently from the trainer thread (reward callback) and the
-# checkpoint-upload daemon thread; without this lock two writers can interleave and
-# truncate/garble heartbeat.json (and race _HB_LAST_UPLOAD).
+# Guards the throttle bookkeeping — _HB_LAST_UPLOAD and the _HB_CLAIM_SEQ slot-claim counter — which
+# heartbeat() reads/updates concurrently from the trainer thread (reward callback) and the
+# checkpoint-upload daemon thread. There is NO shared worker-local heartbeat.json: each commit writes
+# its OWN per-call temp file and uploads that to HF, so this lock protects the shared throttle STATE,
+# not a file. The slow HF commit itself runs OUTSIDE this lock (see _HB_UPLOAD_LOCK).
 _HB_LOCK = threading.Lock()
-# Serializes the actual HF upload (a slow network commit) SEPARATELY from _HB_LOCK so the
-# trainer's frequent local writes never block on the network. Without it, two heartbeat
-# threads can upload heartbeat.json concurrently: a slower upload could land AFTER a newer
-# one on HF (reorder), so this lock makes uploads strictly ordered.
+# Serializes the actual HF commit of heartbeat.json (a slow network upload) SEPARATELY from _HB_LOCK so
+# the trainer's frequent throttle updates never block on the network. Without it, two heartbeat threads
+# could commit to HF concurrently and a slower upload land AFTER a newer one (reorder); this lock makes
+# the HF commits strictly ordered. Each thread uploads its own captured per-call temp file.
 _HB_UPLOAD_LOCK = threading.Lock()
 # Acquire the upload lock with a BOUND: hf upload has no hard timeout, so a wedged upload could hold
 # the lock and block the next heartbeat. Past the bound we skip the best-effort commit and roll the
@@ -72,11 +73,13 @@ _HB_CLAIM_SEQ = 0
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
 
-# When a liveness daemon concludes its phase is wedged (progress stalled past its bound), dump every
-# thread's stack for a root-cause trace, then stop pinging and let the PROVIDER's stall detection (it
-# reads the HF heartbeats; their absence trips it) do the kill + retry. The dump goes to stderr, which
-# the parent tees into console_<phase>.txt and the platform captures in the pod log. No separate
-# re-armed watchdog: the dump fires on EVIDENCE of a stall, not a fixed timer.
+# When a liveness daemon concludes its phase is wedged (no REAL progress past its bound), dump every
+# thread's stack ONCE for a root-cause trace. The daemon then KEEPS emitting liveness pings, but the
+# PROVIDER does the kill + retry: it ignores liveness pings (surface_heartbeat) and stalls on the
+# absence of REAL (non-liveness) progress heartbeats, so a wedged phase that only emits liveness still
+# trips it. The dump goes to stderr, which the parent tees into console_<phase>.txt and the platform
+# captures in the pod log. No separate re-armed watchdog: the dump fires on EVIDENCE of a stall (the
+# ``dumped`` latch keeps it to one dump), not a fixed timer.
 def _dump_thread_stacks(reason: str) -> None:
     with contextlib.suppress(Exception):
         # Print the header to STDERR (not stdout) so it stays co-located with faulthandler's traceback

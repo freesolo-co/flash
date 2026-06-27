@@ -276,13 +276,15 @@ def _record_heartbeat(hb: dict) -> None:
 #   tens of GB) -> sft_model_load/rl_train_start -> sft_initializing/rl_initializing (vLLM build +
 #   *Trainer.__init__) -> [dataset render/tokenize over the full -- possibly uncapped -- dataset,
 #   silent] -> first sft_step/rl_step (training has actually begun).
-# This set is specifically the COLD-START timeline above — it is what the first per-step
-# sft_step/rl_step heartbeat flips OUT of (later non-setup stages like *_trained/done are irrelevant:
-# the run is past stall detection by then). The prefetch + init pings were added so a long-but-LIVE
-# cold start keeps re-arming liveness, but they are still setup: omitting them here would latch the
-# poller into the training stall the moment the first one lands, then false-kill a healthy run whose
-# silent dataset tokenization outlives that tighter window. Canonical here so all three providers
-# (runpod / lambdalabs / hyperstack) share ONE definition.
+# This set is specifically the COLD-START timeline above — it is what the first COMPLETED-step
+# sft_step/rl_step heartbeat flips OUT of into the tight training window. The POST-training stages
+# (*_trained / *_train_done / metrics) are non-setup too and ALSO tighten the window (see
+# STEP_GATED_STAGES) so a hung teardown / DONE upload is caught by the tight training stall, not the
+# wide setup grace. The prefetch + init pings were added so a long-but-LIVE cold start keeps re-arming
+# liveness, but they are still setup: omitting them here would latch the poller into the training stall
+# the moment the first one lands, then false-kill a healthy run whose silent dataset tokenization
+# outlives that tighter window. Canonical here so all three providers (runpod / lambdalabs /
+# hyperstack) share ONE definition.
 SETUP_HEARTBEAT_STAGES = frozenset(
     {
         "boot",
@@ -296,6 +298,40 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "rl_initializing",
     }
 )
+
+# The per-step TRAINING heartbeats. These are the ONLY stages gated on a COMPLETED step (step >= 1)
+# before they tighten the stall window from setup grace: the train-loop daemon / reward callback can
+# emit rl_step/sft_step at step=0 throughout the silent cold FIRST step (a cold rollout runs minutes
+# before global_step ticks to 1), and tightening there would false-kill a healthy cold start. Every
+# OTHER non-setup stage — the POST-training rl_trained / sft_trained / <phase>_train_done + metrics/
+# upload pings, which carry no step field — means training is finished, so they tighten the window
+# immediately (a hung teardown/DONE upload should fall under the tight window, not the wide setup
+# grace). Canonical here so runpod / lambdalabs share ONE definition.
+STEP_GATED_STAGES = frozenset({"rl_step", "sft_step"})
+
+
+def is_training_heartbeat(stage: str | None, step: Any) -> bool:
+    """Whether a just-surfaced heartbeat means cold-start setup is OVER — i.e. the poller should
+    tighten its stall detection from the wide ``setup_grace_s`` to the tight training window.
+
+    - a SETUP stage (``SETUP_HEARTBEAT_STAGES``) or no stage -> False (still the cold start).
+    - a per-step training ping (``STEP_GATED_STAGES``: rl_step/sft_step) -> True ONLY at a COMPLETED
+      step (``step >= 1``). The train-loop daemon / reward callback can emit step=0 throughout the
+      silent cold FIRST step (a cold vLLM rollout runs many minutes before global_step ticks to 1);
+      tightening there would false-kill a healthy cold start, so step=0 keeps the setup grace.
+    - any OTHER non-setup stage -> True. These are the POST-training stages (rl_trained / sft_trained /
+      ``<phase>_train_done`` + metrics/DONE), which carry no ``step`` field; training has FINISHED, so a
+      hung teardown/upload must fall under the tight window, not the wide setup grace.
+
+    ``step`` is coerced via ``_attempt_int`` (a malformed/missing/non-numeric step must never raise
+    inside the poll loop, where no local handler would abort it) and treated as 0. Shared by runpod and
+    lambdalabs so their setup-vs-training transition stays identical.
+    """
+    if not stage or stage in SETUP_HEARTBEAT_STAGES:
+        return False
+    if stage in STEP_GATED_STAGES:
+        return (_attempt_int(step) or 0) >= 1
+    return True
 
 
 def surface_heartbeat(

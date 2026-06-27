@@ -270,6 +270,30 @@ def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, 
 # --------------------------------------------------------------------------------------------
 # Provider: liveness pings must NOT count as progress (else a wedged worker pinging "alive" masks the
 # stall). surface_heartbeat — shared by every provider — returns no-advance for a liveness heartbeat.
+def test_is_training_heartbeat_gates_setup_vs_training():
+    from flash.providers._poll import is_training_heartbeat
+
+    # Setup stages (and a missing stage) never tighten — still the cold start.
+    assert is_training_heartbeat("rl_train_start", None) is False
+    assert is_training_heartbeat("sft_initializing", 5) is False
+    assert is_training_heartbeat(None, 9) is False
+    # The per-step training stages tighten ONLY at a COMPLETED step (>= 1); a step=0 gap-fill during
+    # the silent cold first step keeps setup grace.
+    assert is_training_heartbeat("rl_step", 0) is False
+    assert is_training_heartbeat("sft_step", 0) is False
+    assert is_training_heartbeat("rl_step", 1) is True
+    assert is_training_heartbeat("sft_step", 3) is True
+    # A malformed/missing step on a per-step stage is treated as 0 (must not raise) -> stays setup.
+    assert is_training_heartbeat("rl_step", None) is False
+    assert is_training_heartbeat("sft_step", "not-a-number") is False
+    # POST-training stages carry NO step but mean training is DONE -> tighten so a hung teardown/DONE
+    # upload falls under the tight window, not the wide setup grace (the MqsTh fix).
+    assert is_training_heartbeat("rl_trained", None) is True
+    assert is_training_heartbeat("sft_trained", None) is True
+    assert is_training_heartbeat("rl_train_done", None) is True
+    assert is_training_heartbeat("sft_train_done", None) is True
+
+
 def test_provider_surface_heartbeat_skips_liveness_pings():
     from flash.providers._poll import surface_heartbeat
 

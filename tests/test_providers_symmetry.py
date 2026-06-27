@@ -76,25 +76,32 @@ def test_method_signatures_match_runpod(provider):
 
 
 @pytest.mark.parametrize("provider", ["runpod", "lambda"])
-def test_setup_heartbeat_stages_are_the_one_canonical_set(provider):
+def test_setup_vs_training_gate_is_the_one_canonical_helper(provider):
     """Both poll loops (runpod, lambda) must draw the setup-vs-training stall boundary from the SAME
-    canonical SETUP_HEARTBEAT_STAGES in _poll (so a stage added in one place can't drift the others). It must
-    treat the cold-start pings — including model_prefetching / *_initializing — as SETUP (else the
-    poller latches into the tight training stall the moment one lands and false-kills a healthy run
-    whose silent dataset tokenization outlives it), while the per-step rl_step/sft_step are NOT
-    setup (they're what flips it to training)."""
-    from flash.providers._poll import SETUP_HEARTBEAT_STAGES
+    canonical is_training_heartbeat helper in _poll (so the rule can't drift between providers). The
+    helper keeps the cold-start pings — including model_prefetching / *_initializing — under the wide
+    setup grace, flips to the tight window only on a COMPLETED-step rl_step/sft_step, and also flips on
+    POST-training stages (so a hung teardown isn't left under setup grace)."""
+    from flash.providers._poll import (
+        SETUP_HEARTBEAT_STAGES,
+        STEP_GATED_STAGES,
+        is_training_heartbeat,
+    )
 
     jobs = importlib.import_module(f"flash.providers.{_PKG[provider]}.jobs")
-    # The provider must reference the shared object, not a private copy that can drift.
-    assert jobs.SETUP_HEARTBEAT_STAGES is SETUP_HEARTBEAT_STAGES
+    # The provider must reference the shared helper, not a private copy that can drift.
+    assert jobs.is_training_heartbeat is is_training_heartbeat
 
     # The slow cold-start pings must count as setup (kept under the wide setup grace).
     for stage in ("model_prefetching", "model_prefetched", "sft_initializing", "rl_initializing"):
         assert stage in SETUP_HEARTBEAT_STAGES, f"{stage} must be treated as setup, not training"
-    # Per-step training heartbeats must NOT be setup — they flip the poller to the tight window.
-    assert "rl_step" not in SETUP_HEARTBEAT_STAGES
-    assert "sft_step" not in SETUP_HEARTBEAT_STAGES
+        assert is_training_heartbeat(stage, 9) is False
+    # Per-step training heartbeats are step-gated: NOT setup, but only flip the window at step >= 1.
+    assert sorted(STEP_GATED_STAGES) == ["rl_step", "sft_step"]
+    assert is_training_heartbeat("rl_step", 0) is False  # cold first step keeps setup grace
+    assert is_training_heartbeat("rl_step", 1) is True
+    # Post-training stages flip to the tight window even without a step field.
+    assert is_training_heartbeat("sft_trained", None) is True
 
 
 def test_runpod_provider_implements_the_interface():
