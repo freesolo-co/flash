@@ -75,6 +75,35 @@ def test_method_signatures_match_runpod(provider):
         assert rs == os_, f"{meth} param mismatch: runpod={rs} {provider}={os_}"
 
 
+@pytest.mark.parametrize("provider", ["runpod", "lambda"])
+def test_setup_vs_training_gate_is_the_one_canonical_helper(provider):
+    """Both poll loops (runpod, lambda) must draw the setup-vs-training stall boundary from the SAME
+    canonical is_training_heartbeat helper in _poll (so the rule can't drift between providers). The
+    helper keeps the cold-start pings — including model_prefetching / *_initializing — under the wide
+    setup grace, flips to the tight window only on a COMPLETED-step rl_step/sft_step, and also flips on
+    POST-training stages (so a hung teardown isn't left under setup grace)."""
+    from flash.providers._poll import (
+        SETUP_HEARTBEAT_STAGES,
+        STEP_GATED_STAGES,
+        is_training_heartbeat,
+    )
+
+    jobs = importlib.import_module(f"flash.providers.{_PKG[provider]}.jobs")
+    # The provider must reference the shared helper, not a private copy that can drift.
+    assert jobs.is_training_heartbeat is is_training_heartbeat
+
+    # The slow cold-start pings must count as setup (kept under the wide setup grace).
+    for stage in ("model_prefetching", "model_prefetched", "sft_initializing", "rl_initializing"):
+        assert stage in SETUP_HEARTBEAT_STAGES, f"{stage} must be treated as setup, not training"
+        assert is_training_heartbeat(stage, 9) is False
+    # Per-step training heartbeats are step-gated: NOT setup, but only flip the window at step >= 1.
+    assert sorted(STEP_GATED_STAGES) == ["rl_step", "sft_step"]
+    assert is_training_heartbeat("rl_step", 0) is False  # cold first step keeps setup grace
+    assert is_training_heartbeat("rl_step", 1) is True
+    # Post-training stages flip to the tight window even without a step field.
+    assert is_training_heartbeat("sft_trained", None) is True
+
+
 def test_runpod_provider_implements_the_interface():
     from flash.providers import get_provider
     from flash.providers.base import Provider
