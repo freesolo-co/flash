@@ -137,6 +137,20 @@ def test_sweep_orphans_is_part_of_the_protocol():
     assert "sweep_orphans" in dir(Provider)
 
 
+def test_run_instances_remaining_is_optional_not_required_by_protocol():
+    # Copilot: run_instances_remaining is an OPTIONAL capability (Vast enumerates billable instances by
+    # run label; RunPod serverless self-reaps). It must NOT be on the @runtime_checkable Provider
+    # Protocol, or isinstance(runpod_provider, Provider) would go False and break the symmetry checks
+    # above. Vast implements it; RunPod does not; both still satisfy Provider. Detected via getattr.
+    from flash.providers import get_provider
+    from flash.providers.base import Provider
+
+    assert "run_instances_remaining" not in dir(Provider)  # not a required Protocol member
+    assert hasattr(get_provider("vast"), "run_instances_remaining")  # Vast provides the capability
+    assert not hasattr(get_provider("runpod"), "run_instances_remaining")  # RunPod opts out
+    assert isinstance(get_provider("runpod"), Provider)  # still a Provider despite opting out
+
+
 def test_static_pricing():
     pricing = importlib.import_module("flash.providers.runpod.pricing")
     assert pricing.hourly_rate("RTX 5090") == pytest.approx(0.99)

@@ -474,15 +474,15 @@ class Provider(Protocol):
         """Best-effort: reap any resource this run may have left registered."""
         ...
 
-    def run_instances_remaining(self, run_id: str) -> list[int]:
-        """Optional (instance providers): ids of billable resources STILL carrying this run's label,
-        after a ``gc``. Empty == CONFIRMED clear; non-empty == a possibly-live resource survives (e.g.
-        an unconfirmed teardown, or a phantom from a non-idempotent create). RAISES on a listing
-        failure so a caller can't mistake "couldn't list" for "clear". The handle-less recovery
-        resubmit uses this to require a confirmed reap before launching a second worker, because a
-        best-effort ``gc`` returns no error on an unconfirmed teardown. Providers without a
-        standing-billing substrate (RunPod) need not implement it."""
-        ...
+    # NOTE: ``run_instances_remaining(run_id) -> list[int]`` is an OPTIONAL capability, intentionally
+    # NOT declared on this ``@runtime_checkable`` Protocol — adding it would make it a REQUIRED member
+    # for ``isinstance(prov, Provider)``, which RunPod (serverless, self-reaping — nothing to enumerate)
+    # and Lambda do not implement. Instance providers that CAN enumerate billable resources by run
+    # label (Vast) implement it so the handle-less recovery resubmit can require a CONFIRMED reap before
+    # launching a second worker (a best-effort ``gc`` returns no error on an unconfirmed teardown).
+    # Callers detect it via ``getattr(prov, "run_instances_remaining", None)`` (see server/_runtime.py).
+    # Contract: ``[]`` == CONFIRMED no resource for the run remains; non-empty == a possibly-live one
+    # survives; RAISES on an incomplete enumeration so a caller can't mistake "couldn't list" for "clear".
 
     def sweep_orphans(
         self,
