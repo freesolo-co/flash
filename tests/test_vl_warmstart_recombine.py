@@ -24,12 +24,16 @@ from safetensors.torch import load_file, save_file
 
 from flash.engine.worker.lora import recombine_lora_adapters
 
-# Realistic Qwen3.5 VL adapter key stems (FULL multimodal model -> LM under language_model.).
+# Realistic Qwen3.5 VL adapter key stems. The SFT adapter is trained against the FULL multimodal
+# model, so its LM modules live under ``language_model.`` (MODULES). The fresh GRPO LoRA is saved by
+# the text-only AutoModelForCausalLM trainer, so the SAME modules have no infix (TEXT_MODULES). The
+# recombine must line these equivalent modules up (normalize the infix) and emit the text-only form.
 MODULES = [
     "base_model.model.model.language_model.layers.0.self_attn.q_proj",
     "base_model.model.model.language_model.layers.0.self_attn.v_proj",
     "base_model.model.model.language_model.layers.5.mlp.gate_proj",
 ]
+TEXT_MODULES = [m.replace(".language_model.", ".") for m in MODULES]
 
 
 def _write_adapter(adir: str, *, modules, r, alpha, in_f=8, out_f=6, use_rslora=False, seed=0,
@@ -84,8 +88,9 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
+    # Production forms: SFT keys carry the `.language_model.` infix; the GRPO LoRA is text-only.
     _write_adapter(sft, modules=MODULES, r=r_sft, alpha=a_sft, use_rslora=rs_sft, seed=1)
-    _write_adapter(grpo, modules=MODULES, r=r_grpo, alpha=a_grpo, use_rslora=rs_grpo, seed=2)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=r_grpo, alpha=a_grpo, use_rslora=rs_grpo, seed=2)
 
     rank = recombine_lora_adapters(sft, grpo, out)
     assert rank == r_sft + r_grpo
@@ -96,11 +101,37 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
     assert out_cfg["lora_alpha"] == r_sft + r_grpo
     assert out_cfg["use_rslora"] is False
 
-    # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base.
-    for m in MODULES:
-        want = _delta(sft, m) + _delta(grpo, m)
-        got = _delta(out, m)
-        assert torch.allclose(got, want, atol=1e-6, rtol=1e-5), f"{m}: recombine delta mismatch"
+    # Output is emitted in the text-only key form (the form serving deploys on the catalog base);
+    # no `.language_model.` infix survives.
+    out_sd = load_file(os.path.join(out, "adapter_model.safetensors"))
+    assert all(".language_model." not in k for k in out_sd), "recombined keys must be text-only"
+
+    # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base. SFT's
+    # infixed module maps to the text-only module the GRPO and output adapters use.
+    for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True):
+        want = _delta(sft, m_sft) + _delta(grpo, m_text)
+        got = _delta(out, m_text)
+        assert torch.allclose(got, want, atol=1e-6, rtol=1e-5), f"{m_text}: recombine delta mismatch"
+
+
+def test_recombine_normalizes_language_model_infix(tmp_path):
+    # Regression: the default Qwen3.5 VL warm-start saves an infixed SFT adapter and a text-only
+    # GRPO LoRA. The recombine must treat the equivalent LM modules as the SAME target (not raise
+    # "DIFFERENT modules") and emit text-only keys — otherwise it never publishes the recombined
+    # adapter for the main path.
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)  # infixed (full VL model)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)  # text-only (AutoModelForCausalLM)
+
+    rank = recombine_lora_adapters(sft, grpo, out)
+    assert rank == 8
+
+    out_sd = load_file(os.path.join(out, "adapter_model.safetensors"))
+    out_modules = {k.rsplit(".lora_", 1)[0] for k in out_sd}
+    assert out_modules == set(TEXT_MODULES), "recombined modules must be the normalized text-only set"
+    assert all(".language_model." not in k for k in out_sd)
 
 
 def test_recombine_rejects_mismatched_target_modules(tmp_path):
