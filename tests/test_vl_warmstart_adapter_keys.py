@@ -541,3 +541,41 @@ def test_e2e_warmstart_unfixed_fails_then_fixed_loads_nonzero(monkeypatch, tmp_p
     assert not any(".language_model." in k for k in _adapter_header_keys(dir_b))
     nonzero = _warmstart_load(cfg_b, dir_b, model_id)
     assert nonzero == 4  # 2 layers x {q_proj, v_proj}, every lora_B non-zero
+
+
+# ---------------------------------------------------------------------------
+# adapter_is_vl_warmstart: the VL merge gate keys off adapter EVIDENCE, not only the config probe
+# (Copilot MsAoq / Cursor MsATq — the #286 fragility applied to the #296 merge decision).
+# ---------------------------------------------------------------------------
+def test_adapter_is_vl_warmstart_trusts_adapter_evidence_over_failed_probe(monkeypatch, tmp_path):
+    from flash.engine.worker import lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    _write_safetensors(str(adir / "adapter_model.safetensors"), VL_KEYS)
+    # the config probe FAILED (returns False) for a genuine VL adapter — must still merge as VL
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
+    assert lora.adapter_is_vl_warmstart(str(adir), "some/model") is True
+
+
+def test_adapter_is_vl_warmstart_falls_back_to_probe_for_text_only(monkeypatch, tmp_path):
+    from flash.engine.worker import lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    _write_safetensors(str(adir / "adapter_model.safetensors"), CAUSAL_LM_KEYS)  # no language_model
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
+    assert lora.adapter_is_vl_warmstart(str(adir), "some/model") is False
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
+    assert lora.adapter_is_vl_warmstart(str(adir), "some/model") is True  # probe still authoritative
+
+
+def test_adapter_is_vl_warmstart_missing_file_defers_to_probe(monkeypatch, tmp_path):
+    from flash.engine.worker import lora
+
+    adir = tmp_path / "empty"
+    adir.mkdir()
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
+    assert lora.adapter_is_vl_warmstart(str(adir), "m") is True
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
+    assert lora.adapter_is_vl_warmstart(str(adir), "m") is False
