@@ -41,11 +41,17 @@ def evaluate_run(
     eval_rows: list[dict],
     train_rows: list[dict] | None = None,
     config: EvalConfig | None = None,
+    model_id: str | None = None,
     log=print,
 ) -> BenchResult:
-    """Deploy ``run_id``, score it on the paper's eval split, and return a ``BenchResult``."""
+    """Deploy ``run_id``, score it on the paper's eval split, and return a ``BenchResult``.
+
+    ``model_id`` is the catalog model actually trained — pass the gate/drive-resolved id so a
+    nearest-size *substitution* is reported faithfully; defaults to the manifest's ``flash_model``.
+    """
     cfg = config or EvalConfig()
     metric = case.metric
+    flash_model = model_id or case.flash_model
 
     subset = subsample(eval_rows, cfg.max_eval, seed=cfg.eval_seed)
     leak = leakage_check(train_rows or [], subset)
@@ -66,7 +72,7 @@ def evaluate_run(
         return BenchResult(
             case_id=case.id,
             state="invalid",
-            flash_model=case.flash_model,
+            flash_model=flash_model,
             run_id=run_id,
             paper_metric=metric.reported,
             diagnostics=diagnostics,
@@ -133,7 +139,7 @@ def evaluate_run(
     return BenchResult(
         case_id=case.id,
         state="scored",
-        flash_model=case.flash_model,
+        flash_model=flash_model,
         run_id=run_id,
         env_id=None,
         paper_metric=metric.reported,

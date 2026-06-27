@@ -53,13 +53,24 @@ def _load_local(path: Path) -> list[dict]:
     suffix = path.suffix.lower()
     if suffix == ".jsonl":
         rows = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
+        lineno = 0
+        # Stream line-by-line (no whole-file splitlines copy) and surface a malformed line as a
+        # clear DatasetUnavailable, per this module's error contract.
+        try:
+            with path.open(encoding="utf-8") as f:
+                for raw in f:
+                    lineno += 1
+                    line = raw.strip()
+                    if line:
+                        rows.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise DatasetUnavailable(f"malformed JSONL in {path} (line {lineno}): {exc}") from exc
         return rows
     if suffix == ".json":
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise DatasetUnavailable(f"malformed JSON in {path}: {exc}") from exc
         if isinstance(loaded, dict):
             return loaded.get("records") or loaded.get("data") or []
         return loaded if isinstance(loaded, list) else []
@@ -79,7 +90,10 @@ def _load_http(url: str) -> list[dict]:
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError:
-        return [json.loads(line) for line in text.splitlines() if line.strip()]
+        try:
+            return [json.loads(line) for line in text.splitlines() if line.strip()]
+        except json.JSONDecodeError as exc:
+            raise DatasetUnavailable(f"{url} is neither valid JSON nor JSONL: {exc}") from exc
     if isinstance(loaded, dict):
         return loaded.get("records") or loaded.get("data") or []
     return loaded if isinstance(loaded, list) else []

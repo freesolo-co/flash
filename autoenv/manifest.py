@@ -76,9 +76,9 @@ class DatasetRef:
     """Where the train rows and the held-out eval rows come from.
 
     ``train``/``eval`` are dataset refs resolved by ``autoenv.ingest.sources``: a local
-    ``.jsonl``/``.json`` path, an ``http(s)`` URL, a ``hf:<dataset_id>`` Hugging Face ref, or
-    a GitHub URL. ``input_field``/``output_field`` map the source columns onto Freesolo's
-    canonical ``input``/``output`` row keys.
+    ``.jsonl``/``.json`` path, an ``http(s)`` URL to JSON/JSONL, or a Hugging Face dataset
+    (``hf:<id>[:<config>]`` or a bare ``org/name``). ``input_field``/``output_field`` map the
+    source columns onto Freesolo's canonical ``input``/``output`` row keys.
     """
 
     train: str
@@ -109,7 +109,9 @@ class PaperMetric:
 
     ``name`` must be a key in ``autoenv.eval.metrics.METRICS``. ``reported`` is the paper's
     headline number; ``base_reported`` (optional) is the paper's untrained-baseline number,
-    used only as a sanity cross-check — the harness measures the base itself for scoring.
+    which the eval stage currently uses as the baseline for improvement-normalized scoring
+    (Flash serving is adapter-scoped, so there is no bare-base endpoint to measure yet —
+    independently measuring the base is a later milestone).
     """
 
     name: str

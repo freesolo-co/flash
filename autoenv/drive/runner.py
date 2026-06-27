@@ -122,14 +122,11 @@ def _submit_real(
     env_id = published.get("id") or published.get("env_id") or outcome.env_id
     base.env_id = env_id
 
-    # Re-pin the published env id into the config so the submitted spec references it.
-    cfg = Path(outcome.config_path)
-    cfg.write_text(
-        cfg.read_text(encoding="utf-8").replace(f'id = "{outcome.env_id}"', f'id = "{env_id}"'),
-        encoding="utf-8",
-    )
-    spec = spec_from_file(str(cfg))
-    created = client.create_run(spec.to_dict())
+    # Re-pin the published env id on the parsed spec (not via text replace on the config —
+    # that would silently no-op if the agent reformatted the [environment] id line).
+    spec_dict = spec_from_file(str(outcome.config_path)).to_dict()
+    spec_dict["environment"]["id"] = env_id
+    created = client.create_run(spec_dict)
     run_id = created.get("run_id") or created.get("id")
     base.run_id = run_id
 

@@ -14,6 +14,16 @@ the ``autoenv`` optional extra and are imported lazily, only on the paths that n
 
 from __future__ import annotations
 
+from importlib.metadata import version as _dist_version
+
+from flash._channel import DIST_NAME as _DIST_NAME
+
 __all__ = ["__version__"]
 
-__version__ = "0.0.1"
+# autoenv ships inside the `freesolo-flash` distribution; read the version from dist metadata
+# (the single source of truth in pyproject) rather than a hand-maintained literal that drifts —
+# the same desync guard flash/__init__.py uses. Falls back off the installed path (source tree).
+try:
+    __version__ = _dist_version(_DIST_NAME)
+except Exception:
+    __version__ = "0+unknown"

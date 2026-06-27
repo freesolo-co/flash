@@ -93,10 +93,18 @@ def _not_yet(stage: str) -> int:
 def cmd_eval(args) -> int:
     """Benchmark a completed run: deploy → infer over the eval split → improvement-normalized score."""
     from autoenv.eval.score import EvalConfig, evaluate_run
+    from autoenv.gate.model_match import resolve_flash_model
     from autoenv.ingest import fetch_rows
     from flash.client import client_from_config
 
     case = _load_case(args.case)
+    # Report the model actually trained (a non-catalog flash_model is substituted by the gate).
+    try:
+        model_id = resolve_flash_model(
+            case.flash_model, case.base_model_paper, case.algorithm
+        ).model_id
+    except ValueError:
+        model_id = case.flash_model
     eval_rows = fetch_rows(
         case.resolved_eval(),
         split=case.dataset.eval_split,
@@ -118,6 +126,7 @@ def cmd_eval(args) -> int:
         eval_rows=eval_rows,
         train_rows=train_rows,
         config=EvalConfig(max_eval=args.max_eval, max_tokens=args.max_tokens),
+        model_id=model_id,
     )
     print(result.summary())
     out = args.out or f"autoenv-runs/{case.id}-result.json"

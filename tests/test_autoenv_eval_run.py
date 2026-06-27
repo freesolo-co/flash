@@ -106,6 +106,23 @@ def test_evaluate_run_flags_leakage_and_skips_score():
     assert not client.deployed  # never deployed a leaked eval
 
 
+def test_evaluate_run_reports_substituted_model():
+    case = PaperCase.load(SMOKE_CASE)
+    rows = _eval_rows(case)
+    client = FakeClient({r["input"]: r["output"] for r in rows})
+    result = evaluate_run(
+        case,
+        "r",
+        client=client,
+        eval_rows=rows,
+        train_rows=[],
+        config=EvalConfig(max_eval=len(rows)),
+        model_id="Qwen/Qwen3.5-4B",
+    )
+    # The resolved/substituted model is reported, not the manifest's flash_model.
+    assert result.flash_model == "Qwen/Qwen3.5-4B"
+
+
 def test_evaluate_run_without_base_reported_skips_normalization():
     case = PaperCase.load(SMOKE_CASE)
     case = dataclasses.replace(case, metric=dataclasses.replace(case.metric, base_reported=None))

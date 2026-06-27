@@ -37,3 +37,10 @@ def test_unsupported_scheme_raises_clear_error(ref):
 def test_missing_local_file_raises():
     with pytest.raises(DatasetUnavailable, match="not found"):
         fetch_rows("/no/such/dataset.jsonl")
+
+
+def test_malformed_jsonl_raises_dataset_unavailable(tmp_path):
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text('{"input": "ok", "output": "1"}\nnot json at all\n', encoding="utf-8")
+    with pytest.raises(DatasetUnavailable, match="malformed JSONL"):
+        fetch_rows(str(bad))
