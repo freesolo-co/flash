@@ -1,0 +1,28 @@
+# A self-contained, offline-gateable smoke case (NOT a real paper — a wiring/dev fixture).
+#
+# Easy mode: the reward is supplied (reward_libs/numeric_match.py) and frozen, so this case
+# exercises the agent's ability to build the env + train, not to design a reward. The dataset
+# is bundled locally so `autoenv gate` and `autoenv run --dry-run` work fully offline.
+id = "arithmetic-smoke-sft"
+goal = "Train the model to solve one-step grade-school arithmetic word problems and state the final numeric answer (e.g. 'The answer is 7')."
+paper_url = ""
+base_model_paper = "Qwen2.5-0.5B"
+flash_model = "Qwen/Qwen3.5-0.8B"
+algorithm = "sft"
+difficulty = "easy"
+supplied_reward_path = "reward_libs/numeric_match.py"
+max_usd = 2.0
+max_train_steps = 20
+notes = "Smoke fixture for the autoenv loop; cheapest catalog model, tiny capped SFT run."
+
+[dataset]
+train = "data/arithmetic_smoke_train.jsonl"
+eval = "data/arithmetic_smoke_eval.jsonl"
+input_field = "input"
+output_field = "output"
+
+[metric]
+name = "numeric_match"
+reported = 0.85
+higher_is_better = true
+base_reported = 0.30

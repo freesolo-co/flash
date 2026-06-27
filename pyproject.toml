@@ -66,6 +66,16 @@ server = [
     "datasets>=2.19",
     "freesolo>=0.2.49",
 ]
+# autoenv: the paper-replication benchmark harness (top-level `autoenv/` package, `autoenv` CLI).
+# It imports flash.* one-directionally and adds NO deps to the base client. Local eval/scoring and
+# dataset fetch need the Freesolo env scorer + HF datasets, so they live here behind this extra and
+# are imported lazily (only on the paths that touch them) — `autoenv gate`/`drive --dry-run` stay
+# offline and need none of it.
+autoenv = [
+    "freesolo>=0.2.49",
+    "huggingface-hub>=0.34",
+    "datasets>=2.19",
+]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
     "mypy>=1.13.0",
@@ -91,15 +101,25 @@ flash = "flash.cli:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
 flash-server = "flash.server.__main__:main"
+# The paper-replication benchmark harness. Its own console script (NOT a `flash` subcommand —
+# Flash's parser is part of its agent-CLI contract). Heavy paths need the `autoenv` extra.
+autoenv = "autoenv.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["flash"]
-# Ship the PEP 561 marker so downstream type checkers pick up Flash's type hints.
-artifacts = ["flash/py.typed"]
+packages = ["flash", "autoenv"]
+# Ship the PEP 561 marker so downstream type checkers pick up Flash's type hints, plus the
+# autoenv benchmark case fixtures (manifests, bundled datasets, supplied reward modules) that
+# `autoenv` reads at runtime.
+artifacts = [
+    "flash/py.typed",
+    "autoenv/cases/**/*.toml",
+    "autoenv/cases/**/*.jsonl",
+    "autoenv/cases/**/*.py",
+]
 
 [tool.flash-dev]
 # Version of the dev-channel package `freesolo-flash-dev` (the `flash-dev` CLI, which defaults to

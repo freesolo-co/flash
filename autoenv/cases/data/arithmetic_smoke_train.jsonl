@@ -1,0 +1,16 @@
+{"input": "Liam has 3 apples and buys 4 more. How many apples does he have now?", "output": "He has 7 apples. The answer is 7."}
+{"input": "A box holds 6 pencils. How many pencils are in 5 boxes?", "output": "5 times 6 is 30. The answer is 30."}
+{"input": "Maya read 12 pages on Monday and 9 pages on Tuesday. How many pages total?", "output": "12 plus 9 is 21. The answer is 21."}
+{"input": "There are 20 students and 4 leave. How many remain?", "output": "20 minus 4 is 16. The answer is 16."}
+{"input": "A baker makes 8 muffins per tray. How many muffins in 3 trays?", "output": "8 times 3 is 24. The answer is 24."}
+{"input": "Sam saved $5 each week for 6 weeks. How much did he save?", "output": "5 times 6 is 30. The answer is 30."}
+{"input": "A ribbon is 15 cm long. It is cut into 3 equal pieces. How long is each piece?", "output": "15 divided by 3 is 5. The answer is 5."}
+{"input": "Nora has 9 marbles and finds 7 more. How many marbles now?", "output": "9 plus 7 is 16. The answer is 16."}
+{"input": "A bus carries 40 people. 13 get off. How many are left?", "output": "40 minus 13 is 27. The answer is 27."}
+{"input": "Each crate has 7 oranges. How many oranges in 8 crates?", "output": "7 times 8 is 56. The answer is 56."}
+{"input": "Ava had 18 stickers and gave away 6. How many does she have left?", "output": "18 minus 6 is 12. The answer is 12."}
+{"input": "A garden has 4 rows of 9 flowers. How many flowers in total?", "output": "4 times 9 is 36. The answer is 36."}
+{"input": "Tom walked 3 km each day for 5 days. How far did he walk?", "output": "3 times 5 is 15. The answer is 15."}
+{"input": "There are 25 cookies shared equally among 5 children. How many each?", "output": "25 divided by 5 is 5. The answer is 5."}
+{"input": "A theater has 11 rows of 10 seats. How many seats total?", "output": "11 times 10 is 110. The answer is 110."}
+{"input": "Jack had 50 cents and spent 35 cents. How much is left?", "output": "50 minus 35 is 15. The answer is 15."}
