@@ -17,6 +17,7 @@ import contextlib
 import faulthandler
 import json
 import os
+import sys
 import threading
 import time
 
@@ -25,14 +26,18 @@ from flash.engine.worker.perf import gpu_diagnostics
 
 # High-frequency stages whose HF UPLOAD is throttled to _HB_MIN_INTERVAL_S. Two kinds are
 # high-frequency:
-#   - "rl_step": the per-step training heartbeat (reward callback fires every optimizer step).
+#   - the per-step TRAINING heartbeats "rl_step" / "sft_step": the reward/SFT log callbacks fire
+#     ~every optimizer step, and the train-loop liveness daemon (liveness_heartbeat) re-emits the
+#     SAME stage every _LIVENESS_TICK_S through a slow step. BOTH must be throttled or an SFT run can
+#     blow the commit cap (liveness ~every 30s => ~120/hr by itself, plus the log callback) — the
+#     same reason rl_step is throttled. They share one _HB_LAST_UPLOAD slot so the total stays capped.
 #   - the periodic setup pings ("model_prefetching", "sft_initializing", "rl_initializing"): each
 #     runs on a side thread every 30s through a long phase (a cold snapshot_download can pull tens
 #     of GB for ~40 min => ~80 commits, and disaggregated workers share one HF_REPO), so committing
 #     every 30s risks the repo commit cap _HB_MIN_INTERVAL_S exists to avoid, so we throttle the
 #     UPLOAD to hold commits well under the 128/hr cap. Terminal transitions are never throttled.
 _HB_THROTTLED_STAGES = frozenset(
-    {"rl_step", "model_prefetching", "sft_initializing", "rl_initializing"}
+    {"rl_step", "sft_step", "model_prefetching", "sft_initializing", "rl_initializing"}
 )
 # Terminal transitions the control plane must never miss — always committed.
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
@@ -74,7 +79,14 @@ _SFT_HEARTBEAT_INTERVAL_S = 60.0
 # re-armed watchdog: the dump fires on EVIDENCE of a stall, not a fixed timer.
 def _dump_thread_stacks(reason: str) -> None:
     with contextlib.suppress(Exception):
-        print(f"[stall] {reason}: dumping all thread stacks, then yielding to the provider", flush=True)
+        # Print the header to STDERR (not stdout) so it stays co-located with faulthandler's traceback
+        # — which always goes to stderr — in console_<phase>.txt and the pod log. A stdout header could
+        # be teed into a different stream and separated from the stack dump, hurting triage.
+        print(
+            f"[stall] {reason}: dumping all thread stacks, then yielding to the provider",
+            file=sys.stderr,
+            flush=True,
+        )
         faulthandler.dump_traceback(all_threads=True)
 
 
@@ -130,9 +142,10 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
             _w._HB_LAST_UPLOAD = now  # claim the slot under the lock (throttle stays atomic)
     if upload_due:
         # Serialize the network commit under a SEPARATE lock so uploads can't reorder, and upload the
-        # captured snapshot (via a private temp file, since hf_upload_file takes a path) rather than
-        # re-reading p — which a newer heartbeat may already have overwritten between our slot-claim
-        # and this upload. Acquire the lock with a BOUND (see _HB_UPLOAD_LOCK_TIMEOUT_S) so a wedged
+        # snapshot CAPTURED for this call (via a private temp file, since hf_upload_file takes a path).
+        # Committing this thread's own captured snapshot — rather than any shared/last-written state a
+        # newer heartbeat may have overwritten between our slot-claim and this upload — keeps each
+        # commit self-consistent. Acquire the lock with a BOUND (see _HB_UPLOAD_LOCK_TIMEOUT_S) so a wedged
         # upload holding the lock can't block this heartbeat indefinitely; on timeout skip the
         # best-effort commit and roll the slot claim back below so the throttle doesn't defer the next
         # heartbeat, which re-commits fresher state (HF is the only durable channel — no local copy).

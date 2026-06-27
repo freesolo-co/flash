@@ -218,6 +218,35 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
     assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
 
 
+def test_per_step_training_stages_are_throttled():
+    """Both per-step training stages must be in _HB_THROTTLED_STAGES so their HF upload is capped at
+    _HB_MIN_INTERVAL_S. The reward/SFT log callbacks AND the train-loop liveness daemon re-emit the
+    SAME stage frequently; without throttling sft_step (liveness ~every 30s ~= 120 commits/hr plus the
+    log callback) would blow the 128/hr repo commit cap — exactly the regression rl_step's throttle
+    already prevents."""
+    import flash.engine.worker as ne
+
+    assert "rl_step" in ne._HB_THROTTLED_STAGES
+    assert "sft_step" in ne._HB_THROTTLED_STAGES, (
+        "sft_step must be throttled like rl_step or the SFT liveness daemon blows the commit cap"
+    )
+
+
+def test_sft_step_liveness_upload_is_throttled(monkeypatch):
+    """A burst of sft_step liveness pings within _HB_MIN_INTERVAL_S commits only ONCE — the throttle
+    (not just rl_step) covers sft_step, so a slow SFT run's 30s liveness ticks stay under the cap."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    # First sft_step claims the slot; the next two (well within 60s) must be throttled out.
+    for _ in range(3):
+        ne.heartbeat("sft_step", liveness=True, step=0)
+    assert len(uploads) == 1, "sft_step uploads must be throttled to one per _HB_MIN_INTERVAL_S"
+
+
 # --------------------------------------------------------------------------------------------
 # _hf_cache_bytes feeds the prefetch progress signal: bytes downloaded, or None when the cache dir
 # doesn't exist yet (unmeasurable) — a growth is reported by liveness_heartbeat as REAL progress.
