@@ -306,7 +306,7 @@ class ApiClient:
         if step is not None:
             # Reject a bool explicitly: int(True)/int(False) would silently coerce to step 1/0,
             # but the server guard treats a bool as an invalid step and 400s — fail fast here
-            # with a clear client-side error instead (mirrors deploy()).
+            # with a clear client-side error instead (matches deploy()'s bool guard).
             if isinstance(step, bool):
                 raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
             # Reject a FRACTIONAL step before int() silently truncates it (e.g. 2.7 -> 2 would export
