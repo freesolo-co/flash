@@ -42,8 +42,10 @@ def _write_adapter(adir: str, *, modules, r, alpha, in_f=8, out_f=6, use_rslora=
     g = torch.Generator().manual_seed(seed)
     sd = {}
     for m in modules:
-        sd[f"{m}.lora_A.weight"] = torch.randn(r, in_f, generator=g, dtype=dtype) * 0.1
-        sd[f"{m}.lora_B.weight"] = torch.randn(out_f, r, generator=g, dtype=dtype) * 0.1
+        # Real PEFT adapters embed the adapter name in the saved key (``...lora_A.default.weight``),
+        # not the bare ``...lora_A.weight`` form — write the representative keys.
+        sd[f"{m}.lora_A.default.weight"] = torch.randn(r, in_f, generator=g, dtype=dtype) * 0.1
+        sd[f"{m}.lora_B.default.weight"] = torch.randn(out_f, r, generator=g, dtype=dtype) * 0.1
     save_file(sd, os.path.join(adir, "adapter_model.safetensors"), metadata={"format": "pt"})
     cfg = {
         "peft_type": "LORA", "r": r, "lora_alpha": alpha, "lora_dropout": 0.0,
@@ -71,8 +73,8 @@ def _read_cfg(adir):
 def _delta(adir, module):
     cfg = _read_cfg(adir)
     sd = load_file(os.path.join(adir, "adapter_model.safetensors"))
-    A = sd[f"{module}.lora_A.weight"].to(torch.float64)
-    B = sd[f"{module}.lora_B.weight"].to(torch.float64)
+    A = sd[f"{module}.lora_A.default.weight"].to(torch.float64)
+    B = sd[f"{module}.lora_B.default.weight"].to(torch.float64)
     return _scale(cfg) * (B @ A)
 
 
@@ -231,8 +233,9 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
     # Marker set (VL merge happened): stack the SFT back into the GRPO-only saved adapter.
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
+    # Production forms: SFT infixed (full VL model), GRPO text-only (AutoModelForCausalLM trainer).
     _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
-    _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
     # an aux file should be carried into the deployable dir; trainer state must NOT be.
     with open(os.path.join(grpo, "special_tokens_map.json"), "w") as f:
         f.write("{}")
@@ -246,9 +249,12 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
     assert _read_cfg(out)["r"] == 8  # r_sft + r_grpo
     assert os.path.isfile(os.path.join(out, "special_tokens_map.json"))  # aux carried over
     assert not os.path.exists(os.path.join(out, "optimizer.pt"))  # trainer state skipped
-    # exactness: recombined delta == SFT_delta + GRPO_delta
-    for m in MODULES:
-        assert torch.allclose(_delta(out, m), _delta(sft, m) + _delta(grpo, m), atol=1e-6, rtol=1e-5)
+    # exactness: recombined delta == SFT_delta + GRPO_delta. Output is text-only, so the infixed
+    # SFT module maps to the text-only module the GRPO and recombined output use.
+    for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True):
+        assert torch.allclose(
+            _delta(out, m_text), _delta(sft, m_sft) + _delta(grpo, m_text), atol=1e-6, rtol=1e-5
+        )
 
 
 def test_orchestrator_raises_when_recorded_sft_dir_missing(tmp_path, monkeypatch):
