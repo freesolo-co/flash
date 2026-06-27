@@ -734,6 +734,12 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
                 f"(dir contents: {sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING'}); "
                 "only safetensors adapters can be recombined"
             )
+        if not os.path.isfile(cfg_path):
+            raise ValueError(
+                f"recombine: {d!r} has no adapter_config.json "
+                f"(dir contents: {sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING'}); "
+                "the adapter config is required to read its rank/alpha/scale"
+            )
         with open(cfg_path) as f:
             return json.load(f), load_file(st_path)
 
@@ -837,6 +843,14 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
         # Pair B by swapping the A/B marker — robust to the ``.default.`` adapter-name segment that
         # bare ``lora_A.weight`` -> ``lora_B.weight`` suffix slicing would miss.
         bk = ak.replace(".lora_A.", ".lora_B.", 1)
+        # Both adapters carry the same A/B key set (asserted above), but a malformed adapter could
+        # have a lora_A with no paired lora_B — name the missing key rather than throw a bare
+        # KeyError on the indexing below. (``bk in sft_ab`` ⇒ present in both state dicts.)
+        if bk not in sft_ab:
+            raise ValueError(
+                f"recombine: lora_A key {ak!r} has no matching lora_B key {bk!r} — the adapter is "
+                "malformed (unpaired LoRA tensors)"
+            )
         # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
         out[ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
         # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
