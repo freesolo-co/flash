@@ -381,3 +381,23 @@ def test_list_instances_returns_partial_on_later_page_error(monkeypatch):
     _capture_urlopen(monkeypatch, [_http_error(500)] * 5)
     with pytest.raises(vast_api.VastApiError):
         vast_api.list_instances()
+
+
+def test_list_instances_strict_raises_on_truncated_listing(monkeypatch):
+    """Cursor: a caller that draws a conclusion from an ABSENCE (run_instances_remaining: "no instance
+    for this run remains") must NOT accept a partial page set — an unseen later page could hide the very
+    instance it is ruling out. strict=True raises on ANY incompleteness instead of returning a truncated
+    list, so the caller treats it as "could not confirm" (and defers) rather than a false clear."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    # page 1 ok, page 2 errors: the LENIENT default returns partial, but strict must RAISE.
+    _capture_urlopen(
+        monkeypatch,
+        [{"instances": [{"id": 1}], "next_token": "tok2"}] + [_http_error(500)] * 5,
+    )
+    with pytest.raises(vast_api.VastApiError):
+        vast_api.list_instances(strict=True)
+    # a COMPLETE listing (next_token exhausted) still returns normally under strict.
+    _capture_urlopen(monkeypatch, [{"instances": [{"id": 1}], "next_token": None}])
+    assert [i["id"] for i in vast_api.list_instances(strict=True)] == [1]

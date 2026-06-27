@@ -236,13 +236,20 @@ def get_instance(instance_id: int) -> dict | None:
     return None
 
 
-def list_instances() -> list[dict]:
+def list_instances(strict: bool = False) -> list[dict]:
     # The v0 list route is deprecated (410 "use /api/v1/instances/", verified live); detail/destroy
     # remain on v0. The v1 list is KEYSET-PAGINATED (limit default/max 25; pass the prior page's
     # ``next_token`` as ``after_token``; ``next_token`` is null on the last page). A single read would
     # cap at 25 and MISS flash-labeled orphans on later pages — and EVERY label-keyed path
     # (_adopt_instance_by_label / destroy_run_instances / sweep_orphans) reads this list, so an
     # unseen orphan bills forever. Walk every page until next_token is exhausted.
+    #
+    # ``strict`` (default False) is for callers that need a COMPLETE listing to draw a sound conclusion
+    # from an ABSENCE (e.g. run_instances_remaining: "no instance for this run remains"). A truncated
+    # page set would let such a caller read "absent" as "gone" and act on it. In strict mode any
+    # incompleteness — a page fetch failure (even after earlier pages succeeded), a malformed page, or
+    # exhausting the page cap with pages still pending — RAISES instead of returning a partial list, so
+    # the caller can treat "couldn't enumerate completely" as "could not confirm" (Cursor).
     instances: list[dict] = []
     after_token: str | None = None
     for page_no in range(200):  # runaway guard: 200 pages x 25 = 5000 instances, beyond any real account
@@ -253,13 +260,14 @@ def list_instances() -> list[dict]:
             out = request_with_retries(path)
         except Exception:
             # A LATER page failed after earlier pages succeeded: return what we already have rather than
-            # discarding it. A partial list is safe for every consumer — destroy_run_instances /
+            # discarding it. A partial list is safe for the lenient consumers — destroy_run_instances /
             # sweep_orphans only act on instances they SEE (guarded per-instance by the active/known
             # sets), and _adopt_instance_by_label missing a target leads to destroy-by-label + abort,
             # never a double-provision; the next sweep retries the unfetched pages. If the FIRST page
             # failed we have nothing useful -> re-raise so callers' existing try/except treats a total
-            # listing outage exactly as before (skip the sweep).
-            if instances:
+            # listing outage exactly as before (skip the sweep). A strict caller NEVER accepts a partial
+            # list (an unseen page could hide the very instance it is trying to rule out).
+            if instances and not strict:
                 logger.warning(
                     "vast instance listing truncated at page %d (using %d instance(s) collected so far)",
                     page_no,
@@ -268,6 +276,8 @@ def list_instances() -> list[dict]:
                 return instances
             raise
         if not isinstance(out, dict):
+            if strict:
+                raise VastApiError("vast instance listing returned a non-dict page; listing incomplete")
             break
         page = out.get("instances")
         if isinstance(page, list):
@@ -275,6 +285,9 @@ def list_instances() -> list[dict]:
         after_token = out.get("next_token")
         if not after_token:
             break
+    if strict and after_token:
+        # Fell off the page-cap runaway guard with more pages pending -> the listing is incomplete.
+        raise VastApiError("vast instance listing exceeded the page cap; listing incomplete")
     return instances
 
 

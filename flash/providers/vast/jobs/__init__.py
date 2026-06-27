@@ -835,10 +835,15 @@ def run_instances_remaining(run_id: str) -> list[int]:
     ``destroy_run_instances`` this RAISES on a listing failure (the caller cannot prove the run is
     clear, so it must treat that as not-clear). Used to gate the handle-less recovery resubmit: never
     launch a second worker for a run while an instance for it might still be writing its HF artifacts.
+
+    Uses the STRICT listing (``list_instances(strict=True)``): a truncated/partial page set raises
+    rather than returning silently, so an empty result is a COMPLETE enumeration (a real "clear"), not
+    an unseen page that could hide a live instance (Cursor).
     """
     if not run_id:
         return []
-    instances = vast_api.list_instances()  # may raise -> caller treats as "could not confirm clear"
+    # strict: any incomplete enumeration raises -> caller treats as "could not confirm clear" (defers).
+    instances = vast_api.list_instances(strict=True)
     prefix = run_label_prefix(run_id)
     remaining: list[int] = []
     for inst in instances:

@@ -991,13 +991,13 @@ def test_run_instances_remaining_confirms_clear_and_raises_on_listing_failure(mo
         {"id": 10, "label": "flash-run10-s0-a0"},  # different run (boundary) -> NOT ours
         {"id": 11, "label": "someone-else"},  # not ours
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda strict=False: instances)
     assert vast.run_instances_remaining("run1") == [9]
 
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [])
+    monkeypatch.setattr(vast_api, "list_instances", lambda strict=False: [])
     assert vast.run_instances_remaining("run1") == []  # confirmed clear
 
-    def boom():
+    def boom(strict=False):
         raise vast_api.VastApiError("list failed")
 
     monkeypatch.setattr(vast_api, "list_instances", boom)
