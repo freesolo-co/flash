@@ -595,6 +595,13 @@ def env_published(slug: str) -> str:
     )
 
 
+def env_pulled(dest: str, detail: str = "") -> str:
+    line = ok(f"pulled {_bold(dest)}")
+    if detail:
+        line += f"\n{_dim(f'  {detail}')}"
+    return _safe(line)
+
+
 def help_page(
     tagline: str,
     usage: str,
