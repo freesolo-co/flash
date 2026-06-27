@@ -465,18 +465,25 @@ def make_checkpoint_upload_callback():
         (trained on the SFT-merged base) — on the catalog base it drops the SFT and collapses to
         ~base. ``recombined_warmstart_adapter_dir`` stacks the original SFT LoRA back in (into a
         SEPARATE temp dir, so the resume checkpoint keeps the raw GRPO LoRA that reattaches to the
-        re-merged base on resume). No-op for the continued-adapter / fresh-LoRA paths. Best-effort:
-        a recombine failure falls back to the raw adapter rather than skipping the deployable.
+        re-merged base on resume). ``recombined_warmstart_adapter_dir`` returns None for the
+        continued-adapter / fresh-LoRA paths (raw IS the deployable), but RAISES for a VL warm-start
+        that required a recombine and couldn't (e.g. the recorded SFT dir was evicted). On that raise
+        we must NOT fall back to the raw checkpoint: it's GRPO-only / SFT-less and collapses to ~base
+        on the catalog base, so publishing it would advertise a known-broken deployable. Skip this
+        step's deployable publish and surface the failure instead (the resume checkpoint is still
+        uploaded by the caller, so the run can resume and re-merge).
         """
         recombined: str | None = None
         try:
-            deploy_src = ckpt_dir
             try:
                 recombined = _w.recombined_warmstart_adapter_dir(ckpt_dir)
-                if recombined:
-                    deploy_src = recombined
             except Exception as e:
-                print(f"[ckpt] warm-start recombine warn (step {step}); publishing raw adapter:", e)
+                print(
+                    f"[ckpt] warm-start recombine FAILED (step {step}); skipping deployable publish "
+                    f"to avoid registering an SFT-less adapter: {e}"
+                )
+                return
+            deploy_src = recombined or ckpt_dir
             if with_retry:
                 _publish_deployable_with_retry(deploy_src, step)
             else:
