@@ -16,6 +16,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.grpo import resolve_grpo_sleep_mode
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
@@ -35,7 +36,6 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
-    grpo_sleep_mode,
     liger_on,
     optimal_attn_impl,
     setup_perf_backends,
@@ -112,31 +112,7 @@ def run_rl():
     # hangs mid-training). So enable sleep only when the run genuinely can't fit RESIDENT on THIS
     # card: large/long-context AND the policy + colocated rollout engine + training peak don't fit
     # on the live GPU. When they fit (the common allocator-sized case), skip sleep entirely.
-    _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
-    _card_vram_gb = 0.0
-    try:
-        import torch as _torch_card
-
-        if _torch_card.cuda.is_available():
-            # Decimal GB (/1e9), matching grpo_fits_resident's comparison target: estimate_vram_gb
-            # measures peak in decimal GB (its byte-counting logits terms divide by 1e9), and
-            # rl_per_device_comps sizes the micro-batch in decimal GB too. Binary GiB here would
-            # UNDER-report the card ~7% vs the estimate, so a card that genuinely fits resident
-            # could be told it doesn't (or the micro-batch could assume headroom the gate denied);
-            # one unit everywhere keeps the resident-fit decision and the micro-batch cap consistent.
-            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
-    except Exception as _e:
-        print("[rl] card VRAM probe failed (sleep-mode gate falls back to size/context):", _e)
-    _lora_rank = int(_t.lora_rank) if _t and _t.lora_rank else 32
-    sleep_mode = grpo_sleep_mode(
-        model_id,
-        max_length=_grpo_ctx,
-        group_size=group_size,
-        max_tokens=gcfg.get("max_tokens"),
-        lora_rank=_lora_rank,
-        thinking=_w.THINKING,
-        card_vram_gb=_card_vram_gb,
-    )
+    sleep_mode, _grpo_ctx, _card_vram_gb = resolve_grpo_sleep_mode()
     print(
         f"[rl] vLLM sleep mode = {sleep_mode} "
         f"(model={model_id}, ctx={_grpo_ctx}, card={_card_vram_gb:.0f}GB)"

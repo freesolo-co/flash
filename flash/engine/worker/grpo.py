@@ -259,6 +259,58 @@ def grpo_overrides() -> dict:
     return {k: v for k, v in cfg.items() if v is not None}
 
 
+def card_vram_gb() -> float | None:
+    """The live CUDA device's total VRAM in DECIMAL GB (``total_memory / 1e9``), or ``None`` when no
+    live card is visible / the probe fails.
+
+    Decimal GB (/1e9) matches every other VRAM consumer (``flash.engine.vram``,
+    ``rl_per_device_comps``, ``grpo_fits_resident``): binary GiB would UNDER-report the card ~7% vs
+    the estimate, so a card that genuinely fits resident could be told it doesn't (or the micro-batch
+    could assume headroom the gate denied). One unit everywhere keeps the resident-fit decision and
+    the micro-batch cap consistent. Returns ``None`` (not 0.0) so a caller keeps its own no-card
+    skip/fallback behavior."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_properties(0).total_memory / 1e9
+    except Exception:
+        return None
+
+
+def resolve_grpo_sleep_mode() -> tuple[bool, int, float]:
+    """Resolve the vLLM sleep-mode decision for the colocated GRPO run from the live JOB_SPEC + card.
+
+    The SINGLE source of the sleep gate, shared by ``run_rl`` (which sets
+    ``vllm_enable_sleep_mode``) and ``finalize_alloc_conf_for_sleep`` (which picks the CUDA allocator
+    conf to MATCH it) — so the trainer's sleep mode and the alloc conf can never drift apart. Reads
+    run-scoped state (``JOB_SPEC``/``THINKING``/``grpo_overrides``) THROUGH the worker package at CALL
+    time so the monkeypatch contract holds. Returns ``(sleep_mode, ctx, card_gb)`` so a caller can log
+    the resolved context length + card size."""
+    from flash.engine.recipe import RECIPE
+    from flash.engine.worker.perf import grpo_sleep_mode
+
+    spec = _w.JOB_SPEC
+    train = spec.train if spec else None
+    model_id = spec.model if spec else ""
+    ctx = int(train.max_length if train and train.max_length else 0)
+    gcfg = _w.grpo_overrides()
+    group_size = int(gcfg.get("group_size") or RECIPE.rl.group_size)
+    lora_rank = int(train.lora_rank) if train and train.lora_rank else 32
+    card_gb = card_vram_gb() or 0.0
+    sleep_mode = grpo_sleep_mode(
+        model_id,
+        max_length=ctx,
+        group_size=group_size,
+        max_tokens=gcfg.get("max_tokens"),
+        lora_rank=lora_rank,
+        thinking=_w.THINKING,
+        card_vram_gb=card_gb,
+    )
+    return sleep_mode, ctx, card_gb
+
+
 def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int) -> bool:
     """True when this worker resumed a checkpoint that already reached the target step count.
 

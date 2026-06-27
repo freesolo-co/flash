@@ -131,6 +131,39 @@ def test_bare_environment_id_is_rejected() -> None:
             spec_from_dict(raw)
 
 
+def test_env_ref_validator_matches_adapter_acceptor() -> None:
+    # The submit-time schema validator and the worker's environment acceptor parse ONE grammar;
+    # they must agree exactly (accept <-> no raise, reject <-> raise) or a ref accepted at submit
+    # could fail on the worker (or vice-versa). _require_environment_ref now delegates to the
+    # adapter's is_freesolo_environment_id; this pins that alignment across the grammar's corners.
+    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.schema.fields import _require_environment_ref
+
+    corpus = [
+        "ns/name",  # plain managed slug
+        "github:owner/repo",
+        "github:owner/repo@ref",
+        "https://github.com/owner/repo/blob/dev/envs/e/environment.py",  # blob URL
+        "  github:owner/repo@dev:envs/e/environment.py  ",  # whitespace-padded ref
+        "  ns/name  ",  # whitespace-padded slug
+        "https://github.com/owner/repo/blob/main/envs%2Fe/environment.py",  # %2F-encoded blob URL
+        "github:owner/repo@main:../../etc/passwd",  # traversal attempt
+        "https://github.com/owner/repo/blob/main/../x.py",  # traversal attempt
+        "../../etc/passwd",
+        "",
+    ]
+
+    def schema_accepts(value: str) -> bool:
+        try:
+            _require_environment_ref(value, "msg")
+            return True
+        except ConfigError:
+            return False
+
+    for value in corpus:
+        assert schema_accepts(value) is is_freesolo_environment_id(value), value
+
+
 def test_environment_must_be_a_table() -> None:
     raw = _raw()
     raw["environment"] = "gsm8k"

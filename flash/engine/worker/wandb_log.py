@@ -17,6 +17,22 @@ import threading
 from flash.engine.worker._pkg import W as _w
 
 
+def _wandb_importable() -> bool:
+    """Whether the real ``wandb`` package is importable enough to attempt W&B logging.
+
+    ``importlib.util.find_spec`` can RAISE (not just return None) when wandb is already in sys.modules
+    with an absent/partial ``__spec__`` (a partially-initialized import / namespace package) — that
+    would crash a best-effort W&B path. Treat such an ambiguous probe as "present enough to try"
+    (return True) and let the guarded ``wandb.init`` / ``wandb.finish`` callers decide; only a
+    definitive None (probe succeeded, module truly absent) returns False."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("wandb") is not None
+    except Exception:
+        return True  # ambiguous probe -> "present enough to try"
+
+
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
@@ -30,19 +46,9 @@ def wandb_report_to() -> list[str]:
     W&B env var is the WANDB_API_KEY credential."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
-    import importlib.util
-
-    # find_spec can RAISE (not just return None) when wandb is in sys.modules with an absent/partial
-    # __spec__ (a partially-initialized import / namespace package) — that would crash the worker even
-    # though W&B logging is best-effort (mirrors the guard in wandb_finish). Treat an ambiguous probe
-    # as "present enough to try" and let the guarded wandb.init below decide; only a definitive None
-    # (probe succeeded, module truly absent) skips logging here.
-    try:
-        if importlib.util.find_spec("wandb") is None:
-            print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
-            return []
-    except Exception:
-        pass  # ambiguous probe -> fall through to the guarded wandb.init below
+    if not _wandb_importable():
+        print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
+        return []
     # Best-effort, like the bitsandbytes import above: a partial/broken wandb install or an
     # init failure (auth, network, runtime import error) must NOT abort training — W&B logging is
     # optional and metrics.json is the source of truth. Any failure -> no W&B logging ([]).
@@ -102,18 +108,8 @@ def wandb_finish(exit_code: int = 0) -> None:
     optional, metrics.json is the source of truth)."""
     if not os.environ.get("WANDB_API_KEY"):
         return
-    import importlib.util
-
-    # find_spec can RAISE (not just return None) when wandb is already in sys.modules with an
-    # absent/partial __spec__ (e.g. a namespace-package or a partially-initialized import) — that
-    # would propagate out of the shutdown path and skip the hard exit. Keep it best-effort: treat any
-    # probe failure as "wandb present enough to try", and let the import + finish below (already
-    # wrapped) decide. Only a definitive None (probe succeeded, module truly absent) returns early.
-    try:
-        if importlib.util.find_spec("wandb") is None:
-            return
-    except Exception:
-        pass  # ambiguous probe -> fall through and try to finish (still fully guarded below)
+    if not _wandb_importable():
+        return
     try:
         import wandb
 

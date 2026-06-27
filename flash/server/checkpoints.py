@@ -14,16 +14,14 @@ everything."""
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 
 from flash.runner.checkpoints import list_checkpoints
 from flash.spec import JobSpec
 
-from .auth import INTERNAL_KEY_ENV, freesolo_base_url
+from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key, org_id_of
 
-_TIMEOUT_S = 10.0
 _RECORD_PATH = "/api/runs/internal/checkpoints"
 
 
@@ -32,17 +30,8 @@ def _post_checkpoints(*, token: str, body: dict) -> dict:
 
     Callers in this module always wrap this in a best-effort guard — the raise exists so the
     one network boundary is easy for tests to stub/assert."""
-    url = f"{freesolo_base_url()}{_RECORD_PATH}"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+    req = build_internal_request(_RECORD_PATH, body, token=token)
+    with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
         raw = resp.read()
     try:
         return json.loads(raw or b"{}")
@@ -60,7 +49,7 @@ def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dic
     if not checkpoints:
         raise ValueError("no checkpoints to record")
     context = status.billing_context if isinstance(status.billing_context, dict) else {}
-    org_id = str(context.get("org_id") or "").strip()
+    org_id = org_id_of(context)
     if not org_id:
         raise ValueError("missing org id for run checkpoints")
     spec = status.spec or {}
@@ -88,8 +77,8 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
     def _log(msg: str) -> None:
         print(msg, file=log, flush=True) if log is not None else print(msg)
 
-    internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
-    if not internal_key:
+    key = (internal_key() or "").strip()
+    if not key:
         return 0  # local/dev control plane: HF still has the checkpoints
     try:
         spec = JobSpec.from_dict(status.spec)
@@ -101,7 +90,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
         return 0
     try:
         register_run_checkpoints(
-            internal_key=internal_key, status=status, checkpoints=checkpoints
+            internal_key=key, status=status, checkpoints=checkpoints
         )
     except (ValueError, urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
         _log(f"[ckpt] backend register warn ({status.run_id}): {exc}")

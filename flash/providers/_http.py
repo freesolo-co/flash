@@ -23,44 +23,23 @@ from typing import Any
 # match. ``\b`` after ``404`` rejects ``HTTP 4040``/``HTTP 4041`` (digit immediately after), while
 # still matching ``HTTP 404:``, ``HTTP 404 Not Found``, and a trailing ``HTTP 404`` at end-of-string.
 _HTTP_404_RE = re.compile(r"\bhttp 404\b")
-# Same shape for ``HTTP 409`` (conflict) — bounded so ``HTTP 4090``/``4091`` (and a ``4090`` GPU
-# name) can't match: only a genuine ``HTTP 409`` token counts in the no-cause text fallback.
-_HTTP_409_RE = re.compile(r"\bhttp 409\b")
-
-
-def _status_matches(err: Exception, code: int, token_re: re.Pattern[str]) -> bool:
-    """True when ``err`` represents the given HTTP ``code``, keyed off the chained status when present.
-
-    ``request_with_retries`` chains the original urllib ``HTTPError`` as ``__cause__`` for every
-    fast-failed 4xx (and on the "failed after N attempts" path), so the status CODE is authoritative
-    when a cause is present — anything else is a real failure that must NOT be swallowed. We only
-    fall back to a text match when there is no HTTPError cause, and even then only on an unambiguous
-    ``HTTP <code>`` TOKEN (``token_re``) — NEVER a bare substring, and never a longer number that
-    just begins with ``code``: the token's trailing ``\\b`` rejects ``HTTP <code>0``/``<code>1`` (and
-    a ``4090`` GPU name), so a transient error whose text embeds such an id is not misread."""
-    cause = getattr(err, "__cause__", None)
-    if isinstance(cause, urllib.error.HTTPError):
-        return cause.code == code
-    return bool(token_re.search(str(err).lower()))
 
 
 def is_not_found(err: Exception) -> bool:
     """True only when a provider API error represents a genuine HTTP 404 (resource already gone).
 
-    See ``_status_matches`` for how the chained-HTTPError code is authoritative and why the no-cause
-    fallback uses the bounded ``HTTP 404`` token (never a bare ``"404"`` substring). Mirrors
+    ``request_with_retries`` chains the original urllib ``HTTPError`` as ``__cause__`` for every
+    fast-failed 4xx (and on the "failed after N attempts" path), so the status CODE is authoritative
+    when a cause is present — anything else is a real failure that must NOT be swallowed. We only
+    fall back to a text match when there is no HTTPError cause, and even then only on an unambiguous
+    ``HTTP 404`` TOKEN (``_HTTP_404_RE``) — NEVER a bare ``"404"`` substring, and never a longer
+    number that just begins with ``404``: the token's trailing ``\\b`` rejects ``HTTP 4040``/``4041``,
+    so a transient error whose text embeds such an id is not misread. Mirrors
     ``runpod.api._is_not_found``."""
-    return _status_matches(err, 404, _HTTP_404_RE)
-
-
-def is_conflict(err: Exception) -> bool:
-    """True only when a provider API error represents a genuine HTTP 409 (conflict).
-
-    Same status-CODE-authoritative logic as ``is_not_found`` (see ``_status_matches``): a real 409
-    has the chained ``HTTPError`` whose ``.code == 409``; a non-409 failure whose message merely
-    contains ``"409"`` (e.g. a ``4090`` GPU name) plus the word "conflict" is NOT a conflict and must
-    still surface. Available for providers that treat an in-flight-teardown 409 as success."""
-    return _status_matches(err, 409, _HTTP_409_RE)
+    cause = getattr(err, "__cause__", None)
+    if isinstance(cause, urllib.error.HTTPError):
+        return cause.code == 404
+    return bool(_HTTP_404_RE.search(str(err).lower()))
 
 
 class RestClient:
