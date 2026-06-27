@@ -56,6 +56,12 @@ def test_think_token_count_counts_the_think_span() -> None:
     assert w.think_token_count("a b c d</think>answer with <think> echo here", tok) == 4
     # a self-tagged block followed by an echoed opener still counts only the first real span.
     assert w.think_token_count("<think>a b c</think>tail <think> echo", tok) == 3
+    # prompt-opened + NEVER closed + an echoed <think>: count the WHOLE completion (it's all
+    # unterminated reasoning), not just the text after the echoed opener.
+    assert w.think_token_count("reason 42 <think> more", tok, prompt_opened_thinking=True) == 4
+    # the same echoed completion WITHOUT the prompt-open signal: the model opened <think> itself
+    # (unclosed) -> count after that opener (case: model-opened unclosed).
+    assert w.think_token_count("reason 42 <think> more", tok) == 1
 
 
 def test_prompt_opens_thinking_detects_preopened_tag() -> None:
@@ -71,6 +77,10 @@ def test_prompt_opens_thinking_detects_preopened_tag() -> None:
     assert w.prompt_opens_thinking("...<think>example</think>...<|im_start|>assistant\n") is False
     # If the LAST think is left open (after an earlier closed one), it IS pre-opened.
     assert w.prompt_opens_thinking("<think>ex</think>q<|im_start|>assistant\n<think>\n") is True
+    # FALSE-POSITIVE guard: a user/system message that merely CONTAINS an unclosed literal <think>
+    # must NOT count as pre-opened when the generation suffix didn't actually prefill thinking (the
+    # detection anchors on the trailing <think> suffix, not a scan of the whole prompt).
+    assert w.prompt_opens_thinking("user asked <think> about x<|im_start|>assistant\n") is False
 
 
 def test_graded_text_hides_tagless_prompt_opened_reasoning(monkeypatch) -> None:
@@ -85,6 +95,9 @@ def test_graded_text_hides_tagless_prompt_opened_reasoning(monkeypatch) -> None:
     assert w.graded_text("the answer is 42", prompt_opened_thinking=False) == "the answer is 42"
     # A normally-tagged thinking completion is unaffected: strip to the post-</think> answer.
     assert w.graded_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True) == "\\boxed{5}"
+    # Echoed <think> while still unterminated (no </think>): the WHOLE thing is reasoning -> hidden,
+    # NOT just the text before the echoed opener (which a raw-text fallback could otherwise reward).
+    assert w.graded_text("reason 42 <think> still going", prompt_opened_thinking=True) == ""
     # THINKING off: no stripping at all, even with the flag set.
     monkeypatch.setattr(w, "THINKING", False)
     assert w.graded_text("rambling forever", prompt_opened_thinking=True) == "rambling forever"

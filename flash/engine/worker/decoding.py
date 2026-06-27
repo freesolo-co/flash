@@ -29,15 +29,18 @@ def prompt_opens_thinking(prompt: str | None) -> bool:
     tagless completion is a normal answer — it must NOT be treated, penalized, or stripped as
     unterminated reasoning. Callers pass the result as ``prompt_opened_thinking`` to
     ``think_token_count`` / ``graded_text`` / ``strip_think``.
+
+    A hybrid template pre-opens reasoning by appending ``<think>`` as the TRAILING generation-prompt
+    suffix, so we require the rendered prompt to END with ``<think>`` (ignoring trailing whitespace).
+    Anchoring on the suffix — not a scan of the whole prompt — avoids a false positive when an
+    earlier user/system/example message merely *contains* an unclosed literal ``<think>`` that the
+    template never turned into an assistant prefill.
     """
     if not prompt:
         return False
-    open_idx = prompt.rfind("<think>")
-    if open_idx == -1:
-        return False
-    # ``<think>`` is not a substring of ``</think>``, so rfind finds only real opening tags. The last
-    # opener pre-opens reasoning iff no ``</think>`` follows it.
-    return prompt.rfind("</think>") < open_idx
+    # ``"</think>".endswith("<think>")`` is False (the chars before ``think>`` differ), so a prompt
+    # ending in a CLOSED block is correctly not treated as pre-opened.
+    return prompt.rstrip().endswith("<think>")
 
 
 def strip_think(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
@@ -51,12 +54,12 @@ def strip_think(completion: str | None, *, prompt_opened_thinking: bool = False)
       (usually empty), so answer extraction fails and the completion scores 0 —
       deliberate reward pressure to close thinking within budget, and it keeps a
       last-number fallback from matching numbers inside the reasoning.
-    - tagless completion under a prompt-opened <think> (``prompt_opened_thinking``): the
-      generation ran out of budget before emitting EITHER tag, so the whole completion is
-      unterminated reasoning — return "" so the env grades nothing (scores 0), the same
-      pressure as an unclosed in-band <think>. Without this, an env with a raw-text answer
-      fallback could reward the reasoning ramble. Gated on the caller confirming the prompt
-      actually pre-opened the tag (not merely that THINKING was set), so a non-thinking
+    - unclosed under a prompt-opened <think> (``prompt_opened_thinking``, no </think> anywhere): the
+      generation ran out of budget before closing, so the WHOLE completion is unterminated reasoning
+      — even if it redundantly echoed another <think> inside it — so return "" and the env grades
+      nothing (scores 0), the same pressure as an unclosed in-band <think>. Without this, an env with
+      a raw-text answer fallback could reward the reasoning ramble. Gated on the caller confirming the
+      prompt actually pre-opened the tag (not merely that THINKING was set), so a non-thinking
       template's normal answer is left untouched.
     - no tags (and no prompt pre-open): unchanged.
     """
@@ -64,10 +67,13 @@ def strip_think(completion: str | None, *, prompt_opened_thinking: bool = False)
         return None
     if "</think>" in completion:
         return completion.rsplit("</think>", 1)[1]
-    if "<think>" in completion:
-        return completion.split("<think>", 1)[0]
+    # No </think>: reasoning never closed. A prompt-opened block means the whole completion is
+    # unterminated reasoning (incl. any echoed <think>), so hide it BEFORE the model-opened branch —
+    # else an echoed <think> would leak the pre-think text to the env.
     if prompt_opened_thinking:
         return ""
+    if "<think>" in completion:
+        return completion.split("<think>", 1)[0]
     return completion
 
 
@@ -112,23 +118,32 @@ def think_token_count(
     Case 1 vs 2 is decided by tag ORDER, not mere presence: a prompt-opened completion that closes
     its reasoning and then echoes a literal/malformed ``<think>`` in the answer must still count the
     span up to the FIRST ``</think>`` (case 2) — anchoring on the echoed opener would count the wrong
-    span. Any later ``<think>`` blocks (uncommon — a malformed re-open) are NOT added to the count.
+    span. And when the prompt pre-opened and the completion NEVER closes (no ``</think>`` anywhere),
+    case 3 wins even over an echoed ``<think>``: the whole completion is unterminated reasoning, so
+    we count all of it rather than just the text after the echoed opener. Any later ``<think>`` blocks
+    (uncommon — a malformed re-open) are NOT added to the count.
     """
     if not completion:
         return 0
     open_idx = completion.find("<think>")
     close_idx = completion.find("</think>")
-    if open_idx != -1 and (close_idx == -1 or open_idx < close_idx):
-        # case 1: the model emitted its OWN opening <think> before any close — count that span.
-        after = completion[open_idx + len("<think>") :]
-        think_text = after.split("</think>", 1)[0] if "</think>" in after else after
-    elif close_idx != -1:
-        # case 2: prompt-opened <think> — the completion starts mid-reasoning and only carries the
+    if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+        # case 2: prompt-opened <think> — the completion starts mid-reasoning and carries only the
         # close. Count up to the FIRST </think>; a later literal <think> in the answer is NOT the
         # opener (tag order, not presence).
         think_text = completion[:close_idx]
-    elif prompt_opened_thinking:  # case 3: prompt opened <think>, never closed (ran out of tokens)
+    elif open_idx != -1 and close_idx != -1:
+        # case 1: the model emitted its OWN opening <think> before the close — count between them.
+        think_text = completion[open_idx + len("<think>") : close_idx]
+    elif prompt_opened_thinking:
+        # case 3: prompt pre-opened <think> and the completion never closed it (no </think> anywhere)
+        # — the WHOLE completion is unterminated reasoning, INCLUDING any echoed <think> it redundantly
+        # emitted before running out of budget (don't anchor on that echo and undercount).
         think_text = completion
+    elif open_idx != -1:
+        # the model opened <think>, never closed it, and the prompt did NOT pre-open — count after the
+        # opener (the unclosed model-emitted span).
+        think_text = completion[open_idx + len("<think>") :]
     else:
         return 0
     if not think_text:
