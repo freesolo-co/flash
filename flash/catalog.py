@@ -175,16 +175,17 @@ MODELS: dict[str, ModelInfo] = {
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
     ),
-    # ---- Qwen3.6 MoE: the big-checkpoint tier (H200 for SFT, B200 for GRPO) ----
+    # ---- Qwen3.6 MoE: the big-checkpoint tier (80 GB A100/H100 for SFT, B200 for GRPO) ----
     # 35B-A3B is a Mixture-of-Experts checkpoint: ~3B parameters are ACTIVE per token, but all 35B
     # are materialized on the GPU, so the MEMORY/disk/download terms size the FULL 35B (~70 GB bf16)
     # while the COMPUTE terms (activations, KV pool, rank-linear LoRA) size the ~3B active backbone
     # (engine.vram is MoE-aware via active_params_b). bf16 LoRA, NOT QLoRA — same reason as the 9B.
     # Because the resident weights dominate and the active compute is tiny, the GPU tier is set by
     # how many weight copies each algorithm holds, NOT by context length:
-    #   * SFT — ONE ~70 GB copy + small active-compute (~82 GB peak, ~flat in context) -> fits the
-    #     141 GB H200 with wide margin (context ~unbounded by VRAM). Live-validated on a B200; the
-    #     H200 down-tier is the MoE-aware win (cheaper, plentiful stock).
+    #   * SFT — ONE ~70 GB copy + small active-compute (MEASURED ~71 GB peak, ~flat in context) ->
+    #     fits an 80 GB A100/H100 with ~9 GB headroom. The 80 GB down-tier is the MoE-aware win
+    #     (A100 PCIe ~$1.39/hr, ~68% cheaper than the H200 and far more available); long-context SFT
+    #     escalates to the H200.
     #   * GRPO — colocates the vLLM rollout, so TWO ~70 GB copies (trainer + engine) are resident at
     #     the rollout peak (~167 GB) -> needs the 180 GB B200; the H200 can't hold both. The MoE
     #     rollout weight-sync needed a fused-expert name fix (engine.worker.lora._remap_vl_sync_weights
@@ -207,7 +208,11 @@ MODELS: dict[str, ModelInfo] = {
         active_params_b=3.0,
         vocab_size=248_320,
         algos=("sft", "grpo"),
-        min_vram_gb=141,
+        # PUBLIC minimum VRAM to run this model (the SFT/cheapest-algorithm tier — same role as the
+        # 9B's min_vram_gb=48). SFT now fits an 80 GB A100/H100 (sft_vram_gb below, live-measured
+        # ~71 GB), so the public catalog (/v1/models) must advertise 80, not the old 141 GB H200
+        # figure. GRPO's bigger requirement is carried separately by grpo_min_vram_gb=180 (Codex P2).
+        min_vram_gb=80,
         # SFT tier = an 80 GB A100/H100, LIVE-MEASURED. The MoE-aware estimate is ~75 GB (the 70 GB
         # resident weights dominate; the active-3B activations are tiny + Liger FLCE fuses the 248k
         # logits), and a real A100-80GB SFT run peaked at ~71 GB / 80 GB (~9 GB headroom, train_wall
