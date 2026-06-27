@@ -69,15 +69,17 @@ __all__ = [
 
 
 def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
-    """Training-endpoint names derived from the run registry, in both the bare ``flash-...`` and
-    SDK ``live-flash-...`` forms. Includes both the run's persisted handle name and the name
-    re-derived from its spec, so a run is covered even in the submit -> handle-persisted window.
+    """Training-endpoint names derived from the run registry, in the CANONICAL (bare ``flash-...``)
+    form — the reaper canonicalizes the ``live-flash-...`` names RunPod lists before comparing, so
+    one form per name suffices. Includes both the run's persisted handle name and the name re-derived
+    from its spec, so a run is covered even in the submit -> handle-persisted window.
 
     ``include_terminal=False`` yields the PROTECTED set (live, non-terminal runs only) — endpoints
     the reaper must never delete, even when momentarily idle between seeds. ``include_terminal=True``
     yields the KNOWN set (every run this plane has a record of) — used to SCOPE the reaper to this
     plane's own endpoints (multi-plane safety; see ``_sweep_idle_flash_endpoints``)."""
     from flash.providers.base import canonical_gpu
+    from flash.providers.runpod.jobs import canonical_endpoint_name
     from flash.providers.runpod.train import _run_suffix, endpoint_name
     from flash.runner import TERMINAL_STATES
 
@@ -85,8 +87,7 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
 
     def _add(name: str | None) -> None:
         if name:
-            names.add(name)
-            names.add(f"live-{name}")
+            names.add(canonical_endpoint_name(name))
 
     for row in db.all_runs():
         try:

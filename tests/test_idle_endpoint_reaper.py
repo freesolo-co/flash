@@ -10,6 +10,12 @@ from flash.providers.base import canonical_gpu
 from flash.providers.runpod.train import _run_suffix, endpoint_name
 from flash.runner import RunStatus
 
+# Test run-ids below are plain fixtures: a run id is any string starting with ``flash-`` (the
+# server assigns ``flash-<ts>-<rand>``), and these just name the SCENARIO for readability —
+# ``flash-live`` is a running run, ``flash-done`` a finished one, ``flash-prov`` a provisioning one.
+# They are NOT special names the code keys on (the only real name conventions are the ``flash-`` /
+# ``live-flash-`` endpoint forms; see ``canonical_endpoint_name``).
+
 
 def _derived(gpu: str, run_id: str) -> str:
     return endpoint_name(canonical_gpu(gpu), _run_suffix(run_id))
@@ -39,10 +45,14 @@ def test_protected_names_cover_live_runs_only(monkeypatch):
 
     names = app_mod._protected_train_endpoint_names()
 
-    # active run: the persisted handle name AND the spec-derived name, both registered forms.
-    assert {"flash-5090-handle", "live-flash-5090-handle"} <= names
+    # active run: the persisted handle name AND the spec-derived name. The set holds the CANONICAL
+    # bare form only — the reaper canonicalizes the ``live-flash-...`` names RunPod lists before
+    # comparing, so the ``live-`` form is deliberately NOT stored here.
+    assert "flash-5090-handle" in names
+    assert "live-flash-5090-handle" not in names
     active_derived = _derived("RTX 5090", "flash-active")
-    assert {active_derived, f"live-{active_derived}"} <= names
+    assert active_derived in names
+    assert f"live-{active_derived}" not in names
     # provisioning run: protected by its spec-derived name even with no handle.
     assert _derived("A100", "flash-prov") in names
     # terminal run: not protected (its endpoint is reapable once idle).
@@ -339,6 +349,16 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
 def _idle_health():
     """A warm-idle endpoint with no work — reapable under reap_warm=True."""
     return {"workers": {"ready": 1, "idle": 1}, "jobs": {"inQueue": 0, "inProgress": 0}}
+
+
+def test_canonical_endpoint_name_strips_sdk_live_prefix():
+    """One endpoint, two names: flash stores the bare ``flash-...`` form, the runpod-flash SDK lists
+    it as ``live-flash-...``. ``canonical_endpoint_name`` collapses them to the bare form so every
+    comparison site uses one name. Idempotent; a non-``live-`` name passes through unchanged."""
+    assert jobs.canonical_endpoint_name("live-flash-5090-abc") == "flash-5090-abc"
+    assert jobs.canonical_endpoint_name("flash-5090-abc") == "flash-5090-abc"
+    assert jobs.canonical_endpoint_name(jobs.canonical_endpoint_name("live-flash-x")) == "flash-x"
+    assert jobs.canonical_endpoint_name("") == ""
 
 
 def test_sweep_reaps_responsive_account_when_one_pool_key_fails(monkeypatch):
