@@ -30,6 +30,7 @@ from flash.providers._poll import (
     FIRST_LIVENESS_S,
     PollErrorTracker,
     heartbeat_progress_ts,
+    is_training_heartbeat,
     make_say,
     preload_box_reap_due,
     surface_heartbeat,
@@ -60,12 +61,6 @@ STALL_AFTER_S = 1500.0
 # (Lambda has no server-side execution timeout, so the client deadline + the bootstrap's own cap
 # bound spend). Larger than RunPod's because of the on-host Docker pull.
 PROVISION_GRACE_S = 3000.0
-
-# Heartbeat stages emitted DURING cold start, before the training loop begins. Receiving one proves
-# the worker is alive but NOT that setup finished, so they keep the larger setup grace (cf. RunPod).
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
 
 # Lambda instance statuses that mean "the box is gone / will not progress".
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
@@ -611,9 +606,19 @@ def poll_lambda_job(
             # shared seed path with ts > this launch) can't satisfy this attempt's first-liveness.
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
             if fresh:
-                last_progress = hb_ts
+                # MONOTONIC: never let progress REGRESS. A newer heartbeat whose bounded upload-lock
+                # acquire timed out can be skipped while an older, slow upload eventually lands as the
+                # latest heartbeat.json — so a later poll may read an OLDER ts. Clamp to the max so a
+                # delayed stale upload can't move progress backward and trip the stall clock early.
+                last_progress = max(last_progress, hb_ts)
                 seen_fresh_hb = True  # worker is alive (boot or later) -> first-liveness satisfied
-                if stage not in _SETUP_HEARTBEAT_STAGES:
+                # Tighten to the training window when cold-start setup is OVER (shared with runpod):
+                # a setup stage never tightens; rl_step/sft_step tighten only at a COMPLETED step
+                # (step >= 1) so a step=0 gap-fill during the silent cold first step keeps setup grace;
+                # every other non-setup stage (POST-training rl_trained / *_train_done / metrics, no
+                # step field) tightens so a hung teardown falls under the tight window. See
+                # is_training_heartbeat for the full rationale (new_key[1] is the heartbeat's step).
+                if is_training_heartbeat(stage, new_key[1]):
                     seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
