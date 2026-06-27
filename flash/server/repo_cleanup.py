@@ -229,23 +229,28 @@ def list_run_repos(api, namespace: str) -> list[RepoView]:
     return views
 
 
-def deployed_repo_ids() -> set[str]:
-    """The set of HF repo ids serving is currently loading adapters from (the live keep-set)."""
+def deployed_repo_ids() -> tuple[set[str], bool]:
+    """The HF repo ids serving is currently loading adapters from (the live keep-set), plus a
+    ``complete`` flag.
+
+    ``complete`` is ``False`` when a live record could NOT be mapped to a repo id (missing
+    ``repoId``/``repo_id`` — a schema drift). The two callers treat that differently:
+    destructive tiers (``--checkpoints``/``--repos``) abort on an incomplete set (an unidentifiable
+    live repo could be deleted), while the serving-safe ``--code`` purge proceeds with the
+    best-effort set — it still protects every identifiable deployed repo, and code/flash is never
+    read by serving anyway. (A hard raise here regressed code-only to an EMPTY keep-set.)
+    """
     from flash.serve import deploy
 
     ids: set[str] = set()
+    complete = True
     for rec in deploy.list_deployed_adapters():
         repo = rec.get("repoId") or rec.get("repo_id")
         if not repo:
-            # A deployed adapter record always carries the HF repo serving pulls from. A record
-            # missing it means the schema drifted — fail closed (the caller aborts destructive
-            # tiers) rather than silently dropping it and shrinking the do-not-delete keep-set.
-            raise RuntimeError(
-                f"deployed adapter record has no repoId/repo_id (keys: {sorted(rec)[:8]}); "
-                "refusing to trust an incomplete serving live set"
-            )
+            complete = False  # an unidentifiable live repo — caller decides whether to abort
+            continue
         ids.add(str(repo))
-    return ids
+    return ids, complete
 
 
 def classify(view: RepoView, deployed: set[str], cfg: Config, now: datetime) -> list[Action]:
@@ -366,7 +371,7 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
     # can't be confirmed they abort. The code-only tier is serving-safe and may proceed without it.
     live_set_known = True
     try:
-        deployed = deployed_repo_ids()
+        deployed, complete = deployed_repo_ids()
     except Exception as exc:
         live_set_known = False
         deployed = set()
@@ -376,6 +381,17 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
                 "deletion. Re-run with only --code (serving-safe), or restore serving access."
             ) from exc
         logger.warning("serving live set unavailable (%s); proceeding with code-only purge", exc)
+    else:
+        if not complete:
+            # Serving answered, but a live record couldn't be mapped to a repo id. Destructive tiers
+            # abort (an unidentifiable live repo could be deleted); code-only proceeds with the
+            # best-effort set (still protects every identifiable deployed repo; code is serving-safe).
+            if cfg.needs_live_set:
+                raise CleanupAborted(
+                    "serving returned a live adapter record with no repo id; refusing checkpoint/repo "
+                    "deletion against an incomplete keep-set. Re-run with only --code, or fix serving."
+                )
+            logger.warning("serving live set is incomplete (a record lacked a repo id); code-only purge proceeds")
 
     now = datetime.now(UTC)
     views = list_run_repos(api, cfg.namespace)
@@ -388,7 +404,7 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
     # dry-run path skips this and reports the full preview plan, mutating nothing).
     if not dry_run and plan.actions and live_set_known:
         try:
-            fresh = deployed_repo_ids()
+            fresh, fresh_complete = deployed_repo_ids()
         except Exception as exc:
             if cfg.needs_live_set:
                 raise CleanupAborted(
@@ -397,6 +413,12 @@ def run(cfg: Config, *, dry_run: bool = True, sleep: float = 0.5, manifest_path:
                 ) from exc
             logger.warning("could not re-confirm live set before apply (%s); proceeding (code-only)", exc)
             fresh = set()
+        else:
+            if not fresh_complete and cfg.needs_live_set:
+                raise CleanupAborted(
+                    "serving returned an incomplete live set on re-confirm (a record lacked a repo "
+                    "id); aborting rather than risk deleting a newly-deployed repo."
+                )
         if fresh:
             kept = [a for a in plan.actions if a.repo_id not in fresh]
             dropped = len(plan.actions) - len(kept)
