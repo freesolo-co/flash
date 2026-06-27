@@ -299,9 +299,11 @@ def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list
     We mask the LONGEST SHARED TOKEN PREFIX rather than ``len(prompt_ids)`` so the boundary is robust
     to the thinking chat template, whose ``add_generation_prompt=True`` render pre-opens ``<think>\\n``
     — the prompt then diverges from the full render by a token; we mask up to that divergence and train
-    on everything after. This mirrors TRL's own prompt-completion masking (it likewise derives the
-    boundary from the prompt token length) but in flash's single pre-tokenization pass, so the unpacked
-    and packed paths share one boundary.
+    on everything after. This serves the same goal as TRL's own prompt-completion masking — mask the
+    prompt, train the completion — but is MORE robust: TRL keys the boundary off the prompt token
+    length, whereas we use the shared prefix, so a divergent prompt suffix (the pre-opened ``<think>``)
+    can't mis-place it. Done in flash's single pre-tokenization pass, so the unpacked and packed paths
+    share one boundary.
 
     Returns ``[]`` for empty ``full_ids`` and an ALL-ZERO mask when the full row is entirely prompt
     (``max_length`` truncation removed the whole completion); :func:`run_sft
