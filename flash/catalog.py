@@ -11,7 +11,13 @@ ALGORITHMS = ("sft", "grpo")
 
 def normalize_algorithm(value: str) -> str:
     """Canonical (lowercased, validated) algorithm name."""
-    value = (value or "grpo").lower()
+    if not value:
+        value = "grpo"
+    elif not isinstance(value, str):
+        # A truthy non-string (e.g. a JSON number/bool/array) would AttributeError on .lower(), which
+        # escapes the callers' ValueError/ConfigError guards -> uncaught 500. Raise ValueError instead.
+        raise ValueError(f"algorithm must be a string, got {type(value).__name__}")
+    value = value.lower()
     if value not in ALGORITHMS:
         raise ValueError(f"unsupported algorithm: {value}; known: {', '.join(ALGORITHMS)}")
     return value

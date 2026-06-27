@@ -277,11 +277,17 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     status = owned_run(run_id, key)
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
-    if status.state == "cancelled":
+    has_active_deploy = deployment.get("state") not in (None, "undeployed", "dry_run")
+    # A cancelled run can still serve a per-step checkpoint it deployed: attach_checkpoint_deployment
+    # keeps the run `cancelled` but registers a live adapter that /v1/deployments lists as active. Only
+    # block chat when there's no active deployment to serve (the deploy itself is gated in deploy()).
+    if status.state == "cancelled" and not has_active_deploy:
         raise HTTPException(
-            status_code=409, detail=f"run {run_id} was cancelled; redeploy is not allowed"
+            status_code=409,
+            detail=f"run {run_id} was cancelled; deploy a checkpoint with "
+            f"`flash deploy {run_id} --step <N>` first",
         )
-    if deployment.get("state") in (None, "undeployed", "dry_run"):
+    if not has_active_deploy:
         raise HTTPException(
             status_code=409,
             detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
