@@ -2,8 +2,8 @@
 
 Flash no longer runs its own per-run vLLM endpoint. Instead the control plane is a
 thin client of the freesolo serving service (a Modal multi-LoRA app that serves every
-adapter on a single GPU per base model, scaling to zero when idle — so there is no
-flash-side idle billing to track). The same CLI commands and control-plane endpoints
+adapter on shared base-model capacity — so there is no flash-side idle billing to
+track). The same CLI commands and control-plane endpoints
 (`deploy`/`undeploy`/`chat`/`deployments`) stay; only what they do under the hood
 changed.
 
@@ -11,17 +11,21 @@ The serving service exposes:
 
 - ``POST {FREESOLO_SERVING_URL}/adapters`` — register/deploy an adapter (auth header).
 - ``DELETE {FREESOLO_SERVING_URL}/adapters/{adapterId}`` — undeploy (auth header).
-- ``POST {FREESOLO_SERVING_URL}/v1/chat/completions`` — OpenAI-style chat (no auth).
+- ``POST {FREESOLO_SERVING_URL}/v1/chat/completions`` — OpenAI-style chat.
 - ``GET {FREESOLO_SERVING_URL}/healthz`` / ``GET .../adapters`` — health / list.
 
 The registration/teardown calls carry the shared ``X-Freesolo-Internal-Key`` header
-(the same internal credential flash already holds, ``FREESOLO_INTERNAL_KEY``); chat is
-unauthenticated.
+(the same internal credential flash already holds, ``FREESOLO_INTERNAL_KEY``). The chat
+calls also send it: the control plane is a trusted server-to-server caller (it has already
+authorized the user's key on its own ``/v1/runs/{run_id}/chat`` route), so it uses the
+serving app's internal-key bypass when serving enforces external chat auth.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 
 import httpx
@@ -33,9 +37,6 @@ logger = get_logger(__name__)
 
 # Default freesolo serving base URL (the Modal multi-LoRA app). Overridable per-env.
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
-
-MODES = ("dev", "always-on")
-DEFAULT_IDLE_TIMEOUT_S = 300
 
 
 class ServingError(RuntimeError):
@@ -119,11 +120,6 @@ class Deployment:
     gpu: str
     openai_model: str
     endpoint_name: str
-    mode: str = "dev"
-    idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
-    # freesolo serving scales to zero per base model, so flash never bills for idle
-    # serving — there is no flash-side per-run endpoint to keep warm.
-    est_idle_cost_usd_per_day: float = 0.0
     state: str = "ready"
 
     def to_dict(self) -> dict:
@@ -159,10 +155,9 @@ def deploy_adapter(
     hf_repo: str,
     adapter_prefix: str,
     gpu_name: str = "RTX 5090",
-    mode: str = "dev",
-    idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S,
     dry_run: bool = False,
     thinking: bool = False,
+    org_id: str | None = None,
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app.
 
@@ -171,8 +166,6 @@ def deploy_adapter(
     ``{hf_repo}:{adapter_prefix}/adapter``. ``dry_run`` validates/shapes the deployment
     without making the network call.
     """
-    if mode not in MODES:
-        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
     dep = Deployment(
@@ -182,9 +175,6 @@ def deploy_adapter(
         gpu=friendly,
         openai_model=run_id,
         endpoint_name=serving_base_url(),
-        mode=mode,
-        idle_timeout_s=idle_timeout_s,
-        est_idle_cost_usd_per_day=0.0,
         state="dry_run" if dry_run else "ready",
     )
     if dry_run:
@@ -203,6 +193,13 @@ def deploy_adapter(
         "repoType": "dataset",
         "status": "ready",
     }
+    # Attribute the adapter to the deploying org so serving can authorize external chat by org:
+    # the backend maps adapterId -> org via hosted_lora_adapters.org_id, which serving persists
+    # from this field. Normalize (strip) and omit when blank (older callers / whitespace) so the
+    # registration shape is unchanged and a stray " org " can't mis-attribute the adapter.
+    normalized_org_id = (org_id or "").strip()
+    if normalized_org_id:
+        body["orgId"] = normalized_org_id
     _post_adapter_or_raise(f"{base}/adapters", body)
     logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
@@ -271,6 +268,59 @@ def chat(
     # raises on the 303 and the chat fails mid cold-start. max_redirects is raised because a long
     # cold start polls across several redirect cycles before the result is ready.
     with httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client:
-        resp = client.post(f"{base}/v1/chat/completions", json=body)
+        # The control plane is a trusted server-to-server caller (it already authorized the user's
+        # key on the /v1/runs/{run_id}/chat route), so present the internal key to pass serving's
+        # external chat-auth gate. No-op when the gate is off or the key is unset.
+        resp = client.post(f"{base}/v1/chat/completions", json=body, headers=_internal_key_header())
     resp.raise_for_status()
     return resp.json()
+
+
+def _openai_stream_content(lines: Iterator[str]) -> Iterator[str]:
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:").strip()
+        if data == "[DONE]":
+            break
+        if not data:
+            continue
+        chunk = json.loads(data)
+        for choice in chunk.get("choices") or []:
+            content = ((choice.get("delta") or {}).get("content")) or ""
+            if content:
+                yield str(content)
+
+
+def chat_stream(
+    run_id: str,
+    messages: list[dict],
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+) -> Iterator[str]:
+    """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint."""
+    base = serving_base_url()
+    body = {
+        "model": run_id,
+        "messages": messages,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
+        "stream": True,
+    }
+    with (
+        httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client,
+        client.stream(
+            "POST", f"{base}/v1/chat/completions", json=body, headers=_internal_key_header()
+        ) as resp,
+    ):
+        resp.raise_for_status()
+        if "application/json" in resp.headers.get("content-type", ""):
+            payload = resp.json()
+            content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+            if content:
+                yield str(content)
+            return
+        yield from _openai_stream_content(resp.iter_lines())

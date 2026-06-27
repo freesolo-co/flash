@@ -1,20 +1,17 @@
-"""Pluggable GPU substrates (RunPod Flash + Vast.ai verified datacenters).
+"""Pluggable GPU substrates.
 
-The training worker (``flash.engine.worker``) is substrate-neutral — it reads a
-JobSpec from the environment, pulls code from the HF dataset repo, and streams
-artifacts/heartbeats/metrics back to it. Providers differ only in HOW a GPU is priced,
-provisioned, and torn down. Every provider implements the SAME ``base.Provider``
-protocol — that protocol, not the file set, is what makes them interchangeable — and
-each shares a broadly similar module layout (``providers/<name>/{api,auth,pricing,
-gpus,jobs,train,preflight}.py``), with provider-specific additions where needed (e.g.
-``vast/_bootstrap.py``, which has no RunPod analog):
+The training worker (``flash.engine.worker``) reads a JobSpec from the environment, pulls code
+from the HF dataset repo, and streams artifacts/heartbeats/metrics back to it. The provider
+owns pricing, provisioning, polling, cancellation, and teardown.
 
-  runpod  serverless Flash endpoints (the original substrate)
-  vast    verified-datacenter instances (REST only)
+  runpod      serverless Flash endpoints (always on)
+  lambda      Lambda Cloud GPU instances (instance-based complement; iff LAMBDA_API_KEY set)
+  hyperstack  Hyperstack GPU VMs (instance-based complement; iff HYPERSTACK_API_KEY set)
 
 This module is the registry: ``get_provider(name)`` / ``PROVIDER_NAMES``.
-``allocator.allocate`` is the cross-provider "cheapest GPU that fits" policy that
-iterates every registered provider.
+``allocator.allocate`` iterates the active provider list below; ``available_providers`` narrows
+it to the ones configured on THIS control plane (Lambda/Hyperstack are opt-in via their operator
+keys, so a box without them silently behaves exactly as the RunPod-only setup).
 """
 
 from __future__ import annotations
@@ -23,9 +20,8 @@ from functools import cache
 
 from flash.providers.base import Provider
 
-# Registry order is also the tie-break preference (runpod is the longest-validated
-# substrate, so an equal-priced tie prefers it — see allocator.py).
-PROVIDER_NAMES: tuple[str, ...] = ("runpod", "vast")
+# Active provider order is also the tie-break preference (RunPod wins price ties, then Lambda).
+PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "hyperstack")
 
 
 def get_provider(name: str) -> Provider:
@@ -40,8 +36,12 @@ def _get_provider(key: str) -> Provider:
         from flash.providers.runpod import PROVIDER
 
         return PROVIDER
-    if key == "vast":
-        from flash.providers.vast import PROVIDER
+    if key == "lambda":
+        from flash.providers.lambdalabs import PROVIDER
+
+        return PROVIDER
+    if key == "hyperstack":
+        from flash.providers.hyperstack import PROVIDER
 
         return PROVIDER
     raise KeyError(f"unknown provider {key!r} (known: {', '.join(PROVIDER_NAMES)})")
@@ -49,8 +49,8 @@ def _get_provider(key: str) -> Provider:
 
 def available_providers() -> tuple[str, ...]:
     """Provider NAMES usable from this control plane right now: a provider is available when it
-    ``is_configured()`` (creds present). RunPod is the always-on default; Vast needs
-    ``VAST_API_KEY`` (without it, allocation stays on RunPod's static catalog)."""
+    ``is_configured()`` (creds present). RunPod is always on; Lambda/Hyperstack join only when
+    their operator keys are present."""
     return tuple(n for n in PROVIDER_NAMES if get_provider(n).is_configured())
 
 

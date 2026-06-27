@@ -32,22 +32,22 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
     from flash.providers.base import VALIDATED
 
     # The deployed control plane rejects a submit for any non-validated class, so client-side
-    # allocation must only ever pick a class in the live-validated pool — across ALL candidates,
+    # allocation must only ever pick a class in the validated pool — across ALL candidates,
     # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
-    # whose cheapest VALIDATED RunPod class is RTX 3090 @ $0.46 (cheaper unvalidated 24 GB classes
-    # like L4 are excluded). 16 GB unvalidated classes (RTX 2000 Ada @ $0.24) never appear.
+    # whose cheapest VALIDATED RunPod class is RTX A6000 @ $0.49 (cheaper unvalidated 24 GB classes
+    # like L4 are excluded). 24 GB is the floor — sub-24 GB classes were dropped.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert all(c.gpu in VALIDATED for c in a.candidates), [
         c.gpu for c in a.candidates if c.gpu not in VALIDATED
     ]
-    assert a.gpu == "RTX 3090"  # the cheapest VALIDATED 24 GB RunPod class
+    assert a.gpu == "RTX A6000"  # the cheapest VALIDATED RunPod class that fits 24 GB
 
 
 def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
-    """A small SFT fits a 16-17 GB card; the absolute-cheapest fitting class (RTX 2000 Ada /
-    RTX A4000, ~$0.24-0.25) is UNVALIDATED and must be skipped for the cheapest VALIDATED one,
-    so the run actually submits (the live `flash train` default-submit failure this fixes)."""
+    """A small SFT down-routes below 24 GB; the absolute-cheapest fitting class (L4 @ $0.39, 24 GB)
+    is UNVALIDATED and must be skipped for the cheapest VALIDATED one (RTX A6000 @ $0.49), so the
+    run actually submits (the live `flash train` default-submit failure this fixes)."""
     from flash.providers import allocator
     from flash.providers.base import GPU_INFO, VALIDATED
 
@@ -65,13 +65,13 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
 
 
 def test_runpod_allocation_lands_on_full_validated_cards(monkeypatch):
-    """The 0.8B GRPO (24 GB) lands on the cheapest validated 24 GB RunPod card (RTX 3090) and the
-    9B GRPO (80 GB) on the cheapest validated 80 GB RunPod card (A100 PCIe)."""
+    """The 0.8B GRPO (24 GB) lands on the cheapest validated RunPod card that fits (RTX A6000) and
+    the 9B GRPO (80 GB) on the cheapest validated 80 GB RunPod card (A100 PCIe)."""
     from flash.providers import allocator
 
     a08 = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a08.provider == "runpod"
-    assert a08.gpu == "RTX 3090"  # cheapest validated 24 GB RunPod card
+    assert a08.gpu == "RTX A6000"  # cheapest validated RunPod card that fits 24 GB
     a9 = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a9.provider == "runpod"
     assert a9.gpu == "A100 PCIe"  # cheapest validated 80 GB RunPod card
@@ -94,7 +94,7 @@ def test_cheapest_gpu_picks_cheapest_validated_runpod_class(monkeypatch):
     RunPod-provisionable class that fits, matching what the RunPod allocator path provisions."""
     from flash.providers.base import cheapest_gpu
 
-    assert cheapest_gpu(24) == "RTX 3090"  # cheapest validated 24 GB RunPod class
+    assert cheapest_gpu(24) == "RTX A6000"  # cheapest validated RunPod class that fits 24 GB
     assert cheapest_gpu(80) == "A100 PCIe"  # cheapest validated 80 GB RunPod class
 
 
@@ -102,130 +102,10 @@ def test_offline_allocates_static_cheapest(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import cheapest_gpu
 
-    # No live pricing/offers (RunPod-only, static rates): allocation matches cheapest_gpu.
+    # RunPod-only static rates: allocation matches cheapest_gpu.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert a.gpu == cheapest_gpu(24)
-
-
-def test_exclude_gpu_classes_walks_to_next_cheapest(monkeypatch):
-    # The capacity-walk uses exclude_gpu_classes to skip a throttled class WITHOUT lowering the
-    # VRAM floor: re-allocation then returns the NEXT-cheapest fitting class, never raises just
-    # because the cheapest was excluded (as long as something else still fits).
-    from flash.providers import allocator
-
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    base = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    nxt = allocator.allocate(
-        "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({base.gpu})
-    )
-    assert nxt.gpu != base.gpu  # walked past the excluded (throttled) class
-    assert nxt.min_vram_gb == base.min_vram_gb  # same VRAM floor — never sized below need
-    # the excluded class is gone from the candidate pool entirely
-    assert all(c.gpu != base.gpu for c in nxt.candidates)
-
-
-def test_exclude_gpu_classes_provider_scoped(monkeypatch):
-    # PR #4 review (thread 2): a no_capacity failure is RunPod-only (Vast has no IN_QUEUE), so the
-    # exclusion is passed as a (provider, class) pair and must drop ONLY that provider's offer of
-    # the class — the same class on the other provider must survive so an available Vast A100 isn't
-    # skipped because RunPod's A100 queue was starved.
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
-
-    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
-    monkeypatch.setattr(allocator, "available_providers", lambda: ["runpod", "vast"])
-    monkeypatch.setattr(
-        allocator,
-        "_runpod_candidates",
-        lambda *a, **k: [Candidate("runpod", "A100 SXM", 1.50, 80, True)],
-    )
-    monkeypatch.setattr(
-        allocator,
-        "_vast_candidates",
-        lambda *a, **k: ([Candidate("vast", "A100 SXM", 1.00, 80, True)], ()),
-    )
-
-    # Scoped exclusion of the RunPod A100 leaves the (cheaper) Vast A100 selectable.
-    a = allocator.allocate(
-        "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({("runpod", "A100 SXM")})
-    )
-    assert (a.provider, a.gpu) == ("vast", "A100 SXM")
-    assert all(c.provider != "runpod" for c in a.candidates)
-
-    # A bare class string still excludes the class on EVERY provider (legacy market-wide form).
-    from flash.providers.base import UnsupportedGpuError
-
-    with pytest.raises(UnsupportedGpuError):
-        allocator.allocate(
-            "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({"A100 SXM"})
-        )
-
-
-def test_provider_pin_restricts_or_raises(monkeypatch):
-    """The opt-in provider pin restricts allocation to one substrate: provider="runpod" stays on
-    RunPod; provider=None is unchanged (cross-provider cheapest); provider="vast" without a key
-    raises a clear UnsupportedGpuError instead of silently falling back to RunPod."""
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
-
-    # Offline harness: only RunPod is configured (VAST_API_KEY deleted in conftest).
-    # provider=None -> unchanged cross-provider cheapest-wins (here: the static RunPod cheapest).
-    base = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    pinned_rp = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="runpod")
-    assert pinned_rp.provider == "runpod"
-    assert pinned_rp.gpu == base.gpu  # RunPod-only either way offline, so identical
-
-    # Pinning an unavailable provider is a CLEAN config error, never a silent RunPod fall-through.
-    with pytest.raises(UnsupportedGpuError, match=r"provider 'vast' pinned but not available"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
-
-
-def test_provider_pin_vast_returns_vast_allocation(monkeypatch):
-    """With VAST_API_KEY present and a fitting offer, provider="vast" allocates on Vast (and
-    excludes RunPod from the candidate pool entirely)."""
-    from flash.providers import allocator
-    from flash.providers.vast import jobs as vast_jobs
-    from tests._helpers.vast import make_vast_offer
-
-    # Make Vast "available" and feed the allocator a single fitting, validated offer.
-    monkeypatch.setenv("VAST_API_KEY", "x")
-    offer = make_vast_offer(gpu="RTX 3090", vram_gb=24, dph_total=0.20)
-    monkeypatch.setattr(vast_jobs, "usable_offers", lambda *a, **k: [offer])
-
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
-    assert a.provider == "vast"
-    assert a.gpu == "RTX 3090"
-    assert all(c.provider == "vast" for c in a.candidates)  # RunPod excluded by the pin
-
-
-def test_vast_allocation_passes_node_gpu_count_into_offer_search(monkeypatch):
-    """A disaggregated GRPO run ([train].inference_gpus>0) needs a MULTI-GPU node
-    (inference_gpus + 1 trainer card). The allocator must thread that count into the Vast offer
-    search (usable_offers -> search_offers) so it actually searches multi-GPU machines instead of
-    1-GPU offers that read as 'no capacity'. A colocated run (inference_gpus 0/absent) stays 1."""
-    from flash.providers import allocator
-    from flash.providers.vast import jobs as vast_jobs
-    from tests._helpers.vast import make_vast_offer
-
-    monkeypatch.setenv("VAST_API_KEY", "x")
-    captured = {}
-
-    def fake_usable(min_vram_gb, disk_gb, exclude_machine_ids=frozenset(), num_gpus=1):
-        captured["num_gpus"] = num_gpus
-        return [make_vast_offer(gpu="A100 SXM", vram_gb=80, dph_total=1.0)]
-
-    monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
-
-    # Disaggregated: inference_gpus=2 -> a 3-GPU node (2 rollout + 1 trainer).
-    allocator.allocate(
-        "Qwen/Qwen3.5-4B", "grpo", provider="vast", train={"inference_gpus": 2}
-    )
-    assert captured["num_gpus"] == 3
-
-    # Colocated default (no inference_gpus) -> single-GPU search.
-    allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
-    assert captured["num_gpus"] == 1
 
 
 def test_nothing_fits_names_constraint(monkeypatch):

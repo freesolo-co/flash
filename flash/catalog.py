@@ -17,11 +17,10 @@ def normalize_algorithm(value: str) -> str:
     return value
 
 
-# The default GPU class a run lands on when none is pinned (also the open-model-policy
+# The default GPU class used as the open-model-policy
 # sizing reference and the spec/from_dict fallback). The managed GPU class set (KNOWN)
-# lives in providers.base; per-provider classes and pricing live under
-# providers/{runpod,vast}. Defined above ModelInfo so it can back the recommended_gpu
-# field default.
+# lives in providers.base; RunPod pricing lives under providers/runpod. Defined above
+# ModelInfo so it can back the recommended_gpu field default.
 DEFAULT_GPU = "RTX 5090"
 
 # Output vocab (== config.vocab_size, the lm_head / logits width — the PADDED model vocab,
@@ -105,7 +104,7 @@ class ModelInfo:
 
 # The default model Flash trains when a config omits one. A current-gen dense 4B
 # (text-only fine-tune) on the modern worker stack — the safe out-of-the-box choice for
-# the average developer. It is thinking-"hybrid"; the thinking flag now defaults ON.
+# the average developer. It is thinking-"hybrid"; the thinking flag defaults OFF.
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 MODELS: dict[str, ModelInfo] = {

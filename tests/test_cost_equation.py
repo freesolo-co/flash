@@ -1,13 +1,13 @@
 """Cost estimator invariants: the dollar figure is fully first-principles -- NO output
-multiplier (the anti-reward-hacking invariant), priced at the realized market rate, with
-concurrent reward grading. No network."""
+multiplier (the anti-reward-hacking invariant), priced at the static GPU rate, with concurrent
+reward grading. No network."""
 
 from __future__ import annotations
 
 import dataclasses
 
 from flash.cost import RunConfig, estimate_cost
-from flash.cost.facts import gpu_hourly_usd, realized_hourly_usd
+from flash.cost.facts import gpu_hourly_usd
 from flash.cost.types import CostEstimate
 
 
@@ -22,16 +22,15 @@ def test_total_is_exactly_wall_hours_times_rate():
     so any smuggled-in scaling fails)."""
     e = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 50))
     assert e.total_usd == e.wall_clock_hours * e.gpu_hourly_usd
-    assert e.gpu_hourly_usd == realized_hourly_usd(e.gpu)
+    assert e.gpu_hourly_usd == gpu_hourly_usd(e.gpu)
 
 
-def test_prices_at_realized_rate():
-    """Observed classes price at the realized (spot/queue) rate, usually below list; an
-    unobserved class falls back to the list price (no rate invented)."""
-    for cls in ("RTX 5090", "A100 PCIe", "RTX 3090"):
-        assert realized_hourly_usd(cls) < gpu_hourly_usd(cls)
-    assert realized_hourly_usd("A40") == gpu_hourly_usd("A40")  # unobserved -> list
-    assert realized_hourly_usd("H100") == gpu_hourly_usd("H100") == 3.29  # no clean rate -> list
+def test_prices_at_static_rate():
+    """Cost uses the static GPU registry rate directly."""
+    from flash.providers.base import GPU_INFO
+
+    for cls in ("RTX 5090", "A100 PCIe", "RTX 4090", "A40", "H100"):
+        assert gpu_hourly_usd(cls) == GPU_INFO[cls].hourly_usd
 
 
 def test_concurrent_reward_keeps_heavy_grpo_off_the_floor():

@@ -12,6 +12,7 @@ import urllib.error
 from typing import Any
 
 from flash.providers._http import RestClient
+from flash.providers.runpod import keys as _keys
 
 REST_BASE = "https://rest.runpod.io/v1"
 QUEUE_BASE = "https://api.runpod.ai/v2"
@@ -24,7 +25,18 @@ class RunpodApiError(RuntimeError):
 # Shared urllib client (full-URL form: callers pass absolute REST/QUEUE urls).
 # Env-only by design: ~/.flash/config.json holds the *Flash* key (client-side),
 # never the RunPod key — the operator sets RUNPOD_API_KEY on the control-plane host.
-_CLIENT = RestClient(env_var="RUNPOD_API_KEY", error_cls=RunpodApiError)
+#
+# ``RUNPOD_API_KEY`` may be a comma-separated pool of per-account keys: the client tries
+# them active-account-first per call (``keys.ordered_keys``) and fails over to the next
+# account on an auth/quota/not-found error (``keys.is_failover_error``). RunPod endpoints
+# are account-scoped, so a single-account op (status/cancel/delete) resolves no matter
+# which account a failed-over run was provisioned on. A single key => a pool of one.
+_CLIENT = RestClient(
+    env_var="RUNPOD_API_KEY",
+    error_cls=RunpodApiError,
+    keys_provider=_keys.ordered_keys,
+    failover_predicate=_keys.is_failover_error,
+)
 
 
 def request_with_retries(
@@ -44,8 +56,37 @@ def request_with_retries(
 # Endpoints
 # ---------------------------------------------------------------------------
 def list_endpoints() -> list[dict]:
-    out = request_with_retries(f"{REST_BASE}/endpoints")
-    return out if isinstance(out, list) else []
+    # ``RUNPOD_API_KEY`` may be a comma-separated pool of per-account keys. RunPod
+    # endpoints are account-scoped: a plain request_with_retries() call stops at the
+    # first key that succeeds and returns only *that* account's endpoints. Idle-sweep
+    # and slot-reconcile need the full fleet across every account in the pool, so we
+    # query each key independently (with per-key retries) and aggregate.
+    #
+    # Raises on any per-key failure so callers that treat an empty result as "confirmed
+    # absent" (teardown, slot-reconcile) don't act on an incomplete view. Both
+    # sweep_idle_endpoints() and the slot reconcile already catch and skip on exception.
+    pool = _keys.keys()
+    if not pool:
+        # No RUNPOD_API_KEY at all: an empty `pool` would make this return [] WITHOUT a single
+        # authenticated call, and callers read [] as "the fleet is empty / confirmed absent" and may
+        # act on that (teardown, slot-reconcile). Fail loud instead — matching the old single-call
+        # request_with_retries() behavior, which raised on a missing key.
+        raise RunpodApiError(
+            "RUNPOD_API_KEY is not set; refusing to report an empty endpoint fleet"
+        )
+    all_endpoints: list[dict] = []
+    for key in pool:
+        out = _CLIENT.request_with_retries_for_key(key, f"{REST_BASE}/endpoints", retries=2)
+        if not isinstance(out, list):
+            # A 200 whose body isn't the expected list is NOT an empty account — silently skipping it
+            # (the old behavior) yields a partial fleet view that callers trust as complete. Raise so
+            # the per-key failure surfaces, consistent with this function's "fail, don't under-report"
+            # contract above.
+            raise RunpodApiError(
+                f"unexpected /endpoints response for a pool key (got {type(out).__name__}, want list)"
+            )
+        all_endpoints.extend(out)
+    return all_endpoints
 
 
 def find_endpoints_by_name(substr: str) -> list[dict]:

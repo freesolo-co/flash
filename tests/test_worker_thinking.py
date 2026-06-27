@@ -13,6 +13,8 @@ import importlib
 import json
 import os
 
+import pytest
+
 _WORKER_ENV = (
     "HF_REPO",
     "RUN_MODE",
@@ -68,7 +70,7 @@ def test_strip_think_unit():
 
 def test_thinking_budget_selection(monkeypatch):
     # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
-    # this CPU dry-run doesn't reach the Prime Hub. We only exercise THINKING / micro-batch here.
+    # this CPU dry-run doesn't load the Freesolo env. We only exercise THINKING / micro-batch here.
     monkeypatch.setattr("flash.envs.registry.load_environment", lambda *a, **k: object())
     saved = _set_thinking_worker_env()
     import flash.engine.worker as ne
@@ -76,15 +78,16 @@ def test_thinking_budget_selection(monkeypatch):
     try:
         importlib.reload(ne)
         assert ne.THINKING is True
-        # GRPO micro-batch shrinks (logits VRAM scales with seq len); effective batch
-        # is preserved through grad-accum
-        assert ne.rl_per_device_comps() == 2
-        b = ne.compute_grpo_batching(64, 8, ne.rl_per_device_comps())
+        # Thinking default micro-batch is 2 (vs 8); effective batch is preserved through grad-accum.
+        # use_vllm=False asserts the offline default deterministically (no dependence on a host GPU,
+        # which would engage the colocate VRAM-growth path).
+        assert ne.rl_per_device_comps(use_vllm=False) == 2
+        b = ne.compute_grpo_batching(64, 8, ne.rl_per_device_comps(use_vllm=False))
         assert b["unique_prompts_per_step"] == 64
         assert b["divisible_by_group"]
         # RL_PER_DEVICE_PROMPTS is no longer an override — the default + auto-caps stand.
         os.environ["RL_PER_DEVICE_PROMPTS"] = "4"
-        assert ne.rl_per_device_comps() == 2
+        assert ne.rl_per_device_comps(use_vllm=False) == 2
     finally:
         _restore_env(saved)
     # thinking off: a JobSpec with thinking=false -> original (larger) micro-batch
@@ -99,7 +102,7 @@ def test_thinking_budget_selection(monkeypatch):
     try:
         importlib.reload(ne)
         assert ne.THINKING is False
-        assert ne.rl_per_device_comps() == 8
+        assert ne.rl_per_device_comps(use_vllm=False) == 8
     finally:
         os.environ.pop("FLASH_JOB_SPEC_JSON", None)
         importlib.reload(ne)
@@ -195,3 +198,13 @@ def test_rl_per_device_comps_colocated_flag(monkeypatch):
     assert disagg >= colocated
     # and on this tiny fake card the cap actually bites, so the two genuinely differ
     assert disagg > colocated
+
+
+def test_grpo_prompts_per_step_caps_to_available_dataset():
+    import flash.engine.worker as ne
+
+    importlib.reload(ne)
+    assert ne.resolve_grpo_prompts_per_step(requested=64, available_prompts=3) == 3
+    assert ne.resolve_grpo_prompts_per_step(requested=2, available_prompts=10) == 2
+    with pytest.raises(ValueError, match="at least one retained training prompt"):
+        ne.resolve_grpo_prompts_per_step(requested=64, available_prompts=0)

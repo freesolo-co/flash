@@ -1,23 +1,24 @@
-"""Cross-provider GPU allocation: the cheapest class that comfortably fits the run.
+"""GPU allocation: the cheapest fitting class across the active providers.
 
 Given a base model (+ algorithm), compute the VRAM the FULL run needs — sized for the
-heavier phase, GRPO, since the typical pipeline is SFT followed by GRPO — then rank
-every provisionable candidate across ALL registered providers by live $/hr and pick the
-cheapest:
+heavier phase, GRPO, since the typical pipeline is SFT followed by GRPO — then rank every
+fitting candidate by $/hr and pick the cheapest:
 
-  runpod  every Flash-provisionable class (live pricing, cached; static fallback)
-  vast    live verified-datacenter offers (usable_offers' quality floors applied)
+  runpod      every validated Flash-provisionable class (static $/hr)
+  lambda      every fitting class that currently has LIVE regional capacity (live $/hr); opt-in,
+              available only when LAMBDA_API_KEY is set on the control plane
+  hyperstack  every fitting class whose single-GPU flavor currently has STOCK (static $/hr); opt-in,
+              available only when HYPERSTACK_API_KEY is set on the control plane
 
-Allocation happens at SUBMIT time in the runner (offers are a volatile market);
-the parse-time resolution in schema is a RunPod-static provisional for
-validation/dry-run display. With no live pricing/offers reachable (no network, or no
-``VAST_API_KEY``) the allocator degrades to exactly ``cheapest_gpu``'s deterministic
-static-rate answer (RunPod only — Vast is off without its key).
+RunPod's cheaper static rates almost always win on price, so the instance providers (Lambda,
+Hyperstack) join the ranked list as capacity COMPLEMENTS: when RunPod's cheapest fitting class is
+out of capacity (THROTTLED / queue backstop), the runner's gpu-walk steps down the ranked list and
+reaches an in-capacity instance class. Both instance providers are capacity-filtered up front
+(``_lambda_candidates`` / ``_hyperstack_candidates`` only offer a class a region/flavor can supply
+right now), so the walk never lands on a class that would just fail to launch.
 
-Provider-agnostic by construction: it walks the registered providers and asks each for
-its ``gpu_classes()`` + ``hourly_rate()``; the only provider-specific knowledge is that
-Vast classes come from a live offer book (collected through the provider's
-``usable_offers`` and carried opaquely on ``Candidate.offer``).
+Allocation happens at SUBMIT time in the runner. The parse-time resolution in schema is a
+RunPod-static provisional for validation/dry-run display.
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ from flash.providers.base import (
     Candidate,
     UnsupportedGpuError,
 )
-from flash.spec import node_gpus_from_train
 
 logger = get_logger(__name__)
 
@@ -196,161 +196,101 @@ def _params_b_for_vram(model_id: str) -> float | None:
         return None
 
 
-def _is_excluded(provider: str, gpu: str, exclude_gpu_classes: frozenset) -> bool:
-    """Whether a (provider, gpu) candidate is excluded by ``exclude_gpu_classes``.
-
-    Exclusions are provider-SCOPED ``(provider, gpu)`` tuples — the no_capacity form: a RunPod
-    IN_QUEUE starvation says nothing about the SAME class on Vast, so only RunPod's offer of it is
-    dropped while Vast's survives. (A bare class string, if ever passed, is treated as a market-wide
-    ban across every provider.)
-    """
-    return gpu in exclude_gpu_classes or (provider, gpu) in exclude_gpu_classes
-
-
-def _runpod_candidates(need: int, exclude_gpu_classes: frozenset) -> list[Candidate]:
-    """RunPod's fitting, live-validated classes priced live (static fallback).
+def _runpod_candidates(need: int) -> list[Candidate]:
+    """RunPod's fitting, validated classes priced by the static table.
 
     Restricted to the validated pool (``g.validated``): the deployed control plane rejects a submit
-    for any non-validated class, so allocating one would only fail at submit time. A class excluded
-    by ``exclude_gpu_classes`` (a ``("runpod", gpu)`` tuple) is dropped — used to walk OFF a
-    capacity-starved RunPod class while leaving the same class on another provider selectable.
+    for any non-validated class, so allocating one would only fail at submit time.
     """
     provider = get_provider("runpod")
     return [
         Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb)
         for g in provider.gpu_classes()
-        if g.vram_gb >= need
-        and g.validated
-        and not _is_excluded("runpod", g.name, exclude_gpu_classes)
+        if g.vram_gb >= need and g.validated
     ]
 
 
-def _vast_candidates(
-    need: int,
-    disk_gb: int,
-    exclude_machine_ids,
-    exclude_gpu_classes: frozenset,
-    num_gpus: int = 1,
-) -> tuple[list[Candidate], tuple]:
-    """Vast's fitting, live-validated classes from the live offer book (cheapest per class).
+def _lambda_candidates(need: int) -> list[Candidate]:
+    """Lambda's fitting classes that currently have LIVE capacity, priced live.
 
-    Returns (candidates, full_offer_book). Restricted to the validated pool (``GPU_INFO[gpu]
-    .validated``) — the deployed control plane rejects a submit for any non-validated class. A Vast
-    offer-search failure is caught and degrades to the other providers (RunPod): it is non-fatal AS
-    LONG AS another provider can supply a fitting class. If Vast is the only available provider, the
-    empty result means ``allocate`` then raises (nothing across any provider fits) — i.e. it is only
-    fatal when Vast was the sole option.
+    Capacity-aware by design: a Lambda class with no region advertising capacity is EXCLUDED, so
+    the allocator never hands the runner a Lambda class that would immediately fail to launch (and
+    burn a retry) — directly the "GPU allocation is good, doesn't randomly die" property. A Lambda
+    capacity-lookup failure (no key / network blip) degrades to the other providers: it is
+    non-fatal as long as another provider can supply a fitting class.
     """
-    from flash.providers.base import GPU_INFO
-    from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
+    from flash.providers.lambdalabs.jobs import usable_instances
 
-    book: list = []
-    try:
-        # The offer search must use the SAME disk floor instances are actually provisioned with
-        # (a smaller requested ``disk_gb`` would surface offers that then fail to rent). ``num_gpus``
-        # is the per-instance GPU count (1 colocated, inference_gpus+1 disaggregated): a multi-GPU
-        # run must search multi-GPU machines, not 1-GPU offers masquerading as "no capacity".
-        book = usable_offers(
-            need,
-            max(float(disk_gb), MIN_DISK_GB),
-            exclude_machine_ids=exclude_machine_ids,
-            num_gpus=num_gpus,
-        )
-    except Exception as exc:
-        logger.warning("vast offer search failed (%s); allocating on runpod only", exc)
+    provider = get_provider("lambda")
     out: list[Candidate] = []
-    seen: set[str] = set()
-    for o in book:
-        if o.gpu in seen:  # offers are price-sorted; keep the cheapest per class
-            continue
-        if not GPU_INFO[o.gpu].validated:  # only offer live-validated classes the server accepts
-            continue
-        # walked OFF this provider's capacity-starved offer via a ("vast", gpu) tuple on the
-        # no_capacity infra retry
-        if _is_excluded("vast", o.gpu, exclude_gpu_classes):
-            continue
-        seen.add(o.gpu)
-        out.append(Candidate("vast", o.gpu, o.dph_total, GPU_INFO[o.gpu].vram_gb, offer=o))
-    return out, tuple(book)
+    try:
+        for g in provider.gpu_classes():
+            if g.vram_gb < need:
+                continue
+            # usable_instances reads the cached /instance-types, so only the first call hits the API.
+            if usable_instances(g.name):
+                out.append(Candidate("lambda", g.name, provider.hourly_rate(g.name), g.vram_gb))
+    except Exception as exc:
+        logger.warning("lambda capacity lookup failed (%s); allocating without lambda", exc)
+        return []
+    return out
+
+
+def _hyperstack_candidates(need: int) -> list[Candidate]:
+    """Hyperstack's fitting classes that currently have flavor STOCK, priced statically.
+
+    Capacity-aware, exactly like Lambda: a class with no in-stock flavor is excluded so the runner
+    never walks onto a class that would immediately fail to launch. A capacity-lookup failure
+    degrades to the other providers.
+    """
+    from flash.providers.hyperstack.jobs import usable_instances
+
+    provider = get_provider("hyperstack")
+    out: list[Candidate] = []
+    try:
+        for g in provider.gpu_classes():
+            if g.vram_gb < need:
+                continue
+            # usable_instances reads the cached /core/flavors, so only the first call hits the API.
+            if usable_instances(g.name):
+                out.append(Candidate("hyperstack", g.name, provider.hourly_rate(g.name), g.vram_gb))
+    except Exception as exc:
+        logger.warning("hyperstack capacity lookup failed (%s); allocating without hyperstack", exc)
+        return []
+    return out
 
 
 def allocate(
     model_id: str,
     algorithm: str,
     *,
-    disk_gb: int = 60,
-    exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
-    exclude_gpu_classes: set | frozenset = frozenset(),
     train=None,
     thinking: bool = False,
-    provider: str | None = None,
 ) -> Allocation:
-    """Pick the cheapest (provider, GPU class) able to run the job across the live providers.
+    """Pick the cheapest fitting (provider, GPU class) able to run the job.
 
-    By default there is no GPU pin and no provider pin — every fitting, LIVE-VALIDATED class on
-    every live provider is eligible, and the cheapest wins. An OPT-IN ``provider`` pin ("vast" /
-    "runpod") restricts the candidate pool to that single substrate (for A/B-ing one provider
-    against the full pool); ``None`` keeps the cross-provider cheapest-wins behavior. A pin to a
-    provider that isn't live/configured raises ``UnsupportedGpuError``.
-
-    Allocation is restricted to the validated pool
-    (``GpuClass.validated``) because the deployed control plane rejects a submit for any
-    non-validated class, so picking the absolute-cheapest fitting class (e.g. an unvalidated "RTX
-    2000 Ada") would just make the server refuse the run. ``train``/``thinking`` size the
-    requirement to the run's actual knobs (context, group, rank, batch) via the matrix.
-
-    ``exclude_gpu_classes`` drops candidates from the pool via ``(provider, gpu)`` TUPLES that
-    exclude a class on ONLY that provider (the no_capacity walk: a RunPod IN_QUEUE starvation says
-    nothing about the SAME class on Vast, so only RunPod's offer of it is dropped while Vast's stays
-    selectable). A bare class string, if passed, bans the class market-wide.
+    There is no GPU pin — every fitting class on every available provider is eligible, and the
+    cheapest wins. RunPod is restricted to its validated pool (``GpuClass.validated``) because the
+    deployed control plane rejects a submit for any non-validated class; the instance providers
+    (Lambda via LAMBDA_API_KEY, Hyperstack via HYPERSTACK_API_KEY — both opt-in) each contribute
+    their fitting classes that currently have live capacity/stock. RunPod's cheaper static rates
+    usually win, with Lambda and Hyperstack joining as capacity complements lower in the ranked list.
+    ``train``/``thinking`` size the requirement to the run's actual knobs (context, group, rank,
+    batch) via the matrix.
     """
-    exclude_gpu_classes = frozenset(exclude_gpu_classes)
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
-    live = available_providers()
-    if provider is not None:
-        # OPT-IN provider pin: restrict the candidate pool to the one named substrate. A pin to a
-        # provider that isn't live/configured (e.g. "vast" without VAST_API_KEY) is a clear config
-        # error, not a silent fall-through to the other provider — A/B "vast-only" must NOT quietly
-        # run on RunPod.
-        live = tuple(p for p in live if p == provider)
-        if not live:
-            raise UnsupportedGpuError(
-                f"provider {provider!r} pinned but not available/configured "
-                f"(live: {available_providers() or '(none)'}); "
-                "set its credentials (e.g. VAST_API_KEY for vast) or remove the [gpu] provider pin"
-            )
+    available = available_providers()
     candidates: list[Candidate] = []
-    offer_book: tuple = ()
-    if "runpod" in live:
-        candidates += _runpod_candidates(need, exclude_gpu_classes)
-    if "vast" in live:
-        # Per-instance GPU count the run needs (1 colocated, inference_gpus+1 disaggregated),
-        # derived from the run's [train] spec/dict so a disaggregated GRPO run searches multi-GPU
-        # offers (not 1-GPU offers that then read as "no capacity"). Shares one source of truth with
-        # gpus_per_node so the parse-time and submit-time topologies match.
-        vast_num_gpus = node_gpus_from_train(train)
-        vcands, offer_book = _vast_candidates(
-            need, disk_gb, exclude_machine_ids, exclude_gpu_classes, num_gpus=vast_num_gpus
-        )
-        candidates += vcands
-    # Authoritative exclusion at the allocate level (the per-provider helpers also pre-filter, so
-    # the real path never even fetches an excluded offer; this re-applies it on the combined list so
-    # a bare-string market-wide ban or a (provider, gpu)-scoped ban holds regardless of how the
-    # candidates were produced).
-    if exclude_gpu_classes:
-        candidates = [
-            c for c in candidates if not _is_excluded(c.provider, c.gpu, exclude_gpu_classes)
-        ]
+    if "runpod" in available:
+        candidates += _runpod_candidates(need)
+    if "lambda" in available:
+        candidates += _lambda_candidates(need)
+    if "hyperstack" in available:
+        candidates += _hyperstack_candidates(need)
     if not candidates:
-        excluded = (
-            f" (excluding GPU classes {sorted(map(repr, exclude_gpu_classes))})"
-            if exclude_gpu_classes
-            else ""
-        )
         raise UnsupportedGpuError(
-            f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any live provider "
-            f"({', '.join(live) or '(none)'}){excluded}; add VAST_API_KEY for more classes, or the "
-            "run genuinely exceeds every available GPU class"
+            f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
+            f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
         )
     # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small job),
     # then registry order.
@@ -363,8 +303,6 @@ def allocate(
         hourly_usd=best.hourly_usd,
         min_vram_gb=need,
         candidates=tuple(ranked),
-        offer=best.offer,
-        provider_offers=offer_book,
     )
 
 
@@ -373,11 +311,6 @@ def allocation_summary(a: Allocation) -> str:
         f"allocated {a.gpu} on {a.provider} at ${a.hourly_usd:.2f}/hr "
         f"(need >= {a.min_vram_gb} GB VRAM"
     )
-    # ``a.offer`` is an OPAQUE per-provider provisioning hint, not necessarily a Vast
-    # offer — only format Vast specifics when the chosen provider is vast, so a future
-    # provider's hint never misformats or raises on a missing attribute.
-    if a.provider == "vast" and a.offer is not None:
-        head += f", vast offer {a.offer.offer_id} in {a.offer.geolocation}"
     head += ")"
     if len(a.candidates) > 1:
         nxt = a.candidates[1]

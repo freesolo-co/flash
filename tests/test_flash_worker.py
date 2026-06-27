@@ -27,7 +27,6 @@ def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
     from flash.providers.runpod.train import build_worker_env
 
     knobs = {
-        "RL_VLLM_SLEEP": "1",
         "VLLM_USE_V1": "0",
         "SFT_PER_DEVICE_BS": "4",
     }
@@ -41,12 +40,15 @@ def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
     assert "PYTORCH_CUDA_ALLOC_CONF" in env
 
 
-def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
+def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
+    """flash is fully managed: an operator PYTORCH_CUDA_ALLOC_CONF in the process env does NOT
+    override flash's computed allocator conf (RL is non-expandable, sleep-safe)."""
     from flash.providers.runpod.train import build_worker_env
 
-    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
-    env = build_worker_env(_spec(), 0)
-    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:999")
+    env = build_worker_env(_spec(), 0)  # grpo -> sleep-safe non-expandable
+    assert env["PYTORCH_CUDA_ALLOC_CONF"] != "max_split_size_mb:999"
+    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
 @pytest.mark.parametrize(
@@ -84,43 +86,14 @@ def test_build_worker_env_forwards_judge_model(monkeypatch):
     assert "FLASH_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
 
 
-def test_build_worker_env_forwards_linkd_live_quality_env(monkeypatch):
-    """The linkd live-quality envs read these aliases on the worker; forward them from the
-    control-plane process so secrets do not need to be serialized into a run's [worker_env].
-
-    ``freesolo-co/linkd-profilematch`` reads MONGO_URL directly, while the older linkd-search env
-    reads LINKD_MONGO_URL.
-    """
+def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
+    """The worker receives the control-plane token used for managed Freesolo environments."""
     from flash.providers.runpod.train import build_worker_env
 
-    linkd_env = {
-        "MONGO_URL": "mongodb://example.invalid/db",
-        "LINKD_MONGO_URL": "mongodb://example.invalid/db",
-        "LINKD_JUDGE_AUTH": "judge-secret",
-        "LINKD_JUDGE_MODEL": "accounts/fireworks/models/gpt-oss-120b",
-        "LINKD_JUDGE_BASE_URL": "https://api.example.invalid/inference/v1",
-    }
-    for k, v in linkd_env.items():
-        monkeypatch.setenv(k, v)
-
-    env = build_worker_env(_spec(), 0)
-    for k, v in linkd_env.items():
-        assert env.get(k) == v, f"{k} not forwarded to worker"
-
-    for k in linkd_env:
-        monkeypatch.delenv(k, raising=False)
-    env2 = build_worker_env(_spec(), 0)
-    assert not any(k in env2 for k in linkd_env)
-
-
-def test_build_worker_env_forwards_prime_api_key(monkeypatch):
-    """The worker needs PRIME_API_KEY to `prime env install` the run's Hub env(s)."""
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.setenv("PRIME_API_KEY", "pit-secret")
-    assert build_worker_env(_spec(), 0).get("PRIME_API_KEY") == "pit-secret"
-    monkeypatch.delenv("PRIME_API_KEY", raising=False)
-    assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
+    assert build_worker_env(_spec(), 0).get("GITHUB_TOKEN") == "ghp-secret"
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    assert "GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):
@@ -139,11 +112,33 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
     assert env["WANDB_API_KEY"] == "user-wb"
 
 
+def test_build_worker_env_forwards_declared_environment_runtime_secrets():
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+    )
+
+    env = build_worker_env(
+        spec,
+        0,
+        runtime_secrets={
+            "SERPAPI_API_KEY": "serp-user",
+            "UNDECLARED_API_KEY": "must-not-forward",
+        },
+    )
+    assert env["SERPAPI_API_KEY"] == "serp-user"
+    assert "UNDECLARED_API_KEY" not in env
+
+
 def test_build_worker_env_forwards_upload_console(monkeypatch):
     """FLASH_UPLOAD_CONSOLE (upload the worker console on SUCCESS, not just on crash) is read on the
-    worker by run_mode() from the forwarded env dict — RunPod _train_body AND the Vast bootstrap,
-    both of which reuse this build_worker_env. It MUST be on the allowlist or the success-console
-    upload silently no-ops on every remote run."""
+    worker by run_mode() from the forwarded env dict. It MUST be on the allowlist or the
+    success-console upload silently no-ops on every remote run."""
     from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")
@@ -192,7 +187,7 @@ def _clear_chalk_flags(monkeypatch):
     # extra-pip assertions.
     from flash.engine.chalk_kernels import _KERNELS
 
-    for k in (*(flag for flag, _kw, _on in _KERNELS), "FLASH_CHALK_SPEC", "FLASH_CHALK_WHEEL"):
+    for k in (*(flag for flag, _kw, _on in _KERNELS), "FLASH_CHALK_SPEC"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -224,17 +219,6 @@ def test_chalk_extra_pip_defaults_to_pypi_without_spec(monkeypatch):
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
     assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk")
     assert "<" in DEFAULT_CHALK_SPEC  # bounded range, not an unpinned floating install
-
-
-def test_chalk_extra_pip_uses_staged_wheel_without_spec(monkeypatch, tmp_path):
-    """FLASH_CHALK_WHEEL stages a local wheel and should not require a second worker path knob."""
-    from flash.providers.runpod.train import chalk_extra_pip
-
-    _clear_chalk_flags(monkeypatch)
-    wheel = tmp_path / "freesolo_chalk-0.4.12-py3-none-any.whl"
-    wheel.write_bytes(b"wheel")
-    monkeypatch.setenv("FLASH_CHALK_WHEEL", str(wheel))
-    assert chalk_extra_pip() == ["/runcode/code/wheels/freesolo_chalk-0.4.12-py3-none-any.whl"]
 
 
 def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
@@ -353,51 +337,6 @@ def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
     assert chalk_extra_pip(spec) == []
 
 
-def test_local_env_wheel_extra_pip_skips_prime_hub(monkeypatch, tmp_path):
-    """A staged local env wheel installs through extra_pip and replaces Prime Hub install."""
-    from flash.providers.runpod.train import hub_env_ids_for_run, local_env_extra_pip
-
-    monkeypatch.delenv("FLASH_ENV_WHEEL", raising=False)
-    assert local_env_extra_pip() == []
-    assert hub_env_ids_for_run("owner/env") == ["owner/env"]
-
-    wheel = tmp_path / "linkd_profilematch-0.1.1-py3-none-any.whl"
-    wheel.write_bytes(b"wheel")
-    monkeypatch.setenv("FLASH_ENV_WHEEL", str(wheel))
-    assert local_env_extra_pip() == [
-        "/runcode/code/wheels/linkd_profilematch-0.1.1-py3-none-any.whl"
-    ]
-    assert hub_env_ids_for_run("owner/env") == []
-
-
-def test_local_env_wheel_must_be_wheel(monkeypatch, tmp_path):
-    from flash.providers.runpod.train import local_env_extra_pip
-
-    bad = tmp_path / "linkd_profilematch.zip"
-    bad.write_bytes(b"not a wheel")
-    monkeypatch.setenv("FLASH_ENV_WHEEL", str(bad))
-    with pytest.raises(ValueError, match="FLASH_ENV_WHEEL"):
-        local_env_extra_pip()
-
-
-def test_runpod_live_function_flag_disables_baked_image(monkeypatch):
-    import flash.providers.runpod.jobs as jobs
-
-    monkeypatch.delenv("FLASH_RUNPOD_LIVE_FUNCTION", raising=False)
-    assert jobs._use_baked_worker_image() is True
-    monkeypatch.setenv("FLASH_RUNPOD_LIVE_FUNCTION", "1")
-    assert jobs._use_baked_worker_image() is False
-
-
-def test_resolve_worker_deps_drops_pypi_chalk_when_staging_wheel(monkeypatch):
-    from flash.providers.runpod.train import resolve_worker_deps
-
-    monkeypatch.delenv("FLASH_CHALK_WHEEL", raising=False)
-    assert any(d.startswith("freesolo-chalk") for d in resolve_worker_deps())
-    monkeypatch.setenv("FLASH_CHALK_WHEEL", "/tmp/freesolo_chalk-0.4.12-py3-none-any.whl")
-    assert not any(d.startswith("freesolo-chalk") for d in resolve_worker_deps())
-
-
 def test_build_worker_env_drops_reserved_disagg_parallel(monkeypatch):
     """Review fix: FLASH_DISAGG_PARALLEL is topology-owned. The allocator's required_vram_gb()
     sizes the inference card from the SUBMITTER os.environ (tp divides the server footprint by
@@ -486,27 +425,20 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
 
 
-def test_alloc_conf_default_avoids_expandable_under_grpo_sleep(monkeypatch):
-    # vLLM sleep-mode CuMemAllocator is incompatible with expandable_segments; GRPO with sleep
-    # ON (the default) must NOT default to expandable_segments or the run crashes at engine init.
+def test_alloc_conf_rl_is_non_expandable(monkeypatch):
+    # vLLM sleep-mode CuMemAllocator is incompatible with expandable_segments, so RL ships the
+    # sleep-SAFE non-expandable conf; the worker upgrades to expandable_segments at boot once it
+    # resolves sleep OFF for the model/context (engine.worker.finalize_alloc_conf_for_sleep). The
+    # conf is deterministic — there is no launcher sleep/alloc knob.
     from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    monkeypatch.delenv("RL_VLLM_SLEEP", raising=False)  # default = sleep on
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec(), 0)  # grpo
     assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
     assert env["PYTORCH_ALLOC_CONF"] == env["PYTORCH_CUDA_ALLOC_CONF"]
-
-
-def test_alloc_conf_default_expandable_when_sleep_off(monkeypatch):
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
-    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    monkeypatch.setenv("RL_VLLM_SLEEP", "0")  # sleep off -> expandable is safe + preferred
-    env = build_worker_env(_spec(), 0)
-    assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+    # no launcher->worker FLASH_ALLOC_AUTO signal anymore (the worker gates on PHASE == "rl")
+    assert "FLASH_ALLOC_AUTO" not in env
 
 
 def test_alloc_conf_default_expandable_for_sft(monkeypatch):
@@ -518,19 +450,6 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(steps=2, seeds=(0,)))
     env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
-
-
-def test_alloc_conf_rl_cedes_to_worker(monkeypatch):
-    # The launcher can't know the worker's sleep decision (resolved from model size + context),
-    # so RL ships the conservative non-expandable conf plus FLASH_ALLOC_AUTO=1, ceding the final
-    # choice to the worker (which upgrades to expandable_segments once it resolves sleep OFF).
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
-    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    env = build_worker_env(_spec(), 0)  # grpo
-    assert env["FLASH_ALLOC_AUTO"] == "1"
-    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
 
 
 def test_runpod_backoff_no_overflow_on_long_runs():
@@ -591,26 +510,19 @@ def test_train_body_imports_every_name_it_uses():
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
-    # Names that must be locally imported (regression: contextlib was missing). shutil is used
-    # to gate the conditional `prime` install, so it must also be imported locally.
-    for name in ("contextlib", "json", "os", "shutil", "subprocess", "sys"):
+    # Names that must be locally imported (regression: contextlib was missing).
+    for name in ("contextlib", "json", "os", "subprocess", "sys"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
 
 
-def test_train_body_installs_prime_only_when_absent():
-    """`prime` is often baked into the worker image; an unconditional `pip install prime`
-    every run adds latency + a per-run PyPI failure point. The handler must guard the install
-    behind `shutil.which("prime") is None`."""
+def test_train_body_has_no_prime_install_path():
     import inspect
 
     from flash.providers.runpod import train
 
     src = inspect.getsource(train._train_body)
-    assert 'shutil.which("prime")' in src
-    # The pip install of `prime` must be conditional, not at module/handler top level.
-    install_idx = src.index('_pip_install(["prime"], label="prime")')
-    guard_idx = src.index('shutil.which("prime") is None')
-    assert guard_idx < install_idx, "the prime install must be gated by the which() check"
+    assert '"install", "prime"' not in src
+    assert 'shutil.which("prime")' not in src
 
 
 def test_run_sft_uses_fused_ce_safe_trainer():

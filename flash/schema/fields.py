@@ -8,9 +8,13 @@ reference the rest of the schema package; the package ``__init__`` re-exports th
 from __future__ import annotations
 
 import math
+import re
+import urllib.parse
 from typing import Any
 
 from flash.spec import WandbSpec
+
+_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
@@ -83,12 +87,84 @@ class ConfigError(ValueError):
 
 
 def _require_slug(value: str, message: str) -> None:
-    """Require a Prime Hub-style "owner/name" slug: exactly one slash, both parts
-    non-empty. Raises ConfigError(message) otherwise. Centralizes the rule used for
-    [environment] id and train.hf_repo so they cannot drift apart."""
-    parts = value.split("/")
-    if len(parts) != 2 or not all(parts):
+    """Require an ``owner/name`` slug."""
+    text = (value or "").strip()
+    if not text or ":" in text:
         raise ConfigError(message)
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        raise ConfigError(message)
+    parts = text.split("/")
+    if len(parts) != 2 or not _is_safe_github_path_parts(parts):
+        raise ConfigError(message)
+
+
+def _require_environment_ref(value: str, message: str) -> None:
+    """Require a Freesolo environment id."""
+    try:
+        _require_slug(value, message)
+        return
+    except ConfigError:
+        pass
+    if value.startswith("github:"):
+        body = value[len("github:") :]
+        repo_ref, sep, path = body.partition(":")
+        repo, at, ref = repo_ref.partition("@")
+        if at and not ref:
+            raise ConfigError(message)
+        owner_repo = repo.split("/")
+        if (
+            len(owner_repo) == 2
+            and _is_safe_github_path_parts(owner_repo)
+            and (not at or _is_safe_github_path_parts([ref]))
+            and (not sep or _is_safe_environment_path(path))
+        ):
+            return
+        raise ConfigError(message)
+    if value.startswith("https://github.com/") or value.startswith("http://github.com/"):
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "github.com":
+            parts = [
+                part for part in urllib.parse.unquote(parsed.path).strip("/").split("/") if part
+            ]
+            if len(parts) < 2:
+                raise ConfigError(message)
+            owner, repo = parts[0], parts[1]
+            repo = repo[:-4] if repo.endswith(".git") else repo
+            if len(parts) == 2:
+                if not _is_safe_github_path_parts([owner, repo]):
+                    raise ConfigError(message)
+            elif len(parts) >= 5 and parts[2] in {"blob", "tree"}:
+                ref = parts[3]
+                if not _is_safe_github_path_parts([ref]):
+                    raise ConfigError(message)
+                raw_path = "/".join(parts[4:])
+                if not _is_safe_environment_path(raw_path):
+                    raise ConfigError(message)
+                if not _is_safe_github_path_parts([owner, repo, ref]):
+                    raise ConfigError(message)
+            else:
+                raise ConfigError(message)
+            return
+    raise ConfigError(message)
+
+
+def _is_safe_environment_path(path: str) -> bool:
+    if not path:
+        return True
+    raw = path.strip().replace("\\", "/")
+    if raw.startswith("/"):
+        return False
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return True
+    return not any(part in {".", ".."} for part in parts)
+
+
+def _is_safe_github_path_parts(parts: list[str]) -> bool:
+    if any(part in {".", "..", ""} for part in parts):
+        return False
+    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
 
 
 def _coerce_scalar(value: str):
@@ -105,6 +181,49 @@ def _coerce_scalar(value: str):
         return value
 
 
+def _validate_env_var_names(names, context: str) -> None:
+    bad_names = sorted(repr(k) for k in names if (not k) or any(c in k for c in "=\0 \t\n\r"))
+    if bad_names:
+        raise ConfigError(
+            f"{context} has invalid environment variable name(s): {', '.join(bad_names)}; an "
+            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
+        )
+
+
+_RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
+    {
+        "RUNPOD_API_KEY",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "GITHUB_TOKEN",
+        "FREESOLO_API_KEY",
+        "FREESOLO_INTERNAL_KEY",
+        "RUN_ID",
+        "HF_REPO",
+        "FLASH_ARM",
+    }
+)
+
+
+def _environment_secrets(raw: Any) -> tuple[str, ...]:
+    """Parse [environment].secrets as declared worker env-var secret names."""
+    if raw is None:
+        return ()
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+        raise ConfigError("[environment] secrets must be a list of environment variable names")
+    if not all(isinstance(name, str) for name in raw):
+        raise ConfigError("[environment] secrets entries must be strings")
+    secrets = tuple(dict.fromkeys(raw))
+    _validate_env_var_names(secrets, "[environment] secrets")
+    reserved = sorted(set(secrets) & _RESERVED_ENVIRONMENT_SECRET_KEYS)
+    if reserved:
+        raise ConfigError(
+            "[environment] secrets must not include platform-managed key(s): "
+            f"{', '.join(reserved)}"
+        )
+    return secrets
+
+
 def _worker_env(raw: Any) -> dict[str, str]:
     """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
     if raw is None:
@@ -116,12 +235,7 @@ def _worker_env(raw: Any) -> dict[str, str]:
     # ValueError for an empty name or one containing '=' or a NUL byte (and whitespace breaks most
     # shells). Reject these at parse time so a malformed [worker_env] (e.g. a TOML quoted key like
     # "BAD=KEY", or an empty key) fails on config load — not after a worker has been provisioned.
-    bad_names = sorted(repr(k) for k in env if (not k) or any(c in k for c in "=\0 \t\n\r"))
-    if bad_names:
-        raise ConfigError(
-            f"[worker_env] has invalid environment variable name(s): {', '.join(bad_names)}; an "
-            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
-        )
+    _validate_env_var_names(env, "[worker_env]")
     # [worker_env] is serialized into job_spec_json (persisted + logged), so it must NOT carry
     # secrets — they would leak into run artifacts. Reject secret-looking keys; operators set
     # those as real process environment variables (forwarded to the worker out-of-band) instead.

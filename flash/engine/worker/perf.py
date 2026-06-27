@@ -10,6 +10,7 @@ Torch and other heavy deps are imported lazily inside the functions (CPU-importa
 from __future__ import annotations
 
 import contextlib
+import csv
 import os
 import sys
 import time
@@ -20,31 +21,84 @@ import time
 from flash.engine.vram import _LIGER_LONG_CTX_TOKENS, _LIGER_MIN_PARAMS_B
 
 
-def _attn_impl_for_capability(major: int) -> str | None:
-    """Map a CUDA compute capability to the trainer ``attn_implementation``.
+def _attn_impl_for_capability(
+    major: int, minor: int = 0, *, fa3_available: bool = False, fa2_available: bool = False
+) -> str | None:
+    """Map a CUDA compute capability to the trainer ``attn_implementation`` — the best per-arch
+    FlashAttention kernel for the model's FULL-attention (softmax) layers, so SFT *and* GRPO use a
+    real flash kernel on every arch where one exists (not plain SDPA). The Qwen3.5/3.6
+    Gated-DeltaNet *linear*-attention layers always keep their own path (fla, or the native
+    pure-PyTorch delta rule once fla is dropped on Hopper) — FlashAttention does not apply to linear
+    attention.
 
-    Attention uses PyTorch SDPA (its flash/efficient backend is already selected automatically
-    on Ampere/Ada/Hopper) — the HF Kernels-Hub FA path is disabled because the torch2.10-
-    compatible ``kernels`` versions break transformers' import. So:
-      sm120 (Blackwell consumer 5090/RTX Pro) -> "sdpa" (forced to the cuDNN backend at train
-      time — its default SDPA can fall to the slow math kernel); all other archs -> None (let
-      transformers pick SDPA, which already flash-backs on Ampere/Ada/Hopper). The big LoRA
-      win comes from the Liger fused kernels, not the attention path. Pure function (no torch)
-      so it's unit-testable on CPU.
-    """
-    if major == 12:  # Blackwell consumer: force cuDNN SDPA (avoid the math fallback)
+    Each arch maps to its ONE best flash kernel; the fallback is UNIFORM — plain SDPA on every arch
+    when that kernel's package is absent (no special FA3->FA2 chain on Hopper):
+      * Hopper (sm90, H100/H200): "flash_attention_3" — FA3's warp-specialized async kernels are the
+        fastest exact attention on Hopper; transformers routes it to the LOCAL ``flash_attn_interface``
+        (no HF Kernels-Hub, whose torch2.10 versions break ``import transformers``). FA3 is baked into
+        the worker image by default (Dockerfile FLASH_ATTN_3_SPEC), so ``fa3_available`` is normally
+        True; absent -> plain SDPA, same as every other arch.
+      * Ampere (sm80 A100 / sm86 3090·A6000) + Ada (sm89 4090·L40S): "flash_attention_2" when the
+        ``flash_attn`` wheel is importable (``fa2_available``) — FA3 does NOT support these archs.
+      * consumer Blackwell (sm120 5090 / RTX Pro): "sdpa" forced to the cuDNN backend. THE ONE arch
+        with no flash: FA3/FA4 need TMEM/tcgen05 that sm120 lacks, and the prebuilt FA2 CUDA wheel's
+        sm120 coverage is unverified, so cuDNN SDPA is the validated best here.
+      * anything else / flash unavailable -> None: transformers picks SDPA (already flash-backed on
+        Ampere/Ada/Hopper).
+    Pure function (no torch / no imports) so it's unit-testable on CPU; ``fa2_available`` /
+    ``fa3_available`` are the caller's probes (``optimal_attn_impl``). The big LoRA win is still the
+    Liger/chalk fused kernels; flash helps only the ~25% full-attention layers of the hybrid arch."""
+    if major == 9 and fa3_available:  # Hopper: FA3 is the arch's best flash kernel
+        return "flash_attention_3"
+    if major == 8 and minor in (0, 6, 9) and fa2_available:  # Ampere 8.0/8.6 + Ada 8.9 ONLY: FA2
+        # (gate the minor so an unsupported sm8x like sm87 Jetson Orin doesn't get FA2 forced on it)
+        return "flash_attention_2"
+    if (
+        major == 12
+    ):  # consumer Blackwell: cuDNN SDPA (the one exception — FA3/FA4 need TMEM/tcgen05)
         return "sdpa"
-    return None
+    return None  # the arch's flash kernel is absent -> plain SDPA (the SAME fallback on every arch)
+
+
+def _flash_attn_3_available() -> bool:
+    """True when FlashAttention-3 is usable by transformers on this worker — i.e. the
+    ``flash_attn_interface`` module (the ``flash-attn-3`` Hopper build) is importable.
+
+    transformers' ``flash_attention_3`` path does ``from flash_attn_interface import
+    flash_attn_func, ...`` (modeling_flash_attention_utils), so a present module is exactly what
+    makes ``attn_implementation="flash_attention_3"`` resolve WITHOUT the HF Kernels-Hub. Prefer
+    transformers' own ``is_flash_attn_3_available`` probe (it verifies real importability). Only if
+    that probe is itself unavailable (transformers not importable here) fall back to a GUARDED import
+    of ``flash_attn_interface`` — NOT a bare ``find_spec``, so an on-disk-but-broken install (ABI
+    mismatch / missing .so) reads as unavailable instead of a false positive that would later crash
+    transformers at model load. FA3 is used whenever it's importable — fixed, no disable knob."""
+    try:
+        from transformers.utils import is_flash_attn_3_available
+
+        return bool(is_flash_attn_3_available())
+    except Exception:
+        try:
+            import flash_attn_interface  # noqa: F401  (guarded: verifies real importability)
+
+            return True
+        except Exception:
+            return False
 
 
 def _flash_attn_available() -> bool:
-    """True when the ``flash_attn`` wheel is importable (our worker image builds it from source).
+    """True when the ``flash_attn`` (FA2) wheel is importable (baked into the worker image).
 
-    Gates the packing default: TRL's ``packing_strategy='bfd'`` produces flattened/padding-free
-    batches whose example boundaries are carried by ``position_ids`` and enforced ONLY by an
-    attention impl that honors them (FlashAttention-2 varlen / flex_attention). Under plain SDPA,
-    packed examples attend ACROSS boundaries (silent quality loss). find_spec only — no import side
-    effects (and no CUDA init)."""
+    Drives the FA2 ``attn_implementation`` selection on Ampere/Ada (via ``_attn_impl_for_capability``)
+    AND the SFT packing default on every arch. ``_attn_impl_for_capability`` itself never picks FA2 on
+    Hopper (FA3, else uniform SDPA); FA2 re-enters there ONLY through the SFT packing path, which
+    forces FA2 varlen when ``optimal_attn_impl`` returned None (Hopper without FA3). On sm120 the
+    selector returns ``"sdpa"`` and run_sft DISABLES packing instead (consumer Blackwell stays plain
+    SDPA — no flash), so sm120 never forces FA2. Packing rationale: TRL's ``packing_strategy='bfd'``
+    produces flattened/padding-free
+    batches whose example boundaries are carried by ``position_ids`` and enforced ONLY by a
+    varlen-capable attention impl (FA2/FA3/flex). Under plain SDPA, packed examples attend ACROSS
+    boundaries (silent quality loss). find_spec only — no import side effects (no CUDA init). FA2 is
+    used whenever the wheel is importable — fixed, no disable knob."""
     try:
         import importlib.util
 
@@ -109,11 +163,27 @@ def optimal_attn_impl() -> str | None:
     except Exception as e:
         print("optimal_attn_impl probe failed:", e)
         return None
-    impl = _attn_impl_for_capability(major)
-    if impl:
-        print(f"[attn] sm{major}{minor} -> attn_implementation={impl}")
+    fa2 = _flash_attn_available()  # FA2 wheel importable (Ampere/Ada/Hopper)
+    # Probe FA3 only on Hopper (the only arch it selects it for) so a non-Hopper run never imports
+    # the transformers FA3 helpers needlessly.
+    fa3 = _flash_attn_3_available() if major == 9 else False
+    impl = _attn_impl_for_capability(major, minor, fa3_available=fa3, fa2_available=fa2)
+    if impl in ("flash_attention_2", "flash_attention_3"):
+        ver = "FlashAttention-3" if impl == "flash_attention_3" else "FlashAttention-2"
+        print(
+            f"[attn] sm{major}{minor} -> attn_implementation={impl} ({ver}, full-attention layers)"
+        )
+    elif major == 9 and not fa3:
+        # Hopper but FA3 not selected -> plain SDPA (uniform fallback). FA3 is baked into the worker
+        # image by default, so this means flash_attn_interface is absent/broken — check the install.
+        print(f"[attn] sm{major}{minor}: FA3 unavailable (flash_attn_interface absent) -> SDPA")
+    elif major == 12:  # the only arch that returns impl=="sdpa" -> this branch covers all of it
+        print(
+            f"[attn] sm{major}{minor} (consumer Blackwell) -> SDPA/cuDNN (FA3/FA4 need TMEM; n/a on sm120)"
+        )
+    elif not fa2:
+        print(f"[attn] sm{major}{minor}: flash_attn wheel absent -> SDPA")
     return impl
-
 
 
 # Liger's fused linear cross-entropy is a MEMORY optimization (it never materializes the fp32
@@ -144,18 +214,35 @@ def _estimate_params(cfg) -> float:
 
 
 def _liger_default_for_model(model_id: str) -> bool:
-    """True when the model is large enough (≥ _LIGER_MIN_PARAMS, ~3B) to warrant the memory-mode
-    optimizations (sleep, grad checkpointing) — the worker's size gate, read via ``_memory_mode``.
-    (The ~3B cutoff is the old Liger fused-CE threshold this shared; flash now runs chalk
-    standalone — chalk's FLCE is unconditionally on regardless of size — but the memory cutoff
-    that the sleep/grad-checkpointing decisions key off is the same number, so the helper stays.)"""
+    """Default Liger ON only for models large enough that fused-CE's memory win pays off
+    (≥ _LIGER_MIN_PARAMS, ~3B). 1B-class models measured net-negative -> default OFF."""
     try:
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         return _estimate_params(cfg) >= _LIGER_MIN_PARAMS
     except Exception as e:
-        print("model size probe failed (default off):", e)
+        print("liger model-size probe failed (default off):", e)
+        return False
+
+
+def liger_on(default_on: bool) -> bool:
+    """Whether to enable a Liger kernel path. ``default_on`` is the model-size decision (on only
+    for models large enough that fused-CE's memory win pays off; 1B-class is a measured net loss).
+    Even when on, require a CUDA GPU AND that ``liger_kernel`` is importable — the local
+    ``flash[gpu]`` extra doesn't ship it, so blindly setting use_liger_kernel would crash a
+    local GPU run. No GPU / absent -> off."""
+    if not default_on:
+        return False
+    try:
+        import importlib.util
+
+        import torch
+
+        return bool(
+            torch.cuda.is_available() and importlib.util.find_spec("liger_kernel") is not None
+        )
+    except Exception:
         return False
 
 
@@ -177,7 +264,6 @@ def setup_perf_backends() -> None:
         print("[perf] TF32 matmul/cuDNN enabled")
     except Exception as e:
         print("setup_perf_backends skipped:", e)
-
 
 
 def _remove_fla_dist_metadata(site_dirs: set[str]) -> list[str]:
@@ -272,6 +358,144 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
     return removed, importlib.util.find_spec("fla") is not None
 
 
+def _find_real_libcudart() -> str | None:
+    """Path to a REAL ``libcudart.so.12`` that exports ``cudaDeviceReset`` (the symbol tilelang's
+    stub lacks), or None if none can be found. Prefers the nvidia-cuda-runtime wheel, then the CUDA
+    toolkit baked into the worker's -devel base image, then the system loader's own resolver — and
+    VERIFIES the symbol is actually present (a path is only returned if ``CDLL(path)`` exposes
+    ``cudaDeviceReset``). Never raises."""
+    import ctypes
+    import ctypes.util
+    import glob
+
+    def _verify(cand: str) -> str | None:
+        """Absolute path to ``cand`` if it loads AND exports cudaDeviceReset, else None. Handles both
+        absolute paths (glob results) and bare sonames like ``libcudart.so.12`` (find_library, which
+        the loader resolves but ``os.path.exists`` would reject)."""
+        try:
+            lib = ctypes.CDLL(cand)  # an abs path opens directly; a bare soname is loader-resolved
+        except OSError:
+            return None
+        if not hasattr(lib, "cudaDeviceReset"):
+            return None
+        if os.path.isabs(cand) and os.path.exists(cand):
+            return os.path.realpath(cand)
+        # Bare soname: resolve to the file the loader actually opened, via /proc/self/maps.
+        base = os.path.basename(cand)
+        try:
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    if base in line and "/" in line:
+                        p = line[line.index("/"):].rstrip()
+                        if os.path.basename(p).startswith(base) and os.path.exists(p):
+                            return os.path.realpath(p)
+        except OSError:
+            pass
+        return None
+
+    candidates: list[str] = []
+    # 1. nvidia-cuda-runtime PyPI wheel (a torch/vLLM dep on many images).
+    try:
+        import nvidia.cuda_runtime as _cr  # type: ignore
+
+        candidates += glob.glob(
+            os.path.join(os.path.dirname(_cr.__file__), "lib", "libcudart.so.12*")
+        )
+    except Exception:
+        pass
+    # 2. CUDA toolkit in the -devel base image (Dockerfile.worker: cuda12.8-cudnn9-devel).
+    for pat in (
+        "/usr/local/cuda*/lib64/libcudart.so.12*",
+        "/usr/local/cuda*/targets/*/lib/libcudart.so.12*",
+        "/usr/lib/x86_64-linux-gnu/libcudart.so.12*",
+    ):
+        candidates += glob.glob(pat)
+    # 3. The loader's own resolver (LD_LIBRARY_PATH / ldconfig) — returns a bare soname, handled above.
+    found = ctypes.util.find_library("cudart")
+    if found:
+        candidates.append(found)
+    for cand in candidates:
+        real = _verify(cand)
+        if real is not None:
+            return real
+    return None
+
+
+def _neutralize_tilelang_cudart_stub() -> None:
+    """Stop tilelang's bundled ``libcudart_stub.so`` from shadowing the real CUDA runtime in vLLM.
+
+    tilelang ships a minimal ``libcudart_stub.so`` (soname ``libcudart_stub.so``) that
+    ``libtilelang.so`` / ``libtvm.so`` link against; it exports only a SUBSET of the CUDA runtime —
+    notably it is MISSING ``cudaDeviceReset``. vLLM's ``vllm/device_allocator/cumem.py`` builds a
+    ``CudaRTLibrary`` at MODULE TOP LEVEL (``libcudart = CudaRTLibrary()``), and that module is
+    imported on EVERY vLLM init via ``gpu_worker.load_model`` ->
+    ``_maybe_get_memory_pool_context(tag="weights")`` — so the crash is NOT gated on sleep mode or
+    model size (a 0.8B GRPO run hit it too); any GRPO vLLM init is exposed. ``CudaRTLibrary`` finds
+    libcudart by a SUBSTRING scan of ``/proc/self/maps`` and returns the FIRST matching line
+    (address-ordered, so host-dependent ~coin-flip). Once tilelang is loaded — the Hopper fla fast
+    path, or fla's backend probe on any arch — the stub is mapped into the process and can win that
+    scan, so ``CudaRTLibrary()`` dlopens the stub and aborts the import with ``undefined symbol:
+    cudaDeviceReset`` before step 0. See flash #184.
+
+    Fix: BEFORE anything imports tilelang/fla/vllm, repoint the stub path at the REAL
+    ``libcudart.so.12`` via a symlink. Then whichever copy the loader (or vLLM's scan) resolves has
+    the full symbol set, and the real lib's soname (``libcudart.so.12``) dedupes against the copy
+    torch already loaded — so no second CUDA-runtime instance is created and the stub-named mapping
+    drops out of ``/proc/self/maps`` entirely. tilelang keeps working: the real runtime is a strict
+    superset of the stub it linked against. Applies on EVERY arch and model size (the crash spans
+    0.8B/4B and A100/cheaper classes) and to every provisioning path (baked image or runtime pip),
+    since it runs in the worker before the first tilelang load. Must run AFTER
+    ``_ensure_fla_fastpath_on_hopper`` (a tilelang (re)install there would otherwise rewrite the
+    stub) and BEFORE the model/vLLM import.
+
+    Idempotent and best-effort: a missing tilelang, a missing stub, an already-healthy stub, or no
+    discoverable real runtime is a clean no-op; any error is swallowed (the worker must never crash
+    on this hygiene step). No GPU required.
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("tilelang")
+    except Exception:
+        spec = None
+    locs = list(getattr(spec, "submodule_search_locations", None) or []) if spec else []
+    if not locs:
+        return  # tilelang not installed -> nothing can shadow libcudart
+    stub = os.path.join(locs[0], "lib", "libcudart_stub.so")
+    if not os.path.lexists(stub):  # lexists: a dangling symlink still counts as present
+        return
+    # Idempotency WITHOUT loading the stub: we only ever turn the stub into a symlink, and a pristine
+    # tilelang always ships it as a regular file, so a RESOLVING symlink here means a prior pass
+    # already neutralized it. Crucially, do NOT probe the stub with ctypes.CDLL — that dlopens it (it
+    # loads fine under lazy binding despite the missing cudaDeviceReset) and maps it into THIS
+    # process's /proc/self/maps, which is exactly the libcudart line vLLM's CudaRTLibrary scan would
+    # then pick up -> the very crash we're preventing. The stub must never be loaded; only the file
+    # is touched. A DANGLING symlink (our target moved/was removed) is NOT done — it leaves tilelang
+    # with a broken libcudart_stub.so, so fall through and re-point it (os.path.exists follows links).
+    if os.path.islink(stub) and os.path.exists(stub):
+        return
+    real = _find_real_libcudart()
+    if real is None:
+        print(
+            "[worker] libcudart stub shadow: no real libcudart found; left as-is (flash #184)",
+            flush=True,
+        )
+        return
+    try:
+        # Preserve the original stub ONCE (reversible / debuggable), then point the stub path at the
+        # real runtime. os.replace is atomic; symlink keeps soname-dedup (no duplicate libcudart).
+        backup = stub + ".orig"
+        if not os.path.exists(backup):
+            os.replace(stub, backup)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(stub)
+        os.symlink(real, stub)
+        print(f"[worker] redirected tilelang libcudart_stub.so -> {real} (flash #184)", flush=True)
+    except Exception as e:
+        print(f"[worker] libcudart stub neutralize failed: {e}", flush=True)
+
+
 # Long-context runs are memory-bound (activations + vLLM KV cache scale with sequence length), so
 # they need the memory features even on a SMALL model — PR #174 measured a 1B model OOM on GRPO at
 # 4096 ctx in speed mode, but it fits in memory mode. So "memory mode" = large model OR long ctx.
@@ -292,6 +516,51 @@ def grad_checkpointing_on(model_id: str, max_length: int = 0) -> bool:
     memory — a MEMORY feature, not speed. ON for large models / long context that need the
     headroom; OFF for small+short runs that fit without it (the speed win)."""
     return _memory_mode(model_id, max_length)
+
+
+def grpo_sleep_mode(
+    model_id: str,
+    *,
+    max_length: int = 0,
+    group_size: int = 8,
+    max_tokens: int | None = None,
+    lora_rank: int = 32,
+    thinking: bool = False,
+    card_vram_gb: float = 0.0,
+) -> bool:
+    """Whether colocated-vLLM GRPO should enable vLLM sleep mode (offload the rollout engine
+    between steps).
+
+    Sleep mode trades a large per-step cost for memory, and on the large-model GRPO path the
+    sleep/wake cycle STALLS the colocated rollout (the rollout produces unparseable completions and
+    then the worker hangs). So enable it ONLY when the run genuinely can't fit RESIDENT on the card:
+    when the policy + colocated rollout engine + training peak all fit on ``card_vram_gb`` (the
+    common case on an allocator-sized card), skip sleep mode entirely. Falls back to the
+    size/context gate (``_memory_mode``) when the card VRAM is unknown."""
+    from flash.engine.vram import grpo_fits_resident, grpo_rollout_seq_len
+
+    # Gate on the rollout length run_rl() ACTUALLY launches (max(1024, prompt+completion) when
+    # [train].max_length is unset -- 2368 default / 3584 thinking), NOT the raw max_length. With
+    # max_length unset (0) the size/context pre-filter would see a 0-length "short" run and early-
+    # exit for a sub-3B model, skipping the resident-fit check that a long max_tokens rollout needs.
+    seq_len = grpo_rollout_seq_len(max_length, max_tokens, thinking)
+    if not _memory_mode(model_id, seq_len):
+        return False  # small model AND genuinely short rollout -> never needed
+    if card_vram_gb and card_vram_gb > 0:
+        try:
+            if grpo_fits_resident(
+                model_id,
+                seq_len=seq_len,
+                max_tokens=max_tokens,
+                lora_rank=lora_rank,
+                group_size=group_size,
+                thinking=thinking,
+                card_vram_gb=card_vram_gb,
+            ):
+                return False  # fits resident -> skip the (buggy, slow) sleep/wake cycle
+        except Exception as e:
+            print("[rl] grpo sleep-mode resident check skipped:", e)
+    return True
 
 
 def fused_optim_name() -> str:
@@ -430,36 +699,158 @@ def _sdpa_cudnn_ctx(attn_impl: str | None):
         return contextlib.nullcontext()
 
 
-
-def gpu_diagnostics() -> dict:
-    """Collect CUDA/driver diagnostics to pin down GPU init failures on rented nodes."""
-    diag = {}
+def _float_or_none(value) -> float | None:
     try:
-        import torch
+        text = str(value).strip()
+        if not text or text.upper() in {"N/A", "[N/A]", "NOT SUPPORTED", "[NOT SUPPORTED]"}:
+            return None
+        return float(text)
+    except (TypeError, ValueError):
+        return None
 
-        diag["torch"] = torch.__version__
-        diag["torch_cuda"] = torch.version.cuda
-        diag["cuda_available"] = torch.cuda.is_available()
-        try:
-            diag["device_count"] = torch.cuda.device_count()
-            diag["device_name"] = torch.cuda.get_device_name(0)
-        except Exception as e:
-            diag["device_query_err"] = str(e)[:160]
-    except Exception as e:
-        diag["torch_import_err"] = str(e)[:160]
-    try:
-        import subprocess
 
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version,name,memory.total", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=20,
+def _int_or_none(value) -> int | None:
+    num = _float_or_none(value)
+    return int(num) if num is not None else None
+
+
+def _round_gb_from_mib(value) -> float | None:
+    num = _float_or_none(value)
+    if num is None:
+        return None
+    return round(num / 1024.0, 3)
+
+
+def _clean_diag(diag: dict) -> dict:
+    return {k: v for k, v in diag.items() if v is not None and v != ""}
+
+
+def _query_nvidia_gpu() -> dict:
+    import subprocess
+
+    fields = [
+        "index",
+        "uuid",
+        "driver_version",
+        "name",
+        "utilization.gpu",
+        "utilization.memory",
+        "memory.total",
+        "memory.used",
+        "memory.free",
+        "temperature.gpu",
+        "power.draw",
+        "power.limit",
+        "pstate",
+        "clocks.sm",
+        "clocks.mem",
+        "pcie.link.gen.current",
+        "pcie.link.width.current",
+    ]
+    out = subprocess.run(
+        ["nvidia-smi", f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=8.0,  # nvidia-smi diag timeout (fixed; flash is fully managed)
+    )
+    raw = (out.stdout or out.stderr).strip()
+    if out.returncode != 0:
+        return {"nvidia_smi_err": raw[:300]}
+    rows = list(csv.reader(raw.splitlines()))
+    if not rows:
+        return {}
+    first = [cell.strip() for cell in rows[0]]
+    row = dict(zip(fields, first, strict=False))
+    diag = {
+        "index": _int_or_none(row.get("index")),
+        "uuid": row.get("uuid"),
+        "driver_version": row.get("driver_version"),
+        "device_name": row.get("name"),
+        "gpu_util_pct": _int_or_none(row.get("utilization.gpu")),
+        "mem_util_pct": _int_or_none(row.get("utilization.memory")),
+        "memory_total_gb": _round_gb_from_mib(row.get("memory.total")),
+        "memory_used_gb": _round_gb_from_mib(row.get("memory.used")),
+        "memory_free_gb": _round_gb_from_mib(row.get("memory.free")),
+        "temperature_c": _int_or_none(row.get("temperature.gpu")),
+        "power_w": _float_or_none(row.get("power.draw")),
+        "power_limit_w": _float_or_none(row.get("power.limit")),
+        "pstate": row.get("pstate"),
+        "sm_clock_mhz": _int_or_none(row.get("clocks.sm")),
+        "mem_clock_mhz": _int_or_none(row.get("clocks.mem")),
+        "pcie_gen": _int_or_none(row.get("pcie.link.gen.current")),
+        "pcie_width": _int_or_none(row.get("pcie.link.width.current")),
+    }
+    clean = _clean_diag(diag)
+    clean["nvidia_smi"] = raw[:300]
+    return clean
+
+
+def _query_nvidia_processes() -> list[dict]:
+    import subprocess
+
+    out = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=8.0,  # nvidia-smi diag timeout (fixed; flash is fully managed)
+    )
+    if out.returncode != 0 or not out.stdout.strip():
+        return []
+    rows = []
+    for row in csv.reader(out.stdout.splitlines()):
+        if len(row) < 3:
+            continue
+        rows.append(
+            _clean_diag(
+                {
+                    "pid": _int_or_none(row[0]),
+                    "process_name": row[1].strip(),
+                    "used_memory_gb": _round_gb_from_mib(row[2]),
+                }
+            )
         )
-        diag["nvidia_smi"] = (out.stdout or out.stderr).strip()[:200]
+    return sorted(rows, key=lambda r: float(r.get("used_memory_gb") or 0.0), reverse=True)[:8]
+
+
+def gpu_diagnostics(include_torch: bool = True) -> dict:
+    """Collect live CUDA/GPU telemetry for run logs and status."""
+    diag = {}
+    if include_torch:
+        try:
+            import torch
+
+            diag["torch"] = torch.__version__
+            diag["torch_cuda"] = torch.version.cuda
+            diag["cuda_available"] = torch.cuda.is_available()
+            try:
+                diag["device_count"] = torch.cuda.device_count()
+                if torch.cuda.is_available():
+                    diag["device_name"] = torch.cuda.get_device_name(0)
+                    free, total = torch.cuda.mem_get_info()
+                    diag["torch_memory_free_gb"] = round(free / (1024**3), 3)
+                    diag["torch_memory_total_gb"] = round(total / (1024**3), 3)
+                    diag["torch_memory_allocated_gb"] = round(
+                        torch.cuda.memory_allocated() / (1024**3), 3
+                    )
+                    diag["torch_memory_reserved_gb"] = round(
+                        torch.cuda.memory_reserved() / (1024**3), 3
+                    )
+            except Exception as e:
+                diag["device_query_err"] = str(e)[:160]
+        except Exception as e:
+            diag["torch_import_err"] = str(e)[:160]
+    try:
+        diag.update(_query_nvidia_gpu())
+        processes = _query_nvidia_processes()
+        if processes:
+            diag["processes"] = processes
     except Exception as e:
         diag["nvidia_smi_err"] = str(e)[:160]
-    return diag
+    return _clean_diag(diag)
 
 
 # Human-readable sentinel embedded in the error message (debug tag only — the runner classifies
@@ -479,10 +870,55 @@ class RetriableInfraError(RuntimeError):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
 
 
+def detect_mig_slice() -> str | None:
+    """Return a reason string if this worker was handed a MIG slice (a partitioned GPU), else None.
+
+    A MIG slice NVML-asserts PyTorch's CUDA allocator — observed when a provider substitutes a
+    requested GPU type with a Blackwell MIG slice — which crashes the run with an opaque allocator
+    assert partway through setup. Detect it up front (via nvidia-smi, before the first real CUDA op)
+    so the worker can fail fast as RETRIABLE infra and the runner re-provisions a fresh FULL GPU,
+    rather than letting the run die mid-setup. Best-effort: never raises (a missing/odd nvidia-smi
+    just means "no MIG detected", which the subsequent CUDA readiness probe still guards)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20
+        ).stdout
+        # A MIG slice appears as a nested device line, e.g.
+        #   "  MIG 1g.10gb     Device  0: (UUID: MIG-xxxx)"  (or any "UUID: MIG-..." entry).
+        for line in out.splitlines():
+            s = line.strip()
+            if s.startswith("MIG ") or "UUID: MIG-" in s:
+                return f"MIG slice detected (nvidia-smi -L: {s[:120]!r})"
+    except Exception:
+        pass
+    try:
+        q = subprocess.run(
+            ["nvidia-smi", "--query-gpu=mig.mode.current", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+        # "Enabled" => the assigned GPU is partitioned into MIG instances (no full-GPU access).
+        # "Disabled"/"N/A"/"[Not Supported]" (consumer + MIG-incapable cards) => fine.
+        if q and "enabled" in q.lower():
+            return f"MIG mode enabled on the assigned GPU (mig.mode.current={q!r})"
+    except Exception:
+        pass
+    return None
+
+
 def wait_for_gpu():
     """Rented nodes sometimes report 'CUDA device not ready' transiently at startup.
-    Poll a trivial CUDA op until it succeeds before doing real work; raise if never ready."""
+    Poll a trivial CUDA op until it succeeds before doing real work; raise if never ready.
+
+    Also fails fast (retriable) if the assigned GPU is a MIG slice — a partitioned GPU crashes the
+    CUDA allocator, so we re-provision on a fresh FULL GPU instead of dying mid-setup."""
     import time as _t
+
+    mig = detect_mig_slice()
+    if mig:
+        # Infra-shaped: a MIG slice can never train this workload -> retry on a fresh full GPU.
+        raise RetriableInfraError(f"{mig}; retrying on a fresh full (non-MIG) GPU")
 
     last = None
     for i in range(12):
@@ -552,8 +988,8 @@ def _ensure_fla_fastpath_on_hopper() -> None:
         ``fla.modules``; reinstall from git if the resident copy is incomplete).
     Validated A/B (H100 SXM, Qwen3.5 hidden-2560 LoRA, controlled fla on/off): seq4096 435->105
     ms/step & 9.9->6.1 GB (4.2x / 1.6x); seq8192 7.1x; seq16384 3106->247 ms & 32->17 GB (12.6x /
-    1.9x). Forward loss matches the torch delta to 1.8e-4 (correct). Runs on BOTH substrates
-    (RunPod + Vast exec this module), after all installs and BEFORE any model import. Non-Hopper:
+    1.9x). Forward loss matches the torch delta to 1.8e-4 (correct). Runs in the worker process,
+    after all installs and BEFORE any model import. Non-Hopper:
     no-op (fla's Triton kernel is correct there). Best-effort + FAIL-CLOSED: a failed install
     (pip rc!=0), a missing module, or the wrong resolved ``apache-tvm-ffi`` version all flip the
     gate off and DISABLE fla, leaving the (correct) pure-PyTorch delta rule in place — a worker

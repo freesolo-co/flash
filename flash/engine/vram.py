@@ -95,6 +95,75 @@ def sft_realized_batch(
 # so it's capped (_KV_CAP) instead of growing without bound at long context.
 _KV_COEF = 2.0
 _KV_CAP = 8.0
+
+
+def grpo_rollout_seq_len(
+    max_length: int = 0,
+    max_tokens: int | None = None,
+    thinking: bool = False,
+) -> int:
+    """The vLLM engine context a GRPO run ACTUALLY uses, mirroring run_rl(): the run's
+    ``[train].max_length`` when set, else ``max(1024, RLConfig.max_prompt_len + completion)`` where
+    ``completion`` is ``[train].max_tokens`` or the recipe's thinking/non-thinking default. The
+    allocator sizing, the sleep-mode resident gate, and the colocate KV budget all resolve the SAME
+    length here so a run whose max_length is unset is not sized as a 1024-token rollout while the
+    worker launches a ~2368-token (3584 with thinking) engine."""
+    from flash.engine.recipe import RECIPE
+
+    rl = RECIPE.rl
+    completion = int(
+        max_tokens or (rl.max_completion_len_thinking if thinking else rl.max_completion_len)
+    )
+    return int(max_length or max(1024, rl.max_prompt_len + completion))
+
+
+def _resident_kv_gb(params_b: float | None, vllm_max_len: int, num_generations: int = 8) -> float:
+    """KV (GB) a colocated rollout engine holds RESIDENT for the engine context + generation group.
+    Scales with BOTH (vLLM's cache blocks must cover ``vllm_max_model_length`` for ``num_generations``
+    concurrent sequences) -- unlike the sleep-mode rollout estimate, which caps it (``_KV_CAP``)
+    because the engine is offloaded during the backward there. Shared by the resident-fit estimate
+    and the non-sleep colocate budget so the gate and the budget size the SAME KV."""
+    width = math.sqrt(max(float(params_b or 1.0), 0.1))
+    return _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width * (max(1, num_generations) / 8.0)
+
+
+def colocate_kv_util(
+    params_b: float | None,
+    vllm_max_len: int,
+    total_vram_gb: float,
+    sleep_mode: bool,
+    num_generations: int = 8,
+) -> float:
+    """``vllm_gpu_memory_utilization`` for the colocated GRPO rollout engine, sized to the ACTUAL need
+    rather than a blanket fraction of the card.
+
+    ``gpu_memory_utilization`` is vLLM's WHOLE model-executor budget — its (2nd) bf16 weight copy PLUS
+    the KV cache — so we budget BOTH (budgeting KV alone would starve the weights and, for big models,
+    under-size the engine). The KV a GRPO rollout needs scales with the engine context AND the
+    concurrent generation group (``num_generations`` simultaneous sequences), so we size the pool as
+    ``_KV_COEF x seq x sqrt(params) x group/8`` with a 1.5x margin and an 8 GB floor — NOT capped, so
+    long-context / large-group runs keep a big pool (the 0.45 utilization cap bounds it like the old
+    blanket did). The old blanket sleep-path 0.45 reserved ~36 GB on an 80 GB A100 — MEASURED as the
+    dominant resident allocation that set the GRPO step peak (~46 GB). BOTH paths budget the weight
+    copy + KV; the non-sleep path uses the leaner resident-KV target (_KV_CAP). MEASURED at
+    4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward byte-identical, train_wall neutral; a
+    tighter 12 GB budget preempts, confirming this as the floor."""
+    weights_gb = max(0.5, float(params_b or 1.0)) * 2.0  # vLLM's bf16 weight copy lives in the budget
+    if not sleep_mode:
+        # Resident KV ON TOP of the weight copy: gpu_memory_utilization is the WHOLE executor budget,
+        # so budgeting KV alone (the old _KV_CAP/total) starved the weights and vLLM raised "No
+        # available memory for the cache blocks" on >=3B models whose weights exceed an 8 GB budget.
+        # The KV must ALSO cover the rollout context -- a flat _KV_CAP starves the cache blocks on a
+        # long-context run (vLLM's blocks must span vllm_max_model_length), so scale it with the
+        # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
+        # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
+        # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
+        kv_gb = max(_KV_CAP, _resident_kv_gb(params_b, vllm_max_len, num_generations))
+        return max(0.10, min(0.45, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
+    # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
+    # bigger rollout-phase KV does not compete with the training peak.
+    kv_pool_gb = max(_KV_CAP, 1.5 * _resident_kv_gb(params_b, vllm_max_len, num_generations))
+    return min(0.45, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
 # GRPO backward (activations + fp32 logits over the completion micro-batch) per unit
 # context x model width. Grad checkpointing makes this MILD in seq -- calibrated to
 # measured boundaries: 0.8B GRPO fits 24 GB up to seq 32k (seq ~free), while 4.7B GRPO
@@ -163,7 +232,7 @@ def sft_per_device(batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: 
     """The per-device SFT micro-batch the worker runs: the requested global batch capped at the
     micro-batch default (4) and ADDITIONALLY vocab-sized to the logits budget when the fused CE is
     OFF (small model AND short context) — so the big-vocab [per_device, seq, vocab] logits can't OOM
-    the card. With seq_len/vocab unset (or fused) it's just the old fixed cap (back-compatible)."""
+    the card. With seq_len/vocab unset (or fused), this remains the fixed cap."""
     per_device = max(1, min(_SFT_PER_DEVICE_BS_DEFAULT, max(1, int(batch_size))))
     if not fused and seq_len and vocab:
         per_device = min(per_device, sft_logits_per_device_cap(seq_len, vocab))
@@ -229,6 +298,7 @@ def estimate_vram_gb(
     thinking: bool = False,
     use_vllm: bool = True,
     vocab: int = _VOCAB_DEFAULT,
+    sleep_offload: bool = True,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU, over the full knob matrix.
 
@@ -257,7 +327,17 @@ def estimate_vram_gb(
         #   train:   backward activations + fp32 logits -- MILD in seq (grad ckpt)
         rollout = 0.0
         if use_vllm:
-            rollout = weights + min(_KV_COEF * (seq_len / 1024.0) * width, _KV_CAP)
+            if sleep_offload:
+                # Sleep mode offloads the engine during the backward, so the rollout-phase KV (capped
+                # at _KV_CAP) never competes with the training peak. This is the ALLOCATOR's estimate
+                # (model_required_vram_gb) -- keep it calibrated; it sizes every GRPO allocation.
+                rollout = weights + min(_KV_COEF * (seq_len / 1024.0) * width, _KV_CAP)
+            else:
+                # Resident: the engine stays live THROUGH the backward, so its KV (which must cover the
+                # rollout context for the whole generation group) is held alongside training -- size it
+                # to the real context, matching colocate_kv_util's non-sleep budget, instead of the
+                # flat _KV_CAP (which let grpo_fits_resident wrongly admit long-context runs).
+                rollout = weights + _resident_kv_gb(params_b, seq_len, group_size)
         group_factor = max(1.0, (max(1, group_size) / 4.0) ** 0.5)
         think_factor = 1.3 if thinking else 1.0
         activations = _TRAIN_COEF * (seq_len / 1024.0) * width * group_factor * think_factor
@@ -270,7 +350,11 @@ def estimate_vram_gb(
         completion = max_tokens if max_tokens else min(seq_len, 1024)
         logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
-        return base + max(rollout, train)
+        # Sleep mode offloads the vLLM rollout engine during the backward, so rollout and train
+        # don't peak together (peak = max). WITHOUT sleep the engine stays resident through the
+        # backward, so both are live at once (peak = sum). sleep_offload=False sizes that resident
+        # peak -- used by grpo_fits_resident to decide whether a run can skip sleep mode.
+        return base + (max(rollout, train) if sleep_offload else rollout + train)
     # SFT: peak = base + activations + the big-vocab logits term. Both activations and logits are
     # driven by the worker's per-device micro-batch (capped at 4 AND vocab-sized to the logits budget
     # when the fused CE is off), NOT the global/effective batch_size (grad-accum realizes that). Use
@@ -287,6 +371,47 @@ def estimate_vram_gb(
     # (SFT loss spans the sequence) -- the term the SFT estimate once ignored entirely.
     logits = 0.0 if fused else pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
     return base + activations + logits
+
+
+def grpo_fits_resident(
+    model_id: str,
+    *,
+    seq_len: int = 1024,
+    max_tokens: int | None = None,
+    lora_rank: int = 32,
+    group_size: int = 8,
+    thinking: bool = False,
+    card_vram_gb: float = 0.0,
+    margin: float = 1.15,
+) -> bool:
+    """Whether a colocated-vLLM GRPO run fits RESIDENT (no vLLM sleep-mode offload) on a card of
+    ``card_vram_gb`` with a safety ``margin``. When it fits, sleep mode is unnecessary -- and the
+    sleep/wake cycle is what stalls the large-model GRPO rollout -- so the worker can skip it.
+    Conservative: an unknown card size or unknown model size returns False (keep the memory-safe
+    sleep default)."""
+    if not card_vram_gb or card_vram_gb <= 0:
+        return False
+    from flash.catalog import MODELS, vocab_size_for
+
+    info = MODELS.get(model_id)
+    params_b = float(getattr(info, "params_b", 0.0) or 0.0) if info else 0.0
+    if params_b <= 0:
+        return False  # unknown size (open-model path) -> keep the safe default
+    quant = (getattr(info, "quant", "bf16") or "bf16") if info else "bf16"
+    resident = estimate_vram_gb(
+        params_b,
+        "grpo",
+        quant,
+        seq_len=max(1, int(seq_len or 1024)),
+        max_tokens=max_tokens,
+        lora_rank=lora_rank,
+        group_size=group_size,
+        thinking=thinking,
+        use_vllm=True,
+        vocab=vocab_size_for(model_id),
+        sleep_offload=False,
+    )
+    return resident * margin <= card_vram_gb
 
 
 def model_required_vram_gb(
@@ -331,13 +456,9 @@ def model_required_vram_gb(
     # ~2368-token (3584 with thinking) engine and OOMs after provisioning. Completion = the run's
     # [train].max_tokens override, else the recipe's thinking/non-thinking completion default.
     if (algorithm or "").lower() in ("grpo", "rl"):
-        from flash.engine.recipe import RECIPE
-
-        _rl = RECIPE.rl
-        _completion = max_tokens or (
-            _rl.max_completion_len_thinking if thinking else _rl.max_completion_len
-        )
-        _grpo_default_len = max(1024, _rl.max_prompt_len + int(_completion))
+        # Same engine context run_rl() launches (max_length, else max(1024, prompt+completion)) via
+        # the shared helper, so the allocator and the worker never disagree on the rollout length.
+        _grpo_default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
     else:
         _grpo_default_len = 1024
     seq_len = _pos_int(_g(train, "max_length"), _grpo_default_len)

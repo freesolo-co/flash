@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import os
 import threading
+import time
 from typing import Any
 
 from flash.providers.base import canonical_gpu, gpu_short
@@ -22,6 +23,7 @@ from flash.providers.runpod.train.deps import (
     WORKER_SYSTEM_DEPS,
     logger,
     resolve_worker_deps,
+    worker_image_for_gpu,
 )
 from flash.spec import gpus_per_node
 
@@ -33,7 +35,184 @@ from flash.spec import gpus_per_node
 # are infrequent vs training, so the serialization cost is negligible.
 FLASH_SDK_LOCK = threading.Lock()
 
+# Quota: cap in-flight endpoints under RunPod's account-wide max-workers quota (30; the cap of
+# 28 leaves a 2-slot buffer for endpoints deployed by other tools/the CLI). Every endpoint this
+# process creates claims one slot; terminate_endpoint releases it once the remote endpoint is
+# provably torn down. Runs that find the quota full QUEUE (block) here instead of failing with
+# RunPod's "Max workers across all endpoints must not exceed your workers quota (30)" error.
+#
+# The store is CROSS-PROCESS when an operator internal key is configured: the claim is an
+# advisory-locked atomic op in Postgres (via the freesolo backend), so >1 control-plane replica
+# can never together exceed the cap, and a startup reconcile recovers the true in-use count after
+# a crash. Without an internal key (local/dev single process) we fall back to an in-process
+# semaphore. Releases route by how the slot was acquired (recorded in ``_ACQUIRED``), so a slot
+# claimed against the shared store is always released there.
+RUNPOD_ENDPOINT_SLOT_CAP = 28
+# How long to wait before re-checking a full shared quota (queue-don't-crash), and how many
+# consecutive store errors to tolerate before falling back to the local semaphore so a single
+# process stays capped rather than deadlocking on a persistently-unreachable backend.
+_SLOT_QUEUE_WAIT_S = 10.0
+_SLOT_STORE_MAX_ERRORS = 6
+
+# Local (single-process) fallback, used when no internal key is configured or the shared store is
+# persistently unreachable. Resets on restart — fine, because a fresh process holds no slots.
+_LOCAL_SLOTS = threading.Semaphore(RUNPOD_ENDPOINT_SLOT_CAP)
+# name -> "shared" | "local": how this process acquired each held slot, so release routes to the
+# same store. Makes release idempotent — terminate_endpoint may run more than once for a name
+# (e.g. a retry after a failed undeploy), and only the call that still finds the name releases.
+_ACQUIRED: dict[str, str] = {}
+_ACQUIRED_LOCK = threading.Lock()
+
 _ENDPOINT_CACHE: dict[str, Any] = {}
+
+
+def _acquire_local_slot(name: str) -> None:
+    """Claim an in-process semaphore slot (no internal key / store-unreachable fallback)."""
+    if not _LOCAL_SLOTS.acquire(blocking=False):
+        logger.info(
+            "Quota full (%d/%d slots) — waiting for a free slot...",
+            RUNPOD_ENDPOINT_SLOT_CAP,
+            RUNPOD_ENDPOINT_SLOT_CAP,
+        )
+        _LOCAL_SLOTS.acquire()
+    with _ACQUIRED_LOCK:
+        _ACQUIRED[name] = "local"
+
+
+def _acquire_endpoint_slot(name: str) -> None:
+    """Claim a quota slot for ``name``, QUEUEING (blocking) until one is free. Idempotent per name.
+
+    Uses the shared cross-process store when an internal key is set, else the in-process
+    semaphore. On persistent store errors it falls back to the local semaphore so a single
+    process stays capped instead of deadlocking or oversubscribing.
+    """
+    with _ACQUIRED_LOCK:
+        if name in _ACQUIRED:
+            return  # already hold a slot for this name (e.g. _ENDPOINT_CACHE re-entry)
+    from flash.providers.runpod import slots
+
+    if slots.internal_key() is None:
+        _acquire_local_slot(name)
+        return
+
+    errors = 0
+    queued = False
+    while True:
+        try:
+            claimed, in_use = slots.claim(
+                name, cap=RUNPOD_ENDPOINT_SLOT_CAP, claimed_by=slots.claimed_by_ident()
+            )
+        except slots.SlotStoreError as exc:
+            errors += 1
+            logger.warning(
+                "slot-store claim failed for %s (%s) [%d/%d]",
+                name,
+                exc,
+                errors,
+                _SLOT_STORE_MAX_ERRORS,
+            )
+            if errors >= _SLOT_STORE_MAX_ERRORS:
+                logger.error(
+                    "slot store unreachable; falling back to the in-process cap for %s", name
+                )
+                _acquire_local_slot(name)
+                return
+            time.sleep(_SLOT_QUEUE_WAIT_S)
+            continue
+        errors = 0
+        if claimed:
+            if queued:
+                logger.info(
+                    "RunPod endpoint slot acquired for %s after queueing (%d/%d in use)",
+                    name,
+                    in_use,
+                    RUNPOD_ENDPOINT_SLOT_CAP,
+                )
+            with _ACQUIRED_LOCK:
+                _ACQUIRED[name] = "shared"
+            return
+        if not queued:
+            logger.info(
+                "RunPod quota full (%d/%d) — queueing for a free slot...",
+                in_use,
+                RUNPOD_ENDPOINT_SLOT_CAP,
+            )
+            queued = True
+        time.sleep(_SLOT_QUEUE_WAIT_S)
+
+
+def _release_endpoint_slot(name: str) -> bool:
+    """Release the quota slot for ``name``, routed to the store it was claimed from.
+
+    The ``_ACQUIRED`` map records how this process claimed the slot (``"local"`` | ``"shared"``)
+    and makes the common path idempotent — only the first call for a name this process claimed
+    releases. When a shared store is configured, a teardown running on a DIFFERENT replica than
+    the one that claimed the slot (e.g. a ``flash cancel`` routed to another control-plane
+    replica) has no ``_ACQUIRED`` entry but must STILL drop the shared row, or the slot leaks
+    until the next reconcile and the queue is throttled even though the endpoint is gone. The
+    callers only invoke this once the remote endpoint is provably gone, and server-side release
+    is idempotent, so the best-effort cross-replica release is safe.
+
+    Returns ``True`` if a slot was (or, on the shared path, may have been) released; ``False`` for
+    a no-op (nothing tracked locally and no shared store to release against).
+    """
+    with _ACQUIRED_LOCK:
+        mode = _ACQUIRED.pop(name, None)
+    if mode == "local":
+        _LOCAL_SLOTS.release()
+        return True
+    from flash.providers.runpod import slots
+
+    # mode == "shared": this process holds the row. mode is None: either a cross-replica teardown
+    # (release the shared row anyway) or — with no shared store at all — genuinely nothing to do.
+    cross_replica = mode is None
+    if cross_replica and slots.internal_key() is None:
+        return False
+
+    try:
+        released = slots.release(name)
+    except slots.SlotStoreError as exc:
+        # A transient release failure can't leak the slot permanently: the endpoint is gone, so
+        # the next startup reconcile reclaims its row against the live endpoint list.
+        logger.warning(
+            "slot-store release failed for %s (%s); reconcile will reclaim it on restart",
+            name,
+            exc,
+        )
+        return not cross_replica
+    return released if cross_replica else True
+
+
+def reconcile_endpoint_slots() -> None:
+    """Reconcile the shared slot store against the live RunPod endpoint list (control-plane
+    startup), so a crash can't leak slots: rows for endpoints that no longer exist are reclaimed
+    and the in-use count recovers to the truth. No-op without an internal key (the local
+    semaphore needs no reconciliation — a fresh process starts empty). Best-effort: never raises.
+    """
+    from flash.providers.runpod import slots
+
+    if slots.internal_key() is None:
+        return
+    try:
+        from flash.providers.runpod import api as runpod_api
+
+        live = [
+            name
+            for e in runpod_api.list_endpoints()
+            if (name := (e.get("name") or "")).startswith("flash-")
+        ]
+    except Exception as exc:  # listing failed: do NOT reconcile against a partial/empty list
+        logger.warning("slot reconcile skipped: could not list RunPod endpoints (%s)", exc)
+        return
+    try:
+        result = slots.reconcile(live)
+        logger.info(
+            "RunPod slot reconcile: %s in use, %s reclaimed",
+            result.get("inUse"),
+            result.get("reclaimed"),
+        )
+    except slots.SlotStoreError as exc:
+        logger.warning("slot reconcile failed (%s)", exc)
 
 
 def _train_body(input_data: dict) -> dict:
@@ -45,8 +224,6 @@ def _train_body(input_data: dict) -> dict:
     import contextlib
     import json
     import os
-    import re
-    import shutil
     import subprocess
     import sys
 
@@ -56,70 +233,17 @@ def _train_body(input_data: dict) -> dict:
     # in the worker process AFTER all installs, before any model import) — doing it here would be
     # undone by a later extra_pip / `prime env install`, and depends on a handler redeploy.
 
-    def _redact_console(text: str) -> str:
-        text = re.sub(r"(https?://)([^/\s:@]+):([^@\s/]+)@", r"\1***:***@", text)
-        return re.sub(r"\bhf_[A-Za-z0-9_\-]{20,}\b", "hf_***", text)
-
-    def _pip_install(specs: list[str], *, label: str, env_override: dict[str, str] | None = None) -> None:
-        if not specs:
-            return
-        print(f"[deps] installing {len(specs)} {label} pip spec(s)", flush=True)
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "pip", "install", *specs],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env_override,
-        )
-        tail: list[str] = []
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            safe = _redact_console(line)
-            print(safe, end="", flush=True)
-            tail.append(safe)
-            if len(tail) > 240:
-                tail = tail[-240:]
-        rc = proc.wait()
-        if rc != 0:
-            detail = "".join(tail[-120:])[-8000:]
-            raise RuntimeError(f"{label} pip install failed with exit {rc}; tail:\n{detail}")
+    # Extra pip deps for Freesolo environments (installed per-run).
+    extra_pip = input_data.get("extra_pip") or []
+    if extra_pip:
+        # check=True: a deterministic dependency failure should fail fast here,
+        # not after model download + worker startup with a less actionable error.
+        subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
 
     # NB: fla is kept on ALL arches. On Hopper (sm90) fla's GDN backward is miscomputed with
     # Triton>=3.4 (#640); the fix is fla's tilelang backend, so flash.engine.worker._ensure_fla_fastpath_on_hopper
     # makes fla+tilelang live at worker startup (instead of dropping fla) for ~4-13x faster + ~2x
     # lighter Hopper GDN training than the pure-PyTorch delta fallback.
-
-    # Install the run's verifiers environment(s) from the Prime Hub via the authenticated
-    # `prime` CLI. The public pip index does not serve PRIVATE env wheels, so a plain pip
-    # install can't fetch them; `prime env install` pulls/builds/installs public + private
-    # alike, authenticated by PRIME_API_KEY forwarded from the control plane.
-    hub_env_ids = input_data.get("hub_env_ids") or []
-    if hub_env_ids:
-        worker_env = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
-        prime_key = worker_env.get("PRIME_API_KEY") or os.environ.get("PRIME_API_KEY")
-        if not prime_key:
-            raise RuntimeError(
-                "PRIME_API_KEY is required to install the Prime Hub environment on the worker"
-            )
-        # Only install `prime` when it isn't already on the worker (it's often baked into
-        # the worker image) — an unconditional install adds latency and a per-run PyPI
-        # failure point every run.
-        if shutil.which("prime") is None:
-            _pip_install(["prime"], label="prime")
-        # --with pip: install the env into THIS (the trainer's) python via pip. The default
-        # (`--with uv`) installs into prime's own isolated uv env, so the trainer then can't
-        # import the env module (ModuleNotFoundError at load_environment). PIP_BREAK_SYSTEM_PACKAGES
-        # lets pip write to a PEP-668 "externally-managed" base python (the worker image's).
-        install_env = {
-            **os.environ,
-            "PRIME_API_KEY": prime_key,
-            "PRIME_DISABLE_VERSION_CHECK": "1",
-            "PIP_BREAK_SYSTEM_PACKAGES": "1",
-        }
-        for env_id in hub_env_ids:
-            subprocess.run(
-                ["prime", "env", "install", env_id, "--with", "pip"], check=True, env=install_env
-            )
 
     overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
     snapshot_download(
@@ -130,11 +254,6 @@ def _train_body(input_data: dict) -> dict:
         token=overrides.get("HF_TOKEN"),
     )
     code_dir = "/runcode/code"
-
-    # Extra pip deps for verifiers / Prime Hub environments (installed per-run). Fetch code first so
-    # a run-private wheel staged under code/wheels can be installed by absolute path.
-    extra_pip = input_data.get("extra_pip") or []
-    _pip_install(extra_pip, label="extra_pip")
 
     env = dict(os.environ)
     env.update(overrides)
@@ -208,7 +327,7 @@ def _train_body(input_data: dict) -> dict:
             proc.wait()
         # Console is uploaded on FAILURE (crash root-cause). FLASH_UPLOAD_CONSOLE=1 also uploads it
         # on SUCCESS so an operator can verify which optimizations engaged — LoRA+/8-bit-AdamW/
-        # chalk (standalone production kernels)/PiSSA/rsLoRA/fla all log their engagement (or fallback) to the console.
+        # Liger/PiSSA/rsLoRA/fla/chalk all log their engagement (or fallback) to the console.
         _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
             "", "0", "false", "no", "off",
         )
@@ -373,7 +492,6 @@ def get_train_endpoint(
     from runpod_flash import Endpoint
 
     from flash.providers.runpod.auth import ensure_auth
-    from flash.providers.runpod.jobs import volume_endpoint_kwargs
 
     ensure_auth()
     _patch_runpod_backoff()
@@ -382,39 +500,47 @@ def get_train_endpoint(
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
     if name in _ENDPOINT_CACHE:
+        # Slot was already acquired when the entry was first created; don't re-acquire.
         return _ENDPOINT_CACHE[name]
-    kwargs = dict(
-        name=name,
-        gpu=flash_gpu(friendly),
-        # GPUs per worker (= one trainer card + train.inference_gpus); >1 for disaggregated async
-        # GRPO, else 1. Derived from the rollout topology — there is no [gpu].count field, so the
-        # old getattr(spec.gpu, "count", 1) silently always provisioned 1 GPU (breaking the split).
-        gpu_count=gpus_per_node(spec),
-        min_cuda_version=min_cuda_for(friendly),
-        execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-        workers=(0, 1),  # one dedicated worker per run; scale to zero when idle
-        **volume_endpoint_kwargs(spec),
-    )
-    # RunPod Flash needs its serverless runtime baked into the worker image; the prebuilt
-    # WORKER_IMAGE is Vast's cold-start image (no Flash runtime) and leaves the worker unhealthy if
-    # forced. RunPod boot-installs WORKER_DEPS on Flash's default template instead (cached as a
-    # Flash artifact). Optional FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
-    image = (os.environ.get("FLASH_WORKER_IMAGE") or "").strip()
-    if image:
-        kwargs["image"] = image
-    else:
-        kwargs["dependencies"] = resolve_worker_deps(friendly, spec=spec)
-        kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-    ep = Endpoint(**kwargs)
-    handler = ep(_train_body)  # register the queue-based handler; returns the callable
-    # The resource config is cached on the Endpoint, so raising the disk on it here
-    # carries through to the deploy that the first handler call triggers.
-    from flash.providers.runpod.jobs import apply_disk_gb
+    # Claim a quota slot before creating the endpoint. This QUEUES (blocks) when the quota is
+    # full, making new runs wait here instead of failing with RunPod's worker-quota error. The
+    # slot is released by terminate_endpoint once the remote endpoint is provably torn down.
+    _acquire_endpoint_slot(name)
+    try:
+        kwargs = {
+            "name": name,
+            "gpu": flash_gpu(friendly),
+            # GPUs per worker (= one trainer card + train.inference_gpus); >1 for disaggregated
+            # async GRPO, else 1. Derived from the rollout topology (gpus_per_node) — there is no
+            # [gpu].count field, so the old getattr(spec.gpu, "count", 1) silently always
+            # provisioned 1 GPU (breaking the disaggregated split).
+            "gpu_count": gpus_per_node(spec),
+            "min_cuda_version": min_cuda_for(friendly),
+            "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+            "workers": (0, 1),  # one dedicated worker per run; scale to zero when idle
+        }
+        # live endpoints keep the boot-install path by default. an operator can still opt into a
+        # serverless-compatible image through FLASH_WORKER_IMAGE or the per-sm image template.
+        image = worker_image_for_gpu(friendly, allow_default=False)
+        if image:
+            kwargs["image"] = image
+        else:
+            kwargs["dependencies"] = resolve_worker_deps()
+            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+        ep = Endpoint(**kwargs)
+        handler = ep(_train_body)  # register the queue-based handler; returns the callable
+        # The resource config is cached on the Endpoint, so raising the disk on it here
+        # carries through to the deploy that the first handler call triggers.
+        from flash.providers.runpod.jobs import apply_disk_gb
 
-    cfg = ep._build_resource_config()
-    apply_disk_gb(cfg, disk_gb)
-    _ENDPOINT_CACHE[name] = handler
-    return handler
+        cfg = ep._build_resource_config()
+        apply_disk_gb(cfg, disk_gb)
+        _ENDPOINT_CACHE[name] = handler
+        return handler
+    except Exception:
+        # Endpoint creation failed — release the slot so other runs are not permanently blocked.
+        _release_endpoint_slot(name)
+        raise
 
 
 def _run_suffix(run_id: str | None) -> str | None:
@@ -530,7 +656,31 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             return out
 
         try:
-            results = asyncio.run(_undeploy_all())
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # No running event loop — asyncio.run() works directly.
+                results = asyncio.run(_undeploy_all())
+            else:
+                # Running event loop (e.g. FastAPI lifespan) — asyncio.run() would raise;
+                # daemon=True so a hung undeploy cannot prevent process shutdown.
+                _out: list = []
+                _err: list = []
+
+                def _run_undeploy() -> None:
+                    try:
+                        _out.append(asyncio.run(_undeploy_all()))
+                    except Exception as _e:
+                        _err.append(_e)
+
+                _t = threading.Thread(target=_run_undeploy, daemon=True)
+                _t.start()
+                _t.join(timeout=30)
+                if _err:
+                    raise _err[0]
+                if not _out:
+                    raise TimeoutError("undeploy timed out after 30s")
+                results = _out[0]
         except Exception as exc:
             results = [{"success": False, "name": target, "message": str(exc)}]
 
@@ -538,16 +688,42 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
     # registry per-process under ~/.flash, so a recreated container (or a crash before
     # on_handle() persisted the endpoint id) leaves the live endpoint invisible to the
     # lookup above. Delete it via the RunPod REST API by its reconstructed name so it
-    # can't keep a paid worker alive.
+    # can't keep a paid worker alive.  ``rest_confirmed_absent`` records that the REST
+    # lookup actually RAN and found no endpoint of this name — i.e. we positively verified
+    # there is nothing to tear down (distinct from the API being unreachable, where we
+    # cannot tell and must keep holding the slot).
+    rest_confirmed_absent = False
     if not uids:
-        with contextlib.suppress(Exception):
+        try:
             from flash.providers.runpod import api as runpod_api
 
-            for ep in runpod_api.find_endpoints_by_name(target):
-                if ep.get("name") == target and runpod_api.delete_endpoint(ep["id"]):
+            matches = [
+                e for e in runpod_api.find_endpoints_by_name(target) if e.get("name") == target
+            ]
+            for ep in matches:
+                if runpod_api.delete_endpoint(ep["id"]):
                     results.append(
                         {"success": True, "name": target, "message": "deleted via REST API"}
                     )
+            # No endpoint of this name exists remotely — positively verified absent.
+            rest_confirmed_absent = not matches
+        except Exception as exc:
+            # REST API unreachable: we cannot prove the endpoint is gone, so do NOT treat this
+            # as "absent" — releasing on an unverified absence risks oversubscribing the quota.
+            logger.debug("REST endpoint lookup failed for %s: %s", target, exc)
+
+    # Release the quota slot for this run's endpoint.  Releases the slot this process acquired,
+    # or — when a shared store is configured — the row a different replica claimed (a ``flash
+    # cancel`` may run on another replica than the one that deployed).  Release ONLY when
+    # the remote endpoint is provably gone: (a) at least one undeploy/delete succeeded, or
+    # (b) we positively verified no remote endpoint exists (registry returned no uids AND the
+    # REST lookup confirmed none — e.g. the endpoint never finished deploying, so its slot
+    # would otherwise leak forever and deadlock the queue).  We deliberately do NOT release on
+    # an undeploy/delete *failure*: the endpoint may still be live and counting against the
+    # RunPod quota, so releasing would oversubscribe it — the slot stays held until a later
+    # teardown confirms the endpoint is gone.  (stop_endpoint no longer releases the slot.)
+    if any(r.get("success") for r in results) or (not uids and rest_confirmed_absent):
+        _release_endpoint_slot(target)
 
     # also drop the in-process cached handler for THIS run only (a class-wide
     # drop would evict a concurrent run's endpoint on the same GPU class).

@@ -22,21 +22,19 @@ import inspect
 import os
 
 # Re-export the package's public surface so ``from flash.providers.runpod.train import <name>``
-# (callers in providers/runpod, providers/vast, runner, and the tests) keeps working unchanged.
+# keeps working unchanged for callers and tests.
 from flash.providers.runpod.train.deps import (  # noqa: F401
     DEFAULT_CHALK_SPEC,
     DEFAULT_EXECUTION_TIMEOUT_MS,
     WORKER_DEPS,
     WORKER_IMAGE,
     WORKER_SYSTEM_DEPS,
-    _chalk_selected,
     _effective_worker_env,
     build_worker_env,
     chalk_extra_pip,
-    hub_env_ids_for_run,
-    local_env_extra_pip,
     logger,
     resolve_worker_deps,
+    worker_image_for_gpu,
 )
 from flash.providers.runpod.train.endpoints import (  # noqa: F401
     _ENDPOINT_CACHE,
@@ -55,30 +53,21 @@ from flash.providers.runpod.train.endpoints import (  # noqa: F401
 from flash.spec import JobSpec
 
 
-def upload_code(repo: str | None = None, spec: JobSpec | None = None) -> str:
+def upload_code(repo: str | None = None) -> str:
     """Upload the ``flash`` package to the run's HF artifact repo.
 
     ``repo`` is the per-run artifact repo (``spec.train.hf_repo``); the worker fetches
     ``code/**`` from the same repo it is given in the submit payload, so the code must land in
     that per-run repo.
 
-    The worker downloads ``code/**`` to ``/runcode``. Verifiers-only: there are no built-in
-    example environments to ship — Hub/installed envs are pip-installed on the worker (see
-    ``registry.worker_pip_for_env``).
+    The worker downloads ``code/**`` to ``/runcode``. There are no built-in example
+    environments to ship; Freesolo SDK support is installed through
+    ``registry.worker_pip_for_env`` and environment ids are resolved by the adapter at load time.
 
     Only the ``flash`` package is uploaded, NOT the client's project tree. Managed runs must
-    reference a published Hub env by ``id`` (``flash env push`` to publish a local env first); the
-    worker pip-installs the env wheel.
-
-    ``FLASH_CHALK_WHEEL`` is resolved against the SAME effective worker env (``os.environ`` overlaid
-    with ``spec.worker_env``) that ``chalk_extra_pip`` consumes to point the worker at the staged
-    wheel. Reading bare ``os.environ`` here would miss a wheel specified via the run's ``[worker_env]``
-    block — staging would skip it while the submit path still adds the worker-side path, so pip would
-    fail on the missing file. (``FLASH_ENV_WHEEL`` stays ``os.environ``-only to match its submit-side
-    reader ``local_env_extra_pip``.) ``spec=None`` collapses to plain ``os.environ``.
+    reference a published Freesolo environment by ``id`` (``flash env push`` to publish a local
+    env first).
     """
-    from pathlib import Path
-
     from huggingface_hub import HfApi
 
     import flash
@@ -111,46 +100,12 @@ def upload_code(repo: str | None = None, spec: JobSpec | None = None) -> str:
         # scoped to code/flash (only orphans there are purged; unchanged files are kept).
         delete_patterns=["**"],
     )
-    # Resolve the staged-wheel knobs against the effective worker env (os.environ + spec.worker_env)
-    # so a wheel pointed to by the run's [worker_env] block is staged here — matching the source
-    # chalk_extra_pip()/local_env_extra_pip() read to add the worker-side path. (None -> os.environ.)
-    eff_env = _effective_worker_env(spec)
-    # Private validation path for unpublished chalk builds: stage a local wheel into the same
-    # run-private code artifact. chalk_extra_pip() points selected runs at the staged worker-side
-    # /runcode/code/wheels/<wheel>.whl unless FLASH_CHALK_SPEC explicitly overrides it.
-    chalk_wheel = (eff_env.get("FLASH_CHALK_WHEEL") or "").strip()
-    if chalk_wheel:
-        wheel_path = Path(chalk_wheel).expanduser()
-        if not wheel_path.is_file():
-            raise FileNotFoundError(f"FLASH_CHALK_WHEEL does not exist: {wheel_path}")
-        if wheel_path.suffix != ".whl":
-            raise ValueError(f"FLASH_CHALK_WHEEL must point to a .whl file: {wheel_path}")
-        api.upload_file(
-            path_or_fileobj=str(wheel_path),
-            path_in_repo=f"code/wheels/{wheel_path.name}",
-            repo_id=repo,
-            repo_type="dataset",
-        )
-    # Private validation path for unpublished/private verifiers envs: stage a local wheel into the
-    # run-private artifact, then the submit path installs /runcode/code/wheels/<wheel>.whl and skips
-    # Prime Hub for the env. This unblocks quality runs when Hub team access/publishing is down.
-    env_wheel = (os.environ.get("FLASH_ENV_WHEEL") or "").strip()
-    if env_wheel:
-        wheel_path = Path(env_wheel).expanduser()
-        if not wheel_path.is_file():
-            raise FileNotFoundError(f"FLASH_ENV_WHEEL does not exist: {wheel_path}")
-        if wheel_path.suffix != ".whl":
-            raise ValueError(f"FLASH_ENV_WHEEL must point to a .whl file: {wheel_path}")
-        api.upload_file(
-            path_or_fileobj=str(wheel_path),
-            path_in_repo=f"code/wheels/{wheel_path.name}",
-            repo_id=repo,
-            repo_type="dataset",
-        )
     return repo
 
 
-def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
+def submit_train(
+    spec: JobSpec, seed: int, log=None, runtime_secrets: dict[str, str] | None = None
+) -> dict:
     """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     from flash.envs.registry import worker_pip_for_env
@@ -167,14 +122,12 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
-        "env": build_worker_env(spec, seed),
+        "env": build_worker_env(spec, seed, runtime_secrets=runtime_secrets),
         # extra_pip is installed by the worker for EVERY job (baked-image RunPod _train_body and
         # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
         # default run — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
-        + local_env_extra_pip()
         + chalk_extra_pip(spec),
-        "hub_env_ids": hub_env_ids_for_run(spec.environment.id, spec.environment.params),
     }
     if log is not None:
         print(

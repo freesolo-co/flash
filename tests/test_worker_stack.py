@@ -14,17 +14,15 @@ from flash.providers.runpod.train import (
 )
 
 
-def test_resolve_worker_deps_default(monkeypatch):
-    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
-    # The single pinned stack is the validated default (bench/results/phase1 matrix).
+def test_resolve_worker_deps_default():
+    # The single pinned stack is the validated default (bench/results/phase1 matrix); fully
+    # managed, no per-run override.
     assert resolve_worker_deps() == WORKER_DEPS
 
 
-def test_gdn_fastpath_deps_present_and_kept_on_hopper(monkeypatch):
+def test_gdn_fastpath_deps_present_and_kept_on_hopper():
     """The GDN fast-path stack (fla-from-git + tilelang + pinned apache-tvm-ffi) is baked in, and
     fla is KEPT on Hopper (sm90) — the #640 fix is fla's tilelang backend, not dropping fla."""
-    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
-    monkeypatch.delenv("FLASH_WORKER_EXTRA_DEPS", raising=False)
     joined = " ".join(WORKER_DEPS)
     assert (
         "git+https://github.com/fla-org/flash-linear-attention" in joined
@@ -36,8 +34,8 @@ def test_gdn_fastpath_deps_present_and_kept_on_hopper(monkeypatch):
         d.startswith("apache-tvm-ffi==0.1.11") for d in WORKER_DEPS
     )  # pin (0.1.12 aborts tilelang import)
     # fla must NOT be dropped on Hopper anymore (it was, pre-fix).
-    deps_h100 = resolve_worker_deps("H100")
-    assert any("flash-linear-attention" in d for d in deps_h100), (
+    deps = resolve_worker_deps()
+    assert any("flash-linear-attention" in d for d in deps), (
         "fla must be kept on Hopper for the tilelang fast path"
     )
 
@@ -57,19 +55,6 @@ def test_chalk_floor_is_current_and_consistent_with_dockerfile():
     dm = re.search(r'"(freesolo-chalk>=[^"]+)"', dockerfile)
     assert dm, "Dockerfile.worker must install freesolo-chalk with an explicit bounded range"
     assert dm.group(1) == expected
-
-
-def test_resolve_worker_deps_explicit_list_wins(monkeypatch):
-    # Whitespace-separated; a comma is part of a PEP 440 range, not a delimiter.
-    monkeypatch.setenv("FLASH_WORKER_DEPS", "torch==2.99  vllm==9.9.9   transformers>=5.6,<5.11")
-    assert resolve_worker_deps() == ["torch==2.99", "vllm==9.9.9", "transformers>=5.6,<5.11"]
-
-
-def test_resolve_worker_deps_json_list_supports_comma_specs(monkeypatch):
-    monkeypatch.setenv(
-        "FLASH_WORKER_DEPS", '["torch==2.10.0", "transformers>=5.6,<5.11", "fla==0.5.0"]'
-    )
-    assert resolve_worker_deps() == ["torch==2.10.0", "transformers>=5.6,<5.11", "fla==0.5.0"]
 
 
 def test_worker_stack_pins_qwen35_capable_versions():
@@ -149,6 +134,44 @@ def _fake_bitsandbytes(monkeypatch):
     return _PagedAdamW8bit
 
 
+def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
+    from flash.engine.worker import perf
+
+    class _Completed:
+        def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(cmd, **_kwargs):
+        joined = " ".join(cmd)
+        if "--query-gpu=" in joined:
+            return _Completed(
+                "0, GPU-abc, 575.57, NVIDIA GeForce RTX 5090, 98, 77, "
+                "32607, 24000, 8607, 69, 412.5, 575.0, P0, 2700, 14001, 5, 16\n"
+            )
+        if "--query-compute-apps=" in joined:
+            return _Completed("1234, /usr/bin/python, 23900\n")
+        return _Completed(returncode=1, stderr="unexpected command")
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    diag = perf.gpu_diagnostics()
+
+    assert diag["device_name"] == "NVIDIA GeForce RTX 5090"
+    assert diag["driver_version"] == "575.57"
+    assert diag["gpu_util_pct"] == 98
+    assert diag["mem_util_pct"] == 77
+    assert diag["memory_used_gb"] == pytest.approx(23.438)
+    assert diag["memory_total_gb"] == pytest.approx(31.8428, rel=1e-3)
+    assert diag["temperature_c"] == 69
+    assert diag["power_w"] == 412.5
+    assert diag["processes"][0]["process_name"] == "/usr/bin/python"
+    assert diag["processes"][0]["used_memory_gb"] == pytest.approx(23.34, rel=1e-3)
+
+
 def test_loraplus_optimizer_mirrors_8bit_optim(monkeypatch):
     """An `8bit` optim string -> bnb PagedAdamW8bit (LoRA+ and 8-bit state coexist), always-on."""
     worker = _import_worker(monkeypatch)
@@ -187,15 +210,23 @@ def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
 def test_grpo_no_op_failure_empty_reward_no_resume(monkeypatch):
     """Empty reward_history with no resume = the rollout scored nothing -> fail loudly (no-op run)."""
     worker = _import_worker(monkeypatch)
-    assert worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
+    )
 
 
 def test_grpo_no_op_ok_when_rewards_present(monkeypatch):
     """A non-empty reward_history means the reward path ran -> never a no-op failure."""
     worker = _import_worker(monkeypatch)
-    assert worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10) is False
+    assert (
+        worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10)
+        is False
+    )
     # An all-zero history (env returned all-zero rewards) still counts as real training.
-    assert worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0) is False
+    assert (
+        worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0)
+        is False
+    )
 
 
 def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
@@ -203,14 +234,19 @@ def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
     worker = _import_worker(monkeypatch)
     assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=10) is True
     # Empty history is tolerated -> NOT a no-op failure (finalize the completed policy).
-    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12) is False
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12)
+        is False
+    )
 
 
 def test_grpo_no_op_failure_resume_did_not_reach_target(monkeypatch):
     """A resume that did NOT reach the target steps with no reward is still a genuine no-op -> fail."""
     worker = _import_worker(monkeypatch)
     assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=3) is False
-    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
+    )
     # No target steps configured can never count as a complete resume.
     assert worker._grpo_resume_already_complete("ckpt", target_steps=0, steps_run=0) is False
 
@@ -278,6 +314,7 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     import flash.engine.worker as w
 
     calls = []
+
     def _fake_upload(*a, **k):
         calls.append(a[1])
         return True  # simulate a successful commit so the throttle clock advances
@@ -381,13 +418,50 @@ def test_flex_attn_status_distinguishes_unsupported_from_probe_failure(monkeypat
     assert perf.flex_attn_status("whatever") == "probe_failed"
 
 
+def test_attn_impl_for_capability_per_arch(monkeypatch):
+    """Pure capability -> best-per-arch flash policy (no CUDA needed): flash on every arch EXCEPT
+    consumer Blackwell sm120. Hopper(sm90): FA3, else a UNIFORM fall back to plain SDPA (NO FA3->FA2
+    chain). Ampere(sm80/86)+Ada(sm89): FA2. sm120: cuDNN SDPA (FA3/FA4 can't run)."""
+    w = _import_worker(monkeypatch)
+    f = w._attn_impl_for_capability
+    # Hopper sm90: FA3 is the arch's best flash; absent -> plain SDPA (uniform fallback, NOT FA2).
+    assert f(9, 0, fa3_available=True, fa2_available=True) == "flash_attention_3"
+    assert f(9, 0, fa3_available=False, fa2_available=True) is None  # uniform: -> SDPA, not FA2
+    assert f(9, 0, fa3_available=False, fa2_available=False) is None
+    # Ampere (8.0/8.6) + Ada (8.9): FA2 when the wheel is present, else SDPA. FA3 never applies.
+    assert f(8, 0, fa2_available=True) == "flash_attention_2"  # A100
+    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A6000
+    assert f(8, 9, fa2_available=True) == "flash_attention_2"  # Ada 4090
+    assert f(8, 7, fa2_available=True) is None  # sm87 Jetson Orin: NOT a validated FA2 arch -> SDPA
+    assert f(8, 0, fa2_available=False) is None
+    # consumer Blackwell sm120: cuDNN SDPA regardless of flash availability (the one exception).
+    assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
+
+
+def test_flash_attn_probes_false_in_ci(monkeypatch):
+    """The FA2/FA3 probes report False in offline CI (neither transformers/flash_attn nor the FA3
+    ``flash_attn_interface`` is present). FA is used whenever importable — there is no disable
+    hatch, so the result is purely 'is the package available'."""
+    w = _import_worker(monkeypatch)
+    assert w._flash_attn_3_available() is False  # flash_attn_interface / transformers absent in CI
+    assert w._flash_attn_available() is False  # flash_attn wheel absent in CI
+
+
+def test_liger_on_requires_default_and_gpu(monkeypatch):
+    """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
+    liger_kernel (both absent in CI), so it's off here too."""
+    monkeypatch.setenv("RUN_MODE", "sft")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    assert w.liger_on(False) is False
+    assert w.liger_on(True) is False  # no CUDA / liger_kernel in CI
+
+
 def test_liger_default_model_size_gate(monkeypatch):
-    """The model-size gate (_liger_default_for_model) drives the memory-mode behaviors — sleep and
-    grad checkpointing: OFF for small models (1B-class, speed mode — measured net loss PR #174) and
-    ON for models ≥ ~3B where the memory headroom pays off. (chalk runs standalone and its FLCE is
-    unconditionally on regardless of size; this ~3B cutoff is the old Liger threshold the memory
-    decisions still share, hence the helper name.) Context-aware: a small model at long context is
-    memory-bound, so memory mode flips ON."""
+    """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
+    for models ≥ ~3B where fused-CE's memory win pays off."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
@@ -404,7 +478,9 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w._estimate_params(big) >= 3e9
 
     def fake_cfg(cfg):
-        fake = types.SimpleNamespace(AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg))
+        fake = types.SimpleNamespace(
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg)
+        )
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
     fake_cfg(small)
@@ -423,10 +499,10 @@ def test_liger_default_model_size_gate(monkeypatch):
 
 
 def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
-    """make_lora uses serve-safe LoRA defaults for every model: standard zero-B init (PiSSA removed —
-    its residual corrupts serve + GRPO warm-start). LoRA scaling is env-gated and defaults to rsLoRA
-    ON (maintainer decision; FLASH_USE_RSLORA=0 falls back to standard alpha/r for A/B / serve-safety
-    re-checks — dev #82 found rsLoRA can diverge SFT at the usual LR)."""
+    """make_lora uses serve-safe, convergence-stable LoRA defaults for every model:
+    standard zero-B init (PiSSA removed — its residual corrupts serve + GRPO warm-start) and
+    standard alpha/r scaling (rsLoRA removed — alpha/sqrt(r) is ~5.6x larger and diverges the
+    SFT at the usual LoRA LR -> degenerate served adapter)."""
     captured = {}
     fake_peft = types.ModuleType("peft")
     fake_peft.LoraConfig = lambda **kw: (captured.update(kw), kw)[1]
@@ -435,26 +511,18 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     worker = _import_worker(monkeypatch)
     monkeypatch.setattr(worker, "lora_exclude_modules", lambda m: None)
 
-    # Default (no env override): standard zero-B init, rsLoRA ON.
-    monkeypatch.delenv("FLASH_USE_RSLORA", raising=False)
-    monkeypatch.delenv("FLASH_INIT_LORA_PISSA", raising=False)
     for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
         captured.clear()
         worker.make_lora(model_id)
         assert captured.get("init_lora_weights") is True
         assert "pissa" not in str(captured.get("init_lora_weights")).lower()
-        assert captured.get("use_rslora") is True
-
-    # FLASH_USE_RSLORA=0 -> standard alpha/r scaling (the A/B / serve-safety escape hatch).
-    monkeypatch.setenv("FLASH_USE_RSLORA", "0")
-    captured.clear()
-    worker.make_lora("Qwen/Qwen3.5-0.8B")
-    assert captured.get("use_rslora") is False
+        assert captured.get("use_rslora") is False
 
 
 def test_force_vllm_backend_for_sm120(monkeypatch):
-    """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); an operator override and a
-    non-sm120 GPU leave VLLM_ATTENTION_BACKEND untouched. Regression for the empty-5090-rollout."""
+    """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); deterministic, no operator
+    override. A non-sm120 GPU leaves VLLM_ATTENTION_BACKEND untouched. Regression for the
+    empty-5090-rollout."""
     import os
     import sys
     import types
@@ -475,10 +543,10 @@ def test_force_vllm_backend_for_sm120(monkeypatch):
     assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
     assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
 
-    # operator override wins (not clobbered)
+    # sm120: a pre-set value is OVERWRITTEN — there is no operator override anymore (deterministic)
     monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
-    assert worker.force_vllm_backend_for_sm120() is None
-    assert os.environ["VLLM_ATTENTION_BACKEND"] == "TRITON_ATTN"
+    assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
 
     # non-sm120 (sm90 Hopper) -> untouched
     monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
@@ -543,10 +611,8 @@ def _patch_hopper_stack(
     # CompletedProcess so _pip can read .returncode (the install-success gate).
     def _fake_run(cmd, *a, **k):
         if record_pip is not None:
-            # cmd == [sys.executable, "-m", "pip", "install", *flags, *specs]; record just the
-            # specs (everything after "install" that isn't a -flag, so adding pip flags like
-            # -q / --break-system-packages / --no-deps doesn't shift what the asserts match).
-            record_pip.append(" ".join(str(c) for c in cmd[4:] if not str(c).startswith("-")))
+            # cmd == [sys.executable, "-m", "pip", "install", "-q", *specs]
+            record_pip.append(" ".join(str(c) for c in cmd[5:]))
         return _FakeCompleted(pip_rc)
 
     monkeypatch.setattr(subprocess, "run", _fake_run, raising=True)
@@ -727,7 +793,9 @@ def test_hopper_outer_exception_disables_fla(monkeypatch):
     # Must NOT propagate (the worker keeps running on the pure-PyTorch delta path).
     perf._ensure_fla_fastpath_on_hopper()
 
-    assert removed, "outer exception path must FAIL-CLOSED: disable fla (call _remove_fla_from_disk)"
+    assert removed, (
+        "outer exception path must FAIL-CLOSED: disable fla (call _remove_fla_from_disk)"
+    )
 
 
 def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
@@ -745,9 +813,7 @@ def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "torch", t)
     touched: list[str] = []
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: touched.append("pip"), raising=True
-    )
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: touched.append("pip"), raising=True)
     monkeypatch.setattr(
         perf, "_remove_fla_from_disk", lambda: (touched.append("remove"), ([], False))[1]
     )
@@ -821,78 +887,6 @@ def test_tilelang_pin_is_consistent_and_pinned():
     )
 
 
-# ---------------------------------------------------------------------------
-# _remove_fla_from_disk: also strips flash-linear-attention dist metadata so a
-# stale/broken install is fully removed and `pip install <git url>` reinstalls
-# (Copilot PR #32 review on perf.py:~541).
-# ---------------------------------------------------------------------------
-def test_remove_fla_dist_metadata_strips_all_artifact_kinds(tmp_path):
-    """The metadata helper removes every distribution-metadata artifact kind for
-    flash-linear-attention from each scanned site dir (dist-info, egg-info, egg-link, editable .pth)
-    — both the normalized (underscore) and legacy (hyphen) name forms — best-effort per path."""
-    from flash.engine.worker import perf
-
-    site = tmp_path / "site-packages"
-    site.mkdir()
-    distinfo = site / "flash_linear_attention-0.1.dot0.dist-info"
-    distinfo.mkdir()
-    (distinfo / "METADATA").write_text("Name: flash-linear-attention\n")
-    egginfo = site / "flash_linear_attention.egg-info"
-    egginfo.mkdir()
-    egglink = site / "flash-linear-attention.egg-link"
-    egglink.write_text("/somewhere/src\n")
-    editable_pth = site / "__editable__.flash_linear_attention-0.1.dot0.pth"
-    editable_pth.write_text("/somewhere/src\n")
-    # An UNRELATED package's metadata must be left untouched.
-    keep = site / "torch-2.10.dist-info"
-    keep.mkdir()
-
-    removed = perf._remove_fla_dist_metadata({str(site)})
-
-    assert not distinfo.exists(), "dist-info must be removed"
-    assert not egginfo.exists(), "egg-info must be removed"
-    assert not egglink.exists(), "egg-link must be removed"
-    assert not editable_pth.exists(), "editable .pth must be removed"
-    assert keep.exists(), "unrelated package metadata must NOT be touched"
-    assert str(distinfo) in removed
-    assert str(egginfo) in removed
-
-
-def test_remove_fla_from_disk_removes_package_dir_and_dist_info(tmp_path, monkeypatch):
-    """End-to-end: seeding a fake site-packages with BOTH a `fla/` package dir and a
-    `flash_linear_attention-*.dist-info/` and running `_remove_fla_from_disk()` removes BOTH — so
-    pip can no longer see "requirement already satisfied" and skip the runtime git reinstall."""
-    import importlib
-
-    from flash.engine.worker import perf
-
-    site = tmp_path / "site-packages"
-    site.mkdir()
-    # A real importable `fla` package so find_spec('fla') resolves it from our temp path.
-    fla_pkg = site / "fla"
-    fla_pkg.mkdir()
-    (fla_pkg / "__init__.py").write_text("# fake fla\n")
-    dist_info = site / "flash_linear_attention-0.1.dot0.dist-info"
-    dist_info.mkdir()
-    (dist_info / "METADATA").write_text("Name: flash-linear-attention\nVersion: 0.1.dot0\n")
-
-    # Put our fake site-packages FIRST on sys.path so the spec resolves there, and clear any cached
-    # `fla` import so find_spec re-resolves from disk.
-    monkeypatch.syspath_prepend(str(site))
-    monkeypatch.delitem(sys.modules, "fla", raising=False)
-    importlib.invalidate_caches()
-
-    removed, still_importable = perf._remove_fla_from_disk()
-
-    assert not fla_pkg.exists(), "the fla/ package dir must be removed"
-    assert not dist_info.exists(), (
-        "the flash_linear_attention*.dist-info metadata must ALSO be removed so pip reinstalls"
-    )
-    assert str(fla_pkg) in removed
-    assert str(dist_info) in removed
-    assert not still_importable, "fla must no longer be importable from disk"
-
-
 def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
     # A GPU that never comes up is infra-shaped -> typed RetriableInfraError, not RuntimeError.
     import time as _time
@@ -923,3 +917,222 @@ def test_required_upload_exhaustion_raises_retriable_infra_error(monkeypatch):
 
     with pytest.raises(RetriableInfraError):
         worker._hf_upload(boom, "DONE", required=True, label="DONE")
+
+
+# ---------------------------------------------------------------------------
+# flash #184: tilelang's libcudart_stub.so shadows the real CUDA runtime in
+# vLLM's CudaRTLibrary (intermittent `undefined symbol: cudaDeviceReset`).
+# ---------------------------------------------------------------------------
+def _fake_tilelang(tmp_path, stub_bytes=b"STUB"):
+    """Lay down a fake `tilelang` package (with lib/libcudart_stub.so) and return (pkg_dir, stub)."""
+
+    pkg = tmp_path / "tilelang"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    stub = pkg / "lib" / "libcudart_stub.so"
+    stub.write_bytes(stub_bytes)
+    return str(pkg), str(stub)
+
+
+def test_neutralize_tilelang_stub_symlinks_to_real_libcudart(tmp_path, monkeypatch):
+    import importlib
+    import os
+
+    from flash.engine.worker import perf
+
+    _pkg, stub = _fake_tilelang(tmp_path)
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")  # stands in for the real runtime (has cudaDeviceReset)
+
+    # Make find_spec("tilelang") resolve to our fake package, and skip the real-libcudart probe.
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: str(real))
+
+    perf._neutralize_tilelang_cudart_stub()
+
+    # The stub path now points at the real runtime; the original stub is backed up verbatim.
+    assert os.path.islink(stub), "stub should be replaced by a symlink to the real libcudart"
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    assert os.path.exists(stub + ".orig")
+    with open(stub + ".orig", "rb") as f:
+        assert f.read() == b"STUB", "the original stub must be preserved for reversibility"
+
+    # Idempotent: a second pass keeps the symlink and never clobbers the saved original.
+    perf._neutralize_tilelang_cudart_stub()
+    assert os.path.islink(stub)
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+    with open(stub + ".orig", "rb") as f:
+        assert f.read() == b"STUB"
+
+
+def test_neutralize_tilelang_stub_noop_without_real_libcudart(tmp_path, monkeypatch):
+    """No discoverable real runtime -> leave the stub untouched (never break tilelang)."""
+    import importlib
+    import os
+
+    from flash.engine.worker import perf
+
+    _pkg, stub = _fake_tilelang(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: None)
+
+    perf._neutralize_tilelang_cudart_stub()
+
+    assert not os.path.islink(stub)
+    assert not os.path.exists(stub + ".orig")
+    with open(stub, "rb") as f:
+        assert f.read() == b"STUB"
+
+
+def test_neutralize_tilelang_stub_noop_when_tilelang_absent(monkeypatch):
+    """tilelang not installed -> clean no-op (must not even probe for a real libcudart)."""
+    import importlib.util
+
+    from flash.engine.worker import perf
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+
+    def _boom():
+        raise AssertionError("_find_real_libcudart must not run when tilelang is absent")
+
+    monkeypatch.setattr(perf, "_find_real_libcudart", _boom)
+    perf._neutralize_tilelang_cudart_stub()  # no exception
+
+
+def test_find_real_libcudart_safe_when_nothing_matches(monkeypatch):
+    """_find_real_libcudart returns None (never raises) when no candidate exposes the symbol."""
+    import builtins
+    import ctypes.util
+    import glob
+
+    from flash.engine.worker import perf
+
+    monkeypatch.setattr(glob, "glob", lambda *_a, **_k: [])
+    monkeypatch.setattr(ctypes.util, "find_library", lambda _n: None)
+    real_import = builtins.__import__
+
+    def _no_nvidia(name, *a, **k):
+        if name.startswith("nvidia"):
+            raise ImportError(name)
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_nvidia)
+    assert perf._find_real_libcudart() is None
+
+
+def _compile_so(c_path, so_path, src):
+    """Compile a tiny shared object; return True on success (skip the test if no toolchain)."""
+    import shutil
+    import subprocess
+
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if not cc:
+        return False
+    with open(c_path, "w") as f:
+        f.write(src)
+    return subprocess.run([cc, "-shared", "-fPIC", "-o", so_path, c_path]).returncode == 0
+
+
+def _maps_has(name):
+    with open("/proc/self/maps") as f:
+        return any(name in line for line in f)
+
+
+def test_neutralize_never_loads_the_stub_into_the_process(tmp_path, monkeypatch):
+    """The crux of #184: the neutralize step must NEVER dlopen the stub. Loading it (even just to
+    inspect it) maps `libcudart_stub.so` into /proc/self/maps, which is the exact line vLLM's
+    CudaRTLibrary scan would then resolve -> the crash we're preventing. Compile a REAL stub .so
+    missing cudaDeviceReset, run neutralize, and assert it was never mapped."""
+    import os
+
+    if not os.path.exists("/proc/self/maps"):
+        import pytest
+
+        pytest.skip("/proc/self/maps unavailable (non-Linux); the loaded-mapping assertion needs it")
+
+    pkg = tmp_path / "tilelang"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    stub = str(pkg / "lib" / "libcudart_stub.so")
+    real = str(tmp_path / "libcudart.so.12")
+    if not _compile_so(str(tmp_path / "stub.c"), stub, "void cudaOther(void){}"):
+        import pytest
+
+        pytest.skip("no C toolchain to build a real stub .so")
+    assert _compile_so(str(tmp_path / "real.c"), real, "void cudaDeviceReset(void){}")
+
+    import importlib
+
+    from flash.engine.worker import perf
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: real)
+
+    assert not _maps_has("libcudart_stub.so"), "precondition: stub not yet loaded"
+    perf._neutralize_tilelang_cudart_stub()
+    # THE regression assertion: the stub was redirected on disk WITHOUT ever being dlopen'd.
+    assert not _maps_has("libcudart_stub.so"), "neutralize must not load the stub into the process"
+    assert os.path.islink(stub)
+    assert os.path.realpath(stub) == os.path.realpath(real)
+
+    # And the redirected path now resolves a libcudart that DOES export cudaDeviceReset.
+    import ctypes
+
+    assert hasattr(ctypes.CDLL(stub), "cudaDeviceReset")
+
+
+def test_neutralize_repoints_a_dangling_symlink(tmp_path, monkeypatch):
+    """A DANGLING stub symlink (a prior pass's target moved/was removed) is NOT 'already done' — it
+    leaves tilelang with a broken libcudart_stub.so. Neutralize must re-point it at a real lib."""
+    import importlib
+    import os
+
+    pkg = tmp_path / "tilelang"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    stub = str(pkg / "lib" / "libcudart_stub.so")
+    os.symlink(str(tmp_path / "gone-libcudart.so.12"), stub)  # dangling: target does not exist
+    assert os.path.islink(stub)
+    assert not os.path.exists(stub)
+
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    from flash.engine.worker import perf
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: str(real))
+
+    perf._neutralize_tilelang_cudart_stub()
+
+    assert os.path.islink(stub)
+    assert os.path.exists(stub)  # now RESOLVES
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+
+
+def test_find_real_libcudart_handles_bare_soname_without_crashing(monkeypatch):
+    """find_library('cudart') returns a bare soname (e.g. 'libcudart.so.12'), not a path. The
+    os.path.exists guard must not silently drop it; with no loadable cudart present it still resolves
+    to None safely (and never raises)."""
+    import builtins
+    import ctypes.util
+    import glob
+
+    from flash.engine.worker import perf
+
+    monkeypatch.setattr(glob, "glob", lambda *_a, **_k: [])  # no absolute-path candidates
+    monkeypatch.setattr(ctypes.util, "find_library", lambda _n: "libcudart.so.12")  # bare soname
+    real_import = builtins.__import__
+
+    def _no_nvidia(name, *a, **k):
+        if name.startswith("nvidia"):
+            raise ImportError(name)
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_nvidia)
+    # On a host without a real libcudart the bare soname won't load -> None (no exception, no skip).
+    assert perf._find_real_libcudart() is None

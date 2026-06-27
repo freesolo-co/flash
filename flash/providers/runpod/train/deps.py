@@ -9,9 +9,10 @@ defines the shared ``logger`` the other submodules import.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 from flash._logging import get_logger
+from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+from flash.providers.base import get_gpu_info
 from flash.spec import JobSpec, gpus_per_node
 
 # Literal name (NOT __name__) so the logger stays "flash.providers.runpod.train" after the
@@ -20,7 +21,7 @@ logger = get_logger("flash.providers.runpod.train")
 
 
 # Worker stack: trl 1.6 (colocate default; adds the GRPO `tools=` / `rollout_func`
-# multi-turn hooks used for verifiers ToolEnv / MultiTurnEnv training), vllm 0.19.1
+# multi-turn hooks used for Freesolo EnvironmentMultiTurn training), vllm 0.19.1
 # (Qwen3.5/3.6 archs, native RL APIs, transformers-5
 # compatible metadata), transformers 5.x (qwen3_5/qwen3_5_moe model types),
 # bitsandbytes (the 8-bit paged AdamW optimizer state — LoRA+ coexists with it).
@@ -43,6 +44,9 @@ WORKER_DEPS = [
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
+    # >=0.2.49: first version exposing Environment.sft_completion + datasets.target_messages,
+    # which the worker's SFT/multi-turn path now calls (flash #162 multi-turn SFT).
+    "freesolo>=0.2.49",
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
     # NB: the HF `kernels` Hub package is intentionally NOT pinned here — the versions
@@ -68,53 +72,41 @@ WORKER_DEPS = [
     "freesolo-chalk>=0.4.12,<0.5.0",
     # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this, transformers
     # falls back to a pure-PyTorch delta rule that is dramatically slower + memory-heavier (measured
-    # A/B, Vast H100 SXM, Qwen3.5-0.8B LoRA: seq4096 4413->371 ms/step = 11.9x; seq8192 13.7x;
-    # seq16384 14498->945 ms = 15.3x; forward loss matches to ~6e-4). Installed from git: the PyPI
-    # ``flash-linear-attention`` wheel is a broken stub missing ``fla.modules``. PINNED to a specific
-    # commit (not the moving default branch) so cold-start installs are reproducible and a breaking
-    # upstream change can't silently land on a run; bump intentionally. Keep this SHA in lockstep
-    # with Dockerfile.worker + perf.py's runtime reinstall.
+    # A/B, H100 SXM, Qwen3.5 hidden-2560 LoRA: seq4096 435->105 ms/step & 9.9->6.1 GB = 4.2x/1.6x;
+    # seq16384 3106->247 ms & 32->17 GB = 12.6x/1.9x; forward loss matches to 1.8e-4). Installed
+    # from git: the PyPI ``flash-linear-attention`` wheel is a broken stub missing ``fla.modules``.
+    # PINNED to a specific commit (not the moving default branch) so cold-start installs are
+    # reproducible and a breaking upstream change can't silently land on a run; bump intentionally
+    # after validating. Keep this SHA in lockstep with Dockerfile.worker's fla install.
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
     # fla's gated chunk_bwd is INCORRECT on Hopper (H100) with Triton>=3.4 (fla #640); its
     # ``tilelang`` backend is the correct path there, so we KEEP fla on every arch (the worker's
-    # _ensure_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import) rather
-    # than dropping it to the slow pure-PyTorch delta. PINNED (like the fla SHA) so cold-start
-    # installs / image rebuilds are reproducible. Keep in lockstep with Dockerfile.worker + perf.py.
+    # _ensure_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import).
+    # PINNED (like the fla SHA) so cold-start installs / image rebuilds are reproducible and a
+    # breaking upstream tilelang can't silently land on the Hopper correctness path. Keep this
+    # version in lockstep with Dockerfile.worker + perf.py's runtime reinstall.
     "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
-    # NB on causal_conv1d (#14, INVESTIGATED — deliberately NOT added here): the Qwen3.5/3.6 GDN
-    # layer runs a short depthwise causal conv before the delta rule, and the `causal_conv1d` package
-    # would fuse it (HF auto-detects via is_causal_conv1d_available). BUT: (a) it only gates the small
-    # conv step — the DOMINANT GDN cost (chunk_gated_delta_rule) is gated INDEPENDENTLY on fla and
-    # ALREADY runs on the fla kernel without it, so the win is bounded to the conv (modest); and
-    # (b) causal-conv1d ships SDIST-ONLY on PyPI (no torch2.10/cu128 wheels) -> pip BUILDS FROM SOURCE
-    # at cold-start, which FAILED REPRODUCIBLY on the Vast worker across two GPU classes (RTX 5090 +
-    # A100 SXM) with check=True killing the run. Putting it in WORKER_DEPS would break every cold-start
-    # boot-install run. If revisited, it must be BAKED into Dockerfile.worker (build once at image-build
-    # time with the -devel toolkit) AND the published image rebuild must be VALIDATED to actually
-    # compile it — it is not a safe per-run pip dep. See /tmp/flash_combine_results.md NEW-OPT TESTS.
+    # NB: ``causal_conv1d`` (the conv kernel that, with fla's cu_seqlens, lets GatedDeltaNet hybrids
+    # PACK boundary-correctly — engine.worker.packing) is NOT pip-listed here: it's a CUDA-extension
+    # build, so Dockerfile.worker compiles it best-effort with TORCH_CUDA_ARCH_LIST set (a plain pip
+    # entry would try to compile at the no-GPU image-build step for the wrong/native arch). If it's
+    # absent the GDN packing path stays off (gdn_packing_available) and Qwen3.5/3.6 train unpacked.
     # NB: freesolo-chalk is baked into the base deps above (it's REQUIRED now — chalk runs every
     # fused kernel, standalone). The submit path (chalk_extra_pip) ALSO appends the resolved chalk
     # spec to the worker's `extra_pip` so an operator can OVERRIDE the version/source per-run via
-    # FLASH_CHALK_SPEC (an exact version / git URL / wheel) — e.g. pin to the chalk standalone commit
-    # before 0.2.0 lands on PyPI; a redundant install matching the baked version is harmless. The
-    # worker pip-installs extra_pip for EVERY job (baked-image RunPod
-    # _train_body + Vast bootstrap). Do NOT rely on
-    # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
-    # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
-    # those vars don't reach a default run; and FLASH_WORKER_DEPS would also REPLACE the whole stack.
+    # FLASH_CHALK_SPEC (an exact version / git URL / wheel); a redundant install matching the baked
+    # version is harmless. The worker pip-installs extra_pip for EVERY job through the baked-image
+    # RunPod _train_body.
 ]
 # NOTE on download speed: Flash's runtime already ships hf_transfer and exports
 # HF_HUB_ENABLE_HF_TRANSFER=1 on workers (measured: Qwen3-4B's ~8 GB pulled in 6.3 s,
 # NIC-saturated — bench/results/phase6). Adding hf_transfer here is redundant; don't.
-# Override the whole pinned stack per-run with FLASH_WORKER_DEPS="pkgA==1 pkgB>=2"
-# (whitespace-separated, or a JSON list for specs containing commas).
 WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
 # The prebuilt worker image (full training stack baked in; built by Dockerfile.worker /
 # .github/workflows/worker-image.yml). PUBLIC under the org namespace, so no registry login is
 # ever needed. Must be published to GHCR + made public before the paths that use it can pull it.
-#   * Vast: ALWAYS used (jobs.builders pins the container to WORKER_IMAGE).
 #   * RunPod baked-image submit (jobs.deploy_train_endpoint / build_function_input): the default —
 #     a self-contained serverless worker whose rp_handler runs _train_body. FLASH_WORKER_IMAGE
 #     overrides the tag (e.g. a hotfix); the boot-install fallback is only reachable if BOTH are
@@ -124,74 +116,65 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 #     it boot-installs resolve_worker_deps() on Flash's default template instead. It uses an image
 #     only when the operator sets FLASH_WORKER_IMAGE to a RunPod-serverless-compatible one.
 # So FLASH_WORKER_IMAGE IS an operator override (consulted by every RunPod path).
-# FLASH_TRAIN_WORKER_IMAGE overrides the baked-image TAG (e.g. to validate a candidate image like
-# :cu128-mgpu without overwriting the production :cu128) — read at import, so set it in the
-# control-plane env. .strip() so a whitespace-only FLASH_TRAIN_WORKER_IMAGE falls back to the
-# default tag instead of becoming an invalid Docker ref that RunPod Flash / Vast would try (and
-# fail) to provision with.
-WORKER_IMAGE = (
-    os.environ.get("FLASH_TRAIN_WORKER_IMAGE") or ""
-).strip() or "ghcr.io/freesolo-co/flash-worker:cu128"
+WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
+WORKER_IMAGE_TEMPLATE_ENV = "FLASH_WORKER_IMAGE_TEMPLATE"
+WORKER_IMAGE_PER_SM_ENV = "FLASH_WORKER_IMAGE_PER_SM"
 
 
-def resolve_worker_deps(friendly_gpu: str | None = None, spec=None) -> list[str]:
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _append_tag_suffix(image: str, suffix: str) -> str:
+    slash = image.rfind("/")
+    colon = image.rfind(":")
+    if colon > slash:
+        return f"{image[:colon]}:{image[colon + 1:]}-{suffix}"
+    return f"{image}-{suffix}"
+
+
+def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
+    """Return the RunPod worker image for a GPU class.
+
+    ``FLASH_WORKER_IMAGE`` remains the absolute override. Per-SM warmed images are opt-in through
+    either ``FLASH_WORKER_IMAGE_TEMPLATE`` (for custom tag layouts) or ``FLASH_WORKER_IMAGE_PER_SM``
+    (which appends ``-smXX`` to ``WORKER_IMAGE``'s tag). Without either opt-in, the current base
+    image is returned for durable jobs and ``None`` is returned for live endpoints that request no
+    default image.
+    """
+    override = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
+    if override:
+        return override
+    # per-sm / template images are durable RunPod queue-worker images (CMD runs rp_handler.py), NOT
+    # RunPod Flash live-function images, so they must never leak into the live path. only the
+    # absolute FLASH_WORKER_IMAGE override (handled above) is treated as live-compatible.
+    if friendly_gpu and allow_default:
+        info = get_gpu_info(friendly_gpu)
+        template = os.environ.get(WORKER_IMAGE_TEMPLATE_ENV, "").strip()
+        if template:
+            return template.format(
+                base_image=WORKER_IMAGE,
+                gpu=info.name,
+                gpu_short=info.short,
+                sm=info.sm,
+                sm_num=info.sm.removeprefix("sm"),
+            )
+        if _truthy(os.environ.get(WORKER_IMAGE_PER_SM_ENV)):
+            return _append_tag_suffix(WORKER_IMAGE, info.sm)
+    return WORKER_IMAGE if allow_default else None
+
+
+def resolve_worker_deps() -> list[str]:
     """The dependency list Flash installs on the GPU worker for this run.
 
-    Precedence: FLASH_WORKER_DEPS (explicit list) > the pinned ``WORKER_DEPS``.
+    The pinned ``WORKER_DEPS`` is authoritative — flash is fully managed, no per-run override.
 
-    fla is kept on ALL arches now (including Hopper): the worker's
-    _ensure_fla_fastpath_on_hopper ensures fla's correct ``tilelang`` backend is live on sm90
-    before any model import (fla #640's Triton>=3.4 miscompute is a tilelang-backend fix, not a
-    reason to drop fla). This makes Hopper GDN training ~4-13x faster + ~2x less memory than the
-    pure-PyTorch delta fallback.
+    fla is kept on ALL arches (including Hopper): the worker's _ensure_fla_fastpath_on_hopper
+    ensures fla's correct ``tilelang`` backend is live on sm90 before any model import (fla #640's
+    Triton>=3.4 miscompute is a tilelang-backend fix, not a reason to drop fla). This makes Hopper
+    GDN training ~4-13x faster + ~2x less memory than the pure-PyTorch delta fallback.
     """
-    # Live-function RunPod installs resolve_worker_deps() BEFORE _train_body can fetch the run
-    # artifact. If a local chalk wheel is staged, chalk_extra_pip() installs that wheel after the
-    # fetch and before any model import, so do not also require PyPI to have the same chalk floor at
-    # boot time. This keeps validation of unpublished chalk wheels independent of PyPI release lag.
-    # Applied to BOTH the explicit (FLASH_WORKER_DEPS) and the pinned path: an explicit dep list that
-    # still names freesolo-chalk would otherwise install the PyPI chalk floor ahead of the staged
-    # wheel, defeating the unpublished-wheel validation the FLASH_CHALK_WHEEL stage is for.
-    # FLASH_CHALK_WHEEL is read from the EFFECTIVE worker env (os.environ + spec.worker_env) — the
-    # SAME source chalk_extra_pip()/upload_code use to stage + reference the wheel — so a wheel set
-    # only in the run's [worker_env] block still strips PyPI chalk here. (spec=None -> os.environ.)
-    _chalk_wheel = _effective_worker_env(spec).get("FLASH_CHALK_WHEEL")
-
-    def _strip_pypi_chalk_for_staged_wheel(d: list[str]) -> list[str]:
-        if _chalk_wheel:
-            return [x for x in d if not x.startswith("freesolo-chalk")]
-        return d
-
-    explicit = os.environ.get("FLASH_WORKER_DEPS")
-    if explicit:
-        # JSON list (use this for specs containing commas, e.g.
-        # "transformers>=5.6,<5.13") or a whitespace-separated string.
-        if explicit.strip().startswith("["):
-            import json as _json
-
-            deps = [str(d).strip() for d in _json.loads(explicit) if str(d).strip()]
-        else:
-            # shlex (whitespace) splitting, NOT comma: a comma is part of a PEP 440
-            # range like `transformers>=5.6,<5.11` and must not be split.
-            import shlex
-
-            deps = [d for d in shlex.split(explicit) if d.strip()]
-        if deps:
-            return _strip_pypi_chalk_for_staged_wheel(deps)
-    deps = list(WORKER_DEPS)
-    deps = _strip_pypi_chalk_for_staged_wheel(deps)
-    # fla is kept on ALL arches (incl. Hopper sm90). On Hopper the correctness fix is fla's
-    # tilelang backend (baked into WORKER_DEPS + ensured by _ensure_fla_fastpath_on_hopper), NOT
-    # dropping fla — keeping it gives the ~4-13x faster / ~2x lighter GDN training the pure-PyTorch
-    # delta fallback can't. (friendly_gpu retained for signature/back-compat; no longer drops fla.)
-    # Additive per-run extras (e.g. an extra pinned wheel for an A/B) without
-    # restating the whole pinned stack the way FLASH_WORKER_DEPS requires.
-    extra = os.environ.get("FLASH_WORKER_EXTRA_DEPS")
-    if extra:
-        import shlex
-
-        deps = deps + [d for d in shlex.split(extra) if d.strip()]
-    return deps
+    return list(WORKER_DEPS)
 
 
 def _effective_worker_env(spec=None) -> dict[str, str]:
@@ -240,46 +223,6 @@ def _chalk_selected(spec=None) -> bool:
 DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.4.12,<0.5.0"
 
 
-def _local_env_wheel() -> Path | None:
-    """Operator escape hatch for unpublished/private reward envs.
-
-    ``FLASH_ENV_WHEEL`` points at a local wheel on the control-plane host. ``upload_code`` stages
-    that wheel into the run-private artifact repo under ``code/wheels``; the submit path then adds
-    the worker-side absolute path to ``extra_pip`` and skips ``prime env install`` for the env. This
-    is intentionally not a spec-level local path mode: it is a deployment override for live
-    validation when Hub publishing/access is broken.
-    """
-    raw = (os.environ.get("FLASH_ENV_WHEEL") or "").strip()
-    if not raw:
-        return None
-    return Path(raw).expanduser()
-
-
-def _staged_wheel_pip_spec(wheel: Path, env_key: str) -> str:
-    if not wheel.is_file():
-        raise FileNotFoundError(f"{env_key} does not exist: {wheel}")
-    if wheel.suffix != ".whl":
-        raise ValueError(f"{env_key} must point to a .whl file: {wheel}")
-    return f"/runcode/code/wheels/{wheel.name}"
-
-
-def local_env_extra_pip() -> list[str]:
-    """Worker pip spec(s) for a staged local verifiers env wheel."""
-    wheel = _local_env_wheel()
-    if wheel is None:
-        return []
-    return [_staged_wheel_pip_spec(wheel, "FLASH_ENV_WHEEL")]
-
-
-def hub_env_ids_for_run(env_id: str, params: dict | None = None) -> list[str]:
-    """Prime Hub env ids to install for a run, unless a staged env wheel replaces Hub."""
-    from flash.envs.registry import worker_hub_env_ids
-
-    if _local_env_wheel() is not None:
-        return []
-    return worker_hub_env_ids(env_id, params)
-
-
 def _split_pip_specs(raw: str) -> list[str]:
     """Split a whitespace-separated pip-spec list without breaking PEP 508 direct URLs.
 
@@ -306,9 +249,9 @@ def chalk_extra_pip(spec=None) -> list[str]:
     """Chalk pip spec(s) to ADD to the worker's ``extra_pip`` when a chalk kernel is selected.
 
     This is the install hook that runs for DEFAULT remote jobs: the baked-image RunPod path
-    (``_train_body`` -> ``pip install *extra_pip``) and the Vast bootstrap both consume the
-    payload's ``extra_pip`` regardless of ``WORKER_IMAGE`` — unlike ``FLASH_WORKER_EXTRA_DEPS``
-    / ``resolve_worker_deps``, which the durable ``build_function_input`` baked-image path skips.
+    (``_train_body`` -> ``pip install *extra_pip``) consumes the payload's ``extra_pip``
+    regardless of ``WORKER_IMAGE`` — unlike ``resolve_worker_deps``, which the durable
+    ``build_function_input`` baked-image path skips.
 
     Selection (and the ``FLASH_CHALK_SPEC`` lookup) is resolved against the EFFECTIVE worker env —
     the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
@@ -327,12 +270,6 @@ def chalk_extra_pip(spec=None) -> list[str]:
     spec_str = eff.get("FLASH_CHALK_SPEC", "").strip()
     if spec_str:
         return _split_pip_specs(spec_str)
-    # If the operator stages a local chalk wheel, automatically point extra_pip at the worker-side
-    # copy. Requiring a second FLASH_CHALK_SPEC=/runcode/... knob is easy to forget and silently
-    # falls back to PyPI/stale baked chalk, which defeats the point of staging a validation wheel.
-    chalk_wheel = (eff.get("FLASH_CHALK_WHEEL") or "").strip()
-    if chalk_wheel:
-        return [_staged_wheel_pip_spec(Path(chalk_wheel).expanduser(), "FLASH_CHALK_WHEEL")]
     # PyPI default (version-pinned for reproducibility) — chalk is published, so a normal run
     # installs + applies it automatically.
     spec_str = DEFAULT_CHALK_SPEC
@@ -342,7 +279,7 @@ def chalk_extra_pip(spec=None) -> list[str]:
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
 
 
-_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
+_RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
 
 def build_worker_env(
@@ -353,47 +290,27 @@ def build_worker_env(
     """Per-run env passed to the worker (platform creds + recipe overrides).
 
     Provider and artifact credentials still come from the control-plane process environment.
-    User-owned W&B is the one supported client runtime secret, injected from ``runtime_secrets``
-    below so the control plane does not need a platform W&B key.
+    User runtime secrets (W&B plus [environment].secrets) are injected from ``runtime_secrets``
+    below so the control plane never stores user-owned secret values in the spec.
     """
-    # CUDA allocator conf. Colocate (TRL trainer + vLLM on one GPU) fragments over a long run,
-    # so expandable_segments (which reclaims fragmentation) is the right default — EXCEPT under
-    # GRPO vLLM sleep mode, whose CuMemAllocator memory pool is incompatible with
-    # expandable_segments (vLLM asserts and the run crashes at engine init). So for RL with
-    # sleep mode ON (the default), default to a non-expandable conf instead; SFT and
-    # sleep-off RL keep expandable_segments. An explicit operator override always wins.
+    # CUDA allocator conf. Colocate (TRL trainer + vLLM on one GPU) fragments over a long run, so
+    # expandable_segments (which reclaims fragmentation) is the right default — EXCEPT under GRPO
+    # vLLM sleep mode, whose CuMemAllocator memory pool is incompatible with expandable_segments
+    # (vLLM asserts and the run crashes at engine init). RL is fully managed — no sleep/alloc knob:
+    # we set the sleep-SAFE non-expandable conf for RL here (the launcher can't yet know the model's
+    # resolved sleep decision), and the worker upgrades RL runs to expandable_segments when it
+    # resolves sleep OFF for the model/context (engine.worker.finalize_alloc_conf_for_sleep, same
+    # deterministic _memory_mode gate run_rl uses). SFT has no vLLM engine, so expandable is safe.
+    # torch >= 2.10 renamed the env to PYTORCH_ALLOC_CONF — set BOTH names for either stack.
     _is_rl = str(getattr(spec, "algorithm", "")).lower() not in ("sft",)
-    # RL_VLLM_SLEEP may be pinned per-run via [worker_env] (highest precedence, merged into the
-    # worker env later) OR via the control-plane process env. Resolve it from BOTH here — with
-    # worker_env winning — so a per-run explicit pin counts as explicit: otherwise _sleep_set stays
-    # false, FLASH_ALLOC_AUTO=1 is sent, and the worker can upgrade to expandable_segments while
-    # run_rl still enables vLLM sleep, hitting the CuMemAllocator incompatibility after provisioning.
-    _sleep_raw = (spec.worker_env or {}).get("RL_VLLM_SLEEP", os.environ.get("RL_VLLM_SLEEP"))
-    _sleep_set = _sleep_raw is not None
-    _sleep_on = (_sleep_raw if _sleep_raw is not None else "1") not in ("0", "false", "False")
-    _alloc_default = (
+    _alloc_conf = (
         "garbage_collection_threshold:0.8,max_split_size_mb:256"
-        if (_is_rl and _sleep_on)
+        if _is_rl
         else "expandable_segments:True"
     )
-    # torch >= 2.10 renamed the env to PYTORCH_ALLOC_CONF — set BOTH names for either stack.
-    # Resolve the override from [worker_env] AND the control-plane process env (worker_env wins,
-    # mirroring RL_VLLM_SLEEP above): a per-run [worker_env] PYTORCH_ALLOC_CONF is merged into the
-    # worker env later (and would win), but if it isn't counted as an explicit override HERE,
-    # _alloc_override stays falsy, FLASH_ALLOC_AUTO=1 is sent, and finalize_alloc_conf_for_sleep
-    # overwrites the operator's per-run pin.
-    _we = spec.worker_env or {}
-    _alloc_override = (
-        _we.get("PYTORCH_ALLOC_CONF")
-        or _we.get("PYTORCH_CUDA_ALLOC_CONF")
-        or os.environ.get("PYTORCH_ALLOC_CONF")
-        or os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-    )
-    _alloc_conf = _alloc_override or _alloc_default
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
-        # Compute substrate, read back by engine.worker for the RunMetrics record. Vast's
-        # on-instance bootstrap overrides this to "vast" (it reuses this same env builder).
+        # Compute substrate, read back by engine.worker for the RunMetrics record.
         "FLASH_ARM": "runpod",
         # GPUs provisioned on the node (= one trainer card + train.inference_gpus). The worker reads
         # this (engine.disaggregated.detect_total_gpus) to compute the disaggregated rollout split
@@ -404,36 +321,18 @@ def build_worker_env(
         "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
-        # We picked a DEFAULT alloc conf above without knowing the worker's resolved vLLM sleep
-        # decision (RL + RL_VLLM_SLEEP unset + no operator override). Cede the final choice to the
-        # worker, which resolves sleep from the model config and upgrades to expandable_segments
-        # when sleep is OFF (engine.worker.finalize_alloc_conf_for_sleep). Never set when the
-        # operator pinned an alloc conf or RL_VLLM_SLEEP explicitly — their choice is authoritative.
-        **(
-            {"FLASH_ALLOC_AUTO": "1"}
-            if (_is_rl and not _sleep_set and not _alloc_override)
-            else {}
-        ),
-        # Escape hatch for torch.compile/inductor spikes (Qwen3.5 DeltaNet kernels
-        # compile at first forward and can OOM a tight colocate budget).
-        **(
-            {"TORCHDYNAMO_DISABLE": os.environ["TORCHDYNAMO_DISABLE"]}
-            if os.environ.get("TORCHDYNAMO_DISABLE")
-            else {}
-        ),
     }
-    # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub
-    # env(s), public + private) + optional reward-judge/live-data creds: a verifiers env whose
-    # rubric calls an LLM judge or a live data source needs those secrets ON THE WORKER, where the
-    # reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env reads
-    # (agents/common/prompt.py) to pick the JudgeRubric client model; MONGO_URL and LINKD_* are
-    # consumed by the linkd-search/linkd-profilematch live-quality envs. Forward operator
-    # control-plane overrides so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
-    # back to generated defaults, and so secret values do not need to be serialized into the run's
-    # [worker_env] block.
+    # HF artifact creds + managed environment hub creds + optional reward-judge/live-data creds: a
+    # Freesolo environment whose reward calls an LLM judge (e.g. OpenRouter gpt-oss-120b) or a live
+    # data source needs those secrets ON THE WORKER, where the reward runs. FLASH_JUDGE_MODEL is the
+    # judge model id the optimizer-authored env reads (agents/common/prompt.py) to pick the
+    # JudgeRubric client model; MONGO_URL and LINKD_* are consumed by the linkd-search/
+    # linkd-profilematch live-quality envs. Forward operator control-plane overrides so
+    # SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall back to generated defaults,
+    # and so secret values do not need to be serialized into the run's [worker_env] block.
     for key in (
         "HF_TOKEN",
-        "PRIME_API_KEY",
+        "GITHUB_TOKEN",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "FLASH_JUDGE_MODEL",
@@ -449,11 +348,6 @@ def build_worker_env(
     # code storage + heartbeats). The worker reads HF_REPO from its own process env; that env
     # is now sourced from the spec, not the operator's HF_REPO.
     env["HF_REPO"] = spec.train.hf_repo
-    # Opt-in network volume: point the whole HF cache at the persistent mount so
-    # model weights survive across runs (the download becomes a one-time cost per
-    # volume instead of per run).
-    if getattr(spec.gpu, "network_volume", None):
-        env["HF_HOME"] = "/runpod-volume/hf-cache"
     if spec.train.steps is not None:
         env["RL_STEPS"] = str(spec.train.steps)
     if spec.train.epochs is not None:
@@ -463,13 +357,7 @@ def build_worker_env(
     # structured fields, and the worker hardcodes the vLLM-util / quant / heartbeat defaults.
     for k in (
         "SFT_PER_DEVICE_BS",
-        # RL_VLLM_SLEEP drives the alloc-conf choice above (CuMemAllocator vs expandable_segments).
-        "RL_VLLM_SLEEP",
         "VLLM_USE_V1",
-        # Attention-backend escape hatch: vllm's bundled flash-attn PTX can be newer
-        # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
-        # sidestep it without restricting the host pool to CUDA-13 drivers.
-        "VLLM_ATTENTION_BACKEND",
         # Disaggregated (multi-GPU async) rollout knobs (engine/worker.py + disaggregated.py):
         # SERVER_TIMEOUT raises the vllm-serve health-wait for a slow big-model boot (the 35B can
         # take >20 min); SERVER_UTIL sizes the dedicated rollout card's vLLM pool; DISAGG_PARALLEL
@@ -513,7 +401,9 @@ def build_worker_env(
         "FLASH_GDN_KERNEL",
         "FLASH_TRAINABLE_QKV",
         # The chalk install spec itself — install_chalk_kernels warns pointing at it when a
-        # FLASH_* flag is set but chalk is absent.
+        # FLASH_* flag is set but chalk is absent. Kernel SELECTION otherwise lives in
+        # engine.chalk_kernels; this only points install_chalk_kernels at a specific chalk build,
+        # and is also consumed at submit time to add chalk to extra_pip.
         "FLASH_CHALK_SPEC",
         # LoRA-init + rollout-knob A/B levers (read on the worker: make_lora / run_rl /
         # patch_trl_colocate_vllm_args). Forward a control-plane default; a per-run [worker_env]
@@ -523,12 +413,6 @@ def build_worker_env(
         "FLASH_USE_DORA",
         "FLASH_ROLLOUT_TUNE",
         "FLASH_FP8_KV",
-        # Per-run additive pip specs for the BAKED-image path. The worker process never reads this;
-        # the Vast submit (jobs.builders.build_payload) reads it back off the EFFECTIVE worker env
-        # (this allowlist + [worker_env]) and appends it to the payload's extra_pip. Forward it from
-        # os.environ so a control-plane FLASH_EXTRA_PIP actually takes effect (a per-run [worker_env]
-        # still overrides). Without this forward it only worked when duplicated into [worker_env].
-        "FLASH_EXTRA_PIP",
     ):
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
@@ -539,7 +423,7 @@ def build_worker_env(
     # deploy, and artifact paths all key off spec.run_id / spec.train.hf_repo, so letting a
     # [worker_env] override RUN_ID/HF_REPO would make the worker upload under a different repo/prefix
     # and orphan the artifacts (the poller would never find DONE/metrics, deploy can't locate the
-    # adapter). FLASH_ARM identifies the substrate (Vast rewrites it in its own bootstrap).
+    # adapter). FLASH_ARM identifies the substrate.
     # FLASH_GPU_COUNT is the control-plane topology hint (= the sized/billed [gpu].count); the worker
     # falls back to it when nvidia-smi is unavailable and honors it over an over-exposed node, so a
     # [worker_env] override would let the worker compute a different disaggregated split than was
@@ -577,7 +461,8 @@ def build_worker_env(
         if str(k).upper() in _RESERVED_WORKER_ENV:
             continue  # control plane owns run identity; a per-run override would orphan artifacts
         env[str(k)] = str(v)
+    allowed_runtime_secrets = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
     for k, v in (runtime_secrets or {}).items():
-        if k in _RUNTIME_SECRET_KEYS and v:
+        if k in allowed_runtime_secrets and v:
             env[k] = str(v)
     return env

@@ -29,8 +29,8 @@ def coerce_bool(value: Any) -> bool:
     """Parse a bool from loosely-typed sources (JSON request bodies / env / persisted dicts).
 
     bool(...) on a string is truthy for ANY non-empty string, so "false"/"0"/"no" would
-    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False, so
-    e.g. JSON ``"is_new": "false"`` is parsed as False. An already-bool value passes through.
+    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False.
+    An already-bool value passes through.
     """
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
@@ -125,14 +125,26 @@ def _opt_float(value: Any) -> float | None:
 
 @dataclass(frozen=True)
 class EnvironmentSpec:
-    # Verifiers/Prime Hub env slug ("owner/name") or installed/local env id. No default:
+    # Freesolo environment id. No default:
     # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    # Pip requirements the GPU worker needs for this environment (verifiers/Hub envs).
+    # Pip requirements the GPU worker needs for this environment.
     # Filled in client-side from the local install manifest so the managed control
     # plane never depends on client-local state; empty means "derive on the server".
     pip: tuple[str, ...] = ()
+    # Secret env var names the environment requires on the worker. Values are never stored in the
+    # spec; the client reads matching local env/.env values and sends them out-of-band via
+    # runtime_secrets.
+    secrets: tuple[str, ...] = ()
+    # Optional pinned commit SHA for the environment's GitHub ref, resolved ONCE in the control
+    # plane (runner._assign_resolved_env_sha, called from submit_job after the spec is finalized) so
+    # every worker boots from an immutable sha instead of each one re-resolving the symbolic ref
+    # (e.g. "main") against the GitHub commits API — which trips GitHub's secondary rate limit on a
+    # cold spawn wave. Empty (the default, and whenever the control-plane resolve fails) preserves
+    # today's behavior: the worker resolves the ref itself. The adapter only trusts a real 40-char
+    # sha (see adapter._resolve_ref_sha), so a stale/garbage value falls back to live resolution.
+    resolved_sha: str = ""
 
 
 @dataclass(frozen=True)
@@ -142,8 +154,8 @@ class TrainSpec:
     lora_rank: int = 32
     lora_alpha: int = 64
     seeds: tuple[int, ...] = (0,)
-    # Artifact-store adapter prefix (``<phase>/<run_id>/seed<N>``) to initialize the
-    # LoRA from instead of training fresh — e.g. a GRPO run continuing an SFT adapter.
+    # Artifact-store adapter ref output by `flash status`:
+    # ``<hf_repo>:<phase>/<run_id>/seed<N>``.
     init_from_adapter: str = ""
     # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
     # code storage AND serving. PLATFORM-MANAGED, not a user field: the control plane assigns
@@ -164,7 +176,7 @@ class TrainSpec:
     max_steps: int | None = None
     max_examples: int | None = None
     # GRPO recipe knobs (datums parity), shipped by the SDK in [train] (NOT in
-    # [environment.params], which is forwarded verbatim to the verifiers env loader).
+    # [environment.params], which is forwarded verbatim to the Freesolo env loader).
     # None/() -> recipe default. group_size = completions per prompt; temperature = rollout
     # sampling temp; max_tokens = completion budget; kl_penalty_coef = KL beta;
     # advantage_clip = centered-advantage clamp; thinking_length_penalty_coef =
@@ -186,31 +198,15 @@ class TrainSpec:
 class GpuSpec:
     # The parse-time provisional GPU class (cheapest VALIDATED class that fits the model). GPU
     # pinning is gone: the submit-time allocator always re-picks the cheapest fitting validated
-    # class across ALL providers, so a config's gpu.type does NOT pin — ``type`` is just the
-    # offline sizing/display default and the carrier the runner overwrites with the
-    # actually-allocated class.
+    # active RunPod class, so a config's gpu.type does NOT pin — ``type`` is just the offline
+    # sizing/display default and the carrier the runner overwrites with the actually-allocated
+    # class.
     type: str = DEFAULT_GPU
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
     # each retry resumes from the latest streamed checkpoint.
     max_retries: int = 2
-    # OPT-IN persistent RunPod network volume mounted at /runpod-volume, used as a
-    # cross-run HF model cache (repeat runs skip the model download). Trade-offs: it
-    # pins the run to the volume's datacenter (smaller GPU pool — usually the bigger
-    # cost) and the volume bills monthly while it exists. Off (None) by default.
-    # RunPod-specific: network_volume/datacenter are read only by the RunPod provider
-    # and ignored by Vast (which rents single-GPU instances with no network volume).
-    network_volume: str | None = None
-    network_volume_gb: int = 100
-    datacenter: str | None = None  # e.g. "EU-RO-1"; required pool pin for the volume
-    # OPT-IN per-run provider pin. Unlike gpu.type (no pin — the submit-time allocator always
-    # re-picks the cheapest fitting validated CLASS across ALL providers), provider pins which
-    # SUBSTRATE the allocator may use: "vast" or "runpod" restricts allocation to that provider;
-    # None (default) keeps the cross-provider cheapest-wins behavior. Used for A/B-ing one provider
-    # against the full pool. The allocator raises a clear error if the pinned provider isn't
-    # available/configured.
-    provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -261,11 +257,12 @@ class JobSpec:
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
         env = data.get("environment") or {}
         # Defense-in-depth: a stale/older payload may still carry a local `path`. The worker only
-        # runs published Hub env ids, so reject it here rather than silently dropping it.
+        # runs published Freesolo environment ids, so reject it here rather than silently
+        # dropping it.
         if isinstance(env, dict) and env.get("path"):
             raise ValueError(
                 "local environment paths are no longer supported; the worker only runs "
-                "published Hub env ids"
+                "published Freesolo environment ids"
             )
         train = data.get("train") or {}
         gpu = data.get("gpu") or {}
@@ -276,6 +273,8 @@ class JobSpec:
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
+                secrets=_str_tuple(env.get("secrets")),
+                resolved_sha=str(env.get("resolved_sha") or ""),
             ),
             train=TrainSpec(
                 steps=_opt_int(train.get("steps")),
@@ -309,10 +308,6 @@ class JobSpec:
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 2)),
-                network_volume=gpu.get("network_volume"),
-                network_volume_gb=int(gpu.get("network_volume_gb", 100)),
-                datacenter=gpu.get("datacenter"),
-                provider=gpu.get("provider"),
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),

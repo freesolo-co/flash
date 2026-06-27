@@ -27,8 +27,8 @@ def test_deploy_dry_run():
     # The adapter is addressed by its run_id on the freesolo serving app.
     assert d["openai_model"] == "r1"
     assert d["adapter_hf_prefix"] == "sft/r1/seed0/adapter"
-    # freesolo serving scales to zero per base model — no flash-side idle billing.
-    assert d["est_idle_cost_usd_per_day"] == 0.0
+    assert "mode" not in d
+    assert "est_idle_cost_usd_per_day" not in d
 
 
 def test_deploy_9b_dry_run_is_not_rejected():
@@ -111,6 +111,49 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch):
     assert dep.openai_model == "flash-7-abcd"
     assert dep.endpoint_name == "https://serve.example"
     assert dep.state == "ready"
+
+
+def test_deploy_includes_org_id_when_provided(monkeypatch):
+    """When the deploying org is known, registration carries `orgId` so serving can persist
+    hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+        seen["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+
+    d.deploy_adapter(
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        gpu_name="RTX 5090",
+        org_id="org-xyz",
+    )
+    assert seen["json"]["orgId"] == "org-xyz"
+
+    # No org -> the key is omitted entirely (registration shape unchanged for older callers).
+    d.deploy_adapter(
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        gpu_name="RTX 5090",
+    )
+    assert "orgId" not in seen["json"]
 
 
 def test_deploy_propagates_serving_error(monkeypatch):
@@ -210,6 +253,7 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
 
     seen = {}
     completion = {
@@ -239,9 +283,10 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, headers=None):
             seen["url"] = url
             seen["json"] = json
+            seen["headers"] = headers or {}
             return _Resp()
 
     monkeypatch.setattr(d.httpx, "Client", _FakeClient)
@@ -264,3 +309,120 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
     assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
     # The OpenAI shape is preserved so resp["choices"][0]["message"]["content"] works.
     assert out["choices"][0]["message"]["content"] == "hi there"
+    # The control plane is a trusted serving caller, so it presents the internal key — this is
+    # what lets `flash chat` keep working when the serving app enforces external chat auth.
+    assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+
+
+def test_chat_stream_yields_openai_sse_content(monkeypatch):
+    """chat_stream requests OpenAI streaming and yields assistant content deltas only."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    seen = {}
+
+    class _StreamResp:
+        def __init__(self):
+            self.headers = {"content-type": "text/event-stream"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
+                    'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
+                    'data: {"choices":[{"delta":{"content":" there"},"finish_reason":null}]}',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            seen["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            seen["method"] = method
+            seen["url"] = url
+            seen["json"] = json
+            seen["headers"] = headers or {}
+            return _StreamResp()
+
+    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
+
+    chunks = list(
+        d.chat_stream(
+            run_id="flash-7-abcd",
+            messages=[{"role": "user", "content": "2+2?"}],
+            temperature=0.0,
+            max_tokens=8,
+            thinking=True,
+        )
+    )
+
+    assert chunks == ["hi", " there"]
+    assert seen["client_kwargs"]["follow_redirects"] is True
+    assert seen["method"] == "POST"
+    # Trusted-caller bypass: chat_stream presents the internal key, like the non-streaming chat.
+    assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+    assert seen["url"] == "https://serve.example/v1/chat/completions"
+    assert seen["json"]["stream"] is True
+    assert seen["json"]["model"] == "flash-7-abcd"
+    assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_chat_stream_accepts_json_fallback(monkeypatch):
+    """A new Flash server can still talk to an older serving app that ignores stream=true."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+
+    class _JsonResp:
+        def __init__(self):
+            self.headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "full reply"}}]}
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            return _JsonResp()
+
+    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
+
+    assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
+        "full reply"
+    ]

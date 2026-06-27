@@ -16,10 +16,13 @@ from __future__ import annotations
 import json
 import os
 import struct
+from collections import namedtuple
 
 import pytest
 
 from flash.engine.worker.lora import (
+    assert_adapter_delta_nonzero,
+    assert_adapter_load_clean,
     assert_lora_applied,
     remap_adapter_keys,
     remap_vl_adapter_dir,
@@ -127,13 +130,15 @@ def test_safetensors_remap_for_vl_strips_infix_and_preserves_data(monkeypatch, t
 
 
 def test_safetensors_remap_noop_for_non_vl(monkeypatch, tmp_path):
+    # A genuinely text-only model's SFT adapter has NO '.language_model.' keys (text-only models
+    # have no language_model submodule), so remap is a no-op and leaves the file byte-identical.
     import flash.engine.worker.lora as lora
 
     monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
     adir = tmp_path / "adapter"
     adir.mkdir()
     st = str(adir / "adapter_model.safetensors")
-    _write_safetensors(st, VL_KEYS)
+    _write_safetensors(st, CAUSAL_LM_KEYS)
     with open(st, "rb") as f:
         before = f.read()
 
@@ -141,6 +146,99 @@ def test_safetensors_remap_noop_for_non_vl(monkeypatch, tmp_path):
     assert n == 0
     with open(st, "rb") as f:
         assert f.read() == before  # file untouched for a text model
+
+
+def test_remap_strips_vl_keys_by_evidence_when_probe_says_text_only(monkeypatch, tmp_path):
+    # Issue #286 root cause: is_vl_checkpoint() swallows every exception and returns False, so a
+    # flaky/rate-limited config probe previously SKIPPED the remap on a genuine VL warm-start --
+    # leaving '.language_model.' keys that the text-only base discards -> all-zero lora_B crash.
+    # The adapter's own keys are ground truth: a '.language_model.' LoRA key only comes from a VL
+    # SFT, so the remap must strip it regardless of the probe result.
+    import flash.engine.worker.lora as lora
+
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = str(adir / "adapter_model.safetensors")
+    _write_safetensors(st, VL_KEYS)
+
+    # Despite the probe saying "not VL", the infixed keys are stripped from the file contents.
+    n = remap_vl_adapter_dir(str(adir), "Qwen/Qwen3.5-9B")
+    assert n == len(VL_KEYS)
+    keys = [k for k in _read_safetensors_header(st) if k != "__metadata__"]
+    assert sorted(keys) == sorted(CAUSAL_LM_KEYS)
+    assert not any(".language_model." in k for k in keys)
+
+
+def test_read_adapter_keys_rejects_oversized_header(tmp_path):
+    # A corrupt / hostile safetensors file can declare a huge header length; we must reject it from
+    # the declared length vs the real file size BEFORE allocating/reading the header payload.
+    import struct
+
+    import flash.engine.worker.lora as lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = adir / "adapter_model.safetensors"
+    # 8-byte length prefix claims a 4 GiB header, but the file is only 8 bytes.
+    st.write_bytes(struct.pack("<Q", 4 * 1024**3))
+    with pytest.raises(ValueError, match="implausible"):
+        lora._read_adapter_tensor_keys(str(adir))
+
+
+def test_read_adapter_keys_rejects_non_object_header(tmp_path):
+    # The safetensors header must decode to a JSON object with string keys. A header that decodes to
+    # a list/int (or carries non-string keys) would otherwise raise a confusing TypeError later in
+    # _is_lora_key (substring search on a non-str); fail with a clear ValueError here instead.
+    import json
+    import struct
+
+    import flash.engine.worker.lora as lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = adir / "adapter_model.safetensors"
+    # A well-formed length prefix + valid JSON that is a LIST, not an object.
+    body = json.dumps([1, 2, 3]).encode("utf-8")
+    st.write_bytes(struct.pack("<Q", len(body)) + body)
+    with pytest.raises(ValueError, match="not a JSON object with string keys"):
+        lora._read_adapter_tensor_keys(str(adir))
+
+
+def test_remap_raises_when_adapter_has_no_lora_keys(monkeypatch, tmp_path):
+    # A corrupt / wrong-architecture warm-start adapter with no LoRA weights can't carry an SFT
+    # delta -> it would load as the all-zero identity. Fail loudly at remap time (#286 cause 3).
+    import flash.engine.worker.lora as lora
+
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = str(adir / "adapter_model.safetensors")
+    # Base-model param names (no 'lora_' marker) -> 0 LoRA keys.
+    _write_safetensors(st, ["base_model.model.model.layers.0.self_attn.q_proj.weight"])
+
+    with pytest.raises(RuntimeError, match="NO LoRA weight keys"):
+        remap_vl_adapter_dir(str(adir), "Qwen/Qwen3.5-9B")
+
+
+def test_remap_raises_when_infix_survives_rewrite(monkeypatch, tmp_path):
+    # Fail-closed backstop: if a LoRA key still carries '.language_model.' after the rewrite (an
+    # unexpected key layout the strip can't fully clean), it would be silently discarded by the
+    # text-only base -> all-zero lora_B. Raise at remap time with a precise message instead.
+    import flash.engine.worker.lora as lora
+
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = str(adir / "adapter_model.safetensors")
+    # A double-infix key: strip removes only the FIRST '.language_model.', so one survives.
+    double = (
+        "base_model.model.model.language_model.layers.0.language_model.q_proj.lora_B.default.weight"
+    )
+    _write_safetensors(st, [double])
+
+    with pytest.raises(RuntimeError, match="after the remap"):
+        remap_vl_adapter_dir(str(adir), "Qwen/Qwen3.5-9B")
 
 
 def test_safetensors_remap_idempotent(monkeypatch, tmp_path):
@@ -221,3 +319,195 @@ def test_vl_keys_are_what_sft_actually_saves():
     assert all(".language_model." not in k for k in CAUSAL_LM_KEYS)
     # And the file path the rewriter targets exists in our fixture writer.
     assert os.path.basename("x/adapter_model.safetensors") == "adapter_model.safetensors"
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed key-equality check (matched == saved) on the captured load result.
+#
+# peft injects the LoRA modules from target_modules BEFORE loading weights, so counting injected
+# modules (assert_lora_applied) can't see a silent weight-discard: it passes even when ZERO saved
+# weights matched. assert_adapter_load_clean inspects the load_result peft returns from load_adapter
+# (load_state_dict(strict=False) -> _IncompatibleKeys) and fails closed when matched != saved. These
+# run without torch/peft using a fake load result shaped like peft's namedtuple.
+# ---------------------------------------------------------------------------
+_LoadResult = namedtuple("_LoadResult", ["missing_keys", "unexpected_keys"])
+
+
+def test_assert_adapter_load_clean_passes_on_full_match():
+    # A correct load: every injected module got a weight, every saved key matched a module.
+    assert assert_adapter_load_clean(_LoadResult([], []), "Qwen/Qwen3.5-4B") is None
+
+
+def test_assert_adapter_load_clean_raises_on_vl_infix_mismatch():
+    # The #67 silent-discard: the saved VL keys (infixed) match no injected text-only module ->
+    # unexpected; the injected text-only modules get no saved weight -> missing. This is the exact
+    # case the module-count check waves through and this check must catch.
+    lr = _LoadResult(missing_keys=list(CAUSAL_LM_KEYS), unexpected_keys=list(VL_KEYS))
+    with pytest.raises(RuntimeError, match="did NOT load cleanly"):
+        assert_adapter_load_clean(lr, "Qwen/Qwen3.5-4B")
+
+
+def test_assert_adapter_load_clean_raises_on_missing_only():
+    lr = _LoadResult(missing_keys=list(CAUSAL_LM_KEYS), unexpected_keys=[])
+    with pytest.raises(RuntimeError, match="did NOT load cleanly"):
+        assert_adapter_load_clean(lr, "Qwen/Qwen3.5-4B")
+
+
+def test_assert_adapter_load_clean_raises_on_unexpected_only():
+    lr = _LoadResult(missing_keys=[], unexpected_keys=list(VL_KEYS))
+    with pytest.raises(RuntimeError, match="did NOT load cleanly"):
+        assert_adapter_load_clean(lr, "Qwen/Qwen3.5-4B")
+
+
+def test_assert_adapter_load_clean_ignores_benign_base_misses():
+    # An adapter-only checkpoint loaded with strict=False can report base-model params (no 'lora_'
+    # prefix) as missing even when every LoRA weight matched. Those must NOT abort a correct
+    # warm-start -- only LoRA-key mismatches are fatal.
+    base_misses = [
+        "base_model.model.model.layers.0.self_attn.q_proj.weight",
+        "base_model.model.model.embed_tokens.weight",
+    ]
+    assert assert_adapter_load_clean(_LoadResult(base_misses, []), "Qwen/Qwen3.5-4B") is None
+
+
+# ---------------------------------------------------------------------------
+# Non-zero-delta backstop: a silently-discarded adapter keeps zero-init lora_B, so its delta is
+# identically zero. This is API-independent (no peft load_result needed). Needs real tensors for the
+# zero check, so it is torch-gated like the .bin path above.
+# ---------------------------------------------------------------------------
+class _WeightModule:
+    def __init__(self, weight):
+        self.weight = weight
+
+
+class _FakeModelWithWeights:
+    def __init__(self, named_weights):
+        self._items = [(n, _WeightModule(w)) for n, w in named_weights]
+
+    def named_modules(self):
+        return self._items
+
+
+def test_assert_adapter_delta_nonzero_passes_when_a_b_is_trained():
+    torch = pytest.importorskip("torch")
+    model = _FakeModelWithWeights(
+        [
+            ("base_model.model.model.layers.0.self_attn.q_proj.lora_A.default", torch.zeros(2, 2)),
+            ("base_model.model.model.layers.0.self_attn.q_proj.lora_B.default", torch.zeros(2, 2)),
+            # a trained (non-zero) lora_B -> the adapter delta is real
+            (
+                "base_model.model.model.layers.1.self_attn.q_proj.lora_B.default",
+                torch.tensor([[0.0, 0.7], [0.0, 0.0]]),
+            ),
+        ]
+    )
+    # only lora_B modules are inspected; exactly one is non-zero
+    assert assert_adapter_delta_nonzero(model, "Qwen/Qwen3.5-4B") == 1
+
+
+def test_assert_adapter_delta_nonzero_raises_when_all_b_zero():
+    torch = pytest.importorskip("torch")
+    # Every lora_B is zero -> identity adapter (the silent-discard signature) -> must raise.
+    model = _FakeModelWithWeights(
+        [
+            ("base_model.model.model.layers.0.self_attn.q_proj.lora_B.default", torch.zeros(2, 2)),
+            ("base_model.model.model.layers.0.self_attn.k_proj.lora_B.default", torch.zeros(3, 3)),
+        ]
+    )
+    with pytest.raises(RuntimeError, match="ALL-ZERO lora_B"):
+        assert_adapter_delta_nonzero(model, "Qwen/Qwen3.5-4B")
+
+
+# ---------------------------------------------------------------------------
+# REAL end-to-end regression for #286 through transformers + peft + the worker guards.
+#
+# A tiny text-only causal LM gets a LoRA whose lora_B is NON-ZERO (a 'trained' SFT adapter); its
+# saved keys are rewritten into the VL '.language_model.' form a full-multimodal SFT produces. We
+# then drive the exact worker warm-start load path (PeftModel.from_pretrained -> load_adapter ->
+# the three guards) with is_vl_checkpoint() forced False -- the #286 condition where the config
+# probe silently fails. WITHOUT the remap the infixed keys are discarded (a guard fires); WITH the
+# evidence-driven remap they are stripped, the adapter loads, and lora_B is non-zero. Skips cleanly
+# where torch/peft/transformers aren't installed (e.g. the CPU-only offline CI lane).
+# ---------------------------------------------------------------------------
+def _adapter_header_keys(adir):
+    keys = _read_safetensors_header(adir + "/adapter_model.safetensors")
+    return [k for k in keys if k != "__metadata__"]
+
+
+def _build_vl_form_adapter(tmp_path):
+    """Save a real adapter with non-zero lora_B, rewrite keys into the VL .language_model. form."""
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM, LlamaConfig
+
+    cfg = LlamaConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+    )
+    pm = get_peft_model(
+        AutoModelForCausalLM.from_config(cfg),
+        LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"),
+    )
+    for name, p in pm.named_parameters():
+        if "lora_B" in name:
+            with torch.no_grad():
+                p.add_(0.05)  # a real (non-zero) SFT delta
+    d = tmp_path / "adapter"
+    pm.save_pretrained(str(d))
+    st = str(d / "adapter_model.safetensors")
+    with open(st, "rb") as f:
+        (hl,) = struct.unpack("<Q", f.read(8))
+        hdr = json.loads(f.read(hl))
+        data = f.read()
+    new = {}
+    for k, v in hdr.items():
+        if k == "__metadata__":
+            new[k] = v
+            continue
+        new[k.replace("base_model.model.model.", "base_model.model.model.language_model.", 1)] = v
+    hb = json.dumps(new).encode()
+    with open(st, "wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+        f.write(data)
+    return cfg, str(d)
+
+
+def _warmstart_load(cfg, adir, model_id):
+    """Mirror worker._init_adapter_model's load + guards; returns the non-zero lora_B count."""
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    base = AutoModelForCausalLM.from_config(cfg)
+    model = PeftModel.from_pretrained(base, adir, is_trainable=True)
+    key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+    load_result = model.load_adapter(
+        adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
+    )
+    assert_adapter_load_clean(load_result, model_id)
+    assert_lora_applied(model, model_id)
+    return assert_adapter_delta_nonzero(model, model_id)
+
+
+def test_e2e_warmstart_unfixed_fails_then_fixed_loads_nonzero(monkeypatch, tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    pytest.importorskip("transformers")
+    import flash.engine.worker.lora as lora
+
+    model_id = "Qwen/Qwen3.5-9B"
+    # The #286 condition: the AutoConfig probe failed, so is_vl_checkpoint() returns False.
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda m: False)
+
+    # UNFIXED: skip the remap (old behaviour when is_vl is False) -> infixed keys -> a guard fires.
+    cfg_a, dir_a = _build_vl_form_adapter(tmp_path / "a")
+    assert all(".language_model." in k for k in _adapter_header_keys(dir_a))
+    with pytest.raises(RuntimeError):
+        _warmstart_load(cfg_a, dir_a, model_id)
+
+    # FIXED: the real remap strips the infix BY EVIDENCE despite is_vl False -> warm-start succeeds.
+    cfg_b, dir_b = _build_vl_form_adapter(tmp_path / "b")
+    assert remap_vl_adapter_dir(dir_b, model_id) == 8
+    assert not any(".language_model." in k for k in _adapter_header_keys(dir_b))
+    nonzero = _warmstart_load(cfg_b, dir_b, model_id)
+    assert nonzero == 4  # 2 layers x {q_proj, v_proj}, every lora_B non-zero

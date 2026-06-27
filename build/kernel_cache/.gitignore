@@ -1,0 +1,5 @@
+# the GPU-produced mega-cache is a large binary artifact, not a source deliverable: keep only the
+# .keep placeholder tracked (so the Dockerfile COPY source exists), ignore everything else here.
+*
+!.gitignore
+!.keep

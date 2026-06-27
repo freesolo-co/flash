@@ -110,6 +110,46 @@ def test_poll_job_completes(monkeypatch):
     assert res.metrics == {"acc": 1.0}
 
 
+def test_surface_heartbeat_logs_gpu_status(monkeypatch):
+    from flash.providers._poll import surface_heartbeat
+
+    lines = []
+    hb = {
+        "stage": "sft_step",
+        "step": 12,
+        "loss": 1.23456,
+        "ts": 123.0,
+        "gpu": {
+            "device_name": "RTX 5090",
+            "driver_version": "575.57",
+            "torch_cuda": "12.8",
+            "gpu_util_pct": 97,
+            "memory_used_gb": 22.25,
+            "memory_total_gb": 31.8,
+            "temperature_c": 68,
+            "power_w": 411.3,
+            "power_limit_w": 575.0,
+            "processes": [
+                {"pid": 1234, "process_name": "/usr/bin/python", "used_memory_gb": 21.9}
+            ],
+        },
+    }
+    monkeypatch.setattr("flash.providers._poll._record_heartbeat", lambda _hb: None)
+
+    key, stage = surface_heartbeat(lambda: hb, None, lines.append)
+
+    assert key == ("sft_step", 12, 123.0)
+    assert stage == "sft_step"
+    assert len(lines) == 1
+    line = lines[0]
+    assert "worker: stage=sft_step step=12 loss=1.2346" in line
+    assert "gpu[RTX 5090" in line
+    assert "util=97%" in line
+    assert "mem=22.2GB/31.8GB" in line
+    assert "power=411W/575W" in line
+    assert "procs=python:1234:21.9GB" in line
+
+
 def test_poll_job_failure(monkeypatch):
     res, _ = _poll(
         monkeypatch,
@@ -118,6 +158,77 @@ def test_poll_job_failure(monkeypatch):
     assert not res.ok
     assert res.failure == "job_failed"
     assert "worker exploded" in res.detail
+
+
+def test_poll_job_failure_surfaces_forced_heartbeat(monkeypatch):
+    import io
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda eid, jid: {"status": "FAILED", "error": "worker exploded"},
+    )
+    log = io.StringIO()
+    hb = {
+        "run_id": "missing-local-status-is-ok",
+        "stage": "boot",
+        "ts": 456.0,
+        "gpu": {"device_name": "RTX 5090", "gpu_util_pct": 1, "memory_total_gb": 31.8},
+    }
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: hb,
+        log=log,
+    )
+
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert "worker: stage=boot" in log.getvalue()
+    assert "gpu[RTX 5090" in log.getvalue()
+
+
+def test_poll_job_failure_appends_worker_artifacts(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    seq = iter(
+        [
+            {"status": "IN_PROGRESS"},
+            {
+                "status": "FAILED",
+                "error": "train phase 'sft' produced no /tmp/metrics.json (it crashed before finishing)",
+            },
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(seq))
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    calls = {"force": None}
+
+    def failure_detail_reader(force=False):
+        calls["force"] = force
+        return (
+            "--- error_sft.txt ---\n"
+            "Traceback (most recent call last):\nImportError: no module named flash_attn\n"
+            "--- console_sft.txt ---\nworker console tail"
+        )
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: None,
+        failure_detail_reader=failure_detail_reader,
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert calls["force"] is True
+    assert "produced no /tmp/metrics.json" in res.detail
+    assert "ImportError: no module named flash_attn" in res.detail
+    assert "worker console tail" in res.detail
 
 
 def test_poll_job_platform_preempt_maps_to_job_preempted(monkeypatch):
@@ -130,6 +241,29 @@ def test_poll_job_platform_preempt_maps_to_job_preempted(monkeypatch):
         assert not res.ok
         assert res.failure == "job_preempted", status
         assert f"[{status}]" in res.detail
+
+
+def test_poll_job_platform_preempt_does_not_read_worker_artifacts(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(
+        runpod_api, "job_status", lambda eid, jid: {"status": "TIMED_OUT", "error": "timeout"}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    def failure_detail_reader(force=False):
+        raise AssertionError("platform terminations should not read worker artifacts")
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: None,
+        failure_detail_reader=failure_detail_reader,
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"
+    assert "timeout" in res.detail
 
 
 def _poll_failed_with_heartbeat(monkeypatch, hb):
@@ -178,8 +312,10 @@ def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):
         jobs.JobHandle("ep", "name", "job"),
         interval_s=0,
         heartbeat_reader=lambda force=False: {"retriable": True},
+        failure_detail_reader=lambda force=False: "--- error_sft.txt ---\nCUDA out of memory",
     )
     assert res.failure == "job_preempted"
+    assert "CUDA out of memory" in res.detail
 
 
 def test_poll_job_stall_detection(monkeypatch):
@@ -230,9 +366,38 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
         queue_grace_s=900.0,
     )
     assert not res.ok
-    assert res.failure == "stalled"
+    # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
+    assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
     assert "next-best GPU" in res.detail
+
+
+def test_capacity_grace_scales_with_gpu_walk_position():
+    # The two no-capacity backstops — IN_QUEUE with no worker (queue_grace_s) and a worker stuck
+    # THROTTLED (throttled_grace_s) — are tuned to the gpu-walk position. While a next-best class
+    # still exists they wait ~5 min, long enough to ride out a brief blip but short enough to hand
+    # off promptly to the next-best class. On the LAST candidate there is nowhere to walk, so they
+    # wait ~15 min before giving up. A *placed* worker that is still cold-starting is governed by
+    # the much larger setup_grace_s and must NOT be shortened — assert it stays large so we never
+    # abandon a legitimately-initializing worker.
+    import inspect
+
+    from flash.providers.runpod import jobs
+
+    not_last = jobs.stall_kwargs()  # default on_last_gpu=False
+    assert not_last["queue_grace_s"] == 300.0
+    assert not_last["throttled_grace_s"] == 300.0
+    assert not_last["setup_grace_s"] >= 1800.0  # cold-start budget unchanged
+
+    last = jobs.stall_kwargs(on_last_gpu=True)
+    assert last["queue_grace_s"] == 900.0
+    assert last["throttled_grace_s"] == 900.0
+    assert last["setup_grace_s"] == not_last["setup_grace_s"]  # only the capacity backstops move
+
+    sig = inspect.signature(jobs.poll_job)
+    assert sig.parameters["queue_grace_s"].default == 300.0
+    assert sig.parameters["throttled_grace_s"].default == 300.0
+    assert sig.parameters["setup_grace_s"].default >= 1800.0
 
 
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
@@ -363,6 +528,7 @@ def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,  # huge: only the unhealthy fast-fail can trip here
+        queue_grace_s=100000.0,  # huge: isolate the unhealthy path from the (tight) queue backstop
         unhealthy_grace_s=240.0,
     )
     assert res.failure == "stalled"  # infra-shaped -> runner retries on a fresh endpoint
@@ -411,6 +577,7 @@ def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,
+        queue_grace_s=100000.0,  # huge: isolate the transient-unhealthy recovery from the queue backstop
         unhealthy_grace_s=240.0,
     )
     assert res.ok
@@ -444,10 +611,13 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
         stall_after_s=150.0,
         setup_grace_s=100000.0,  # huge: only the throttled fast-fail can trip here
         unhealthy_grace_s=100000.0,  # huge: isolate the throttled path
+        queue_grace_s=100000.0,  # huge: isolate the throttled path from the (tight) queue backstop
         throttled_grace_s=300.0,
     )
-    assert res.failure == "stalled"  # infra-shaped -> runner retries on the next-best GPU
-    assert "throttled" in res.detail
+    # A throttled-only worker was never usable -> reported as no_capacity (never scheduled),
+    # infra-shaped so the runner retries on the next-best GPU.
+    assert res.failure == "no_capacity"
+    assert "THROTTLED" in res.detail
 
 
 def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
@@ -492,6 +662,7 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,
+        queue_grace_s=100000.0,  # huge: isolate the transient-throttle recovery from the queue backstop
         throttled_grace_s=300.0,
     )
     assert res.ok
@@ -575,7 +746,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
@@ -602,7 +773,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
@@ -626,7 +797,7 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(
                 False, failure="job_failed", detail="Remote execution failed: ValueError"
@@ -645,21 +816,16 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     # A policy ("cheapest") request that keeps hitting infra-shaped failures must walk
     # down the ranked candidate list, not burn every retry on the same (capacity-starved)
     # class. With static rates the validated >=24 GB pool for a 0.8B GRPO run ranks
-    # RTX 3090 < RTX A6000 < ... by $/hr, so successive attempts step through them.
+    # RTX A6000 < RTX 4090 < RTX 5090 < ... by $/hr, so successive attempts step through them.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        # Force the deterministic static ranking (no live pricing fetch) so successive attempts
-        # step through the validated-only pool in ascending $/hr order.
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
-
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
@@ -689,7 +855,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         rates = [hourly_rate(g) for g in gpus_seen]
         assert rates == sorted(rates)
         # cheapest validated class with >= 24 GB
-        assert gpus_seen[0] == "RTX 3090"
+        assert gpus_seen[0] == "RTX A6000"
 
 
 def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
@@ -698,14 +864,12 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(
                 False, failure="job_failed", detail="ValueError: bad reward fn (no infra marker)"
@@ -728,24 +892,24 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
         assert orch.get_status("code-crash").state == "failed"
 
 
-def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
-    # The candidate walk steps to the next-cheapest class on each infra retry but CLAMPS at
-    # the last fitting candidate — it must never index past the ranked list. Force a VRAM need that
-    # only the 80 GB+ VALIDATED tier satisfies, then trim the ranked candidate list to exactly the
-    # two cheapest 80 GB classes (A100 PCIe, A100 SXM) for a clean walk+clamp assertion: attempt 0
-    # takes the cheaper (A100 PCIe @ $1.39), attempt 1 walks to the pricier (A100 SXM @ $1.49),
-    # attempt 2's walk offset clamps back onto that same last class.
+def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch):
+    # The candidate walk steps to the next class on each infra retry, then — once every distinct
+    # class on the (single) provider has been tried — falls back to the CHEAPEST one rather than
+    # clamping on the priciest (no point re-rolling the most expensive card when re-trying an
+    # already-tried option). It must never index past the ranked list. Force a VRAM need that only
+    # the 80 GB+ VALIDATED tier satisfies, then trim the ranked candidate list to exactly the two
+    # cheapest 80 GB classes (A100 PCIe, A100 SXM): attempt 0 takes the cheaper (A100 PCIe @ $1.39),
+    # attempt 1 walks to the pricier (A100 SXM @ $1.49), attempt 2 (both now tried) re-rolls the
+    # cheapest (A100 PCIe).
     import dataclasses
 
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         # Need 80 GB; the validated 80 GB+ RunPod pool is A100 PCIe ($1.39), A100 SXM ($1.49), RTX
         # Pro 6000 Server ($2.09), H100 ($3.29). Trim the ranked candidates to the two cheapest so
         # exactly TWO candidates remain for a clean walk+clamp assertion.
@@ -756,14 +920,12 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
             alloc = real_allocate(*a, **k)
             keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
             best = keep[0]
-            return dataclasses.replace(
-                alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep, offer=best.offer
-            )
+            return dataclasses.replace(alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep)
 
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
@@ -785,8 +947,61 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         orch.submit_job(spec, dry_run=False, background=False)
 
         assert orch.get_status("clamp").state == "done"
-        # Walk advances to the last candidate then clamps on it (never out of range).
-        assert gpus_seen == ["A100 PCIe", "A100 SXM", "A100 SXM"]
+        # Walk advances through both classes, then re-rolls the cheapest (never out of range).
+        assert gpus_seen == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
+
+
+def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
+    # on_last_gpu must reach the provider so the no-capacity backstops know whether there is a
+    # next-best class to fall to: False while the walk still has somewhere to go (attempt 0 on the
+    # cheaper of two classes), True once it lands on (and clamps to) the last candidate.
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        # Same trim as the clamp test: exactly two 80 GB candidates so the walk has one step.
+        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
+        real_allocate = allocator.allocate
+
+        def two_candidate_allocate(*a, **k):
+            alloc = real_allocate(*a, **k)
+            keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
+            best = keep[0]
+            return dataclasses.replace(alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep)
+
+        monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
+        last_flags: list[bool] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
+            last_flags.append(on_last_gpu)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            if attempt < 2:
+                return jobs.PollResult(False, failure="stalled", detail="frozen")
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="lastgpu",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("lastgpu").state == "done"
+        # attempt 0: cheaper class, a next-best still exists -> False; attempts 1 & 2: on the last
+        # candidate (and clamped onto it) -> True.
+        assert last_flags == [False, True, True]
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -797,11 +1012,8 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
 
         real_allocate = allocator.allocate
         alloc_calls = {"n": 0}
@@ -816,7 +1028,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
@@ -837,8 +1049,8 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         assert orch.get_status("alloc-blip").state == "done"
         # First allocation failed (no provision); the retry provisioned the cheapest class
-        # (RTX 3090, the cheapest validated 24 GB RunPod class).
-        assert gpus_seen == ["RTX 3090"]
+        # (RTX A6000, the cheapest validated RunPod class that fits 24 GB).
+        assert gpus_seen == ["RTX A6000"]
 
 
 def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
@@ -847,10 +1059,8 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         status = orch.RunStatus(
             run_id="walked",
             state="running",
@@ -905,9 +1115,8 @@ def test_cancel_uses_rest_handle(monkeypatch):
         st = orch.cancel_run("c1")
         assert st.state == "cancelled"
         assert cancelled == [("epX", "jX")]
-        # cancel_run now also destroys the handle's endpoint for cost-safety symmetry
-        # with vast (idempotent); the GC backstop may delete it again — endpoint id
-        # was torn down, which is what matters.
+        # cancel_run now also destroys the handle's endpoint (idempotent); the GC backstop may
+        # delete it again — endpoint id was torn down, which is what matters.
         assert deleted
         assert all(e == "epX" for e in deleted)
 
@@ -1093,3 +1302,381 @@ def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):
         orch._update("c", "cancelled", cost_usd=2.0)
         assert orch.get_status("c").state == "cancelled"
         assert orch.get_status("c").cost_usd == 2.0
+
+
+# ---------------------------------------------------------------------------
+# deploy_train_endpoint: quota-error sweep-and-retry
+# ---------------------------------------------------------------------------
+
+
+def _make_runpod_flash_mocks(monkeypatch, FakeRM):
+    """Inject fake runpod_flash modules so deploy_train_endpoint can be called without the SDK."""
+    import sys
+    import types
+
+    class FakeEndpoint:
+        def __init__(self, **kwargs):
+            pass
+
+        def _build_resource_config(self):
+            return {}
+
+    # Mark every stub as a package (via __path__) so Python allows dotted imports from them,
+    # e.g. `from runpod_flash.core.resources.resource_manager import ResourceManager`.
+    rf_mod = types.ModuleType("runpod_flash")
+    rf_mod.__path__ = []
+    rf_mod.Endpoint = FakeEndpoint
+    monkeypatch.setitem(sys.modules, "runpod_flash", rf_mod)
+
+    core_mod = types.ModuleType("runpod_flash.core")
+    core_mod.__path__ = []
+    monkeypatch.setitem(sys.modules, "runpod_flash.core", core_mod)
+
+    res_mod = types.ModuleType("runpod_flash.core.resources")
+    res_mod.__path__ = []
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources", res_mod)
+
+    rm_mod = types.ModuleType("runpod_flash.core.resources.resource_manager")
+    rm_mod.ResourceManager = FakeRM
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", rm_mod)
+
+
+def _patch_deploy_deps(monkeypatch, jobs):
+    """Patch all module-level symbols in jobs that deploy_train_endpoint uses."""
+    import flash.providers.runpod.auth as auth_mod
+
+    monkeypatch.setattr(jobs, "FLASH_SDK_LOCK", __import__("threading").Lock())
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(auth_mod, "ensure_auth", lambda: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "flash_gpu", lambda g: g)
+    monkeypatch.setattr(jobs, "canonical_gpu", lambda g: g)
+    monkeypatch.setattr(jobs, "endpoint_name", lambda g, s: f"flash-{g}-test")
+    monkeypatch.setattr(jobs, "min_cuda_for", lambda g: "12.8")
+    monkeypatch.setattr(jobs, "WORKER_IMAGE", "fake-image")
+    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda g, allow_default=True: "fake-image")
+    monkeypatch.setattr(jobs, "DEFAULT_EXECUTION_TIMEOUT_MS", 3600000)
+    monkeypatch.setattr(jobs, "apply_disk_gb", lambda c, d: None)
+    monkeypatch.setattr(jobs, "time", type("T", (), {"sleep": staticmethod(lambda s: None)})())
+
+
+def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
+    """On a workers-quota error, deploy_train_endpoint sweeps idle endpoints and retries."""
+    import flash.providers.runpod.jobs as jobs
+
+    attempts = {"count": 0}
+    swept = {"count": 0}
+
+    class FakeResource:
+        id = "ep-new"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise RuntimeError(
+                    "GraphQL errors: Max workers across all endpoints must not exceed "
+                    "your workers quota (30)"
+                )
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
+        swept["count"] += 1
+        return 5
+
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", fake_sweep)
+
+    ep_id, _ep_name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+
+    assert ep_id == "ep-new"
+    assert attempts["count"] == 3, "should take 3 attempts (2 quota failures + 1 success)"
+    assert swept["count"] == 2, "should sweep once per quota-error retry"
+
+
+def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
+    """deploy_train_endpoint re-raises the quota error after all retries are exhausted."""
+    import flash.providers.runpod.jobs as jobs
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            raise RuntimeError(
+                "GraphQL errors: Max workers across all endpoints must not exceed "
+                "your workers quota (30)"
+            )
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0)
+
+    with pytest.raises(RuntimeError, match="workers quota"):
+        jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+
+
+def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
+    """A multi-account RUNPOD_API_KEY fails the deploy over to the next account on quota."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
+    keys.reset()
+
+    class FakeResource:
+        id = "ep-on-kB"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            # Account kA is out of worker quota; kB has room. advance_key() (the deploy's
+            # failover) moves keys.active_key() from kA to kB.
+            if keys.active_key() == "kA":
+                raise RuntimeError(
+                    "GraphQL errors: Max workers across all endpoints must not exceed "
+                    "your workers quota (30)"
+                )
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0)
+
+    ep_id, _name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    assert ep_id == "ep-on-kB"
+    assert keys.active_key() == "kB"  # provisioning pointer advanced to the working account
+
+
+def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
+    """When EVERY account is quota-exhausted, deploy fails over once per account and then RAISES —
+    it must NOT loop forever. advance_key() wraps (always True for a multi-key pool), so the deploy
+    bounds its own failovers by key_count(); a regression would spin here indefinitely."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
+    keys.reset()
+
+    calls = {"count": 0}
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            calls["count"] += 1
+            if calls["count"] > 20:  # safety net: fail loudly instead of hanging on a regression
+                raise AssertionError("deploy failover did not terminate (looped past the pool)")
+            raise RuntimeError(
+                "GraphQL errors: Max workers across all endpoints must not exceed "
+                "your workers quota (30)"
+            )
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
+
+    with pytest.raises(RuntimeError, match="workers quota"):
+        jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    # 2 accounts x _QUOTA_MAX_RETRIES (3) = 6 deploy attempts, then it stops — never the unbounded spin.
+    assert calls["count"] == 6
+
+
+def test_sweep_idle_flash_endpoints(monkeypatch):
+    """_sweep_idle_flash_endpoints deletes only idle flash-* / live-flash-* endpoints."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    # RunPod Flash registers endpoints as "live-<endpoint_name>", so real names are
+    # "live-flash-<gpu>-<suffix>". Both the bare "flash-*" and "live-flash-*" forms
+    # must be swept; the current run's endpoint (and its "live-" form) must be skipped.
+    endpoints = [
+        {"id": "ep-live-idle", "name": "live-flash-a100-abc"},  # scaled to zero, idle → delete
+        {"id": "ep-warm-idle", "name": "live-flash-a100-warm"}, # WARM idle/ready worker → delete
+        {"id": "ep-live-busy", "name": "live-flash-a100-xyz"},  # running a job → keep
+        {"id": "ep-initing",   "name": "flash-a100-init"},      # worker spinning up → keep
+        {"id": "ep-live-skip", "name": "live-flash-a100-cur"},  # live- form of current → skip
+        {"id": "ep-bare-idle", "name": "flash-a100-old"},       # bare prefix, idle → delete
+        {"id": "ep-skip-bare", "name": "flash-a100-cur"},       # current run (bare) → skip
+        {"id": "ep-other",     "name": "other-ep"},              # not flash-* → skip
+    ]
+
+    def fake_list_endpoints():
+        return endpoints
+
+    def fake_health(eid):
+        if eid in ("ep-live-idle", "ep-bare-idle"):
+            return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
+        if eid == "ep-warm-idle":  # warm worker left over after a job, nothing pending → reapable
+            return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
+        if eid == "ep-live-busy":
+            return {"workers": {"running": 1, "ready": 0, "idle": 0, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 1}}
+        if eid == "ep-initing":  # initializing worker is busy (spinning up) → not reapable
+            return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 1},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
+        return {}
+
+    deleted = []
+
+    def fake_delete(eid):
+        deleted.append(eid)
+        return True
+
+    monkeypatch.setattr(runpod_api, "list_endpoints", fake_list_endpoints)
+    monkeypatch.setattr(runpod_api, "endpoint_health", fake_health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", fake_delete)
+    jobs._idle_since.clear()
+
+    count = jobs._sweep_idle_flash_endpoints(
+        protected={"flash-a100-cur", "live-flash-a100-cur"}
+    )
+
+    # warm idle/ready (ep-warm-idle) is reaped too — the dominant leak the old scaled-to-zero rule
+    # never caught; running/initializing stay, current-run endpoints are protected.
+    assert count == 3
+    assert sorted(deleted) == sorted(["ep-live-idle", "ep-warm-idle", "ep-bare-idle"])
+
+
+def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
+    """reap_warm=False (the deploy-time reactive sweep, which protects only the current run) reaps
+    ONLY fully scaled-to-zero endpoints — never another run's warm idle/ready between-seeds one."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    endpoints = [
+        {"id": "ep-warm", "name": "live-flash-a100-warm"},  # warm idle/ready worker
+        {"id": "ep-zero", "name": "flash-a100-zero"},       # fully scaled to zero
+    ]
+
+    def health(eid):
+        if eid == "ep-warm":
+            return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
+        return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                "jobs": {"inQueue": 0, "inProgress": 0}}
+
+    deleted = []
+    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: endpoints)
+    monkeypatch.setattr(runpod_api, "endpoint_health", health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+
+    # Deploy-path mode: warm endpoint is treated as busy and kept; only scaled-to-zero is reaped.
+    jobs._idle_since.clear()
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), reap_warm=False) == 1
+    assert deleted == ["ep-zero"]
+
+    # Periodic-reaper mode (default): the warm endpoint is reaped too.
+    deleted.clear()
+    jobs._idle_since.clear()
+    assert jobs._sweep_idle_flash_endpoints(protected=set()) == 2
+    assert sorted(deleted) == sorted(["ep-warm", "ep-zero"])
+
+
+def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
+    """With min_idle_s > 0, an endpoint that reports a single transient zero (cold start / between
+    jobs) is NOT deleted; only one idle across sweeps for >= min_idle_s is reaped."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    monkeypatch.setattr(
+        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                     "jobs": {"inQueue": 0, "inProgress": 0}},
+    )
+    deleted = []
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    jobs._idle_since.clear()
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+
+    # First sweep: idle observed, but grace (300s) not elapsed -> not deleted, timer recorded.
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
+    assert "ep-x" in jobs._idle_since
+
+    # Still within grace -> still not deleted.
+    clock["t"] = 1200.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
+
+    # Past grace -> reaped.
+    clock["t"] = 1400.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 1
+    assert deleted == ["ep-x"]
+
+
+def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
+    """A busy reading clears the grace timer, so the idle clock restarts if it goes idle again —
+    a long-running endpoint that dips idle briefly is never reaped."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    state = {"busy": False}
+    monkeypatch.setattr(
+        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+    )
+
+    def health(eid):
+        w = {"running": 1 if state["busy"] else 0, "ready": 0, "idle": 0, "initializing": 0}
+        j = {"inQueue": 0, "inProgress": 1 if state["busy"] else 0}
+        return {"workers": w, "jobs": j}
+
+    monkeypatch.setattr(runpod_api, "endpoint_health", health)
+    deleted = []
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    jobs._idle_since.clear()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+
+    # idle at t=1000 -> timer set
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert "ep-x" in jobs._idle_since
+    # busy at t=1200 -> timer cleared
+    state["busy"] = True
+    clock["t"] = 1200.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert "ep-x" not in jobs._idle_since
+    # idle again at t=1400 -> fresh timer (not deleted: only 0s of new idleness)
+    state["busy"] = False
+    clock["t"] = 1400.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
+
+
+def test_sweep_serializes_on_idle_since_lock(monkeypatch):
+    """_idle_since access is guarded: a sweep blocks while another holds the lock (the periodic
+    reaper and a deploy-time sweep run on different threads, so the prune can't race mid-iteration)."""
+    import threading
+
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [{"id": "e", "name": "flash-a100-x"}])
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                     "jobs": {"inQueue": 0, "inProgress": 0}},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: True)
+    jobs._idle_since.clear()
+
+    done = threading.Event()
+
+    def run_sweep():
+        jobs._sweep_idle_flash_endpoints(protected=set())
+        done.set()
+
+    with jobs._idle_since_lock:
+        t = threading.Thread(target=run_sweep)
+        t.start()
+        # The sweep must block on the lock we hold -> it cannot finish.
+        assert not done.wait(0.2)
+    t.join(timeout=2)
+    assert done.is_set()  # completes as soon as the lock is released

@@ -10,10 +10,10 @@ from flash.providers.allocator import required_vram_gb, vram_headroom
 
 from .facts import (
     download_weight_gb,
+    gpu_hourly_usd,
     gpu_tflops,
     gpu_vram_gb,
     pick_gpu,
-    realized_hourly_usd,
     reward_seconds_per_completion,
     total_params_b,
 )
@@ -24,7 +24,7 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-# Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod/Vast
+# Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
 # wall clock. LoRA + small batches sit well below dense-pretraining MFU.
 MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
@@ -93,7 +93,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
 
 
 def select_gpu(config: RunConfig) -> tuple[str, int]:
-    """(chosen GPU class, required VRAM GB): the cheapest fitting class for the cost estimate.
+    """(chosen GPU class, required VRAM GB): the cheapest fitting class for the cost.
 
     Uses ``pick_gpu``, which (unlike the submit-time allocator) intentionally stays gate-free —
     it considers every fitting class, validated or not — so the estimate reflects the cheapest
@@ -122,7 +122,7 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
             + (f", env {n.environment}" if n.environment else "")
             + ") + policy+reference update"
         )
-    notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; market (spot/queue) $/hr")
+    notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; static GPU $/hr")
     if wall_capped:
         per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
@@ -133,9 +133,9 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
 
 
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
-    """Deterministic pre-flight cost estimate -- the analytical ground truth."""
+    """Deterministic pre-flight cost calculation."""
     gpu, need = select_gpu(config)
-    hourly = realized_hourly_usd(gpu)
+    hourly = gpu_hourly_usd(gpu, provider=config.provider)
     # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
 

@@ -1,7 +1,7 @@
 """Cost estimator: GPU compute table, pricing/VRAM lookups, cheapest-fit selection.
 
 No network. The compute table and the selection rule must stay consistent with the
-provider-agnostic GPU registry in ``flash.providers.base``.
+RunPod GPU registry in ``flash.providers.base``.
 """
 
 from __future__ import annotations
@@ -10,40 +10,17 @@ import pytest
 
 from flash.cost.facts import (
     GPU_COMPUTE_TFLOPS,
-    REALIZED_HOURLY_USD,
     gpu_hourly_usd,
     gpu_tflops,
     gpu_vram_gb,
     pick_gpu,
-    realized_hourly_usd,
 )
-from flash.providers.base import GPU_INFO, providers_for
+from flash.providers.base import GPU_INFO
 
 
-def test_realized_rate_never_exceeds_list_for_any_class():
-    # The realized (spot/queue) rate is conservative: clamped to the on-demand list so the
-    # estimator can never over-quote a class vs its list price. Holds for EVERY registry class,
-    # by construction.
+def test_static_rate_is_positive_for_any_class():
     for name in GPU_INFO:
-        assert realized_hourly_usd(name) <= gpu_hourly_usd(name), name
-
-
-def test_over_list_realized_entry_is_clamped_to_list(monkeypatch):
-    # An observed realized rate that sits ABOVE the on-demand list must be clamped down to list, so
-    # the estimator can never over-quote. Inject an over-list entry for a real class and assert the
-    # clamp (a genuinely-discounted entry like the RTX 5090 still reports its discount).
-    over_list = gpu_hourly_usd("RTX 3090") + 0.10
-    monkeypatch.setitem(REALIZED_HOURLY_USD, "RTX 3090", over_list)
-    assert REALIZED_HOURLY_USD["RTX 3090"] > gpu_hourly_usd("RTX 3090")  # raw entry is over list
-    assert realized_hourly_usd("RTX 3090") == gpu_hourly_usd("RTX 3090")  # clamped to list
-    assert realized_hourly_usd("RTX 5090") == REALIZED_HOURLY_USD["RTX 5090"]  # below list -> unchanged
-    assert realized_hourly_usd("RTX 5090") < gpu_hourly_usd("RTX 5090")
-
-
-def test_realized_rate_falls_back_to_list_when_unobserved():
-    # A class without an observed realized rate reports its list price (no rate invented).
-    assert "L40S" not in REALIZED_HOURLY_USD
-    assert realized_hourly_usd("L40S") == gpu_hourly_usd("L40S")
+        assert gpu_hourly_usd(name) > 0, name
 
 
 def test_compute_table_only_lists_real_classes():
@@ -54,7 +31,7 @@ def test_compute_table_only_lists_real_classes():
 
 def test_gpu_tflops_known_and_default():
     assert gpu_tflops("RTX 5090") == GPU_COMPUTE_TFLOPS["RTX 5090"]
-    assert gpu_tflops("RTX 5090") > gpu_tflops("RTX 3090")  # newer/faster
+    assert gpu_tflops("RTX 5090") > gpu_tflops("RTX 4090")  # newer/faster
     assert gpu_tflops("totally-unknown-gpu") == 100.0  # documented default
 
 
@@ -72,11 +49,12 @@ def test_unknown_gpu_lookup_raises():
 
 
 def test_pick_gpu_cheapest_fit_no_validation_gate():
-    # No validation gate: every fitting class is eligible, ranked by the REALIZED rate it bills
-    # at. The RTX 3090 ($0.239, 24 GB) is the cheapest realized card, so it wins anything <= 24 GB.
-    assert pick_gpu(12) == "RTX 3090"
-    assert pick_gpu(24) == "RTX 3090"
-    # > 24 GB needs the big-VRAM tier -> cheapest realized >= 40 is the A40 ($0.44, 48 GB).
+    # No validation gate: every fitting class is eligible, ranked by static rate. 24 GB is the
+    # floor (sub-24 GB classes dropped), so anything that fits <=24 GB lands on the cheapest 24 GB
+    # card, L4 ($0.39).
+    assert pick_gpu(12) == "L4"
+    assert pick_gpu(24) == "L4"
+    # > 24 GB needs the big-VRAM tier -> cheapest static >= 40 is the A40 ($0.44, 48 GB).
     assert pick_gpu(40) == "A40"
 
 
@@ -84,19 +62,19 @@ def test_pick_gpu_result_actually_fits_and_is_cheapest():
     for need in (8, 16, 24, 33, 48, 80):
         gpu = pick_gpu(need)
         assert gpu_vram_gb(gpu) >= need
-        # No validation gate: nothing fitting is cheaper at the REALIZED (billed) rate.
+        # No validation gate: nothing fitting is cheaper at the static rate.
         cheaper_fits = [
             g
             for g in GPU_INFO.values()
-            if g.vram_gb >= need and realized_hourly_usd(g.name) < realized_hourly_usd(gpu)
+            if g.vram_gb >= need and gpu_hourly_usd(g.name) < gpu_hourly_usd(gpu)
         ]
         assert not cheaper_fits, f"{cheaper_fits} cheaper than {gpu} for {need} GB"
 
 
 def test_pick_gpu_includes_unvalidated_classes():
-    # No validation gate: the cheapest realized-rate class wins regardless of validation status.
-    # The RTX 3090 ($0.239) is the cheapest realized card and wins at 12 GB.
-    assert pick_gpu(12) == "RTX 3090"
+    # No validation gate: the cheapest static-rate class wins regardless of validation status
+    # (L4 is unvalidated yet is the cheapest fitting class).
+    assert pick_gpu(12) == "L4"
 
 
 def test_pick_gpu_impossible_raises():
@@ -104,30 +82,6 @@ def test_pick_gpu_impossible_raises():
         pick_gpu(100_000)
 
 
-def test_pick_gpu_provider_pin_restricts_to_provisionable():
-    # The only per-provider filter is PROVISIONABILITY (providers_for) -- there is no validation
-    # gate. A provider pin only ever returns a class that provider can actually provision.
-    for prov in ("runpod", "vast"):
-        assert prov in providers_for(pick_gpu(24, provider=prov))
-
-
-def test_pick_gpu_provider_filter_excludes_other_providers_only_class():
-    # A class only the OTHER provider can provision must be excluded under a provider pin.
-    # Provisionability is providers_for() (enum_member for runpod, vast_name for vast); pricing
-    # a Vast-only class on a runpod pin would misquote the run.
-    vast_only = [n for n, g in GPU_INFO.items() if g.vast_name and not g.enum_member]
-    assert vast_only, "expected at least one Vast-only class in the registry"
-    for need in (16, 24, 48, 80):
-        try:
-            runpod_pick = pick_gpu(need, provider="runpod")
-        except ValueError:
-            continue  # nothing runpod-provisionable fits this tier; fine
-        assert "runpod" in providers_for(runpod_pick)
-        assert runpod_pick not in vast_only
-
-
-def test_pick_gpu_auto_spans_all_providers():
-    # Without a provider pin, selection spans the whole registry: the cheapest (realized-rate)
-    # fitting class overall, regardless of which provider(s) can run it or whether it's validated.
-    assert pick_gpu(24, provider="auto") == "RTX 3090"
-    assert pick_gpu(12) == "RTX 3090"
+def test_pick_gpu_auto_matches_default():
+    assert pick_gpu(24, provider="auto") == pick_gpu(24)
+    assert pick_gpu(12) == "L4"

@@ -719,11 +719,11 @@ def run():
         print(f"[verl] snapshot_download fallback to id ({e})", flush=True)
 
     total = detect_total_gpus()
-    split = (
-        select_rollout_split(total, inf)
-        if inf > 0
-        else type("S", (), {"train_gpus": total or 1, "infer_gpus": 0})()
-    )
+    # detect_total_gpus() can report 0 (no nvidia-smi and no FLASH_GPU_COUNT); clamp to 1 so the
+    # colocate path still yields a valid single-GPU split (mirrors the old `total or 1`) rather than
+    # select_rollout_split raising. inf == 0 -> the canonical colocate RolloutSplit, not a duck-typed
+    # stand-in that only fakes train_gpus/infer_gpus.
+    split = select_rollout_split(max(total, 1), inf)
     print(
         f"[verl] total_gpus={total} inference_gpus={inf} -> train={getattr(split, 'train_gpus', '?')} infer={getattr(split, 'infer_gpus', '?')} "
         f"({'one-step-off OVERLAP' if inf > 0 else 'colocate (no overlap)'})",
@@ -1053,11 +1053,9 @@ def run():
         with open("/tmp/DONE", "w") as f:
             f.write(str(time.time()))
         hf_upload_file("/tmp/DONE", "DONE", required=True)
-        _hb("done")
+        _hb("done", verl_s_per_step=s_per_step or 0.0)
         print("[verl] uploaded metrics.json + DONE (run finalized)", flush=True)
     except Exception as _e:
         print(f"[verl] finalize upload FAILED ({_e}) -> plane may orphan-restart", flush=True)
 
-    return metrics
-    _hb("done", verl_s_per_step=s_per_step or 0.0)
     return metrics
