@@ -650,7 +650,9 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
         out[ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
         # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
         # combined adapter carries unit scale, so the per-component scales survive intact.
-        dt = sft_sd[bk].dtype
+        # Promote to the higher of the two input dtypes (don't force the SFT's, which would downcast a
+        # higher-precision GRPO B); A is cat'd as-is and auto-promotes the same way, so A/B stay consistent.
+        dt = torch.promote_types(sft_sd[bk].dtype, grpo_sd[bk].dtype)
         b_sft = sft_sd[bk].to(torch.float32) * s_sft
         b_grpo = grpo_sd[bk].to(torch.float32) * s_grpo
         out[bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
@@ -661,10 +663,15 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     out_cfg["use_rslora"] = False
     out_cfg["rank_pattern"] = {}
     out_cfg["alpha_pattern"] = {}
-    # The GRPO adapter was trained on the ephemeral SFT-merged temp dir, so its
-    # base_model_name_or_path points there; name the real catalog base (from the SFT config) instead.
-    if sft_cfg.get("base_model_name_or_path"):
-        out_cfg["base_model_name_or_path"] = sft_cfg["base_model_name_or_path"]
+    # The GRPO adapter was trained on the ephemeral SFT-merged temp dir, so out_cfg (copied from
+    # grpo_cfg) still names that temp path as base_model_name_or_path. Replace it with the real catalog
+    # base from the SFT config; if the SFT config carries none (e.g. an external/legacy adapter), DROP
+    # the field rather than ship a deployed config pointing at a now-deleted temp dir.
+    sft_base = sft_cfg.get("base_model_name_or_path")
+    if sft_base:
+        out_cfg["base_model_name_or_path"] = sft_base
+    else:
+        out_cfg.pop("base_model_name_or_path", None)
 
     os.makedirs(out_dir, exist_ok=True)
     save_file(out, os.path.join(out_dir, "adapter_model.safetensors"), metadata={"format": "pt"})
