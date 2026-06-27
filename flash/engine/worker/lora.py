@@ -95,14 +95,25 @@ _LM_SYNC_REMAP_ON = {"on": False}
 def _remap_vl_sync_weights(weights):
     """Rewrite TRL's trainer weight names to vLLM's VL-engine names for the train-time sync.
 
-    The trainer (built via ``AutoModelForCausalLM``) names its LM params ``model.layers.*`` /
-    ``model.norm`` / ``model.embed_tokens`` / ``lm_head.*``; the colocated vLLM engine loaded the
-    same checkpoint as ``Qwen3_5ForConditionalGeneration`` whose LM params live under
-    ``language_model.*``. Prefix incoming ``model.``/``lm_head.`` names with ``language_model.`` so
-    they resolve. Also tolerate a peft ``base_model.model.`` prefix (a merged-adapter sync can yield
-    base-model names through that wrapper) by stripping it before the language_model. prefix is
-    added. Names that already start with ``language_model.`` (or anything else) pass through
-    untouched. A generator so vLLM's loader still streams one (name, tensor) at a time.
+    The trainer (built via ``AutoModelForCausalLM``) names its LM params under ``model.*`` while the
+    colocated vLLM engine loaded the same checkpoint as ``Qwen3_5ForConditionalGeneration`` whose LM
+    params live under ``language_model.*``. Each incoming ``(name, tensor)`` is remapped per the form
+    the trainer's checkpoint class produced:
+
+    - peft wrapper: a ``base_model.model.`` prefix (a continued/merged-adapter sync surfacing
+      base-model names through the PeftModel wrapper) is STRIPPED first, so the rules below apply to
+      the unwrapped name.
+    - multimodal-named trainer (``model.language_model.*`` / ``model.visual.*`` / ``lm_head.*`` — what
+      ``AutoModelForCausalLM`` yields when it resolves the FULL ``*ForConditionalGeneration``, e.g. the
+      Qwen3.6-35B-A3B MoE): passed through UNTOUCHED, because vLLM's own ``hf_to_vllm_mapper`` already
+      maps these. Prepending ``language_model.`` here would double the prefix and crash the fused-MoE
+      expert lookup (see the inline comment).
+    - text-only dense trainer (bare ``model.*`` — the dense Qwen3.5 family's ``Qwen3_5ForCausalLM``,
+      no infix, no vision tower): prefixed with ``language_model.`` so it lands under
+      ``language_model.model.*``.
+    - anything already ``language_model.*`` (or otherwise unmatched): passed through untouched.
+
+    A generator so vLLM's loader still streams one (name, tensor) at a time.
     """
     for name, tensor in weights:
         # A continued-adapter (PeftModel) sync can surface names through the peft wrapper as
@@ -110,7 +121,25 @@ def _remap_vl_sync_weights(weights):
         # so the same model./lm_head. rule applies.
         if name.startswith("base_model.model."):
             name = name[len("base_model.model.") :]
-        if name.startswith(("model.", "lm_head.")):
+        # MULTIMODAL-named trainers: when AutoModelForCausalLM resolves the checkpoint to the FULL
+        # ``*ForConditionalGeneration`` (the Qwen3.6-35B-A3B MoE does — its params are
+        # ``model.language_model.*`` / ``model.visual.*`` / ``lm_head.*``), the vLLM engine's OWN
+        # ``hf_to_vllm_mapper`` already maps these (``model.language_model.`` -> ``language_model.model.``,
+        # ``model.visual.`` -> ``visual.``, ``lm_head.`` -> ``language_model.lm_head.``). Pass them
+        # through UNTOUCHED so the sync is byte-identical to the proven initial on-disk load.
+        # Prepending ``language_model.`` here would yield ``language_model.model.language_model.*``,
+        # which the mapper's ``startswith("model.language_model.")`` rule no longer matches -> the
+        # fused-MoE expert lookup then crashes with
+        # ``KeyError: 'language_model.layers.N.mlp.experts.w13_weight'`` (the ``.model.`` segment is
+        # lost in the AutoWeightsLoader recursion).
+        if name.startswith(("model.language_model.", "model.visual.", "lm_head.")):
+            yield name, tensor
+            continue
+        # TEXT-ONLY trainers: the dense Qwen3.5 family resolves to ``Qwen3_5ForCausalLM``
+        # (``model.layers.*`` / ``model.norm`` / ``model.embed_tokens``, no infix, no vision tower).
+        # The mapper has NO bare-``model.`` rule, so prepend ``language_model.`` ourselves to land
+        # them under ``language_model.model.*`` (unchanged behavior for dense GRPO).
+        if name.startswith("model."):
             name = "language_model." + name
         yield name, tensor
 
@@ -147,7 +176,10 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
         # (only some models are MoE, and older vLLM lacks the module) so its absence stays quiet.
         for mod_name, cls_name, required in (
             ("vllm.model_executor.models.qwen3_5", "Qwen3_5ForConditionalGeneration", True),
-            ("vllm.model_executor.models.qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration", False),
+            # NB: the MoE class lives in the SAME ``qwen3_5`` module (there is no ``qwen3_5_moe``
+            # module). It also inherits the dense class's (patched) ``load_weights``, but patch it
+            # explicitly too so the remap is guaranteed active for the MoE rollout engine.
+            ("vllm.model_executor.models.qwen3_5", "Qwen3_5MoeForConditionalGeneration", False),
         ):
             try:
                 mod = importlib.import_module(mod_name)

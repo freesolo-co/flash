@@ -120,6 +120,9 @@ def test_flash_gpu_enum_members():
 
     assert flash_gpu("RTX 5090").name == "NVIDIA_GEFORCE_RTX_5090"
     assert flash_gpu("4090").name == "NVIDIA_GEFORCE_RTX_4090"
+    # B200 is newly added; resolving it fails fast (AttributeError) if the installed runpod_flash SDK
+    # doesn't expose the NVIDIA_B200 enum member, so CI catches an SDK/version gap before a live run.
+    assert flash_gpu("B200").name == "NVIDIA_B200"
 
 
 def test_gpu_short():
