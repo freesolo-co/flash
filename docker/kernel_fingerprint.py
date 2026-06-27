@@ -130,16 +130,15 @@ def collect_inputs(
         ),
     }
 
+    # worker-image.yml holds the FA wheels in a job-level env block (single source for the build-args
+    # and these fingerprint inputs). CI passes the resolved values via --fa{2,3}-spec; for a manual
+    # bake / the tests we read those env defaults here.
     if fa2_spec is None:
-        fa2_spec = _search(
-            r"(?m)^\s*FLASH_ATTN_SPEC=(\S+)", worker_image_yml, "worker-image.yml FLASH_ATTN_SPEC"
-        )
+        fa2_spec = _search(r"(?m)^\s*FA2_SPEC:\s*(\S+)", worker_image_yml, "worker-image.yml FA2_SPEC")
     if fa3_spec is None:
-        # the build-arg is `FLASH_ATTN_3_SPEC=${{ ... || '<default wheel>' }}`; take the default.
+        # FA3_SPEC: ${{ github.event.inputs.flash_attn_3_spec || '<default wheel>' }} -> the default.
         fa3_spec = _search(
-            r"FLASH_ATTN_3_SPEC=.*?\|\|\s*'([^']+)'",
-            worker_image_yml,
-            "worker-image.yml FLASH_ATTN_3_SPEC default",
+            r"FA3_SPEC:.*?\|\|\s*'([^']+)'", worker_image_yml, "worker-image.yml FA3_SPEC default"
         )
 
     causal_conv1d = _search(
