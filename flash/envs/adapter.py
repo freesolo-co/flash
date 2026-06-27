@@ -459,13 +459,26 @@ def _safe_repo_relative_path(path: str) -> str:
     return "/".join(parts)
 
 
+def _environment_dir(env_path: str) -> str:
+    """The environment's directory within the repo, given a ref's path.
+
+    A ref may name the entrypoint FILE (``.../environment.py``) or the environment DIRECTORY itself
+    (``.../envs/e``) — both resolve to the same dir. ``rpartition('/')`` alone would mis-handle a
+    directory ref (treating its last segment as a filename), so strip a trailing ``environment.py``
+    and otherwise treat the whole path as the directory."""
+    parts = [p for p in env_path.split("/") if p]
+    if parts and parts[-1] == _DEFAULT_ENVIRONMENT_PATH:
+        parts = parts[:-1]
+    return "/".join(parts)
+
+
 def environment_local_dirname(env_ref: str) -> str:
     """A sensible local directory name for a pulled environment (used as the default output dir)."""
     slug = _parse_managed_environment_slug(env_ref)
     if slug is not None:
         return slug[1]
     ref = _coerce_environment_github_ref(env_ref)
-    env_dir = ref.path.rpartition("/")[0]
+    env_dir = _environment_dir(ref.path)
     return env_dir.rsplit("/", 1)[-1] if env_dir else ref.repo
 
 
@@ -483,7 +496,7 @@ def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 1
     """
     ref = _coerce_environment_github_ref(env_ref)
     safe_rel = _safe_repo_relative_path(rel_path)
-    env_dir = ref.path.rpartition("/")[0]
+    env_dir = _environment_dir(ref.path)
     full_path = f"{env_dir}/{safe_rel}" if env_dir else safe_rel
     quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in full_path.split("/"))
     url = (
@@ -511,7 +524,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
     never the rest of the (shared) environment-hub repo.
     """
     ref = _coerce_environment_github_ref(env_ref)
-    env_dir = ref.path.rpartition("/")[0]
+    env_dir = _environment_dir(ref.path)
     # A managed slug always expands to ``<namespace>/<name>/environment.py`` (a subdir), so env_dir
     # is non-empty for managed ids. An empty env_dir only arises from an explicit github ref to a
     # repo-ROOT environment.py — a dedicated single-env repo, where copying the whole repo is
@@ -537,6 +550,14 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             raise FileNotFoundError(
                 f"environment directory {env_dir or '.'!r} not found in {ref.repo_full_name}@{ref.ref}"
             )
+        # Verify the entrypoint is actually present before reporting a successful pull — a ref can
+        # name a directory that exists but lacks ``environment.py`` (the resolver rejects that same
+        # case), which would otherwise leave the user with an invalid package and no error.
+        if not (source / _DEFAULT_ENVIRONMENT_PATH).is_file():
+            raise FileNotFoundError(
+                f"environment entrypoint {_DEFAULT_ENVIRONMENT_PATH!r} not found in "
+                f"{env_dir or '.'!r} of {ref.repo_full_name}@{ref.ref}"
+            )
         # Create any missing parent dirs (mirrors the single-file download) so a nested output path
         # works.
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -544,10 +565,18 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
         # refuses) or followed — we write a real directory and leave any symlink target untouched.
         if dest_path.is_symlink():
             dest_path.unlink()
+        # When the destination IS the current working directory (or an ancestor of it) — e.g.
+        # ``-o .`` — we must never rmtree/rename it (``shutil.rmtree('.')`` deletes its contents
+        # before raising, and you can't rename over a live dir). Merge the env's files in place,
+        # overwriting same-named children, instead of swapping the directory itself.
+        cwd = Path.cwd().resolve()
+        dest_resolved = dest_path.resolve()
+        in_place = dest_resolved == cwd or dest_resolved in cwd.parents
         if not dest_path.exists():
             shutil.copytree(source, dest_path)
-        elif dest_path.is_dir() and not any(dest_path.iterdir()):
-            # Populate an existing EMPTY dir in place, preserving its own perms/metadata.
+        elif in_place or (dest_path.is_dir() and not any(dest_path.iterdir())):
+            # An existing empty dir, or the cwd/an ancestor: populate in place (preserve the dir and
+            # its perms; overwrite only same-named children). `occupied` already gated on overwrite.
             shutil.copytree(source, dest_path, dirs_exist_ok=True)
         else:
             # Overwriting an OCCUPIED destination: build the new tree in a sibling staging dir and
