@@ -565,3 +565,57 @@ def test_cmd_env_pull_whole_env_default_output_dir(monkeypatch, tmp_path):
     rc = cmd_env_pull(_args())  # no path, no output -> dir named after the env
     assert rc == 0
     assert (tmp_path / "stuff" / "environment.py").is_file()
+
+
+def test_pull_overwrite_preserves_old_package_when_swap_fails(monkeypatch, tmp_path):
+    # If the final swap-in fails, the previous package must be restored intact (never half-removed).
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    dest = tmp_path / "env"
+    dest.mkdir()
+    (dest / "old.txt").write_text("precious")
+
+    real_replace = adapter.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        # let the move-aside succeed; fail the staging->dest swap, then allow the restore
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("simulated swap failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(adapter.os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="simulated swap failure"):
+        pull_environment_package("david-freesolo-co/stuff", dest, overwrite=True)
+    assert (dest / "old.txt").read_text() == "precious"  # original restored intact
+    assert not (dest / "environment.py").exists()  # the new tree was not installed
+
+
+def test_merge_into_dir_replaces_file_atomically(monkeypatch, tmp_path):
+    # A failed copy during an in-place merge must not truncate the existing same-named file.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "environment.py").write_text("ORIGINAL")  # collides with the env's environment.py
+
+    def boom_copy(src, tmp):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(adapter.shutil, "copy2", boom_copy)
+    with pytest.raises(OSError, match="disk full"):
+        pull_environment_package("david-freesolo-co/stuff", ".", overwrite=True)
+    assert (tmp_path / "environment.py").read_text() == "ORIGINAL"  # not truncated/partially written
+
+
+def test_download_github_tarball_uses_whole_repo_ceiling(monkeypatch):
+    # The whole-repo tarball download is bounded by the larger _MAX_TARBALL_BYTES, not the per-env
+    # _MAX_ARCHIVE_BYTES — so a small env pull from a big shared hub isn't rejected at download.
+    assert adapter._MAX_TARBALL_BYTES > adapter._MAX_ARCHIVE_BYTES
+    big = b"x" * (adapter._MAX_ARCHIVE_BYTES + 10)  # over the per-env cap, under the tarball ceiling
+    monkeypatch.setattr(adapter, "_urlopen", lambda req, timeout=None: big)
+    monkeypatch.setattr(adapter, "_github_token", lambda: None)
+    ref = adapter._coerce_environment_github_ref("david-freesolo-co/stuff")
+    assert adapter._download_github_tarball(ref) == big  # not rejected
+    too_big = b"x" * (adapter._MAX_TARBALL_BYTES + 10)
+    monkeypatch.setattr(adapter, "_urlopen", lambda req, timeout=None: too_big)
+    with pytest.raises(RuntimeError, match="tarball is too large"):
+        adapter._download_github_tarball(ref)
