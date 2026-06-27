@@ -304,6 +304,43 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
         )
 
 
+def test_orchestrator_cleans_temp_dir_when_recombine_fails(tmp_path, monkeypatch):
+    # If the recombine raises (malformed adapter / config guard), the freshly-created
+    # flash_recomb_adapter_* temp dir must be removed — the per-step publish path catches and
+    # continues, so a leak would accumulate under /tmp across repeated failures.
+    import tempfile as _tempfile
+
+    import flash.engine.worker.adapter as A
+
+    sft = tmp_path / "sft"
+    sft.mkdir()  # marker dir must exist; contents irrelevant (recombine is stubbed to raise)
+    grpo = str(tmp_path / "grpo")
+    os.makedirs(grpo)
+    monkeypatch.setattr(W, "_VL_WARMSTART_SFT_DIR", str(sft), raising=False)
+
+    created: list[str] = []
+    real_mkdtemp = _tempfile.mkdtemp
+
+    def tracking_mkdtemp(*a, **k):
+        d = real_mkdtemp(*a, dir=str(tmp_path), **k)
+        created.append(d)
+        return d
+
+    monkeypatch.setattr(_tempfile, "mkdtemp", tracking_mkdtemp)
+
+    def boom(*a, **k):
+        raise ValueError("recombine: simulated failure")
+
+    monkeypatch.setattr(A, "recombine_lora_adapters", boom)
+
+    with pytest.raises(ValueError, match="simulated failure"):
+        W.recombined_warmstart_adapter_dir(grpo)
+
+    assert created, "mkdtemp should have been called"
+    for d in created:
+        assert not os.path.exists(d), f"leaked temp dir {d}"
+
+
 def test_orchestrator_raises_when_recorded_sft_dir_missing(tmp_path, monkeypatch):
     # The VL merge baked the SFT into the (ephemeral) training base, so the saved GRPO adapter is
     # SFT-less. If the recorded SFT dir is gone at finalize we MUST fail loud, not ship it broken.
