@@ -506,9 +506,9 @@ def run_sft():
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
     t_train = time.time()
     # Gap-filler liveness around the train loop: make_sft_heartbeat_callback only emits on on_log
-    # (every N steps), so the cold first steps can outlast the setup grace with no sft_step and look
-    # hung. Same shared helper as RL, gated on global_step so a genuinely stuck train() still trips the
-    # stall path. See heartbeat.liveness_heartbeat.
+    # (every N steps), so the first step(s) can be silent for minutes. liveness_heartbeat emits
+    # best-effort liveness pings for operator visibility/stack dumps; pollers ignore liveness for stalls.
+    # See heartbeat.liveness_heartbeat.
     with liveness_heartbeat("sft_step"), _sdpa_cudnn_ctx(_attn):  # cuDNN SDPA on sm120 (no-op else)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
