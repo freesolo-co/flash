@@ -243,6 +243,40 @@ def undeploy_adapter(run_id: str) -> list[str]:
     return [run_id]
 
 
+def list_deployed_adapters() -> list[dict]:
+    """Return the serving app's live adapter registry — the authoritative DO-NOT-DELETE set.
+
+    Each record carries at least ``adapterId`` (== run_id), ``repoId`` (the HF dataset repo
+    serving pulls weights from), and the ``subfolder``/``adapter_hf_prefix`` it loads. Used by
+    operator repo GC (``flash.server.repo_cleanup``) to know which per-run repos are currently
+    serving traffic and must never be touched.
+
+    Raises ``ServingError`` if the serving backend is unreachable or returns non-200 — a caller
+    gating destructive cleanup on this set MUST treat that as "unknown, do not delete" rather than
+    "nothing deployed". The response is tolerated as either a bare list or an
+    ``{"adapters": [...]}`` / ``{"data": [...]}`` envelope.
+    """
+    base = serving_base_url()
+    url = f"{base}/adapters"
+    try:
+        resp = httpx.get(
+            url,
+            headers=_internal_key_header(),
+            timeout=60.0,
+            # Modal answers a slow request with a 303 to an async-result poll URL; follow it (see chat).
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise _serving_status_error(url, exc) from exc
+    except httpx.RequestError as exc:
+        raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
+    data = resp.json()
+    if isinstance(data, dict):
+        data = data.get("adapters") or data.get("data") or []
+    return [rec for rec in data if isinstance(rec, dict)]
+
+
 def chat(
     run_id: str,
     messages: list[dict],
