@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import threading
 import time
 
@@ -455,6 +456,35 @@ def make_checkpoint_upload_callback():
 
     lock = threading.Lock()
 
+    def _publish_deployable_recombined(
+        ckpt_dir: str, step: int, *, with_retry: bool = False
+    ) -> None:
+        """Publish a step's deployable adapter, stacking the SFT back in for a VL warm-start.
+
+        For a VL merge-into-base warm-start (#296) the trainer checkpoint's adapter is GRPO-ONLY
+        (trained on the SFT-merged base) — on the catalog base it drops the SFT and collapses to
+        ~base. ``recombined_warmstart_adapter_dir`` stacks the original SFT LoRA back in (into a
+        SEPARATE temp dir, so the resume checkpoint keeps the raw GRPO LoRA that reattaches to the
+        re-merged base on resume). No-op for the continued-adapter / fresh-LoRA paths. Best-effort:
+        a recombine failure falls back to the raw adapter rather than skipping the deployable.
+        """
+        recombined: str | None = None
+        try:
+            deploy_src = ckpt_dir
+            try:
+                recombined = _w.recombined_warmstart_adapter_dir(ckpt_dir)
+                if recombined:
+                    deploy_src = recombined
+            except Exception as e:
+                print(f"[ckpt] warm-start recombine warn (step {step}); publishing raw adapter:", e)
+            if with_retry:
+                _publish_deployable_with_retry(deploy_src, step)
+            else:
+                publish_deployable_checkpoint(deploy_src, step)
+        finally:
+            if recombined:
+                shutil.rmtree(recombined, ignore_errors=True)
+
     class _CheckpointUpload(TrainerCallback):
         def on_save(self, args, state, control, **kwargs):
             if not _w.HF_REPO:
@@ -472,7 +502,7 @@ def make_checkpoint_upload_callback():
                     # Deployable per-step adapter FIRST: it's small, kept-forever, and the only
                     # artifact that makes a cancelled/preempted run deployable from this step, so
                     # it must land before the larger resume checkpoint (best-effort, latest-only).
-                    publish_deployable_checkpoint(ckpt_dir, step)
+                    _publish_deployable_recombined(ckpt_dir, step)
                     _w.hf_api().upload_folder(
                         folder_path=ckpt_dir,
                         path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
@@ -513,7 +543,7 @@ def make_checkpoint_upload_callback():
             # prevent; the bounded retry rides out a transient concurrent-commit 409.
             if lock.acquire(timeout=_CKPT_FLUSH_TIMEOUT_S):
                 try:
-                    publish_deployable_checkpoint(ckpt_dir, step)
+                    _publish_deployable_recombined(ckpt_dir, step)
                 finally:
                     lock.release()
             else:
@@ -521,6 +551,6 @@ def make_checkpoint_upload_callback():
                     f"[ckpt] flush lock busy after {_CKPT_FLUSH_TIMEOUT_S:.0f}s; publishing final "
                     f"deployable (step {step}) without it"
                 )
-                _publish_deployable_with_retry(ckpt_dir, step)
+                _publish_deployable_recombined(ckpt_dir, step, with_retry=True)
 
     return _CheckpointUpload()

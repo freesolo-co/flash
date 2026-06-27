@@ -17,6 +17,7 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
+    recombine_lora_adapters,
 )
 from flash.engine.worker.perf import optimal_attn_impl
 
@@ -159,6 +160,10 @@ def _init_adapter_model(model_id: str):
         del base, model, merged
         gc.collect()
         print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
+        # Record the SFT adapter dir: the saved GRPO LoRA will be SFT-less (trained on the merged
+        # base), so finalize MUST recombine it with this SFT before deploy (recombined_warmstart_
+        # adapter_dir). The dir persists for the run (worker is ephemeral; init's download stays).
+        _w._VL_WARMSTART_SFT_DIR = adir
         return merged_dir, make_lora(merged_dir)
 
     # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
@@ -177,6 +182,59 @@ def _init_adapter_model(model_id: str):
     assert_lora_applied(model, model_id)
     assert_adapter_delta_nonzero(model, model_id)
     return model, None
+
+
+def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
+    """For a VL merge-into-base warm-start GRPO run, return a NEW dir holding the SFT⊕GRPO
+    recombined adapter (deployable on the ORIGINAL catalog base); otherwise ``None``.
+
+    ``_init_adapter_model`` (VL path, #296) merges the SFT into the base and trains a FRESH LoRA on
+    the merged weights — so ``src_adapter_dir`` (the just-saved trainer adapter) is GRPO-ONLY and,
+    deployed on the catalog base, drops the SFT (served output collapses to ~base: malformed,
+    SFT-less filters). Recombining the original SFT LoRA back in produces a rank-(r_sft+r_grpo)
+    adapter that reproduces ``base + SFT + GRPO`` on the unmodified base.
+
+    Gated on the SFT dir ``_init_adapter_model`` recorded when (and only when) it took the VL merge
+    path — so this is a NO-OP for the continued-adapter (non-VL) path, which already carries the SFT
+    in its saved adapter, and for fresh-LoRA runs (no ``init_from_adapter``). When the merge DID
+    happen, the recombine is REQUIRED: if the recorded SFT dir has vanished, raise rather than
+    silently ship the SFT-less GRPO adapter (the exact broken deploy this guards against).
+    """
+    sft_adir = getattr(_w, "_VL_WARMSTART_SFT_DIR", None)
+    if not sft_adir:
+        return None
+    if not os.path.isdir(sft_adir):
+        raise RuntimeError(
+            f"VL warm-start merged the SFT into the base at init but its adapter dir {sft_adir!r} is "
+            "gone at finalize — the saved GRPO adapter is SFT-less and cannot be recombined. Refusing "
+            "to deploy an SFT-less adapter (re-run; check /tmp/evdl was not evicted mid-run)."
+        )
+
+    import fnmatch
+    import shutil
+    import tempfile
+
+    from flash.engine.worker.hf import _CHECKPOINT_TRAINER_STATE
+
+    out_dir = tempfile.mkdtemp(prefix="flash_recomb_adapter_")
+    rank = recombine_lora_adapters(sft_adir, src_adapter_dir, out_dir)
+    # Carry tokenizer/aux files from the raw save (serving uses the base tokenizer, but keep the
+    # deployed dir at parity with the un-recombined save); the recombined config+weights stay. Skip
+    # trainer state — for the per-step path src is a `checkpoint-<n>` dir carrying optimizer/scheduler
+    # state that the deployable adapter must not duplicate.
+    for name in os.listdir(src_adapter_dir):
+        if name in ("adapter_model.safetensors", "adapter_config.json", "adapter_model.bin"):
+            continue
+        if any(fnmatch.fnmatch(name, pat) for pat in _CHECKPOINT_TRAINER_STATE):
+            continue
+        src = os.path.join(src_adapter_dir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(out_dir, name))
+    print(
+        f"[recombine] VL warm-start: stacked SFT⊕GRPO -> rank-{rank} deployable adapter at "
+        f"{out_dir} (reproduces base+SFT+GRPO on the catalog base)"
+    )
+    return out_dir
 
 
 def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
