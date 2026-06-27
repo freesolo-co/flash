@@ -239,6 +239,87 @@ def test_pull_environment_package_rejects_dir_without_entrypoint(monkeypatch, tm
         )
 
 
+def _make_custom_entrypoint_tarball() -> bytes:
+    """A hub tarball where an env's entrypoint file is NOT named ``environment.py``."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+
+        def add(name: str, data: bytes) -> None:
+            info = tarfile.TarInfo(f"{_TOP}/{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+        add("david-freesolo-co/custom-env/custom.py", b"# custom entry\n")
+        add("david-freesolo-co/custom-env/datasets/train.jsonl", b'{"a":1}\n')
+    return buf.getvalue()
+
+
+def test_pull_environment_package_refuses_whole_hub_root_case_insensitively(monkeypatch, tmp_path):
+    # GitHub owner/repo are case-insensitive, so a differently-cased ref to the hub root must STILL
+    # be refused — otherwise it would extract the entire shared hub.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    with pytest.raises(ValueError, match="whole shared environment hub"):
+        pull_environment_package(
+            "github:Freesolo-Co/Environment-Hub@main:environment.py", tmp_path / "x"
+        )
+
+
+def test_pull_environment_package_custom_entrypoint_ref(monkeypatch, tmp_path):
+    # A ref naming a custom entrypoint file (not environment.py) resolves to that file's DIRECTORY,
+    # so the whole env (entrypoint + sidecars) is pulled, not a path under ``custom.py/``.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_custom_entrypoint_tarball())
+    dest = tmp_path / "out"
+    pull_environment_package(
+        "github:freesolo-co/environment-hub@main:david-freesolo-co/custom-env/custom.py", dest
+    )
+    assert (dest / "custom.py").is_file()
+    assert (dest / "datasets" / "train.jsonl").is_file()
+
+
+def test_download_environment_file_with_custom_entrypoint_ref(monkeypatch):
+    # A sidecar path is relative to the env DIR, even when the ref names a custom entrypoint file.
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        return b"data"
+
+    monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
+    download_environment_file(
+        "github:owner/repo@main:envs/e/custom.py", "datasets/train.jsonl"
+    )
+    assert "envs/e/datasets/train.jsonl" in seen["url"]
+    assert "custom.py" not in seen["url"]
+
+
+def test_pull_environment_package_refuses_symlink_dest_without_overwrite(monkeypatch, tmp_path):
+    # A symlink destination is "occupied": replacing a link needs explicit consent (overwrite=True).
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    real_target = tmp_path / "real"
+    real_target.mkdir()
+    dest = tmp_path / "link"
+    dest.symlink_to(real_target)
+    with pytest.raises(FileExistsError):
+        pull_environment_package("david-freesolo-co/stuff", dest)  # no overwrite
+    assert dest.is_symlink()  # untouched
+
+
+def test_pull_into_cwd_does_not_follow_child_symlink(monkeypatch, tmp_path):
+    # If the cwd already has e.g. ``datasets -> /external``, an in-place --force merge must NOT write
+    # through that link into the external target; it replaces the link with a real directory.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    external = tmp_path / "external"
+    external.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "datasets").symlink_to(external)
+    monkeypatch.chdir(work)
+    pull_environment_package("david-freesolo-co/stuff", ".", overwrite=True)
+    assert not (work / "datasets").is_symlink()  # link replaced by a real dir
+    assert (work / "datasets" / "train.jsonl").is_file()  # written inside the output tree
+    assert not (external / "train.jsonl").exists()  # NOT written through the link
+
+
 # --- helpers ----------------------------------------------------------------
 
 
@@ -264,7 +345,7 @@ def _args(**kw) -> Namespace:
     return Namespace(**base)
 
 
-def test_cmd_env_pull_single_file(monkeypatch, tmp_path, capsys):
+def test_cmd_env_pull_single_file(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "download_environment_file", lambda env, path: b"line1\nline2\n")
     out = tmp_path / "train.jsonl"
     rc = cmd_env_pull(_args(path="datasets/train.jsonl", output=str(out)))
@@ -272,7 +353,7 @@ def test_cmd_env_pull_single_file(monkeypatch, tmp_path, capsys):
     assert out.read_bytes() == b"line1\nline2\n"
 
 
-def test_cmd_env_pull_refuses_overwrite_of_existing_file(monkeypatch, tmp_path, capsys):
+def test_cmd_env_pull_refuses_overwrite_of_existing_file(monkeypatch, tmp_path):
     calls = {"n": 0}
 
     def fake_download(env, path):

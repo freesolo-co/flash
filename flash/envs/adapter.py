@@ -462,14 +462,25 @@ def _safe_repo_relative_path(path: str) -> str:
 def _environment_dir(env_path: str) -> str:
     """The environment's directory within the repo, given a ref's path.
 
-    A ref may name the entrypoint FILE (``.../environment.py``) or the environment DIRECTORY itself
-    (``.../envs/e``) — both resolve to the same dir. ``rpartition('/')`` alone would mis-handle a
-    directory ref (treating its last segment as a filename), so strip a trailing ``environment.py``
-    and otherwise treat the whole path as the directory."""
+    A ref may name the entrypoint FILE (``.../environment.py`` or a custom ``.../custom.py``) or the
+    environment DIRECTORY itself (``.../envs/e``). All resolve to the same dir. ``rpartition('/')``
+    alone would mis-handle a directory ref (treating its last segment as a filename), so strip a
+    trailing ``*.py`` entrypoint file and otherwise treat the whole path as the directory. (Sidecars
+    like ``datasets/train.jsonl`` are relative to this dir, so a custom entrypoint name must not be
+    mistaken for a directory.)"""
     parts = [p for p in env_path.split("/") if p]
-    if parts and parts[-1] == _DEFAULT_ENVIRONMENT_PATH:
+    if parts and parts[-1].endswith(".py"):
         parts = parts[:-1]
     return "/".join(parts)
+
+
+def _environment_entrypoint(env_path: str) -> str:
+    """The entrypoint filename a ref names — a trailing ``*.py`` (custom or ``environment.py``), or
+    the default ``environment.py`` when the ref names a directory."""
+    parts = [p for p in env_path.split("/") if p]
+    if parts and parts[-1].endswith(".py"):
+        return parts[-1]
+    return _DEFAULT_ENVIRONMENT_PATH
 
 
 def environment_local_dirname(env_ref: str) -> str:
@@ -515,6 +526,27 @@ def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 1
     return data
 
 
+def _merge_into_dir(source: Path, dest: Path) -> None:
+    """Recursively copy ``source``'s contents into existing ``dest``, overwriting same-named
+    children. Unlike ``shutil.copytree(dirs_exist_ok=True)``, a child of ``dest`` that is a SYMLINK
+    is removed before writing, never followed — so a pre-existing ``datasets -> /elsewhere`` link in
+    the destination (e.g. the cwd, when merging in place with ``--force``) can't redirect writes
+    outside the requested output tree."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        target = dest / child.name
+        if target.is_symlink():
+            target.unlink()  # replace the link itself; do not write through it
+        if child.is_dir():
+            if target.exists() and not target.is_dir():
+                target.unlink()
+            _merge_into_dir(child, target)
+        else:
+            if target.is_dir():
+                shutil.rmtree(target)
+            shutil.copy2(child, target)
+
+
 def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool = False) -> Path:
     """Download a published environment's whole directory to ``dest`` and return it.
 
@@ -530,14 +562,20 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
     # repo-ROOT environment.py — a dedicated single-env repo, where copying the whole repo is
     # intended. Guard the one case where that would dump the entire SHARED hub: a root-level ref that
     # resolves to the managed environment-hub repo. Pull a specific ``namespace/name`` id instead.
-    if not env_dir and ref.repo_full_name == _DEFAULT_MANAGED_ENV_REPO:
+    # GitHub owner/repo names are case-insensitive, so compare case-folded — otherwise a ref like
+    # ``github:Freesolo-Co/Environment-Hub@main:environment.py`` would slip past the guard and
+    # extract the entire shared hub root.
+    if not env_dir and ref.repo_full_name.lower() == _DEFAULT_MANAGED_ENV_REPO.lower():
         raise ValueError(
             f"refusing to pull the whole shared environment hub ({_DEFAULT_MANAGED_ENV_REPO}); "
             "specify a managed environment id (namespace/name) or a github ref to its subdirectory"
         )
     dest_path = Path(dest)
-    # "occupied" = a file, or a non-empty directory; an empty dir is fine to populate in place.
-    occupied = dest_path.exists() and (not dest_path.is_dir() or any(dest_path.iterdir()))
+    # "occupied" = a symlink (replacing a link needs explicit consent), a file, or a non-empty
+    # directory; an empty real dir is fine to populate in place.
+    occupied = dest_path.is_symlink() or (
+        dest_path.exists() and (not dest_path.is_dir() or any(dest_path.iterdir()))
+    )
     if occupied and not overwrite:
         raise FileExistsError(
             f"destination {dest_path} already exists (pass overwrite=True to replace)"
@@ -551,11 +589,13 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
                 f"environment directory {env_dir or '.'!r} not found in {ref.repo_full_name}@{ref.ref}"
             )
         # Verify the entrypoint is actually present before reporting a successful pull — a ref can
-        # name a directory that exists but lacks ``environment.py`` (the resolver rejects that same
-        # case), which would otherwise leave the user with an invalid package and no error.
-        if not (source / _DEFAULT_ENVIRONMENT_PATH).is_file():
+        # name a directory that exists but lacks its entrypoint (the resolver rejects that same
+        # case), which would otherwise leave the user with an invalid package and no error. Honor a
+        # custom entrypoint filename from the ref (e.g. ``.../custom.py``), not just environment.py.
+        entrypoint = _environment_entrypoint(ref.path)
+        if not (source / entrypoint).is_file():
             raise FileNotFoundError(
-                f"environment entrypoint {_DEFAULT_ENVIRONMENT_PATH!r} not found in "
+                f"environment entrypoint {entrypoint!r} not found in "
                 f"{env_dir or '.'!r} of {ref.repo_full_name}@{ref.ref}"
             )
         # Create any missing parent dirs (mirrors the single-file download) so a nested output path
@@ -577,7 +617,9 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
         elif in_place or (dest_path.is_dir() and not any(dest_path.iterdir())):
             # An existing empty dir, or the cwd/an ancestor: populate in place (preserve the dir and
             # its perms; overwrite only same-named children). `occupied` already gated on overwrite.
-            shutil.copytree(source, dest_path, dirs_exist_ok=True)
+            # Use the symlink-safe merge so a child symlink in the destination can't redirect writes
+            # outside the output tree.
+            _merge_into_dir(source, dest_path)
         else:
             # Overwriting an OCCUPIED destination: build the new tree in a sibling staging dir and
             # atomically swap it in, so a mid-copy failure never destroys the existing data.
