@@ -1092,6 +1092,37 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert st.remote["job_id"] == "j2"  # latest handle persisted
 
 
+def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
+    """A cancel landing mid-attempt raised _RunCancelled straight out of the retry loop, skipping
+    _gc_seen_endpoints — leaking a walk-provisioned endpoint (one _gc_run_endpoints can't name, whose
+    `running` write lost the terminal-stickiness race so it's absent from status.remote). The cancel
+    path must now reap seen_endpoints."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.providers.runpod import api as runpod_api
+
+        deleted: list[str] = []
+        monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid))
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            orch._update(spec.run_id, "cancelled")  # cancel lands during provisioning
+            if on_handle:  # endpoint comes up anyway; its "running" write is rejected (terminal)
+                on_handle({"endpoint_id": "epWALK", "endpoint_name": "n", "job_id": "jW"})
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        orch.submit_job(_spec("cancel-reap"), dry_run=False, background=False)
+
+        assert orch.get_status("cancel-reap").state == "cancelled"
+        assert orch.get_status("cancel-reap").remote is None  # handle write lost the stickiness race
+        assert "epWALK" in deleted  # the walked endpoint was reaped on the cancel path
+
+
 def test_last_seed_clears_handle_in_gap_then_restores_on_done(monkeypatch):
     """Bug A: the LAST (here only) seed must clear remote + advance resume_seed_index in the gap
     before `done` is written, so a restart there resumes (empty -> done) instead of re-attaching and

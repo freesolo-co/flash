@@ -107,7 +107,11 @@ def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
 
 
 def _worker_artifacts(spec) -> dict[str, str]:
-    """Fetch worker console/error logs from the private HF artifact repo using the operator token."""
+    """Fetch worker console/error logs from the private HF artifact repo using the operator token.
+
+    Each seed uploads under its own seed{N} prefix; a multi-seed run that fails on a LATER seed keeps
+    its traceback there, not under seed0, so scan every seed (key entries by seed when there's >1).
+    """
     repo = getattr(getattr(spec, "train", None), "hf_repo", None)
     if not repo:
         return {}
@@ -115,25 +119,28 @@ def _worker_artifacts(spec) -> dict[str, str]:
         from huggingface_hub import hf_hub_download
     except Exception:
         return {}
-    prefix = adapter_prefix(spec)
+    seeds = list(getattr(getattr(spec, "train", None), "seeds", None) or [0])
     out: dict[str, str] = {}
-    for name in (
-        f"console_{spec.phase}.txt",
-        _latest_error_artifact_name(repo, prefix, spec.phase),
-    ):
-        try:
-            path = hf_hub_download(
-                repo_id=repo,
-                repo_type="dataset",
-                filename=f"{prefix}/{name}",
-                token=os.environ.get("HF_TOKEN"),
-                force_download=True,  # worker appends across run; cached copy goes stale
-            )
-            # errors="replace": worker stdout can carry non-UTF-8 bytes from tracebacks/progress bars
-            with open(path, encoding="utf-8", errors="replace") as f:
-                out[name] = f.read()
-        except Exception:
-            continue
+    for seed in seeds:
+        prefix = adapter_prefix(spec, seed=seed)
+        key_prefix = f"seed{seed}/" if len(seeds) > 1 else ""
+        for name in (
+            f"console_{spec.phase}.txt",
+            _latest_error_artifact_name(repo, prefix, spec.phase),
+        ):
+            try:
+                path = hf_hub_download(
+                    repo_id=repo,
+                    repo_type="dataset",
+                    filename=f"{prefix}/{name}",
+                    token=os.environ.get("HF_TOKEN"),
+                    force_download=True,  # worker appends across run; cached copy goes stale
+                )
+                # errors="replace": worker stdout can carry non-UTF-8 bytes from tracebacks/progress bars
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    out[f"{key_prefix}{name}"] = f.read()
+            except Exception:
+                continue
     return out
 
 

@@ -181,6 +181,24 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
     assert retriable is False
 
 
+def test_bootstrap_fetch_code_failure_is_retriable(monkeypatch):
+    # A transient HF blip fetching the run's OWN code (the control plane uploaded it before submit) is
+    # infra-shaped, exactly like the already-wrapped fetch_spec_from_hf — it must surface as a
+    # retriable marker so the run walks to a fresh host, NOT a fatal job_failed (the asymmetry = bug).
+    lb, calls, markers = _bootstrap_env(monkeypatch)
+
+    def boom(_payload):
+        raise RuntimeError("HF 503 storm")
+
+    monkeypatch.setattr(lb, "fetch_code", boom)
+    assert lb.main() == 1
+    assert calls == []  # crashed before launching the worker subprocess
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert "fetch run code from HF" in error
+    assert retriable is True
+
+
 def test_bootstrap_sets_lambda_arm():
     """The shared bootstrap stamps FLASH_ARM from payload['flash_arm'] so the metrics record
     attributes the substrate (Lambda's build_payload sets it to 'lambda')."""
