@@ -1513,13 +1513,16 @@ def test_export_validates_repository_and_token(api):
     )
     assert missing_token.status_code == 400
     assert "hf_token" in missing_token.json()["detail"]
-    malformed = api.post(
-        f"/v1/runs/{run_id}/export",
-        json={"repository": "noslash", "hf_token": "hf"},
-        headers=_bearer(key),
-    )
-    assert malformed.status_code == 400
-    assert "owner/name" in malformed.json()["detail"]
+    # A HF repo id is EXACTLY two non-empty segments: reject no-slash AND the over-/under-segmented
+    # forms that the old "at least one '/'" check let through (which would 404/400 deep in hf_hub).
+    for bad_repo in ("noslash", "owner/name/extra", "owner//name", "/name", "name/"):
+        malformed = api.post(
+            f"/v1/runs/{run_id}/export",
+            json={"repository": bad_repo, "hf_token": "hf"},
+            headers=_bearer(key),
+        )
+        assert malformed.status_code == 400, bad_repo
+        assert "owner/name" in malformed.json()["detail"]
 
 
 def test_export_unfinished_run_is_409(api, monkeypatch):

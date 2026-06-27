@@ -283,3 +283,12 @@ def test_export_rejects_bool_step():
     for bad in (True, False):
         with pytest.raises(ClientError, match="invalid checkpoint step"):
             client.export("r1", repository="me/a", hf_token="hf", step=bad)
+
+
+def test_export_rejects_fractional_step():
+    """A fractional step would int-truncate (2.7 -> 2) and export the WRONG checkpoint, so reject it
+    client-side."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    for bad in (2.5, 0.1, 3.9):
+        with pytest.raises(ClientError, match="invalid checkpoint step"):
+            client.export("r1", repository="me/a", hf_token="hf", step=bad)

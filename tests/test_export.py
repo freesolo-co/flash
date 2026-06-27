@@ -99,21 +99,27 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     assert calls["upload"]["repo_id"] == "me/adapters"
     assert calls["upload"]["repo_type"] == "model"
     assert set(calls["upload"]["files"]) == {"adapter_config.json", "adapter_model.safetensors"}
-    # Visibility is ENFORCED after create (create_repo(exist_ok=True) won't change an existing repo).
+    # The repo is created PRIVATE, then visibility is enforced after the upload commits (create_repo(
+    # exist_ok=True) won't change an existing repo's visibility).
+    assert calls["create_repo"]["private"] is True
     assert calls["update_settings"] == {
         "repo_id": "me/adapters",
         "repo_type": "model",
         "private": True,
     }
-    # Brand-new repo -> nothing orphaned to delete.
-    assert calls["upload"]["delete_patterns"] == []
+    # Stale adapter artifacts are cleared by STATIC, adapter-scoped patterns (never the user's
+    # unrelated files), so a re-export of the same format is a no-op delete.
+    assert calls["upload"]["delete_patterns"] == ["adapter_model*", "adapter_config.json"]
 
 
-def test_export_deletes_orphaned_files_from_a_prior_export(monkeypatch):
-    """A re-export into a repo holding a previous, differently-serialized adapter clears every leftover
-    file (so a stale ``.bin`` can't be loaded next to the new ``.safetensors``) but keeps repo
-    furniture like the model card."""
+def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeypatch):
+    """A re-export into a repo holding a previous, differently-serialized adapter must clear the stale
+    adapter weights (so a leftover ``.bin`` can't be loaded next to the new ``.safetensors``) WITHOUT
+    deleting the user's unrelated files. The deletion is by STATIC adapter-scoped patterns, not a
+    ``existing - uploaded`` mirror, and needs no ``list_repo_files`` call (so a listing failure can't
+    silently skip cleanup either)."""
     calls: dict = {}
+    listed = {"called": False}
 
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
@@ -130,15 +136,8 @@ def test_export_deletes_orphaned_files_from_a_prior_export(monkeypatch):
             pass
 
         def list_repo_files(self, *, repo_id, repo_type):
-            # Left behind by a prior export of a DIFFERENT adapter (bin format) + a leftover data file,
-            # plus repo furniture that must be preserved.
-            return [
-                "adapter_config.json",
-                "adapter_model.bin",
-                "extra_weights.pt",
-                "README.md",
-                ".gitattributes",
-            ]
+            listed["called"] = True  # must NOT be called: cleanup is pattern-based, not listing-based
+            return []
 
         def update_repo_settings(self, **kw):
             pass
@@ -156,9 +155,52 @@ def test_export_deletes_orphaned_files_from_a_prior_export(monkeypatch):
         dest_repo="me/adapters",
         dest_token="hf_user",
     )
-    # Every file NOT in the new upload is deleted (orphans), regardless of extension; the re-uploaded
-    # adapter_config.json is not an orphan, and README/.gitattributes are preserved.
-    assert calls["delete_patterns"] == ["adapter_model.bin", "extra_weights.pt"]
+    # Static, adapter-scoped delete patterns: ``adapter_model*`` clears a stale ``.bin`` (and sharded /
+    # index variants); ``adapter_config.json`` clears the old config. A hypothetical ``extra_weights.pt``
+    # or any other user file matches NEITHER pattern, so it is never deleted — the data-loss the old
+    # ``existing - uploaded`` mirror caused.
+    assert calls["delete_patterns"] == ["adapter_model*", "adapter_config.json"]
+    assert "extra_weights.pt" not in calls["delete_patterns"]
+    assert not listed["called"], "stale cleanup must not depend on list_repo_files"
+
+
+def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
+    """``private=False`` must not expose an empty/partial PUBLIC repo: the repo is created/ensured
+    private, the adapter is uploaded, and only THEN is it flipped public — so a failed upload never
+    leaves an empty public repo behind."""
+    order: list = []
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, *, repo_id, repo_type, private, exist_ok):
+            order.append(("create_repo", private))
+
+        def update_repo_settings(self, *, repo_id, repo_type, private):
+            order.append(("update_settings", private))
+
+        def upload_folder(self, **kw):
+            order.append(("upload", None))
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        private=False,
+    )
+    # Created private, uploaded, THEN made public — never public before the content lands.
+    assert order == [("create_repo", True), ("upload", None), ("update_settings", False)]
 
 
 def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):

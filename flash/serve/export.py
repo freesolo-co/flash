@@ -24,31 +24,17 @@ from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
 
-# Repo files we never delete when re-exporting into an existing destination repo: these are user/repo
-# furniture, not adapter artifacts. Everything else already in the repo that this export does NOT
-# re-upload is treated as a stale leftover and removed (see ``_orphan_files``) — so the destination
-# always mirrors exactly the exported adapter and can't serve a mix of old + new files (e.g. an old
-# ``adapter_model.safetensors`` surviving next to a freshly-exported bin-only adapter, which the
-# loader would prefer as stale weights).
-_PRESERVE_ON_EXPORT = frozenset({"README.md", ".gitattributes", ".gitignore"})
-
-
-def _orphan_files(api, dest_repo: str, uploaded: set[str]) -> list[str]:
-    """Files already in ``dest_repo`` that this export is NOT replacing (stale leftovers).
-
-    Computed as ``existing - uploaded`` so it is serialization-format-agnostic — it can never miss a
-    new/sharded weight filename the way a fixed extension/pattern list would. Repo furniture
-    (``_PRESERVE_ON_EXPORT``) and the HF cache dir are kept. Returns ``[]`` for a brand-new or
-    not-yet-listable repo (nothing to clean)."""
-    try:
-        existing = set(api.list_repo_files(repo_id=dest_repo, repo_type="model"))
-    except Exception:
-        return []
-    return sorted(
-        f
-        for f in existing - uploaded
-        if f not in _PRESERVE_ON_EXPORT and not f.startswith(".cache/")
-    )
+# Stale ADAPTER artifacts to delete (in the same commit as the upload) when re-exporting into an
+# existing repo, so an old weight file can't linger next to a freshly-exported one — e.g. a previous
+# ``adapter_model.safetensors`` surviving next to a new ``.bin``, which the loader would then prefer as
+# stale weights. Scoped to PEFT adapter filenames ONLY (NEVER the user's unrelated repo files): the
+# destination is a user-owned repo that may legitimately hold other content, so a full ``existing -
+# uploaded`` mirror would delete files this export has no business touching. Static patterns (no
+# ``list_repo_files`` call), so a listing failure can't silently skip the cleanup either. The
+# ``adapter_model*`` glob covers single-file, sharded, and ``.index.json`` variants regardless of
+# extension; HF evaluates ``delete_patterns`` against the repo's pre-commit state, and the freshly
+# uploaded files in the SAME commit win, so a re-export of the same format is a no-op delete.
+_STALE_ADAPTER_DELETE_PATTERNS = ["adapter_model*", "adapter_config.json"]
 
 
 def _hf_api():
@@ -117,26 +103,31 @@ def export_adapter(
                 "(nothing to export)"
             )
         api = HfApi(token=dest_token)
-        uploaded = {p.relative_to(adapter_dir).as_posix() for p in files}
         try:
+            # Always create/ensure the repo PRIVATE first: a brand-new public repo would otherwise be
+            # exposed (empty, then partial) for the whole upload, and a failed upload would leave an
+            # empty PUBLIC repo behind. Visibility is enforced AFTER the upload succeeds (below).
             api.create_repo(
-                repo_id=dest_repo, repo_type="model", private=private, exist_ok=True
+                repo_id=dest_repo, repo_type="model", private=True, exist_ok=True
             )
-            # create_repo(exist_ok=True) does NOT change the visibility of a repo that already
-            # exists, so a default-private export into a pre-existing PUBLIC repo would otherwise
-            # stay public (and vice-versa). Enforce the requested visibility explicitly.
-            api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=private)
-            # Mirror the adapter folder into the repo: upload this adapter's files and, in the SAME
-            # atomic commit, delete any leftover files from a previous export so stale weights can't
-            # linger (see _orphan_files). delete_patterns runs against the repo's pre-commit state,
-            # and these are exact relative paths (valid fnmatch patterns).
+            # Upload this adapter's files and, in the SAME atomic commit, delete only the STALE ADAPTER
+            # artifacts of a prior export (see _STALE_ADAPTER_DELETE_PATTERNS) so old weights can't
+            # linger — without touching the user's unrelated repo files. delete_patterns runs against
+            # the repo's pre-commit state; the files uploaded in this commit win, so re-exporting the
+            # same format is a no-op delete.
             api.upload_folder(
                 repo_id=dest_repo,
                 repo_type="model",
                 folder_path=str(adapter_dir),
                 commit_message=f"Export Freesolo adapter ({source_subfolder})",
-                delete_patterns=_orphan_files(api, dest_repo, uploaded),
+                delete_patterns=_STALE_ADAPTER_DELETE_PATTERNS,
             )
+            # Now that the adapter is committed, enforce the requested visibility. We created/ensured
+            # the repo private above and create_repo(exist_ok=True) never changes an existing repo's
+            # visibility, so this single call covers both a public export (exposed only now that it has
+            # content) and a re-export into a pre-existing repo whose visibility differs from the
+            # request.
+            api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=private)
         except Exception as exc:
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc
     logger.info(

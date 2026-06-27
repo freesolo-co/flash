@@ -222,7 +222,10 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             status_code=400,
             detail="repository is required: the destination HuggingFace repo 'owner/name'",
         )
-    if "/" not in repository.strip("/"):
+    # A HF repo id is EXACTLY two non-empty segments (``owner/name``). "at least one '/'" wrongly
+    # accepted ``owner/name/extra``, ``owner//name``, ``/name``, ``name/`` — which would 404/400 deep
+    # in huggingface_hub. Strip surrounding slashes, then require precisely two non-empty parts.
+    if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
         raise HTTPException(
             status_code=400,
             detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
@@ -262,7 +265,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     if status.state not in allowed_states:
         detail = (
             f"run {run_id} is {status.state!r}; export a checkpoint only once the run "
-            "has finished or been cancelled"
+            "has finished, been cancelled, or failed"
             if is_checkpoint
             else f"run {run_id} is {status.state!r}; only finished runs with "
             "trained adapter artifacts can be exported"

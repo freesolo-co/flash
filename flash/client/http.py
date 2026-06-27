@@ -309,6 +309,12 @@ class ApiClient:
             # with a clear client-side error instead (mirrors deploy()).
             if isinstance(step, bool):
                 raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
+            # Reject a FRACTIONAL step before int() silently truncates it (e.g. 2.7 -> 2 would export
+            # the wrong checkpoint). An integral float (2.0) is fine.
+            if isinstance(step, float) and not step.is_integer():
+                raise ClientError(
+                    f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
+                )
             body["step"] = int(step)
         return self._request(
             "POST", f"/v1/runs/{run_id}/export", body=body, timeout=30 * 60
