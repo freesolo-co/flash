@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from flash.runner import cancel_run, new_run_id, runs_file_path
 from flash.server import app as _app
 from flash.server import db
-from flash.server._deps import _parse_spec, _runtime_secrets, owned_run, require_key
+from flash.server._deps import _parse_spec, _require_bool, _runtime_secrets, owned_run, require_key
 from flash.spec import JobSpec
 
 _LOG = logging.getLogger("flash.server.runs")
@@ -28,12 +28,7 @@ router = APIRouter()
 @router.post("/v1/runs")
 def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
     spec = _parse_spec(payload, run_id=new_run_id())
-    # Validate ``dry_run`` is an actual JSON boolean — never ``bool(...)`` a truthy non-bool
-    # (e.g. the string "false" would coerce to True and silently flip a real run into dry-run).
-    dry_run_raw = payload.get("dry_run", False)
-    if not isinstance(dry_run_raw, bool):
-        raise HTTPException(status_code=400, detail="dry_run must be a boolean")
-    dry_run = dry_run_raw
+    dry_run = _require_bool(payload, "dry_run", False)
     runtime_secrets = _runtime_secrets(payload, spec, require_environment_secrets=not dry_run)
     # External user-key runs are charged only after training succeeds. Persist the org id
     # (non-secret) so the background runner can bill with the operator internal key at

@@ -179,8 +179,8 @@ def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    # spy on the streaming reader so we prove _post_with_progress (not the plain _request
-    # path) ran — a refactor that faked progress around a one-shot send must fail this test.
+    # spy on the streaming reader so we prove the streaming _request(progress=...) path (not the
+    # plain one-shot path) ran — a refactor that faked progress around a one-shot send must fail.
     wrapped: list[int] = []
     real_reader = http_mod._ProgressReader
 

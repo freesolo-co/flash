@@ -112,15 +112,20 @@ def run_sft():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
+    # SDK [train].<knob> override-or-recipe-default shorthand (None == knob unset). _t is the run's
+    # [train] table (None when there's no JobSpec or no [train]); _train_opt returns the override else
+    # the recipe default, so a missing [train] table can never AttributeError.
+    _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+
+    def _train_opt(name, default):
+        val = getattr(_t, name, None) if _t else None
+        return val if val is not None else default
+
     # Build SFT text dataset (seeded shuffle for reproducibility)
     train = env.dataset()
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
-    max_examples = int(
-        _w.JOB_SPEC.train.max_examples or 0
-        if _w.JOB_SPEC and _w.JOB_SPEC.train and _w.JOB_SPEC.train.max_examples is not None
-        else 0
-    )
+    max_examples = int(_train_opt("max_examples", 0) or 0)
     if max_examples > 0:
         train = train[:max_examples]
     texts = []
@@ -173,21 +178,14 @@ def run_sft():
     _w.heartbeat("sft_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
     # Epochs come from the run's [train] epochs (already in JOB_SPEC), else the recipe default.
-    epochs = int(
-        _w.JOB_SPEC.train.epochs
-        if _w.JOB_SPEC and _w.JOB_SPEC.train.epochs is not None
-        else RECIPE.sft.num_epochs
-    )
+    epochs = int(_train_opt("epochs", RECIPE.sft.num_epochs))
     # SDK [train] knobs override the recipe default.
     from flash.catalog import vocab_size_for
     from flash.engine.vram import resolve_params_b, sft_grad_accum, sft_logits_fused
 
-    _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
-    sft_lr = _t.learning_rate if _t and _t.learning_rate is not None else RECIPE.sft.learning_rate
-    sft_max_len = (
-        _t.max_length
-        if _t and _t.max_length is not None
-        else (RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len)
+    sft_lr = _train_opt("learning_rate", RECIPE.sft.learning_rate)
+    sft_max_len = _train_opt(
+        "max_length", RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len
     )
     # Pre-tokenize into {input_ids, completion_mask} and drop rows with no completion target (see
     # _pretokenize_completion_only). This SINGLE representation feeds every path: TRL's unpacked
@@ -221,9 +219,7 @@ def run_sft():
         )
     # batch_size is the GLOBAL/effective batch; sft_grad_accum sizes the per-device micro-batch +
     # grad-accum to realize it (shared with the cost estimator's step count, see engine.vram).
-    effective_batch = (
-        _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
-    )
+    effective_batch = _train_opt("batch_size", RECIPE.sft.effective_batch)
     # Large-vocab OOM guard: when the fused CE (Liger) is OFF, the SFTTrainer materializes the full
     # [per_device, seq, vocab] fp32 logits + grad — at Qwen3.5's ~248k vocab a 0.8B SFT OOM'd a
     # 24 GB card in backward. Cap the per-device micro-batch by the real model vocab + seq so those
@@ -247,12 +243,12 @@ def run_sft():
             f"(seq={sft_max_len}, vocab={_sft_vocab}; realized batch "
             f"{per_device_bs * grad_accum} >= requested {effective_batch})"
         )
-    sft_save_default = _t.save_every if _t and _t.save_every is not None else 50
+    sft_save_default = _train_opt("save_every", 50)
     out_dir = f"/tmp/sft_seed{_w.SEED}"
     resume_ckpt = _w.hf_resume_checkpoint()
 
     # [train].max_steps>0 caps optimizer steps (used by the cheap pre-flight smoke).
-    max_steps = int(_t.max_steps or 0 if _t and _t.max_steps is not None else 0)
+    max_steps = int(_train_opt("max_steps", 0) or 0)
     cfg_kwargs = {
         "output_dir": out_dir,
         "num_train_epochs": epochs,
@@ -634,7 +630,10 @@ def run_sft():
         _w.publish_deployable_checkpoint(adapter_dir, _final_step)
     _w.heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
-    train_tokens = int(sum(len(tok(t["text"])["input_ids"]) for t in texts) * epochs)
+    # Per-epoch trained-token total reused from _total_tok (the truncated, EOS-appended input_ids the
+    # trainer actually saw) times epochs — exact, and avoids a redundant O(N) tokenizer pass over
+    # `texts` that re-tokenized with no truncation/EOS and over-counted whenever a row hit sft_max_len.
+    train_tokens = _total_tok * epochs
 
     # Write train metadata + the completion sentinel (metrics.json/DONE) for this phase.
     _w.write_train_meta(

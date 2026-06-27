@@ -634,6 +634,27 @@ def _append_failure_artifacts(detail: str, failure_detail_reader) -> str:
     return extra
 
 
+@dataclass
+class GraceTimer:
+    """A stuck-state grace timer: starts when ``active`` first holds, fails once it has held
+    continuously past ``grace``, and resets the instant ``active`` clears.
+
+    ``poll_job`` runs three of these in parallel (the IN_QUEUE / UNHEALTHY / THROTTLED capacity
+    backstops); ``since`` stays public so the caller can render the elapsed-time detail string.
+    """
+
+    since: float | None = None
+
+    def expired(self, active: bool, now: float, grace: float) -> bool:
+        if not active:
+            self.since = None
+            return False
+        if self.since is None:
+            self.since = now  # first poll the state held -> arm, but never fail on the same poll
+            return False
+        return now - self.since > grace
+
+
 def poll_job(
     handle: JobHandle,
     log=None,
@@ -690,9 +711,9 @@ def poll_job(
     last_progress = time.time()
     seen_heartbeat = False
     last_health_probe = 0.0
-    unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
-    throttled_since: float | None = None  # first time the worker was seen stuck THROTTLED
-    queued_since: float | None = None  # first time the job was seen IN_QUEUE with no worker yet
+    unhealthy_timer = GraceTimer()  # tracks a worker seen stuck UNHEALTHY
+    throttled_timer = GraceTimer()  # tracks a worker seen stuck THROTTLED
+    queued_timer = GraceTimer()  # tracks the job seen IN_QUEUE with no worker yet
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
@@ -753,18 +774,13 @@ def poll_job(
         # so it holds even when the health probe is blind: once IN_QUEUE exceeds queue_grace_s, return a
         # retryable stall so the runner's gpu-walk re-provisions on the next-best (in-capacity) class.
         now = time.time()
-        if status == "IN_QUEUE":
-            if queued_since is None:
-                queued_since = now
-            elif now - queued_since > queue_grace_s:
-                return PollResult(
-                    False,
-                    failure="no_capacity",
-                    detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_since)}s "
-                    "(no RunPod capacity for the pinned GPU class); retrying on the next-best GPU",
-                )
-        else:
-            queued_since = None
+        if queued_timer.expired(status == "IN_QUEUE", now, queue_grace_s):
+            return PollResult(
+                False,
+                failure="no_capacity",
+                detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
+                "(no RunPod capacity for the pinned GPU class); retrying on the next-best GPU",
+            )
         # While queued, surface worker availability (throttled hosts are the common
         # cause of silent multi-minute waits — make them visible in the run log).
         if status == "IN_QUEUE" and now - last_health_probe > 90:
@@ -785,38 +801,36 @@ def poll_job(
                 # unhealthy_grace_s, return a (retryable) stall so the runner re-provisions a FRESH
                 # endpoint (fresh image pull, likely a different host). Observed: a mutable image
                 # tag republished mid-pull corrupts the worker -> unhealthy, and a fresh pull fixes it.
-                if workers.get("unhealthy") and not usable and not recovering:
-                    if unhealthy_since is None:
-                        unhealthy_since = time.time()
-                    elif time.time() - unhealthy_since > unhealthy_grace_s:
-                        return PollResult(
-                            False,
-                            failure="stalled",
-                            detail=f"worker stuck unhealthy for "
-                            f"{int(time.time() - unhealthy_since)}s while IN_QUEUE (likely a failed "
-                            f"image pull); retrying on a fresh endpoint",
-                        )
-                else:
-                    unhealthy_since = None  # recovered / usable worker appeared
+                if unhealthy_timer.expired(
+                    workers.get("unhealthy") and not usable and not recovering,
+                    now,
+                    unhealthy_grace_s,
+                ):
+                    return PollResult(
+                        False,
+                        failure="stalled",
+                        detail=f"worker stuck unhealthy for "
+                        f"{int(now - unhealthy_timer.since)}s while IN_QUEUE (likely a failed "
+                        f"image pull); retrying on a fresh endpoint",
+                    )
                 # Fail fast on a worker stuck THROTTLED: RunPod has no capacity for the pinned GPU
                 # class/pool and a throttled worker won't self-recover, so don't burn the full
                 # setup_grace_s (~50 min) waiting on it. Once it has stayed throttled with nothing
                 # usable or (re)initializing for throttled_grace_s, return a (retryable) stall so
                 # the runner's gpu-walk re-provisions on the NEXT-BEST GPU class — the cheapest fit
                 # often has no capacity while the next-best (a few cents/hr more) does.
-                if workers.get("throttled") and not usable and not recovering:
-                    if throttled_since is None:
-                        throttled_since = time.time()
-                    elif time.time() - throttled_since > throttled_grace_s:
-                        return PollResult(
-                            False,
-                            failure="no_capacity",
-                            detail=f"never scheduled: worker stuck THROTTLED for "
-                            f"{int(time.time() - throttled_since)}s while IN_QUEUE (no RunPod "
-                            f"capacity for the pinned GPU class); retrying on the next-best GPU",
-                        )
-                else:
-                    throttled_since = None  # capacity appeared / usable worker
+                if throttled_timer.expired(
+                    workers.get("throttled") and not usable and not recovering,
+                    now,
+                    throttled_grace_s,
+                ):
+                    return PollResult(
+                        False,
+                        failure="no_capacity",
+                        detail=f"never scheduled: worker stuck THROTTLED for "
+                        f"{int(now - throttled_timer.since)}s while IN_QUEUE (no RunPod "
+                        f"capacity for the pinned GPU class); retrying on the next-best GPU",
+                    )
             except Exception:
                 # Health surfacing is diagnostic only; a probe failure must not stop polling.
                 pass

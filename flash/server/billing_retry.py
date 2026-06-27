@@ -22,11 +22,10 @@ FREESOLO_INTERNAL_KEY, exactly like realized-cost reconciliation.
 from __future__ import annotations
 
 import contextlib
-import os
 from collections.abc import Callable
 
 from flash import runner
-from flash.server.auth import INTERNAL_KEY_ENV
+from flash.server._internal_client import enabled
 
 # States that produced a final, deployable adapter -> a completion charge applies. `deployed` is a
 # `done` run with serving stood up on top -> still billable (its done-time charge may have failed
@@ -47,7 +46,7 @@ _CHARGE_STARTED_STATES = frozenset({"charging", "failed"})
 
 def charge_retry_enabled() -> bool:
     """Retrying completion charges needs the operator internal key (the same key the charge uses)."""
-    return bool(os.environ.get(INTERNAL_KEY_ENV))
+    return enabled()
 
 
 def _needs_charge(status: runner.RunStatus) -> bool:

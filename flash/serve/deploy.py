@@ -31,7 +31,7 @@ from dataclasses import asdict, dataclass
 import httpx
 
 from flash._logging import get_logger
-from flash.providers.base import canonical_gpu, gpu_short
+from flash.providers.base import canonical_gpu
 
 logger = get_logger(__name__)
 
@@ -52,25 +52,42 @@ class ServingError(RuntimeError):
         self.status_code = status_code
 
 
-def _post_adapter_or_raise(url: str, body: dict) -> httpx.Response:
-    """POST an adapter registration to the serving backend, translating any transport- or
-    status-level failure into a ``ServingError`` that carries the upstream detail."""
+def _serving_request(
+    method: str,
+    url: str,
+    *,
+    json: dict | None = None,
+    ok_statuses: tuple[int, ...] = (),
+) -> httpx.Response:
+    """Issue a request to the serving backend, translating any transport- or status-level failure
+    into a ``ServingError`` that carries the upstream detail (shared by the deploy POST and the
+    undeploy DELETE). A status in ``ok_statuses`` is returned WITHOUT raising so the caller can
+    short-circuit it (undeploy treats a 404 as an already-gone no-op).
+
+    Dispatched by name (``httpx.post``/``httpx.delete``) rather than ``httpx.request`` so the call
+    is equivalent (``httpx.post(..., json=x)`` == ``httpx.request("POST", ..., json=x)``); ``json``
+    is omitted for a bodyless request (e.g. the DELETE)."""
+    # follow_redirects: Modal answers a slow request with a 303 to an async-result poll URL
+    # (?__modal_function_call_id=...); without following it httpx raises on the 303 (see chat).
+    kwargs: dict = {"headers": _internal_key_header(), "timeout": 60.0, "follow_redirects": True}
+    if json is not None:
+        kwargs["json"] = json
     try:
-        # follow_redirects: Modal answers a slow request with a 303 to an async-result poll URL
-        # (?__modal_function_call_id=...); without following it httpx raises on the 303 (see chat).
-        resp = httpx.post(
-            url,
-            json=body,
-            headers=_internal_key_header(),
-            timeout=60.0,
-            follow_redirects=True,
-        )
+        resp = getattr(httpx, method.lower())(url, **kwargs)
+        if resp.status_code in ok_statuses:
+            return resp
         resp.raise_for_status()
         return resp
     except httpx.HTTPStatusError as exc:
         raise _serving_status_error(url, exc) from exc
     except httpx.RequestError as exc:
         raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
+
+
+def _post_adapter_or_raise(url: str, body: dict) -> httpx.Response:
+    """POST an adapter registration to the serving backend, translating any transport- or
+    status-level failure into a ``ServingError`` that carries the upstream detail."""
+    return _serving_request("POST", url, json=body)
 
 
 def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
@@ -124,13 +141,6 @@ class Deployment:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-
-def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
-    """Cosmetic endpoint label (the freesolo app serves all adapters on one endpoint)."""
-    tail = (run_id or "").split("-")[-1][:24]
-    base = f"flash-serve-{gpu_short(canonical_gpu(friendly_gpu))}"
-    return f"{base}-{tail}" if tail else base
 
 
 def servable_gpu(gpu_name: str) -> str:
@@ -222,23 +232,11 @@ def undeploy_adapter(run_id: str) -> list[str]:
     """
     base = serving_base_url()
     url = f"{base}/adapters/{run_id}"
-    try:
-        resp = httpx.delete(
-            url,
-            headers=_internal_key_header(),
-            timeout=60.0,
-            # Modal answers a slow request with a 303 to an async-result poll URL; follow it (see chat).
-            follow_redirects=True,
-        )
-        # Undeploy is idempotent: an already-absent adapter (404) is a no-op success, not an
-        # error — handle it before raise_for_status() so it never becomes a ServingError.
-        if resp.status_code == 404:
-            return []
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise _serving_status_error(url, exc) from exc
-    except httpx.RequestError as exc:
-        raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
+    # Undeploy is idempotent: an already-absent adapter (404) is a no-op success, not an error —
+    # ok_statuses=(404,) returns it without raising so it never becomes a ServingError.
+    resp = _serving_request("DELETE", url, ok_statuses=(404,))
+    if resp.status_code == 404:
+        return []
     logger.info("deregistered adapter %s from freesolo serving (%s)", run_id, base)
     return [run_id]
 
