@@ -524,7 +524,13 @@ def poll_job(
                 detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_timer.since)}s "
                 "(no RunPod capacity for the pinned GPU class); retrying on the next-best GPU",
             )
-        if status == "IN_QUEUE" and now - last_health_probe > 90:
+        if status != "IN_QUEUE":
+            # The in-queue grace timers measure CONTINUOUS throttle/unhealthy while queued (like
+            # queued_timer, driven every iteration above); reset them whenever the job leaves the
+            # queue so a re-queue after an IN_PROGRESS spell doesn't fire on a stale arm time.
+            unhealthy_timer.since = None
+            throttled_timer.since = None
+        elif now - last_health_probe > 90:
             last_health_probe = now
             try:
                 h = runpod_api.endpoint_health(handle.endpoint_id)

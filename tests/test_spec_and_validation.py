@@ -60,6 +60,11 @@ def _raw(**overrides) -> dict:
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
+        # A truthy non-string algorithm used to AttributeError on .lower() (uncaught 500); it must be
+        # a clean ConfigError (400) like seeds. Falsy values still default to "grpo" (tested below).
+        ({"algorithm": 5}, "algorithm must be a string"),
+        ({"algorithm": ["grpo"]}, "algorithm must be a string"),
+        ({"algorithm": True}, "algorithm must be a string"),
         # NOTE: model_policy is no longer a user knob (it's read from the FLASH_MODEL_POLICY env on
         # the control plane), so a bad user-supplied model_policy is ignored, not rejected here.
         # Unknown config sections/keys are rejected (not silently dropped → 16x-cost defaults).
@@ -72,6 +77,12 @@ def _raw(**overrides) -> dict:
 def test_spec_validation_rejections(overrides, match) -> None:
     with pytest.raises(ConfigError, match=match):
         spec_from_dict(_raw(**overrides))
+
+
+def test_falsy_algorithm_defaults_to_grpo() -> None:
+    # The type guard must preserve the original `(value or "grpo")` semantics: falsy values default.
+    for falsy in (None, "", 0):
+        assert spec_from_dict(_raw(algorithm=falsy)).algorithm == "grpo"
 
 
 def test_seeds_are_deduped_preserving_order() -> None:

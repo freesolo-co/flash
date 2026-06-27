@@ -476,6 +476,51 @@ def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     assert res.ok
 
 
+def test_poll_job_throttled_timer_resets_on_leaving_queue(monkeypatch):
+    # A worker throttled in its FIRST queue window must not carry a stale arm-time across an
+    # IN_PROGRESS spell: if RunPod re-queues the job (still throttled), the throttled grace must be
+    # measured from the re-queue, not the original arm. Otherwise the first re-queue probe fires
+    # no_capacity instantly, defeating throttled_grace_s. Clock advances one tick per job_status poll.
+    import base64
+
+    import cloudpickle
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    ok = {"success": True, "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode()}
+    statuses = iter(
+        [
+            {"status": "IN_QUEUE"},  # arm throttled_timer (~t=100)
+            {"status": "IN_QUEUE"},  # accumulate (~t=200, still < grace 150 from t=100... fires at 250)
+            {"status": "IN_PROGRESS"},  # leaves the queue -> timer must reset
+            {"status": "IN_QUEUE"},  # re-queued, throttled: with a stale arm this would fire instantly
+            {"status": "COMPLETED", "output": ok},
+        ]
+    )
+    clock = {"t": 0.0}
+
+    def fake_job_status(eid, jid):
+        clock["t"] += 100.0
+        return next(statuses)
+
+    monkeypatch.setattr(runpod_api, "job_status", fake_job_status)
+    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: {"workers": {"throttled": 1}})
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        throttled_grace_s=150.0,
+        queue_grace_s=100_000.0,
+        setup_grace_s=100_000.0,
+        stall_after_s=100_000.0,
+    )
+    assert res.ok, res.detail  # completed; the re-queue throttle timer re-armed fresh, no false no_capacity
+
+
 def test_poll_job_setup_grace_before_first_heartbeat(monkeypatch):
     # No heartbeat ever (cold start that never finishes): must NOT trip the tight
     # stall_after_s window — it waits for the larger setup_grace_s instead.
