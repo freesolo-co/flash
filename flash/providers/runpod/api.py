@@ -254,6 +254,14 @@ def billing_endpoints(
     RunPod has no per-job cost; the finest realized granularity is per-endpoint per time bucket.
     Flash provisions one endpoint per run, so filtering by ``endpoint_id`` yields that run's
     realized cost even after the endpoint is torn down (billing history survives deletion).
+
+    ``RUNPOD_API_KEY`` may be a pool of per-account keys, and billing — like ``/endpoints`` — is
+    account-scoped: a query for an endpointId owned by another account returns a *successful* 200
+    with zero rows, so a plain ``request_with_retries()`` waterfall stops at the active account and
+    silently reports $0 for an endpoint that quota-failover provisioned on a different account. So
+    query every account and aggregate (only the owning account contributes rows for the filter).
+    Best-effort per account (reconcile is swallowed + retried): a single account's failure is
+    skipped rather than aborting the others.
     """
     from urllib.parse import urlencode
 
@@ -264,10 +272,25 @@ def billing_endpoints(
     }
     if endpoint_id:
         params["endpointId"] = endpoint_id
-    out = request_with_retries(f"{REST_BASE}/billing/endpoints?{urlencode(params)}")
+    url = f"{REST_BASE}/billing/endpoints?{urlencode(params)}"
+    pool = _keys.keys()
+    if not pool:
+        # No pool configured: preserve the historical single-call behavior (raises on a missing key).
+        return _billing_rows(request_with_retries(url))
+    rows: list[dict] = []
+    for key in pool:
+        try:
+            rows.extend(_billing_rows(_CLIENT.request_with_retries_for_key(key, url, retries=2)))
+        except RunpodApiError:
+            continue  # foreign/failing account: skip so it can't zero out the owning account's rows
+    return rows
+
+
+def _billing_rows(out) -> list[dict]:
+    """Extract the billing row list from a RunPod billing response (a bare list, or rows wrapped
+    under ``data``/``endpoints``/``billing``)."""
     if isinstance(out, list):
         return out
-    # Defensive: some RunPod list responses wrap rows under a key.
     if isinstance(out, dict):
         rows = out.get("data") or out.get("endpoints") or out.get("billing")
         return rows if isinstance(rows, list) else []

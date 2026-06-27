@@ -153,3 +153,17 @@ def test_serving_prices_cover_catalog_and_apply_markup():
         assert row["billed_output_usd_per_mtok"] == pytest.approx(
             row["base_output_usd_per_mtok"] * SERVING_MARKUP
         )
+
+
+def test_resolve_deploy_step_rejects_malformed_step_as_400():
+    """A malformed ``step`` must raise HTTPException(400), never a 500. Regression for ``"--5"``:
+    ``str.lstrip("-").isdigit()`` accepted it, then ``int("--5")`` raised an uncaught ValueError.
+    The 400 path raises before any checkpoint lookup, so the spec/app args are unused here."""
+    from fastapi import HTTPException
+
+    from flash.server.routes.serving import _resolve_deploy_step
+
+    for bad in ("--5", "40.9", "+5", "5-", "abc", "-", "", "   ", "0x5"):
+        with pytest.raises(HTTPException) as ei:
+            _resolve_deploy_step("flash-7-abcd", object(), bad)
+        assert ei.value.status_code == 400, bad

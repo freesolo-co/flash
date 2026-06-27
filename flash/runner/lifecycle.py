@@ -562,15 +562,20 @@ def _run_seed_loop(
     with contextlib.suppress(FileNotFoundError):
         if get_status(spec.run_id).state == "cancelled":
             raise _RunCancelled(f"run {spec.run_id} was cancelled")
-    _update(
+    # Gate the paid side effects on the terminal write actually applying: a cancel can still land
+    # in the window between the unlocked check above and this CAS, which rejects the `done` write
+    # (cancelled is terminal). Charging on a discarded write would bill a run the user cancelled.
+    # Mirrors deploy.py's `if applied:` recovery gate.
+    applied = _update(
         spec.run_id,
         "done",
         cost_usd=total_cost,
         artifacts_dir=artifacts_dir(spec),
         resume_seed_index=None,
     )
-    _charge_completed_run_best_effort(spec, log)
-    _register_checkpoints_best_effort(spec, log)
+    if applied:
+        _charge_completed_run_best_effort(spec, log)
+        _register_checkpoints_best_effort(spec, log)
 
 
 def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:

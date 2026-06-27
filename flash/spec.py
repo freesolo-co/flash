@@ -87,6 +87,19 @@ def _volume_gb(value: Any, default: int = 100) -> int:
     return gb if gb > 0 else default
 
 
+def _seed_tuple(value: Any) -> tuple[int, ...]:
+    """Parse the [train] seeds list from a loosely-typed spec source; dedupe preserving order.
+
+    A scalar/str/bytes is rejected with a clean ``ValueError`` (this was an un-guarded
+    ``tuple(int(s) for s in value)`` -> uncaught ``TypeError`` on a non-iterable). Schema-side
+    validation (``fields._train_seeds``) already enforces this for control-plane submits; this is
+    the worker/round-trip guard, so it stays ``ValueError`` (no ``ConfigError`` import -> no cycle).
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"train.seeds must be a list of integers, got {type(value).__name__}")
+    return tuple(dict.fromkeys(int(s) for s in value))
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
@@ -278,7 +291,7 @@ class JobSpec:
                 epochs=_opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),
-                seeds=tuple(int(s) for s in train.get("seeds", (0,))),
+                seeds=_seed_tuple(train.get("seeds", (0,))),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),

@@ -9,6 +9,7 @@ deploy lock and the deployable-state sets are resolved through the ``flash.serve
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -74,8 +75,12 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
         want = raw_step
     elif isinstance(raw_step, float):
         want = int(raw_step) if raw_step.is_integer() else None
-    elif isinstance(raw_step, str) and raw_step.strip().lstrip("-").isdigit():
-        want = int(raw_step.strip())
+    elif isinstance(raw_step, str):
+        # Match an ASCII signed integer only, then int() — NOT str.isdigit()/lstrip("-"), which
+        # accepts unicode digits and multi-dash strings ("--5") that then crash int() with an
+        # uncaught ValueError (HTTP 500). A non-match leaves want=None -> the clean 400 below.
+        s = raw_step.strip()
+        want = int(s) if re.fullmatch(r"-?[0-9]+", s) else None
     # Checkpoint steps are always non-negative (derived from ``step-<N>``); reject a negative
     # value as malformed (400) rather than letting it fall through to the 404 below.
     if want is not None and want < 0:
