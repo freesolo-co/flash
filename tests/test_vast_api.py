@@ -179,6 +179,30 @@ def test_get_instance_reraises_non_404_with_404ish_body(monkeypatch):
         vast_api.get_instance(4040)
 
 
+def test_create_error_is_ambiguous_classification():
+    # Codex Mr72L: classify create_instance failures so the walk only reconciles-by-label on the
+    # AMBIGUOUS ones (a billed contract may exist), and walks straight past DEFINITIVE rejections.
+    from flash.providers.vast import api as vast_api
+
+    def err(cause=None, msg="x"):
+        e = vast_api.VastApiError(msg)
+        if cause is not None:
+            e.__cause__ = cause
+        return e
+
+    def http(code):
+        return urllib.error.HTTPError("u", code, "m", None, io.BytesIO(b""))
+
+    # DEFINITIVE (created nothing) -> not ambiguous
+    assert vast_api.create_error_is_ambiguous(err(http(404))) is False
+    assert vast_api.create_error_is_ambiguous(err(http(400))) is False
+    assert vast_api.create_error_is_ambiguous(err(msg="rejected: {'success': False}")) is False
+    # AMBIGUOUS (a contract may exist) -> reconcile by label
+    assert vast_api.create_error_is_ambiguous(err(http(503))) is True
+    assert vast_api.create_error_is_ambiguous(err(urllib.error.URLError("timed out"))) is True
+    assert vast_api.create_error_is_ambiguous(err(msg="...: no instance id in response: {}")) is True
+
+
 def test_destroy_instance_never_raises(monkeypatch):
     from flash.providers.vast import api as vast_api
 

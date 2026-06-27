@@ -145,6 +145,23 @@ def create_instance(
     return int(instance_id)
 
 
+def create_error_is_ambiguous(err: Exception) -> bool:
+    """True when a ``create_instance`` failure MIGHT have left a billed contract behind, so the caller
+    must reconcile by label before renting another offer (the non-idempotent PUT /asks can succeed on
+    the host while the response is lost).
+
+    DEFINITIVE (created nothing -> safe to walk to the next offer): a 4xx client rejection (offer
+    taken / bad request) carries a chained ``HTTPError`` with ``code < 500``; a ``success: false``
+    body is raised with NO chained cause. AMBIGUOUS (a contract may exist): a 5xx, a network/timeout
+    (``URLError`` with no ``.code``), or a ``success`` body that carried no instance id."""
+    cause = getattr(err, "__cause__", None)
+    if isinstance(cause, urllib.error.HTTPError):  # subclass of URLError -> check first
+        return cause.code >= 500
+    if isinstance(cause, urllib.error.URLError):  # connection error / timeout
+        return True
+    return "no instance id" in str(err)  # success body without a contract id -> may be billing
+
+
 def get_instance(instance_id: int) -> dict | None:
     """Instance detail dict, or None once it no longer exists (destroyed).
 

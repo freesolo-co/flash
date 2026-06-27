@@ -151,6 +151,69 @@ def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     assert h.offer_id == 99
 
 
+def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
+    # Codex Mr72L: a 5xx/timeout on the NON-IDEMPOTENT create may have made a billed contract. The
+    # walk must reconcile by our unique label and ADOPT it, not rent the next offer (double-billing).
+    import io
+    import urllib.error
+
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    rented = []
+
+    def fake_create(offer_id, **kw):
+        rented.append(offer_id)
+        e = vast_api.VastApiError("create failed: 503")
+        e.__cause__ = urllib.error.HTTPError("u", 503, "boom", None, io.BytesIO(b""))
+        raise e
+
+    monkeypatch.setattr(vast_api, "create_instance", fake_create)
+    # the contract DID materialize under our exact attempt label -> list_instances surfaces it
+    label = "flash-1700000000-abcd1234-s0-a2"
+    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 555, "label": label}])
+    offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
+    h = vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
+    assert h.instance_id == 555  # adopted the existing contract, not a fresh rent
+    assert h.offer_id == 1
+    assert rented == [1]  # did NOT walk on to offer 2 (no duplicate create)
+
+
+def test_deploy_walks_when_ambiguous_create_left_nothing(monkeypatch):
+    # Same ambiguous failure, but NO instance materialized under our label -> safe to continue the
+    # walk as before (the create truly didn't happen).
+    import io
+    import urllib.error
+
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    def fake_create(offer_id, **kw):
+        if offer_id == 1:
+            e = vast_api.VastApiError("create failed: 503")
+            e.__cause__ = urllib.error.HTTPError("u", 503, "boom", None, io.BytesIO(b""))
+            raise e
+        return 9999
+
+    monkeypatch.setattr(vast_api, "create_instance", fake_create)
+    monkeypatch.setattr(vast_api, "list_instances", lambda: [])  # nothing under our label
+    offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
+    h = vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
+    assert h.instance_id == 9999  # walked to offer 2 and rented normally
+    assert h.offer_id == 2
+
+
+def test_vast_image_honors_worker_image_override(monkeypatch):
+    # Codex Mr72Q: Vast must honor FLASH_WORKER_IMAGE (and per-SM) via worker_image_for_gpu like
+    # RunPod/Lambda, not always return the baked default.
+    from flash.providers.vast.jobs.builders import vast_image
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/x/hotfix:test")
+    assert vast_image("RTX 4090") == "ghcr.io/x/hotfix:test"
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    assert vast_image("RTX 4090")  # default path still returns a real (baked) image
+
+
 def test_deploy_raises_when_pool_exhausted(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast

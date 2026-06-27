@@ -33,9 +33,9 @@ def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
     """Representative $/hr for a class, on ``provider`` when given.
 
     The nominal ``GpuClass.hourly_usd`` is the RunPod rate, which is WRONG for a provider-specific
-    quote (e.g. a Lambda RTX A6000 is $1.09/hr, not RunPod's $0.49). When ``provider`` is
-    ``lambda`` and the class is offered there, price it through that provider's
-    pricing module (live with a static fallback); otherwise (runpod/auto/None) use the nominal rate.
+    quote (e.g. a Lambda RTX A6000 is $1.09/hr, not RunPod's $0.49). When ``provider`` is ``lambda``
+    or ``vast`` and the class is offered there, price it through that provider's pricing module (live
+    with a static fallback); otherwise (runpod/auto/None) use the nominal rate.
     """
     info = GPU_INFO.get(name)
     if info is None:
@@ -43,6 +43,13 @@ def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
     p = (provider or "").strip().lower()
     if p == "lambda" and info.lambda_name:
         from flash.providers.lambdalabs.pricing import hourly_rate
+
+        return hourly_rate(name)
+    if p == "vast" and info.vast_name:
+        # Vast is a live verified-datacenter market — its rates differ materially from RunPod's static
+        # ones, so a provider="vast" quote must price through the Vast pricing module (live + static
+        # fallback), not fall back to GpuClass.hourly_usd (the RunPod rate).
+        from flash.providers.vast.pricing import hourly_rate
 
         return hourly_rate(name)
     return info.hourly_usd

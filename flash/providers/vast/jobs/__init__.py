@@ -165,6 +165,22 @@ def usable_offers(
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
 
 
+def _adopt_instance_by_label(label: str) -> int | None:
+    """Best-effort id of the instance carrying this EXACT (unique per run/seed/attempt) label, or
+    ``None``. Reclaims a contract a possibly-successful-but-unconfirmed create left behind, so the
+    offer walk adopts it instead of renting a duplicate. Any lookup failure -> ``None`` (the caller
+    falls back to the normal walk; the orphan sweep remains the backstop)."""
+    try:
+        for inst in vast_api.list_instances():
+            if str(inst.get("label") or "") == label:
+                iid = inst.get("id")
+                if iid:
+                    return int(iid)
+    except Exception as exc:  # listing is best-effort; never let it abort the launch
+        logger.warning("vast label reconcile failed (%s); proceeding without adoption", exc)
+    return None
+
+
 def deploy_and_submit(
     spec,
     seed: int,
@@ -197,7 +213,7 @@ def deploy_and_submit(
         try:
             instance_id = vast_api.create_instance(
                 offer.offer_id,
-                image=vast_image(),
+                image=vast_image(offer.gpu),
                 disk_gb=_effective_disk_gb(spec),
                 env={},
                 onstart=onstart,
@@ -207,6 +223,29 @@ def deploy_and_submit(
         except vast_api.VastApiError as e:
             last_err = e
             say(f"offer {offer.offer_id} ({offer.gpu} ${offer.dph_total:.2f}/hr) rejected: {e}")
+            # An AMBIGUOUS create failure (5xx / network-timeout on the NON-IDEMPOTENT PUT /asks) may
+            # have created a billed contract that never surfaced in the response. Renting the next
+            # offer would leave that one untracked and billing until the orphan sweep. Reconcile by our
+            # unique per-attempt label first: if the instance materialized, ADOPT it (no leak, no
+            # duplicate) and proceed; only a DEFINITIVE rejection (4xx / success=false body — created
+            # nothing) safely walks on. Any lookup failure -> None -> fall through to the normal walk.
+            if vast_api.create_error_is_ambiguous(e):
+                adopted = _adopt_instance_by_label(label)
+                if adopted is not None:
+                    say(
+                        f"adopted vast instance {adopted} from an ambiguous create "
+                        f"(label={label}, offer {offer.offer_id}, {offer.gpu})"
+                    )
+                    return VastJobHandle(
+                        instance_id=adopted,
+                        offer_id=offer.offer_id,
+                        machine_id=offer.machine_id,
+                        label=label,
+                        gpu=offer.gpu,
+                        hourly_usd=offer.dph_total,
+                        attempt=attempt,
+                        started_ts=time.time(),
+                    )
             if not candidates and not refreshed:
                 refreshed = True
                 taken = {o.machine_id for o in tried}

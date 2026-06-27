@@ -97,13 +97,17 @@ class VastJobHandle:
         )
 
 
-def vast_image() -> str:
-    """Docker image for the rented container: the prebuilt, PUBLIC ``WORKER_IMAGE`` (the byte-
-    identical training stack RunPod bakes). The Blackwell driver floor lives in the ``cuda_max_good``
-    offer filter, not the image. ``FLASH_WORKER_IMAGE`` overrides it via ``worker_image_for_gpu``."""
-    from flash.providers.runpod.train import WORKER_IMAGE
+def vast_image(gpu: str | None = None) -> str:
+    """Docker image for the rented container: the prebuilt, PUBLIC worker image (the byte-identical
+    training stack RunPod bakes). Routed through ``worker_image_for_gpu`` so the SAME operator
+    overrides RunPod/Lambda honor apply to Vast too — ``FLASH_WORKER_IMAGE`` (hotfix), and the per-SM
+    kernel-cache image via ``FLASH_WORKER_IMAGE_PER_SM`` / ``FLASH_WORKER_IMAGE_TEMPLATE`` (Vast runs
+    the worker via its own onstart, so the image's CMD is irrelevant — only the baked deps/cache
+    matter, exactly what the per-SM image carries). The Blackwell driver floor lives in the
+    ``cuda_max_good`` offer filter, not the image."""
+    from flash.providers.runpod.train.deps import WORKER_IMAGE, worker_image_for_gpu
 
-    return WORKER_IMAGE
+    return worker_image_for_gpu(gpu) or WORKER_IMAGE
 
 
 def build_payload(spec, seed: int, attempt: int, runtime_secrets: dict | None = None) -> dict:
