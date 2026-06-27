@@ -62,6 +62,16 @@ def test_think_token_count_counts_the_think_span() -> None:
     # the same echoed completion WITHOUT the prompt-open signal: the model opened <think> itself
     # (unclosed) -> count after that opener (case: model-opened unclosed).
     assert w.think_token_count("reason 42 <think> more", tok) == 1
+    # prompt-opened + an echoed <think> BEFORE the first </think>: the prompt pre-opened reasoning, so
+    # the span is the WHOLE pre-opened reasoning from the start through the first close
+    # ("reason 42 <think> more" = 4) -- NOT just the sliver after the echoed opener (" more" = 1).
+    assert (
+        w.think_token_count("reason 42 <think> more </think> ans", tok, prompt_opened_thinking=True)
+        == 4
+    )
+    # the same string WITHOUT the prompt-open signal: the model opened AND closed its own <think>, so
+    # only the span between the model's tags counts (" more" = 1) -- case 1.
+    assert w.think_token_count("reason 42 <think> more </think> ans", tok) == 1
 
 
 def test_prompt_opens_thinking_detects_preopened_tag() -> None:

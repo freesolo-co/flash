@@ -115,31 +115,46 @@ def think_token_count(
          exact case the penalty targets — would score 0. When ``prompt_opened_thinking`` is False a
          tag-less completion is plain (non-thinking) text and counts 0.
     Without case 2 the penalty silently no-ops for the common enable_thinking=true path.
-    Case 1 vs 2 is decided by tag ORDER, not mere presence: a prompt-opened completion that closes
-    its reasoning and then echoes a literal/malformed ``<think>`` in the answer must still count the
-    span up to the FIRST ``</think>`` (case 2) — anchoring on the echoed opener would count the wrong
-    span. And when the prompt pre-opened and the completion NEVER closes (no ``</think>`` anywhere),
-    case 3 wins even over an echoed ``<think>``: the whole completion is unterminated reasoning, so
-    we count all of it rather than just the text after the echoed opener. Any later ``<think>`` blocks
-    (uncommon — a malformed re-open) are NOT added to the count.
+    When ``prompt_opened_thinking`` is set the reasoning ALWAYS begins at the completion's first
+    token (the prompt pre-opened ``<think>``), so cases 2/3 span from the start to the first
+    ``</think>`` (or the whole completion if it never closes) — INCLUDING any ``<think>`` the model
+    redundantly echoed *inside* the reasoning. The lone exception is a ``<think>`` re-emitted at the
+    very START (only whitespace before it): that leading tag is the opener, not content, so it's
+    skipped. Anchoring on a mid-reasoning echoed opener (e.g. ``reason 42 <think> more </think> ans``)
+    would wrongly count only the post-echo sliver instead of the full pre-opened span.
+    When ``prompt_opened_thinking`` is False, case 1 vs 2 is decided by tag ORDER, not mere presence:
+    a completion that closes its reasoning and then echoes a literal/malformed ``<think>`` in the
+    answer must still count the span up to the FIRST ``</think>`` (case 2) — anchoring on the echoed
+    opener would count the wrong span. Any later ``<think>`` blocks (a malformed re-open) are NOT
+    added to the count.
     """
     if not completion:
         return 0
     open_idx = completion.find("<think>")
     close_idx = completion.find("</think>")
-    if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
-        # case 2: prompt-opened <think> — the completion starts mid-reasoning and carries only the
-        # close. Count up to the FIRST </think>; a later literal <think> in the answer is NOT the
-        # opener (tag order, not presence).
+    if prompt_opened_thinking:
+        # cases 2 & 3, prompt pre-opened: reasoning starts at the completion's FIRST token. Count from
+        # there to the first </think> (or the whole completion when it never closes — budget ran out),
+        # INCLUDING any <think> the model echoed mid-reasoning. The one exception: a <think> re-emitted
+        # at the very START is the opener, not content — skip past it so its tokens aren't counted.
+        start = (
+            open_idx + len("<think>")
+            if open_idx != -1 and not completion[:open_idx].strip()
+            else 0
+        )
+        think_text = (
+            completion[start:close_idx]
+            if close_idx != -1 and close_idx >= start
+            else completion[start:]
+        )
+    elif close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+        # case 2 (flag not passed): a hybrid template pre-opened <think> in the PROMPT, so the
+        # completion starts mid-reasoning and carries only the close. Count up to the FIRST </think>;
+        # a later literal <think> in the answer is NOT the opener (tag order, not presence).
         think_text = completion[:close_idx]
     elif open_idx != -1 and close_idx != -1:
         # case 1: the model emitted its OWN opening <think> before the close — count between them.
         think_text = completion[open_idx + len("<think>") : close_idx]
-    elif prompt_opened_thinking:
-        # case 3: prompt pre-opened <think> and the completion never closed it (no </think> anywhere)
-        # — the WHOLE completion is unterminated reasoning, INCLUDING any echoed <think> it redundantly
-        # emitted before running out of budget (don't anchor on that echo and undercount).
-        think_text = completion
     elif open_idx != -1:
         # the model opened <think>, never closed it, and the prompt did NOT pre-open — count after the
         # opener (the unclosed model-emitted span).
