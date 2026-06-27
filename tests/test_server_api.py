@@ -915,6 +915,54 @@ def test_chat_streams_deployed_run(api, monkeypatch):
     assert seen["messages"] == [{"role": "user", "content": "hello"}]
 
 
+def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkeypatch):
+    """A run cancelled mid-RL can deploy a per-step checkpoint (stays `cancelled`, listed active by
+    /v1/deployments). The chat route must SERVE that live adapter, not 409 on the cancelled state."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "cancelled"  # cancelled, but with a live checkpoint deployment
+    status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+    runner._save_status(status)
+
+    monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi", " there"]))
+    with api.stream(
+        "POST",
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    ) as resp:
+        text = resp.read().decode()
+    assert resp.status_code == 200, text
+    assert text == "hi there"
+
+
+def test_chat_cancelled_run_without_deployment_is_409(api):
+    """A cancelled run with no active deployment still 409s, pointing the user at `flash deploy`."""
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "cancelled"
+    runner._save_status(status)
+
+    r = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers=_bearer(key),
+    )
+    assert r.status_code == 409
+    assert "deploy a checkpoint" in r.json()["detail"]
+
+
 def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     """An undeploy that hits a serving-backend failure surfaces as a clean 502 (same as deploy),
     not an unhandled 500: ServingError from undeploy_adapter is translated to HTTPException(502)."""
