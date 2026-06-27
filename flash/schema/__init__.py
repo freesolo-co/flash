@@ -161,6 +161,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         model = raw["model"]
     except KeyError as exc:
         raise ConfigError("config must set `model`") from exc
+    # An unhashable model (TOML array / `[model]` table) would TypeError on MODELS.get() downstream,
+    # escaping the callers' ConfigError/ValueError guards -> 500; type-check like the other scalars.
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
 
     try:
         algorithm = normalize_algorithm(raw.get("algorithm"))

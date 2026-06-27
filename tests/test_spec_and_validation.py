@@ -60,6 +60,11 @@ def _raw(**overrides) -> dict:
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
+        # An unhashable model (TOML array / `[model]` table) used to TypeError on MODELS.get() -> 500;
+        # it must be a clean ConfigError like every other scalar.
+        ({"model": ["Qwen/Qwen3.5-4B"]}, "must be a model id string"),
+        ({"model": {"id": "x"}}, "must be a model id string"),
+        ({"model": "   "}, "must be a model id string"),
         # A truthy non-string algorithm used to AttributeError on .lower() (uncaught 500); it must be
         # a clean ConfigError (400) like seeds. Falsy values still default to "grpo" (tested below).
         ({"algorithm": 5}, "algorithm must be a string"),
