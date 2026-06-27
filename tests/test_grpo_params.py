@@ -36,6 +36,81 @@ def test_think_token_count_counts_the_think_span() -> None:
     assert w.think_token_count("pre <think>a b c d", tok) == 4
     assert w.think_token_count(None, tok) == 0
     assert w.think_token_count("<think></think>x", tok) == 0
+    # prompt-opened hybrid thinking: the chat template appended <think> to the PROMPT, so the
+    # completion starts mid-reasoning with only the closing </think>. The reasoning is everything
+    # before that close (without this the penalty no-ops on the common enable_thinking=true path).
+    assert w.think_token_count("a b c d</think>{\"x\": 1}", tok) == 4
+    assert w.think_token_count("</think>just the answer", tok) == 0
+    # case 3: prompt-opened thinking that NEVER closes (ran out of max_tokens) — no tags at all. With
+    # prompt_opened_thinking the WHOLE completion is unterminated reasoning and is counted, so the
+    # longest rambles can't dodge the penalty; without the flag a tag-less completion is plain text (0).
+    assert w.think_token_count("rambling on and on forever", tok, prompt_opened_thinking=True) == 5
+    assert w.think_token_count("rambling on and on forever", tok) == 0
+    # the flag does NOT change a completion that already carries a tag (cases 1/2 still win).
+    assert w.think_token_count("a b c</think>ans", tok, prompt_opened_thinking=True) == 3
+    assert w.think_token_count("<think>a b</think>ans", tok, prompt_opened_thinking=True) == 2
+    assert w.think_token_count("", tok, prompt_opened_thinking=True) == 0
+    # Case 1 vs 2 is decided by tag ORDER, not presence: a prompt-opened completion that CLOSES its
+    # reasoning and then echoes a literal <think> in the answer must count the span up to the FIRST
+    # </think> (the reasoning), NOT anchor on the echoed opener (which would count "echo here" = 2).
+    assert w.think_token_count("a b c d</think>answer with <think> echo here", tok) == 4
+    # a self-tagged block followed by an echoed opener still counts only the first real span.
+    assert w.think_token_count("<think>a b c</think>tail <think> echo", tok) == 3
+    # prompt-opened + NEVER closed + an echoed <think>: count the WHOLE completion (it's all
+    # unterminated reasoning), not just the text after the echoed opener.
+    assert w.think_token_count("reason 42 <think> more", tok, prompt_opened_thinking=True) == 4
+    # the same echoed completion WITHOUT the prompt-open signal: the model opened <think> itself
+    # (unclosed) -> count after that opener (case: model-opened unclosed).
+    assert w.think_token_count("reason 42 <think> more", tok) == 1
+    # prompt-opened + an echoed <think> BEFORE the first </think>: the prompt pre-opened reasoning, so
+    # the span is the WHOLE pre-opened reasoning from the start through the first close
+    # ("reason 42 <think> more" = 4) -- NOT just the sliver after the echoed opener (" more" = 1).
+    assert (
+        w.think_token_count("reason 42 <think> more </think> ans", tok, prompt_opened_thinking=True)
+        == 4
+    )
+    # the same string WITHOUT the prompt-open signal: the model opened AND closed its own <think>, so
+    # only the span between the model's tags counts (" more" = 1) -- case 1.
+    assert w.think_token_count("reason 42 <think> more </think> ans", tok) == 1
+
+
+def test_prompt_opens_thinking_detects_preopened_tag() -> None:
+    import flash.engine.worker as w
+
+    # A hybrid template pre-opens <think> at the end of the generation prompt (no closing tag).
+    assert w.prompt_opens_thinking("<|im_start|>assistant\n<think>\n") is True
+    # An uncurated/non-thinking template appends no <think> -> a tagless completion is a real answer.
+    assert w.prompt_opens_thinking("<|im_start|>assistant\n") is False
+    assert w.prompt_opens_thinking("") is False
+    assert w.prompt_opens_thinking(None) is False
+    # A prompt that opened AND closed a <think> (e.g. a few-shot exemplar) is NOT pre-opened.
+    assert w.prompt_opens_thinking("...<think>example</think>...<|im_start|>assistant\n") is False
+    # If the LAST think is left open (after an earlier closed one), it IS pre-opened.
+    assert w.prompt_opens_thinking("<think>ex</think>q<|im_start|>assistant\n<think>\n") is True
+    # FALSE-POSITIVE guard: a user/system message that merely CONTAINS an unclosed literal <think>
+    # must NOT count as pre-opened when the generation suffix didn't actually prefill thinking (the
+    # detection anchors on the trailing <think> suffix, not a scan of the whole prompt).
+    assert w.prompt_opens_thinking("user asked <think> about x<|im_start|>assistant\n") is False
+
+
+def test_graded_text_hides_tagless_prompt_opened_reasoning(monkeypatch) -> None:
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", True)
+    # Tagless completion under a prompt-opened <think>: the generation never closed reasoning, so the
+    # env must grade NOTHING (scores 0) — not the raw ramble (which a raw-text fallback could reward).
+    assert w.graded_text("rambling forever no answer", prompt_opened_thinking=True) == ""
+    # Without the prompt-opened signal (e.g. an uncurated template that didn't pre-open), the same
+    # tagless text is a normal answer and is graded as-is.
+    assert w.graded_text("the answer is 42", prompt_opened_thinking=False) == "the answer is 42"
+    # A normally-tagged thinking completion is unaffected: strip to the post-</think> answer.
+    assert w.graded_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True) == "\\boxed{5}"
+    # Echoed <think> while still unterminated (no </think>): the WHOLE thing is reasoning -> hidden,
+    # NOT just the text before the echoed opener (which a raw-text fallback could otherwise reward).
+    assert w.graded_text("reason 42 <think> still going", prompt_opened_thinking=True) == ""
+    # THINKING off: no stripping at all, even with the flag set.
+    monkeypatch.setattr(w, "THINKING", False)
+    assert w.graded_text("rambling forever", prompt_opened_thinking=True) == "rambling forever"
 
 
 def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
@@ -705,6 +780,49 @@ def test_run_rl_wires_mask_truncated_completions_to_the_gating_helper() -> None:
         "mask_truncated_completions must be wired to grpo_mask_truncated_completions(...) so the "
         "stop_sequences gating is honored"
     )
+
+
+def test_run_rl_threads_prompt_opened_thinking_to_grading_and_penalty() -> None:
+    """run_rl must forward the computed _prompt_opens_thinking flag to BOTH graded_text and
+    think_token_count. The leaf-helper tests above cover the flag's True/False logic, but nothing
+    else guarantees run_rl actually PASSES it: drop either keyword and the helper tests stay green
+    while production silently reverts to the pre-fix no-op (the thinking-length penalty does nothing
+    and a tag-less reasoning ramble is graded as the answer — PR #281). Assert on run_rl's AST so it
+    survives reformatting — mirrors test_run_rl_wires_mask_truncated_completions_* above."""
+    import ast
+    import inspect
+
+    import flash.engine.worker as w
+
+    tree = ast.parse(inspect.getsource(w.run_rl))
+
+    def _forwards_flag(call: ast.Call, fname: str) -> bool:
+        # The called name, whether bare (think_token_count(...)) or qualified (_w.graded_text(...)).
+        func = call.func
+        name = (
+            func.id
+            if isinstance(func, ast.Name)
+            else func.attr
+            if isinstance(func, ast.Attribute)
+            else None
+        )
+        if name != fname:
+            return False
+        # ...passing prompt_opened_thinking=_prompt_opens_thinking (the computed flag, not a literal).
+        return any(
+            kw.arg == "prompt_opened_thinking"
+            and isinstance(kw.value, ast.Name)
+            and kw.value.id == "_prompt_opens_thinking"
+            for kw in call.keywords
+        )
+
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    for fname in ("graded_text", "think_token_count"):
+        assert any(_forwards_flag(c, fname) for c in calls), (
+            f"run_rl must call {fname}(..., prompt_opened_thinking=_prompt_opens_thinking); without "
+            "it the prompt-opened-<think> fix silently no-ops (the length penalty and <think> strip "
+            "do nothing on the common enable_thinking=true path — PR #281)"
+        )
 
 
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:
