@@ -209,19 +209,20 @@ def test_deploy_dry_run_is_not_a_false_success(monkeypatch) -> None:
     assert "dry_run" not in dry  # the old green `✓ deploy ● dry_run` badge form is gone
 
 
-def test_undeploy_noop_is_not_a_false_confirmation(monkeypatch) -> None:
-    """`flash undeploy` against a run with no active deployment deletes nothing (`deleted_endpoints:
-    []`); the themed card must not claim a teardown for that no-op — only a real deletion confirms."""
+def test_undeploy_confirms_teardown_and_names_endpoints(monkeypatch) -> None:
+    """`flash undeploy` always confirms the teardown: the server clears the deployment record
+    idempotently, so an empty `deleted_endpoints` (the serving adapter was already gone / 404) is
+    still a real teardown, not a no-op the response can prove. A real deregistration names what
+    was removed; the empty case must never claim nothing was torn down."""
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
     # a real teardown confirms and names what was deregistered
-    real = render.undeployed({"run_id": "flash-1", "deleted_endpoints": ["live-x"]})
-    assert "torn down flash-1" in real
-    assert "live-x" in real
-    # a no-op: no false "torn down", just an honest "no active deployment" line
-    noop = render.undeployed({"run_id": "flash-1", "deleted_endpoints": []})
-    assert "torn down" not in noop
-    assert "no active deployment" in noop
+    named = render.undeployed({"run_id": "flash-1", "deleted_endpoints": ["live-x"]})
+    assert "torn down flash-1" in named
+    assert "live-x" in named
+    # an idempotent teardown (serving adapter already gone) still confirms — no false no-op
+    idempotent = render.undeployed({"run_id": "flash-1", "deleted_endpoints": []})
+    assert "torn down flash-1" in idempotent
 
 
 def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:

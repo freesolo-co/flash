@@ -582,17 +582,16 @@ def deployed(dep: dict) -> str:
 
 
 def undeployed(result: dict) -> str:
-    """`flash undeploy`: confirm the serving endpoint was torn down. A no-op undeploy (the run had
-    no active deployment, so the server deletes nothing) shows a neutral line instead of a green
-    confirmation — mirroring the cancel/deploy no-op handling, so nothing is faked as torn down."""
-    deleted = result.get("deleted_endpoints") or []
-    if not deleted:
-        return _safe(
-            note(f"{result.get('run_id', '')} had no active deployment — nothing to tear down")
-        )
+    """`flash undeploy`: confirm the run's serving deployment was torn down. The server clears the
+    deployment record idempotently (an already-absent serving adapter that 404s still counts as a
+    teardown), and the response can't distinguish that from a true no-op, so we always confirm;
+    when the serving backend actually deregistered endpoints we name them."""
     rid = _paint(result.get("run_id", ""), _ACCENT2)
-    names = ", ".join(deleted)
-    return _safe(f"{ok(f'torn down {rid}')}\n{_dim(f'  deregistered {names}')}")
+    deleted = result.get("deleted_endpoints") or []
+    line = ok(f"torn down {rid}")
+    if deleted:
+        line += "\n" + _dim(f"  deregistered {', '.join(deleted)}")
+    return _safe(line)
 
 
 def exported(result: dict) -> str:
