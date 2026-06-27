@@ -610,6 +610,17 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
             f"(only-SFT={only_sft}, only-GRPO={only_grpo}); their target_modules must match for a "
             "rank-stacked recombine"
         )
+    # Symmetric to the per-A pairing guard in the loop below: the loop iterates only lora_A keys, so a
+    # lora_B with no paired lora_A would be silently DROPPED from the output (an incomplete adapter),
+    # not caught by the equal-key-set check above. Fail loudly, like the A-without-B case.
+    orphan_b = sorted(
+        bk for bk in sft_ab if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in sft_ab
+    )
+    if orphan_b:
+        raise ValueError(
+            f"recombine: lora_B key(s) {orphan_b[:3]} have no matching lora_A — the adapter is "
+            "malformed (unpaired LoRA tensors)"
+        )
 
     def _scale(cfg) -> float:
         r, alpha = int(cfg["r"]), float(cfg["lora_alpha"])

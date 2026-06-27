@@ -263,6 +263,22 @@ def test_recombine_rejects_unpaired_lora_tensors(tmp_path):
         recombine_lora_adapters(sft, grpo, out)
 
 
+def test_recombine_rejects_lora_b_without_paired_lora_a(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    # Symmetric to the above: a lora_B with NO paired lora_A (same key set on both, so the module-set
+    # check passes). The recombine loop iterates only lora_A keys, so an orphan B would be SILENTLY
+    # dropped — recombine must instead fail loudly and name the unpaired key.
+    for adir in (sft, grpo):
+        _write_adapter(adir, modules=TEXT_MODULES, r=4, alpha=8, seed=1)
+        st = os.path.join(adir, "adapter_model.safetensors")
+        sd = {k: v for k, v in load_file(st).items() if ".lora_A." not in k}
+        save_file(sd, st, metadata={"format": "pt"})
+    with pytest.raises(ValueError, match=r"no matching lora_A"):
+        recombine_lora_adapters(sft, grpo, out)
+
+
 # --- orchestrator gating: recombined_warmstart_adapter_dir(src) ---------------------------------
 # Gated on the `_VL_WARMSTART_SFT_DIR` marker that _init_adapter_model sets ONLY on the VL merge path.
 import flash.engine.worker as W
