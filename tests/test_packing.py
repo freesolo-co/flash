@@ -491,6 +491,30 @@ def test_pretokenize_completion_only_drops_empty_and_keeps_lockstep():
     assert all(len(r["completion_mask"]) == len(r["input_ids"]) for r in pretok)
 
 
+def test_pretokenize_drops_content_free_completion():
+    # A completion whose only masked token is special (an empty assistant turn -> just EOS/turn-closer)
+    # has no REAL target and must be dropped — not train the model to emit EOS immediately. "Special" is
+    # the tokenizer's own all_special_ids, so the check is template-agnostic.
+    from flash.engine.worker.sft import _pretokenize_completion_only
+
+    class _TokWithSpecials(_FakeTok):
+        all_special_ids = (1, ord("!"))  # BOS + EOS marked special
+
+    tok = _TokWithSpecials(eos="!")
+    texts = [
+        {"text": "AB", "prompt_text": "AB"},  # full [1,A,B,!]; prompt [1,A,B] -> completion=[!] (EOS) -> dropped
+        {"text": "ABx", "prompt_text": "AB"},  # completion=[x,!] has real token x -> kept
+    ]
+    kept_texts, _pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)
+    assert n_dropped == 1
+    assert [t["text"] for t in kept_texts] == ["ABx"]
+    # Without special ids the filter degrades to "any masked token" (NaN guard only): the EOS-only row
+    # survives, confirming the special-id set is what distinguishes a content-free target.
+    kept2, _, dropped2 = _pretokenize_completion_only(texts, _FakeTok(eos="!"), max_length=100)
+    assert dropped2 == 0
+    assert [t["text"] for t in kept2] == ["AB", "ABx"]
+
+
 def test_pack_carries_completion_mask_aligned():
     # The completion mask rides along with input_ids through the FFD reorder + truncation, staying
     # token-aligned (sum(seq_lengths) == len(input_ids) == len(completion_mask)).

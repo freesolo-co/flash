@@ -59,11 +59,16 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     tokenize. ``input_ids`` is token-identical to TRL's own non-packed SFT prep; ``completion_mask`` is
     0 over the prompt, 1 over the completion (the assistant turn[s] to learn).
 
-    Rows whose mask is all-zero — the whole row is prompt because ``max_length`` truncation removed the
-    completion, or the completion was empty — carry no loss and are dropped: a micro-batch (or a packed
-    block at ``per_device_train_batch_size==1``) of only such rows is all -100 and yields a NaN under
-    TRL's default nll loss. ``kept_texts`` is filtered in lockstep with ``pretok`` (zip preserves their
-    1:1 correspondence) so the caller's token/cost accounting reflects only the rows actually trained.
+    A row is dropped unless its completion span holds at least one REAL (non-special) token. This
+    covers two degenerate shapes: an ALL-ZERO mask (``max_length`` truncation removed every token past
+    the prompt) and a CONTENT-FREE completion (the assistant turn is only the turn-closer + EOS, e.g.
+    an empty/degenerate target). The former, alone in a micro-batch (or a packed block at
+    ``per_device_train_batch_size==1``), is all -100 and yields a NaN under TRL's default nll loss; the
+    latter would train the model to emit EOS immediately. "Real" is judged against the tokenizer's own
+    ``all_special_ids`` (so it's template-agnostic, not a hard-coded EOS check); when the tokenizer
+    exposes no special ids this degrades to "any masked token", preserving the NaN guard. ``kept_texts``
+    is filtered in lockstep with ``pretok`` (zip preserves their 1:1 correspondence) so the caller's
+    token/cost accounting reflects only the rows actually trained.
     """
     full_ids = tokenize_for_packing([t["text"] for t in texts], tokenizer, max_length)
     prompt_ids = tokenizer(
@@ -73,7 +78,16 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
         {"input_ids": ids, "completion_mask": completion_mask_from_ids(pids, ids)}
         for ids, pids in zip(full_ids, prompt_ids, strict=True)
     ]
-    kept = [(t, r) for t, r in zip(texts, pretok, strict=True) if any(r["completion_mask"])]
+    special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+
+    def _has_real_target(row) -> bool:
+        # >=1 completion-masked token that isn't a special token (EOS / turn-closer / pad).
+        return any(
+            m and tid not in special_ids
+            for tid, m in zip(row["input_ids"], row["completion_mask"], strict=True)
+        )
+
+    kept = [(t, r) for t, r in zip(texts, pretok, strict=True) if _has_real_target(r)]
     return [t for t, _ in kept], [r for _, r in kept], len(pretok) - len(kept)
 
 
@@ -189,8 +203,8 @@ def run_sft():
         texts, _pretok, _dropped = _pretokenize_completion_only(texts, tok, sft_max_len)
     if _dropped:
         print(
-            f"[sft] dropped {_dropped} rows with no completion target "
-            "(sft_max_len truncated away the whole completion, or an empty completion)"
+            f"[sft] dropped {_dropped} rows with no real completion target "
+            "(sft_max_len truncated away the whole completion, or an empty/content-free completion)"
         )
     if not _pretok:
         raise ValueError(
