@@ -10,7 +10,11 @@ tests exercise the pure remap and its gating without a GPU / vLLM.
 from __future__ import annotations
 
 
-def test_remap_prefixes_model_and_lm_head():
+def test_remap_prefixes_text_only_model_names():
+    """TEXT-ONLY trainer (dense Qwen3.5 -> Qwen3_5ForCausalLM, params ``model.*``): bare ``model.``
+    names get the ``language_model.`` prefix so they land under ``language_model.model.*``. ``lm_head.``
+    is now passed through UNTOUCHED — the engine's ``hf_to_vllm_mapper`` maps ``lm_head.`` ->
+    ``language_model.lm_head.`` itself, so the end result at vLLM is identical."""
     from flash.engine.worker.lora import _remap_vl_sync_weights
 
     src = [
@@ -24,8 +28,28 @@ def test_remap_prefixes_model_and_lm_head():
         "language_model.model.layers.0.self_attn.q_proj.weight": "T0",
         "language_model.model.embed_tokens.weight": "T1",
         "language_model.model.norm.weight": "T2",
-        "language_model.lm_head.weight": "T3",
+        "lm_head.weight": "T3",  # passthrough: the engine mapper handles lm_head.
     }
+
+
+def test_remap_multimodal_names_pass_through_for_engine_mapper():
+    """MULTIMODAL trainer (the Qwen3.6-35B-A3B MoE resolves to the full
+    ``Qwen3_5MoeForConditionalGeneration``, params ``model.language_model.*`` / ``model.visual.*`` /
+    ``lm_head.*``): these MUST pass through untouched. The engine's own ``hf_to_vllm_mapper`` maps
+    them (``model.language_model.`` -> ``language_model.model.`` etc.), so the sync is byte-identical
+    to the proven initial on-disk load. Regression for the fused-MoE-expert
+    ``KeyError: experts.w13_weight`` (prepending ``language_model.`` here broke the mapper match)."""
+    from flash.engine.worker.lora import _remap_vl_sync_weights
+
+    src = [
+        ("model.language_model.layers.0.mlp.experts.gate_up_proj", "E0"),  # the crashing fused expert
+        ("model.language_model.layers.0.mlp.experts.down_proj", "E1"),
+        ("model.language_model.layers.0.self_attn.qkv_proj.weight", "D0"),
+        ("model.visual.blocks.0.attn.qkv.weight", "V0"),
+        ("lm_head.weight", "L0"),
+    ]
+    out = list(_remap_vl_sync_weights(iter(src)))
+    assert out == src  # every name untouched
 
 
 def test_remap_leaves_non_lm_names_untouched():
@@ -54,7 +78,7 @@ def test_remap_strips_peft_base_model_wrapper():
     out = dict(_remap_vl_sync_weights(iter(src)))
     assert out == {
         "language_model.model.layers.1.mlp.up_proj.weight": "X",
-        "language_model.lm_head.weight": "Y",
+        "lm_head.weight": "Y",  # passthrough after wrapper strip: the engine mapper handles lm_head.
     }
 
 
