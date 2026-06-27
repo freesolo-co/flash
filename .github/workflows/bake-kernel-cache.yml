@@ -115,9 +115,7 @@ jobs:
               allowed_cuda: "13.0",
             }
     steps:
-      - uses: actions/checkout@v6
-
-      # skip arches not requested in the dispatch input
+      # Gate FIRST (no checkout needed) so skipped arches do no crane / checkout / build work.
       - name: Should bake ${{ matrix.sm }}?
         id: gate
         run: |
@@ -127,6 +125,52 @@ jobs:
             *,${{ matrix.sm }},*) echo "run=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "run=false" >> "$GITHUB_OUTPUT"; echo "skipping ${{ matrix.sm }}" ;;
           esac
+
+      - name: Install crane
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          curl -sSL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin crane
+          crane version
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolve the base + fingerprints BEFORE checkout, so the checkout (hence the warmed flash code)
+      # is pinned to the EXACT commit the base was built from. auto-rebake passes everything (fast path);
+      # a manual dispatch READS the labels off the published base, so the per-arch image always matches
+      # the base it extends (same source of truth as the gate) instead of recomputing from the checkout.
+      - name: Resolve base + fingerprints
+        id: base
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if [ -n "${{ inputs.fp_cache }}" ]; then
+            echo "ref=${{ inputs.base_ref }}" >> "$GITHUB_OUTPUT"
+            echo "fp_cache=${{ inputs.fp_cache }}" >> "$GITHUB_OUTPUT"
+            echo "fp_base=${{ inputs.fp_base }}" >> "$GITHUB_OUTPUT"
+            echo "revision=${{ inputs.base_revision }}" >> "$GITHUB_OUTPUT"
+          else
+            base="${{ inputs.base_ref || 'ghcr.io/freesolo-co/flash-worker:cu128' }}"
+            digest=$(crane digest "$base"); repo=${base%:*}
+            cfg=$(crane config "$repo@$digest")
+            echo "ref=$repo@$digest" >> "$GITHUB_OUTPUT"
+            echo "fp_cache=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')" >> "$GITHUB_OUTPUT"
+            echo "fp_base=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_base"] // ""')" >> "$GITHUB_OUTPUT"
+            echo "revision=$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Pin the checkout to the base's source commit so the warmed flash code matches the base exactly
+      # (the cache is content-keyed by the code that compiled it). Falls back to the event sha if the
+      # base predates the revision label.
+      - uses: actions/checkout@v6
+        if: steps.gate.outputs.run == 'true'
+        with:
+          ref: ${{ steps.base.outputs.revision || github.sha }}
 
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
@@ -141,42 +185,32 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: uv sync --extra server
 
-      # Use the fingerprints auto-rebake passed (the EXPENSIVE path), or compute them for a manual
-      # dispatch (which bakes on the current :cu128, whose FA specs are worker-image.yml's defaults).
-      - name: Resolve kernel fingerprints
-        if: steps.gate.outputs.run == 'true'
-        id: fp
-        run: |
-          if [ -n "${{ inputs.fp_cache }}" ]; then
-            echo "fp_cache=${{ inputs.fp_cache }}" >> "$GITHUB_OUTPUT"
-            echo "fp_base=${{ inputs.fp_base }}" >> "$GITHUB_OUTPUT"
-          else
-            python3 docker/kernel_fingerprint.py --format github >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Install Infisical CLI
         if: steps.gate.outputs.run == 'true'
         run: |
           curl -1sLf 'https://dl.cloudsmith.io/public/infisical/infisical-cli/setup.deb.sh' | sudo -E bash
           sudo apt-get update && sudo apt-get install -y infisical
 
-      # The warm pod (RUNPOD_API_KEY) + the temp dataset that ferries code/cache (HF_TOKEN) come from
-      # Infisical (/flash, prod) -- single source of truth, mirrors infisical-entrypoint.sh. The CLI
-      # takes the project UUID directly (the secrets-action wants a slug). BASE_IMAGE is digest-pinned
-      # by auto-rebake so the warm runs inside the EXACT base the per-arch tag will sit on.
+      # RUNPOD_API_KEY + HF_TOKEN come from Infisical (/flash, prod) -- mirrors infisical-entrypoint.sh;
+      # the CLI takes the project UUID directly (the secrets-action wants a slug). `env -u
+      # FLASH_CHALK_SPEC` drops any chalk-spec override living in /flash so the bake always warms the
+      # repo-default chalk (the value the fingerprint hashed) -- otherwise the image could be warmed with
+      # one chalk and labeled with another. BASE_IMAGE is digest-pinned so the warm runs inside the EXACT
+      # base the per-arch tag will sit on.
       - name: Warm kernels on a RunPod ${{ matrix.sm }} GPU -> build/kernel_cache
         if: steps.gate.outputs.run == 'true'
         env:
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
-          BASE_IMAGE: ${{ inputs.base_ref || 'ghcr.io/freesolo-co/flash-worker:cu128' }}
+          BASE_IMAGE: ${{ steps.base.outputs.ref }}
         run: |
           INFISICAL_TOKEN="$(infisical login --method=universal-auth \
             --client-id="$INFISICAL_CLIENT_ID" --client-secret="$INFISICAL_CLIENT_SECRET" \
             --silent --plain)"
           export INFISICAL_TOKEN
           infisical run --projectId "$INFISICAL_PROJECT_ID" --env prod --path /flash -- \
+            env -u FLASH_CHALK_SPEC \
             uv run python docker/bake_kernel_cache.py \
               --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
               --gpu-type-id "${{ matrix.gpu_type_id }}" \
@@ -198,17 +232,9 @@ jobs:
       - uses: docker/setup-buildx-action@v3
         if: steps.gate.outputs.run == 'true'
 
-      - name: Log in to GHCR
-        if: steps.gate.outputs.run == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       # thin layer FROM the SAME base the warmup ran inside -> the cache toolchain always matches the
       # shipped image (rebuilding the full Dockerfile.worker from the checkout could drift from the
-      # published base and bake a cache that silently won't load).
+      # published base and bake a cache that silently won't load). GHCR auth from the login step above.
       - name: Build + push baked per-sm image (thin layer on the warmed base)
         if: steps.gate.outputs.run == 'true'
         uses: docker/build-push-action@v6
@@ -219,7 +245,7 @@ jobs:
           tags: ghcr.io/freesolo-co/flash-worker:cu128-${{ matrix.sm }}
           provenance: false
           build-args: |
-            BASE=${{ inputs.base_ref || 'ghcr.io/freesolo-co/flash-worker:cu128' }}
-            FP_CACHE=${{ steps.fp.outputs.fp_cache }}
-            FP_BASE=${{ steps.fp.outputs.fp_base }}
-            BASE_REVISION=${{ inputs.base_revision || github.sha }}
+            BASE=${{ steps.base.outputs.ref }}
+            FP_CACHE=${{ steps.base.outputs.fp_cache }}
+            FP_BASE=${{ steps.base.outputs.fp_base }}
+            BASE_REVISION=${{ steps.base.outputs.revision }}

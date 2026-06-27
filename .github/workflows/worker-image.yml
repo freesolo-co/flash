@@ -36,15 +36,20 @@ on:
       # so handler changes (e.g. the weight-cache preload branch) MUST rebuild the image. flash/**
       # covers the handler source (endpoints.py); the generator lives outside flash/, so watch it too.
       - docker/make_rp_handler.py
+      # The fp_cache/fp_base labels are computed by this script at build time, so a change to the
+      # fingerprint logic must rebuild :cu128 to re-stamp them (else auto-rebake never reclassifies).
+      - docker/kernel_fingerprint.py
 
 permissions:
   contents: read
   packages: write
 
 # A newer base build supersedes an older one: cancel the in-flight run so auto-rebake (which triggers
-# on this workflow's completion) only ever reasons about the latest :cu128.
+# on this workflow's completion) only ever reasons about the latest :cu128. The tag is in the group so
+# a non-prod `tag=cu128-test` dispatch can't cancel an in-flight prod `cu128` push on the same ref
+# (which would leave :cu128 unpublished for that commit and auto-rebake blind to it).
 concurrency:
-  group: worker-image-${{ github.ref }}
+  group: worker-image-${{ github.ref }}-${{ github.event.inputs.tag || 'cu128' }}
   cancel-in-progress: true
 
 jobs:

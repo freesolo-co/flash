@@ -24,6 +24,16 @@ A stale baked cache is a SILENT cold-JIT (the worker only validates by SM, then 
 ignores a mismatched blob), never a crash. So a missing or wrong input here is invisible at run
 time, which is why every parse below FAILS LOUD rather than hashing a None.
 
+Known limitations (deliberately scoped -- each only ever costs a recoverable cold-JIT, never
+correctness, and the alternatives over-fire the approval-gated paid GPU bake):
+  * We hash the Dockerfile REQUIREMENT STRINGS, not pip-resolved versions. A cache-affecting range
+    (liger-kernel>=, the chalk spec) could resolve a newer build on a later worker-image rebuild with
+    no text change, leaving the fingerprint unmoved. Pin those exactly if you want airtight coverage.
+  * fp_cache hashes kernel_warmup.py but not its transitive flash imports (e.g. perf's Hopper
+    fla/tilelang setup). The kernel-DETERMINING inputs (tilelang/tvm-ffi/fla versions) are captured
+    here; perf code is fetched fresh at runtime, so a perf change only risks a stale sm90 cache that
+    cold-JITs. Hashing all of perf would re-warm 5 GPUs on every unrelated perf edit.
+
 stdlib only, no flash/torch import, so it runs under a bare python3 in CI (no uv sync needed).
 """
 
