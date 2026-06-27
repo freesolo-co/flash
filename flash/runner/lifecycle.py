@@ -350,6 +350,7 @@ def _run_seed_loop(
 
     total_cost = prior_cost
     seeds = spec.train.seeds
+    last_remote: dict | None = None
     for i in range(start_index, len(seeds)):
         seed = seeds[i]
         # Guard against recovery TOCTOU: another thread may have flipped the run terminal already.
@@ -366,13 +367,20 @@ def _run_seed_loop(
         with contextlib.suppress(FileNotFoundError):
             if get_status(spec.run_id).state == "cancelled":
                 raise _RunCancelled(f"run {spec.run_id} was cancelled")
-        # Clear stale handle between seeds; record next index so recovery can resume remaining seeds.
-        more_seeds = (i + 1) < len(seeds)
+        # Capture the winning handle before clearing it: the terminal `done` record carries it again
+        # (billing/gc/log fetch read remote), but the *running* gap below must keep remote=None.
+        with contextlib.suppress(FileNotFoundError):
+            last_remote = get_status(spec.run_id).remote or last_remote
+        # Clear the handle + advance the resume index after EVERY seed (including the last). A restart
+        # in the window before the `done` write then routes through resume_run, not a re-attach that
+        # would re-provision and re-bill the already-completed seed (its cost is in cost_usd above).
+        # The last seed yields resume_seed_index=len(seeds): an empty resume straight to `done`.
         _update(
             spec.run_id,
             "running",
             cost_usd=total_cost,
-            **({"remote": None, "resume_seed_index": i + 1} if more_seeds else {}),
+            remote=None,
+            resume_seed_index=i + 1,
         )
         print(
             f"seed={seed} done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
@@ -383,12 +391,15 @@ def _run_seed_loop(
         if get_status(spec.run_id).state == "cancelled":
             raise _RunCancelled(f"run {spec.run_id} was cancelled")
     # Gate side effects on the CAS succeeding — a concurrent cancel rejects the `done` write.
+    # Restore the winning handle onto the terminal record (None on the empty resume-recovery path,
+    # where the completion charge instead recovers provider/gpu from the last seed's metrics.json).
     applied = _update(
         spec.run_id,
         "done",
         cost_usd=total_cost,
         artifacts_dir=artifacts_dir(spec),
         resume_seed_index=None,
+        remote=last_remote,
     )
     if applied:
         _charge_completed_run_best_effort(spec, log)
@@ -412,6 +423,33 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
     _charge_completed_run_by_id(spec.run_id, log)
 
 
+def _billing_meta_from_last_seed(status) -> dict | None:
+    """Recover {provider, allocated_gpu} from the last seed's persisted metrics for the completion
+    charge, since the run's handle is cleared once the seed finishes."""
+    from pathlib import Path
+
+    from flash._fileio import read_json_or_empty
+    from flash.runner import artifacts_dir
+
+    try:
+        spec = JobSpec.from_dict(status.spec)
+        seeds = list(spec.train.seeds) or [0]
+        m = read_json_or_empty(
+            Path(artifacts_dir(spec)) / f"seed{seeds[-1]}" / "metrics.json"
+        )
+    except Exception:
+        return None
+    if not isinstance(m, dict) or not m:
+        return None
+    notes = m.get("notes") if isinstance(m.get("notes"), dict) else {}
+    meta = {}
+    if notes.get("provider"):
+        meta["provider"] = notes["provider"]
+    if m.get("allocated_gpu") or notes.get("runpod_gpu"):
+        meta["allocated_gpu"] = m.get("allocated_gpu") or notes.get("runpod_gpu")
+    return meta or None
+
+
 def _charge_completed_run_by_id(run_id: str, log) -> None:
     """Bill a completed run by id; reads everything from persisted RunStatus so stale specs don't block recovery."""
     from flash.runner import get_status, record_billing_state
@@ -431,6 +469,12 @@ def _charge_completed_run_by_id(run_id: str, log) -> None:
 
     record_billing_state(run_id, billing_state="charging", billing_error=None)
     status = get_status(run_id)
+    # The handle is cleared at completion, so recover provider/gpu (COGS attribution that
+    # charge_completed_run reads off status.remote) from the last seed's persisted metrics.
+    if not status.remote:
+        meta = _billing_meta_from_last_seed(status)
+        if meta:
+            status.remote = meta
     try:
         charge = charge_completed_run(internal_key=internal_key, status=status)
     except BillingError as exc:

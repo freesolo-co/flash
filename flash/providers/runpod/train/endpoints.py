@@ -318,7 +318,7 @@ def _train_body(input_data: dict) -> dict:
         if proc.returncode != 0 and check:
             raise RuntimeError(
                 f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
-                f"and error_{mode}.txt in the HF dataset repo"
+                f"and error_{mode}_attempt*.txt in the HF dataset repo"
             )
         return proc.returncode
 
@@ -333,7 +333,7 @@ def _train_body(input_data: dict) -> dict:
         _upload_console(phase)
         raise RuntimeError(
             f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
-            f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF "
+            f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
             f"dataset repo for the full traceback"
         )
     with open("/tmp/metrics.json") as f:

@@ -224,6 +224,11 @@ class ApiClient:
             # int(True/False) silently coerces to 1/0 — fail fast before the server 400s.
             if isinstance(step, bool):
                 raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
+            # int() silently truncates floats (2.7 -> 2 deploys the wrong checkpoint).
+            if isinstance(step, float) and not step.is_integer():
+                raise ClientError(
+                    f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
+                )
             body["step"] = int(step)
         return self._request(
             "POST",

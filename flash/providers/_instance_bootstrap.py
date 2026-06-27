@@ -345,7 +345,8 @@ def main() -> int:
         if not os.path.exists("/tmp/metrics.json"):
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
-                f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF dataset repo"
+                f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
+                f"dataset repo"
             )
         # Non-zero rc is tolerated only when completion artifacts landed on HF: RL's vLLM can
         # segfault at interpreter exit AFTER DONE/metrics.json are already uploaded.
@@ -353,8 +354,8 @@ def main() -> int:
             raise RetriableBootstrapError(
                 f"train phase '{phase}' exited non-zero ({rc}) and its required completion "
                 f"artifacts (DONE/metrics.json) are not on HF — the run did not finish (e.g. a "
-                f"failed upload after the local metrics.json was written); see error_{phase}.txt "
-                f"and console_{phase}.txt in the HF dataset repo"
+                f"failed upload after the local metrics.json was written); see "
+                f"error_{phase}_attempt*.txt and console_{phase}.txt in the HF dataset repo"
             )
         ok = True
     except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt
