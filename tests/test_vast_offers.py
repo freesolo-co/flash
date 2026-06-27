@@ -52,7 +52,9 @@ def test_usable_offers_filters_and_order(monkeypatch):
 
     captured = {}
 
-    def fake_search(min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, limit=64, extra_q=None):
+    def fake_search(
+        min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, min_duration_seconds=0, limit=64, extra_q=None
+    ):
         captured["min_vram_mb"] = min_vram_mb
         captured["min_disk_gb"] = min_disk_gb
         return list(FIXTURE)
@@ -113,15 +115,39 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
 
     captured = {}
 
-    def fake_search(min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, limit=64, extra_q=None):
+    def fake_search(
+        min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, min_duration_seconds=0, limit=64, extra_q=None
+    ):
         captured["limit"] = limit
+        captured["min_duration_seconds"] = min_duration_seconds
         return []
 
     monkeypatch.setattr(vast_api, "search_offers", fake_search)
     vast.usable_offers(24, disk_gb=60)
     assert captured["limit"] >= 256  # wide default page (was 64)
+    assert captured["min_duration_seconds"] == 0  # no deadline -> duration filter off
     vast.usable_offers(24, disk_gb=60, limit=512)
     assert captured["limit"] == 512  # explicit override honored
+
+
+def test_usable_offers_threads_duration_floor(monkeypatch):
+    # Codex Msvb0: when a wall cap is supplied, usable_offers requires offers available for at least
+    # max_wall + PROVISION_GRACE_S (the SAME deadline the poller enforces), so the search never returns
+    # an offer that would expire mid-run. 0 wall = no duration floor.
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_search(min_vram_mb, *, min_duration_seconds=0, **k):
+        captured["min_duration_seconds"] = min_duration_seconds
+        return []
+
+    monkeypatch.setattr(vast_api, "search_offers", fake_search)
+    vast.usable_offers(24, disk_gb=60, max_wall_seconds=7200.0)
+    assert captured["min_duration_seconds"] == 7200.0 + vast.PROVISION_GRACE_S
+    vast.usable_offers(24, disk_gb=60)  # no wall cap -> filter stays off
+    assert captured["min_duration_seconds"] == 0
 
 
 def test_live_rates_gates_on_min_disk(monkeypatch):

@@ -105,6 +105,7 @@ def usable_offers(
     disk_gb: float,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
     limit: int = 256,
+    max_wall_seconds: float = 0,
 ) -> list[VastOffer]:
     """Verified-datacenter offers able to run the job, cheapest first.
 
@@ -117,11 +118,17 @@ def usable_offers(
     a larger fitting class that has usable offers just past the limit. 256 comfortably covers the
     verified-datacenter market across the managed GPU classes; a specific-class caller still filters
     down client-side (a wider page only gives it more candidates).
+
+    ``max_wall_seconds`` is the run's wall cap; when set, the search additionally requires offers to be
+    available for at least ``max_wall + PROVISION_GRACE_S`` (the SAME deadline the poller enforces, so
+    the search never advertises capacity an offer can't outlast). 0 = no duration floor.
     """
+    min_duration = (max_wall_seconds + PROVISION_GRACE_S) if max_wall_seconds and max_wall_seconds > 0 else 0
     rows = vast_api.search_offers(
         int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
+        min_duration_seconds=min_duration,
         limit=int(limit),
     )
     out: list[VastOffer] = []
@@ -277,6 +284,7 @@ def deploy_and_submit(
                         min(o.vram_gb for o in offers),
                         _effective_disk_gb(spec),
                         exclude_machine_ids=taken,
+                        max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
                     )
                     if o.gpu in allowed
                 ][:5]
@@ -632,7 +640,13 @@ def submit_run_vast(
         )
     info = GPU_INFO[spec.gpu.type]
     offers = [
-        o for o in usable_offers(info.vram_gb, _effective_disk_gb(spec)) if o.gpu == spec.gpu.type
+        o
+        for o in usable_offers(
+            info.vram_gb,
+            _effective_disk_gb(spec),
+            max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+        )
+        if o.gpu == spec.gpu.type
     ]
     handle = deploy_and_submit(
         spec, seed, offers, attempt=attempt, log=log, runtime_secrets=runtime_secrets

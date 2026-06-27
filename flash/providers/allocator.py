@@ -109,7 +109,7 @@ def _lambda_candidates(need: int) -> list[Candidate]:
     return out
 
 
-def _vast_candidates(need: int, disk_gb: float = 0.0) -> list[Candidate]:
+def _vast_candidates(need: int, disk_gb: float = 0.0, max_wall_seconds: float = 0.0) -> list[Candidate]:
     """Vast's fitting classes that currently have a LIVE verified-datacenter offer, priced live.
 
     Capacity-aware like Lambda: a Vast class with no fitting offer on the market right now is EXCLUDED,
@@ -121,7 +121,8 @@ def _vast_candidates(need: int, disk_gb: float = 0.0) -> list[Candidate]:
     ``disk_gb`` is the run's requested disk; the capacity search uses the SAME effective floor
     (``max(disk_gb, MIN_DISK_GB)``) the submit path provisions with, so a high-disk run isn't advertised
     Vast capacity that only exists at the 60 GB floor and then fails to rent (an impossible attempt that
-    a max_retries=0 run never escapes).
+    a max_retries=0 run never escapes). ``max_wall_seconds`` is likewise threaded into the SAME duration
+    floor the submit path uses, so a long run isn't advertised short-lived offers that expire mid-run.
     """
     from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
 
@@ -133,7 +134,11 @@ def _vast_candidates(need: int, disk_gb: float = 0.0) -> list[Candidate]:
         # Search once at the smallest fitting class's VRAM floor; usable_offers returns every managed
         # class at/above it, which we then restrict to the fitting set.
         floor = min(g.vram_gb for g in fitting)
-        offers = usable_offers(floor, max(float(disk_gb or 0.0), MIN_DISK_GB))
+        offers = usable_offers(
+            floor,
+            max(float(disk_gb or 0.0), MIN_DISK_GB),
+            max_wall_seconds=float(max_wall_seconds or 0.0),
+        )
     except Exception as exc:
         logger.warning("vast capacity lookup failed (%s); allocating without vast", exc)
         return []
@@ -156,6 +161,7 @@ def allocate(
     train=None,
     thinking: bool = False,
     disk_gb: float = 0.0,
+    max_wall_seconds: float = 0.0,
 ) -> Allocation:
     """Pick the cheapest fitting (provider, GPU class) able to run the job.
 
@@ -176,7 +182,7 @@ def allocate(
     if "lambda" in available:
         candidates += _lambda_candidates(need)
     if "vast" in available:
-        candidates += _vast_candidates(need, disk_gb)
+        candidates += _vast_candidates(need, disk_gb, max_wall_seconds)
     if not candidates:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "

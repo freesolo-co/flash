@@ -9,6 +9,8 @@ box); callers re-check hosting_type + verification + the reliability floor clien
 
 from __future__ import annotations
 
+import http.client
+import json
 import time
 import urllib.error
 import urllib.parse
@@ -63,6 +65,7 @@ def search_offers(
     *,
     min_disk_gb: float = 0,
     min_reliability: float = 0.95,
+    min_duration_seconds: float = 0,
     limit: int = 64,
     extra_q: dict | None = None,
 ) -> list[dict]:
@@ -71,6 +74,11 @@ def search_offers(
     ``datacenter`` here is Vast's hosting-type filter (professional datacenters vs
     consumer/hobbyist machines); results additionally carry ``hosting_type`` which
     callers re-check (``usable_offers``) — never trust one filter layer alone.
+
+    ``min_duration_seconds`` applies Vast's documented ``duration`` filter ("the offer must be
+    available for at least this long from now", in seconds): a run whose wall cap exceeds an offer's
+    remaining availability would otherwise rent a short-lived offer that expires/preempts mid-run,
+    burning retries (fatal for ``max_retries=0``) while longer offers/providers went unused. 0 = off.
     """
     # Apply Vast's server-side datacenter-only filter (hosting_type==1). usable_offers now rejects
     # community/marketplace hosts unconditionally (run secrets ship to the box), so a mixed search
@@ -91,6 +99,10 @@ def search_offers(
     }
     if min_disk_gb:
         q["disk_space"] = {"gte": float(min_disk_gb)}
+    if min_duration_seconds and min_duration_seconds > 0:
+        # Same operator-dict form as every other numeric filter above (gpu_ram/disk_space/reliability2):
+        # keep only offers Vast says are available for at least the run's deadline.
+        q["duration"] = {"gte": float(min_duration_seconds)}
     if extra_q:
         q.update(extra_q)
     out = request_with_retries("/v0/search/asks/", method="PUT", body={"q": q})
@@ -140,7 +152,20 @@ def create_instance(
     # walks to the next offer, and to the orchestrator, which consumes a run retry; a
     # duplicate paid instance is the worse failure. (Idempotent calls — search,
     # detail, destroy — keep their retries.)
-    out = request_with_retries(f"/v0/asks/{int(offer_id)}/", method="PUT", body=body, retries=0)
+    try:
+        out = request_with_retries(f"/v0/asks/{int(offer_id)}/", method="PUT", body=body, retries=0)
+    except (json.JSONDecodeError, http.client.HTTPException) as e:
+        # A 200 whose body is truncated / non-JSON on this NON-IDEMPOTENT create: Vast may have
+        # already accepted the PUT and billed a contract while the RESPONSE leg failed, so we have a
+        # phantom instance with no returned id. JSONDecodeError (ValueError) and IncompleteRead
+        # (HTTPException) are NOT OSErrors, so the _http retry wrapper neither catches nor wraps them
+        # — they'd otherwise escape as a raw decode error past deploy_and_submit's ``except
+        # VastApiError`` and skip the ambiguous-create reconcile (leaking the contract). Re-raise as a
+        # VastApiError chaining the cause so create_error_is_ambiguous classifies it AMBIGUOUS and the
+        # adopt-by-label / destroy-and-abort path runs.
+        raise VastApiError(
+            f"create_instance({offer_id}) response unreadable (possible billed contract): {e}"
+        ) from e
     if not isinstance(out, dict) or not out.get("success"):
         raise VastApiError(f"create_instance({offer_id}) rejected: {out}")
     instance_id = out.get("new_contract")
@@ -173,6 +198,15 @@ def create_error_is_ambiguous(err: Exception) -> bool:
     if isinstance(cause, urllib.error.HTTPError):  # subclass of OSError -> check first (4xx stays False)
         return cause.code >= 500 or cause.code == 429
     if isinstance(cause, OSError):  # URLError / TimeoutError / ConnectionError + any other socket error
+        return True
+    # A 200 whose body could not be read/parsed on the non-idempotent create (truncated read /
+    # non-JSON): the host may have billed a contract while the RESPONSE was lost, so this is
+    # ambiguous, NOT a clean rejection. JSONDecodeError (ValueError) and IncompleteRead/HTTPException
+    # are not OSErrors so they miss the branches above; create_instance wraps them as a VastApiError
+    # chaining the cause, but match a bare one too (defensive).
+    if isinstance(err, (json.JSONDecodeError, http.client.HTTPException)) or isinstance(
+        cause, (json.JSONDecodeError, http.client.HTTPException)
+    ):
         return True
     return "no instance id" in str(err)  # success body without a contract id -> may be billing
 

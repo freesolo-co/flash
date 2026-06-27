@@ -296,6 +296,9 @@ def _submit_seed_supervised(
                 # floor submit provisions with — else a high-disk run is advertised Vast capacity that
                 # only exists at 60 GB and then can't rent.
                 disk_gb=float(getattr(spec.gpu, "disk_gb", 0.0) or 0.0),
+                # The run's wall cap, so the Vast capacity check requires offers available for at least
+                # max_wall+grace — else a long run is advertised short-lived offers that expire mid-run.
+                max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0.0) or 0.0),
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError

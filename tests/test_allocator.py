@@ -430,3 +430,23 @@ def test_vast_candidates_searches_at_effective_disk(monkeypatch):
     assert captured["disk_gb"] == 200.0
     allocator._vast_candidates(16, disk_gb=10.0)  # below the floor still clamps up
     assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB
+
+
+def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
+    # Codex Msvb0: the allocator's Vast capacity search must thread the run's wall cap so usable_offers
+    # applies the duration floor — else the allocator advertises Vast classes whose only live offers
+    # expire before the run finishes (fatal for a max_retries=0 run).
+    from flash.providers import allocator
+    from flash.providers.vast import jobs as vast_jobs
+
+    captured = {}
+
+    def fake_usable(vram_floor, disk_gb, *a, **k):
+        captured["max_wall_seconds"] = k.get("max_wall_seconds")
+        return []
+
+    monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
+    allocator._vast_candidates(16)  # default -> no deadline threaded (0 = duration filter off)
+    assert captured["max_wall_seconds"] == 0.0
+    allocator._vast_candidates(16, max_wall_seconds=7200.0)  # long run threads its wall cap
+    assert captured["max_wall_seconds"] == 7200.0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import urllib.error
@@ -89,6 +90,23 @@ def test_search_offers_query_shape(monkeypatch):
     assert q["disk_space"] == {"gte": 60.0}
     assert q["reliability2"] == {"gte": 0.97}
     assert q["order"] == [["dph_total", "asc"]]
+    # No duration filter unless a deadline is threaded in (default off).
+    assert "duration" not in q
+
+
+def test_search_offers_applies_duration_filter(monkeypatch):
+    # Codex Msvb0: a run whose wall cap exceeds an offer's remaining availability must not rent a
+    # short-lived offer. When min_duration_seconds is set, the search adds Vast's documented
+    # `duration` filter (seconds, "available at least this long from now") in the same operator-dict
+    # form as the other numeric filters; 0/unset leaves it off.
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    calls = _capture_urlopen(monkeypatch, [{"offers": []}, {"offers": []}])
+    vast_api.search_offers(24576, min_duration_seconds=7200.0)
+    assert calls[0][2]["q"]["duration"] == {"gte": 7200.0}
+    vast_api.search_offers(24576, min_duration_seconds=0)
+    assert "duration" not in calls[1][2]["q"]
 
 
 def test_request_retries_5xx_and_429_then_succeeds(monkeypatch):
@@ -159,6 +177,48 @@ def test_create_instance_is_not_retried(monkeypatch):
     assert len(calls) == 1  # exactly one create attempt, never a retry
 
 
+def test_create_instance_unreadable_response_is_ambiguous(monkeypatch):
+    # Codex Msvbz: a 200 with a truncated / non-JSON body on the NON-IDEMPOTENT create may mean the
+    # host already billed a contract while the RESPONSE leg failed. Such a failure (JSONDecodeError /
+    # IncompleteRead — neither an OSError, so the _http retry wrapper doesn't catch/wrap them) must
+    # surface as a VastApiError the walk classifies AMBIGUOUS, NOT escape raw past deploy_and_submit's
+    # `except VastApiError` and leak the contract.
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast_api.time, "sleep", lambda s: None)
+    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+
+    class _NonJsonResp:  # 200 with a non-JSON body -> json.loads raises JSONDecodeError
+        def read(self):
+            return b"<html>502 Bad Gateway (truncated)</html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _ReadFailsResp:  # 200 whose body read truncates -> http.client.IncompleteRead
+        def read(self):
+            raise http.client.IncompleteRead(b"partial")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    for resp in (_NonJsonResp(), _ReadFailsResp()):
+        monkeypatch.setattr(
+            vast_api.urllib.request, "urlopen", lambda req, timeout=None, _r=resp: _r
+        )
+        with pytest.raises(vast_api.VastApiError, match="unreadable") as ei:
+            vast_api.create_instance(123, **kwargs)
+        # the wrapped error is classified AMBIGUOUS so deploy_and_submit reconciles by label
+        assert vast_api.create_error_is_ambiguous(ei.value) is True
+
+
 def test_get_instance_none_on_404(monkeypatch):
     from flash.providers.vast import api as vast_api
 
@@ -209,6 +269,18 @@ def test_create_error_is_ambiguous_classification():
     assert vast_api.create_error_is_ambiguous(err(TimeoutError("read timed out"))) is True
     assert vast_api.create_error_is_ambiguous(err(ConnectionResetError("peer reset"))) is True
     assert vast_api.create_error_is_ambiguous(err(OSError("socket error"))) is True
+    # Codex Msvbz: a 200 whose body is unreadable (truncated read / non-JSON) on the non-idempotent
+    # create -> AMBIGUOUS. JSONDecodeError (a ValueError) and IncompleteRead (an HTTPException) are
+    # NOT OSErrors, so they miss the branches above and must be classified explicitly — both when
+    # create_instance wraps them as a VastApiError-from-cause AND if a bare one ever reaches here.
+    from http.client import IncompleteRead  # bare name: the local http() helper above shadows the module
+
+    jde = json.JSONDecodeError("Expecting value", "x", 0)
+    assert vast_api.create_error_is_ambiguous(err(jde)) is True  # wrapped (cause is JSONDecodeError)
+    assert vast_api.create_error_is_ambiguous(jde) is True  # bare
+    inc = IncompleteRead(b"partial")
+    assert vast_api.create_error_is_ambiguous(err(inc)) is True  # wrapped (cause is IncompleteRead)
+    assert vast_api.create_error_is_ambiguous(inc) is True  # bare
 
 
 def test_destroy_instance_never_raises(monkeypatch):
