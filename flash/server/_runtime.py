@@ -165,10 +165,18 @@ def recover_runs() -> None:
     )
 
     active: set[str] = set()
+    # Every run this plane knows about (whatever its state). This is the multi-plane safety scope for
+    # the orphan sweep below — WITHOUT it, a restarting plane sharing a Vast/Lambda account sees the
+    # OTHER plane's `flash-` instances as "not active locally" and the providers' unscoped
+    # known_labels=None path would DESTROY them (the same guard app.py's periodic sweep already
+    # passes). `active` (handle-backed/resuming only) is the narrower must-keep set; `known` is the
+    # broad don't-touch-other-planes set. Both belong on the sweep.
+    known: set[str] = set()
     # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
     # attempt is reaped without racing the resubmit's fresh allocation.
     resubmit: list[JobSpec] = []
     for row in db.all_runs():
+        known.add(row["run_id"])
         try:
             status = get_status(row["run_id"])
         except FileNotFoundError:
@@ -227,7 +235,7 @@ def recover_runs() -> None:
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
-            prov.sweep_orphans(active_labels=active)
+            prov.sweep_orphans(active_labels=active, known_labels=known)
 
     for spec in resubmit:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)

@@ -20,13 +20,15 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from flash.providers._instance import (
+    _spill_large_spec_to_hf,
+    instance_label,
+    run_label_prefix,
+)
+
 # Shared instance-provider helpers (single source of truth; Vast binds arm="vast" + its own onstart).
 from flash.providers._instance import (
     build_payload as _shared_build_payload,
-)
-from flash.providers._instance import (
-    instance_label,
-    run_label_prefix,
 )
 
 __all__ = [
@@ -134,6 +136,10 @@ def build_onstart(payload: dict) -> str:
     The bootstrap source is the SHARED ``_instance_bootstrap.py`` (the same module Lambda's
     cloud-init runs inside its container), so the in-container behavior is identical across substrates.
     """
+    # Spill a large job spec to HF first (same as Lambda's build_user_data): a big inline spec would
+    # balloon the base64 payload and can blow Vast's exec-arg / onstart length limit, failing the rent
+    # before any handle is persisted. Idempotent — a small (or already-spilled) payload rides inline.
+    payload = _spill_large_spec_to_hf(payload)
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     # Ship the SHARED instance bootstrap (sibling of the vast package's parent: providers/_instance_bootstrap.py).
     bootstrap_src = (Path(__file__).parent.parent.parent / "_instance_bootstrap.py").read_text()

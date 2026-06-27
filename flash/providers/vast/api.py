@@ -154,12 +154,21 @@ def create_error_is_ambiguous(err: Exception) -> bool:
     taken / bad request, ``code < 500`` and not 429) carries a chained ``HTTPError``; a
     ``success: false`` body is raised with NO chained cause. AMBIGUOUS (a contract may exist): a 5xx,
     a 429 (rate-limit — the request may have been accepted then throttled on the response, so a billed
-    instance can exist without a returned id; mirrors Lambda's launch path), a network/timeout
-    (``URLError`` with no ``.code``), or a ``success`` body that carried no instance id."""
+    instance can exist without a returned id; mirrors Lambda's launch path), ANY socket-level
+    transient (timeout / connection reset / DNS), or a ``success`` body that carried no instance id.
+
+    The socket-level case must match every cause ``RestClient`` can chain, not just ``URLError``:
+    urllib raises a BARE ``TimeoutError`` (== ``socket.timeout``) / ``ConnectionError`` when a request
+    times out or drops on the RESPONSE leg (after the host already accepted the non-idempotent
+    ``PUT /asks/{id}`` and billed a contract) — those are NOT ``URLError`` subclasses, so keying off
+    ``URLError`` alone let a read-phase timeout look like a clean rejection and leak the instance.
+    ``OSError`` is exactly the right boundary: ``URLError``, ``TimeoutError`` and ``ConnectionError``
+    are all ``OSError`` subclasses, matching the ``_http`` wrapper's transient except-tuple precisely.
+    ``HTTPError`` (also an ``OSError``) is checked FIRST so a 4xx stays definitive."""
     cause = getattr(err, "__cause__", None)
-    if isinstance(cause, urllib.error.HTTPError):  # subclass of URLError -> check first
+    if isinstance(cause, urllib.error.HTTPError):  # subclass of OSError -> check first (4xx stays False)
         return cause.code >= 500 or cause.code == 429
-    if isinstance(cause, urllib.error.URLError):  # connection error / timeout
+    if isinstance(cause, OSError):  # URLError / TimeoutError / ConnectionError + any other socket error
         return True
     return "no instance id" in str(err)  # success body without a contract id -> may be billing
 

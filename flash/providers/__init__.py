@@ -23,6 +23,12 @@ from flash.providers.base import Provider
 # Active provider order is also the tie-break preference (RunPod wins price ties, then Lambda, Vast).
 PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "vast")
 
+# Instance-billed providers: they rent a VM/container that BILLS UNTIL TERMINATED, so they need the
+# generic instance-cleanup paths (retry teardown, gc-by-label) that endpoint-based RunPod doesn't.
+# Single source of truth — keep cleanup/realization sites pointed here so a new instance provider is
+# wired into every reaper by adding ONE name (not by hunting hardcoded ("lambda", "vast") tuples).
+INSTANCE_PROVIDERS: tuple[str, ...] = ("lambda", "vast")
+
 
 def get_provider(name: str) -> Provider:
     """The ``Provider`` singleton for a registered name (raises on unknown)."""

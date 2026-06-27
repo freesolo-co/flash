@@ -230,6 +230,8 @@ def _submit_seed_supervised(
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
+            from flash.providers import INSTANCE_PROVIDERS
+
             if last_handle.get("endpoint_id"):
                 try:
                     from flash.providers.runpod import api as runpod_api
@@ -245,11 +247,11 @@ def _submit_seed_supervised(
                 except Exception:
                     # Logging the host-escape note is cosmetic; never let it abort the retry.
                     pass
-            elif last_handle.get("provider") == "lambda":
-                # An instance-based provider bills until terminated: tear the previous attempt's
-                # instance down so the retry lands on a fresh host (and we stop paying for the sick
-                # one). Dispatched generically through the handle's provider (destroy() knows the
-                # provider's own id field — instance_id for Lambda).
+            elif last_handle.get("provider") in INSTANCE_PROVIDERS:
+                # An instance-based provider (Lambda/Vast) bills until terminated: tear the previous
+                # attempt's instance down so the retry lands on a fresh host (and we stop paying for the
+                # sick one). Dispatched generically through the handle's provider (destroy() knows the
+                # provider's own id field — instance_id for Lambda/Vast).
                 with contextlib.suppress(Exception):
                     from flash.providers import get_provider
                     from flash.providers.base import JobHandle
@@ -670,13 +672,13 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
-    # Instance-based providers (Lambda) bill until terminated: the runner's per-attempt
+    # Instance-based providers (Lambda/Vast) bill until terminated: the runner's per-attempt
     # `finally` already tears them down, but a crashed supervisor thread can leave one behind. Reap
     # any instance still named for this run via each configured provider's gc (best-effort).
-    from flash.providers import available_providers, get_provider
+    from flash.providers import INSTANCE_PROVIDERS, available_providers, get_provider
 
     _avail = available_providers()
-    for _prov in ("lambda",):
+    for _prov in INSTANCE_PROVIDERS:
         if _prov in _avail:
             with contextlib.suppress(Exception):
                 get_provider(_prov).gc(spec)

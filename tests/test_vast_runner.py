@@ -112,6 +112,43 @@ def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch
     assert "no python interpreter" in script
 
 
+def test_onstart_spills_large_spec_to_hf(monkeypatch):
+    """Codex MsMPw: a large inline job spec is spilled to HF (parity with Lambda's build_user_data)
+    so it never inflates the base64 onstart past Vast's exec-arg / onstart length limit and fails the
+    rent before a handle is persisted. A small spec rides inline unchanged."""
+    import huggingface_hub
+
+    from flash.providers.vast.jobs import builders
+
+    uploaded = {}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
+            uploaded.update(path=path_in_repo, repo=repo_id, type=repo_type)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    big = "x" * 20_000  # > _SPEC_SPILL_THRESHOLD (16k)
+    payload = {
+        "job_spec_json": big,
+        "hf_prefix": "sft/run/seed0",
+        "hf_repo": "org/repo",
+        "env": {"HF_TOKEN": "t"},
+        "flash_arm": "vast",
+    }
+    script = builders.build_onstart(payload)
+    assert big not in script  # the giant spec is NOT embedded inline...
+    assert uploaded["path"] == "sft/run/seed0/job_spec.json"  # ...it was spilled to the dataset repo
+    assert uploaded["type"] == "dataset"
+    b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
+    embedded = json.loads(base64.b64decode(b64))
+    assert embedded["job_spec_in_hf"] is True
+    assert embedded["job_spec_json"] == ""
+
+
 def test_build_payload_sets_vast_arm():
     """build_payload stamps flash_arm='vast' so the metrics record attributes the substrate, and the
     shared bootstrap turns it into FLASH_ARM."""
@@ -456,6 +493,34 @@ def test_poll_running_no_heartbeat_first_liveness_fails_over(monkeypatch):
     assert res.failure == "stalled"
     assert "no worker heartbeat" in res.detail
     assert "limit 500s" in res.detail
+
+
+def test_poll_container_log_output_protects_slow_bootstrap(monkeypatch):
+    """Codex MsMPz: a 'running' container with NO worker heartbeat but ACTIVE container-log output
+    (slow per-run pip install / code fetch) is a healthy cold start, not a wedged host — so the
+    container-log signal latches and the run is governed by setup_grace_s, NOT fast-failed at
+    first_liveness_s the way a genuinely silent box is. Mirrors Lambda's boot.log liveness."""
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        logs="Collecting torch...\nDownloading flash code...",  # bootstrap is producing output
+        step=100.0,
+    )
+    res = vast.poll_vast_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        first_liveness_s=300.0,  # would fast-fail a SILENT box here
+        setup_grace_s=4000.0,
+        stall_after_s=200.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    # governed by the larger SETUP grace, not the first-liveness fast-fail
+    assert "setup (pre-training)" in res.detail
+    assert "limit 4000s" in res.detail
+    assert "no worker heartbeat" not in res.detail
 
 
 def test_poll_fresh_boot_heartbeat_satisfies_liveness(monkeypatch):

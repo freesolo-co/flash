@@ -202,6 +202,13 @@ def test_create_error_is_ambiguous_classification():
     assert vast_api.create_error_is_ambiguous(err(http(429))) is True  # Cursor MsA6e: rate-limit
     assert vast_api.create_error_is_ambiguous(err(urllib.error.URLError("timed out"))) is True
     assert vast_api.create_error_is_ambiguous(err(msg="...: no instance id in response: {}")) is True
+    # Codex MsMPk: the _http RestClient also chains BARE socket errors (TimeoutError ==
+    # socket.timeout, ConnectionError, generic OSError) — a RESPONSE-leg timeout of the non-idempotent
+    # PUT /asks AFTER the host billed a contract surfaces as one of these, NOT a URLError. They MUST be
+    # ambiguous (else the walk treats a real billed instance as a clean rejection and leaks it).
+    assert vast_api.create_error_is_ambiguous(err(TimeoutError("read timed out"))) is True
+    assert vast_api.create_error_is_ambiguous(err(ConnectionResetError("peer reset"))) is True
+    assert vast_api.create_error_is_ambiguous(err(OSError("socket error"))) is True
 
 
 def test_destroy_instance_never_raises(monkeypatch):

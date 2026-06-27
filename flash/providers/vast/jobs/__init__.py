@@ -26,6 +26,7 @@ from collections.abc import Callable
 
 from flash._logging import get_logger
 from flash.providers._poll import (
+    BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
     FIRST_LIVENESS_S,
     PollErrorTracker,
@@ -449,6 +450,12 @@ def poll_vast_job(
     # Any FRESH heartbeat from THIS attempt (boot included) proves the worker started -> clears the
     # first-liveness deadline. Distinct from seen_training_hb (which gates the tighter training window).
     seen_fresh_hb = False
+    # Vast-parity for Lambda's boot.log liveness: a non-empty CONTAINER LOG tail proves the bootstrap
+    # is alive (pip install / code fetch can legitimately outlast first_liveness_s before the worker's
+    # first heartbeat), so we don't fast-fail a healthy cold start. ``console_log_absent_polls`` requires
+    # the silence to persist across BOOT_LOG_ABSENT_POLLS so a transient log-API blip can't burn a retry.
+    console_log_seen = False
+    console_log_absent_polls = 0
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
@@ -554,24 +561,40 @@ def poll_vast_job(
         # model download), so use the larger setup grace; tighten only once training begins.
         if became_running:
             # Fast-failover: a container that reached 'running' but never emitted ANY heartbeat past
-            # first_liveness_s is a wedged host -> 'stalled' (infra-shaped -> the runner fails over
+            # first_liveness_s MIGHT be a wedged host -> 'stalled' (infra-shaped -> the runner fails over
             # cross-provider), instead of burning the full setup grace. The observed-running floor
-            # keeps a reattach from fast-failing a box that only just came up.
+            # keeps a reattach from fast-failing a box that only just came up. But a healthy box doing a
+            # slow per-run pip install + code fetch (the documented cold-start that SETUP_GRACE_S covers)
+            # also has no worker heartbeat yet — so before failing over, consult Vast's container-log
+            # API: a non-empty tail means the bootstrap is actively producing output (alive), so latch
+            # and let setup_grace_s govern instead. Only a genuinely SILENT container (no logs across
+            # BOOT_LOG_ABSENT_POLLS) is the wedged host we fast-fail. Mirrors Lambda's boot.log path.
             if (
                 not seen_fresh_hb
+                and not console_log_seen
                 and time.time() - running_since > first_liveness_s
                 and observed_running_since is not None
                 and time.time() - observed_running_since > FIRST_LIVENESS_OBSERVED_FLOOR_S
             ):
-                terminal = terminal_artifact_result()
-                if terminal is not None:
-                    return terminal
-                return PollResult(
-                    False,
-                    failure="stalled",
-                    detail=f"no worker heartbeat for {int(time.time() - running_since)}s after the "
-                    f"container started (worker never came up; limit {int(first_liveness_s)}s)",
-                )
+                if not vast_api.instance_logs(handle.instance_id):
+                    # A lone empty read can be a transient log-API error -> require the silence to
+                    # persist across BOOT_LOG_ABSENT_POLLS before failing over.
+                    console_log_absent_polls += 1
+                    if console_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
+                        terminal = terminal_artifact_result()
+                        if terminal is not None:
+                            return terminal
+                        return PollResult(
+                            False,
+                            failure="stalled",
+                            detail=f"no worker heartbeat AND no container-log output for "
+                            f"{int(time.time() - running_since)}s after the container started "
+                            f"(worker never came up; limit {int(first_liveness_s)}s)",
+                        )
+                else:
+                    # The bootstrap is producing output -> healthy slow cold start, not wedged. Stop
+                    # fast-failing; setup_grace_s/stall_after_s below remain the backstop.
+                    console_log_seen = True
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 terminal = terminal_artifact_result()
