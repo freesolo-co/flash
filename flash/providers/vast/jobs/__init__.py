@@ -253,11 +253,16 @@ def deploy_and_submit(
                 # AMBIGUOUS create with NOTHING adopted: a billed contract may still exist but not be
                 # visible yet (object-store / API eventual consistency). Renting another offer would
                 # double-provision, so ABORT the walk and surface to the orchestrator (which consumes a
-                # run retry); the orphan sweep reclaims any instance that later materializes. We do NOT
-                # walk on — a duplicate paid instance is the worse failure (see create_instance).
+                # run retry). PROACTIVELY destroy this run's instances by label first (mirrors Lambda's
+                # ambiguous path calling terminate_run_instances) so a phantom contract that DID
+                # materialize is killed now, not left billing through retries while sweep_orphans
+                # shields it as a still-active run. Best-effort (destroy_run_instances never raises).
+                destroyed = destroy_run_instances(spec.run_id)
+                if destroyed:
+                    say(f"destroyed {len(destroyed)} possible phantom instance(s) {destroyed} on abort")
                 raise vast_api.VastApiError(
                     f"ambiguous vast create on offer {offer.offer_id} (label={label}); aborting the "
-                    f"offer walk to avoid double-provisioning (orphan sweep reclaims any leak): {e}"
+                    f"offer walk to avoid double-provisioning (destroyed phantom by label): {e}"
                 ) from e
             if not candidates and not refreshed:
                 refreshed = True

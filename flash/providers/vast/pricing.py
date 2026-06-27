@@ -4,7 +4,11 @@ RunPod prices a fixed class catalog; Vast is a live market, so a class's "rate" 
 cheapest currently-usable offer for it (``usable_offers``). This module gives the
 provider interface a uniform ``hourly_rate(gpu)`` and a ``live_rates()`` map for the
 ``flash gpus`` table. Offline-safe: without ``VAST_API_KEY`` (or on any failure) it falls
-back to the static Vast snapshot carried on ``GpuClass.hourly_usd``.
+back to the shared catalog snapshot (``GpuClass.hourly_usd`` — the RunPod static rate,
+NOT a live Vast price), a rough proxy that may not match the live Vast market. The
+authoritative Vast rate is the live path; the fallback exists only so an offline cost
+estimate / ``flash gpus`` render never crashes. (A dedicated Vast static snapshot, like
+``lambdalabs/pricing.py`` carries, is the follow-up to make the offline number Vast-accurate.)
 """
 
 from __future__ import annotations
@@ -17,7 +21,10 @@ logger = get_logger(__name__)
 
 
 def _static_rates() -> dict[str, float]:
-    """Static Vast snapshot rate per class with a ``vast_name`` (display-only fallback)."""
+    """Offline fallback rate per class with a ``vast_name``. NOTE: this is the shared catalog
+    ``GpuClass.hourly_usd`` (the RunPod static snapshot), NOT a live Vast price — a rough proxy used
+    only when live pricing is unavailable, so consumers of ``live_rates()`` get a number rather than
+    a crash. May not match the Vast market."""
     from flash.providers.base import GPU_INFO
 
     return {name: info.hourly_usd for name, info in GPU_INFO.items() if info.vast_name}

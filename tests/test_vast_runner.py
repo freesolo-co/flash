@@ -202,10 +202,14 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
 
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
     monkeypatch.setattr(vast_api, "list_instances", lambda: [])  # nothing under our label
+    # Cursor MsECQ: the abort must proactively destroy this run's instances (kill any phantom)
+    destroyed_for = []
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
     with pytest.raises(vast_api.VastApiError, match="aborting the offer walk"):
         vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
     assert rented == [1]  # aborted after the FIRST offer — never rented offer 2
+    assert destroyed_for  # destroy_run_instances was called to reap any phantom contract
 
 
 def test_vast_image_honors_worker_image_override(monkeypatch):
