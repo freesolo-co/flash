@@ -31,6 +31,7 @@ from flash.runner.checkpoints import list_checkpoints
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.serve.deploy import deploy_adapter, undeploy_adapter
+from flash.serve.export import export_adapter
 
 from . import db
 from ._locks import _DEPLOY_LOCKS, _deploy_lock
@@ -66,6 +67,7 @@ __all__ = [
     "_worker_artifacts",
     "create_app",
     "deploy_adapter",
+    "export_adapter",
     "get_status",
     "list_checkpoints",
     "recover_runs",
