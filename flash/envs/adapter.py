@@ -330,34 +330,46 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     return data
 
 
-def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
+def _safe_extract_archive(tar_bytes: bytes, dest: Path, subdir: str = "") -> Path:
+    """Extract the GitHub repo tarball under ``dest`` and return its single top-level directory.
+
+    When ``subdir`` is given (the environment's path within the repo, e.g. ``ns/name``), ONLY that
+    subtree is extracted, and only its members count toward ``_MAX_ARCHIVE_MEMBERS`` /
+    ``_MAX_ARCHIVE_BYTES``. This matters for the shared environment-hub: a small env pull must not
+    fail (or pay the cost) because unrelated sibling environments push the whole repo over the
+    limits. Unrelated members are skipped entirely, so a stray unsafe path in some OTHER env can't
+    abort this pull either."""
     root = dest.resolve()
+    want = [p for p in subdir.split("/") if p] if subdir else []
     top_dirs: set[str] = set()
     total = 0
+    extracted = 0
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-        for count, member in enumerate(tar, start=1):
-            if count > _MAX_ARCHIVE_MEMBERS:
+        for member in tar:
+            if member.type in _TAR_METADATA_TYPES:
+                continue
+            raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
+            if not raw:
+                continue
+            # ``raw[0]`` is the archive's single top dir; ``raw[1:]`` is the path within the repo.
+            # Track the top dir from EVERY member (so the layout is known even when the requested
+            # subtree is absent), but only extract/count members inside that subtree.
+            top_dirs.add(raw[0])
+            if want and raw[1 : 1 + len(want)] != want:
+                continue
+            if ".." in raw:
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+            extracted += 1
+            if extracted > _MAX_ARCHIVE_MEMBERS:
                 raise RuntimeError(
                     f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
                 )
-            if member.type in _TAR_METADATA_TYPES:
-                continue
-            parts: list[str] = []
-            for part in member.name.replace("\\", "/").split("/"):
-                if not part or part == ".":
-                    continue
-                if part == "..":
-                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-                parts.append(part)
-            if not parts:
-                continue
-            normalized_name = "/".join(parts)
+            normalized_name = "/".join(raw)
             target = (dest / normalized_name).resolve()
             if target != root and root not in target.parents:
                 raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
-            top_dirs.add(parts[0])
             total += max(0, member.size)
             if total > _MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
@@ -367,10 +379,11 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
             tar.extract(member, dest)
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")
-    extracted = dest / next(iter(top_dirs))
-    if not extracted.is_dir():
-        raise RuntimeError("environment archive did not extract to a directory")
-    return extracted
+    # The top dir always exists; create it even when the requested subtree had no members, so the
+    # caller can report the missing environment directory itself (rather than a layout error here).
+    extracted_dir = dest / next(iter(top_dirs))
+    extracted_dir.mkdir(parents=True, exist_ok=True)
+    return extracted_dir
 
 
 def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
@@ -399,7 +412,9 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
+        extracted = _safe_extract_archive(
+            _download_github_tarball(resolved), tmp_parent, subdir=_environment_dir(parsed.path)
+        )
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
@@ -582,7 +597,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
         )
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
     try:
-        extracted = _safe_extract_archive(_download_github_tarball(ref), tmp_parent)
+        extracted = _safe_extract_archive(_download_github_tarball(ref), tmp_parent, subdir=env_dir)
         source = extracted / env_dir if env_dir else extracted
         if not source.is_dir():
             raise FileNotFoundError(
