@@ -9,6 +9,11 @@ from flash import __version__
 from flash._channel import CLI_NAME
 from flash._logging import configure_logging, get_logger
 from flash._update_check import emit_update_notice, maybe_start_update_check
+from flash.cli import render
+
+# Command handlers + the patched client surface live in submodules; re-export them so
+# `flash.cli` stays the single public import surface (and so monkeypatching
+# `flash.cli.commands` reaches the bare globals the handlers read).
 from flash.cli.commands import (  # noqa: F401
     _CLI_DONE_STATES,
     _OK_STATES,
@@ -40,9 +45,89 @@ from flash.cli.envpush import cmd_env_install, cmd_env_push
 
 logger = get_logger("flash.cli")
 
+# Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
+# summary is the short one-liner the themed grid shows (the verbose per-command text stays on
+# every subparser's own `help=` / `<cmd> --help`). test_cli_help.py asserts these rows stay in
+# lockstep with the registered subcommands, so a newly added command can't go silently unlisted.
+_HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "getting started",
+        [
+            ("login", "log in with your freesolo API key"),
+            ("whoami", "show the identity behind your stored key"),
+            ("version", "print the flash version"),
+        ],
+    ),
+    (
+        "catalog",
+        [
+            ("models", "list supported base models"),
+            ("gpus", "list managed GPU classes with live $/hr"),
+        ],
+    ),
+    (
+        "environments",
+        [
+            ("env", "manage Freesolo environments"),
+        ],
+    ),
+    (
+        "training",
+        [
+            ("train", "submit a managed run from a TOML config"),
+            ("status", "show a run's status, logs, or live follow"),
+            ("runs", "list runs with their state and cost"),
+            ("checkpoints", "list a run's deployable RL checkpoints"),
+            ("cancel", "cancel a running job"),
+        ],
+    ),
+    (
+        "serving & export",
+        [
+            ("deploy", "deploy a run's adapter to an endpoint"),
+            ("chat", "chat with a deployed adapter"),
+            ("deployments", "list active serving deployments"),
+            ("undeploy", "tear down a run's endpoint"),
+            ("export", "export an adapter to your HuggingFace repo"),
+        ],
+    ),
+]
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog=CLI_NAME, description="Managed LoRA post-training")
+_HELP_OPTIONS: list[tuple[str, str]] = [
+    ("-h, --help", "show this help and exit"),
+    ("-V, --version", "print the flash version"),
+    ("--debug", "show full tracebacks on error"),
+    ("-v, --verbose", "increase log verbosity (-v info, -vv debug)"),
+]
+
+
+class _FlashParser(argparse.ArgumentParser):
+    """Root parser that renders the themed help page on a styled stdout.
+
+    Only the top-level parser is a `_FlashParser`; the subparsers are plain argparse (see the
+    `parser_class=` below), so `flash <cmd> --help` keeps argparse's standard layout. Piped or
+    scripted `flash --help` also falls back to argparse, so existing greps stay byte-for-byte.
+    Overriding `format_help` (not the help action) preserves argparse's `--help` exit-0 flow.
+    """
+
+    def format_help(self) -> str:
+        if not render.styled():
+            return super().format_help()
+        usage = f"{CLI_NAME} [--debug] [-v] <command> [args]"
+        footers = [
+            f"new here? run `{CLI_NAME} login`, then `{CLI_NAME} train configs/rl.toml`",
+            f"any command in depth: `{CLI_NAME} <command> --help`",
+            "docs: https://freesolo.co/docs",
+        ]
+        return render.help_page(
+            "managed LoRA post-training", usage, _HELP_GROUPS, _HELP_OPTIONS, footers
+        )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the fully-configured root parser. Extracted from main() so tests can introspect the
+    registered subcommands and keep the themed help catalog (_HELP_GROUPS) in lockstep."""
+    parser = _FlashParser(prog=CLI_NAME, description="Managed LoRA post-training")
     parser.add_argument("-V", "--version", action="version", version=f"{CLI_NAME} {__version__}")
     parser.add_argument(
         "--debug",
@@ -56,7 +141,9 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="increase log verbosity (-v for info, -vv for debug)",
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    # subparsers stay vanilla argparse so `flash <cmd> --help` keeps the standard layout; only
+    # the root parser themes its help (see _FlashParser).
+    sub = parser.add_subparsers(dest="cmd", required=True, parser_class=argparse.ArgumentParser)
 
     version = sub.add_parser("version", help="print the Flash version")
     version.set_defaults(func=cmd_version)
@@ -169,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     checkpoints.add_argument("run_id")
     checkpoints.set_defaults(func=cmd_checkpoints)
 
-    deploy = sub.add_parser("deploy")
+    deploy = sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
     deploy.add_argument("run_id")
     deploy.add_argument("--dry-run", action="store_true")
     deploy.add_argument(
@@ -185,9 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     undeploy.add_argument("run_id")
     undeploy.set_defaults(func=cmd_undeploy)
 
-    export = sub.add_parser(
-        "export", help="export a trained adapter to your own HuggingFace repo"
-    )
+    export = sub.add_parser("export", help="export a trained adapter to your own HuggingFace repo")
     export.add_argument(
         "--adapter-id",
         dest="adapter_id",
@@ -228,6 +313,14 @@ def main(argv: list[str] | None = None) -> int:
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
 
+    # The control plane is operator-only and run as a separate one-off service via the
+    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
