@@ -324,5 +324,11 @@ def destroy_instance(instance_id: int) -> bool:
         if isinstance(out, dict) and "success" in out:
             return bool(out.get("success"))
         return True
-    except Exception:
-        return False
+    except Exception as exc:
+        # A 404 means the instance no longer exists — already destroyed, or host-preempted/disappeared.
+        # That is a CONFIRMED non-billing state, so report it destroyed (True): the retry loop and
+        # VastProvider.destroy() treat the box as gone and proceed, instead of raising "unconfirmed
+        # teardown" and failing the run over an instance that is provably not billing (Codex). Reserve
+        # False for failures where the box MAY still bill (success:false, 5xx, socket breakdown).
+        # is_not_found is True ONLY for a genuine 404 -> confirmed-gone; every other failure -> False.
+        return is_not_found(exc)

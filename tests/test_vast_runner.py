@@ -521,6 +521,23 @@ def test_poll_running_then_unknown_is_dead_host_preempted(monkeypatch):
     assert res.failure == "job_preempted"
 
 
+def test_poll_frozen_is_dead_host_preempted(monkeypatch):
+    """Codex: Vast's 'frozen' is a PAUSED container that keeps billing GPU charges yet emits no
+    DONE/heartbeat, so a worker that freezes must take the dead-host path immediately (preempted)
+    instead of waiting out the setup/training stall window while the box bills. Unlike 'unknown' it
+    is never the poller's no-status fallback, so it needs no became_running gate (fails even if the
+    box never reported running first)."""
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "frozen"}],
+        logs="+ paused\nFLASH: container frozen",
+    )
+    assert "frozen" in vast._DEAD_STATES
+    res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_preempted"
+
+
 def test_poll_unknown_before_running_is_not_dead(monkeypatch):
     """The became_running gate: 'unknown' is ALSO the fallback the poller substitutes for a present
     instance with no actual_status yet (normal provisioning), so a box that has NEVER run must NOT be

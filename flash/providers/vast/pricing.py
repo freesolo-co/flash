@@ -38,6 +38,30 @@ def _static_rates() -> dict[str, float]:
     return {name: info.hourly_usd for name, info in GPU_INFO.items() if info.vast_name}
 
 
+def _fetch_offer_rates(max_wall_seconds: float) -> dict[str, float]:
+    """Friendly-name -> cheapest LIVE verified-datacenter $/hr, for ONLY the classes that currently
+    have a usable offer (NO static merge). Raises on a fetch failure (callers decide the fallback);
+    assumes ``VAST_API_KEY`` is set (callers gate on it)."""
+    from flash.providers.base import GPU_INFO
+    from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
+
+    rates: dict[str, float] = {}
+    # Floor the market query at the SMALLEST managed Vast class's VRAM, NOT 0: with min_vram_gb=0
+    # the server returns the cheapest offers across ALL sizes — a flood of tiny UNMANAGED low-VRAM
+    # cards fills the fixed-size price-sorted page and crowds the managed classes off it, so
+    # live pricing misses them and falls back to static (RunPod) rates even when live Vast offers
+    # exist. The floor keeps it to ONE market query while making the page relevant; no managed class
+    # is smaller than the floor, so none is excluded (Copilot Mtugt). 0 if nothing is managed.
+    vram_floor = int(min((i.vram_gb for i in GPU_INFO.values() if i.vast_name), default=0))
+    # Gate on MIN_DISK_GB (what create() enforces): disk_gb=0 would disable disk filtering and
+    # price the run off "cheapest" offers that aren't actually provisionable, making live pricing
+    # optimistic and inconsistent with the allocator/submit paths (both pass MIN_DISK_GB). Thread
+    # the wall cap so duration-bound estimates match the offers a launch would actually accept.
+    for offer in usable_offers(vram_floor, MIN_DISK_GB, max_wall_seconds=max_wall_seconds):
+        rates.setdefault(offer.gpu, offer.dph_total)  # offers are price-sorted, cheapest first
+    return rates
+
+
 def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str, float]:
     """Friendly-name -> cheapest live verified-datacenter $/hr (static fallback).
 
@@ -64,31 +88,32 @@ def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str
     ):
         return _rates_cache["data"]
     try:
-        from flash.providers.base import GPU_INFO
-        from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
-
-        rates: dict[str, float] = {}
-        # Floor the market query at the SMALLEST managed Vast class's VRAM, NOT 0: with min_vram_gb=0
-        # the server returns the cheapest offers across ALL sizes — a flood of tiny UNMANAGED low-VRAM
-        # cards fills the fixed-size price-sorted page and crowds the managed classes off it, so
-        # live_rates() misses them and hourly_rate() falls back to static (RunPod) rates even when live
-        # Vast offers exist. The floor keeps it to ONE market query while making the page relevant; no
-        # managed class is smaller than the floor, so none is excluded (Copilot Mtugt). 0 if nothing is
-        # managed (degrades to the old behavior).
-        vram_floor = int(min((i.vram_gb for i in GPU_INFO.values() if i.vast_name), default=0))
-        # Gate on MIN_DISK_GB (what create() enforces): disk_gb=0 would disable disk filtering and
-        # price the run off "cheapest" offers that aren't actually provisionable, making live pricing
-        # optimistic and inconsistent with the allocator/submit paths (both pass MIN_DISK_GB). Thread
-        # the wall cap so duration-bound estimates match the offers a launch would actually accept.
-        for offer in usable_offers(vram_floor, MIN_DISK_GB, max_wall_seconds=max_wall_seconds):
-            rates.setdefault(offer.gpu, offer.dph_total)  # offers are price-sorted, cheapest first
-        merged = {**static, **rates}
-        if use_cache:
-            _rates_cache.update(ts=now, data=merged)
-        return merged
+        merged = {**static, **_fetch_offer_rates(max_wall_seconds)}
     except Exception as exc:
         logger.warning("live vast pricing unavailable (%s); using static rates", exc)
         return static
+    if use_cache:
+        _rates_cache.update(ts=now, data=merged)
+    return merged
+
+
+def live_offer_rates(max_wall_seconds: float = 0.0) -> dict[str, float]:
+    """Friendly-name -> cheapest live $/hr for ONLY the classes that currently have a rentable offer
+    (NO static merge); ``{}`` offline / without ``VAST_API_KEY`` / on any fetch failure.
+
+    Unlike ``live_rates`` (which merges static rates so the ``flash gpus`` table can render a row per
+    managed class), this returns just the classes a Vast launch could ACTUALLY rent under the wall
+    cap. Provider-specific GPU SELECTION uses it so a cheaper class with NO surviving offer is not
+    chosen — and quoted — on its static (RunPod) rate when the launch-time ``usable_offers`` path
+    would never rent it (Codex). Never cached: selection always reflects the current market.
+    """
+    if not os.environ.get("VAST_API_KEY"):
+        return {}
+    try:
+        return _fetch_offer_rates(max_wall_seconds)
+    except Exception as exc:
+        logger.warning("live vast offer rates unavailable (%s)", exc)
+        return {}
 
 
 def hourly_rate(gpu_name: str, max_wall_seconds: float = 0.0) -> float:

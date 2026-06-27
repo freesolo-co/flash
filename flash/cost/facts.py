@@ -85,19 +85,29 @@ def pick_gpu(
     if not candidates:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
     # Rank by the rate on the REQUESTED provider so a provider-specific quote picks that provider's
-    # cheapest fit (not the cheapest by the RunPod nominal rate). For Vast, fetch the whole live rate
-    # map ONCE rather than calling gpu_hourly_usd() per candidate inside the key: a duration-bound Vast
-    # query bypasses the per-call cache (Codex MtzrI), so per-candidate pricing would fire one identical
-    # full market fetch per fitting class — N redundant Vast queries (latency/rate-limit) per estimate.
-    # live_rates() returns merged live+static keyed by class name, so a single fetch ranks them all
-    # (Copilot). Other providers price statically/cheaply, so per-candidate lookup is fine there.
+    # cheapest fit (not the cheapest by the RunPod nominal rate). For Vast, fetch the live offer map
+    # ONCE (a duration-bound Vast query bypasses the per-call cache per Codex MtzrI, so pricing each
+    # candidate via gpu_hourly_usd() inside the key would fire one identical full market fetch per
+    # fitting class — N redundant queries; Copilot). When the market is reachable, restrict the
+    # candidates to classes that ACTUALLY have a rentable offer under the wall cap and rank by their
+    # LIVE price: a cheaper class with no surviving offer must not be selected (and quoted) on its
+    # static (RunPod) rate when the launch-time usable_offers path would never rent it (Codex). Fall
+    # back to static across all fitting classes only when the market is unreachable (offline / no key /
+    # fetch failure) or no fitting class has an offer, so the estimate stays offline-safe.
     if (provider or "").strip().lower() == "vast":
-        from flash.providers.vast.pricing import live_rates
+        from flash.providers.vast.pricing import live_offer_rates
 
-        vast_rates = live_rates(max_wall_seconds=max_wall_seconds)
+        live = live_offer_rates(max_wall_seconds=max_wall_seconds)
+        rentable = [g for g in candidates if g.name in live] if live else []
+        if rentable:
+            candidates = rentable
 
-        def _rate(g: GpuClass) -> float:
-            return vast_rates.get(g.name) or g.hourly_usd
+            def _rate(g: GpuClass) -> float:
+                return live[g.name]
+        else:
+
+            def _rate(g: GpuClass) -> float:
+                return g.hourly_usd
     else:
 
         def _rate(g: GpuClass) -> float:

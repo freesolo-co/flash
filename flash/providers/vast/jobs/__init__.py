@@ -94,8 +94,13 @@ MIN_DISK_GB = 60.0
 # The setup-vs-training stall boundary is the SHARED canonical helper ``_poll.is_training_heartbeat``
 # (same one runpod + lambdalabs use) so the cold-start grace rule can't drift between providers.
 
-# Vast instance states that mean "the container is gone / will not progress".
-_DEAD_STATES = {"exited", "stopped", "offline", "deleted"}
+# Vast instance states that mean "the container is gone / will not progress". ``frozen`` is a
+# paused container that KEEPS billing GPU charges (per Vast's show-instances status docs) yet can
+# emit no DONE/heartbeat, so a worker that freezes would otherwise only fail over after the full
+# setup/training stall window (or load timeout) while the box bills — classify it dead for fast
+# failover like the other non-progressing states (Codex). Unlike ``unknown`` it is never this
+# poller's no-status fallback, so it needs no ``became_running`` gate.
+_DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 
 # A fresh DONE can be visible before the separately-uploaded metrics.json (HF read-after-write is
 # eventually consistent). Re-read metrics this many times (this far apart) before treating a

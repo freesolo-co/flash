@@ -136,3 +136,34 @@ def test_pick_gpu_vast_duration_bound_fetches_market_once(monkeypatch):
     gpu = pick_gpu(8, provider="vast", max_wall_seconds=7200.0)
     assert gpu  # a class was chosen
     assert calls["n"] == 1  # ONE market fetch despite multiple fitting candidates (was N)
+
+
+def test_pick_gpu_vast_skips_classes_without_a_live_offer(monkeypatch):
+    # Codex: ranking via the static-merged map could SELECT and quote a cheaper class (e.g. RTX 4090)
+    # that has NO surviving offer under the wall cap — one the launch-time usable_offers path would
+    # never rent. pick_gpu(provider="vast") must restrict selection to classes that ACTUALLY have a
+    # rentable offer, even when a cheaper class fits and is cheaper on its static (RunPod) rate.
+    from types import SimpleNamespace
+
+    from flash.cost.facts import pick_gpu
+    from flash.providers.vast import jobs as vast
+
+    # The live market has ONLY an A100 SXM offer (a larger/pricier class); the cheaper 24/48 GB classes
+    # fit the 8 GB requirement and are cheaper statically, but have NO surviving offer.
+    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
+        return [SimpleNamespace(gpu="A100 SXM", dph_total=1.20)]
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    gpu = pick_gpu(8, provider="vast", max_wall_seconds=7200.0)
+    assert gpu == "A100 SXM"  # the only class with a rentable offer, NOT the cheaper-static 4090
+
+
+def test_pick_gpu_vast_offline_falls_back_to_static(monkeypatch):
+    # When the market is unreachable (no VAST_API_KEY -> live_offer_rates returns {}), selection must
+    # stay offline-safe: rank ALL fitting classes by their static rate rather than crash or pick nothing.
+    from flash.cost.facts import pick_gpu
+
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
+    gpu = pick_gpu(8, provider="vast")
+    assert gpu  # a fitting class is still chosen from the static fallback

@@ -327,6 +327,21 @@ def test_destroy_instance_respects_success_flag(monkeypatch):
     assert vast_api.destroy_instance(5) is True
 
 
+def test_destroy_instance_404_is_confirmed_gone(monkeypatch):
+    """Codex: a 404 DELETE means the instance no longer exists (already destroyed / host-preempted) —
+    a CONFIRMED non-billing state, so destroy_instance reports True. Otherwise the retry loop's
+    pre-launch destroy would raise "unconfirmed teardown" on an already-gone box and fail the run
+    instead of retrying. A non-404 4xx whose body merely embeds "404" stays unconfirmed (False)."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [_http_error(404)] * 3)
+    assert vast_api.destroy_instance(9) is True  # genuine 404 -> gone -> confirmed
+    # status-CODE-authoritative: a 400 whose body embeds an id like "4040" is NOT a 404 -> still False
+    _capture_urlopen(monkeypatch, [_http_error(400, b'{"error":"bad id 4040"}')] * 3)
+    assert vast_api.destroy_instance(4040) is False
+
+
 def test_list_instances_paginates_every_page(monkeypatch):
     """Codex MsXoI: the v1 instances list is keyset-paginated (limit max 25; pass the prior page's
     `next_token` as `after_token`; `next_token` is null on the last page). list_instances must walk

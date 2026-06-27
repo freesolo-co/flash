@@ -1605,6 +1605,66 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         assert "bad reward fn" in (st.error or "")
 
 
+def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
+    # Codex: a recovered Vast run whose poll ended not-ok must CONFIRM the in-flight instance is gone
+    # before resuming. If destroy() raises (unconfirmed DELETE — the old worker may still be running and
+    # writing this seed's HF artifacts), attach must NOT launch a second worker (double-bill + corrupt
+    # the shared DONE/metrics); it keeps the handle and leaves the run non-terminal so a later
+    # recovery/sweep reconciles. Mirrors the retry-loop MtzrH guard.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers as providers
+        import flash.providers.runpod.train as flash_train
+        from flash.providers.base import PollResult
+        from flash.providers.vast import api as vast_api
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="v1",
+                state="running",
+                spec=_spec("v1").to_dict(),
+                cost_usd=0.0,
+                remote={"provider": "vast", "instance_id": "iX", "seed": 0},
+            )
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        class _RaisingVast:
+            def poll(self, handle, spec, seed, *, log=None):
+                return PollResult(False, failure="stalled", detail="host vanished")
+
+            def destroy(self, handle):  # unconfirmed teardown -> attach must not resume over it
+                raise vast_api.VastApiError("destroy unconfirmed (success:false)")
+
+            def gc(self, spec):  # best-effort label reap
+                pass
+
+            def is_configured(self):  # available_providers() probes this in the terminal-GC finally
+                return False
+
+        real_get = providers.get_provider
+        monkeypatch.setattr(
+            providers,
+            "get_provider",
+            lambda name: _RaisingVast() if name == "vast" else real_get(name),
+        )
+
+        resumed = {"called": False}
+
+        def fake_loop(spec, log, *, start_index, prior_cost):
+            resumed["called"] = True
+
+        monkeypatch.setattr(orch, "_run_seed_loop", fake_loop)
+
+        st = orch.attach_run("v1", log_stream=sys.stderr)
+
+        assert resumed["called"] is False, "must NOT resume a second worker over a possibly-live box"
+        assert st.state == "running", "run left non-terminal for a later recovery/sweep"
+        remote = orch.get_status("v1").remote
+        assert remote is not None, "handle preserved"
+        assert remote.get("instance_id") == "iX", "handle preserved"
+
+
 def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):
     # Terminal states are STICKY: once cancelled, no other state may overwrite it —
     # neither a non-terminal lifecycle write (provisioning/running) NOR a late terminal
