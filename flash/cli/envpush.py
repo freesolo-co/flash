@@ -1,6 +1,7 @@
-"""Environment publish/install machinery for the `flash env` subcommands.
+"""Environment publish/install/pull machinery for the `flash env` subcommands.
 
-`flash env install` records a Freesolo environment id locally;
+`flash env install` records a Freesolo environment id locally (no files are downloaded);
+`flash env pull` downloads a published environment's files (whole env, or a single file);
 `flash env push` packages a local Freesolo environment and uploads it through the
 managed Flash control plane.
 """
