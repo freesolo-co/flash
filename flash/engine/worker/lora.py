@@ -660,7 +660,12 @@ def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
         if keys and any(_LANGUAGE_MODEL_INFIX in k for k in keys if _is_lora_key(k)):
             return True
     except Exception as e:  # best-effort: never let a key-read failure abort the launch
-        print("[init-adapter] adapter VL-key probe failed; deferring to the config probe:", e)
+        # Name the adapter dir + model so a transient failure is tied to the specific warm-start
+        # when several workers log into the same stream.
+        print(
+            f"[init-adapter] adapter VL-key probe failed for adir={adir!r} model={model_id!r}; "
+            f"deferring to the config probe: {e}"
+        )
     return is_vl_checkpoint(model_id)
 
 
