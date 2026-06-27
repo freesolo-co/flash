@@ -190,7 +190,10 @@ def _build_parser() -> argparse.ArgumentParser:
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
-    env_install = env_sub.add_parser("install", help="record a Freesolo environment")
+    env_install = env_sub.add_parser(
+        "install",
+        help="register a published env id locally (does not download files — use 'env pull' for that)",
+    )
     env_install.add_argument("env_id", help="the Freesolo environment id to record")
     env_install.set_defaults(func=cmd_env_install)
 
