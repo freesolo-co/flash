@@ -286,6 +286,43 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
     ]
 
 
+def test_on_save_skips_deployable_when_vl_recombine_fails(tmp_path, monkeypatch, fake_trainer_callback):
+    """A VL warm-start whose recorded SFT dir was evicted makes recombined_warmstart_adapter_dir
+    RAISE. The raw checkpoint adapter is GRPO-only / SFT-less, so the deployable publish must be
+    SKIPPED (not fall back to the raw adapter and advertise a known-broken step). The resume
+    checkpoint is still uploaded so the run can resume and re-merge."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+
+    def _raise(_ckpt):
+        raise RuntimeError("recombine: ... SFT-less adapter cannot be recombined")
+
+    monkeypatch.setattr(worker, "recombined_warmstart_adapter_dir", _raise)
+
+    class _SyncThread:
+        def __init__(self, target=None, daemon=None, **kw):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr(worker.threading, "Thread", _SyncThread)
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)
+    cb = worker.make_checkpoint_upload_callback()
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+
+    paths = [u["path_in_repo"] for u in rec.uploads]
+    # NO deployable adapter advertised for this step...
+    assert not any(p.endswith("checkpoints/step-4/adapter") for p in paths), paths
+    # ...but the resume checkpoint is still uploaded so the run can resume and re-merge.
+    assert "rl/flash-ckpt-1/seed0/checkpoint/checkpoint-4" in paths
+
+
 # --------------------------------------------------------------------------------------------
 # Control plane: list_checkpoints
 # --------------------------------------------------------------------------------------------
