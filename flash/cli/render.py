@@ -593,3 +593,44 @@ def env_published(slug: str) -> str:
     return _safe(
         f"{ok(f'published {_bold(slug)}')}\n\n{_dim('reference it in your config:')}\n{body}"
     )
+
+
+def help_page(
+    tagline: str,
+    usage: str,
+    groups: list[tuple[str, list[tuple[str, str]]]],
+    options: list[tuple[str, str]],
+    footers: list[str],
+) -> str:
+    """The themed ``flash --help`` page — the styled twin of argparse's flat default.
+
+    Mirrors the rest of the CLI: brand banner + faint rule (like ``header``), dim-bold
+    section titles (like ``env_list``), accent command names with dimmed summaries (like
+    ``env_setup``), and ``arrow`` next-step hints. Commands arrive pre-grouped as
+    ``(title, [(command, summary)])`` so the workflow ordering lives with the parser, not
+    here. Only ever called on the styled path; piped/scripted ``--help`` keeps argparse's
+    plain text (see ``flash.cli._FlashParser``), so existing greps stay byte-for-byte.
+    """
+    mark = _paint(CLI_NAME, _ACCENT, "1")
+    banner = f"{mark}  {_paint(tagline, _GRAY)}"
+    usage_line = f"{_dim('usage:')} {_paint(usage, _GRAY)}"
+    # one name-column width across every group AND the options block, so every summary lines up
+    # down the whole page (same single-shared-width discipline as _table).
+    names = [name for _, rows in groups for name, _ in rows] + [flag for flag, _ in options]
+    width = max((len(n) for n in names), default=0)
+
+    def section(title: str, rows: list[tuple[str, str]]) -> str:
+        head = _paint(title, _GRAY, "1")
+        body = "\n".join(
+            f"  {_paint(name.ljust(width), _ACCENT2)}  {_dim(summary)}" for name, summary in rows
+        )
+        return f"{head}\n{body}"
+
+    blocks = [section(title, rows) for title, rows in groups]
+    blocks.append(section("options", options))
+
+    body = "\n\n".join(blocks)
+    foot = "\n".join(arrow(line) for line in footers)
+    # trailing newline so the styled page matches argparse's newline-terminated help (argparse
+    # writes format_help() verbatim via print_help, with no print() to add one).
+    return _safe(f"{banner}\n{_rule()}\n{usage_line}\n\n{body}\n\n{foot}\n")
