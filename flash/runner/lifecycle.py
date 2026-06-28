@@ -286,19 +286,32 @@ def _submit_seed_supervised(
             # CONFIRMED. On an unconfirmed instance teardown we keep it (see below). The next on_handle()
             # records the new one.
             if teardown_confirmed:
-                # Drop the IN-MEMORY handle too, not just the persisted remote: the previous instance
-                # is CONFIRMED gone, so the next on_handle() records the fresh one. Leaving last_handle
-                # populated lets a retry that fails BEFORE provisioning a new handle (allocation/search
-                # error -> no on_handle) re-enter THIS teardown on the next iteration and destroy the
-                # already-cleared box again; a transient Vast destroy/list failure on that phantom
-                # re-teardown would then take the unconfirmed-teardown FATAL path though no prior worker
-                # remains (Codex). Cleared here so `attempt > 0 and last_handle` is false until a real
-                # new handle exists.
-                last_handle.clear()
-                with contextlib.suppress(FileNotFoundError):
+                # Clear the PERSISTED ``remote`` BEFORE dropping the in-memory ``last_handle`` so we can
+                # never end in the state {last_handle empty, remote still set}: if get_status raises or
+                # _update(..., remote=None) fails to apply, an empty last_handle would skip the inter-
+                # attempt teardown on the next retry while the persisted remote still references the old
+                # resource, orphaning it (cursor). FileNotFoundError == no persisted status, so there is
+                # nothing to leak (clear is a no-op); any OTHER failure leaves last_handle populated so it
+                # stays consistent with the still-set remote (and a within-process retry can re-confirm).
+                remote_cleared = True
+                try:
                     st = get_status(spec.run_id)
                     if st.state not in TERMINAL_STATES and st.remote is not None:
                         _update(spec.run_id, st.state, remote=None)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    remote_cleared = False
+                # Drop the IN-MEMORY handle too, not just the persisted remote, ONLY once that persisted
+                # clear is confirmed-applied: the previous instance is CONFIRMED gone, so the next
+                # on_handle() records the fresh one. Leaving last_handle populated lets a retry that fails
+                # BEFORE provisioning a new handle (allocation/search error -> no on_handle) re-enter THIS
+                # teardown on the next iteration and destroy the already-cleared box again; a transient
+                # Vast destroy/list failure on that phantom re-teardown would then take the unconfirmed-
+                # teardown FATAL path though no prior worker remains (Codex). Cleared here so
+                # `attempt > 0 and last_handle` is false until a real new handle exists.
+                if remote_cleared:
+                    last_handle.clear()
             else:
                 # MtzrH: do NOT launch the retry's worker while the previous instance's teardown is
                 # unconfirmed. The old worker may still be running and writing this seed's HF artifacts

@@ -166,14 +166,27 @@ def _confirm_run_clear(spec) -> bool:
     # An instance provider that WAS available at submit (so it could have taken the lost create) but is
     # NOT configurable now and owns the standing-instance capability can't be enumerated -> can't prove
     # clear -> fail closed. Already-configured providers were handled above; non-capability ones (Lambda)
-    # have no standing label to leak.
-    with contextlib.suppress(Exception):
+    # have no standing label to leak. CRITICAL: do NOT wrap this in a broad ``suppress(Exception)`` — an
+    # error loading the status, resolving a recorded provider, or reading the capability would otherwise
+    # be swallowed and leave ``clear`` True, defeating the fail-closed intent (cursor). Every failure
+    # inspecting the recorded set must instead make the guard CONSERVATIVE (block/defer the resubmit).
+    try:
         recorded = getattr(get_status(spec.run_id), "submitted_instance_providers", None) or []
-        for name in recorded:
-            if name in configured or name not in INSTANCE_PROVIDERS:
-                continue
-            if getattr(get_provider(name), "run_instances_remaining", None) is not None:
-                clear = False
+    except Exception:
+        # Can't read the durable record of providers available at submit -> can't rule out a recorded
+        # Vast phantom that this restart can no longer enumerate -> fail CLOSED.
+        return False
+    for name in recorded:
+        if name in configured or name not in INSTANCE_PROVIDERS:
+            continue
+        try:
+            has_capability = getattr(get_provider(name), "run_instances_remaining", None) is not None
+        except Exception:
+            # Can't even resolve a RECORDED instance provider -> assume it could own a phantom -> fail
+            # closed rather than declare clear.
+            has_capability = True
+        if has_capability:
+            clear = False
     return clear
 
 

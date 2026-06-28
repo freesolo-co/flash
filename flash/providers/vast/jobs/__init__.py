@@ -308,8 +308,13 @@ def deploy_and_submit(
                 # materialize is killed now, not left billing through retries while sweep_orphans
                 # shields it as a still-active run. Best-effort (destroy_run_instances never raises).
                 destroyed = destroy_run_instances(spec.run_id)
+                # ABORT log must NOT throw: a raising ``say`` (closed log stream / disk error) here would
+                # exit with the LOGGING exception instead of the terminal UnreconciledCreateError below,
+                # so the orchestrator would see a generic deploy/submit flake and retry — double-
+                # provisioning if the phantom contract materialized. Suppress so the raise always wins.
                 if destroyed:
-                    say(f"destroyed {len(destroyed)} possible phantom instance(s) {destroyed} on abort")
+                    with contextlib.suppress(Exception):
+                        say(f"destroyed {len(destroyed)} possible phantom instance(s) {destroyed} on abort")
                 # TERMINAL, not retriable: ``destroy_run_instances`` is a point-in-time sweep, so a
                 # phantom contract that has not surfaced yet (eventual consistency) survives it. A
                 # plain VastApiError here is caught by the orchestrator as ``poll_error`` and RETRIED —
