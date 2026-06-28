@@ -326,6 +326,8 @@ class PollResult:
     ok: bool
     metrics: dict | None = None
     # "job_failed"    : genuine worker/job code error (NOT retried)
+    # "oom"           : worker crashed with CUDA out-of-memory -> retried on a strictly LARGER GPU
+    #                   (a same-size retry would just OOM again)
     # "job_preempted" : provider killed the worker (platform termination) -> infra-shaped, retried
     # "no_capacity"   : NEVER scheduled — no provider capacity for the pinned GPU class (job sat
     #                   IN_QUEUE / the only worker stayed THROTTLED) -> infra-shaped, retried on the
