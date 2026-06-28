@@ -280,7 +280,7 @@ def test_download_environment_file_with_custom_entrypoint_ref(monkeypatch):
     # A sidecar path is relative to the env DIR, even when the ref names a custom entrypoint file.
     seen = {}
 
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(req, timeout=None, max_bytes=None):
         seen["url"] = req.full_url
         return b"data"
 
@@ -473,7 +473,9 @@ def test_download_environment_file_rejects_oversized_body(monkeypatch):
     monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 16)
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: io.BytesIO(b"x" * 100))
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    with pytest.raises(RuntimeError, match="too large"):
+    # Now caught by the streaming cap (aborts mid-download) rather than the post-read length check;
+    # either way it's a RuntimeError that rejects the oversized body before returning it.
+    with pytest.raises(RuntimeError, match="exceeded the maximum allowed size|too large"):
         download_environment_file("david-freesolo-co/stuff", "datasets/train.jsonl")
 
 
@@ -611,11 +613,80 @@ def test_download_github_tarball_uses_whole_repo_ceiling(monkeypatch):
     # _MAX_ARCHIVE_BYTES — so a small env pull from a big shared hub isn't rejected at download.
     assert adapter._MAX_TARBALL_BYTES > adapter._MAX_ARCHIVE_BYTES
     big = b"x" * (adapter._MAX_ARCHIVE_BYTES + 10)  # over the per-env cap, under the tarball ceiling
-    monkeypatch.setattr(adapter, "_urlopen", lambda req, timeout=None: big)
+    monkeypatch.setattr(adapter, "_urlopen", lambda req, timeout=None, max_bytes=None: big)
     monkeypatch.setattr(adapter, "_github_token", lambda: None)
     ref = adapter._coerce_environment_github_ref("david-freesolo-co/stuff")
     assert adapter._download_github_tarball(ref) == big  # not rejected
     too_big = b"x" * (adapter._MAX_TARBALL_BYTES + 10)
-    monkeypatch.setattr(adapter, "_urlopen", lambda req, timeout=None: too_big)
+    monkeypatch.setattr(adapter, "_urlopen", lambda req, timeout=None, max_bytes=None: too_big)
     with pytest.raises(RuntimeError, match="tarball is too large"):
         adapter._download_github_tarball(ref)
+
+
+def test_download_github_tarball_passes_streaming_cap(monkeypatch):
+    # _download_github_tarball must hand _urlopen its _MAX_TARBALL_BYTES ceiling so the body is
+    # stream-capped (aborts early) rather than buffered whole and only then length-checked.
+    seen = {}
+
+    def fake_urlopen(req, timeout=None, max_bytes=None):
+        seen["max_bytes"] = max_bytes
+        return b"ok"
+
+    monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
+    monkeypatch.setattr(adapter, "_github_token", lambda: None)
+    ref = adapter._coerce_environment_github_ref("david-freesolo-co/stuff")
+    adapter._download_github_tarball(ref)
+    assert seen["max_bytes"] == adapter._MAX_TARBALL_BYTES
+
+
+def test_urlopen_streams_and_aborts_over_max_bytes(monkeypatch):
+    # A body larger than max_bytes aborts mid-stream (early-abort) instead of being read whole.
+    served = {"n": 0}
+
+    class _Resp:
+        def __init__(self, data):
+            self._buf = io.BytesIO(data)
+
+        def read(self, size=-1):
+            chunk = self._buf.read(size)
+            served["n"] += len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(adapter, "_DOWNLOAD_CHUNK_BYTES", 4)
+    payload = b"x" * 64
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Resp(payload))
+    req = urllib.request.Request("https://api.github.com/x")
+    with pytest.raises(RuntimeError, match="exceeded the maximum allowed size"):
+        adapter._urlopen(req, max_bytes=16)
+    # early abort: stopped reading not long after crossing the limit, not the whole 64-byte body
+    assert served["n"] <= 16 + adapter._DOWNLOAD_CHUNK_BYTES
+
+
+def test_urlopen_streams_full_body_under_cap(monkeypatch):
+    # Under the cap the streamed body is returned intact (chunk reassembly is lossless).
+    payload = b"abcdefghij" * 5
+    monkeypatch.setattr(adapter, "_DOWNLOAD_CHUNK_BYTES", 7)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: io.BytesIO(payload))
+    req = urllib.request.Request("https://api.github.com/x")
+    assert adapter._urlopen(req, max_bytes=10_000) == payload
+
+
+def test_safe_extract_archive_bounds_total_members_scanned(monkeypatch, tmp_path):
+    # Pulling a tiny subdir from a tarball with many UNRELATED members must still bound the scan:
+    # the total-headers cap fires even though almost nothing would be extracted.
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_SCAN_MEMBERS", 4)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for i in range(20):  # 20 unrelated members, only "wanted/" would be extracted
+            info = tarfile.TarInfo(name=f"repo-sha/unrelated/f{i}.txt")
+            data = b"x"
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    with pytest.raises(RuntimeError, match="too many entries to scan"):
+        adapter._safe_extract_archive(buf.getvalue(), tmp_path, subdir="wanted")
