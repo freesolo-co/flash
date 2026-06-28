@@ -88,11 +88,15 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
     }
 )
 _ENV_PUSH_SIDECAR_DIRS = frozenset({"datasets"})
+# ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
+# user-authored README/NOTES) travels with the env into the hub and back out through
+# ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
 _ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
     {
         ".csv",
         ".json",
         ".jsonl",
+        ".md",
         ".parquet",
         ".tsv",
         ".txt",
@@ -281,9 +285,10 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | No
     bar.clear()
     slug = result.get("id")
     if not slug:
-        msg = "the env was uploaded but the server returned no id"
-        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
-        return 1
+        # a publish that can't report an id has not done its job (no `id = "..."` snippet to show),
+        # so this is a hard failure — route it through _err's red ✗ idiom, not the amber ⚠ warning
+        # idiom (which means "succeeded / still proceeding") it used to borrow.
+        return _err("the env was uploaded but the server returned no id")
     if render.styled():
         print(render.env_published(slug))
     else:
@@ -332,7 +337,11 @@ def cmd_env_push(args) -> int:
         module_source = entrypoint.read_text()
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
         _copy_env_sidecars(env_root, pkg, entrypoint=entrypoint)
-        (pkg / "README.md").write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
+        # Only synthesize a stub README when the env didn't ship its own (now carried as a
+        # ``.md`` sidecar) — don't clobber a user-authored README with boilerplate.
+        readme = pkg / "README.md"
+        if not readme.exists():
+            readme.write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
         # One progress widget spans both phases the user otherwise waits through silently:
         # packaging (walk + gzip, slow for large datasets) and the upload itself.
         bar = _UploadProgress(env_name)
