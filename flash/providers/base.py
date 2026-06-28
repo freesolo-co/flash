@@ -248,8 +248,7 @@ class JobHandle:
 class PollResult:
     ok: bool
     metrics: dict | None = None
-    # failure values: "job_failed" (not retried), "job_preempted" / "no_capacity" / "stalled" /
-    # "poll_error" (infra-shaped, retried). "no_capacity" = never scheduled; distinct from "stalled".
+    # failure: job_failed, oom, job_preempted, no_capacity, stalled, or poll_error.
     failure: str | None = None
     detail: str | None = None
 
