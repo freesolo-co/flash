@@ -87,7 +87,7 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
 
     seen = _stub_adapter_config(monkeypatch, tmp_path, rank=64)
 
-    with pytest.raises(ValueError, match="adapter artifact rank 64"):
+    with pytest.raises(ValueError, match="adapter artifact has rank 64"):
         deploy_adapter(
             run_id="r-recombined",
             model="Qwen/Qwen3.5-4B",
