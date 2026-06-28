@@ -650,19 +650,27 @@ def _replace_opposite_type(target: Path, build) -> None:
     that conventional name is never clobbered."""
     scratch = Path(tempfile.mkdtemp(prefix=".flash-env-old-", dir=target.parent))
     backup = scratch / target.name
+    preserve_scratch = False
     try:
         os.replace(target, backup)  # atomic move-aside (file, dir, or symlink)
+        preserve_scratch = True  # backup is now the ONLY copy of the original
         try:
             build()
         except BaseException:
             if target.is_symlink() or target.exists():
                 _rm_path(target)  # drop any partial replacement
             os.replace(backup, target)  # restore the original intact
+            preserve_scratch = False  # restored back to target; backup no longer needed
             raise
+        preserve_scratch = False  # replacement succeeded; backup is a now-stale copy
     finally:
-        # Drop the scratch dir: on success it still holds the saved original (no longer needed); on
-        # failure the original has already been moved back out, leaving it empty.
-        shutil.rmtree(scratch, ignore_errors=True)
+        # Drop the scratch dir ONLY once the user's original is provably safe — either the
+        # replacement succeeded (backup is a now-stale copy) or it was restored to ``target``. If
+        # ``build`` failed AND the restore (_rm_path / os.replace back) also failed, the backup is the
+        # ONLY surviving copy of the original, so leave the scratch dir (and its preserved original)
+        # in place rather than delete the user's data.
+        if not preserve_scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _merge_into_dir(source: Path, dest: Path) -> None:
