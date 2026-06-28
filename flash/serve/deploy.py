@@ -243,6 +243,73 @@ def undeploy_adapter(run_id: str) -> list[str]:
     return [run_id]
 
 
+def list_deployed_adapters() -> list[dict]:
+    """Return the serving app's live adapter registry — the authoritative DO-NOT-DELETE set.
+
+    A record normally carries ``adapterId`` (== run_id), ``repoId`` (the HF dataset repo serving
+    pulls weights from), and the ``subfolder``/``adapter_hf_prefix`` it loads, but this function
+    only validates that the body is a list of dict records — it does NOT enforce those keys, so
+    callers must tolerate a record missing them (e.g. on schema drift). Used by operator repo GC
+    (``flash.server.repo_cleanup``), whose ``deployed_repo_ids`` flags an unmappable record rather
+    than trusting an incomplete keep-set, to know which per-run repos are serving traffic.
+
+    Raises ``ServingError`` if the serving backend is unreachable, returns non-200, returns a
+    non-JSON body, or returns a 200 in an unrecognized shape — a caller gating destructive cleanup
+    on this set MUST treat any of those as "unknown, do not delete" rather than "nothing deployed".
+    The success body is tolerated as either a bare list or an ``{"adapters": [...]}`` /
+    ``{"data": [...]}`` envelope; an empty list (live set genuinely empty) returns ``[]``.
+    """
+    base = serving_base_url()
+    url = f"{base}/adapters"
+    try:
+        resp = httpx.get(
+            url,
+            headers=_internal_key_header(),
+            timeout=60.0,
+            # Modal answers a slow request with a 303 to an async-result poll URL; follow it (see chat).
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise _serving_status_error(url, exc) from exc
+    except httpx.RequestError as exc:
+        raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        # A 200 with an un-decodable body is NOT "nothing deployed" — surface it so the GC caller
+        # treats the live set as unknown and refuses to delete.
+        raise ServingError(f"serving backend returned a non-JSON adapter list from {url}: {exc}") from exc
+    if isinstance(data, dict):
+        # Accept only the known envelopes. An unrecognized object must NOT silently degrade to an
+        # empty keep-set (that would green-light deleting live repos); fail closed instead.
+        if "adapters" in data:
+            data = data["adapters"]
+        elif "data" in data:
+            data = data["data"]
+        else:
+            raise ServingError(
+                f"serving backend returned an unrecognized adapter-list envelope from {url} "
+                # ``sorted(data, key=str)`` not ``sorted(data)``: JSON object keys are always strings,
+                # but a hypothetical mixed-type keyset would make a bare ``sorted`` raise TypeError and
+                # MASK this fail-closed ServingError with a less actionable error. Sort defensively.
+                f"(keys: {sorted(data, key=str)[:8]}); refusing to treat it as an empty live set"
+            )
+    if not isinstance(data, list):
+        raise ServingError(
+            f"serving backend returned a {type(data).__name__}, not an adapter list, from {url}; "
+            "refusing to treat it as an empty live set"
+        )
+    # Every item must be a record. Silently dropping non-dict items (strings/None) would shrink the
+    # keep-set toward empty — and this set gates destructive GC — so a malformed item fails closed.
+    if any(not isinstance(rec, dict) for rec in data):
+        raise ServingError(
+            f"serving backend returned a non-record item in the adapter list from {url}; "
+            "refusing to treat it as the live set"
+        )
+    return list(data)
+
+
 def chat(
     run_id: str,
     messages: list[dict],
