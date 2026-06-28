@@ -242,6 +242,69 @@ def test_recombine_rejects_unpaired_lora_tensors(tmp_path):
         recombine_lora_adapters(sft, grpo, out)
 
 
+def test_recombine_rejects_lora_b_without_paired_lora_a(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    # Symmetric to the above: a lora_B with NO paired lora_A (same key set on both, so the module-set
+    # check passes). The recombine loop iterates only lora_A keys, so an orphan B would be SILENTLY
+    # dropped — recombine must instead fail loudly and name the unpaired key.
+    for adir in (sft, grpo):
+        _write_adapter(adir, modules=TEXT_MODULES, r=4, alpha=8, seed=1)
+        st = os.path.join(adir, "adapter_model.safetensors")
+        sd = {k: v for k, v in load_file(st).items() if ".lora_A." not in k}
+        save_file(sd, st, metadata={"format": "pt"})
+    with pytest.raises(ValueError, match=r"no matching lora_A"):
+        recombine_lora_adapters(sft, grpo, out)
+
+
+def _set_base(adir, value):
+    cfg = _read_cfg(adir)
+    if value is None:
+        cfg.pop("base_model_name_or_path", None)
+    else:
+        cfg["base_model_name_or_path"] = value
+    with open(os.path.join(adir, "adapter_config.json"), "w") as f:
+        json.dump(cfg, f)
+
+
+def test_recombine_names_catalog_base_from_sft_not_grpo_temp(tmp_path):
+    # The GRPO adapter trained on the merged base names the ephemeral /tmp/flash_sft_merged_* dir as
+    # its base. The recombined config must name the real catalog base (from the SFT config), never the
+    # GRPO temp path.
+    sft, grpo, out = str(tmp_path / "sft"), str(tmp_path / "grpo"), str(tmp_path / "out")
+    _write_adapter(sft, modules=TEXT_MODULES, r=4, alpha=8, seed=1)  # base = Qwen/Qwen3.5-2B
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    _set_base(grpo, "/tmp/flash_sft_merged_xyz")
+    recombine_lora_adapters(sft, grpo, out)
+    assert _read_cfg(out)["base_model_name_or_path"] == "Qwen/Qwen3.5-2B"
+
+
+def test_recombine_drops_stale_temp_base_when_sft_lacks_base(tmp_path):
+    # If the SFT config carries no base to override with (external/legacy adapter), recombine must DROP
+    # the field rather than inherit the GRPO adapter's now-deleted /tmp merged-base path.
+    sft, grpo, out = str(tmp_path / "sft"), str(tmp_path / "grpo"), str(tmp_path / "out")
+    _write_adapter(sft, modules=TEXT_MODULES, r=4, alpha=8, seed=1)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    _set_base(sft, None)
+    _set_base(grpo, "/tmp/flash_sft_merged_xyz")
+    recombine_lora_adapters(sft, grpo, out)
+    assert not _read_cfg(out).get("base_model_name_or_path")  # dropped, not a dangling temp path
+
+
+def test_recombine_preserves_higher_dtype_of_either_adapter(tmp_path):
+    # A higher-precision GRPO B must not be downcast to the SFT's dtype; output A and B stay consistent.
+    sft, grpo, out = str(tmp_path / "sft"), str(tmp_path / "grpo"), str(tmp_path / "out")
+    _write_adapter(sft, modules=TEXT_MODULES, r=4, alpha=8, seed=1, dtype=torch.float16)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2, dtype=torch.float32)
+    recombine_lora_adapters(sft, grpo, out)
+    sd = load_file(os.path.join(out, "adapter_model.safetensors"))
+    b = next(v for k, v in sd.items() if ".lora_B." in k)
+    a = next(v for k, v in sd.items() if ".lora_A." in k)
+    assert b.dtype == torch.float32  # promoted, not downcast to fp16
+    assert a.dtype == torch.float32  # cat auto-promotes; A/B stay consistent
+
+
 # --- orchestrator gating: recombined_warmstart_adapter_dir(src) ---------------------------------
 # Gated on the `_VL_WARMSTART_SFT_DIR` marker that _init_adapter_model sets ONLY on the VL merge path.
 import flash.engine.worker as W

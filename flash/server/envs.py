@@ -1,13 +1,9 @@
-"""Managed Freesolo environment publishing.
-
-``POST /v1/envs`` accepts a packaged Freesolo environment and uploads it to the
-managed environment hub. The returned id is a Freesolo environment slug
-(``namespace/name``) that Flash resolves internally.
-"""
+"""Managed Freesolo environment publishing."""
 
 from __future__ import annotations
 
 import base64
+import gzip
 import io
 import os
 import re
@@ -22,6 +18,7 @@ from pathlib import Path
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_MEMBERS = 5000
+_MAX_SCAN_MEMBERS = 200_000
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
@@ -40,6 +37,12 @@ _REPO_CONTROL_TOP_LEVEL_PATHS = {
 # and publish writes `source/<name>` without objection — so the delete validator must reject only
 # `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
 _BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
+_TAR_METADATA_TYPES = {
+    tarfile.XHDTYPE,
+    tarfile.XGLTYPE,
+    tarfile.GNUTYPE_LONGNAME,
+    tarfile.GNUTYPE_LONGLINK,
+}
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
@@ -54,19 +57,11 @@ class EnvPublishError(Exception):
         self.status = status
 
 
-# Reserved hub namespace for the operator/internal service key. Its /v1/me identity is synthetic
-# and shared (no per-user email), so it can't derive a namespace from an email like a user key does —
-# but it IS a trusted identity that can submit runs and read everything, so it must be able to
-# publish environments too. Matches the slug `internal@freesolo.co` would yield (see
-# flash.server.db.ensure_internal_key) so the namespace is stable regardless of the row's email.
+# Internal service key has no per-user email; fixed namespace keeps it stable.
 _INTERNAL_NAMESPACE = "internal-freesolo-co"
 
 
 def namespace_for(key: dict) -> str:
-    # Special case RESERVED for the internal service key ONLY (auth_kind == "internal"): give it a
-    # fixed namespace instead of requiring an email. Every other key is a freesolo USER key and still
-    # must carry a real email — we never loosen that, so two different users can't collide on one
-    # namespace.
     if key.get("auth_kind") == "internal":
         return _INTERNAL_NAMESPACE
     email = str(key.get("email") or "")
@@ -86,16 +81,47 @@ def _sanitize_name(name: str) -> str:
     return slug or "env"
 
 
+class _LimitedReader:
+    """Bounds total bytes read from a *decompressed* tar stream. A GNU LONGNAME/LONGLINK or PAX header
+    payload is consumed inside ``tarfile.next()`` and never yielded as a member, so per-member size
+    accounting can't see it — a tiny gzip can declare a multi-GB header and OOM the process. Reads are
+    clamped to the remaining budget so a single oversized header read allocates at most the limit, then
+    raises ``EnvPublishError``."""
+
+    def __init__(self, raw, limit: int):
+        self._raw = raw
+        self._remaining = limit
+
+    def read(self, size: int = -1) -> bytes:
+        want = self._remaining + 1 if size is None or size < 0 else min(size, self._remaining + 1)
+        chunk = self._raw.read(want)
+        self._remaining -= len(chunk)
+        if self._remaining < 0:
+            raise EnvPublishError(
+                f"env package is too large uncompressed (limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})"
+            )
+        return chunk
+
+
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     root = dest.resolve()
+    # Stream backstop > the per-member content cap by the max header+padding overhead (<=1KB/member),
+    # so it never false-rejects a legitimate package but still bounds an oversized header payload.
+    stream_cap = _MAX_UNCOMPRESSED_BYTES + _MAX_MEMBERS * 1024 + (1 << 20)
     try:
-        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+        reader = _LimitedReader(gzip.GzipFile(fileobj=io.BytesIO(tar_bytes)), stream_cap)
+        with tarfile.open(fileobj=reader, mode="r|") as tar:
             total = 0
-            for count, member in enumerate(tar, start=1):
-                if count > _MAX_MEMBERS:
+            scanned = 0
+            extracted = 0
+            for member in tar:
+                scanned += 1
+                if scanned > _MAX_SCAN_MEMBERS:
                     raise EnvPublishError(
-                        f"env package has too many members (limit {_MAX_MEMBERS})"
+                        f"env package has too many entries to scan (limit {_MAX_SCAN_MEMBERS})"
                     )
+                if member.type in _TAR_METADATA_TYPES:
+                    continue
                 segments: list[str] = []
                 for segment in member.name.replace("\\", "/").split("/"):
                     if not segment or segment == ".":
@@ -119,6 +145,11 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     raise EnvPublishError(
                         f"only regular files and directories are allowed in env packages, "
                         f"but {member.name!r} is a special file"
+                    )
+                extracted += 1
+                if extracted > _MAX_MEMBERS:
+                    raise EnvPublishError(
+                        f"env package has too many members (limit {_MAX_MEMBERS})"
                     )
                 total += max(0, member.size)
                 if total > _MAX_UNCOMPRESSED_BYTES:

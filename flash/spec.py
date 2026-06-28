@@ -13,11 +13,7 @@ _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 
 
 def _str_tuple(value: Any) -> tuple[str, ...]:
-    """Normalize a string-or-list knob (e.g. stop_sequences) to a tuple of strings.
-
-    A bare string is ONE element — never iterated into characters ("</s>" must not become
-    ('<','/','s','>')). None and empty strings -> () (no stop configured); empty entries
-    in a list are dropped."""
+    """Normalize a string-or-list knob to a tuple of strings; a bare string is one element, not iterated."""
     if value is None:
         return ()
     if isinstance(value, str):
@@ -26,37 +22,21 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
 
 
 def coerce_bool(value: Any) -> bool:
-    """Parse a bool from loosely-typed sources (JSON request bodies / env / persisted dicts).
-
-    bool(...) on a string is truthy for ANY non-empty string, so "false"/"0"/"no" would
-    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False.
-    An already-bool value passes through.
-    """
+    """Parse a bool from loosely-typed sources; treats "false"/"0"/"no"/"off" as False."""
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
     return bool(value)
 
 
 def _coerce_str_map(value: Any) -> dict[str, str]:
-    """Coerce a loosely-typed spec field into a ``dict[str, str]``.
-
-    A malformed persisted spec (or programmatic caller) can set a mapping field to a non-dict;
-    `.items()` on that would crash `from_dict` with AttributeError. Treat a non-dict as empty,
-    mirroring how the other nested fields tolerate missing/garbage input.
-    """
+    """Coerce to dict[str, str]; non-dict input returns empty dict."""
     if not isinstance(value, dict):
         return {}
     return {str(k): str(v) for k, v in value.items()}
 
 
 def _coerce_wandb(value: Any) -> WandbSpec:
-    """Coerce a loosely-typed ``wandb`` spec field into a ``WandbSpec``.
-
-    A malformed/older persisted spec can set ``wandb`` to a non-dict (e.g. a bare string), and
-    ``(value or {}).get(...)`` would crash ``from_dict`` with AttributeError on the worker. Treat
-    a non-dict as empty (default naming), mirroring ``_coerce_str_map``. String-coerce + trim the
-    leaves so a non-string label can't reach the W&B SDK / run-name path; blank -> None (default).
-    """
+    """Coerce to WandbSpec; non-dict input returns default."""
     if not isinstance(value, dict):
         return WandbSpec()
 
@@ -70,15 +50,9 @@ def _coerce_wandb(value: Any) -> WandbSpec:
 
 
 def _volume_gb(value: Any, default: int = 100) -> int:
-    """Parse the platform-managed weight-cache volume size, defaulting on anything not a positive int.
-
-    Tolerant by design (the field is platform-set, and stale/hand-edited specs must still load): a
-    missing / null / empty / non-numeric value, or a non-positive size (incl. the string "0" or a
-    negative), all fall back to ``default`` rather than crashing or round-tripping a nonsensical size.
-    """
+    """Parse volume size in GB; non-positive / non-numeric / missing values return default."""
     if isinstance(value, bool):
-        # bool is an int subclass (int(True) == 1), so a stray boolean would become a 1 GB volume;
-        # treat it as invalid and default (mirrors the bool rejection in _opt_int).
+        # bool is an int subclass; reject to avoid int(True)==1 becoming a 1 GB volume.
         return default
     try:
         gb = int(value)
@@ -88,12 +62,7 @@ def _volume_gb(value: Any, default: int = 100) -> int:
 
 
 def _opt_int(value: Any) -> int | None:
-    """Parse an optional int from a loosely-typed spec source; None stays None.
-
-    Rejects JSON booleans: ``bool`` is an ``int`` subclass in Python, so ``int(True)`` would
-    silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Mirrors the
-    bool rejection in schema._train_int — a bool is a type error, not a number.
-    """
+    """Parse optional int; rejects bools (bool is int subclass — int(True)==1 is a footgun)."""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -102,11 +71,7 @@ def _opt_int(value: Any) -> int | None:
 
 
 def _opt_float(value: Any) -> float | None:
-    """Parse an optional float from a loosely-typed spec source; None stays None.
-
-    Rejects JSON booleans (``bool`` is an ``int`` subclass) so a stray boolean train knob is
-    not silently coerced to 0.0/1.0; mirrors the bool rejection in schema._train_float.
-    """
+    """Parse optional float; rejects bools (mirrors _opt_int)."""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -116,25 +81,15 @@ def _opt_float(value: Any) -> float | None:
 
 @dataclass(frozen=True)
 class EnvironmentSpec:
-    # Freesolo environment id. No default:
-    # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     # Pip requirements the GPU worker needs for this environment; empty means "use defaults"
     # (resolved via worker_pip_for_env in spec_payload / provider submit). An explicit
     # [environment] pip is the escape hatch.
     pip: tuple[str, ...] = ()
-    # Secret env var names the environment requires on the worker. Values are never stored in the
-    # spec; the client reads matching local env/.env values and sends them out-of-band via
-    # runtime_secrets.
+    # Names only — values sent out-of-band via runtime_secrets, never stored in spec.
     secrets: tuple[str, ...] = ()
-    # Optional pinned commit SHA for the environment's GitHub ref, resolved ONCE in the control
-    # plane (runner._assign_resolved_env_sha, called from submit_job after the spec is finalized) so
-    # every worker boots from an immutable sha instead of each one re-resolving the symbolic ref
-    # (e.g. "main") against the GitHub commits API — which trips GitHub's secondary rate limit on a
-    # cold spawn wave. Empty (the default, and whenever the control-plane resolve fails) preserves
-    # today's behavior: the worker resolves the ref itself. The adapter only trusts a real 40-char
-    # sha (see adapter._resolve_ref_sha), so a stale/garbage value falls back to live resolution.
+    # Resolved once in control plane to avoid GitHub rate-limits on cold spawn waves.
     resolved_sha: str = ""
 
 
@@ -153,30 +108,15 @@ class TrainSpec:
     # Artifact-store adapter ref output by `flash status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = ""
-    # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
-    # code storage AND serving. PLATFORM-MANAGED, not a user field: the control plane assigns
-    # it server-side in runner.submit_job (a per-run private dataset under the operator's
-    # namespace, written by the operator HF_TOKEN). A user-supplied value is ignored by
-    # schema.spec_from_dict; this field carries the control-plane-assigned repo to the worker.
+    # PLATFORM-MANAGED: control-plane-assigned HF artifact repo; user-supplied values are ignored.
     hf_repo: str = ""
-    # Optimizer/batching knobs (SFT + GRPO). None -> the worker's tuned recipe default.
-    # batch_size is the GLOBAL/effective batch (SFT: grad-accum is sized to hit it; GRPO:
-    # prompts per optimizer step). max_length is the SFT max sequence length. save_every
-    # is the checkpoint interval in optimizer steps.
+    # None -> worker's tuned recipe default.
     learning_rate: float | None = None
     batch_size: int | None = None
     max_length: int | None = None
     save_every: int | None = None
-    # SFT caps (None/0 -> no cap). max_steps caps optimizer steps (cheap pre-flight smoke);
-    # max_examples truncates the SFT dataset.
     max_steps: int | None = None
     max_examples: int | None = None
-    # GRPO recipe knobs (datums parity), shipped by the SDK in [train] (NOT in
-    # [environment.params], which is forwarded verbatim to the Freesolo env loader).
-    # None/() -> recipe default. group_size = completions per prompt; temperature = rollout
-    # sampling temp; max_tokens = completion budget; kl_penalty_coef = KL beta;
-    # advantage_clip = centered-advantage clamp; thinking_length_penalty_coef =
-    # per-<think>-token reward deduction; stop_sequences = rollout stop strings.
     group_size: int | None = None
     temperature: float | None = None
     max_tokens: int | None = None
@@ -188,35 +128,18 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    # The parse-time provisional GPU class (cheapest VALIDATED class that fits the model). GPU
-    # pinning is gone: the submit-time allocator always re-picks the cheapest fitting validated
-    # active RunPod class, so a config's gpu.type does NOT pin — ``type`` is just the offline
-    # sizing/display default and the carrier the runner overwrites with the actually-allocated
-    # class.
+    # gpu.type does NOT pin — allocator re-picks cheapest fitting validated class at submit time.
     type: str = DEFAULT_GPU
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
-    # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
-    # each retry resumes from the latest streamed checkpoint. Matches INFRA_RETRY_FLOOR
-    # (runner.lifecycle) so a streak of broken/busy GPUs walks to a healthy host before giving up.
     max_retries: int = 5
-    # Persistent RunPod network-volume weight cache (platform-managed, NOT user config). When set,
-    # the RunPod provider attaches a same-named volume in EVERY datacenter in the cache fleet and
-    # allows the endpoint across all of them (no single-DC pin), and the worker points HF_HOME at
-    # the mount so a model download is a one-time cost per region instead of per run. Assigned by
-    # the runner (``_assign_weight_cache_volume``); a single fixed datacenter is intentionally NOT
-    # a field — the DC SET is deploy-time platform policy (see jobs.weight_cache_datacenters), so a
-    # run can never be region-pinned. ``None`` = no volume (cold download, cross-region).
+    # PLATFORM-MANAGED: runner assigns weight-cache volume; None = cold download.
     network_volume: str | None = None
     network_volume_gb: int = 100
 
 
 @dataclass(frozen=True)
 class WandbSpec:
-    # Optional W&B naming, defined in the [wandb] config table (first-class spec config, NOT
-    # env vars). project/run_name are non-secret labels; the actual WANDB_API_KEY stays an
-    # env-var secret. None -> the worker's defaults ("flash" project, "flash-<phase>-<run_id>-
-    # seedN" run name).
     project: str | None = None
     run_name: str | None = None
 
@@ -229,20 +152,11 @@ class JobSpec:
     train: TrainSpec = field(default_factory=TrainSpec)
     gpu: GpuSpec = field(default_factory=GpuSpec)
     run_id: str = "local"
-    # Per-run worker-environment overrides merged into the GPU worker's env (highest precedence
-    # over the control-plane os.environ allowlist). The escape hatch for A/B kernel experiments
-    # that must differ PER RUN, not globally: e.g. an optimizer or LoRA-init override on just the
-    # experiment run while others keep the global default. Forwarded verbatim (string values);
-    # never set secrets here.
+    # Per-run env overrides forwarded to the GPU worker; never put secrets here.
     worker_env: dict[str, str] = field(default_factory=dict)
     # "catalog" (curated models only) or "allow" (any HF model that fits the GPU).
     model_policy: str = "catalog"
-    # Thinking/reasoning mode (thinking-capable models only). One flag per run, consumed
-    # identically by SFT rendering, RL rollouts, and serving (decoding parity). OFF by default
-    # (operator preference: training defaults to no-reasoning; set thinking = true to enable).
     thinking: bool = False
-    # Optional W&B run naming from the [wandb] config table. Carried as typed spec config
-    # (round-tripped in the job-spec JSON the worker reads), not as environment variables.
     wandb: WandbSpec = field(default_factory=WandbSpec)
 
     @property
@@ -258,9 +172,7 @@ class JobSpec:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
         env = data.get("environment") or {}
-        # Defense-in-depth: a stale/older payload may still carry a local `path`. The worker only
-        # runs published Freesolo environment ids, so reject it here rather than silently
-        # dropping it.
+        # Reject stale payloads carrying a local `path`; worker only runs published env ids.
         if isinstance(env, dict) and env.get("path"):
             raise ValueError(
                 "local environment paths are no longer supported; the worker only runs "
@@ -308,8 +220,6 @@ class JobSpec:
                 # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
                 # _assign_managed_hf_repo before deploy.
                 network_volume=gpu.get("network_volume"),
-                # Tolerant: null / "" / "0" / 0 / negative / non-numeric / missing -> the default.
-                # Platform-managed, so a stale or hand-edited spec must still load with a sane size.
                 network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
             ),
             run_id=data.get("run_id", "local"),

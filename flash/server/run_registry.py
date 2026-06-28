@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
-import os
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from typing import Any
 
-from .auth import INTERNAL_KEY_ENV, freesolo_base_url
+from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key, org_id_of
 
 _LOG = logging.getLogger("flash.server.runs")
-_TIMEOUT_S = 10.0
 _RUN_PATH = "/api/flash/runs/internal"
 _CHECKPOINT_PATH = "/api/flash/runs/checkpoints/internal"
 
@@ -29,20 +26,12 @@ def _iso_from_epoch(value: float | int | None) -> str | None:
 
 
 def _post(path: str, body: dict[str, Any]) -> bool:
-    internal_key = os.environ.get(INTERNAL_KEY_ENV)
-    if not internal_key:
+    key = internal_key()
+    if not key:
         return False
-    req = urllib.request.Request(
-        f"{freesolo_base_url()}{path}",
-        data=json.dumps(body).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {internal_key}",
-            "Content-Type": "application/json",
-        },
-    )
+    req = build_internal_request(path, body, token=key)
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -84,7 +73,7 @@ def _managed_environment_slug(spec: dict[str, Any]) -> str | None:
 
 def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bool:
     context = {**_context_from_status(status), **(key or {})}
-    org_id = str(context.get("org_id") or "").strip()
+    org_id = org_id_of(context)
     if not org_id:
         return False
 
@@ -131,7 +120,7 @@ def record_training_checkpoint(
     except Exception:
         return False
     context = _context_from_status(status)
-    org_id = str(context.get("org_id") or "").strip()
+    org_id = org_id_of(context)
     if not org_id:
         return False
     body = {
