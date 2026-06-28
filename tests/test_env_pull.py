@@ -170,6 +170,29 @@ def test_pull_environment_package_populates_empty_dir(monkeypatch, tmp_path):
     assert dest.stat().st_mode & 0o777 == 0o700
 
 
+def test_pull_environment_package_populates_empty_dir_with_internal_staging(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
+    real_mkdtemp = env_pull.tempfile.mkdtemp
+    staging_dirs: list[Path] = []
+
+    def fake_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        if kwargs.get("prefix") == ".flash-env-pull-":
+            staging_dirs.append(Path(kwargs["dir"]))
+        return path
+
+    monkeypatch.setattr(env_pull.tempfile, "mkdtemp", fake_mkdtemp)
+    dest = tmp_path / "stuff"
+    dest.mkdir()
+
+    pull_environment_package("david-freesolo-co/stuff", dest)
+
+    assert dest in staging_dirs
+    assert (dest / "environment.py").is_file()
+
+
 def test_pull_environment_package_replaces_file_with_force(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
     dest = tmp_path / "stuff"
@@ -543,6 +566,30 @@ def test_urlopen_returns_bytes_when_capped(monkeypatch):
 
     assert isinstance(data, bytes)
     assert data == b"ok"
+
+
+def test_urlopen_streams_capped_response_to_output(monkeypatch):
+    class _Resp:
+        def __init__(self, data):
+            self._buf = io.BytesIO(data)
+
+        def read(self, size=-1):
+            return self._buf.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Resp(b"ok"))
+    req = urllib.request.Request("https://api.github.com/x")
+    out = io.BytesIO()
+
+    data = adapter._urlopen(req, max_bytes=16, out=out)
+
+    assert data == b""
+    assert out.getvalue() == b"ok"
 
 
 def test_resolve_github_env_extracts_repo_level_siblings(monkeypatch, tmp_path):

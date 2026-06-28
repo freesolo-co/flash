@@ -99,12 +99,12 @@ def _cwd_is_inside(path: Path) -> bool:
 
 
 def _populate_empty_dir(source: Path, dest: Path) -> None:
-    staging_parent = Path(tempfile.mkdtemp(prefix=".flash-env-pull-", dir=dest.resolve().parent))
+    staging_parent = Path(tempfile.mkdtemp(prefix=".flash-env-pull-", dir=dest))
     moved: list[Path] = []
     try:
         staging = staging_parent / "contents"
         shutil.copytree(source, staging)
-        if any(dest.iterdir()):
+        if any(child.name != staging_parent.name for child in dest.iterdir()):
             raise FileExistsError(
                 f"destination {dest} already exists (pass overwrite=True to replace)"
             )
