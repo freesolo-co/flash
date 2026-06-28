@@ -191,7 +191,11 @@ def _submit_seed_supervised(
         res = None
         alloc = None
         chosen = None
-        # Re-check cancel right before paid provisioning — no handle exists yet for cancel_run() to see.
+        # A cancel can land after _run_training's pre-submit check but while
+        # allocation/pricing runs, when no handle exists yet for cancel_run() to
+        # delete. Re-read state right before paid provisioning so a cancelled run
+        # never launches a worker (the later checks only stop the final-state
+        # overwrite, after the GPU has already run and billed).
         with contextlib.suppress(FileNotFoundError):
             if get_status(spec.run_id).state == "cancelled":
                 raise _cancel()
@@ -313,18 +317,12 @@ def _run_job_inner(
     upload_code,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
-    from flash.runner import _run_seed_loop, _RunCancelled, _update, get_status
+    from flash.runner import _run_training, _RunCancelled, _update, get_status
 
     try:
         upload_code(spec.train.hf_repo)
         with open(log_path, "a") as log:
-            _run_seed_loop(
-                spec,
-                log,
-                start_index=0,
-                prior_cost=0.0,
-                runtime_secrets=runtime_secrets,
-            )
+            _run_training(spec, log, prior_cost=0.0, runtime_secrets=runtime_secrets)
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
@@ -333,19 +331,20 @@ def _run_job_inner(
         raise
 
 
-def _run_seed_loop(
+def _run_training(
     spec: JobSpec,
     log,
     *,
-    start_index: int,
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
-    """Run spec.train.seeds[start_index:] under supervision; finalize the run.
+    """Train the run's single adapter under supervision; finalize the run.
 
-    Shared by a fresh submit (start_index=0) and post-restart recovery, which
-    resumes the remaining seeds after the in-flight one completes."""
+    Shared by a fresh submit and post-restart recovery (the worker resumes from its last HF
+    checkpoint on a fresh allocation). ``prior_cost`` carries spend already booked before a
+    recovery so the total isn't under-reported."""
     from flash.runner import (
+        FIXED_SEED,
         TERMINAL_STATES,
         _persist_metrics,
         _RunCancelled,
@@ -355,58 +354,41 @@ def _run_seed_loop(
         get_status,
     )
 
-    total_cost = prior_cost
-    seeds = spec.train.seeds
-    last_remote: dict | None = None
-    for i in range(start_index, len(seeds)):
-        seed = seeds[i]
-        # Guard against recovery TOCTOU: another thread may have flipped the run terminal already.
-        if get_status(spec.run_id).state in TERMINAL_STATES:
-            raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting seed")
-        _update(spec.run_id, "running")
-        print(
-            f"starting seed={seed} phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
-            file=log,
-            flush=True,
-        )
-        metrics = _submit_seed_supervised(spec, seed, log, runtime_secrets=runtime_secrets)
-        total_cost += _persist_metrics(spec, seed, metrics)
-        with contextlib.suppress(FileNotFoundError):
-            if get_status(spec.run_id).state == "cancelled":
-                raise _RunCancelled(f"run {spec.run_id} was cancelled")
-        # Capture the winning handle before clearing it: the terminal `done` record carries it again
-        # (billing/gc/log fetch read remote), but the *running* gap below must keep remote=None.
-        with contextlib.suppress(FileNotFoundError):
-            last_remote = get_status(spec.run_id).remote or last_remote
-        # Clear the handle + advance the resume index after EVERY seed (including the last). A restart
-        # in the window before the `done` write then routes through resume_run, not a re-attach that
-        # would re-provision and re-bill the already-completed seed (its cost is in cost_usd above).
-        # The last seed yields resume_seed_index=len(seeds): an empty resume straight to `done`.
-        _update(
-            spec.run_id,
-            "running",
-            cost_usd=total_cost,
-            remote=None,
-            resume_seed_index=i + 1,
-        )
-        print(
-            f"seed={seed} done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
-            file=log,
-            flush=True,
-        )
+    # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped into ANY
+    # terminal state — not just `cancelled` — by a concurrent thread/process between the resume
+    # decision and here. Bail before _update + the supervised submit so we never submit PAID GPU
+    # work for an already-terminal run. _RunCancelled is the terminal signal; callers swallow it.
+    if get_status(spec.run_id).state in TERMINAL_STATES:
+        raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting")
+    # The pre-check above closes most of the window, but a concurrent flip can still land between
+    # it and this transition. _update is a compare-and-set: it returns False when the run is already
+    # terminal and leaves the state untouched. Gate the PAID supervised submit on that result so a
+    # run cancelled in this last instant is never resumed onto a GPU.
+    if not _update(spec.run_id, "running"):
+        raise _RunCancelled(f"run {spec.run_id} went terminal before submit; not submitting")
+    print(
+        f"starting phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
+        file=log,
+        flush=True,
+    )
+    metrics = _submit_seed_supervised(spec, FIXED_SEED, log, runtime_secrets=runtime_secrets)
+    total_cost = prior_cost + _persist_metrics(spec, metrics)
+    # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
+    # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.
     with contextlib.suppress(FileNotFoundError):
         if get_status(spec.run_id).state == "cancelled":
             raise _RunCancelled(f"run {spec.run_id} was cancelled")
     # Gate side effects on the CAS succeeding — a concurrent cancel rejects the `done` write.
-    # Restore the winning handle onto the terminal record (None on the empty resume-recovery path,
-    # where the completion charge instead recovers provider/gpu from the last seed's metrics.json).
     applied = _update(
         spec.run_id,
         "done",
         cost_usd=total_cost,
         artifacts_dir=artifacts_dir(spec),
-        resume_seed_index=None,
-        remote=last_remote,
+    )
+    print(
+        f"done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
+        file=log,
+        flush=True,
     )
     if applied:
         _charge_completed_run_best_effort(spec, log)
@@ -430,33 +412,6 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
     _charge_completed_run_by_id(spec.run_id, log)
 
 
-def _billing_meta_from_last_seed(status) -> dict | None:
-    """Recover {provider, allocated_gpu} from the last seed's persisted metrics for the completion
-    charge, since the run's handle is cleared once the seed finishes."""
-    from pathlib import Path
-
-    from flash._fileio import read_json_or_empty
-    from flash.runner import artifacts_dir
-
-    try:
-        spec = JobSpec.from_dict(status.spec)
-        seeds = list(spec.train.seeds) or [0]
-        m = read_json_or_empty(
-            Path(artifacts_dir(spec)) / f"seed{seeds[-1]}" / "metrics.json"
-        )
-    except Exception:
-        return None
-    if not isinstance(m, dict) or not m:
-        return None
-    notes = m.get("notes") if isinstance(m.get("notes"), dict) else {}
-    meta = {}
-    if notes.get("provider"):
-        meta["provider"] = notes["provider"]
-    if m.get("allocated_gpu") or notes.get("runpod_gpu"):
-        meta["allocated_gpu"] = m.get("allocated_gpu") or notes.get("runpod_gpu")
-    return meta or None
-
-
 def _charge_completed_run_by_id(run_id: str, log) -> None:
     """Bill a completed run by id; reads everything from persisted RunStatus so stale specs don't block recovery."""
     from flash.runner import get_status, record_billing_state
@@ -476,12 +431,6 @@ def _charge_completed_run_by_id(run_id: str, log) -> None:
 
     record_billing_state(run_id, billing_state="charging", billing_error=None)
     status = get_status(run_id)
-    # The handle is cleared at completion, so recover provider/gpu (COGS attribution that
-    # charge_completed_run reads off status.remote) from the last seed's persisted metrics.
-    if not status.remote:
-        meta = _billing_meta_from_last_seed(status)
-        if meta:
-            status.remote = meta
     try:
         charge = charge_completed_run(internal_key=internal_key, status=status)
     except BillingError as exc:

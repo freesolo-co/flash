@@ -148,7 +148,7 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
         render.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
         render.deployments_table([{"run_id": "r", "deployment": {"gpu": "RTX 4090"}}]),
         render.env_setup(["environment.py", "datasets/train.jsonl", "configs/rl.toml"]),
-        render.env_list([], []),
+        render.env_list([]),
         render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"),
         render.submitted("flash-xyz"),
         render.run_status({"run_id": "r", "state": "failed", "spec": {}, "error": "boom — bad"}),

@@ -130,7 +130,17 @@ _INSTANCE_OWNING_STATES = _RECOVERABLE
 def _active_run_ids() -> set[str]:
     """Run ids that may still own a live training instance — protected from the orphan sweep.
 
-    Passed as a callable so it is resolved AFTER the provider lists, closing the launch race."""
+    Why this is a safe protection set with no idle grace: a run's status is flipped to an
+    instance-owning state BEFORE its first instance is ever launched (``_run_training`` writes
+    ``running`` ahead of ``_submit_seed_supervised``), and the launched instance is torn down BEFORE
+    the run can leave these states for ``done``/``deployed``/terminal (the provider lifecycle's
+    ``finally``). So a billed instance exists ONLY while its run is in this set — ownership is a
+    deterministic name->run mapping, not the noisy idle signal the RunPod reaper must grace. The
+    sweep passes this function itself (a callable) so the set is read AFTER the provider lists, which
+    closes the launch race — see ``_sweep_orphan_instances_once``. (Startup recovery in
+    ``recover_runs`` deliberately uses a NARROWER set — only handle-backed/resume runs — because it
+    is simultaneously RESUBMITTING handle-less runs and must reap their stale half-rented instances;
+    in-lifetime we instead protect every instance-owning run.)"""
     ids: set[str] = set()
     for row in db.all_runs():
         try:

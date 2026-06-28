@@ -257,7 +257,7 @@ def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_pat
         run_id="flash-bg-resolve",
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=1, seeds=(0,)),
+        train=TrainSpec(steps=1),
         gpu=GpuSpec(type="RTX 4090"),
         environment=EnvironmentSpec(id=_GH_ENV),
     )
