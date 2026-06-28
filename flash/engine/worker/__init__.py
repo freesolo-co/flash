@@ -130,8 +130,6 @@ from flash.engine.worker.lora import (
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
     recombine_lora_adapters,
-    remap_adapter_keys,
-    remap_vl_adapter_dir,
     strip_language_model_infix,
     vllm_language_model_only_kwargs,
 )
@@ -571,8 +569,6 @@ __all__ = [
     "publish_deployable_checkpoint",
     "recombine_lora_adapters",
     "recombined_warmstart_adapter_dir",
-    "remap_adapter_keys",
-    "remap_vl_adapter_dir",
     "render_prompt",
     "require_active_env",
     "require_vllm_for_rollout_func",

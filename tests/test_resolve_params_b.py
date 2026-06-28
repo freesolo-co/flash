@@ -14,9 +14,10 @@ def test_resolve_params_b_uses_catalog_params_b_float():
     assert resolve_params_b("Qwen/Qwen3.5-9B") == 9.7
 
 
-def test_resolve_params_b_falls_back_to_params_string(monkeypatch):
-    """A catalog entry lacking the numeric params_b but carrying a ``params`` display string is
-    parsed (run_sft's fallback) — and the HF fetch is NOT consulted."""
+def test_resolve_params_b_zero_falls_through_to_hf_not_string(monkeypatch):
+    """An entry with params_b=0.0 (no curated size) falls through to the HF fetch — the ``params``
+    display string is NOT parsed. params_b_from_str was removed; the string is display-only now, so a
+    "6.5B" display must NOT be mistaken for the size (the HF metadata is the only fallback)."""
     import types
 
     import flash.catalog as catalog
@@ -25,9 +26,10 @@ def test_resolve_params_b_falls_back_to_params_string(monkeypatch):
     fake = types.SimpleNamespace(params_b=0.0, params="6.5B (text-only fine-tune)")
     monkeypatch.setitem(catalog.MODELS, "acme/with-string", fake)
     calls = []
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda mid: calls.append(mid))
-    assert vram.resolve_params_b("acme/with-string") == 6.5
-    assert calls == []  # the string parse short-circuits the HF fetch
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda mid: calls.append(mid) or 7.0)
+    # 7.0 from the HF fetch, NOT 6.5 from the display string (which is now ignored).
+    assert vram.resolve_params_b("acme/with-string") == 7.0
+    assert calls == ["acme/with-string"]  # the HF fetch IS consulted (string no longer short-circuits)
 
 
 def test_resolve_params_b_open_model_uses_hf_metadata(monkeypatch):
