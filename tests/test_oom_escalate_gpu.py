@@ -66,13 +66,13 @@ def _read(mod):
 
 def test_worker_stamps_oom_flag():
     src = _read("flash.engine.worker")
-    assert "oom = is_cuda_oom(e) and not retriable" in src
+    assert "oom = not retriable and is_cuda_oom(e)" in src  # short-circuits on retriable infra
     assert '{"retriable": retriable, "oom": oom}' in src
 
 
 def test_poller_maps_oom_flag_to_oom_failure():
     src = _read("flash.providers.runpod.jobs")
-    assert src.count('failure="oom" if oom else ("job_preempted" if retriable else "job_failed")') == 2
+    assert src.count('"oom" if oom else') == 2  # oom wins in both worker-fail paths
     assert "def worker_flagged_oom" in src
 
 
@@ -90,3 +90,5 @@ def test_runner_escalates_on_oom():
     assert "oom_vram_floor = max(oom_vram_floor, int(chosen.vram_gb))" in body
     assert "_oom_escalated(alloc.candidates, oom_vram_floor)" in body
     assert "if not oom_shaped:" in body  # oom grows the card, doesn't escape the provider
+    # OOM escalation is cost -> bounded by the user's RAW max_retries, not the floored infra budget.
+    assert "retry_budget = max_retries if oom_shaped else infra_budget" in body
