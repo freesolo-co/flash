@@ -99,10 +99,14 @@ def test_lambda_poller_escalates_oom_for_cross_provider_parity():
     # the oom flag is read in BOTH Lambda worker-fail paths (marker + dead-host error_*.txt crash),
     # BOTH gate on handle.attempt (5Wy: a prior attempt's lingering {"oom": true} can't misclassify),
     # and BOTH read off a single shared _once_forced snapshot hb_once (8bS: two separate forced reads
-    # could disagree, the first missing a not-yet-visible heartbeat the second would see).
-    assert compact.count("worker_flagged_oom(hb_once,handle.attempt)") == 2
+    # could disagree, the first missing a not-yet-visible heartbeat the second would see). Match with a
+    # regex that tolerates positional OR keyword (current_attempt=) form so a harmless refactor passes.
+    oom_calls = re.findall(
+        r"worker_flagged_oom\(hb_once,(?:current_attempt=)?handle\.attempt\)", compact
+    )
+    assert len(oom_calls) == 2
     assert "worker_flagged_oom(heartbeat_reader" not in compact  # no direct-reader read survives
-    assert "worker_flagged_retriable(hb_once)" in compact  # retriable shares the same snapshot
+    assert re.search(r"worker_flagged_retriable\(hb_once[),]", compact)  # retriable shares the snapshot
     assert "worker_flagged_retriable(heartbeat_reader)" not in compact
     # marker path: oom wins over the retriable/job_failed split
     assert 'failure="oom" if oom else ("job_preempted" if retriable else "job_failed")' in src
