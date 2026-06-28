@@ -29,7 +29,11 @@ def _identity_for_token(token: str) -> dict[str, str]:
     if not token.startswith(_USER_PREFIX):
         return {}
     suffix = token.removeprefix(_USER_PREFIX)
-    identity = {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
+    identity = {
+        "email": f"user-{suffix}@example.com",
+        "key_prefix": "fslo_test",
+        "org_slug": f"org-{suffix}",
+    }
     if suffix != "noorg":
         identity["org_id"] = f"org-{suffix}"
     return identity
@@ -292,7 +296,12 @@ def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch
     token = "fslo-user-spoof"
     auth_mod._verify_cache[token] = (
         True,
-        {"key_prefix": "internal", "email": "user@example.com", "org_id": "org-spoof"},
+        {
+            "key_prefix": "internal",
+            "email": "user@example.com",
+            "org_id": "org-spoof",
+            "org_slug": "org-spoof",
+        },
         time.time() + auth_mod._VERIFY_CACHE_TTL_S,
     )
 
