@@ -1,4 +1,4 @@
-"""Run-execution machinery: the submit -> seed-loop -> per-seed supervised job -> GC flow.
+"""Run-execution machinery: the submit -> supervised training job -> GC flow.
 
 Store helpers (get_status/_update/_save_status/artifacts_dir/_persist_metrics/RUNS_DIR/...)
 and sibling lifecycle functions are pulled in via FUNCTION-LOCAL lazy

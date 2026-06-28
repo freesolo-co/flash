@@ -150,8 +150,8 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
         e = estimate_cost(cfg)
         assert e.wall_clock_seconds == pytest.approx(60.0)
         assert e.total_usd > 0.0
-    one = RunConfig(BIG, "grpo", 100_000, setup_repeats=1, max_wall_seconds=3600)
-    assert estimate_cost(one).wall_clock_seconds == pytest.approx(3600.0)
+    capped = RunConfig(BIG, "grpo", 100_000, max_wall_seconds=3600)
+    assert estimate_cost(capped).wall_clock_seconds == pytest.approx(3600.0)
 
 
 def test_select_gpu_picks_cheapest_including_unvalidated():

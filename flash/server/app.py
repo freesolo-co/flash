@@ -86,7 +86,7 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
     from its spec, so a run is covered even in the submit -> handle-persisted window.
 
     ``include_terminal=False`` yields the PROTECTED set (live, non-terminal runs only) — endpoints
-    the reaper must never delete, even when momentarily idle between seeds. ``include_terminal=True``
+    the reaper must never delete, even when momentarily idle. ``include_terminal=True``
     yields the KNOWN set (every run this plane has a record of) — used to SCOPE the reaper to this
     plane's own endpoints (multi-plane safety; see ``_sweep_idle_flash_endpoints``)."""
     from flash.providers.base import canonical_gpu
@@ -165,8 +165,8 @@ async def _reap_idle_endpoints_loop() -> None:
 
 # Run states that may still OWN a live, billing training instance, so their provider instances must
 # be PROTECTED from the orphan sweep. Deliberately EXCLUDES ``deployed``: a run only reaches
-# ``deployed`` after it went ``done`` (the seed loop's ``finally`` already tore every training
-# instance down), so a deployed run owns no training worker — keeping it in the protection set would
+# ``deployed`` after it went ``done`` (which already tore its training instance down), so a deployed
+# run owns no training worker — keeping it in the protection set would
 # instead SHIELD a genuine leaked instance under its prefix from the sweep (the very thing the sweep
 # exists to reap). Terminal states are excluded for the same reason. This is exactly ``_RECOVERABLE``
 # — a run is recoverable on restart iff it may still have an in-flight worker — so it is ALIASED
