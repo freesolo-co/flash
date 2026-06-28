@@ -33,7 +33,7 @@ def hf_api():
 
 
 def hf_prefix() -> str:
-    return f"{_w.PHASE}/{_w.RUN_ID}/seed{_w.SEED}"
+    return f"{_w.PHASE}/{_w.RUN_ID}"
 
 
 def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool:
