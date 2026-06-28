@@ -295,7 +295,11 @@ def test_instance_bootstrap_oom_scanner_is_self_contained():
         if isinstance(node, ast.Import):
             assert not any(a.name.split(".")[0] == "flash" for a in node.names)
     assert "def _text_flags_cuda_oom" in boot  # inlined predicate
-    assert "return _text_flags_cuda_oom(tail)" in boot
+    # the inlined predicate is applied to the TERMINAL exception block of the console tail, never the
+    # whole tail — mirrors runpod.jobs.detail_flags_cuda_oom so an early 'cuda' init line + a later
+    # host-RAM OOM can't be combined into a false escalating marker (and stays self-contained).
+    assert "def _terminal_exception_block" in boot  # inlined narrower
+    assert "return _text_flags_cuda_oom(_terminal_exception_block(tail))" in boot
     # the inlined predicate matches the worker's CUDA-OOM behavior (string branch of is_cuda_oom)
     import importlib
 
@@ -309,6 +313,23 @@ def test_instance_bootstrap_oom_scanner_is_self_contained():
         "ValueError: bad config",
     ):
         assert boot_mod._text_flags_cuda_oom(text) == is_cuda_oom(None, text)
+    # the terminal-block narrower mirrors the worker: a mixed tail (early 'cuda' init log + a later
+    # host-RAM OOM in the terminal traceback) is NOT a CUDA OOM, while a real CUDA OOM in the
+    # terminal traceback still flags. This is the bootstrap analog of detail_flags_cuda_oom narrowing.
+    mixed = (
+        "INFO: CUDA initialized on device 0 (NVIDIA A100)\n"
+        "Traceback (most recent call last):\n"
+        '  File "/x/torch/utils/data/_utils.py", line 9, in _try_get\n'
+        "RuntimeError: DataLoader worker (pid 7) killed by signal: out of memory\n"
+    )
+    assert boot_mod._text_flags_cuda_oom(boot_mod._terminal_exception_block(mixed)) is False
+    real = (
+        "INFO: starting vLLM EngineCore\n"
+        "Traceback (most recent call last):\n"
+        '  File "/x/vllm/engine.py", line 3, in step\n'
+        "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+    )
+    assert boot_mod._text_flags_cuda_oom(boot_mod._terminal_exception_block(real)) is True
 
 
 def _src(modfile_attr, name):

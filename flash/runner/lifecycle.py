@@ -534,7 +534,11 @@ def _submit_seed_supervised(
             else "retrying (resume from last checkpoint)"
         )
         print(
-            f"seed={seed} attempt={attempt} failed ({res.failure}); {action}"
+            # Log the CUMULATIVE/monotonic ``submit_attempt`` (the real attempt id used for the
+            # endpoint suffix, the worker ATTEMPT env, heartbeat gating, and the persisted handle),
+            # NOT the local loop index ``attempt`` — after an OOM-recovery resume the index resets to
+            # 0 while the real id is higher, so the index would break log/heartbeat/handle correlation.
+            f"seed={seed} attempt={submit_attempt} failed ({res.failure}); {action}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,

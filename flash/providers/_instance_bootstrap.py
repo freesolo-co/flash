@@ -292,6 +292,24 @@ def _text_flags_cuda_oom(text: str) -> bool:
     return "cuda" in blob or "triton" in blob
 
 
+def _terminal_exception_block(text: str) -> str:
+    """The LAST traceback in a multi-line console tail — i.e. the terminal exception. Mirrors
+    ``flash.providers.runpod.jobs._terminal_exception_block`` (INLINED — the bootstrap stays
+    self-contained, flash is not importable here).
+
+    ``_text_flags_cuda_oom`` ANDs an OOM marker with CUDA/Triton context anywhere in the text it is
+    given, so feeding it the WHOLE tail lets the two come from UNRELATED lines: a 'cuda' from an early
+    init log plus an 'out of memory' from a later host-RAM/DataLoader OOM would falsely escalate onto a
+    larger card (more VRAM can't fix that). Restricting the scan to the final traceback forces both
+    signals to come from the SAME terminal failure. When there is no traceback framing (a bare one-line
+    handler error), fall back to the last few lines where the terminal exception lives."""
+    marker = "Traceback (most recent call last):"
+    idx = text.rfind(marker)
+    if idx != -1:
+        return text[idx:]
+    return "\n".join(text.splitlines()[-15:])
+
+
 def _console_flags_cuda_oom(mode: str | None) -> bool:
     """True if THIS attempt's training console (``/tmp/console_<mode>.txt``) names a CUDA OOM — a
     subprocess OOM (e.g. a vLLM EngineCore child) the worker's own exception classifier missed
@@ -311,7 +329,10 @@ def _console_flags_cuda_oom(mode: str | None) -> bool:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - tail_bytes))
             tail = f.read().decode(errors="replace")
-        return _text_flags_cuda_oom(tail)
+        # Scan only the TERMINAL exception block (last traceback), not the whole tail — mirrors the
+        # worker's runpod.jobs.detail_flags_cuda_oom narrowing so an early 'cuda' init line plus a
+        # later host-RAM 'out of memory' can't be combined into a false GPU-escalating OOM marker.
+        return _text_flags_cuda_oom(_terminal_exception_block(tail))
     except Exception:
         return False
 
