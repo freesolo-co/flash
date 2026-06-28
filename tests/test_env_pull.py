@@ -807,3 +807,69 @@ def test_pull_preserves_symlink_dest_on_copy_failure(monkeypatch, tmp_path):
     assert dest.is_symlink()  # link preserved
     assert dest.resolve() == realtarget.resolve()
     assert (realtarget / "keep").read_text() == "x"  # target untouched
+
+
+def test_merge_into_dir_preserves_child_symlink_on_copy_failure(monkeypatch, tmp_path):
+    # An in-place merge that replaces a child SYMLINK must not lose the user's link if the copy
+    # fails: the link is moved aside and restored, never eagerly unlinked before the copy succeeds.
+    realtarget = tmp_path / "real"
+    realtarget.mkdir()
+    (realtarget / "keep").write_text("orig")
+    source = tmp_path / "src"
+    (source / "datasets").mkdir(parents=True)
+    (source / "datasets" / "train.jsonl").write_text("new")
+    dest = tmp_path / "dst"
+    dest.mkdir()
+    (dest / "datasets").symlink_to(realtarget, target_is_directory=True)
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(adapter, "_atomic_copy2", boom)
+    with pytest.raises(OSError, match="disk full"):
+        adapter._merge_into_dir(source, dest)
+    assert (dest / "datasets").is_symlink()  # link preserved (move-aside/restore, not unlink-first)
+    assert (dest / "datasets").resolve() == realtarget.resolve()
+    assert (realtarget / "keep").read_text() == "orig"  # never written through the link
+    assert [p.name for p in dest.iterdir()] == ["datasets"]  # scratch backup dir cleaned up
+
+
+def test_replace_opposite_type_does_not_clobber_existing_flash_old(tmp_path):
+    # The move-aside must use a UNIQUE scratch name, never a fixed ``.<name>.flash-old`` sibling that
+    # could collide with — and delete — unrelated user content that happens to bear that name.
+    (tmp_path / "data").write_text("ORIGINAL")  # existing FILE; incoming is a DIR (opposite type)
+    sentinel = tmp_path / ".data.flash-old"
+    sentinel.write_text("user's own file, unrelated")
+
+    def build():
+        (tmp_path / "data").mkdir()
+
+    adapter._replace_opposite_type(tmp_path / "data", build)
+    assert sentinel.read_text() == "user's own file, unrelated"  # not clobbered
+    assert (tmp_path / "data").is_dir()  # replacement installed
+
+
+def test_safe_extract_archive_spills_to_tempfile_not_bytesio(monkeypatch, tmp_path):
+    # The compressed body is spilled to a temp FILE and the tar is opened from disk, not wrapped in
+    # io.BytesIO(...) (which copies the buffer and would ~double peak RAM for a near-1 GiB hub).
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name="repo-sha/wanted/environment.py")
+        data = b"# env\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    captured: dict[str, object] = {}
+    real_open = adapter.tarfile.open
+
+    def spy_open(*args, **kwargs):
+        captured["fileobj"] = kwargs.get("fileobj")
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(adapter.tarfile, "open", spy_open)
+    # Pass a bytearray (what _read_capped returns) to confirm the spill accepts it too.
+    out = adapter._safe_extract_archive(bytearray(buf.getvalue()), tmp_path, subdir="wanted")
+    fileobj = captured["fileobj"]
+    assert not isinstance(fileobj, io.BytesIO)  # opened from disk, not an in-memory copy
+    assert hasattr(fileobj, "fileno")  # a real on-disk temp file
+    assert (out / "wanted" / "environment.py").is_file()

@@ -12,7 +12,6 @@ from __future__ import annotations
 import contextlib
 import functools
 import hashlib
-import io
 import json
 import os
 import re
@@ -398,48 +397,56 @@ def _safe_extract_archive(tar_bytes: bytes | bytearray, dest: Path, subdir: str 
     total = 0
     extracted = 0
     scanned = 0
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-        for member in tar:
-            # Bound the TOTAL headers iterated, not just the extracted subset: filtering to a small
-            # subtree still walks every member of a (possibly huge) whole-repo tarball, so without
-            # this a tarball packed with many tiny entries is a CPU/time DoS even when extraction is
-            # tiny. Count every member yielded, before the metadata/subtree skips below.
-            scanned += 1
-            if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
-                raise RuntimeError(
-                    f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
-                )
-            if member.type in _TAR_METADATA_TYPES:
-                continue
-            raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
-            if not raw:
-                continue
-            # ``raw[0]`` is the archive's single top dir; ``raw[1:]`` is the path within the repo.
-            # Track the top dir from EVERY member (so the layout is known even when the requested
-            # subtree is absent), but only extract/count members inside that subtree.
-            top_dirs.add(raw[0])
-            if want and raw[1 : 1 + len(want)] != want:
-                continue
-            if ".." in raw:
-                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-            extracted += 1
-            if extracted > _MAX_ARCHIVE_MEMBERS:
-                raise RuntimeError(
-                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
-                )
-            normalized_name = "/".join(raw)
-            target = (dest / normalized_name).resolve()
-            if target != root and root not in target.parents:
-                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-            if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
-                continue
-            total += max(0, member.size)
-            if total > _MAX_ARCHIVE_BYTES:
-                raise RuntimeError(
-                    f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
-                )
-            member.name = normalized_name
-            tar.extract(member, dest)
+    # Spill the compressed body to a temp FILE and read the tar from disk instead of wrapping it in
+    # io.BytesIO(...), which copies the buffer: a near-_MAX_TARBALL_BYTES body would otherwise peak at
+    # ~2x in RAM (the downloaded buffer plus its BytesIO copy) and OOM even for a tiny env pulled from
+    # a big shared hub. ``del tar_bytes`` releases the in-RAM copy once it is on disk.
+    with tempfile.NamedTemporaryFile(prefix="flash-env-tar-", suffix=".tar.gz") as spill:
+        spill.write(tar_bytes)
+        spill.seek(0)
+        del tar_bytes
+        with tarfile.open(fileobj=spill, mode="r:gz") as tar:
+            for member in tar:
+                # Bound the TOTAL headers iterated, not just the extracted subset: filtering to a
+                # small subtree still walks every member of a (possibly huge) whole-repo tarball, so
+                # without this a tarball packed with many tiny entries is a CPU/time DoS even when
+                # extraction is tiny. Count every member yielded, before the metadata/subtree skips.
+                scanned += 1
+                if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
+                    raise RuntimeError(
+                        f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
+                    )
+                if member.type in _TAR_METADATA_TYPES:
+                    continue
+                raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
+                if not raw:
+                    continue
+                # ``raw[0]`` is the archive's single top dir; ``raw[1:]`` is the path within the repo.
+                # Track the top dir from EVERY member (so the layout is known even when the requested
+                # subtree is absent), but only extract/count members inside that subtree.
+                top_dirs.add(raw[0])
+                if want and raw[1 : 1 + len(want)] != want:
+                    continue
+                if ".." in raw:
+                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+                extracted += 1
+                if extracted > _MAX_ARCHIVE_MEMBERS:
+                    raise RuntimeError(
+                        f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
+                    )
+                normalized_name = "/".join(raw)
+                target = (dest / normalized_name).resolve()
+                if target != root and root not in target.parents:
+                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+                if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
+                    continue
+                total += max(0, member.size)
+                if total > _MAX_ARCHIVE_BYTES:
+                    raise RuntimeError(
+                        f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+                    )
+                member.name = normalized_name
+                tar.extract(member, dest)
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")
     # The top dir always exists; create it even when the requested subtree had no members, so the
@@ -634,48 +641,62 @@ def _rm_path(p: Path) -> None:
 
 
 def _replace_opposite_type(target: Path, build) -> None:
-    """Replace an existing ``target`` of the OPPOSITE type (file<->dir) without destroying it until the
-    replacement is ready: move it aside, run ``build()`` to create the new ``target``, drop the backup
-    on success, and RESTORE the original if ``build`` raises (a mid-copy disk/quota/read error). The
-    naive ``unlink()``/``rmtree()``-then-copy would leave the user with nothing if the copy failed."""
-    backup = target.with_name(f".{target.name}.flash-old")
-    if backup.is_symlink() or backup.exists():
-        _rm_path(backup)
-    os.replace(target, backup)  # atomic move-aside (file, dir, or symlink)
+    """Replace an existing ``target`` (a file/dir being swapped for the OPPOSITE type, or a symlink)
+    without destroying it until the replacement is ready: move it aside into a fresh UNIQUE scratch
+    dir, run ``build()`` to create the new ``target``, drop the backup on success, and RESTORE the
+    original if ``build`` raises (a mid-copy disk/quota/read error). The naive
+    ``unlink()``/``rmtree()``-then-copy would leave the user with nothing if the copy failed. A unique
+    scratch dir (NOT a fixed ``.<name>.flash-old`` sibling) is used so a pre-existing user file/dir of
+    that conventional name is never clobbered."""
+    scratch = Path(tempfile.mkdtemp(prefix=".flash-env-old-", dir=target.parent))
+    backup = scratch / target.name
     try:
-        build()
-    except BaseException:
-        if target.is_symlink() or target.exists():
-            _rm_path(target)  # drop any partial replacement
-        os.replace(backup, target)  # restore the original intact
-        raise
-    _rm_path(backup)  # success: the saved original is no longer needed
+        os.replace(target, backup)  # atomic move-aside (file, dir, or symlink)
+        try:
+            build()
+        except BaseException:
+            if target.is_symlink() or target.exists():
+                _rm_path(target)  # drop any partial replacement
+            os.replace(backup, target)  # restore the original intact
+            raise
+    finally:
+        # Drop the scratch dir: on success it still holds the saved original (no longer needed); on
+        # failure the original has already been moved back out, leaving it empty.
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _merge_into_dir(source: Path, dest: Path) -> None:
     """Recursively copy ``source``'s contents into existing ``dest``, overwriting same-named
-    children. Unlike ``shutil.copytree(dirs_exist_ok=True)``, a child of ``dest`` that is a SYMLINK
-    is removed before writing, never followed — so a pre-existing ``datasets -> /elsewhere`` link in
-    the destination (e.g. the cwd, when merging in place with ``--force``) can't redirect writes
-    outside the requested output tree. Each file is replaced atomically (stage + ``os.replace``) so a
-    failed merge never leaves an existing file truncated. A child being replaced by one of the
-    OPPOSITE type (existing file vs incoming dir, or vice versa) is swapped via move-aside/restore so a
-    mid-copy failure can't destroy the user's existing child."""
+    children. Unlike ``shutil.copytree(dirs_exist_ok=True)``, a child of ``dest`` that is a SYMLINK is
+    replaced (never followed) — so a pre-existing ``datasets -> /elsewhere`` link in the destination
+    (e.g. the cwd, when merging in place with ``--force``) can't redirect writes outside the requested
+    output tree. Each file is replaced atomically (stage + ``os.replace``) so a failed merge never
+    leaves an existing file truncated. A child being replaced by one of the OPPOSITE type (existing
+    file vs incoming dir, or vice versa) OR a child symlink is swapped via move-aside/restore, so a
+    mid-copy failure can neither destroy the user's existing child nor lose their symlink."""
     dest.mkdir(parents=True, exist_ok=True)
     for child in source.iterdir():
         target = dest / child.name
+        build = (
+            functools.partial(_merge_into_dir, child, target)
+            if child.is_dir()
+            else functools.partial(_atomic_copy2, child, target)
+        )
         if target.is_symlink():
-            target.unlink()  # replace the link itself; do not write through it
-        if child.is_dir():
+            # Replace the link ITSELF (never write through it), but keep it until the replacement
+            # succeeds: move it aside and restore on a mid-copy failure, exactly like the
+            # opposite-type paths below. An eager unlink would lose the link if the copy then failed.
+            _replace_opposite_type(target, build)
+        elif child.is_dir():
             if target.exists() and not target.is_dir():
                 # incoming dir over an existing file: keep the file until the subtree is fully built.
-                _replace_opposite_type(target, functools.partial(_merge_into_dir, child, target))
+                _replace_opposite_type(target, build)
             else:
                 _merge_into_dir(child, target)
         else:
             if target.is_dir():
                 # incoming file over an existing dir: keep the dir until the file copy succeeds.
-                _replace_opposite_type(target, functools.partial(_atomic_copy2, child, target))
+                _replace_opposite_type(target, build)
             else:
                 _atomic_copy2(child, target)
 
