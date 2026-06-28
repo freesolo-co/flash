@@ -470,6 +470,11 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
     assert captured["queue_grace_s"] == 300.0
     assert captured["current_attempt"] == 0
 
+    captured.clear()
+    PROVIDER.poll(JobHandle.from_dict(base), spec, 0)
+    assert captured["queue_grace_s"] == 300.0
+    assert captured["current_attempt"] is None
+
 
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     # A job that leaves IN_QUEUE (a worker picks it up) must clear the queue timer: the later

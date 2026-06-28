@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import types
 
 import pytest
@@ -108,34 +107,15 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
     assert res.failure == "job_failed"
 
 
-def _worker_source():
-    import inspect
-
+def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):
     import flash.engine.worker as worker
 
-    return inspect.getsource(worker)
-
-
-def test_worker_stamps_oom_flag():
-    tree = ast.parse(_worker_source())
-    oom_assigns = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "oom" for t in n.targets)
-    ]
-    assert oom_assigns, "worker never assigns an `oom` flag"
-    val = oom_assigns[0].value
-    assert isinstance(val, ast.BoolOp), "`oom` must be a boolean (`and`) expression"
-    assert isinstance(val.op, ast.And), "`oom` must short-circuit via `and`"
-    first, second = val.values[0], val.values[1]
-    assert isinstance(first, ast.UnaryOp), "first operand must be a `not ...` guard"
-    assert isinstance(first.op, ast.Not), "first operand must be `not retriable`"
-    assert isinstance(first.operand, ast.Name), "first operand must negate a bare name"
-    assert first.operand.id == "retriable", "first operand must be `not retriable`"
-    assert isinstance(second, ast.Call), "second operand must be a call"
-    assert isinstance(second.func, ast.Name), "second operand must call a bare name"
-    assert second.func.id == "is_cuda_oom", "second operand must be is_cuda_oom(...)"
-    src = _worker_source()
-    assert '"oom": oom' in src
-    assert '"retriable": retriable' in src
+    monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: True)
+    assert worker._worker_failure_flags(RuntimeError("cuda oom")) == {
+        "retriable": False,
+        "oom": True,
+    }
+    assert worker._worker_failure_flags(worker.RetriableInfraError("bad host")) == {
+        "retriable": True,
+        "oom": False,
+    }
