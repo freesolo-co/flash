@@ -8,6 +8,8 @@ and ``JOB_SPEC`` (``grpo_overrides``)."""
 
 from __future__ import annotations
 
+import os
+
 from flash.engine.worker._pkg import W as _w
 
 
@@ -143,7 +145,9 @@ def rl_per_device_comps(
     *,
     use_vllm: bool = True,
     params_b: float | None = None,
+    active_params_b: float | None = None,
     seq_len: int = 0,
+    fused_logits: bool = False,
 ) -> int:
     """Per-device *completion* micro-batch for GRPO (TRL counts completions, not prompts).
 
@@ -184,10 +188,32 @@ def rl_per_device_comps(
     """
     default = 2 if _w.THINKING else 8
 
+    # Operator/tuning override: force an EXACT per-device micro-batch, bypassing every auto-cap
+    # below. This is the MFU-sweep handle (probe the throughput plateau at a fixed per_device) and a
+    # production escape hatch when the auto-sizer is wrong for a model/card. It is honored verbatim
+    # (>=1) — the caller takes responsibility for fit, since it skips the logits + activation/VRAM
+    # safety caps. Unset/blank/invalid -> the auto-sizer runs as normal.
+    _ovr = os.environ.get("FLASH_RL_PER_DEVICE_COMPS", "").strip()
+    if _ovr:
+        try:
+            forced = int(_ovr)
+            if forced >= 1:
+                print(f"rl_per_device_comps: FLASH_RL_PER_DEVICE_COMPS override -> per_device={forced}")
+                return forced
+            print(f"rl_per_device_comps: ignoring non-positive FLASH_RL_PER_DEVICE_COMPS={_ovr!r}")
+        except ValueError:
+            print(f"rl_per_device_comps: ignoring non-integer FLASH_RL_PER_DEVICE_COMPS={_ovr!r}")
+
     # Logits budget: hard upper bound on the fp32 [per_device, completion, vocab] logprob tensor —
-    # a single forward's logits must fit a ~6 GB ceiling.
+    # a single forward's logits must fit a ~6 GB ceiling. This is a SAFETY NET for the unfused
+    # fallback path: when the fused GRPO loss is on (``fused_logits`` — TRL's liger_grpo_loss /
+    # use_liger_kernel, which is unconditional on the GRPO path), those fp32 logits are NEVER
+    # materialized, so the 6 GB cap models a tensor that doesn't exist and over-throttles — it pins
+    # the 35B-A3B colocate to pd=15 at a 384-tok completion, and to pd=1 on a long multi-turn
+    # transcript (cap ~= 6e9/(32k*248k*4)). When fused, drop the budget term to the structural max
+    # and let the ceiling + activation/VRAM cap bind instead; keep the real 6 GB cap when unfused.
     logits_cap = _RL_PER_DEVICE_MAX
-    if completion_len > 0:
+    if completion_len > 0 and not fused_logits:
         logits_cap = max(1, int(6.0e9 / (max(1, completion_len) * vocab * 4)))
 
     # Growth is gated to SHORT sequences (seq < the reference). At/above the reference seq the
@@ -209,7 +235,13 @@ def rl_per_device_comps(
                 # (flash.engine.vram + gpu_setup.finalize_alloc_conf_for_sleep) so the
                 # divisor/scale thresholds and calibration comments stay on one unit.
                 vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-                width = (max(float(params_b), 0.1) ** 0.5) if params_b else 1.41
+                # MoE: the trainer-step activation footprint scales with the ACTIVE backbone
+                # (~3B for the 35B-A3B), not the 35B resident total — mirrors engine.vram's eff_b.
+                # Without this, sqrt(35) crushes vram_cap BELOW the dense default ceiling, throttling
+                # the A3B beneath dense models despite cheap active compute + ~100 GB free VRAM during
+                # the sleep-offloaded backward. None/dense -> falls back to params_b (unchanged).
+                _eff_b = float(active_params_b) if active_params_b else params_b
+                width = (max(float(_eff_b), 0.1) ** 0.5) if _eff_b else 1.41
                 seq_scale = min(
                     _RL_ACT_SEQ_SCALE_CEIL,
                     max(_RL_ACT_SEQ_SCALE_FLOOR, (seq_len or _RL_ACT_SEQ_REF) / _RL_ACT_SEQ_REF),
