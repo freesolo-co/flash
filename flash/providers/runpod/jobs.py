@@ -646,8 +646,14 @@ def poll_job(
     throttled_grace_s: float = 300.0,
     queue_grace_s: float = 300.0,
     deadline_s: float | None = None,
+    current_attempt: int | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
+
+    ``current_attempt`` (the attempt this poll is for) is forwarded to ``worker_flagged_oom`` so a
+    prior attempt's lingering ``{"oom": true}`` in the shared-prefix heartbeat can't misclassify an
+    unrelated startup/platform failure as an OOM and escalate onto a larger card (see that helper).
+    ``None`` keeps the historical behavior for callers that don't know the attempt (reattach poll).
 
     Two stall windows: the cold-start phase (dep install, per-run env pip, model download,
     vLLM init) is slow and only emits *setup* heartbeats (``SETUP_HEARTBEAT_STAGES``).
@@ -720,7 +726,7 @@ def poll_job(
                 hb_reader = _once_forced(heartbeat_reader)
                 last_hb_key, _ = surface_forced_heartbeat(hb_reader, last_hb_key, say)
                 retriable = worker_flagged_retriable(hb_reader)
-                oom = worker_flagged_oom(hb_reader)
+                oom = worker_flagged_oom(hb_reader, current_attempt)
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
                     False,
@@ -746,7 +752,7 @@ def poll_job(
             hb_reader = _once_forced(heartbeat_reader)
             last_hb_key, _ = surface_forced_heartbeat(hb_reader, last_hb_key, say)
             retriable = worker_flagged_retriable(hb_reader)
-            oom = worker_flagged_oom(hb_reader)
+            oom = worker_flagged_oom(hb_reader, current_attempt)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
                 False,
@@ -973,6 +979,7 @@ def submit_run(
         log=log,
         heartbeat_reader=reader,
         failure_detail_reader=failure_reader,
+        current_attempt=int(attempt),
         **stall_kwargs(on_last_gpu=on_last_gpu),
     )
 
@@ -1090,13 +1097,30 @@ def worker_flagged_retriable(heartbeat_reader) -> bool:
     return bool(hb.get("retriable"))
 
 
-def worker_flagged_oom(heartbeat_reader) -> bool:
+def worker_flagged_oom(heartbeat_reader, current_attempt: int | None = None) -> bool:
     """True if the worker stamped ``oom`` (a CUDA out-of-memory crash) in its last heartbeat — the
     structured signal that lets the runner ESCALATE the retry to a strictly larger GPU instead of
-    failing fast on a too-small card. Same fresh-read contract as ``worker_flagged_retriable``."""
+    failing fast on a too-small card. Same fresh-read contract as ``worker_flagged_retriable``.
+
+    ``current_attempt`` gates against a STALE flag: the heartbeat file lives at a per-seed prefix
+    SHARED across attempts (the prefix has no attempt segment), so after an OOM escalation the prior
+    attempt's ``{"oom": true}`` lingers until the new worker overwrites it. If the escalated endpoint
+    dies before writing its own heartbeat (a platform/startup failure on the bigger card), this
+    forced read would otherwise misclassify that unrelated failure as an OOM and escalate AGAIN onto
+    a needlessly expensive card. When the caller passes the attempt it is polling, we trust the flag
+    only when the heartbeat was stamped by THAT attempt (the worker stamps ``attempt`` in every
+    heartbeat). ``None`` (e.g. the reattach poll, which has no expected attempt) keeps the historical
+    trust-the-flag behavior — no regression. OOM is gated but ``retriable`` is not: a stale retriable
+    flag only retries on a fresh worker (which a platform failure warrants anyway), whereas a stale
+    OOM wrongly burns a larger, costlier GPU class."""
     if heartbeat_reader is None:
         return False
     hb = heartbeat_reader(force=True)
     if not isinstance(hb, dict):
         return False
-    return bool(hb.get("oom"))
+    if not hb.get("oom"):
+        return False
+    # A prior attempt's lingering OOM flag must not escalate this attempt: trust it only when the
+    # heartbeat was stamped by the attempt we're polling (current_attempt None = caller has no
+    # expected attempt, e.g. the reattach poll → keep the historical trust-the-flag behavior).
+    return current_attempt is None or _attempt_int(hb.get("attempt")) == current_attempt

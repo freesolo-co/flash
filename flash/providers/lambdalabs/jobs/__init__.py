@@ -444,7 +444,13 @@ def poll_lambda_job(
         # RetriableInfraError retries on a fresh host like a platform termination.
         from flash.providers.runpod.jobs import worker_flagged_oom, worker_flagged_retriable
 
-        oom = bool(marker and marker.get("oom")) or worker_flagged_oom(heartbeat_reader)
+        # The attempt-scoped marker (lambda_attempt{N}.json) is already this-attempt-safe; the
+        # heartbeat fallback reads the shared-prefix file, so gate its OOM flag on handle.attempt
+        # (a prior attempt's lingering {"oom": true} must not escalate this attempt — see
+        # worker_flagged_oom).
+        oom = bool(marker and marker.get("oom")) or worker_flagged_oom(
+            heartbeat_reader, handle.attempt
+        )
         retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(heartbeat_reader)
         return PollResult(
             False,
@@ -565,7 +571,7 @@ def poll_lambda_job(
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
             # A CUDA OOM here is its own escalation category (grow the GPU), not a fail-fast crash —
             # parity with fail_from_marker / RunPod. It takes precedence over the crash/preempt split.
-            oom = worker_flagged_oom(heartbeat_reader)
+            oom = worker_flagged_oom(heartbeat_reader, handle.attempt)
             worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,

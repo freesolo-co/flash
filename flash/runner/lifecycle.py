@@ -138,6 +138,7 @@ def _submit_seed_supervised(
     seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
+    oom_vram_floor_start: int = 0,
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
@@ -187,6 +188,11 @@ def _submit_seed_supervised(
                 **handle,
                 "seed": int(seed),
                 "allocated_gpu": current_gpu.get("name"),
+                # The in-flight card's VRAM + the escalation floor so far, so a control-plane restart
+                # that reattaches and finds THIS attempt OOM'd can resume PAST it (the floor persisted
+                # here predates this attempt's card; recovery bumps it by allocated_vram_gb on an OOM).
+                "allocated_vram_gb": current_gpu.get("vram_gb"),
+                "oom_vram_floor": int(oom_vram_floor),
                 "on_last_gpu": bool(current_on_last_gpu["value"]),
             },
         )
@@ -230,8 +236,10 @@ def _submit_seed_supervised(
     tried_classes: set[tuple[str, str]] = set()
     # The largest GPU VRAM (GB) that has OOM'd this run. A CUDA-OOM retry must land on a STRICTLY
     # larger card (a same-size walk would just OOM again), so the next attempt filters its candidates
-    # to ``vram_gb > oom_vram_floor`` (see _oom_escalated). 0 until the first OOM.
-    oom_vram_floor = 0
+    # to ``vram_gb > oom_vram_floor`` (see _oom_escalated). 0 until the first OOM. ``oom_vram_floor_start``
+    # seeds it >0 when a control-plane restart RESUMES a seed that had already escalated: the floor is
+    # persisted into the run handle (on_handle) so recovery doesn't re-roll a smaller card and OOM again.
+    oom_vram_floor = int(oom_vram_floor_start)
     # Attempts spent on the cache-drop fallback, EXCLUDED from the GPU-walk budget. The bonus slot
     # ``cache_fallback_attempts`` widens the loop range, but the budget checks below use the raw attempt
     # counter; without this offset the cache-drop attempt would still tick the budget, so a run that
@@ -380,6 +388,7 @@ def _submit_seed_supervised(
             if drop_weight_cache:
                 run_spec = _drop_weight_cache(run_spec)
             current_gpu["name"] = chosen.gpu
+            current_gpu["vram_gb"] = int(chosen.vram_gb)
             provider = get_provider(chosen.provider)
             try:
                 submit_kwargs = {
@@ -470,10 +479,17 @@ def _submit_seed_supervised(
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
         )
+        # OOM escalation walks onto STRICTLY LARGER (more expensive) cards, so it must respect the
+        # USER's explicit ``max_retries`` — NOT the INFRA_RETRY_FLOOR that only exists to keep infra
+        # bad-luck from killing a run. Infra failures keep the floored ``infra_budget``. These are
+        # equal whenever ``max_retries >= INFRA_RETRY_FLOOR``; only an explicitly-LOWERED budget (e.g.
+        # ``max_retries=1``) caps OOM escalation sooner, so a CUDA OOM can't quietly walk through five
+        # ever-pricier GPUs against the user's wishes.
+        retry_budget = max_retries if oom_shaped else infra_budget
         # "retrying" is true when the GPU-walk budget remains OR a cache-drop fallback will retry this
         # even past it (first_cache_drop) — else the log would say "not retrying" while the loop actually
         # continues with the reserved cache-less fallback attempt.
-        will_retry = retry_shaped and (walk_attempt < infra_budget or first_cache_drop)
+        will_retry = retry_shaped and (walk_attempt < retry_budget or first_cache_drop)
         action = (
             f"OOM on the largest GPU class ({oom_vram_floor} GB); not retrying"
             if oom_no_larger
@@ -495,7 +511,7 @@ def _submit_seed_supervised(
         # available. The bonus attempt granted above is reserved for exactly this transition; once the
         # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
         # and the loop cannot spin past its one extra cache-less attempt.
-        if walk_attempt >= infra_budget and not first_cache_drop:
+        if walk_attempt >= retry_budget and not first_cache_drop:
             break
         if first_cache_drop:
             drop_weight_cache = True
@@ -555,11 +571,18 @@ def _run_seed_loop(
     start_index: int,
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
+    resume_oom_vram_floor: int = 0,
 ) -> None:
     """Run spec.train.seeds[start_index:] under supervision; finalize the run.
 
     Shared by a fresh submit (start_index=0) and post-restart recovery, which
-    resumes the remaining seeds after the in-flight one completes."""
+    resumes the remaining seeds after the in-flight one completes.
+
+    ``resume_oom_vram_floor`` (>0 only on an OOM-aware recovery) seeds the GPU-escalation floor for
+    the FIRST seed run here — the in-flight seed being resumed, which may have already escalated past
+    a too-small card before the restart. Later seeds in the loop start fresh (floor 0): an OOM is a
+    per-run property but the floor is rebuilt empirically per seed, and a seed that hasn't OOM'd yet
+    must not be pinned onto an expensive card it might fit under."""
     from flash.runner import (
         TERMINAL_STATES,
         _persist_metrics,
@@ -589,7 +612,12 @@ def _run_seed_loop(
             file=log,
             flush=True,
         )
-        metrics = _submit_seed_supervised(spec, seed, log, runtime_secrets=runtime_secrets)
+        # The resumed escalation floor applies ONLY to the in-flight seed (the first iteration after a
+        # restart); subsequent seeds rebuild their own floor from scratch (see the docstring).
+        seed_oom_floor = resume_oom_vram_floor if i == start_index else 0
+        metrics = _submit_seed_supervised(
+            spec, seed, log, runtime_secrets=runtime_secrets, oom_vram_floor_start=seed_oom_floor
+        )
         total_cost += _persist_metrics(spec, seed, metrics)
         # A cancel can land while this thread writes metrics — after the supervised
         # late-cancel check. Re-read before the post-seed status writes so a late

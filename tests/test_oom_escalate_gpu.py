@@ -92,13 +92,42 @@ def test_once_forced_reads_underlying_heartbeat_only_once():
 def test_lambda_poller_escalates_oom_for_cross_provider_parity():
     # The Lambda poller must also map a worker OOM flag to failure="oom" so a Lambda candidate's OOM
     # escalates to a larger GPU instead of failing fast as job_failed (parity with RunPod's poll_job).
+    import re
+
     src, _ = _src("flash.providers.lambdalabs.jobs", "")
-    # the oom flag is read in BOTH Lambda worker-fail paths (marker + dead-host error_*.txt crash)
-    assert src.count("worker_flagged_oom(heartbeat_reader)") >= 2
+    compact = re.sub(r"\s+", "", src)  # drop all whitespace (one call site wraps across lines)
+    # the oom flag is read in BOTH Lambda worker-fail paths (marker + dead-host error_*.txt crash),
+    # and BOTH gate on handle.attempt so a prior attempt's lingering {"oom": true} can't misclassify
+    # an unrelated startup/platform failure as an OOM (5Wy parity with the RunPod current_attempt gate)
+    assert compact.count("worker_flagged_oom(heartbeat_reader,handle.attempt)") == 2
+    assert "worker_flagged_oom(heartbeat_reader)" not in compact  # no ungated read survives
     # marker path: oom wins over the retriable/job_failed split
     assert 'failure="oom" if oom else ("job_preempted" if retriable else "job_failed")' in src
     # dead-host crash path: oom takes precedence before the crash/preempt split
     assert '"job_failed" if worker_crashed else "job_preempted"' in src
+
+
+def test_worker_flagged_oom_ignores_a_prior_attempts_stale_flag():
+    # The shared-prefix heartbeat outlives an attempt: after an OOM escalation, attempt 0's
+    # {"oom": true} lingers until the bigger card's worker overwrites it. If that escalated endpoint
+    # dies before writing its own heartbeat, the forced read must NOT re-classify the new (unrelated)
+    # failure as an OOM and escalate AGAIN — it gates on the heartbeat's stamped attempt.
+    from flash.providers.runpod.jobs import worker_flagged_oom
+
+    stale = lambda force=False: {"oom": True, "attempt": "0"}  # noqa: E731
+    fresh = lambda force=False: {"oom": True, "attempt": "1"}  # noqa: E731
+    # polling attempt 1: attempt-0's lingering OOM flag is NOT trusted...
+    assert worker_flagged_oom(stale, 1) is False
+    # ...but attempt-1's own OOM flag still escalates.
+    assert worker_flagged_oom(fresh, 1) is True
+    # attempt stamped as int (not the worker's str env) also matches.
+    assert worker_flagged_oom(lambda force=False: {"oom": True, "attempt": 1}, 1) is True
+    # a missing/blank attempt with a known current_attempt can't be dated -> not trusted.
+    assert worker_flagged_oom(lambda force=False: {"oom": True}, 1) is False
+    assert worker_flagged_oom(lambda force=False: {"oom": True, "attempt": ""}, 1) is False
+    # current_attempt=None (reattach poll, no expected attempt) keeps the historical trust-the-flag.
+    assert worker_flagged_oom(stale, None) is True
+    assert worker_flagged_oom(stale) is True
 
 
 def _src(modfile_attr, name):
@@ -145,3 +174,34 @@ def test_runner_classifies_oom_as_retriable_and_escalates_vram():
     # an OOM on the largest class terminates immediately (no extra "retrying on a larger GPU" spin)
     assert "oom_no_larger" in body
     assert "retry_shaped = (infra_shaped or oom_shaped) and not oom_no_larger" in body
+
+
+def test_oom_escalation_floor_survives_a_control_plane_restart():
+    # 5W1: the GPU-escalation floor is in-process state. A control-plane restart that reattaches and
+    # resumes the in-flight seed must NOT lose it, or recovery re-rolls the same too-small card and
+    # OOMs again. The floor (+ in-flight card VRAM) is persisted into the run handle and threaded back
+    # into the resumed seed loop.
+    life = pathlib.Path(
+        __import__("flash.runner.lifecycle", fromlist=["x"]).__file__
+    ).read_text()
+    deploy = pathlib.Path(
+        __import__("flash.runner.deploy", fromlist=["x"]).__file__
+    ).read_text()
+
+    # the floor + the in-flight card's VRAM are persisted into the handle on every submit (on_handle)
+    assert '"oom_vram_floor": int(oom_vram_floor)' in life
+    assert '"allocated_vram_gb": current_gpu.get("vram_gb")' in life
+    assert 'current_gpu["vram_gb"] = int(chosen.vram_gb)' in life
+    # the seed supervisor accepts a starting floor and seeds oom_vram_floor from it (not a hard 0)
+    assert "oom_vram_floor_start: int = 0" in life
+    assert "oom_vram_floor = int(oom_vram_floor_start)" in life
+    # the seed loop forwards it ONLY to the in-flight (first) seed; later seeds start fresh
+    assert "resume_oom_vram_floor: int = 0" in life
+    assert "seed_oom_floor = resume_oom_vram_floor if i == start_index else 0" in life
+    assert "oom_vram_floor_start=seed_oom_floor" in life
+    # recovery reads the persisted floor, bumps it by the reattached card's VRAM on an OOM, and
+    # threads it into the resumed seed loop
+    assert 'persisted_oom_floor = int(remote.pop("oom_vram_floor", 0) or 0)' in deploy
+    assert 'allocated_vram_gb = int(remote.pop("allocated_vram_gb", 0) or 0)' in deploy
+    assert "resumed_floor = max(resumed_floor, allocated_vram_gb)" in deploy
+    assert "resume_oom_vram_floor=resumed_floor" in deploy

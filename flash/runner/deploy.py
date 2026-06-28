@@ -160,6 +160,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     # on recovery the worker output carries no such field, so recover it from the handle
     # to cost the right card.
     allocated_gpu = remote.pop("allocated_gpu", None)
+    # The escalation floor as of the in-flight attempt's submit, plus that attempt's card VRAM, so an
+    # OOM-aware resume below can escalate PAST a too-small card across a control-plane restart instead
+    # of re-rolling the same size and OOMing again. Popped (like allocated_gpu) so the JobHandle below
+    # sees only the transport fields.
+    persisted_oom_floor = int(remote.pop("oom_vram_floor", 0) or 0)
+    allocated_vram_gb = int(remote.pop("allocated_vram_gb", 0) or 0)
     log = log_stream or sys.stderr
     # Dispatch the poll generically via the handle's provider (the provider owns its
     # heartbeat reader + poll loop); the orchestrator stays provider-agnostic.
@@ -196,8 +202,18 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
+            # Carry the GPU-escalation floor across the restart. If the reattached attempt itself
+            # OOM'd, its card joins the floor (the persisted floor predates this attempt's card), so
+            # the resumed seed escalates to a STRICTLY larger class rather than re-OOMing on the same.
+            resumed_floor = persisted_oom_floor
+            if res.failure == "oom":
+                resumed_floor = max(resumed_floor, allocated_vram_gb)
             _run_seed_loop(
-                spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
+                spec,
+                log,
+                start_index=seed_index,
+                prior_cost=float(status.cost_usd or 0.0),
+                resume_oom_vram_floor=resumed_floor,
             )
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the
