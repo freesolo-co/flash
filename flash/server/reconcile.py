@@ -12,8 +12,8 @@ Realized cost is reported with the operator INTERNAL key (this is COGS, not a cu
 which also gates the whole feature -- with no FREESOLO_INTERNAL_KEY set, reconciliation is off.
 
 Scope note (v1): cost is attributed from the run's last persisted handle (RunStatus.remote).
-Each run trains one adapter on a single resource, so that handle covers the whole run and the
-attribution is exact.
+This is exact for the common single-attempt run; runs that retried across multiple resources may be
+under-counted until every attempt's resource id is persisted.
 """
 
 from __future__ import annotations
