@@ -33,6 +33,7 @@ _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
+_MAX_ARCHIVE_SCAN_MEMBERS = 200_000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _TAR_METADATA_TYPES = {
@@ -356,11 +357,17 @@ def _safe_extract_archive(tar_bytes: bytes | bytearray, dest: Path, subdir: str 
     top_dirs: set[str] = set()
     total = 0
     extracted = 0
+    scanned = 0
     with tempfile.NamedTemporaryFile(prefix="flash-env-tar-", suffix=".tar.gz") as spill:
         spill.write(tar_bytes)
         spill.seek(0)
         with tarfile.open(fileobj=spill, mode="r:gz") as tar:
             for member in tar:
+                scanned += 1
+                if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
+                    raise RuntimeError(
+                        f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
+                    )
                 if member.type in _TAR_METADATA_TYPES:
                     continue
                 raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
