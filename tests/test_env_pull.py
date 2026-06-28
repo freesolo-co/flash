@@ -475,7 +475,7 @@ def test_download_environment_file_rejects_oversized_body(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     # Now caught by the streaming cap (aborts mid-download) rather than the post-read length check;
     # either way it's a RuntimeError that rejects the oversized body before returning it.
-    with pytest.raises(RuntimeError, match="exceeded the maximum allowed size|too large"):
+    with pytest.raises(RuntimeError, match=r"exceeded the maximum allowed size|too large"):
         download_environment_file("david-freesolo-co/stuff", "datasets/train.jsonl")
 
 
@@ -690,3 +690,85 @@ def test_safe_extract_archive_bounds_total_members_scanned(monkeypatch, tmp_path
             tar.addfile(info, io.BytesIO(data))
     with pytest.raises(RuntimeError, match="too many entries to scan"):
         adapter._safe_extract_archive(buf.getvalue(), tmp_path, subdir="wanted")
+
+
+# --- adversarial-review hardening (round 4) ---------------------------------
+
+
+def test_read_capped_returns_bytearray_no_double_copy(monkeypatch):
+    # _read_capped returns a single growing bytearray (no retained chunk list + join), so a near-cap
+    # body never needs a second contiguous allocation. Result is correct and bytes-comparable.
+    monkeypatch.setattr(adapter, "_DOWNLOAD_CHUNK_BYTES", 4)
+    out = adapter._read_capped(io.BytesIO(b"x" * 20), 100)
+    assert isinstance(out, bytearray)
+    assert out == b"x" * 20
+
+
+def test_resolve_github_env_extracts_repo_level_siblings(monkeypatch, tmp_path):
+    # The execution resolver must extract the WHOLE repo (not just the env subtree) so an env that
+    # references a repo-level sidecar via a relative param/import (e.g. ../datasets) finds it in cache.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        def add(name, data):
+            info = tarfile.TarInfo(name=f"repo-sha/{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        add("envs/e/environment.py", b"# env\n")
+        add("envs/datasets/train.jsonl", b'{"a":1}\n')  # sibling one level up from the env dir
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: buf.getvalue())
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **k: "a" * 40)
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    env_file = adapter._resolve_github_environment_file(
+        "github:owner/repo@main:envs/e/environment.py"
+    )
+    assert env_file.is_file()
+    # the repo-level sibling is present in cache next to the env dir — it would be MISSING if the
+    # resolver had filtered extraction to envs/e only.
+    envs_dir = env_file.parents[1]  # .../cache/<key>/repo-sha/envs/e/environment.py -> .../envs
+    assert (envs_dir / "datasets" / "train.jsonl").is_file()
+
+
+def test_merge_opposite_type_restores_file_on_copy_failure(monkeypatch, tmp_path):
+    # An incoming DIR replacing an existing FILE must not destroy the file if the recursive copy fails.
+    source = tmp_path / "src" / "data"
+    source.mkdir(parents=True)
+    (source.parent / "data" / "f.txt").write_text("new")
+    dest = tmp_path / "dst"
+    dest.mkdir()
+    (dest / "data").write_text("ORIGINAL")  # existing FILE where the incoming tree has a DIR
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(adapter, "_atomic_copy2", boom)
+    with pytest.raises(OSError, match="disk full"):
+        adapter._merge_into_dir(tmp_path / "src", dest)
+    # the user's original file survived intact (move-aside/restore, not unlink-then-copy)
+    assert (dest / "data").is_file()
+    assert (dest / "data").read_text() == "ORIGINAL"
+    assert not any(p.name.startswith(".data") for p in dest.iterdir())  # backup cleaned up
+
+
+def test_pull_preserves_symlink_dest_on_copy_failure(monkeypatch, tmp_path):
+    # `--force` over a SYMLINK destination: if the staged copy fails, the user's link must survive
+    # (it is not unlinked up front), and its target is left untouched.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    realtarget = tmp_path / "real"
+    realtarget.mkdir()
+    (realtarget / "keep").write_text("x")
+    dest = tmp_path / "link"
+    dest.symlink_to(realtarget, target_is_directory=True)
+
+    orig_copytree = adapter.shutil.copytree
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(adapter.shutil, "copytree", boom)
+    with pytest.raises(OSError, match="disk full"):
+        adapter.pull_environment_package("david-freesolo-co/stuff", dest, overwrite=True)
+    monkeypatch.setattr(adapter.shutil, "copytree", orig_copytree)
+    assert dest.is_symlink()  # link preserved
+    assert dest.resolve() == realtarget.resolve()
+    assert (realtarget / "keep").read_text() == "x"  # target untouched
