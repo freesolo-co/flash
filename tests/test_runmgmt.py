@@ -38,6 +38,39 @@ def test_list_and_cancel(monkeypatch):
         assert same.state in {"dry_run", "cancelled"}
 
 
+def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
+    # A status JSON written by an OLDER control plane can carry a since-removed field (e.g.
+    # `resume_seed_index` from the pre-#317 multi-seed era); `~/.flash/runs/*.json` is never GC'd,
+    # so those files persist across an upgrade. get_status/list_runs must drop unknown keys rather
+    # than 500 (a strict RunStatus(**d) would TypeError, and callers catch only FileNotFoundError).
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        stale = {
+            "run_id": "old",
+            "state": "done",
+            "spec": {},
+            "cost_usd": 2.0,
+            "resume_seed_index": 3,  # removed field
+            "totally_unknown_future_key": "x",  # forward-compat unknown field
+        }
+        os.makedirs(tmp, exist_ok=True)
+        with open(runner.runs_file_path("old", ".json"), "w") as f:
+            json.dump(stale, f)
+
+        s = runner.get_status("old")
+        assert s.run_id == "old"
+        assert s.state == "done"
+        assert s.cost_usd == 2.0
+        assert not hasattr(s, "resume_seed_index")
+        assert "old" in {r.run_id for r in runner.list_runs()}
+
+
 def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         import flash.runner as runner
@@ -202,36 +235,6 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["notes"]["provider"] == "runpod"
-
-
-def test_get_status_tolerates_legacy_unknown_fields(monkeypatch):
-    """A status JSON written by the pre-multi-seed-removal control plane still carries the dropped
-    ``resume_seed_index`` key. Loading it must ignore the unknown field, not raise TypeError, so a
-    control-plane upgrade can recover/list in-flight runs (get_status + list_runs)."""
-    import json
-    import os
-
-    with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        legacy = {
-            "run_id": "legacy",
-            "state": "running",
-            "spec": {"model": "Qwen/Qwen3.5-4B"},
-            "resume_seed_index": 1,  # removed field still present on disk
-            "some_future_field": "x",  # any other unknown key is also dropped
-        }
-        with open(os.path.join(tmp, "legacy.json"), "w") as f:
-            json.dump(legacy, f)
-
-        status = runner.get_status("legacy")
-        assert status.run_id == "legacy"
-        assert status.state == "running"
-        assert not hasattr(status, "resume_seed_index")
-        # list_runs uses the same tolerant loader.
-        assert {r.run_id for r in runner.list_runs()} == {"legacy"}
 
 
 def test_run_training_bails_when_running_cas_rejects(monkeypatch):
