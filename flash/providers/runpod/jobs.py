@@ -714,9 +714,10 @@ def poll_job(
             except RuntimeError as e:
                 # COMPLETED but the output decodes as an error (a handler exception). Consult the
                 # worker flag too: an infra failure can surface here and must still retry.
-                last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
-                retriable = worker_flagged_retriable(heartbeat_reader)
-                oom = worker_flagged_oom(heartbeat_reader)
+                hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
+                last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
+                retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
+                oom = bool(hb.get("oom")) if isinstance(hb, dict) else False
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
                     False,
