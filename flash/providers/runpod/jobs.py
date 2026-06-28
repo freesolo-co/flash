@@ -738,9 +738,10 @@ def poll_job(
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
             # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
-            last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
-            retriable = worker_flagged_retriable(heartbeat_reader)
-            oom = worker_flagged_oom(heartbeat_reader)
+            hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
+            last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
+            retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
+            oom = bool(hb.get("oom")) if isinstance(hb, dict) else False
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
                 False,
