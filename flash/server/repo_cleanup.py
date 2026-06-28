@@ -135,17 +135,20 @@ def _known_run_repo_ids() -> set[str]:
     return {f"{_ARTIFACT_NAMESPACE}/{RUN_REPO_PREFIX}{row['run_id']}" for row in db.all_runs()}
 
 
-def _repo_deploy_in_progress(repo_id: str) -> bool:
-    """True if a deploy/undeploy is currently registering ``repo_id``'s run with serving.
+def _hold_run_lock(repo_id: str):
+    """Non-blocking acquire-and-HOLD of the per-run deploy/export lock for ``repo_id``'s run.
 
-    A deploy holds the per-run deploy lock for its whole duration — INCLUDING the window before the
-    repo shows up in serving's live ``/adapters`` set, which the per-delete re-check can't see. Skip
-    such a repo so the GC never deletes the HF source out from under an in-flight registration.
-    Best-effort, in-process; never raises."""
-    from flash.server._locks import _deploy_in_progress
+    Returns the held lock — the caller MUST ``release()`` it once ``delete_repo`` is done — or
+    ``None`` when a deploy/undeploy/export currently holds it. The GC holds this lock (the SAME one
+    ``/v1/runs/{run_id}/deploy``, ``/undeploy`` and ``/export`` take) ACROSS the delete so the
+    destructive mutation is mutually exclusive with adapter registration AND export. A non-blocking
+    READ — the previous guard — only *observed* the lock and left a start-after-check race: a deploy
+    or export that began just after the read still raced the delete. Best-effort/in-process; never
+    blocks the sweep waiting on a slow deploy/export — it just spares the repo this cycle."""
+    from flash.server._locks import _try_hold_deploy_lock
 
     run_id = repo_id.split("/", 1)[-1].removeprefix(RUN_REPO_PREFIX)
-    return _deploy_in_progress(run_id)
+    return _try_hold_deploy_lock(run_id)
 
 
 def list_run_repos(api, namespace: str) -> list[tuple[str, datetime | None]]:
@@ -176,11 +179,16 @@ def _deletable(repo_id: str, last_modified, protected: set[str], now: datetime, 
     return (now - last_modified).total_seconds() >= max_age_s
 
 
-def run_scheduled_cleanup(*, dry_run: bool = False, api=None) -> int:
+def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) -> int:
     """One sweep of the fixed policy. Returns the number of repos deleted (0 in dry-run).
 
     Fails closed: raises ``CleanupAborted`` (deleting nothing) when the serving live set can't be
-    confirmed up front. The HF + serving calls are blocking, so callers offload this to a thread."""
+    confirmed up front. The HF + serving calls are blocking, so callers offload this to a thread.
+
+    ``should_stop`` is an optional cooperative-cancel callback checked BETWEEN deletes. The sweep
+    runs in a worker thread that ``task.cancel()`` cannot interrupt, so at shutdown the caller sets a
+    stop flag and this loop halts promptly instead of churning through more destructive deletes long
+    after the server was told to stop (mirrors the completion-charge retry sweeps)."""
     from huggingface_hub import HfApi
 
     api = api or HfApi()
@@ -206,25 +214,37 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None) -> int:
 
     deleted = 0
     for repo_id in targets:
-        # Re-confirm the live set immediately before EACH delete. If it can't be confirmed now —
-        # serving unreachable, OR a live adapter whose repo id couldn't be mapped — abort the WHOLE
-        # sweep (re-raise, exactly like the up-front confirm) rather than press on deleting other
-        # repos while an unidentified live adapter may be backed by one of them. Reconsidered next
-        # cycle once serving is confirmable again.
-        fresh = _confirm_live_set()  # raises CleanupAborted -> whole sweep fails closed
-        if repo_id in fresh:
-            logger.warning("repo GC: %s became deployed mid-sweep; skipping", repo_id)
-            continue
-        # A deploy registering this run holds the per-run deploy lock for the whole window before the
-        # repo shows up in the live set above — skip it so we never delete the source mid-deploy.
-        if _repo_deploy_in_progress(repo_id):
-            logger.warning("repo GC: %s has a deploy in progress; skipping", repo_id)
+        # Cooperative shutdown: this loop runs in a worker thread (blocking HF calls) that
+        # task.cancel() can't interrupt, so honor the stop signal BETWEEN deletes — bail promptly
+        # when the lifespan is tearing down rather than keep deleting repos after the server stopped.
+        if should_stop is not None and should_stop():
+            logger.info("repo GC: stop requested; halting sweep after %d delete(s)", deleted)
+            break
+        # Acquire-and-HOLD the per-run deploy/export lock across the delete so the destructive
+        # mutation is mutually exclusive with a concurrent deploy/undeploy/export of this run (see
+        # _hold_run_lock). Non-blocking: if one already holds it, spare the repo this cycle rather
+        # than wait on a slow registration/export. None => skip.
+        held = _hold_run_lock(repo_id)
+        if held is None:
+            logger.warning("repo GC: %s has a deploy/undeploy/export in progress; skipping", repo_id)
             continue
         try:
-            api.delete_repo(repo_id=repo_id, repo_type="dataset", missing_ok=True)
-            deleted += 1
-            logger.info("repo GC: deleted %s", repo_id)
-        except Exception as exc:
-            logger.warning("repo GC: failed to delete %s: %s", repo_id, exc)
+            # Re-confirm the live set immediately before the delete — now UNDER the held lock, so a
+            # deploy can't register this repo between the confirm and the delete. If it can't be
+            # confirmed now (serving unreachable, OR a live adapter whose repo id couldn't be mapped),
+            # abort the WHOLE sweep (re-raise, exactly like the up-front confirm) rather than press on
+            # deleting other repos while an unidentified live adapter may be backed by one of them.
+            fresh = _confirm_live_set()  # raises CleanupAborted -> finally releases, sweep fails closed
+            if repo_id in fresh:
+                logger.warning("repo GC: %s became deployed mid-sweep; skipping", repo_id)
+                continue
+            try:
+                api.delete_repo(repo_id=repo_id, repo_type="dataset", missing_ok=True)
+                deleted += 1
+                logger.info("repo GC: deleted %s", repo_id)
+            except Exception as exc:
+                logger.warning("repo GC: failed to delete %s: %s", repo_id, exc)
+        finally:
+            held.release()
         time.sleep(_DELETE_SLEEP_S)  # HF repo-mutation rate-limit courtesy
     return deleted
