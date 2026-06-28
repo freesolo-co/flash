@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import tarfile
-import urllib.error
 import urllib.request
 from argparse import Namespace
 from pathlib import Path
