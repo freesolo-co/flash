@@ -565,16 +565,44 @@ def test_delete_package_internal_key_can_delete_any_namespace(monkeypatch):
 
 def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch):
     # The internal key bypasses the namespace-ownership check, so _validate_slug is the ONLY barrier
-    # before `git rm -r -- <namespace>/<name>`. A reserved repo-control top-level path (the same set
-    # publish blocks via _safe_extract) must be rejected so e.g. DELETE /v1/envs/.github/workflows
-    # can't remove tracked repo infrastructure.
+    # before `git rm -r -- <namespace>/<name>`. A GENUINE repo-control top-level path (a dir at the
+    # root of the hub checkout) must be rejected so e.g. DELETE /v1/envs/.github/workflows can't
+    # remove tracked repo infrastructure. Only `.git`/`.github` qualify — `namespace_for` can never
+    # slugify an email to a dot-prefixed namespace, so these are never publishable.
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(
         envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
     )
-    for blocked in envs._BLOCKED_TOP_LEVEL_PATHS:
+    assert {".git", ".github"} == envs._REPO_CONTROL_TOP_LEVEL_PATHS
+    assert "source" not in envs._REPO_CONTROL_TOP_LEVEL_PATHS
+    for blocked in envs._REPO_CONTROL_TOP_LEVEL_PATHS:
         with pytest.raises(envs.EnvPublishError, match="invalid env id segment"):
             envs.delete_package(slug=f"{blocked}/workflows", key={"auth_kind": "internal"})
+
+
+def test_delete_package_allows_publishable_source_namespace(monkeypatch):
+    # Regression guard for publish/delete symmetry: `source` is in publish's package-CONTENT
+    # blocklist (_BLOCKED_TOP_LEVEL_PATHS via _safe_extract) but is a legitimate user NAMESPACE —
+    # `namespace_for` slugifies an email like `source@` to `source` and publish writes `source/<name>`
+    # without objection. Delete must therefore reach storage for `source/<name>` (not 400), or those
+    # envs would be publishable-but-undeletable.
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    seen: dict[str, str] = {}
+
+    def fake_delete(canonical, *, token):
+        seen["slug"] = canonical
+        return True
+
+    monkeypatch.setattr(envs, "_github_delete", fake_delete)
+    # A user key whose email normalizes to the `source` namespace deletes its OWN `source/<name>`.
+    source_key = {"email": "source@"}
+    assert envs.namespace_for(source_key) == "source"
+    assert "source" in envs._BLOCKED_TOP_LEVEL_PATHS  # still barred from package CONTENTS
+    assert envs.delete_package(slug="source/my-env", key=source_key) is True
+    assert seen["slug"] == "source/my-env"
+    # And the internal key (which may delete any namespace) reaches storage too.
+    assert envs.delete_package(slug="source/other", key={"auth_kind": "internal"}) is True
+    assert seen["slug"] == "source/other"
 
 
 def test_delete_package_validates_slug(monkeypatch):

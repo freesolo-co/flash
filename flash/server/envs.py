@@ -25,11 +25,21 @@ _MAX_MEMBERS = 5000
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
-_BLOCKED_TOP_LEVEL_PATHS = {
+# Genuine repo-control directories that live at the ROOT of the environment-hub checkout. A DELETE
+# runs `git rm -r -- <namespace>/<name>` directly against that checkout, so a slug whose namespace is
+# one of these would target tracked repo infrastructure (e.g. `DELETE /v1/envs/.github/workflows`).
+# `namespace_for` slugifies an email and can NEVER emit a dot-prefixed namespace, so these are never
+# publishable namespaces and are always safe to reject on delete.
+_REPO_CONTROL_TOP_LEVEL_PATHS = {
     ".github",
     ".git",
-    "source",
 }
+# Top-level segments barred from env-package CONTENTS by `_safe_extract`. A strict SUPERSET of the
+# repo-control set: it also bars a top-level `source/` dir inside a package. `source` is intentionally
+# NOT a repo-control namespace — `namespace_for` can slugify a user email to the `source` namespace
+# and publish writes `source/<name>` without objection — so the delete validator must reject only
+# `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
+_BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
@@ -413,12 +423,14 @@ def _validate_slug(slug: str) -> tuple[str, str]:
             raise EnvPublishError(f"invalid env id segment: {segment!r}")
     namespace, name = parts
     # The delete path runs `git rm -r -- <namespace>/<name>` directly against the hub checkout, so
-    # the top-level path component (the namespace) must never be a repo-control directory. Publish
-    # blocks these same names from environment packages (_safe_extract); apply the SAME guard here
-    # because an internal-key delete bypasses the namespace-ownership check in delete_package — this
-    # validator is then the only barrier, and a request like `DELETE /v1/envs/.github/workflows`
-    # would otherwise remove tracked repo infrastructure.
-    if namespace in _BLOCKED_TOP_LEVEL_PATHS:
+    # the top-level path component (the namespace) must never be a genuine repo-control directory.
+    # An internal-key delete bypasses the namespace-ownership check in delete_package, so this
+    # validator is the only barrier, and a request like `DELETE /v1/envs/.github/workflows` would
+    # otherwise remove tracked repo infrastructure. Reject ONLY `_REPO_CONTROL_TOP_LEVEL_PATHS`, NOT
+    # the wider publish-content blocklist: `source` is a legitimately publishable namespace
+    # (`namespace_for` can slugify an email to it and publish writes `source/<name>` without
+    # objection), so blocking it here would leave those envs publishable-but-undeletable.
+    if namespace in _REPO_CONTROL_TOP_LEVEL_PATHS:
         raise EnvPublishError(f"invalid env id segment: {namespace!r}")
     return namespace, name
 
