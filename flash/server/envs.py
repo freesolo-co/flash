@@ -362,8 +362,11 @@ def _validate_slug(slug: str) -> tuple[str, str]:
     """
     if not isinstance(slug, str):
         raise EnvPublishError("env id must be a string")
-    cleaned = slug.strip().strip("/")
-    parts = cleaned.split("/")
+    # Do NOT strip leading/trailing '/': a request like `DELETE /v1/envs/ns/env/` (trailing slash
+    # captured by the :path param) must be REJECTED, not silently normalized to `ns/env`. Otherwise
+    # the non-canonical id could flow on to the response / downstream mirroring while deletion targets
+    # the stripped form — split on the raw value so an empty leading/trailing segment fails the check.
+    parts = slug.strip().split("/")
     if len(parts) != 2 or not all(parts):
         raise EnvPublishError("env id must be 'namespace/name'")
     for segment in parts:
