@@ -52,8 +52,9 @@ async def _reconcile_cost_loop() -> None:
 
 async def _repo_cleanup_loop() -> None:
     """Background loop: periodically delete per-run HF artifact repos (``Freesolo-Co/flashrun-*``)
-    that are NOT currently deployed and older than the configured age (default 30d), reclaiming the
-    org's private-storage quota. Currently-deployed repos are the only thing spared.
+    that are NOT currently deployed and older than a fixed 30-day age, reclaiming the org's
+    private-storage quota. Currently-deployed repos are the only thing spared. The age and the daily
+    cadence are hardcoded constants (no env knobs) — see ``flash.server.repo_cleanup``.
 
     Fails CLOSED: each sweep aborts (deleting nothing) if the serving live set can't be confirmed, so
     a serving blip never risks deleting a live adapter — it just retries next cycle. The HF + serving
