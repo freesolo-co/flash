@@ -49,9 +49,27 @@ def test_delete_rejects_non_env_id(monkeypatch):
             return {}
 
     monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
-    # no slash => not a Freesolo environment id => rejected before any network call
-    assert cmd_env_delete(_args("not-an-id")) == 1
+    # Rejected before any network call: not a slug, a github ref (can't delete from the hub), and
+    # mixed-case / whitespace that the server's lowercase-only slug validator would 400 on.
+    for bad in (
+        "not-an-id",
+        "github:owner/repo@main:environment.py",
+        "MyNs/MyEnv",
+        "acme/My-Env",
+        "ns/bad name",
+        "acme/env/extra",
+    ):
+        assert cmd_env_delete(_args(bad)) == 1, bad
     assert called["n"] == 0
+
+
+def test_delete_strips_and_sends_canonical_id(monkeypatch, capsys):
+    # Surrounding whitespace is stripped so the id sent to the server is canonical.
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    rc = cmd_env_delete(_args("  acme/my-env  "))
+    assert rc == 0
+    assert cap["env_id"] == "acme/my-env"
 
 
 def test_delete_aborts_on_declined_confirmation(monkeypatch):

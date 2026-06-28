@@ -569,7 +569,11 @@ def test_delete_package_validates_slug(monkeypatch):
     monkeypatch.setattr(
         envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
     )
-    for bad in ("noslash", "a/b/c", "ns/..", "../escape", "ns/", "/name", "ns/bad name"):
+    # incl. a VALID two-segment id with a trailing/leading slash (e.g. from a `:path` route capture):
+    # it must be REJECTED, not silently normalized to ns/env (which would leak a non-canonical id).
+    for bad in (
+        "noslash", "a/b/c", "ns/..", "../escape", "ns/", "/name", "ns/bad name", "ns/env/", "/ns/env",
+    ):
         with pytest.raises(envs.EnvPublishError):
             envs.delete_package(slug=bad, key={"auth_kind": "internal"})
 
