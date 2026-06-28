@@ -25,6 +25,7 @@ from flash.serve.deploy import ServingError
 from flash.server import app as _app
 from flash.server import db
 from flash.server._deps import _require_bool, owned_run, require_key
+from flash.server._internal_client import run_org_id
 from flash.spec import JobSpec
 
 router = APIRouter()
@@ -125,21 +126,8 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         # CAS guard: /cancel is NOT serialized by the deploy lock, so capture state before deploy.
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
-        def _run_org(*contexts) -> str:
-            for ctx in contexts:
-                if isinstance(ctx, dict):
-                    org = str(ctx.get("org_id") or "").strip()
-                    if org:
-                        return org
-            return ""
-
         deploy_org_id = (
-            _run_org(
-                getattr(status, "billing_context", None),
-                getattr(status, "platform_context", None),
-            )
-            or str(key.get("org_id") or "").strip()
-            or None
+            run_org_id(status) or str(key.get("org_id") or "").strip() or None
         )
         try:
             dep = _app.deploy_adapter(
