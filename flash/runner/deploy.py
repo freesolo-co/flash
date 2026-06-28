@@ -53,21 +53,30 @@ def cancel_run(run_id: str) -> RunStatus:
         except Exception:
             pass
     _gc_run_endpoints(spec)
-    # Override terminal `done` only if we entered `deployed`: a racing mark_undeployed writes
-    # `done` as an undeploy artifact (cancel wins), but a genuine training completion must not
-    # be clobbered (cancel loses). The two races are mutually exclusive on entry state.
-    _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
-    # A deploy can race in after the entry snapshot (running -> done -> deployed) and land before this
-    # write; `deployed` is non-terminal so the `cancelled` write still wins, but the entry-gated undeploy
-    # above never ran. Re-read and tear down any deployment still active so cancel never orphans one. (A
-    # deliberate post-cancel checkpoint deploy is a later request, after we return, so it is untouched.)
-    final = get_status(run_id)
-    if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
-        with contextlib.suppress(Exception):
-            from flash.serve.deploy import undeploy_adapter
+    # Serialize the terminal `cancelled` write + orphan teardown under the per-run deploy lock (the
+    # /deploy route holds the same lock around attach_checkpoint_deployment/mark_deployed). Without it,
+    # a deliberate post-cancel checkpoint deploy could attach its deployment between the `cancelled`
+    # write and the re-read below, and the teardown would tear that fresh, intentional deployment down
+    # as if it were a cancel orphan.
+    from flash.server._locks import _deploy_lock
 
-            undeploy_adapter(run_id)
-            mark_deployment_undeployed(run_id)
+    with _deploy_lock(run_id):
+        # Override terminal `done` only if we entered `deployed`: a racing mark_undeployed writes
+        # `done` as an undeploy artifact (cancel wins), but a genuine training completion must not
+        # be clobbered (cancel loses). The two races are mutually exclusive on entry state.
+        _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
+        # A deploy can race in after the entry snapshot (running -> done -> deployed) and land before
+        # this write; `deployed` is non-terminal so the `cancelled` write still wins, but the
+        # entry-gated undeploy above never ran. Re-read and tear down any deployment still active so
+        # cancel never orphans one. Holding the deploy lock keeps a post-cancel checkpoint deploy from
+        # interleaving here: it blocks until we release, then attaches its deployment untouched.
+        final = get_status(run_id)
+        if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
+            with contextlib.suppress(Exception):
+                from flash.serve.deploy import undeploy_adapter
+
+                undeploy_adapter(run_id)
+                mark_deployment_undeployed(run_id)
     with contextlib.suppress(Exception):
         from flash.server.checkpoints import register_checkpoints_best_effort
 
