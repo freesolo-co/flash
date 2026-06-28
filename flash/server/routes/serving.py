@@ -124,17 +124,6 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 "trained adapter artifacts can be deployed"
             )
             raise HTTPException(status_code=409, detail=detail)
-        # Legacy runs persisted before [train].hf_repo was mandatory rehydrate with an
-        # empty hf_repo; without this guard freesolo serving cannot locate the adapter
-        # artifacts (the per-run HF dataset repo). Reject early with a clear 409.
-        if not dry_run and not spec.train.hf_repo:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
-                    "cannot be located, so it cannot be deployed"
-                ),
-            )
         # A checkpoint deploy serves the per-step adapter; otherwise the run's final adapter.
         deploy_prefix = (
             checkpoint_adapter_prefix(spec, checkpoint_step)
@@ -292,15 +281,6 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
 
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
-        # Legacy runs with no artifact repo (mirrors the /deploy guard): the adapter can't be located.
-        if not spec.train.hf_repo:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
-                    "cannot be located, so it cannot be exported"
-                ),
-            )
         # Optional `step`: export a specific intermediate checkpoint instead of the final adapter,
         # validated against what's actually on HF (a missing step 404s with the available list).
         checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
@@ -387,14 +367,6 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         raise HTTPException(
             status_code=409,
             detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
-        )
-    # Legacy run with no artifact repo (mirrors the /deploy guard): a run that never had a
-    # [train].hf_repo was never registered with freesolo serving, so reject early with a
-    # clear 409 instead of an opaque downstream inference error.
-    if not spec.train.hf_repo:
-        raise HTTPException(
-            status_code=409,
-            detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
         )
     # Parse the client-supplied sampling params BEFORE the broad try: a bad value
     # (e.g. {"temperature": "hot"}) is a request error -> 400, not a 502 inference

@@ -129,6 +129,35 @@ def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
     assert "assets/labels.json" not in files
 
 
+def test_push_ships_training_md_and_keeps_user_readme(monkeypatch, tmp_path):
+    # The TRAINING.md `flash env setup` scaffolds — and a user-authored README — must travel into
+    # the pushed package so they land in the hub and round-trip back through `flash env pull`.
+    env_dir = tmp_path / "math"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "TRAINING.md").write_text("# TRAINING.md\n\nplaybook body\n")
+    (env_dir / "README.md").write_text("# math\n\nmy own readme\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir, name="math")) == 0
+    files = _members(cap["package_b64"])
+    assert "playbook body" in files["TRAINING.md"]
+    # the user's README survives — it is NOT clobbered by the synthesized stub
+    assert "my own readme" in files["README.md"]
+
+
+def test_push_synthesizes_readme_stub_when_absent(monkeypatch, tmp_path):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="math-env")) == 0
+    files = _members(cap["package_b64"])
+    assert "# math-env" in files["README.md"]
+
+
 def test_push_single_py_ships_sibling_helper_modules(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("import helper\n\ndef load_environment(**k):\n    return None\n")
