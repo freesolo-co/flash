@@ -64,7 +64,9 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
             json.dump(stale, f)
 
         s = runner.get_status("old")
-        assert s.run_id == "old" and s.state == "done" and s.cost_usd == 2.0
+        assert s.run_id == "old"
+        assert s.state == "done"
+        assert s.cost_usd == 2.0
         assert not hasattr(s, "resume_seed_index")
         assert "old" in {r.run_id for r in runner.list_runs()}
 
