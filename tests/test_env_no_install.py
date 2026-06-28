@@ -40,6 +40,7 @@ def test_install_manifest_machinery_is_removed():
 
 
 def test_env_list_reports_local_only(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FLASH_STYLE", "0")  # force the plain renderer so substring asserts are stable
     monkeypatch.chdir(tmp_path)
     (tmp_path / "environment.py").write_text("# env\n")
     rc = cmd_env_list(argparse.Namespace())
@@ -51,6 +52,7 @@ def test_env_list_reports_local_only(tmp_path, monkeypatch, capsys):
 
 
 def test_env_list_empty_hint(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FLASH_STYLE", "0")  # force the plain renderer so substring asserts are stable
     monkeypatch.chdir(tmp_path)
     rc = cmd_env_list(argparse.Namespace())
     assert rc == 0
