@@ -25,11 +25,9 @@ do-not-touch set:
 * Only ``flashrun-*`` repos are ever touched (hard prefix allowlist), and a repo whose age can't be
   determined is left alone.
 
-Operator env (no per-invocation flags; these are standing operational config):
-
-* ``FLASH_REPO_GC_ENABLED``          master switch (default on; the loop also needs an operator HF_TOKEN)
-* ``FLASH_REPO_GC_DELETE_AGE_DAYS``  age threshold in days (default 30)
-* ``FLASH_REPO_GC_INTERVAL_HOURS``   sweep cadence (default 24; see ``_repo_cleanup_loop``)
+There is nothing to configure: the policy (30-day age, daily sweep) is fixed, with no env knobs or
+flags. The loop only runs on a plane that has an operator ``HF_TOKEN`` — without it the sweep cannot
+delete operator-owned repos at all.
 """
 
 from __future__ import annotations
@@ -44,7 +42,7 @@ from flash.runner import _ARTIFACT_NAMESPACE
 logger = get_logger(__name__)
 
 RUN_REPO_PREFIX = "flashrun-"
-DEFAULT_DELETE_AGE_DAYS = 30.0
+DELETE_AGE_SECONDS = 30.0 * 86400.0  # delete an undeployed repo once it is this old (fixed: 30 days)
 _DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
 
 
@@ -52,26 +50,13 @@ class CleanupAborted(RuntimeError):
     """The serving live set could not be confirmed, so the sweep deleted nothing (fails closed)."""
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in ("", "0", "false", "no", "off")
-
-
 def repo_cleanup_enabled() -> bool:
     """Whether the always-on repo GC should run on this control plane.
 
     Requires an operator ``HF_TOKEN`` — the sweep deletes operator-owned ``flashrun-*`` dataset
     repos, impossible (and meaningless) without it — so a plane without the token never schedules the
-    loop. Killable via ``FLASH_REPO_GC_ENABLED=0`` (default on) to pause automatic deletion."""
-    if not (os.environ.get("HF_TOKEN") or "").strip():
-        return False
-    return _env_flag("FLASH_REPO_GC_ENABLED", True)
-
-
-def _delete_age_seconds() -> float:
-    return float(os.environ.get("FLASH_REPO_GC_DELETE_AGE_DAYS") or DEFAULT_DELETE_AGE_DAYS) * 86400.0
+    loop. This is a credential check, not a knob: there is no on/off env switch."""
+    return bool((os.environ.get("HF_TOKEN") or "").strip())
 
 
 def deployed_repo_ids() -> tuple[set[str], bool]:
@@ -164,7 +149,7 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None) -> int:
     from huggingface_hub import HfApi
 
     api = api or HfApi()
-    max_age_s = _delete_age_seconds()
+    max_age_s = DELETE_AGE_SECONDS
 
     deployed = _confirm_live_set()  # fail closed before we even list
     # In-flight runs are protected regardless of age (their repo predates any worker and isn't in the
