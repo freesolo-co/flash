@@ -499,12 +499,23 @@ def submit_job(
     return get_status(spec.run_id)
 
 
+def _runstatus_from_json(d: dict) -> RunStatus:
+    # Tolerant load: drop unknown keys before constructing RunStatus. A status JSON written by an
+    # OLDER control plane can carry a since-removed field (e.g. ``resume_seed_index`` from the
+    # pre-#317 multi-seed era) -- and `~/.flash/runs/*.json` is never GC'd, so those files exist in
+    # prod RIGHT NOW. A strict ``RunStatus(**d)`` raises TypeError on such a key; the read sites
+    # (get_status callers, recover/reconcile) catch only FileNotFoundError, so it would escape and
+    # 500 runs-list / poll / recover / reconcile. This is operational tolerance for data already on
+    # disk, NOT feature back-compat -- the removed field itself stays gone (it's simply ignored).
+    return RunStatus(**{k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__})
+
+
 def get_status(run_id: str) -> RunStatus:
     path = runs_file_path(run_id, ".json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"unknown run_id: {run_id}")
     with open(path) as f:
-        return RunStatus(**json.load(f))
+        return _runstatus_from_json(json.load(f))
 
 
 def list_runs() -> list[RunStatus]:
@@ -513,7 +524,7 @@ def list_runs() -> list[RunStatus]:
     for name in sorted(os.listdir(RUNS_DIR)):
         if name.endswith(".json"):
             with open(os.path.join(RUNS_DIR, name)) as f:
-                runs.append(RunStatus(**json.load(f)))
+                runs.append(_runstatus_from_json(json.load(f)))
     return runs
 
 
