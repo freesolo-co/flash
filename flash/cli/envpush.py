@@ -82,8 +82,11 @@ def cmd_env_pull(args) -> int:
     try:
         if args.path:
             out = Path(args.output) if args.output else Path(Path(args.path).name)
-            if out.is_dir():
-                # a single file can't replace a directory; refuse instead of crashing on write.
+            if out.is_dir() and not out.is_symlink():
+                # a single file can't replace a REAL directory; refuse instead of crashing on write.
+                # A symlink-to-a-dir is NOT rejected here — it's handled by the symlink/--force check
+                # below, and _atomic_write_bytes replaces the link itself (os.replace), never the
+                # target dir, so `pull -o <symlink-to-dir> --force` is safe.
                 print(
                     f"refusing to overwrite directory {out} with a file (pass an explicit -o path)",
                     file=sys.stderr,
