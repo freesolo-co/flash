@@ -417,14 +417,14 @@ def _make_poll_provider(monkeypatch, *, on_poll):
     monkeypatch.setattr(providers, "get_provider", lambda name: _StubProvider())
 
 
-def test_attach_run_recovery_skips_seed_loop_when_raced_terminal(tmp_path, monkeypatch):
+def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkeypatch):
     """Recovery-path TOCTOU regression (the reviewed bug). attach_run checks the terminal state
     ONCE up front, then runs a long poll. If a concurrent thread/process flips the run terminal
     (e.g. another attach_run marks it `failed`) DURING that poll, the not-ok recovery path must
-    NOT resume `_run_seed_loop` — doing so would submit PAID GPU work for an already-terminal run.
+    NOT resume `_run_training` — doing so would submit PAID GPU work for an already-terminal run.
     The atomic guard: _update(.., "running", ..)'s sticky CAS rejects the write (returns False),
     so the resume is skipped. Here we flip the run to `failed` from inside the (mocked) poll, then
-    return a not-ok result, and assert the seed loop is never entered."""
+    return a not-ok result, and assert training is never resumed."""
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -435,16 +435,16 @@ def test_attach_run_recovery_skips_seed_loop_when_raced_terminal(tmp_path, monke
         run_id=spec.run_id,
         state="running",
         spec=spec.to_dict(),
-        remote={"provider": "runpod", "endpoint_id": "ep-1", "job_id": "job-1", "seed": 0},
+        remote={"provider": "runpod", "endpoint_id": "ep-1", "job_id": "job-1"},
     )
     orch._save_status(st)
 
-    # The seed loop is the PAID-work entry point; it must never be called for a terminal run.
-    seed_loop_calls = {"n": 0}
+    # _run_training is the PAID-work entry point; it must never be called for a terminal run.
+    training_calls = {"n": 0}
     monkeypatch.setattr(
         orch,
-        "_run_seed_loop",
-        lambda *a, **k: seed_loop_calls.__setitem__("n", seed_loop_calls["n"] + 1),
+        "_run_training",
+        lambda *a, **k: training_calls.__setitem__("n", training_calls["n"] + 1),
     )
 
     from flash.providers.base import PollResult
@@ -459,16 +459,16 @@ def test_attach_run_recovery_skips_seed_loop_when_raced_terminal(tmp_path, monke
     _make_poll_provider(monkeypatch, on_poll=racing_poll)
 
     out = orch.attach_run(spec.run_id)
-    assert seed_loop_calls["n"] == 0, (
-        "must NOT submit paid work (resume seed loop) for a run raced to terminal"
+    assert training_calls["n"] == 0, (
+        "must NOT submit paid work (resume training) for a run raced to terminal"
     )
     assert out.state == "failed", "the authoritative terminal state must be preserved"
     assert orch.get_status(spec.run_id).state == "failed"
 
 
-def test_attach_run_recovery_resumes_seed_loop_when_still_active(tmp_path, monkeypatch):
+def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkeypatch):
     """Happy-path guard: the TOCTOU fix must NOT regress a genuine recovery. A not-ok poll on a
-    run that is STILL active (no terminal race) must resume `_run_seed_loop` exactly as before."""
+    run that is STILL active (no terminal race) must resume `_run_training` exactly as before."""
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -479,15 +479,15 @@ def test_attach_run_recovery_resumes_seed_loop_when_still_active(tmp_path, monke
         run_id=spec.run_id,
         state="running",
         spec=spec.to_dict(),
-        remote={"provider": "runpod", "endpoint_id": "ep-1", "job_id": "job-1", "seed": 0},
+        remote={"provider": "runpod", "endpoint_id": "ep-1", "job_id": "job-1"},
     )
     orch._save_status(st)
 
-    seed_loop_calls = {"n": 0}
+    training_calls = {"n": 0}
     monkeypatch.setattr(
         orch,
-        "_run_seed_loop",
-        lambda *a, **k: seed_loop_calls.__setitem__("n", seed_loop_calls["n"] + 1),
+        "_run_training",
+        lambda *a, **k: training_calls.__setitem__("n", training_calls["n"] + 1),
     )
 
     from flash.providers.base import PollResult
@@ -498,13 +498,13 @@ def test_attach_run_recovery_resumes_seed_loop_when_still_active(tmp_path, monke
     )
 
     out = orch.attach_run(spec.run_id)
-    assert seed_loop_calls["n"] == 1, "a still-active run must resume the seed loop (no regression)"
+    assert training_calls["n"] == 1, "a still-active run must resume training (no regression)"
     assert out.state == "running"
 
 
-def test_run_seed_loop_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
-    """Defense in depth: _run_seed_loop's own pre-submit guard now bails on ANY terminal state
-    (not just `cancelled`). If the run is terminal when the loop is entered — e.g. a concurrent
+def test_run_training_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
+    """Defense in depth: _run_training's own pre-submit guard bails on ANY terminal state
+    (not just `cancelled`). If the run is terminal when training is entered — e.g. a concurrent
     thread marked it `done`/`failed` after the caller decided to resume — it must raise
     _RunCancelled and never call _submit_seed_supervised (the paid GPU submit)."""
     import flash.runner as orch
@@ -512,10 +512,8 @@ def test_run_seed_loop_bails_on_terminal_before_paid_work(tmp_path, monkeypatch)
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     from flash.spec import JobSpec
 
-    spec = JobSpec.from_dict(
-        {"gpu": {"type": "RTX 5090"}, "run_id": "flash-loop-terminal", "train": {"seeds": [0, 1]}}
-    )
-    # The run is already terminal (failed) before the loop runs.
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-loop-terminal"})
+    # The run is already terminal (failed) before training runs.
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="failed", spec=spec.to_dict()))
 
     submitted = {"n": 0}
@@ -530,7 +528,7 @@ def test_run_seed_loop_bails_on_terminal_before_paid_work(tmp_path, monkeypatch)
     import pytest
 
     with pytest.raises(orch._RunCancelled):
-        orch._run_seed_loop(spec, io.StringIO(), start_index=0, prior_cost=0.0)
+        orch._run_training(spec, io.StringIO(), prior_cost=0.0)
     assert submitted["n"] == 0, "no paid GPU work may be submitted for an already-terminal run"
     assert orch.get_status(spec.run_id).state == "failed", "the terminal state must be untouched"
 

@@ -259,7 +259,12 @@ def _train_body(input_data: dict) -> dict:
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
 
     def _upload_console(mode: str) -> None:
-        """Upload the last 64 KB of console_<mode>.txt to the HF run repo. Best-effort."""
+        """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
+        console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
+        from both the subprocess-failure path and the missing-metrics crash path: a worker killed
+        without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
+        ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
+        crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
         console = f"/tmp/console_{mode}.txt"
         if not os.path.exists(console):
             return
@@ -268,7 +273,9 @@ def _train_body(input_data: dict) -> dict:
 
             spec = json.loads(input_data["job_spec_json"])
             phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
-            prefix = f"{phase_ns}/{spec['run_id']}/seed{input_data['seed']}"
+            prefix = f"{phase_ns}/{spec['run_id']}"
+            # Read only the last 64 KB (seek from the end) — the console can be very large on long
+            # runs, so f.read()[-64_000:] would pull the whole file into memory just to slice it.
             tail_bytes = 64_000
             with open(console, "rb") as f:
                 f.seek(0, os.SEEK_END)

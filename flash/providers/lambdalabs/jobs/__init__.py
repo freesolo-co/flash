@@ -282,7 +282,7 @@ def poll_lambda_job(
     launch_ts = handle.started_ts or time.time()
 
     hf_repo = spec.train.hf_repo
-    prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+    prefix = f"{spec.phase}/{spec.run_id}"
     done_reader = _make_hf_file_reader(hf_repo, f"{prefix}/DONE")
     marker_reader = _make_hf_file_reader(
         hf_repo, f"{prefix}/lambda_attempt{handle.attempt}.json", min_interval_s=60.0
@@ -525,7 +525,7 @@ def submit_run_lambda(
         if on_handle is not None:
             on_handle(handle.to_dict())
         hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+        prefix = f"{spec.phase}/{spec.run_id}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
         return poll_lambda_job(

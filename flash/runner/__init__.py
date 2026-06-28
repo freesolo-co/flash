@@ -10,10 +10,10 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 from flash.catalog import ModelInfo, resolve_model
-from flash.spec import JobSpec
+from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -29,17 +29,16 @@ def artifacts_dir(spec: JobSpec) -> str:
     return os.path.join(RESULTS_DIR, "runpod", spec.phase, spec.run_id)
 
 
-def adapter_prefix(spec: JobSpec, seed: int | None = None) -> str:
-    """A run's adapter location on the HF artifact store."""
-    chosen = spec.train.seeds[0] if seed is None else seed
-    return f"{spec.phase}/{spec.run_id}/seed{chosen}"
+def adapter_prefix(spec: JobSpec) -> str:
+    """A run's adapter location on the HF artifact store: ``<phase>/<run_id>``."""
+    return f"{spec.phase}/{spec.run_id}"
 
 
-def adapter_ref(spec: JobSpec, seed: int | None = None) -> str | None:
+def adapter_ref(spec: JobSpec) -> str | None:
     """Full init_from_adapter reference for a run's trained adapter."""
     if not spec.train.hf_repo:
         return None
-    return f"{spec.train.hf_repo}:{adapter_prefix(spec, seed=seed)}"
+    return f"{spec.train.hf_repo}:{adapter_prefix(spec)}"
 
 
 def _adapter_ref_from_status_spec(raw: dict) -> str | None:
@@ -72,9 +71,11 @@ class RunStatus:
     adapter_ref: str | None = None
     deployment: dict | None = None
     remote: dict | None = None
-    # Set in the gap between seeds so recover_runs can resume remaining seeds after restart.
-    resume_seed_index: int | None = None
-    # Realized provider COGS (vs cost_usd which is a wall x rate projection).
+    # Realized provider cost (COGS), pulled from the provider's billing API after the run
+    # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
+    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the wall x $/hr
+    # PROJECTION); ``reconciled_at`` marks that the realized pull has happened so it isn't
+    # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
@@ -93,6 +94,18 @@ class RunStatus:
             _adapter_ref_from_status_spec(self.spec) if self.state in {"done", "deployed"} else None
         )
         return data
+
+    @classmethod
+    def from_persisted(cls, data: dict) -> RunStatus:
+        """Build a RunStatus from persisted status JSON, ignoring unknown keys.
+
+        Run-status JSON is forward/backward compatible across control-plane upgrades: a release
+        that REMOVES a field (e.g. the old multi-seed ``resume_seed_index``) must still load runs
+        written by the prior version. A plain ``RunStatus(**data)`` would raise ``TypeError`` on
+        any extra key, breaking startup ``recover_runs`` / ``flash status`` / ``list_runs`` for
+        every in-flight run carried across the upgrade. Drop keys not on the current dataclass."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 class _RunCancelled(RuntimeError):
@@ -294,7 +307,7 @@ def get_status(run_id: str) -> RunStatus:
     if not os.path.exists(path):
         raise FileNotFoundError(f"unknown run_id: {run_id}")
     with open(path) as f:
-        return RunStatus(**json.load(f))
+        return RunStatus.from_persisted(json.load(f))
 
 
 def list_runs() -> list[RunStatus]:
@@ -303,7 +316,7 @@ def list_runs() -> list[RunStatus]:
     for name in sorted(os.listdir(RUNS_DIR)):
         if name.endswith(".json"):
             with open(os.path.join(RUNS_DIR, name)) as f:
-                runs.append(RunStatus(**json.load(f)))
+                runs.append(RunStatus.from_persisted(json.load(f)))
     return runs
 
 
@@ -364,9 +377,12 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
     _report_status(status)
 
 
-def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
-    """Write metrics to results/runpod/<phase>/<run_id>/seedN and return cost."""
-    dest = os.path.join(artifacts_dir(spec), f"seed{seed}")
+def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
+    """Write metrics to results/runpod/<phase>/<run_id> and return the cost.
+
+    The run id keeps concurrent/sequential runs of the same phase from
+    overwriting each other's artifacts."""
+    dest = artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.
     gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
@@ -388,15 +404,17 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     with contextlib.suppress(Exception):
         from flash.server.run_registry import record_training_checkpoint
 
-        record_training_checkpoint(spec=spec, seed=seed, metrics=metrics, artifact_path=dest)
+        record_training_checkpoint(spec=spec, metrics=metrics, artifact_path=dest)
     return float(cost)
 
 
 def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
-    allow_from_terminal is only for cancel_run's final `cancelled` write over a racing `done`
-    from mark_undeployed — never use it for genuine training-completion races.
+    Returns ``True`` if the transition was applied, ``False`` if it was rejected because
+    the run was already in a terminal state (the sticky compare-and-set below). Callers
+    that gate PAID work on a transition (e.g. the recovery path resuming ``_run_training``)
+    must check this return so a run concurrently flipped terminal does not get resumed.
     """
     report_status: RunStatus | None = None
     with _STATUS_LOCK:
@@ -497,13 +515,12 @@ from flash.runner.deploy import (  # noqa: E402,F401
     mark_deployed,
     mark_deployment_undeployed,
     mark_undeployed,
-    resume_run,
 )
 from flash.runner.lifecycle import (  # noqa: E402,F401
     _gc_run_endpoints,
     _run_job,
     _run_job_inner,
-    _run_seed_loop,
+    _run_training,
     _spec_with_gpu,
     _submit_seed_supervised,
 )

@@ -20,7 +20,6 @@ from flash.schema.fields import (
     _require_environment_ref,
     _train_float,
     _train_int,
-    _train_seeds,
     _train_stops,
     _wandb_spec,
     _worker_env,
@@ -31,7 +30,7 @@ _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 _ADAPTER_REF_RE = re.compile(
     rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl)/"
-    rf"(?P<run_id>{_RUN_ID_RE})/seed(?P<seed>\d+)$"
+    rf"(?P<run_id>{_RUN_ID_RE})$"
 )
 
 
@@ -74,6 +73,7 @@ def _apply_override(raw: dict, item: str) -> None:
         if not isinstance(node, dict):
             raise ConfigError(f"--set path {key!r} traverses a non-table value")
     leaf = parts[-1]
+    # support list values like pip=["a","b"]
     val = value.strip()
     # wandb leaves are string labels — don't coerce to int/bool
     if parts[0] == "wandb":
@@ -98,7 +98,7 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
         return ref
     raise ConfigError(
         "train.init_from_adapter must be the full adapter_ref emitted by `flash status` "
-        "(<owner>/<repo>:<phase>/<run_id>/seed<N>)"
+        "(<owner>/<repo>:<phase>/<run_id>)"
     )
 
 
@@ -125,7 +125,6 @@ _TRAIN_KEYS = frozenset(
         "epochs",
         "lora_rank",
         "lora_alpha",
-        "seeds",
         "init_from_adapter",
         "hf_repo",
         "learning_rate",
@@ -256,7 +255,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=_train_int(train_raw, "lora_rank", minimum=1) or 32,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
-            seeds=_train_seeds(train_raw),
             init_from_adapter=_init_from_adapter_ref(train_raw),
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
@@ -288,8 +286,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
 
 
 def _validate_spec(spec: JobSpec) -> None:
-    if not spec.train.seeds:
-        raise ConfigError("train.seeds must contain at least one seed")
     try:
         canonical_gpu(spec.gpu.type)
     except UnsupportedGpuError as exc:
