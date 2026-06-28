@@ -12,13 +12,14 @@ import ast
 import pathlib
 import types
 
+import pytest
+
 
 def test_is_cuda_oom_is_structured(monkeypatch):
-    import torch
-
+    # torch-free (the offline CI image has no torch): is_cuda_oom imports torch internally under a
+    # try/except, so the counter + MemoryError paths classify without it.
     from flash.engine.worker.perf import lifecycle as lc
 
-    assert lc.is_cuda_oom(torch.cuda.OutOfMemoryError("x")) is True  # typed signal
     # NO string matching: a RuntimeError that SAYS "out of memory" is not an OOM without a real signal
     monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
     assert lc.is_cuda_oom(RuntimeError("Triton Error [CUDA]: out of memory")) is False
@@ -28,6 +29,13 @@ def test_is_cuda_oom_is_structured(monkeypatch):
     assert lc.is_cuda_oom(RuntimeError("whatever")) is True
     # a host-RAM OOM is never a GPU OOM (a bigger card can't fix it), even with the counter pinned >0
     assert lc.is_cuda_oom(MemoryError("host ram: out of memory")) is False
+
+
+def test_is_cuda_oom_typed_torch_error():
+    torch = pytest.importorskip("torch")  # skipped on the torch-less offline CI image
+    from flash.engine.worker.perf.lifecycle import is_cuda_oom
+
+    assert is_cuda_oom(torch.cuda.OutOfMemoryError("x")) is True  # typed allocator signal
 
 
 def _card(gpu, vram):
