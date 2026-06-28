@@ -248,6 +248,25 @@ def _push_environment_commit(*, checkout: Path, token: str) -> None:
     _run_git(checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token)
 
 
+def _push_environment_delete(*, checkout: Path, publish_root: str, token: str) -> None:
+    """Rebase onto the remote tip, re-apply the slug removal, then push.
+
+    A concurrent publish can add files under the same ``publish_root`` between our clone and this
+    push. ``git pull --rebase`` only replays the removals our delete commit recorded, so a
+    non-conflicting concurrent addition (e.g. a new sidecar while ``environment.py`` is unchanged)
+    survives the rebase: the push would succeed and we'd report ``deleted: true`` while the slug
+    directory still exists partially. Re-run ``git rm -r`` against the freshly rebased tree and fold
+    any newly-tracked paths into the delete commit so the pushed state has the slug fully removed.
+    """
+    _run_git(checkout, ["pull", "--rebase", "origin", _GITHUB_BRANCH], token=token)
+    _run_git(
+        checkout, ["rm", "-r", "--quiet", "--ignore-unmatch", "--", publish_root], token=token
+    )
+    if _staged_has_changes(checkout):
+        _run_git(checkout, ["commit", "--amend", "--no-edit"], token=token)
+    _run_git(checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token)
+
+
 def _github_publish_once(
     *,
     dest: Path,
@@ -362,17 +381,32 @@ def _validate_slug(slug: str) -> tuple[str, str]:
     """
     if not isinstance(slug, str):
         raise EnvPublishError("env id must be a string")
-    # Do NOT strip leading/trailing '/': a request like `DELETE /v1/envs/ns/env/` (trailing slash
-    # captured by the :path param) must be REJECTED, not silently normalized to `ns/env`. Otherwise
-    # the non-canonical id could flow on to the response / downstream mirroring while deletion targets
-    # the stripped form — split on the raw value so an empty leading/trailing segment fails the check.
-    parts = slug.strip().split("/")
+    # Reject — never silently normalize — anything that isn't ALREADY the canonical two-segment id.
+    # Do NOT strip leading/trailing '/' OR surrounding whitespace: requests like
+    # `DELETE /v1/envs/ns/env/` (trailing slash captured by the :path param) or an encoded-padded
+    # `ns/env%20` (FastAPI decodes to `ns/env `) must FAIL, not be trimmed to `ns/env`. Otherwise the
+    # package is deleted under the canonical slug while the response / downstream mirroring carry the
+    # non-canonical id, leaving a stale UI row. Split on the raw value so any empty (stray separator)
+    # or whitespace-padded segment fails the per-segment check below.
+    parts = slug.split("/")
     if len(parts) != 2 or not all(parts):
         raise EnvPublishError("env id must be 'namespace/name'")
     for segment in parts:
         if segment in {".", ".."} or not _SLUG_SEGMENT_RE.match(segment):
             raise EnvPublishError(f"invalid env id segment: {segment!r}")
     return parts[0], parts[1]
+
+
+def canonical_env_id(slug: str) -> str:
+    """Validate ``slug`` and return the canonical ``namespace/name`` id.
+
+    Public wrapper over :func:`_validate_slug` so the route can normalize the id ONCE up front and
+    use the same canonical value for deletion, the metadata-mirror drop, and the response — never a
+    non-canonical variant. Raises :class:`EnvPublishError` (400) for anything that isn't already
+    canonical, so a padded / stray-separator id is rejected rather than silently trimmed.
+    """
+    namespace, name = _validate_slug(slug)
+    return f"{namespace}/{name}"
 
 
 def _staged_has_changes(checkout: Path) -> bool:
@@ -384,13 +418,25 @@ def _staged_has_changes(checkout: Path) -> bool:
             text=True,
             timeout=_GIT_TIMEOUT_S,
         )
+    except FileNotFoundError as exc:
+        raise EnvPublishError(
+            "git is required to delete environments from Freesolo", status=503
+        ) from exc
     except subprocess.TimeoutExpired as exc:
         raise EnvPublishError(
             f"Freesolo environment delete git command timed out after {_GIT_TIMEOUT_S}s",
             status=504,
         ) from exc
-    # `--quiet` => exit 0 when nothing is staged, 1 when there are staged changes.
-    return proc.returncode != 0
+    # `git diff --cached --quiet` exits 0 (nothing staged) or 1 (staged changes). Treat ONLY 1 as
+    # "has changes"; any other code (e.g. 128 for a broken/unexpected repo state) is an error, not a
+    # signal to commit-and-push, so surface it as a controlled EnvPublishError instead of a bare 500.
+    if proc.returncode not in (0, 1):
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        raise EnvPublishError(
+            f"Freesolo environment delete failed during staged diff check: {output}",
+            status=502,
+        )
+    return proc.returncode == 1
 
 
 def _github_delete_once(*, repo: str, token: str, publish_root: str, message: str) -> bool:
@@ -426,7 +472,7 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
             # The directory was present on disk but untracked (never committed) — nothing to push.
             return False
         _run_git(checkout, ["commit", "-m", message], token=token)
-        _push_environment_commit(checkout=checkout, token=token)
+        _push_environment_delete(checkout=checkout, publish_root=publish_root, token=token)
         return True
 
 
