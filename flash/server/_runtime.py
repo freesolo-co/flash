@@ -109,10 +109,9 @@ def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
 def _worker_artifacts(spec) -> dict[str, str]:
     """Fetch worker console/error logs from the private HF artifact repo using the operator token.
 
-    The worker streams ``console_<phase>.txt`` and the attempt-scoped
-    ``error_<phase>_attempt<N>.txt`` to the run's PRIVATE HF repo; read them with the OPERATOR
-    ``HF_TOKEN`` so ``flash status --logs`` shows the real worker output regardless of run state
-    and without the user needing repo access. Best-effort: a missing file / no repo yields {}.
+    The repo is PRIVATE (a user's own HF token 404s), so we read with the OPERATOR ``HF_TOKEN`` the
+    control plane holds. The error file is attempt-scoped (``error_<phase>_attempt<N>.txt``), so we
+    resolve the newest attempt's file. Best-effort: a missing file / no repo yields {}.
     """
     repo = getattr(getattr(spec, "train", None), "hf_repo", None)
     if not repo:
