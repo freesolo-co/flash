@@ -26,8 +26,9 @@ def _atomic_write_bytes(out: Path, data: bytes | bytearray) -> None:
     never truncates an existing file, and ``os.replace`` swaps the path itself — replacing a symlink
     at ``out`` rather than writing through it to the link target."""
     fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=".flash-env-pull-")
+    os.close(fd)
     try:
-        with os.fdopen(fd, "wb") as f:
+        with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, out)
     except BaseException:
