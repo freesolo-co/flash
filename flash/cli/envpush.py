@@ -1,4 +1,8 @@
-"""Environment publish/install machinery for the `flash env` subcommands."""
+"""Environment publish machinery for the `flash env` subcommands.
+
+`flash env push` packages a local Freesolo environment and uploads it through the
+managed Flash control plane.
+"""
 
 from __future__ import annotations
 
@@ -22,24 +26,6 @@ def _err(msg: str) -> int:
     return 1
 
 
-def cmd_env_install(args) -> int:
-    from flash.envs.adapter import is_freesolo_environment_id
-    from flash.envs.registry import INSTALLED_MANIFEST, record_installed_env
-
-    env_id = args.env_id
-    if not is_freesolo_environment_id(env_id):
-        return _err(
-            f'env id must be a Freesolo environment id, e.g. "your-name/your-env" (got {env_id!r})'
-        )
-    record_installed_env(env_id, package="freesolo")
-    if render.styled():
-        print(render.env_installed(env_id, str(INSTALLED_MANIFEST)))
-    else:
-        print(f"installed {env_id}; recorded in {INSTALLED_MANIFEST}")
-        print(f'use it via:  [environment]\\nid = "{env_id}"')
-    return 0
-
-
 _ENV_ENTRYPOINT = "environment.py"
 _ENV_PUSH_IGNORED_NAMES = frozenset(
     {
@@ -55,11 +41,15 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
     }
 )
 _ENV_PUSH_SIDECAR_DIRS = frozenset({"datasets"})
+# ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
+# user-authored README/NOTES) travels with the env into the hub and back out through
+# ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
 _ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
     {
         ".csv",
         ".json",
         ".jsonl",
+        ".md",
         ".parquet",
         ".tsv",
         ".txt",
@@ -291,8 +281,13 @@ def cmd_env_push(args) -> int:
         module_source = entrypoint.read_text()
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
         _copy_env_sidecars(env_root, pkg, entrypoint=entrypoint)
-        (pkg / "README.md").write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
-        # One progress widget spans packaging (slow for large datasets) and upload.
+        # Only synthesize a stub README when the env didn't ship its own (now carried as a
+        # ``.md`` sidecar) — don't clobber a user-authored README with boilerplate.
+        readme = pkg / "README.md"
+        if not readme.exists():
+            readme.write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
+        # One progress widget spans both phases the user otherwise waits through silently:
+        # packaging (walk + gzip, slow for large datasets) and the upload itself.
         bar = _UploadProgress(env_name)
         bar.status("packaging environment")
         try:

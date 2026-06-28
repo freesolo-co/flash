@@ -36,6 +36,14 @@ class ModelInfo:
     params: str
     algos: tuple[str, ...]
     min_vram_gb: int
+    # Total parameters in billions — the numeric model size the cost estimator + VRAM equations read
+    # DIRECTLY (no parsing of the ``params`` display string). Drives the memory/size terms (VRAM, disk,
+    # download), which always size the FULL checkpoint. REQUIRED: every ModelInfo must state it — a
+    # curated catalog model sets its true count, and the open-model policy passes the HF/estimated count
+    # (or 0.0 when the size is genuinely "unknown size"). ``test_every_catalog_entry_sets_params_b``
+    # asserts every curated MODELS entry sets it > 0, so a new entry can never silently fall back to a
+    # parsed string again.
+    params_b: float
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
     # 0 => GRPO uses min_vram_gb like SFT; set when colocated vLLM rollout needs a bigger card.
@@ -48,8 +56,10 @@ class ModelInfo:
     # "none" / "hybrid" (Qwen3-style) / "always" (can't disable) / "unknown" (open-model policy)
     thinking: str = "none"
     vocab_size: int = _DEFAULT_VOCAB_SIZE
-    params_b: float = 0.0
-    # MoE only: active params per token; 0.0 means dense (same as params_b).
+    # Parameters ACTIVE per token in billions — only meaningful for an MoE, where a token routes
+    # through a small subset of experts. The cost estimator's per-token FLOPs/step-time term reads
+    # this (a token exercises only the active params), while VRAM/disk/download keep using the total
+    # ``params_b``. 0.0 (the dense default) means "same as params_b" — every token hits every param.
     active_params_b: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -204,6 +214,9 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
         id=model_id,
         display_name=model_id,
         params=params,
+        # Carry the estimated/HF param count straight through (0.0 when size is unknown) so downstream
+        # sizing reads ``params_b`` directly — no re-parsing the display string.
+        params_b=est.params_b or 0.0,
         algos=ALGORITHMS,
         min_vram_gb=math.ceil(est.est_gb) if est.est_gb else 24,
         min_disk_gb=min_disk,

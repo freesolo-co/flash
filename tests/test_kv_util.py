@@ -73,3 +73,39 @@ def test_caps_at_045_on_small_or_weight_heavy_configs():
 def test_robust_to_missing_params_and_zero_context():
     u = colocate_kv_util(None, 0, 80.0, sleep_mode=True, num_generations=8)
     assert 0.0 < u <= 0.45
+
+
+def test_moe_sizes_kv_on_active_backbone_not_total():
+    """Cursor MsXcx: an MoE's resident KV pool must scale with the ACTIVE backbone (so the runtime
+    colocate budget matches grpo_fits_resident's sleep-mode gate, which sizes its KV on active), while
+    the bf16 weight copy stays on the FULL total. Keying KV off the 35B total would budget a bigger
+    pool than the gate counted -> the gate could disable sleep while the engine reserves more KV than
+    it sized (the near-margin 35B-A3B GRPO mismatch)."""
+    card = 400.0  # large enough that the 0.45 cap doesn't mask the active-vs-total KV difference
+    # 35B-A3B, non-sleep resident path: KV on the active 3B, weights on the full 35B.
+    u_active = colocate_kv_util(35.0, 2048, card, sleep_mode=False, active_params_b=3.0)
+    kv_active = max(_KV_CAP, _resident_kv_gb(3.0, 2048))
+    assert u_active == max(0.10, min(0.45, (35.0 * 2.0 + kv_active) / card))
+    # active unset -> the whole thing keys off total, giving a bigger KV (sqrt(35) vs sqrt(3)) ->
+    # a bigger budget. The two diverging is exactly the resident-gate/runtime-budget mismatch.
+    u_total = colocate_kv_util(35.0, 2048, card, sleep_mode=False)
+    kv_total = max(_KV_CAP, _resident_kv_gb(35.0, 2048))
+    assert u_total == max(0.10, min(0.45, (35.0 * 2.0 + kv_total) / card))
+    assert u_active < u_total
+    # dense (active unset/0) is unchanged: every term keys off the single params_b.
+    assert colocate_kv_util(4.0, 2048, 80.0, sleep_mode=False, active_params_b=0.0) == colocate_kv_util(
+        4.0, 2048, 80.0, sleep_mode=False
+    )
+
+
+def test_moe_colocate_budget_kv_matches_resident_gate_kv():
+    # The invariant the fix restores: grpo_sleep_mode's resident-fit gate (estimate_vram_gb
+    # sleep_offload=False, active-aware) and THIS colocate budget must size the SAME KV for an MoE.
+    # Recover the KV implied by the colocate budget (util*card - the full bf16 weight copy) and assert
+    # it equals the active-width resident KV the gate adds — so the gate can't disable sleep on a KV
+    # the engine then exceeds.
+    card = 320.0  # below the 0.45 cap so util*card exposes the real KV term
+    util = colocate_kv_util(35.0, 4096, card, sleep_mode=False, num_generations=8, active_params_b=3.0)
+    budget_kv = util * card - 35.0 * 2.0
+    gate_kv = max(_KV_CAP, _resident_kv_gb(3.0, 4096, 8))  # what the active-aware gate adds for KV
+    assert round(budget_kv, 6) == round(gate_kv, 6)

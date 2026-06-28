@@ -26,7 +26,7 @@ def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": "flash-1700000000-abcd1234",
-            "train": {"epochs": 1, "seeds": [0], "hf_repo": "org/repo"},
+            "train": {"epochs": 1, "hf_repo": "org/repo"},
             "gpu": gpu,
         }
     )
@@ -64,7 +64,7 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     payload = builders.build_payload(_spec(), seed=0, attempt=1)
     assert payload["phase"] == "sft"
     assert payload["attempt"] == 1
-    assert payload["hf_prefix"] == "sft/flash-1700000000-abcd1234/seed0"
+    assert payload["hf_prefix"] == "sft/flash-1700000000-abcd1234"
     assert payload["max_wall_s"] == 3600
     assert payload["hf_repo"] == "org/repo"
     # The worker env's HF_REPO is sourced from the run's [train] hf_repo (not an operator default).
@@ -147,7 +147,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
             "flash_arm": "lambda",
             "env": {},
             "extra_pip": [],
-            "hf_prefix": "sft/x/seed0",
+            "hf_prefix": "sft/x",
             "max_wall_s": 60,
             "attempt": 0,
         },
@@ -1593,7 +1593,7 @@ def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
     stays conservative (False) on an HF read error so a non-zero exit propagates."""
     from flash.providers import _instance_bootstrap as lb
 
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/x/seed0", "env": {}}
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/x", "env": {}}
     present = {"DONE", "metrics.json"}
     monkeypatch.setattr(lb, "hf_file_exists", lambda p, sub: sub in present)
     assert lb.remote_completion_confirmed(payload) is True
@@ -1664,7 +1664,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
         lambda path=lb.PAYLOAD_PATH: {
             "hf_repo": "org/repo", "job_spec_json": "", "job_spec_in_hf": True,
             "phase": "sft", "seed": 0, "flash_arm": "lambda", "env": {}, "extra_pip": [],
-            "hf_prefix": "sft/x/seed0", "max_wall_s": 60, "attempt": 0,
+            "hf_prefix": "sft/x", "max_wall_s": 60, "attempt": 0,
         },
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
@@ -1706,7 +1706,7 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
         "flash_arm": "lambda",
         "job_spec_json": big,
         "hf_repo": "o/r",
-        "hf_prefix": "sft/x/seed0",
+        "hf_prefix": "sft/x",
         "env": {"HF_TOKEN": "t"},
         "attempt": 0,
     }
@@ -1714,7 +1714,7 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     embedded = json.loads(base64.b64decode(ud.split("FLASH_PAYLOAD_EOF")[1].strip()))
     assert embedded["job_spec_json"] == ""
     assert embedded["job_spec_in_hf"] is True
-    assert uploaded["path"] == "sft/x/seed0/job_spec.json"
+    assert uploaded["path"] == "sft/x/job_spec.json"
     assert uploaded["repo"] == "o/r"
     # The spec is uploaded as an unambiguous file-like object (io.BytesIO), NOT raw bytes — raw
     # bytes is a valid path type and huggingface_hub could misread it as a (huge) filesystem path.
@@ -1755,7 +1755,7 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
 
     from flash.providers import _instance as inst
 
-    payload = {"flash_arm": "lambda", "attempt": 0, "hf_prefix": "sft/x/seed0", "hf_repo": "o/r", "env": {}}
+    payload = {"flash_arm": "lambda", "attempt": 0, "hf_prefix": "sft/x", "hf_repo": "o/r", "env": {}}
 
     def run_failmark(exists_seq=(False,), read_raises=False):
         """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads.
@@ -1792,7 +1792,7 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
     # Worker already wrote its marker -> host must NOT clobber it.
     assert run_failmark(exists_seq=(True,)) == []
     # No worker marker at all (never-started container) -> host failmark IS written.
-    assert run_failmark(exists_seq=(False,)) == ["sft/x/seed0/lambda_attempt0.json"]
+    assert run_failmark(exists_seq=(False,)) == ["sft/x/lambda_attempt0.json"]
     # HF read error -> conservative: skip the write (never risk clobbering).
     assert run_failmark(exists_seq=(False,), read_raises=True) == []
     # RACE: absent on the first check, present on the re-check (worker uploaded in the gap) -> SKIP.

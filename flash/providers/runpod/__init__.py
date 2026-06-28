@@ -63,7 +63,7 @@ class RunpodProvider:
         )
 
         hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+        prefix = f"{spec.phase}/{spec.run_id}"
         hd = handle.to_dict()
         rh = RunpodJobHandle.from_dict(hd)
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
