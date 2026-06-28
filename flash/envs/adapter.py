@@ -20,6 +20,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -256,8 +257,7 @@ def _resolve_ref_sha(
     return sha
 
 
-def _read_capped(resp: object, max_bytes: int, out: BinaryIO | None = None) -> bytes:
-    chunks: list[bytes] = []
+def _iter_capped_chunks(resp: object, max_bytes: int) -> Iterator[bytes]:
     total = 0
     while True:
         chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
@@ -269,11 +269,16 @@ def _read_capped(resp: object, max_bytes: int, out: BinaryIO | None = None) -> b
                 "download aborted"
             )
         total += len(chunk)
-        if out is None:
-            chunks.append(chunk)
-        else:
-            out.write(chunk)
-    return b"".join(chunks)
+        yield chunk
+
+
+def _read_capped(resp: object, max_bytes: int) -> bytes:
+    return b"".join(_iter_capped_chunks(resp, max_bytes))
+
+
+def _copy_capped(resp: object, max_bytes: int, out: BinaryIO) -> None:
+    for chunk in _iter_capped_chunks(resp, max_bytes):
+        out.write(chunk)
 
 
 def _urlopen(
@@ -309,7 +314,10 @@ def _urlopen(
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if max_bytes is not None:
-                    return _read_capped(resp, max_bytes, out=out)
+                    if out is not None:
+                        _copy_capped(resp, max_bytes, out)
+                        return b""
+                    return _read_capped(resp, max_bytes)
                 if out is not None:
                     shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
                     return b""
