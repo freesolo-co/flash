@@ -13,7 +13,7 @@ import logging
 import os
 import threading
 
-from flash.runner import adapter_prefix, get_status, runs_file_path
+from flash.runner import adapter_prefix, runs_file_path
 from flash.spec import JobSpec
 
 from . import db
@@ -156,6 +156,32 @@ def _append_run_log(run_id: str, message: str) -> None:
         f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
 
 
+def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
+    """Newest attempt-scoped worker error file under prefix (error_<phase>_attempt<N>.txt).
+
+    The worker writes error_<phase>_attempt<N>.txt (see error_artifact_name); on a retried run only the
+    highest attempt is the real final crash. Falls back to attempt0 when the repo can't be listed.
+    """
+    import re
+
+    default = f"error_{phase}_attempt0.txt"
+    try:
+        from huggingface_hub import HfApi
+
+        files = HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
+            repo_id=repo, repo_type="dataset"
+        )
+    except Exception:
+        return default
+    pat = re.compile(rf"^{re.escape(prefix)}/error_{re.escape(phase)}_attempt(\d+)\.txt$")
+    best: int | None = None
+    for f in files:
+        m = pat.match(f)
+        if m and (best is None or int(m.group(1)) > best):
+            best = int(m.group(1))
+    return default if best is None else f"error_{phase}_attempt{best}.txt"
+
+
 def _worker_artifacts(spec) -> dict[str, str]:
     """The run's train-subprocess stdout + traceback, fetched from its HF artifact repo.
 
@@ -175,7 +201,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
         return {}
     prefix = adapter_prefix(spec)
     out: dict[str, str] = {}
-    for name in (f"console_{spec.phase}.txt", f"error_{spec.phase}.txt"):
+    for name in (f"console_{spec.phase}.txt", _latest_error_artifact_name(repo, prefix, spec.phase)):
         try:
             path = hf_hub_download(
                 repo_id=repo,
@@ -205,6 +231,7 @@ def recover_runs() -> None:
         _run_job_background,
         _update,
         attach_run,
+        get_status,
     )
 
     active: set[str] = set()

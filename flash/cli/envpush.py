@@ -279,23 +279,17 @@ def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
 
 
 def _human_bytes(n: int) -> str:
-    """A short human-readable byte count, e.g. ``13.4 MB`` (whole bytes for sub-KB sizes)."""
+    """Human-readable byte count."""
     size = float(n)
     for unit in ("B", "KB", "MB"):
         if size < 1024:
             return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
-    # anything >= 1024 MB falls through to GB (env packages never reach TB).
     return f"{size:.1f} GB"
 
 
 class _UploadProgress:
-    """A carriage-return upload progress bar on stderr; a no-op off a TTY.
-
-    Mirrors ``_LogFollowSpinner`` in commands.py: render only when stderr is interactive,
-    rewrite a single line with ``\\r``, and wipe it before normal output. Off a TTY (CI, pipes)
-    ``callback`` is None, so the client uploads in one shot exactly as before and nothing is
-    written to stderr."""
+    """Carriage-return upload progress bar on stderr; no-op off a TTY."""
 
     _BAR_WIDTH = 24
 
@@ -312,11 +306,9 @@ class _UploadProgress:
 
     @property
     def callback(self) -> ProgressCallback | None:
-        # None off a TTY so the client keeps the plain single-shot upload path.
         return self.update if self._enabled else None
 
     def status(self, message: str) -> None:
-        """Show a transient pre-upload line (e.g. ``packaging environment``)."""
         if self._enabled:
             self._write(message)
 
@@ -324,7 +316,7 @@ class _UploadProgress:
         if not self._enabled:
             return
         pct = 100 if total <= 0 else min(100, sent * 100 // total)
-        # redraw only when the whole-number percent changes (8 KB chunks => thousands of calls)
+        # avoid thousands of redraws: skip if percent unchanged mid-upload
         if pct == self._last_pct and sent < total:
             return
         self._last_pct = pct
