@@ -17,7 +17,7 @@ BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k"},
-    "train": {"steps": 10, "lora_rank": 8, "seeds": [0], "hf_repo": "owner/runs"},
+    "train": {"steps": 10, "lora_rank": 8, "hf_repo": "owner/runs"},
     "gpu": {"type": "RTX 4090"},
 }
 
@@ -41,7 +41,9 @@ def _raw(**overrides) -> dict:
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"train.seeds": []}, "at least one seed"),
+        # `seeds` is no longer a valid [train] key (multi-seed removed); it's now rejected
+        # as an unknown key rather than seed-validated.
+        ({"train.seeds": [0]}, "unknown key"),
         ({"train.steps": 0}, "steps must be >= 1"),
         # lora_rank/alpha now parse via _train_int(minimum=1), so out-of-range values
         # are rejected at parse time with the shared ">= 1" message (a non-positive int
@@ -69,7 +71,7 @@ def test_spec_validation_rejections(overrides, match) -> None:
 
 def test_sft_epochs_must_be_positive() -> None:
     raw = _raw(algorithm="sft")
-    raw["train"] = {"epochs": 0, "lora_rank": 8, "seeds": [0]}
+    raw["train"] = {"epochs": 0, "lora_rank": 8}
     with pytest.raises(ConfigError, match="epochs must be >= 1"):
         spec_from_dict(raw)
 
@@ -84,7 +86,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     # required NOR honored from a user config: a config without it parses fine, and a user-
     # supplied value is ignored (left blank for the control plane to assign at submit).
     raw = _raw()
-    raw["train"] = {"steps": 10, "lora_rank": 8, "seeds": [0]}
+    raw["train"] = {"steps": 10, "lora_rank": 8}
     assert spec_from_dict(raw).train.hf_repo == ""
     raw["train"]["hf_repo"] = "someone-else/their-repo"
     assert spec_from_dict(raw).train.hf_repo == ""
@@ -277,7 +279,6 @@ def test_job_spec_json_round_trip() -> None:
     spec = spec_from_dict(_raw(), run_id="rt-1")
     restored = JobSpec.from_json(spec.to_json())
     assert restored == spec
-    assert restored.train.seeds == (0,)
     assert restored.phase == "rl"  # grpo's internal phase id
 
 
@@ -338,8 +339,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw(), run_id="flash-1-x")
     assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "flash-1-x"))
-    assert orch.adapter_prefix(spec) == "rl/flash-1-x/seed0"
-    assert orch.adapter_prefix(spec, seed=3) == "rl/flash-1-x/seed3"
+    assert orch.adapter_prefix(spec) == "rl/flash-1-x"
     assert orch.adapter_ref(spec) is None
 
     d = spec.to_dict()
@@ -347,7 +347,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     spec_with_repo = JobSpec.from_dict(d)
     assert (
         orch.adapter_ref(spec_with_repo)
-        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x/seed0"
+        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
     )
 
 
