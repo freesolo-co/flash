@@ -73,8 +73,8 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
     def _log(msg: str) -> None:
         print(msg, file=log, flush=True) if log is not None else print(msg)
 
-    key = (internal_key() or "").strip()
-    if not key:
+    token = internal_key()  # already whitespace-stripped; None when unset/blank
+    if not token:
         return 0  # local/dev control plane: HF still has the checkpoints
     try:
         spec = JobSpec.from_dict(status.spec)
@@ -91,7 +91,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
         return 0
     try:
         register_run_checkpoints(
-            internal_key=key, status=status, checkpoints=checkpoints
+            internal_key=token, status=status, checkpoints=checkpoints
         )
     except (ValueError, urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
         _log(f"[ckpt] backend register warn ({status.run_id}): {exc}")
