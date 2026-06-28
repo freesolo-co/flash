@@ -51,13 +51,21 @@ def test_oom_escalated_keeps_only_strictly_larger_cards():
     assert _oom_escalated(cands, 180) == []  # OOM'd the biggest -> nowhere larger
 
 
-def test_worker_flagged_oom_reads_the_flag():
-    from flash.providers.runpod.jobs import worker_flagged_oom
+def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
+    from flash.providers.runpod.jobs import surfaced_worker_flags
 
-    assert worker_flagged_oom(lambda force=False: {"oom": True}) is True
-    assert worker_flagged_oom(lambda force=False: {"oom": False}) is False
-    assert worker_flagged_oom(lambda force=False: {"retriable": True}) is False
-    assert worker_flagged_oom(None) is False
+    say = lambda _m: None  # noqa: E731
+    reads = {"n": 0}
+
+    def reader(force=False):
+        reads["n"] += 1
+        return {"oom": True, "retriable": False, "stage": "rl_train"}
+
+    _key, retriable, oom = surfaced_worker_flags(reader, None, say)
+    assert (retriable, oom) == (False, True)
+    assert reads["n"] == 1  # surfacing + both flags share ONE forced read
+    assert surfaced_worker_flags(lambda force=False: {"retriable": True}, None, say)[1:] == (True, False)
+    assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
 
 
 def _read(mod):
@@ -73,7 +81,7 @@ def test_worker_stamps_oom_flag():
 def test_poller_maps_oom_flag_to_oom_failure():
     src = _read("flash.providers.runpod.jobs")
     assert src.count('"oom" if oom else') == 2  # oom wins in both worker-fail paths
-    assert "def worker_flagged_oom" in src
+    assert "def surfaced_worker_flags" in src  # single-read helper feeds both paths
 
 
 def test_runner_escalates_on_oom():
