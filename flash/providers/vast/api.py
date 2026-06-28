@@ -173,7 +173,20 @@ def create_instance(
     instance_id = out.get("new_contract")
     if not instance_id:
         raise VastApiError(f"create_instance({offer_id}): no instance id in response: {out}")
-    return int(instance_id)
+    try:
+        return int(instance_id)
+    except (TypeError, ValueError) as e:
+        # A TRUTHY but non-numeric new_contract on this success body (e.g. a malformed id string): Vast
+        # accepted the NON-IDEMPOTENT PUT /asks — a contract may be billing — but handed back an id we
+        # cannot use as a handle. A bare ``int()`` ValueError here would escape past deploy_and_submit's
+        # ``except VastApiError`` and skip the ambiguous-create reconcile, LEAKING the contract. Surface
+        # it as a VastApiError whose message create_error_is_ambiguous classifies AMBIGUOUS ("no instance
+        # id"), so the adopt-by-label / destroy-and-abort path runs — fail closed toward "a phantom may
+        # exist", exactly like a ``success`` body with no contract id at all.
+        raise VastApiError(
+            f"create_instance({offer_id}): no instance id usable in response "
+            f"(unparseable new_contract {instance_id!r}, possible billed contract): {out}"
+        ) from e
 
 
 def create_error_is_ambiguous(err: Exception) -> bool:
@@ -186,7 +199,8 @@ def create_error_is_ambiguous(err: Exception) -> bool:
     ``success: false`` body is raised with NO chained cause. AMBIGUOUS (a contract may exist): a 5xx,
     a 429 (rate-limit — the request may have been accepted then throttled on the response, so a billed
     instance can exist without a returned id; mirrors Lambda's launch path), ANY socket-level
-    transient (timeout / connection reset / DNS), or a ``success`` body that carried no instance id.
+    transient (timeout / connection reset / DNS), or a ``success`` body that carried no usable
+    instance id (the contract id is missing OR truthy-but-unparseable).
 
     The socket-level case must match every cause ``RestClient`` can chain, not just ``URLError``:
     urllib raises a BARE ``TimeoutError`` (== ``socket.timeout``) / ``ConnectionError`` when a request
@@ -211,7 +225,7 @@ def create_error_is_ambiguous(err: Exception) -> bool:
     _unreadable = (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException)
     if isinstance(err, _unreadable) or isinstance(cause, _unreadable):
         return True
-    return "no instance id" in str(err)  # success body without a contract id -> may be billing
+    return "no instance id" in str(err)  # success body with no / an unparseable contract id -> may be billing
 
 
 def get_instance(instance_id: int) -> dict | None:

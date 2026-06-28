@@ -231,6 +231,23 @@ def test_create_instance_unreadable_response_is_ambiguous(monkeypatch):
         assert vast_api.create_error_is_ambiguous(ei.value) is True
 
 
+def test_create_instance_unparseable_new_contract_is_ambiguous(monkeypatch):
+    # Codex: a 200 ``success`` body whose new_contract is TRUTHY but non-numeric (malformed id) on the
+    # NON-IDEMPOTENT create means Vast may have accepted/billed a contract we can't use as a handle. A
+    # bare int() ValueError here would escape past deploy_and_submit's ``except VastApiError`` and skip
+    # the ambiguous-create reconcile (leaking the contract). It must surface as a VastApiError the walk
+    # classifies AMBIGUOUS, exactly like a ``success`` body that carried no contract id at all.
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    for bad in ("not-a-number", {"id": 1}, [7]):  # truthy but non-intable shapes
+        _capture_urlopen(monkeypatch, [{"success": True, "new_contract": bad}])
+        with pytest.raises(vast_api.VastApiError, match="no instance id") as ei:
+            vast_api.create_instance(123, **kwargs)
+        assert vast_api.create_error_is_ambiguous(ei.value) is True
+
+
 def test_get_instance_none_on_404(monkeypatch):
     from flash.providers.vast import api as vast_api
 

@@ -276,8 +276,16 @@ def deploy_and_submit(
             # nothing) safely walks on. Any lookup failure -> None -> fall through to the normal walk.
             if vast_api.create_error_is_ambiguous(e):
                 adopted = _adopt_instance_by_label(label)
-                if adopted is not None:
-                    iid = int(adopted["id"])
+                # A matching row whose id is truthy-but-unparseable (unexpected API shape) cannot be
+                # cleanly adopted as a handle. A bare ``int(adopted["id"])`` would raise ValueError
+                # BEFORE the terminal UnreconciledCreateError below, aborting the reconcile with the
+                # WRONG error — a generic flake the orchestrator retries, double-provisioning. Coerce
+                # defensively; on an unparseable id FALL THROUGH to the fail-closed abort path (destroy
+                # by label + UnreconciledCreateError), treating the row as a phantom we couldn't adopt
+                # ("a phantom may exist") rather than crashing past the reconcile (Codex).
+                adopted_id = _coerce_instance_id(adopted.get("id")) if adopted is not None else None
+                if adopted_id is not None:
+                    iid = adopted_id
                     # Stamp the handle with the box's REAL launch time (Vast ``start_date`` epoch) so
                     # realized cost + liveness/stall/deadline timing align with its actual runtime, not
                     # the later reconciliation moment. Fall back to now if the field is absent.
@@ -300,8 +308,9 @@ def deploy_and_submit(
                         attempt=attempt,
                         started_ts=started,
                     )
-                # AMBIGUOUS create with NOTHING adopted: a billed contract may still exist but not be
-                # visible yet (object-store / API eventual consistency). Renting another offer would
+                # AMBIGUOUS create with NOTHING cleanly adopted (no row under our label, OR a matching
+                # row whose id was unparseable): a billed contract may still exist but not be cleanly
+                # reclaimable yet (object-store / API eventual consistency). Renting another offer would
                 # double-provision, so ABORT the walk and surface to the orchestrator (which consumes a
                 # run retry). PROACTIVELY destroy this run's instances by label first (mirrors Lambda's
                 # ambiguous path calling terminate_run_instances) so a phantom contract that DID
@@ -570,7 +579,16 @@ def poll_vast_job(
         try:
             inst = vast_api.get_instance(handle.instance_id)
             poll_errors.reset()
-        except vast_api.VastApiError as e:
+        except (vast_api.VastApiError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            # A transient MALFORMED 200 body from the instance-detail API (truncated / non-JSON /
+            # invalid-UTF8) makes ``RestClient.request`` raise JSONDecodeError/UnicodeDecodeError, NOT a
+            # VastApiError — the _http retry wrapper only catches the OSError-family transients, so a
+            # decode failure escapes get_instance's ``except VastApiError`` raw. Without catching it here
+            # it would ESCAPE the poll loop and a recoverable read blip would be misclassified (e.g. as a
+            # terminal/gone instance). A malformed status read is a TRANSIENT poll error: count it
+            # against the poll-error budget and keep polling, exactly like a VastApiError. (UnicodeDecode
+            # Error is a sibling of JSONDecodeError under ValueError that json.loads raises on invalid-UTF8
+            # bytes; the JSONDecodeError clause alone would miss it.) (Codex)
             if poll_errors.record(e):
                 return PollResult(False, failure="poll_error", detail=str(e))
             continue

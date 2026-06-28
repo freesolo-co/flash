@@ -295,6 +295,40 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
     assert destroyed_for  # destroy_run_instances was called to reap any phantom contract
 
 
+def test_deploy_aborts_when_adopted_row_has_unparseable_id(monkeypatch):
+    # Codex: in the ambiguous-create reconcile a matching Vast row can carry our EXACT label but a
+    # truthy-but-NON-NUMERIC id (unexpected API shape). A bare int(adopted["id"]) would raise ValueError
+    # BEFORE the terminal UnreconciledCreateError, aborting with the WRONG (orchestrator-retried) error
+    # -> double-provision. An unparseable id must be treated as a phantom we couldn't cleanly adopt ->
+    # FALL THROUGH to the fail-closed abort (destroy by label + UnreconciledCreateError), NOT rent on.
+    import io
+    import urllib.error
+
+    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    rented = []
+
+    def fake_create(offer_id, **kw):
+        rented.append(offer_id)
+        e = vast_api.VastApiError("create failed: 503")
+        e.__cause__ = urllib.error.HTTPError("u", 503, "boom", None, io.BytesIO(b""))
+        raise e
+
+    monkeypatch.setattr(vast_api, "create_instance", fake_create)
+    # a row under our EXACT attempt label, but its id is non-numeric -> cannot be adopted as a handle
+    label = "flash-1700000000-abcd1234-s0-a2"
+    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": "not-an-int", "label": label}])
+    destroyed_for = []
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
+    offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
+    with pytest.raises(UnreconciledCreateError, match="aborting the offer walk"):
+        vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
+    assert rented == [1]  # never walked on to offer 2 (no duplicate create)
+    assert destroyed_for  # fail-closed: destroy-by-label was attempted before the terminal raise
+
+
 def test_vast_image_honors_worker_image_override(monkeypatch):
     # Codex Mr72Q: Vast must honor FLASH_WORKER_IMAGE (and per-SM) via worker_image_for_gpu like
     # RunPod/Lambda, not always return the baked default.
@@ -427,6 +461,38 @@ def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
     )
     res = vast.poll_vast_job(_handle(started_ts=10_000.0), _spec(), seed=0, interval_s=0)
     assert res.ok  # late DONE recognized via the retry -> success, NOT job_preempted
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        json.JSONDecodeError("Expecting value", "<malformed>", 0),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
+    # Codex: a transient MALFORMED 200 body from the instance-detail API makes RestClient.request raise
+    # JSONDecodeError/UnicodeDecodeError (NOT a VastApiError — the _http wrapper only catches the
+    # OSError-family transients). The poll loop must treat that as a TRANSIENT poll error (count + keep
+    # polling, give up only once the budget is spent), never let it escape and misclassify a recoverable
+    # read blip as a terminal/gone instance.
+    from flash.providers import _poll
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    def boom(instance_id):
+        raise exc
+
+    monkeypatch.setattr(vast_api, "get_instance", boom)
+    monkeypatch.setattr(vast, "_make_hf_file_reader", lambda *a, **k: (lambda force=False: None))
+    monkeypatch.setattr(vast.time, "sleep", lambda s: None)
+    monkeypatch.setattr(_poll.time, "sleep", lambda s: None)  # PollErrorTracker.record backoff
+    clock = itertools.count(start=10_000, step=10.0)
+    monkeypatch.setattr(vast.time, "time", lambda: float(next(clock)))
+
+    res = vast.poll_vast_job(_handle(started_ts=10_000.0), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "poll_error"  # decode failure caught as a poll error, not escaped raw
 
 
 def test_poll_stale_done_is_ignored(monkeypatch):
