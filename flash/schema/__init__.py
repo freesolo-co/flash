@@ -195,14 +195,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
-    # Local environment paths are gone: a run names a published Freesolo env by [environment] id.
-    # A stray `path` (alone or alongside `id`) is a stale config — reject it loudly instead of
-    # silently ignoring the key and training against the wrong/missing env.
-    if env_raw.get("path"):
-        raise ConfigError(
-            "local environment paths are no longer supported — remove `path` and reference a "
-            "Freesolo environment `id` returned by `flash env push --name <name>`"
-        )
     # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
     # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
     # value (false -> {}/()) but a present-but-wrong-typed value otherwise crashes opaquely or
