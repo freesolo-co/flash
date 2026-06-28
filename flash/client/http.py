@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -227,10 +228,14 @@ class ApiClient:
     def delete_env(self, env_id: str) -> dict:
         """Delete a published Freesolo environment by its ``namespace/name`` id.
 
-        The id carries a slash, which the server route matches with a ``:path`` converter, so it
-        goes straight into the URL. The server removes the hub package and best-effort drops the
-        platform metadata mirror; deleting an already-absent env is a no-op (``deleted: false``)."""
-        return self._request("DELETE", f"/v1/envs/{env_id}", timeout=600.0)
+        The id carries a slash, which the server route matches with a ``:path`` converter, so the
+        path segments go straight into the URL — but percent-encode everything except ``/`` first so
+        a programmatic caller passing reserved characters (``?``, ``#``, spaces) can't change the
+        request target or drop a fragment, turning a destructive ``team/env?x=1`` into a silent
+        delete of ``team/env``. The server removes the hub package and best-effort drops the platform
+        metadata mirror; deleting an already-absent env is a no-op (``deleted: false``)."""
+        quoted = urllib.parse.quote(env_id, safe="/")
+        return self._request("DELETE", f"/v1/envs/{quoted}", timeout=600.0)
 
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
