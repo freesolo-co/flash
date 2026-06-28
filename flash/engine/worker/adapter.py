@@ -56,6 +56,63 @@ def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_
         )
 
 
+def _assert_warmstart_adapter_applied(model, model_id: str, load_result) -> None:
+    """Fail closed if a warm-start adapter didn't fully apply: clean load (no silently-discarded
+    keys), LoRA actually present, and a non-zero delta. Shared by the VL and non-VL load paths."""
+    assert_adapter_load_clean(load_result, model_id)
+    assert_lora_applied(model, model_id)
+    assert_adapter_delta_nonzero(model, model_id)
+
+
+def _merge_vl_warmstart_adapter(adir: str, model_id: str, attn_kw: dict) -> str:
+    """VL warm-start (#296): MERGE the SFT into the FULL multimodal base and save the merged model to a
+    fresh temp dir — the new training base for a GRPO LoRA trained from scratch. Continuing the live SFT
+    LoRA instead makes the colocated vLLM rollout AND KL reference run off the BARE base (the SFT only
+    reaches vLLM via a text<->VL weight-sync that round-trips poorly for ``*ForConditionalGeneration``
+    models), so GRPO rolls out base-verbose and collapses a working SFT back to base (observed: every
+    Qwen3.5 GRPO reverts; non-VL MiniCPM does not). Merging into the full multimodal model (NOT the
+    text-only tree) keeps the VL config + ``language_model.*`` keys that both the trainer reload and
+    vLLM's VL loader expect; the SFT keys match here WITHOUT the infix strip. Records the SFT dir for the
+    finalize recombine and returns the merged dir."""
+    import gc
+    import tempfile
+
+    from peft import PeftModel
+    from transformers import AutoModelForImageTextToText
+
+    base = AutoModelForImageTextToText.from_pretrained(
+        model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
+    )
+    model = PeftModel.from_pretrained(base, adir, is_trainable=False)
+    key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+    load_result = model.load_adapter(
+        adir, adapter_name="default", is_trainable=False, key_mapping=key_mapping
+    )
+    _assert_warmstart_adapter_applied(model, model_id, load_result)
+    merged = model.merge_and_unload()
+    # UNIQUE per call (mkdtemp): a fixed /tmp/flash_sft_merged would let two GRPO warm-starts on the
+    # SAME host clobber each other's merged weights. The dir is the run's training base, so it persists
+    # for the run (the worker is ephemeral).
+    merged_dir = tempfile.mkdtemp(prefix="flash_sft_merged_")
+    merged.save_pretrained(merged_dir, safe_serialization=True)
+    from transformers import AutoProcessor
+
+    # processor (preferred for VL) so vLLM/loaders find tokenizer + image-processor config; fall back
+    # to the bare tokenizer if no processor is published.
+    try:
+        AutoProcessor.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
+    except Exception:
+        from transformers import AutoTokenizer
+
+        AutoTokenizer.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
+    del base, model, merged
+    gc.collect()
+    # The saved GRPO LoRA will be SFT-less (trained on the merged base), so finalize MUST recombine it
+    # with this SFT before deploy (recombined_warmstart_adapter_dir).
+    _w._VL_WARMSTART_SFT_DIR = adir
+    return merged_dir
+
+
 def _init_adapter_model(model_id: str):
     """Load init_from_adapter as a trainable PeftModel, or return model_id + fresh LoRA."""
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
@@ -69,68 +126,18 @@ def _init_adapter_model(model_id: str):
             "the base model. Fix the adapter prefix / HF credentials, or omit "
             "init_from_adapter to train a fresh LoRA."
         )
-    from peft import PeftModel
-
     print(f"[init-adapter] initializing LoRA from {prefix}")
     _attn = optimal_attn_impl()
     attn_kw = {"attn_implementation": _attn} if _attn else {}
 
     if adapter_is_vl_warmstart(adir, model_id):
-        # VL checkpoints (Qwen3.5/3.6): MERGE the SFT into the base and train a FRESH LoRA on the
-        # merged weights, instead of continuing the live SFT LoRA. Continuing it makes the colocated
-        # vLLM rollout engine AND the KL reference key off the BARE base — the SFT only reaches vLLM
-        # through the text-trainer<->VL-vLLM weight-sync, which round-trips poorly for these
-        # `*ForConditionalGeneration` models, so GRPO rolls out base-verbose and collapses a working
-        # concise-thinking SFT back to base (observed: every Qwen3.5 GRPO reverts; non-VL MiniCPM
-        # does not). We merge into the FULL multimodal model (NOT the text-only tree) so the saved
-        # checkpoint keeps the VL config + ``language_model.*`` keys that BOTH the trainer reload and
-        # vLLM's VL loader (language_model_only skips the vision weights) expect — a text-only
-        # AutoModelForCausalLM merge saves a Qwen3_5TextConfig that vLLM's VL loader rejects. The SFT
-        # adapter was trained against the full VL model, so its keys match here WITHOUT the infix strip.
-        from transformers import AutoModelForImageTextToText
-
-        base = AutoModelForImageTextToText.from_pretrained(
-            model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
-        )
-        model = PeftModel.from_pretrained(base, adir, is_trainable=False)
-        key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
-        load_result = model.load_adapter(
-            adir, adapter_name="default", is_trainable=False, key_mapping=key_mapping
-        )
-        assert_adapter_load_clean(load_result, model_id)
-        assert_lora_applied(model, model_id)
-        assert_adapter_delta_nonzero(model, model_id)
-        import gc
-        import tempfile
-
-        merged = model.merge_and_unload()
-        # UNIQUE per call (mkdtemp): a fixed /tmp/flash_sft_merged would let two GRPO warm-starts on
-        # the SAME host clobber each other's merged weights (or load a partially-written tree). The
-        # dir is the run's training base, so it persists for the run (the worker is ephemeral); the
-        # old fixed path never cleaned up either, so uniqueness adds no leak it didn't already have.
-        merged_dir = tempfile.mkdtemp(prefix="flash_sft_merged_")
-        merged.save_pretrained(merged_dir, safe_serialization=True)
-        from transformers import AutoProcessor
-
-        # processor (preferred for VL) so vLLM/loaders find tokenizer + image-processor config; fall
-        # back to the bare tokenizer if no processor is published.
-        try:
-            AutoProcessor.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
-        except Exception:
-            from transformers import AutoTokenizer
-
-            AutoTokenizer.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
-        del base, model, merged
-        gc.collect()
+        merged_dir = _merge_vl_warmstart_adapter(adir, model_id, attn_kw)
         print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
-        # Record the SFT adapter dir: the saved GRPO LoRA will be SFT-less (trained on the merged
-        # base), so finalize MUST recombine it with this SFT before deploy (recombined_warmstart_
-        # adapter_dir). The dir persists for the run (worker is ephemeral; init's download stays).
-        _w._VL_WARMSTART_SFT_DIR = adir
         return merged_dir, make_lora(merged_dir)
 
     # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
     # so keep it — TRL trains the LOADED adapter (peft_config=None).
+    from peft import PeftModel
     from transformers import AutoModelForCausalLM
 
     base = AutoModelForCausalLM.from_pretrained(
@@ -141,9 +148,7 @@ def _init_adapter_model(model_id: str):
     load_result = model.load_adapter(
         adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
     )
-    assert_adapter_load_clean(load_result, model_id)
-    assert_lora_applied(model, model_id)
-    assert_adapter_delta_nonzero(model, model_id)
+    _assert_warmstart_adapter_applied(model, model_id, load_result)
     return model, None
 
 
