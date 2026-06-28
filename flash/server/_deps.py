@@ -1,11 +1,7 @@
 """Shared FastAPI request dependencies and spec/secret parsing for the route modules.
 
-Imports fastapi, so this module must only be imported lazily from ``create_app()`` (inside
-the server-extras guard) — never at ``flash.server.app`` import time. The route modules that
-import it are themselves only imported from ``create_app()``, so that invariant holds.
-
-``owned_run`` resolves ``get_status`` through the ``flash.server.app`` module (not a direct
-import) so a test that patches ``app.get_status`` is honored by the handlers.
+Only import lazily from ``create_app()`` — never at ``flash.server.app`` import time.
+``owned_run`` resolves ``get_status`` via the module so test patches on ``app.get_status`` are honored.
 """
 
 from __future__ import annotations
@@ -43,11 +39,16 @@ def owned_run(run_id: str, key: dict):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+def _require_bool(payload: dict, field: str, default: bool) -> bool:
+    """Read ``payload[field]`` as a real JSON boolean; 400 on non-bool. Never coerce — "false" (str) is truthy."""
+    value = payload.get(field, default)
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"{field} must be a boolean")
+    return value
+
+
 def _parse_spec(payload: dict, run_id: str) -> JobSpec:
-    # Default to {} ONLY when the field is missing/None — never `or {}`, which would coerce a
-    # falsy non-object (``""``/``0``/``[]``/``false``) to {} and bypass the type check below,
-    # producing a misleading downstream 400 ("config must set [environment] id") instead of the
-    # intended "spec must be a JSON object". A bad payload is a 400, not an unhandled 500.
+    # Use get()+None check, not `or {}` — falsy non-objects must still hit the type check below.
     spec_raw = payload.get("spec")
     if spec_raw is None:
         spec_raw = {}
@@ -76,8 +77,7 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
 def _runtime_secrets(
     payload: dict, spec: JobSpec, *, require_environment_secrets: bool
 ) -> dict[str, str]:
-    # Default to {} ONLY when missing/None — never `or {}`, which would coerce a falsy non-object
-    # (``""``/``0``/``[]``/``false``) to {} and bypass the type check below.
+    # Use get()+None check, not `or {}` — falsy non-objects must still hit the type check below.
     raw = payload.get("runtime_secrets")
     if raw is None:
         raw = {}

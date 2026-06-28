@@ -8,9 +8,9 @@ cancelled run's checkpoints survive in one queryable place.
 Like ``flash.server.billing``, the POST is authenticated with the operator INTERNAL key (the
 control plane never persists a user's freesolo key) and carries the org id persisted WITH the
 run — ``billing_context`` for user runs, THEN ``platform_context`` for internal/operator runs
-(the submit-path order). That billing-then-platform precedence matches
-``routes/serving.py::_run_org`` (NOT ``run_registry._context_from_status``, which prefers
-``platform_context`` first — see ``_run_org_id``). Unlike billing, checkpoint persistence is
+(the submit-path order). That billing-then-platform precedence is the canonical
+``_internal_client.run_org_id`` (NOT ``run_registry._context_from_status``, which prefers
+``platform_context`` first). Unlike billing, checkpoint persistence is
 STRICTLY best-effort: a failure here must never disturb a run or a deploy, so the public entry
 point swallows everything. Internal/operator runs with no org attribution at all are skipped
 quietly (HF stays the source of truth) — only genuine backend failures warn."""
@@ -18,52 +18,21 @@ quietly (HF stays the source of truth) — only genuine backend failures warn.""
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 
 from flash.runner.checkpoints import list_checkpoints
 from flash.spec import JobSpec
 
-from .auth import INTERNAL_KEY_ENV, freesolo_base_url
+from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key, run_org_id
 
-_TIMEOUT_S = 10.0
 _RECORD_PATH = "/api/runs/internal/checkpoints"
 
 
-def _run_org_id(status) -> str:
-    """Org that owns the run, or "" if none.
-
-    Prefers the org persisted WITH the run — ``billing_context`` for user runs, THEN
-    ``platform_context`` for internal/operator runs (the submit-path order). Same
-    billing-then-platform precedence as ``routes/serving.py::_run_org``. (NB: this is the
-    OPPOSITE order to ``run_registry._context_from_status``, which prefers ``platform_context``
-    first — don't conflate them.) Each context is isinstance-guarded against a non-dict legacy
-    value."""
-    for ctx in (getattr(status, "billing_context", None), getattr(status, "platform_context", None)):
-        if isinstance(ctx, dict):
-            org = str(ctx.get("org_id") or "").strip()
-            if org:
-                return org
-    return ""
-
-
 def _post_checkpoints(*, token: str, body: dict) -> dict:
-    """POST the checkpoint batch to the backend; raise on any non-2xx/unreachable.
-
-    Callers in this module always wrap this in a best-effort guard — the raise exists so the
-    one network boundary is easy for tests to stub/assert."""
-    url = f"{freesolo_base_url()}{_RECORD_PATH}"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+    """POST the checkpoint batch to the backend; raise on any non-2xx/unreachable."""
+    req = build_internal_request(_RECORD_PATH, body, token=token)
+    with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
         raw = resp.read()
     try:
         return json.loads(raw or b"{}")
@@ -75,12 +44,12 @@ def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dic
     """Upsert ``checkpoints`` for one run into the backend store (idempotent by run_id+step).
 
     Pulls the org id from the run's persisted context (``billing_context`` then
-    ``platform_context``, via :func:`_run_org_id`). Raises ``ValueError`` when there's nothing
+    ``platform_context``, via :func:`run_org_id`). Raises ``ValueError`` when there's nothing
     to record or no org id; raises ``urllib`` errors through on a backend failure —
     ``register_checkpoints_best_effort`` is the guarded wrapper most callers use."""
     if not checkpoints:
         raise ValueError("no checkpoints to record")
-    org_id = _run_org_id(status)
+    org_id = run_org_id(status)
     if not org_id:
         raise ValueError("missing org id for run checkpoints")
     spec = status.spec or {}
@@ -99,24 +68,20 @@ def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dic
 
 
 def register_checkpoints_best_effort(status, *, log=None) -> int:
-    """List ``status``'s deployable checkpoints from HF and mirror them to the backend.
-
-    Returns the number of checkpoints submitted (0 if none, or if persistence was skipped /
-    failed). Never raises: the HF copy remains the source of truth, so a persistence miss only
-    costs the convenience of a DB-backed listing — not correctness."""
+    """Mirror deployable checkpoints to the backend; returns count submitted, never raises."""
 
     def _log(msg: str) -> None:
         print(msg, file=log, flush=True) if log is not None else print(msg)
 
-    internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
-    if not internal_key:
+    token = internal_key()  # already whitespace-stripped; None when unset/blank
+    if not token:
         return 0  # local/dev control plane: HF still has the checkpoints
     try:
         spec = JobSpec.from_dict(status.spec)
     except Exception as exc:
         _log(f"[ckpt] register skipped ({status.run_id}): bad spec: {exc}")
         return 0
-    if not _run_org_id(status):
+    if not run_org_id(status):
         # Internal/operator run with no org attribution: nothing to scope the rows to. Skip
         # quietly BEFORE the HF listing — HF stays the source of truth — so an expected-skip run
         # does no unnecessary network work and emits no `[ckpt] list warn` noise.
@@ -126,7 +91,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
         return 0
     try:
         register_run_checkpoints(
-            internal_key=internal_key, status=status, checkpoints=checkpoints
+            internal_key=token, status=status, checkpoints=checkpoints
         )
     except (ValueError, urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
         _log(f"[ckpt] backend register warn ({status.run_id}): {exc}")

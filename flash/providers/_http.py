@@ -1,10 +1,4 @@
-"""Shared stdlib REST client for provider API modules.
-
-Provider API clients use the same hardened-retry shape: a Bearer/Content-Type urllib
-request, a jittered exponential backoff that retries 5xx/429 and fast-fails other 4xx
-with the response body as the actionable detail, and a "failed after N attempts" raise.
-This module factors that common core out so the backoff math lives in one place.
-"""
+"""Shared stdlib REST client with jittered-backoff retries for provider API modules."""
 
 from __future__ import annotations
 
@@ -19,62 +13,22 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-# An unambiguous ``HTTP 404`` token: ``http 404`` bounded so a longer status-LIKE number can't
-# match. ``\b`` after ``404`` rejects ``HTTP 4040``/``HTTP 4041`` (digit immediately after), while
-# still matching ``HTTP 404:``, ``HTTP 404 Not Found``, and a trailing ``HTTP 404`` at end-of-string.
 _HTTP_404_RE = re.compile(r"\bhttp 404\b")
-# Same shape for ``HTTP 409`` (conflict) — bounded so ``HTTP 4090``/``4091`` (and a ``4090`` GPU
-# name) can't match: only a genuine ``HTTP 409`` token counts in the no-cause text fallback.
-_HTTP_409_RE = re.compile(r"\bhttp 409\b")
-
-
-def _status_matches(err: Exception, code: int, token_re: re.Pattern[str]) -> bool:
-    """True when ``err`` represents the given HTTP ``code``, keyed off the chained status when present.
-
-    ``request_with_retries`` chains the original urllib ``HTTPError`` as ``__cause__`` for every
-    fast-failed 4xx (and on the "failed after N attempts" path), so the status CODE is authoritative
-    when a cause is present — anything else is a real failure that must NOT be swallowed. We only
-    fall back to a text match when there is no HTTPError cause, and even then only on an unambiguous
-    ``HTTP <code>`` TOKEN (``token_re``) — NEVER a bare substring, and never a longer number that
-    just begins with ``code``: the token's trailing ``\\b`` rejects ``HTTP <code>0``/``<code>1`` (and
-    a ``4090`` GPU name), so a transient error whose text embeds such an id is not misread."""
-    cause = getattr(err, "__cause__", None)
-    if isinstance(cause, urllib.error.HTTPError):
-        return cause.code == code
-    return bool(token_re.search(str(err).lower()))
 
 
 def is_not_found(err: Exception) -> bool:
-    """True only when a provider API error represents a genuine HTTP 404 (resource already gone).
-
-    See ``_status_matches`` for how the chained-HTTPError code is authoritative and why the no-cause
-    fallback uses the bounded ``HTTP 404`` token (never a bare ``"404"`` substring). Mirrors
-    ``runpod.api._is_not_found``."""
-    return _status_matches(err, 404, _HTTP_404_RE)
-
-
-def is_conflict(err: Exception) -> bool:
-    """True only when a provider API error represents a genuine HTTP 409 (conflict).
-
-    Same status-CODE-authoritative logic as ``is_not_found`` (see ``_status_matches``): a real 409
-    has the chained ``HTTPError`` whose ``.code == 409``; a non-409 failure whose message merely
-    contains ``"409"`` (e.g. a ``4090`` GPU name) plus the word "conflict" is NOT a conflict and must
-    still surface. Available for providers that treat an in-flight-teardown 409 as success."""
-    return _status_matches(err, 409, _HTTP_409_RE)
+    """True when a provider API error is a genuine HTTP 404."""
+    cause = getattr(err, "__cause__", None)
+    if isinstance(cause, urllib.error.HTTPError):
+        return cause.code == 404
+    return bool(_HTTP_404_RE.search(str(err).lower()))
 
 
 class RestClient:
     """Parametrized urllib REST client with jittered-backoff retries.
 
-    ``base_url`` is prefixed onto the ``target`` passed to each call. The key is read
-    from ``env_var`` on each request (env-only by design — never persisted) and failures
-    raise ``error_cls``.
-
-    ``keys_provider`` (optional) supplies an *ordered* list of API keys to try per call:
-    each key runs the full backoff loop, and a key that ends in a failover-class error
-    (per ``failover_predicate``) hands off to the next key — used by providers whose key
-    is a multi-account pool (see ``runpod.keys``). With no ``keys_provider`` the client
-    uses the single ``env_var`` key and behaves exactly as a single-key client.
+    With a ``keys_provider``, keys are tried in order; a failover-class error advances to
+    the next key. Without one, the single ``env_var`` key is used.
     """
 
     def __init__(
@@ -98,14 +52,8 @@ class RestClient:
         )
         self.keys_provider = keys_provider
         self.failover_predicate = failover_predicate
-        # Static headers added to EVERY request (e.g. a custom User-Agent). Lambda Cloud sits
-        # behind Cloudflare, which 403s the stdlib default ``Python-urllib/<v>`` UA — so the
-        # Lambda client passes a real UA here. The auth + ``Content-Type`` headers are always set
-        # by ``request`` and win on a key collision.
+        # Lambda sits behind Cloudflare, which 403s the stdlib default UA — pass a real UA via extra_headers.
         self.extra_headers = dict(extra_headers or {})
-        # How the API key is presented. Default is RunPod/Lambda's ``Authorization: Bearer <key>``;
-        # a provider can override with a bare ``api_key: <key>`` header instead
-        # (``auth_header_name="api_key"``, ``auth_value_format="{key}"``).
         self.auth_header_name = auth_header_name
         self.auth_value_format = auth_value_format
 
@@ -162,8 +110,6 @@ class RestClient:
                 return self.request(target, method=method, body=body, key=key)
             except urllib.error.HTTPError as e:
                 if e.code < 500 and e.code != 429:
-                    # The response body usually carries the actionable error detail; e.reason
-                    # alone (e.g. "Bad Request") is rarely enough to debug a 4xx.
                     detail = ""
                     with contextlib.suppress(Exception):
                         detail = e.read().decode("utf-8", "replace")[:500].strip()
@@ -172,15 +118,15 @@ class RestClient:
                         f"{method} {target} -> HTTP {e.code}: {e.reason}{suffix}"
                     ) from e
                 last = e
+            except json.JSONDecodeError as e:
+                # Cloudflare HTML interstitial or truncated body — treat as transient.
+                last = e
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
                 last = e
             if attempt < retries:
                 delay = min(base_delay * (2 ** min(attempt, 6)), 30.0)
                 time.sleep(delay * random.uniform(0.7, 1.3))
-        # Chain the last exception so callers can inspect it: ``_is_not_found`` keys off the
-        # HTTPError code, and the multi-key waterfall's ``failover_predicate`` needs it to see
-        # a persistent 429's status (without the cause it can't tell the account is rate/quota
-        # limited and would stop instead of trying the next account).
+        # Chain last so is_not_found and failover_predicate can inspect the HTTPError code.
         raise self.error_cls(
             f"{method} {target} failed after {retries + 1} attempts: {last}"
         ) from last
@@ -194,11 +140,7 @@ class RestClient:
         retries: int = 4,
         base_delay: float = 2.0,
     ) -> Any:
-        """Like request_with_retries but always uses the supplied key, bypassing the pool.
-
-        Use this when you need to query each account in the pool independently (e.g.
-        list_endpoints aggregation) rather than stopping at the first success.
-        """
+        """Like request_with_retries but uses the supplied key, bypassing the pool."""
         return self._request_one_key(key, target, method, body, retries, base_delay)
 
     def request_with_retries(
@@ -209,12 +151,7 @@ class RestClient:
         retries: int = 4,
         base_delay: float = 2.0,
     ) -> Any:
-        """REST call hardened against transient network/5xx blips (jittered backoff).
-
-        With a multi-key ``keys_provider``, a key that fails with a failover-class error
-        hands off to the next key in the pool; a hard, key-agnostic error (or the last
-        key) is raised. Single-key clients try exactly one key — identical to before.
-        """
+        """REST call with jittered backoff; with a key pool, failover-class errors try the next key."""
         ordered = self._ordered_keys()
         last_exc: Exception | None = None
         for i, key in enumerate(ordered):
@@ -226,5 +163,4 @@ class RestClient:
                 if more_keys and self.failover_predicate is not None and self.failover_predicate(e):
                     continue
                 raise
-        # Only reachable if ordered is empty, which _ordered_keys already guards against.
         raise last_exc or self.error_cls(self.missing_key_message)

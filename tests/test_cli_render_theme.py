@@ -78,6 +78,30 @@ def test_styled_path_is_themed_but_lossless(monkeypatch, fake_client, capsys) ->
     assert '"state": "done"' in out
 
 
+def test_run_where_keeps_runs_and_status_provider_consistent(monkeypatch) -> None:
+    # A remote handle present but carrying no explicit provider label means RunPod (the original
+    # sole provider). `flash runs` and `flash status` derive `(gpu, provider)` from the single
+    # `_run_where` helper so the two views can't drift — `flash status` used to drop the runpod
+    # fallback and show a bare gpu while `flash runs` showed `gpu@runpod`.
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    assert render._run_where({"gpu": {"type": "RTX 4090"}}, {"gpu": "RTX 4090"}) == (
+        "RTX 4090",
+        "runpod",
+    )
+
+    run = {
+        "run_id": "flash-1",
+        "state": "done",
+        "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
+        "remote": {"gpu": "RTX 4090"},  # allocated, but provider unlabeled -> runpod
+    }
+    # each view keeps its own `@` spacing, but both name the same place
+    assert "RTX 4090@runpod" in render.runs_table([run])
+    assert "RTX 4090 @ runpod" in render.run_status(run)
+
+
 def test_color_respects_no_color(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("TERM", "xterm-256color")

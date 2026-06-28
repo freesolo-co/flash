@@ -1,14 +1,6 @@
 """Client for the shared RunPod endpoint-slot quota (freesolo backend).
 
-The control plane provisions one live RunPod endpoint per run and must keep its in-flight
-endpoints under RunPod's account-wide cap. When an operator internal key is configured, the cap
-is enforced CROSS-PROCESS via the freesolo backend's ``runpod_endpoint_slots`` store
-(``POST /api/runpod/internal/slots/*``): an advisory-locked atomic claim, so >1 control-plane
-replica can never together exceed the cap, and a startup reconcile recovers the true in-use
-count after a crash. Without an internal key (local/dev single process) the caller falls back to
-an in-process semaphore — see ``endpoints.py``.
-
-This module is the thin network boundary only; the queue/fallback policy lives in ``endpoints``.
+Advisory-locked cross-process cap via ``POST /api/runpod/internal/slots/*``; queue/fallback policy lives in ``endpoints``.
 """
 
 from __future__ import annotations
@@ -63,8 +55,7 @@ def _post(path: str, body: dict) -> dict:
 
 
 def claim(name: str, *, cap: int, claimed_by: str | None = None) -> tuple[bool, int]:
-    """Atomically claim a slot. Returns ``(claimed, in_use)``; ``claimed`` is False (no error)
-    when the cap is full, so the caller queues and retries rather than oversubscribing RunPod."""
+    """Atomically claim a slot. Returns ``(claimed, in_use)``; False means cap full, not an error."""
     out = _post(_CLAIM_PATH, {"name": name, "cap": cap, "claimedBy": claimed_by})
     return bool(out.get("claimed")), int(out.get("inUse") or 0)
 
