@@ -58,18 +58,12 @@ async def _repo_cleanup_loop() -> None:
     Fails CLOSED: each sweep aborts (deleting nothing) if the serving live set can't be confirmed, so
     a serving blip never risks deleting a live adapter — it just retries next cycle. The HF + serving
     calls are blocking, so each sweep is offloaded to a thread. Gated by ``repo_cleanup_enabled``
-    (needs an operator ``HF_TOKEN``; killable via ``FLASH_REPO_GC_ENABLED=0``)."""
+    (needs an operator ``HF_TOKEN``)."""
     from flash.server.repo_cleanup import CleanupAborted, run_scheduled_cleanup
 
-    # Sweep cadence (default daily; floored at 1h). The 30-day delete age makes the exact cadence
-    # non-critical — a repo a few hours past 30d is no different from one a few hours under. Parse
-    # defensively: a non-numeric env value must fall back to the default, not kill the loop (which
-    # would also re-raise through the lifespan shutdown await).
-    try:
-        interval = max(3600.0, float(os.environ.get("FLASH_REPO_GC_INTERVAL_HOURS") or 24.0) * 3600.0)
-    except ValueError:
-        _log.warning("ignoring non-numeric FLASH_REPO_GC_INTERVAL_HOURS; using 24h")
-        interval = 24.0 * 3600.0
+    # Daily sweep (fixed). The 30-day delete age makes the exact cadence non-critical — a repo a few
+    # hours past 30d is no different from one a few hours under.
+    interval = 24.0 * 3600.0
     while True:
         await asyncio.sleep(interval)
         try:
