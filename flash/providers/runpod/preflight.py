@@ -1,10 +1,4 @@
-"""Fail-fast credential checks for the RunPod substrate (operator-side).
-
-These run when the Flash server starts (and before any RunPod Flash provisioning) so
-missing operator configuration produces one clear, actionable error instead of a
-partial run that dies mid-provisioning. End users never see these — their preflight is
-client-side ("do I have an Flash key?", see flash/client).
-"""
+"""Fail-fast credential checks for the RunPod substrate (operator-side)."""
 
 from __future__ import annotations
 

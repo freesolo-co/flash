@@ -18,7 +18,7 @@ def _spec():
     return JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        train=TrainSpec(steps=10, hf_repo="owner/runs"),
     )
 
 
@@ -100,7 +100,7 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
-        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        train=TrainSpec(steps=10, hf_repo="owner/runs"),
     )
 
     env = build_worker_env(
@@ -182,7 +182,7 @@ def _spec_worker_env(worker_env: dict):
     return JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        train=TrainSpec(steps=10, hf_repo="owner/runs"),
         worker_env=dict(worker_env),
     )
 
@@ -257,7 +257,7 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     per_run = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, seeds=(0,), hf_repo="myorg/runs"),
+        train=TrainSpec(steps=10, hf_repo="myorg/runs"),
     )
     assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
     # still the per-run value even with no operator HF_REPO at all
@@ -287,7 +287,7 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(steps=2, seeds=(0,)))
+    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(steps=2))
     env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
@@ -324,13 +324,19 @@ def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():
     require_vllm_for_rollout_func(False, True, "m")
 
 
-def test_error_artifact_name_is_per_phase():
-    """Per-phase error files keep the root-cause train traceback under a stable name."""
+def test_error_artifact_name_is_per_phase_and_attempt():
+    """Error files are scoped per-phase and per-attempt so a stale prior-attempt
+    traceback can't be mistaken for the current attempt's crash on a retry."""
     from flash.engine.worker import error_artifact_name
 
     names = {error_artifact_name(m) for m in ("sft", "rl")}
     assert len(names) == 2  # distinct per phase -> no clobber
-    assert error_artifact_name("rl") == "error_rl.txt"
+    assert error_artifact_name("rl") == "error_rl_attempt0.txt"
+    assert error_artifact_name("rl", 0) != error_artifact_name("rl", 1)
+    assert error_artifact_name("sft", 2) == "error_sft_attempt2.txt"
+    # str-typed ATTEMPT env value coerces cleanly
+    assert error_artifact_name("sft", "3") == "error_sft_attempt3.txt"
+    assert error_artifact_name("sft", "") == "error_sft_attempt0.txt"
 
 
 def test_train_body_imports_every_name_it_uses():
@@ -407,10 +413,48 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "_lp_ratio" in src
     # large-vocab logits cap (per-device micro-batch sizing)
     assert "sft_grad_accum(" in src
-    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer
-    assert '"gradient_checkpointing": grad_checkpointing_on(model_id, sft_max_len)' in src
+    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. The GC decision now runs through
+    # the SFT GC-off gate (grad_checkpointing_on(model_id, sft_max_len, allow_disable=True, ...)) and is
+    # wired in via the _grad_ckpt result — still on by default, droppable only when the GC-off peak fits.
+    assert "grad_checkpointing_on(\n        model_id,\n        sft_max_len," in src
+    assert '"gradient_checkpointing": _grad_ckpt' in src
     assert '"use_reentrant": False' in src
     assert '"optim": fused_optim_name()' in src
+
+
+def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
+    """When TRL bfd packing stays ON, grad_accum must be re-derived from the ~ex/block estimate so
+    the effective batch stays in EXAMPLES — otherwise bfd bins ~ex_per_block examples per row and
+    inflates the effective batch ~ex_per_block-fold (undertraining). The SDPA/GDN packing paths
+    already do this; pin that the bfd path does too, AFTER the packing-finalization block."""
+    import ast
+    import inspect
+
+    from flash.engine.worker import sft
+
+    src = inspect.getsource(sft.run_sft)
+    # The re-derivation is guarded on packing still being ON post-finalization and uses a bfd ex/block
+    # estimate (a separate pack_token_ids call from the two SDPA/GDN ones).
+    assert "pack_token_ids(_bfd_ids, sft_max_len)" in src
+    assert "[sft] bfd packing:" in src
+    tree = ast.parse(src)
+
+    # The bfd-rederive block assigns cfg_kwargs["gradient_accumulation_steps"] guarded by a
+    # cfg_kwargs.get("packing") test — assert such a guarded assignment exists.
+    def _stores_grad_accum(node):
+        return any(
+            isinstance(sub, ast.Subscript)
+            and isinstance(sub.ctx, ast.Store)
+            and "gradient_accumulation_steps" in ast.dump(sub)
+            for sub in ast.walk(node)
+        )
+
+    assert any(
+        isinstance(node, ast.If)
+        and "packing" in ast.dump(node.test)
+        and _stores_grad_accum(node)
+        for node in ast.walk(tree)
+    ), "bfd path must re-derive gradient_accumulation_steps under a packing guard"
 
 
 def test_trl_collator_masks_prompt_from_pretokenized_rows():
@@ -493,7 +537,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
         console_uploads = [u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")]
         assert console_uploads, f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
-        assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/seed0/console_sft.txt"
+        assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
     finally:
         # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
         # doesn't leak state across tests (flaky under isolated/parallel runners).

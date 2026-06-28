@@ -132,14 +132,6 @@ def test_config_max_wall_seconds_overrides_default_cap():
     assert short.total_usd < uncapped.total_usd
 
 
-def test_wall_cap_is_applied_per_seed_not_to_the_aggregate():
-    # The cap is per-seed, so a runaway 3-seed run bills 3x the per-seed cap, not one aggregate cap.
-    cfg = RunConfig(BIG, "grpo", 300_000, setup_repeats=3, max_wall_seconds=3600)
-    e = estimate_cost(cfg)
-    assert e.wall_capped is True
-    assert e.wall_clock_seconds == pytest.approx(3 * 3600.0)
-
-
 def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
     # The runner floors the cap to max(60, ...); the estimate mirrors it (else a ~$0 quote).
     e10 = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=10))
@@ -158,8 +150,8 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
         e = estimate_cost(cfg)
         assert e.wall_clock_seconds == pytest.approx(60.0)
         assert e.total_usd > 0.0
-    one = RunConfig(BIG, "grpo", 100_000, setup_repeats=1, max_wall_seconds=3600)
-    assert estimate_cost(one).wall_clock_seconds == pytest.approx(3600.0)
+    capped = RunConfig(BIG, "grpo", 100_000, max_wall_seconds=3600)
+    assert estimate_cost(capped).wall_clock_seconds == pytest.approx(3600.0)
 
 
 def test_select_gpu_picks_cheapest_including_unvalidated():
@@ -186,17 +178,19 @@ def test_9b_bf16_grpo_needs_an_80gb_class():
 
 
 def test_35b_moe_long_context_grpo_sized_past_the_b200():
-    # The 35B MoE colocated GRPO holds two ~70 GB weight copies + a KV pool on ONE 180 GB B200, so a
-    # long rollout context overflows it. The grpo_min_vram_gb floor engages the seq escalation, keyed
-    # on the ~3B ACTIVE params (not the 35B total): default/moderate GRPO stays on the B200, but a
-    # 32k-token run is sized PAST 180 GB so it's rejected at parse time rather than booted-then-OOM'd.
+    # The 35B MoE is RESIDENT-ONLY for GRPO (sleep_unsupported: vLLM sleep HANGS its wake), so it's
+    # sized on the RESIDENT peak (two ~70 GB weight copies + KV pool, fp8 KV). Default/moderate context
+    # fits the single 180 GB B200, but anything past the resident wall (~4-5k tok at group 8) is sized
+    # PAST 180 GB -> REJECTED at parse time, rather than admitted-then-HUNG in the broken sleep path
+    # (the old sleep estimate wrongly admitted up to ~16k, then the worker stalled).
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     moe = "Qwen/Qwen3.6-35B-A3B"
     # default + moderate context fit the single B200 (<= 180 GB).
     assert alloc_required_vram_gb(moe, "grpo", train={}, thinking=False) <= 180
-    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 8192}, thinking=False) <= 180
-    # a 32k-token rollout is sized ABOVE the 180 GB B200 (the biggest single card) -> nothing fits.
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 4096}, thinking=False) <= 180
+    # past the resident wall -> sized ABOVE the 180 GB B200 -> rejected (NOT routed to broken sleep).
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 8192}, thinking=False) > 180
     assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 32768}, thinking=False) > 180
     # The GRPO escalation is GRPO-only: default SFT stays at its 180 GB floor (fits the B200). (Long-
     # context SFT has its OWN large-vocab fp32-logits growth, independent of this grpo escalation.)

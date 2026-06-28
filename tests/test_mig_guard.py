@@ -1,6 +1,11 @@
-"""Worker-side MIG-slice fail-fast: a partitioned GPU must be detected up front and surfaced as a
-RETRIABLE infra error so the runner re-provisions a fresh FULL GPU — instead of the run dying with
-an opaque CUDA-allocator assert mid-setup ("won't randomly die")."""
+"""Worker-side GPU verification + CUDA-readiness fail-fast (perf.lifecycle).
+
+``verify_gpu`` is the identity / CUDA-floor check that runs on EVERY provider's rented box, so a
+wrong/smaller GPU or a too-old driver fails over fast (a RETRIABLE infra error) instead of crashing
+mid-setup with an opaque "no kernel image" / "PTX unsupported toolchain" / OOM. ``wait_for_gpu`` wraps
+it in the CUDA-readiness poll, fast-failing a dead host (NVML can't init) instead of burning the full
+patient loop. (The MIG-slice guard was removed with the MIG-capable GPUs it protected against.)
+"""
 
 from __future__ import annotations
 
@@ -15,69 +20,9 @@ from flash.engine.worker.perf.lifecycle import (
     RetriableInfraError,
     _gpu_mismatch_reason,
     _sm_major,
-    detect_mig_slice,
     verify_gpu,
     wait_for_gpu,
 )
-
-
-def _fake_run(outputs):
-    """A subprocess.run stub returning per-command stdout (keyed by '-L' vs 'mig.mode')."""
-
-    def run(cmd, capture_output=True, text=True, timeout=None):
-        key = "-L" if "-L" in cmd else "mig.mode"
-        return types.SimpleNamespace(stdout=outputs.get(key, ""))
-
-    return run
-
-
-_FULL_A100 = "GPU 0: NVIDIA A100-SXM4-80GB (UUID: GPU-abc123)"
-_MIG_LIST = (
-    "GPU 0: NVIDIA A100-SXM4-80GB (UUID: GPU-abc123)\n"
-    "  MIG 1g.10gb     Device  0: (UUID: MIG-deadbeef-0000-0000-0000-000000000000)"
-)
-
-
-def test_detect_mig_via_device_list(monkeypatch):
-    monkeypatch.setattr("subprocess.run", _fake_run({"-L": _MIG_LIST, "mig.mode": "Disabled"}))
-    reason = detect_mig_slice()
-    assert reason is not None
-    assert "MIG slice detected" in reason
-
-
-def test_detect_mig_via_mig_mode(monkeypatch):
-    # -L doesn't show a MIG device, but mig.mode reports Enabled (partitioned GPU).
-    monkeypatch.setattr("subprocess.run", _fake_run({"-L": _FULL_A100, "mig.mode": "Enabled"}))
-    reason = detect_mig_slice()
-    assert reason is not None
-    assert "MIG mode enabled" in reason
-
-
-def test_no_false_positive_on_full_gpu(monkeypatch):
-    # A normal full GPU: no MIG device line, mig.mode Disabled / Not Supported.
-    for mode in ("Disabled", "[N/A]", "[Not Supported]", ""):
-        monkeypatch.setattr(
-            "subprocess.run", _fake_run({"-L": "GPU 0: NVIDIA L40 (UUID: GPU-x)", "mig.mode": mode})
-        )
-        assert detect_mig_slice() is None
-
-
-def test_detect_never_raises_on_nvidia_smi_failure(monkeypatch):
-    def boom(*a, **k):
-        raise FileNotFoundError("nvidia-smi not found")
-
-    monkeypatch.setattr("subprocess.run", boom)
-    assert detect_mig_slice() is None  # best-effort; absence of nvidia-smi != MIG
-
-
-def test_wait_for_gpu_fails_fast_retriable_on_mig(monkeypatch):
-    # wait_for_gpu checks MIG BEFORE any CUDA op, so this raises without needing a GPU/torch.
-    monkeypatch.setattr("subprocess.run", _fake_run({"-L": _MIG_LIST, "mig.mode": "Enabled"}))
-    with pytest.raises(RetriableInfraError) as exc:
-        wait_for_gpu()
-    # The runner classifies this off the heartbeat 'retriable' flag; the marker is for human logs.
-    assert "RETRIABLE_INFRA_GPU" in str(exc.value)
-    assert "fresh full" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +152,7 @@ def test_verify_gpu_passes_on_correct_gpu(monkeypatch):
 
 def test_wait_for_gpu_propagates_verify_mismatch(monkeypatch):
     # A verify mismatch must FAIL OVER, not be swallowed by the readiness retry loop and masked as
-    # "never became ready". Drive past MIG + the CUDA-live probe, then have verify_gpu reject.
-    monkeypatch.setattr("subprocess.run", _fake_run({"-L": _FULL_A100, "mig.mode": "Disabled"}))
+    # "never became ready". Drive past the CUDA-live probe, then have verify_gpu reject.
     torch = pytest.importorskip("torch")  # offline CI has no torch -> skip the live-read tests
 
     class _Live:  # the result of torch.zeros(...) must support `+ 1`
@@ -238,7 +182,6 @@ def test_wait_for_gpu_fast_fails_on_dead_nvml(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("CUDA error: cudaErrorDevicesUnavailable")
 
-    monkeypatch.setattr(lifecycle, "detect_mig_slice", lambda: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True, raising=False)
     monkeypatch.setattr(torch, "zeros", boom, raising=False)
     monkeypatch.setattr("time.sleep", lambda *a, **k: None)
@@ -255,7 +198,6 @@ def test_wait_for_gpu_fast_fails_on_dead_nvml_when_cuda_unavailable(monkeypatch)
     broken host burns the full ~120s patient loop instead of failing over fast (~30s)."""
     torch = pytest.importorskip("torch")
 
-    monkeypatch.setattr(lifecycle, "detect_mig_slice", lambda: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)  # no exception
     monkeypatch.setattr("time.sleep", lambda *a, **k: None)
     monkeypatch.setattr(lifecycle, "_nvml_alive", lambda: False)  # broken host: NVML can't init
@@ -273,7 +215,6 @@ def test_wait_for_gpu_stays_patient_when_nvml_alive(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("CUDA device busy")
 
-    monkeypatch.setattr(lifecycle, "detect_mig_slice", lambda: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True, raising=False)
     monkeypatch.setattr(torch, "zeros", boom, raising=False)
     monkeypatch.setattr("time.sleep", lambda *a, **k: None)

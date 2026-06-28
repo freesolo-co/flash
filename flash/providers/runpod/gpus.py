@@ -1,10 +1,4 @@
-"""RunPod's GPU classes + the Flash-specific bits of the shared GPU table.
-
-The class table itself is provider-agnostic and lives in ``providers/base.py`` (one
-canonical row per friendly name). This module carves out RunPod's rows
-(``gpu_classes()`` == every class with a Flash ``enum_member``) and owns the
-RunPod-only translation: friendly name -> Flash ``GpuType``.
-"""
+"""RunPod GPU classes and friendly-name → GpuType translation."""
 
 from __future__ import annotations
 
@@ -16,8 +10,6 @@ from flash.providers.base import (
 )
 
 
-# Lazy import so unit tests that only exercise the mapping don't pull the whole SDK
-# graph unless needed. ``runpod_flash`` is a hard dependency, so this import is safe.
 def _gpu_enum():
     from runpod_flash import GpuType
 

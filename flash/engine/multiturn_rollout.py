@@ -1,30 +1,8 @@
 """Multi-turn / tool GRPO rollout for TRL's experimental ``rollout_func`` (colocate vLLM).
 
-TRL's ``GRPOTrainer`` generates a single assistant turn per prompt, which cannot drive a
-Freesolo ``EnvironmentMultiTurn`` turn loop (model turn -> env reply -> ...). This
-module supplies a ``rollout_func`` that:
-
-  * drives the env's turn loop via the adapter helpers (``new_rollout_state`` /
-    ``record_model_turn`` / ``env_reply`` / ``rollout_done``), so the *env* owns tool
-    execution, ``StatefulToolEnv`` state threading, and any simulated-user turns;
-  * returns the FULL interleaved token sequence as ``completion_ids`` together with an
-    ``env_mask`` that marks model-generated tokens (``1``, trained) vs tool/env tokens
-    (``0``, masked out of the loss). ``env_mask`` is TRL's documented mechanism for
-    multi-turn credit assignment (it is treated internally as the tool mask), so only the
-    policy's own tokens get advantage while the env tokens still provide context for the
-    forward pass;
-  * scores each rollout with the environment reward (``reward_from_messages``) and returns
-    it as an extra field consumed by a pass-through ``reward_func``.
-
-Token alignment assumes a **prefix-preserving** chat template: appending a message must not
-retokenize earlier turns (the same assumption TRL's native tool loop documents; auto-patched
-for Qwen3 / DeepSeek-V3). The env segment between two model turns is taken as the suffix of a
-full re-render; if the prefix invariant is violated the rollout raises (fails loudly) rather
-than mis-masking model vs env tokens and silently mistraining.
-
-The core (:func:`rollout_one`) is pure Python and takes injected ``render``/``generate``
-callables so it can be unit-tested without a GPU/tokenizer; :func:`build_rollout_func` wires
-the real tokenizer + the colocate vLLM engine into it at runtime.
+Drives a Freesolo ``EnvironmentMultiTurn`` turn loop, returning the full interleaved token
+sequence with an ``env_mask`` (1=model, 0=env/tool) for multi-turn credit assignment.
+:func:`rollout_one` is unit-testable on CPU; :func:`build_rollout_func` wires the real engine.
 """
 
 from __future__ import annotations
@@ -40,7 +18,7 @@ from typing import TypedDict
 
 
 class RolloutResult(TypedDict):
-    """Token-aligned fields returned per rollout for TRL's ``rollout_func``."""
+    """Token-aligned fields returned per rollout."""
 
     prompt_ids: list[int]
     completion_ids: list[int]
@@ -49,10 +27,6 @@ class RolloutResult(TypedDict):
     reward: float
 
 
-# Field names shared between a single RolloutResult and the batched dict-of-lists that
-# build_rollout_func returns. Kept as a plain tuple (not RolloutResult.__annotations__) so
-# the batch accumulator's key source isn't a single-rollout type whose value types (float,
-# list[int], ...) deliberately differ from the accumulator's list-of-those.
 _ROLLOUT_FIELDS: tuple[str, ...] = (
     "prompt_ids",
     "completion_ids",
@@ -62,23 +36,30 @@ _ROLLOUT_FIELDS: tuple[str, ...] = (
 )
 
 
+def _strip_none(obj):
+    """Drop None-valued dict entries recursively. Dataset.from_list unifies a list<struct> schema and
+    materializes ``key: null`` on rows that lacked a key another row added (e.g. a `name`/`tool_calls`
+    message field); stripping those nulls keys an Arrow-materialized prompt identically to the raw row."""
+    if isinstance(obj, dict):
+        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip_none(v) for v in obj]
+    return obj
+
+
 def _prompt_key(prompt) -> str:
-    """Stable key for mapping a dataset ``prompt`` value back to its example row."""
+    """Stable string key for a dataset ``prompt`` value (insensitive to Arrow null-injection)."""
     try:
-        return json.dumps(prompt, sort_keys=True, default=str)
+        return json.dumps(_strip_none(prompt), sort_keys=True, default=str)
     except (TypeError, ValueError):
         return str(prompt)
 
 
 class _LRUCache:
-    """Tiny bounded LRU cache (string key -> ``list[int]``) for the render / env_glue closures.
+    """Tiny bounded LRU cache (string key -> ``list[int]``).
 
-    A plain ``len(d) < MAX`` guard FREEZES the cache once full: any new key after the cap is never
-    admitted, so later-repeated-but-diverse prompts/glue re-render forever and the cache stops paying
-    off over a long run. This evicts the least-recently-used entry on insert-when-full instead, so a
-    fixed-size window of recently-seen keys stays cached no matter how many distinct keys appear.
-    Recency is updated on every hit (``move_to_end``); not thread-safe (each cache is owned by a
-    single closure called from one thread).
+    Evicts the LRU entry when full rather than freezing, so recently-seen keys stay cached over a
+    long diverse run. Not thread-safe; each cache is owned by a single closure.
     """
 
     __slots__ = ("_data", "maxsize")
@@ -90,36 +71,31 @@ class _LRUCache:
         self._data: OrderedDict[str, list[int]] = OrderedDict()
 
     def get(self, key: str) -> list[int] | None:
-        """Return the cached value and mark it most-recently-used, or None on a miss."""
+        """Return cached value (MRU-bumped) or None."""
         value = self._data.get(key)
         if value is not None:
             self._data.move_to_end(key)
         return value
 
     def put(self, key: str, value: list[int]) -> None:
-        """Insert/refresh ``key`` as most-recently-used, evicting the oldest entry if at capacity."""
+        """Insert/refresh ``key``, evicting LRU entry if at capacity."""
         if key in self._data:
             self._data.move_to_end(key)
         self._data[key] = value
         if len(self._data) > self.maxsize:
-            self._data.popitem(last=False)  # drop the least-recently-used entry
+            self._data.popitem(last=False)
 
     def __len__(self) -> int:
         return len(self._data)
 
 
 def build_examples_index(rows: list[dict], prompt_of: Callable[[dict], object]) -> dict:
-    """Map each row's rendered ``prompt`` value to the example row (for reward/answer lookup).
-
-    Collisions (two rows producing the same prompt) keep the last row and are reported by the
-    caller via :func:`index_collisions`; duplicates are rare in training data and only affect
-    which ``answer``/``info`` a shared prompt scores against.
-    """
+    """Map each row's prompt key to the example row. Collisions keep the last row."""
     return {_prompt_key(prompt_of(r)): r for r in rows}
 
 
 def index_collisions(rows: list[dict], prompt_of: Callable[[dict], object]) -> int:
-    """Number of rows dropped by prompt-key collisions in :func:`build_examples_index`."""
+    """Rows dropped by prompt-key collisions in :func:`build_examples_index`."""
     return len(rows) - len({_prompt_key(prompt_of(r)) for r in rows})
 
 
@@ -134,28 +110,7 @@ def rollout_one(
     per_turn_max_tokens: int,
     engine_max_len: int | None = None,
 ) -> RolloutResult:
-    """Run one multi-turn/tool rollout and return TRL ``rollout_func`` fields for it.
-
-    Args:
-        example: the dataset row carried into environment scoring.
-        active_env: the Freesolo environment adapter (drives the turn loop + scoring).
-        render: ``render(messages, add_generation_prompt) -> token_ids`` (chat template) — used
-            only for the INITIAL prompt.
-        generate: ``generate(prefix_token_ids, max_tokens) -> (token_ids, token_logprobs,
-            text)`` for one sampled assistant turn (model tokens + sampling logprobs + text);
-            ``max_tokens`` bounds that turn so it can't overflow the engine context.
-        env_glue: ``env_glue(env_messages) -> token_ids`` — the tokens that CLOSE the
-            just-finished assistant turn, render the env reply message(s), and OPEN the next
-            generation prompt. The running token sequence is built incrementally from these
-            (the model's generated ids + env glue), never by re-rendering the whole
-            conversation — so a chat template that does not round-trip prior turns (e.g. Qwen3's
-            empty ``<think>`` block, which is injected into the generation prompt but stripped
-            from history) stays token-aligned instead of failing the old prefix check.
-        max_turns: hard cap on model turns (defense against a non-terminating env).
-
-    Returns a dict with ``prompt_ids``, ``completion_ids``, ``logprobs``, ``env_mask`` (all
-    token-aligned) and the scalar ``reward`` for this rollout.
-    """
+    """Run one multi-turn/tool rollout and return TRL ``rollout_func`` fields for it."""
     state = active_env.new_rollout_state(example)
     initial_messages = state.get("prompt") or state.get("messages")
     if not isinstance(initial_messages, list):
@@ -163,8 +118,6 @@ def rollout_one(
     messages = [dict(m) for m in initial_messages]
     prompt_ids = render(messages, True)
     cur_ids = list(prompt_ids)  # invariant: cur_ids == prompt_ids + completion_ids so far
-    # Per-rollout completion cap so prompt + accumulated completion never exceeds the colocate
-    # engine's context (which would overflow the next generate()); leave a small margin.
     token_budget = (engine_max_len - len(prompt_ids) - 8) if engine_max_len else None
     completion_ids: list[int] = []
     logprobs: list[float] = []
@@ -172,9 +125,6 @@ def rollout_one(
 
     turns = 0
     while True:
-        # Bound THIS turn's generation by the remaining engine headroom so even a single
-        # generate() can't push prompt+completion past the context (the cap below stops the
-        # loop AFTER a turn; this stops the turn itself from overflowing).
         max_new = per_turn_max_tokens
         if token_budget is not None:
             remaining = token_budget - len(completion_ids)
@@ -198,24 +148,17 @@ def rollout_one(
         if not env_msgs:
             break
         messages.extend(env_msgs)
-        # If the env step finished the episode (it can set done / hit its budget while replying),
-        # stop here: do NOT append the next-generation glue — there is no next model turn, and the
-        # glue would leave a trailing assistant prompt in completion_ids (and could trigger one
-        # more generate()).
+        # Don't append glue if the env step finished — no next model turn.
         if active_env.rollout_done(state, max_turns):
             break
 
-        # Env-segment tokens = close the just-finished assistant turn + render the env reply +
-        # open the next generation prompt, computed INCREMENTALLY (env_glue) rather than by
-        # re-rendering the whole conversation. Masked (0) — they are not the policy's tokens —
-        # but kept in completion_ids so the next turn conditions on them. Building the sequence
-        # by id-concatenation (model ids + glue) keeps it token-aligned even for templates that
-        # don't round-trip history (Qwen3's empty <think> block), which the old re-render +
-        # prefix-check could not handle.
         glue = env_glue(env_msgs)
-        # Don't append glue that would push prompt+completion past the engine budget (the next
-        # generate() would be skipped anyway); end the rollout cleanly instead of returning an
-        # over-length sequence that could break the trainer's forward/loss pass.
+        # Collapse a duplicate turn terminator at the seam: env_glue leads with the assistant turn's
+        # terminator (e.g. <|im_end|>), which vLLM also keeps as the last token of a naturally-stopped
+        # turn — keep the assistant's own (env_mask=1, real logprob) over the env copy. See
+        # _advance_after_turn (the rollout_async twin) for the same fix.
+        if glue and completion_ids and completion_ids[-1] == glue[0]:
+            glue = glue[1:]
         if token_budget is not None and len(completion_ids) + len(glue) > token_budget:
             break
         completion_ids.extend(glue)
@@ -223,8 +166,6 @@ def rollout_one(
         env_mask.extend([0] * len(glue))
         cur_ids.extend(glue)
 
-    # Score with the ACTUAL rollout state (not a fresh one) so reward funcs see the tool/env
-    # state the rollout accumulated. state["completion"] holds the full transcript.
     reward = active_env.reward("", example, state)
     return {
         "prompt_ids": prompt_ids,
@@ -236,12 +177,7 @@ def rollout_one(
 
 
 class _RolloutState:
-    """Mutable per-rollout accumulator for the continuous-batched rollout (:func:`rollout_async`).
-
-    Holds exactly the running fields :func:`rollout_one` keeps in locals, so the two paths produce
-    byte-identical token alignment / env_mask / reward — the only difference is that the async path
-    advances rollouts' turns as independent, continuously-batched engine requests.
-    """
+    """Mutable per-rollout accumulator for :func:`rollout_async` (mirrors :func:`rollout_one` locals)."""
 
     __slots__ = (
         "budget",
@@ -267,7 +203,7 @@ class _RolloutState:
         self.env_mask: list[int] = []
         self.state = state
         self.turns = 0
-        self.budget = budget  # max completion tokens (engine headroom), or None
+        self.budget = budget
         self.done = False
 
     def result(self, reward: float) -> RolloutResult:
@@ -290,9 +226,7 @@ def _advance_after_turn(
     env_glue: Callable[[list], list[int]],
     max_turns: int,
 ) -> None:
-    """Fold one freshly-sampled assistant turn into rollout ``r`` and run its env step, mirroring the
-    body of :func:`rollout_one`'s loop EXACTLY. Sets ``r.done`` when the rollout should stop. Used by
-    :func:`rollout_async` so the continuous-batched and single-rollout paths can never drift."""
+    """Fold one assistant turn into ``r`` and run its env step. Sets ``r.done`` when finished."""
     r.completion_ids.extend(asst_ids)
     r.logprobs.extend(asst_lp)
     r.env_mask.extend([1] * len(asst_ids))
@@ -315,6 +249,12 @@ def _advance_after_turn(
         r.done = True
         return
     glue = env_glue(env_msgs)
+    # env_glue's text starts at the assistant turn's terminator (e.g. <|im_end|>); vLLM also keeps that
+    # terminator as the final token of a naturally-stopped turn (it's in asst_ids). Collapse the duplicate
+    # at the seam so the stream has exactly one terminator per turn (matches the chat template + SFT
+    # transcripts), keeping the assistant's own token (env_mask=1, real logprob) over the env copy.
+    if glue and r.completion_ids and r.completion_ids[-1] == glue[0]:
+        glue = glue[1:]
     if r.budget is not None and len(r.completion_ids) + len(glue) > r.budget:
         r.done = True
         return
@@ -330,9 +270,7 @@ def _build_rollout_states(
     render: Callable[[list, bool], list[int]],
     engine_max_len: int | None,
 ) -> list[_RolloutState]:
-    """Initialise one :class:`_RolloutState` per example (initial prompt rendered, engine budget
-    computed) for :func:`rollout_async`, starting from the same state :func:`rollout_one` builds
-    inline so the two paths stay byte-identical."""
+    """Initialise one :class:`_RolloutState` per example for :func:`rollout_async`."""
     rollouts: list[_RolloutState] = []
     for example in examples:
         state = active_env.new_rollout_state(example)
@@ -347,13 +285,11 @@ def _build_rollout_states(
 
 
 def _turn_budget(r: _RolloutState, per_turn_max_tokens: int) -> int | None:
-    """Max new tokens for ``r``'s next assistant turn, bounded by the remaining engine headroom so
-    prompt+completion can't overflow the context. Returns ``None`` and marks ``r.done`` when the
-    headroom is already exhausted. Identical cap for both rollout paths (no drift)."""
+    """Max new tokens for ``r``'s next turn (capped to engine headroom). Returns None and sets r.done when exhausted."""
     max_new = per_turn_max_tokens
     if r.budget is not None:
         remaining = r.budget - len(r.completion_ids)
-        if remaining <= 0:  # prompt already fills the context -> this rollout is done
+        if remaining <= 0:
             r.done = True
             return None
         max_new = min(max_new, remaining)
@@ -361,12 +297,7 @@ def _turn_budget(r: _RolloutState, per_turn_max_tokens: int) -> int | None:
 
 
 def _score_rollouts(active_env, rollouts: list[_RolloutState]) -> list[float]:
-    """Reward for each rollout, in order. Uses ``active_env.reward_many`` when the env provides it
-    (one batched, env-concurrent scoring call per task instead of a blocking call per rollout — the
-    win for judge/expensive-reward envs). Otherwise falls back to per-rollout ``active_env.reward()``,
-    run CONCURRENTLY in a thread pool when the env declares its reward thread-safe (PR #224) so an
-    IO-bound judge/tool reward still overlaps instead of N serial GPU-idle round-trips. Every path
-    reassembles in INPUT ORDER and yields identical values — only scoring concurrency differs."""
+    """Reward each rollout in input order, using reward_many, concurrent, or serial scoring."""
     reward_many = getattr(active_env, "reward_many", None)
     if callable(reward_many):
         rewards = reward_many([(r.example, r.state) for r in rollouts])
@@ -377,12 +308,8 @@ def _score_rollouts(active_env, rollouts: list[_RolloutState]) -> list[float]:
     def _score(r: _RolloutState) -> float:
         return float(active_env.reward("", r.example, r.state))
 
-    # Serial for a single rollout, or when the env declares its reward NOT thread-safe (a scorer that
-    # keeps mutable state or a thread-bound client) — it worked serially and must not be raced.
     if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
         return [_score(r) for r in rollouts]
-    # Concurrent. On the first reward error, cancel not-yet-started scorers and drain in-flight ones
-    # so a failed step spends no further judge/API calls and leaves no scorer running into the next.
     pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
     try:
         futures = {pool.submit(_score, r): i for i, r in enumerate(rollouts)}
@@ -407,38 +334,17 @@ def rollout_async(
     per_turn_max_tokens: int,
     engine_max_len: int | None = None,
 ) -> list[RolloutResult]:
-    """Run ``len(examples)`` multi-turn rollouts with CONTINUOUS-BATCHED generation (no turn barrier).
+    """Run ``len(examples)`` multi-turn rollouts with continuous-batched generation.
 
-    Same result as one :func:`rollout_one` per example — identical token alignment, env_mask,
-    per-rollout reward and input order — but rollouts are NOT advanced in lockstep. Each rollout's
-    assistant turn is an independent engine request; the moment one finishes, its env step runs and
-    its NEXT turn is submitted, so the decode batch stays full instead of stalling at a turn boundary
-    while the slowest rollout's turn (and then every rollout's env reply) completes. For high-variance
-    multi-turn (rollouts of very different depths) this keeps the GPU busy across the many turn
-    boundaries a turn-synchronized rollout would idle at.
-
-    The work is split across two threads so the per-turn ENV work (env reply + glue render — the
-    overhead that bounds an otherwise GPU-light rollout) overlaps the GPU decode instead of blocking
-    it: the MAIN thread owns the engine (submit / poll / busy) and a single WORKER thread owns the
-    env (``_advance_after_turn``). vLLM's ``step()`` runs the model forward in CUDA with the GIL
-    released, so the worker advances finished turns DURING the decode of the still-running ones. The
-    two threads share no mutable state — only thread-safe queues, and each next-turn prefix is handed
-    over as a copy — so the env (not thread-safe) is touched by exactly one thread and the engine by
-    exactly one thread. Results are byte-identical to one :func:`rollout_one` per example (a rollout
-    keeps at most one request in flight, so its turns stay strictly sequential), in input order.
-
-    The engine is injected as three callables so the loop is unit-testable on CPU:
-      * ``submit(req_id, prefix_ids, max_tokens, initial)`` — enqueue one assistant-turn request
-        (``initial`` marks a turn-0 prompt, the only externally-rendered ids worth bounds-checking);
-      * ``poll()`` — return ``(req_id, token_ids, logprobs, text)`` for every request that FINISHED
-        since the last call (``[]`` if none finished this step);
-      * ``busy()`` — whether any request is still in flight.
+    Rollouts are not turn-synchronized: each turn is an independent engine request submitted as
+    soon as the previous one finishes. Main thread owns the engine; a worker thread owns the env.
+    Results are byte-identical to one :func:`rollout_one` per example, in input order.
     """
     rollouts = _build_rollout_states(examples, active_env, render, engine_max_len)
     by_id: dict[str, _RolloutState] = {}
     counter = 0
-    to_env: queue.Queue = queue.Queue()  # main -> worker: finished turns to fold + run the env step
-    to_submit: queue.Queue = queue.Queue()  # worker -> main: ("next", r, prefix, max_new) | ("done", r)
+    to_env: queue.Queue = queue.Queue()
+    to_submit: queue.Queue = queue.Queue()
 
     def do_submit(r: _RolloutState, prefix: list[int], max_new: int, initial: bool) -> None:
         nonlocal counter
@@ -448,10 +354,6 @@ def rollout_async(
         submit(req_id, prefix, max_new, initial)
 
     def env_worker() -> None:
-        # Owns the env: fold each finished turn, run its env step (env reply + glue render), and hand
-        # the next-turn prefix (a copy) back to the main thread — or signal the rollout is done. An
-        # env/template error here must propagate to the main thread (which owns the engine), not die
-        # silently in this thread and hang the main loop waiting for a result that never comes.
         while True:
             item = to_env.get()
             if item is None:
@@ -463,7 +365,7 @@ def rollout_async(
                     active_env=active_env, env_glue=env_glue, max_turns=max_turns,
                 )
                 max_new = None if r.done else _turn_budget(r, per_turn_max_tokens)
-            except Exception as exc:  # surfaced + re-raised on the main thread (engine owner)
+            except Exception as exc:  # propagate to the main thread (engine owner)
                 to_submit.put(("error", exc))
                 return
             to_submit.put(("done", r) if max_new is None else ("next", r, list(r.cur_ids), max_new))
@@ -476,8 +378,6 @@ def rollout_async(
     def take(msg) -> None:
         nonlocal completed
         if msg[0] == "error":
-            # Re-raise the worker's env/template error on the main thread (the engine owner),
-            # preserving the ORIGINAL worker traceback so the stack points at the real failing line.
             err = msg[1]
             raise err.with_traceback(err.__traceback__)
         if msg[0] == "done":
@@ -487,7 +387,7 @@ def rollout_async(
             do_submit(r, prefix, max_new, False)
 
     try:
-        for r in rollouts:  # prime turn 0 on the main thread
+        for r in rollouts:
             max_new = _turn_budget(r, per_turn_max_tokens)
             if max_new is None:
                 completed += 1
@@ -495,7 +395,7 @@ def rollout_async(
                 do_submit(r, list(r.cur_ids), max_new, r.turns == 0)
         while completed < n:
             progressed = False
-            while True:  # submit every next-turn the worker has produced (and count finished ones)
+            while True:
                 try:
                     take(to_submit.get_nowait())
                     progressed = True
@@ -503,33 +403,23 @@ def rollout_async(
                     break
             if completed >= n:
                 break
-            if busy():  # step the engine; hand finished turns to the worker (overlaps its env work)
+            if busy():
                 for req_id, asst_ids, asst_lp, text in poll():
                     to_env.put((by_id.pop(req_id), asst_ids, asst_lp, text))
             elif not progressed:
-                # nothing in flight and nothing newly ready: the worker is mid-advance — block on its
-                # next output instead of spinning (every rollout is in exactly one stage, so this
-                # can't deadlock: the only state with all queues + in-flight empty is all-done).
+                # Worker is mid-advance; block briefly instead of spinning.
                 with contextlib.suppress(queue.Empty):
                     take(to_submit.get(timeout=0.1))
     finally:
         to_env.put(None)
         worker.join()
 
-    # Score with the ACTUAL accumulated rollout state (matches rollout_one), batched per task.
     rewards = _score_rollouts(active_env, rollouts)
     return [r.result(rw) for r, rw in zip(rollouts, rewards, strict=True)]
 
 
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:
-    """Render ``messages`` with the chat template, then tokenize to a flat ``list[int]``.
-
-    Render to text first, then tokenize — the return shape of apply_chat_template(tokenize=True)
-    varies by tokenizer, whereas tok(text).input_ids is reliably a flat list[int] (matches the
-    single-turn render_prompt path). add_special_tokens=False because the template already
-    emits the special tokens. Shared by the GRPO rollout closure and mid-run eval so both
-    produce identical token alignment.
-    """
+    """Render ``messages`` with the chat template and tokenize to a flat ``list[int]``."""
     text = tok.apply_chat_template(
         messages,
         add_generation_prompt=add_generation_prompt,
@@ -540,12 +430,7 @@ def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: 
 
 
 def _engine_vocab_size(engine) -> int | None:
-    """Best-effort vocab size of the colocate vLLM engine, or None if it can't be read.
-
-    Used only for a cheap fail-loud bounds check on the pre-tokenized prompt ids before they
-    reach ``engine.generate`` (the ``prompt_token_ids`` path does no bounds checking, so an
-    out-of-range id would otherwise surface as an opaque CUDA illegal-access). Never raises.
-    """
+    """Best-effort vocab size from the colocate vLLM engine, or None. Never raises."""
     try:
         mc = engine.llm_engine.model_config
     except Exception:
@@ -576,21 +461,10 @@ def build_rollout_func(
     thinking: bool,
     engine_max_len: int | None = None,
 ):
-    """Return a TRL ``rollout_func`` closure that drives ``active_env`` on the colocate engine.
-
-    The closure reaches the in-process vLLM engine through ``trainer.vllm_generation.llm`` and
-    samples each assistant turn with per-token logprobs. It returns exactly ONE rollout per
-    prompt in the slice TRL passes: TRL's ``RepeatSampler`` already repeats each unique prompt
-    ``num_generations`` times before calling ``rollout_func`` (the consecutive repeats form the
-    GRPO group), so the closure must NOT multiply by ``num_generations`` again.
-    """
-    from vllm import SamplingParams  # gpu-only; imported lazily so the module loads on CPU
+    """Return a TRL ``rollout_func`` closure that drives ``active_env`` on the colocate engine."""
+    from vllm import SamplingParams  # gpu-only; lazy import so the module loads on CPU
 
     try:
-        # FINAL_ONLY makes each manual add_request emit exactly one RequestOutput, at finish, with
-        # the complete turn (matching LLM.generate); without it the engine streams a cumulative
-        # output every step. Optional so the CPU import (stubbed vllm) still works — poll() filters
-        # on `finished` either way.
         from vllm.sampling_params import RequestOutputKind
 
         _final_only_kind = RequestOutputKind.FINAL_ONLY
@@ -600,11 +474,6 @@ def build_rollout_func(
     _render_cache = _LRUCache(8192)
 
     def render(messages: list, add_generation_prompt: bool) -> list[int]:
-        # The initial-prompt render is identical for every rollout in a GRPO group (they share one
-        # prompt), so cache it by content instead of re-rendering num_generations times per step.
-        # LRU-bounded: when full it EVICTS the least-recently-used entry rather than freezing, so a
-        # long run with many distinct prompts keeps caching the recently-seen ones (a freeze-when-full
-        # cache would stop admitting any new prompt after the cap and re-render them forever).
         cache_key = f"{add_generation_prompt}\x00{json.dumps(messages, sort_keys=True, default=str)}"
         cached = _render_cache.get(cache_key)
         if cached is not None:
@@ -616,25 +485,12 @@ def build_rollout_func(
     _glue_cache = _LRUCache(8192)
 
     def env_glue(env_messages: list) -> list[int]:
-        # The inter-turn glue is a pure function of env_messages (+ this closure's tokenizer /
-        # thinking). Within a GRPO group every rollout gets the SAME env reply each turn, and many
-        # turns repeat env messages across rollouts and steps, so apply_chat_template would
-        # otherwise re-render byte-identical glue dozens-to-hundreds of times — the dominant per-turn
-        # CPU cost in the (otherwise overhead-bound) multi-turn rollout. Cache by env-message
-        # content; LRU-bounded so an env whose every reply is unique can't grow it without limit and,
-        # unlike a freeze-when-full cache, recently-seen glue stays cached over a long diverse run.
         cache_key = json.dumps(env_messages, sort_keys=True, default=str)
         cached = _glue_cache.get(cache_key)
         if cached is not None:
             return cached
-        # Tokens between two assistant turns: close the previous assistant turn, render the env
-        # reply message(s), and open the next generation prompt. Derived by rendering a probe
-        # assistant turn followed by the env messages (+ generation prompt) and taking everything
-        # AFTER the probe content — so the glue is exactly the template's inter-turn wrapper,
-        # whatever it is (Qwen's <|im_end|> + user turn + <|im_start|>assistant + <think> block).
-        # This avoids re-rendering history (which Qwen3 does not round-trip) and matches how the
-        # model actually conditioned during generation. The probe is plain text the template
-        # inserts verbatim into assistant content; its FIRST occurrence is the probe turn.
+        # Render a probe assistant turn + env messages, then take everything after the probe
+        # to get the inter-turn glue without re-rendering history (Qwen3 doesn't round-trip).
         probe = "flash-env-glue-probe"
         text = tok.apply_chat_template(
             [{"role": "assistant", "content": probe}, *env_messages],
@@ -642,9 +498,6 @@ def build_rollout_func(
             tokenize=False,
             enable_thinking=thinking,
         )
-        # Locate the probe to slice off the inter-turn glue. Fail LOUD with context if the
-        # template did not insert the assistant content verbatim (some templates strip/escape it,
-        # or could emit the probe more than once) instead of a bare "substring not found".
         first = text.find(probe)
         if first == -1 or text.find(probe, first + len(probe)) != -1:
             raise ValueError(
@@ -660,36 +513,17 @@ def build_rollout_func(
 
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
-        # The colocate engine is a vLLM `LLM`; its V1 `LLMEngine` exposes the public
-        # add_request / step / has_unfinished_requests loop that lets us decode many rollouts'
-        # turns CONTINUOUSLY (a finished turn's slot refills with another rollout's next turn)
-        # instead of one synchronized batched decode per turn.
         llm_engine = engine.llm_engine
-        # Colocate vLLM sleep mode (GRPOConfig.vllm_enable_sleep_mode, ON for large / long-context
-        # runs) offloads BOTH the rollout engine's weights and its KV cache between steps. TRL's
-        # rollout_func path (GRPOTrainer._generate) calls vllm_generation.sync_weights() — which
-        # wakes only tags=["weights"] — and then hands control to this closure, but, UNLIKE TRL's
-        # own single-turn generate() path, it never wakes tags=["kv_cache"]. So the first decode
-        # below would run against a freed/offloaded KV cache and fault with CUDA "illegal memory
-        # access" on step 0. Wake the KV cache here and re-sleep after the whole batch, mirroring
-        # trl.generation.vllm_generation.generate (and trl.experimental.openenv). No-op when sleep
-        # mode is off (small/short-context runs keep the engine resident). See flash issue #162.
+        # TRL's rollout_func path only wakes tags=["weights"]; wake kv_cache too or step 0 faults (flash #162).
         sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
         vocab_size = _engine_vocab_size(engine)
-        active_ids: set[str] = set()  # submitted-but-not-finished requests, for abort-on-exit
+        active_ids: set[str] = set()
 
         def submit(req_id: str, prefix_ids: list[int], max_tokens: int, initial: bool) -> None:
-            """Enqueue one assistant-turn request on the colocate engine."""
+            """Enqueue one assistant-turn request."""
             if not prefix_ids:
-                # Fail loudly on a degenerate prompt instead of letting it reach the embedding gather
-                # as an opaque async CUDA illegal-access (the failure mode #162 was first mistaken
-                # for): the prompt_token_ids path does no bounds checking.
                 raise ValueError("multi-turn rollout produced an empty prompt for engine.add_request()")
             if initial:
-                # Turn-0 prefixes are the only externally-rendered initial prompts (later turns are
-                # vLLM-generated / tokenizer glue, already in range); validate each, since the
-                # prompt_token_ids path does no bounds checking and an out-of-range id would surface
-                # as an opaque CUDA illegal-access.
                 lo, hi = min(prefix_ids), max(prefix_ids)
                 if lo < 0 or (vocab_size is not None and hi >= vocab_size):
                     raise ValueError(
@@ -711,16 +545,13 @@ def build_rollout_func(
             active_ids.add(req_id)
 
         def poll() -> list[tuple[str, list[int], list[float], str]]:
-            """Advance the engine one step; return (req_id, token_ids, logprobs, text) for every
-            request that finished this step (``[]`` if none did / a dummy batch ran)."""
+            """Step the engine; return finished (req_id, token_ids, logprobs, text) tuples."""
             finished: list[tuple[str, list[int], list[float], str]] = []
             for out in llm_engine.step():
                 if not getattr(out, "finished", False):
                     continue
                 comp = out.outputs[0]
                 token_ids = list(comp.token_ids)
-                # comp.logprobs is a list (per position) of {token_id: Logprob}; pull the sampled
-                # token's logprob at each position.
                 lps: list[float] = []
                 for pos, tid in enumerate(token_ids):
                     entry = (comp.logprobs or [])[pos] if comp.logprobs else None
@@ -733,22 +564,11 @@ def build_rollout_func(
         def busy() -> bool:
             return bool(llm_engine.has_unfinished_requests())
 
-        # Wake the KV cache for the whole batch (see the note above), then re-sleep so the engine
-        # returns to its fully-offloaded state and the optimizer step has the freed memory back.
-        # `woke` is set AFTER a successful wake so the finally re-sleeps ONLY when we actually woke
-        # the engine — a wake_up() that raises leaves the engine asleep (its resting state), and we
-        # must not then call sleep() on it; a failure DURING the rollout still re-sleeps.
         woke = False
         try:
             if sleep_mode:
                 engine.wake_up(tags=["kv_cache"])
                 woke = True
-            # ONE rollout per prompt: TRL's RepeatSampler already repeats each unique prompt
-            # num_generations times BEFORE handing the slice to rollout_func (trl 1.6/1.7:
-            # `prompts = [x["prompt"] for x in inputs]`, no dedup), and it expects exactly
-            # len(prompts) completions back — the GRPO group is the consecutive num_generations rows
-            # of the same prompt. rollout_async returns one result per example in input order, so
-            # the group stays aligned.
             examples = [examples_by_key.get(_prompt_key(p), {"prompt": p}) for p in prompts]
             rollouts = rollout_async(
                 examples=examples,
@@ -768,9 +588,7 @@ def build_rollout_func(
                     out[k].append(r[k])
             return out
         finally:
-            # Abort any still-in-flight requests so a mid-rollout error (e.g. an env_glue/template
-            # failure on a later turn) can't leak live requests into the engine and corrupt the
-            # next GRPO step. No-op on the success path (every request finished -> active_ids empty).
+            # Abort in-flight requests on error so they don't corrupt the next GRPO step.
             if active_ids:
                 with contextlib.suppress(Exception):
                     llm_engine.abort_request(list(active_ids))

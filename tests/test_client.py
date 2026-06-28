@@ -59,6 +59,16 @@ def stub():
                 return
             self._send(200, {"run_id": "r1", "state": "queued"})
 
+        def do_DELETE(self):
+            seen["auth"] = self.headers.get("Authorization")
+            seen["path"] = self.path
+            seen["method"] = "DELETE"
+            if self.path.startswith("/v1/envs/"):
+                slug = self.path[len("/v1/envs/") :]
+                self._send(200, {"id": slug, "deleted": True})
+                return
+            self._send(200, {})
+
         def log_message(self, *a):
             pass
 
@@ -173,14 +183,36 @@ def test_publish_env_plain_without_progress(stub):
     assert seen["body"] == {"name": "e", "package_b64": "QQ=="}
 
 
+def test_delete_env_sends_delete_to_slug_path(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    out = client.delete_env("dev-clado-ai/my-env")
+    assert out == {"id": "dev-clado-ai/my-env", "deleted": True}
+    assert seen["method"] == "DELETE"
+    # the namespace/name slug (with its slash) goes straight into the path
+    assert seen["path"] == "/v1/envs/dev-clado-ai/my-env"
+    assert seen["auth"] == "Bearer fslo-user-test"
+
+
+def test_delete_env_percent_encodes_reserved_chars(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    # A programmatic caller passing reserved characters must NOT be able to truncate the request
+    # target: `?` becomes %3F (not a query string), `#` becomes %23 (not a dropped fragment), while
+    # the namespace/name separator `/` is preserved so the server still routes the :path param.
+    client.delete_env("team/env?x=1#frag")
+    assert seen["method"] == "DELETE"
+    assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag"
+
+
 def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
     import flash.client.http as http_mod
 
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    # spy on the streaming reader so we prove _post_with_progress (not the plain _request
-    # path) ran — a refactor that faked progress around a one-shot send must fail this test.
+    # spy on the streaming reader so we prove the streaming _request(progress=...) path (not the
+    # plain one-shot path) ran — a refactor that faked progress around a one-shot send must fail.
     wrapped: list[int] = []
     real_reader = http_mod._ProgressReader
 
@@ -248,6 +280,24 @@ def test_deploy_passes_integer_step(stub):
     assert seen["path"] == "/v1/runs/flash-run/deploy"
     assert seen["body"]["step"] == 40
     assert seen["body"]["dry_run"] is False
+
+
+def test_deploy_rejects_fractional_step():
+    """A fractional step would int-truncate (2.7 -> 2) and deploy the WRONG checkpoint, so reject it
+    client-side (mirrors export's guard)."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    for bad in (2.5, 0.1, 3.9):
+        with pytest.raises(ClientError, match="invalid checkpoint step"):
+            client.deploy("flash-run", step=bad)
+
+
+def test_deploy_passes_whole_float_step(stub):
+    """A float that is a whole number (40.0) passes the guard and forwards as an int."""
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.deploy("flash-run", step=40.0)
+    assert seen["body"]["step"] == 40
+    assert isinstance(seen["body"]["step"], int)
 
 
 def test_export_sends_repository_token_and_step(stub):

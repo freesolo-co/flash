@@ -1,15 +1,4 @@
-"""Lambda Cloud provider: single-GPU instances bootstrapped via cloud-init (the instance-based
-complement to RunPod's serverless Flash endpoints).
-
-Fine-tuning runs on a Lambda Cloud GPU instance launched by Flash. The instance's cloud-init
-``user_data`` runs the prebuilt, PUBLIC ``WORKER_IMAGE`` via Docker (the byte-identical training
-stack RunPod bakes), which executes ``flash.engine.worker`` on the GPU; completion is detected
-purely from the worker's HF artifacts (no inbound network, no serverless queue). It implements the
-SAME ``base.Provider`` interface as RunPod, so the orchestrator/allocator treat the two
-interchangeably.
-
-``PROVIDER`` is the ``base.Provider`` implementation the registry hands out.
-"""
+"""Lambda Cloud provider: single-GPU instances bootstrapped via cloud-init."""
 
 from __future__ import annotations
 
@@ -27,9 +16,6 @@ class LambdaProvider:
     def is_configured(self) -> bool:
         from flash.providers.lambdalabs.auth import load_api_key
 
-        # Lambda is an opt-in instance substrate: it is available only when its operator key is
-        # present. Without LAMBDA_API_KEY (tests / CI / RunPod-only operators) allocation degrades
-        # deterministically to RunPod's catalog — exactly the prior RunPod-only behavior.
         return load_api_key() is not None
 
     def preflight(self, require_hf: bool = True) -> list[str]:
@@ -58,8 +44,6 @@ class LambdaProvider:
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
     ) -> PollResult:
-        # ``on_last_gpu`` is accepted for the shared Provider interface (RunPod stretches its grace on
-        # the last GPU); the instance providers use a UNIFORM per-GPU wait, so it is intentionally unused.
         from flash.providers.lambdalabs.jobs import submit_run_lambda
 
         return submit_run_lambda(
@@ -83,21 +67,14 @@ class LambdaProvider:
         from flash.providers.runpod.jobs import make_hf_heartbeat_reader
 
         hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+        prefix = f"{spec.phase}/{spec.run_id}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         lh = LambdaJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: lambda instance={lh.instance_id}", file=log, flush=True)
-        # The wall-cap deadline counts from the instance's LAUNCH, not from this reattach — Lambda
-        # has no server-side execution timeout, so resetting it on every recovery would let a
-        # control-plane restart extend the billable window unbounded. The poll loop already anchors
-        # its deadline check to ``handle.started_ts`` (start = launch), so we pass the FULL
-        # launch-relative budget here; pre-subtracting elapsed too would double-count and tear down
-        # a still-valid instance the moment a recovered run is past half its window.
+        # Deadline is launch-relative, not reattach-relative: resetting on recovery would extend billable window unbounded.
         deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S)
         try:
-            # Uniform per-GPU wait: poll_lambda_job uses its default FIRST_LIVENESS_S / SETUP_GRACE_S
-            # (no last-GPU scaling), matching the submit path.
             return poll_lambda_job(
                 lh,
                 spec,
@@ -107,15 +84,11 @@ class LambdaProvider:
                 deadline_s=deadline,
             )
         finally:
-            # Recovery (attach_run) has no submit_run_lambda teardown ``finally``; terminate the
-            # reattached instance here so a finished/abandoned recovered seed stops billing
-            # immediately instead of idling until the whole run ends.
+            # attach_run has no submit_run_lambda teardown; terminate here so recovered seeds stop billing.
             with contextlib.suppress(Exception):
                 lambda_api.terminate_instances([lh.instance_id])
 
     def cancel(self, handle: JobHandle) -> None:
-        # Terminating the instance both stops the job and tears down the (only) billable resource —
-        # Lambda has no separate "cancel job" vs "destroy resource".
         from flash.providers.lambdalabs import api as lambda_api
 
         d = handle.to_dict()
@@ -139,11 +112,7 @@ class LambdaProvider:
         active_labels: set[str] | Callable[[], set[str]] | None = None,
         known_labels: set[str] | Callable[[], set[str]] | None = None,
     ) -> list[str]:
-        """Lambda crash-recovery sweep (called via the provider object at startup).
-
-        Lambda instance ids are opaque hex STRINGS (the ``base.Provider`` protocol widens the return
-        to ``list[int | str]`` to cover both substrates); the orchestrator only logs/counts them.
-        ``known_labels`` scopes the sweep to this control plane's own runs (multi-plane safety)."""
+        """Lambda crash-recovery sweep."""
         from flash.providers.lambdalabs.jobs import sweep_orphans
 
         return sweep_orphans(active_labels=active_labels, known_labels=known_labels)

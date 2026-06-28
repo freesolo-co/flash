@@ -349,3 +349,35 @@ def test_list_endpoints_raises_on_non_list_response(monkeypatch):
 
     with pytest.raises(runpod_api.RunpodApiError, match="unexpected /endpoints response"):
         runpod_api.list_endpoints()
+
+
+# ---------------------------------------------------------------------------
+# billing_endpoints — account-scoped realized-cost query across the whole pool
+# ---------------------------------------------------------------------------
+def test_billing_endpoints_queries_every_pool_account(monkeypatch):
+    """An endpoint provisioned via quota-failover lives on a NON-active pool account; its billing
+    query must hit every account. A billing filter for a foreign endpointId returns a successful
+    empty 200 (not a 404), so a single-key waterfall stops at the active account and silently
+    reports $0. Best-effort: a single account's failure is skipped, not fatal."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b,rk-c")
+    keys.reset()
+
+    queried = []
+
+    def fake_for_key(key, target, **_kw):
+        queried.append(key)
+        if key == "rk-c":  # a flaky account must not abort the sweep
+            raise runpod_api.RunpodApiError("GET .../billing/endpoints -> HTTP 500")
+        # The endpoint is owned by rk-b; rk-a returns a successful EMPTY result for the filter.
+        return [{"endpointId": "ep-owned", "amount": 4.5}] if key == "rk-b" else []
+
+    monkeypatch.setattr(runpod_api._CLIENT, "request_with_retries_for_key", fake_for_key)
+
+    rows = runpod_api.billing_endpoints(
+        start_time="2026-06-01T00:00:00Z", end_time="2026-06-02T00:00:00Z", endpoint_id="ep-owned"
+    )
+    assert set(queried) == {"rk-a", "rk-b", "rk-c"}  # every account queried, not just the active one
+    assert rows == [{"endpointId": "ep-owned", "amount": 4.5}]  # owner's rows; failing account skipped

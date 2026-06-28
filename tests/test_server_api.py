@@ -28,7 +28,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
+    "train": {"steps": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 
@@ -345,7 +345,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # Negative (401) -> cached with the SHORT negative TTL.
     now = time.time()
     assert auth_mod._freesolo_verify("neg") is False
-    neg_exp = auth_mod._verify_cache["neg"][1]
+    neg_exp = auth_mod._verify_cache["neg"][2]
     assert neg_exp <= now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
     # ...and definitely shorter than the long TTL.
     assert neg_exp < now + auth_mod._VERIFY_CACHE_TTL_S
@@ -355,7 +355,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     state["code"] = 200
     now = time.time()
     assert auth_mod._freesolo_verify("pos") is True
-    pos_exp = auth_mod._verify_cache["pos"][1]
+    pos_exp = auth_mod._verify_cache["pos"][2]
     assert pos_exp > now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
     assert pos_exp <= now + auth_mod._VERIFY_CACHE_TTL_S + 1
 
@@ -364,11 +364,11 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # expired while a same-age positive would still be live.
     auth_mod._verify_cache.clear()
     base = time.time()
-    auth_mod._verify_cache["neg"] = (False, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
-    auth_mod._verify_cache["pos"] = (True, base + auth_mod._VERIFY_CACHE_TTL_S)
+    auth_mod._verify_cache["neg"] = (False, {}, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
+    auth_mod._verify_cache["pos"] = (True, {}, base + auth_mod._VERIFY_CACHE_TTL_S)
     later = base + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1.0  # past neg TTL, well under pos TTL
-    assert auth_mod._verify_cache["neg"][1] <= later  # negative entry has expired
-    assert auth_mod._verify_cache["pos"][1] > later  # positive entry is still live
+    assert auth_mod._verify_cache["neg"][2] <= later  # negative entry has expired
+    assert auth_mod._verify_cache["pos"][2] > later  # positive entry is still live
 
 
 def test_freesolo_verify_rejects_oversized_token(monkeypatch):
@@ -466,7 +466,7 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
 
     # An already-expired entry must be removed on the next write (no longer reachable).
-    auth_mod._verify_cache["stale"] = (True, time.time() - 1)
+    auth_mod._verify_cache["stale"] = (True, {}, time.time() - 1)
     auth_mod._freesolo_verify("fresh-token")
     assert "stale" not in auth_mod._verify_cache
     assert "fresh-token" in auth_mod._verify_cache
@@ -620,6 +620,95 @@ def test_worker_output_route(api, monkeypatch):
     # Another user can't read it (same ownership gate as /logs).
     other = _login()
     assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
+
+
+def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
+    """The logs fetcher resolves the newest attempt-scoped error file, so a retried-then-failed run
+    surfaces the FINAL attempt's traceback, not attempt0's stale one."""
+    import huggingface_hub
+
+    from flash.server._runtime import _latest_error_artifact_name
+
+    prefix = "sft/run-1/seed0"
+    listed = [
+        f"{prefix}/console_sft.txt",
+        f"{prefix}/error_sft_attempt0.txt",
+        f"{prefix}/error_sft_attempt2.txt",
+        f"{prefix}/error_sft_attempt1.txt",
+        f"{prefix}/heartbeat.json",
+        "other/run/error_sft_attempt9.txt",  # different prefix -> ignored
+    ]
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return listed
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    assert _latest_error_artifact_name("org/repo", prefix, "sft") == "error_sft_attempt2.txt"
+
+
+def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
+    """If the repo can't be listed, fall back to attempt0 rather than failing the logs fetch."""
+    import huggingface_hub
+
+    from flash.server._runtime import _latest_error_artifact_name
+
+    class _BoomApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            raise RuntimeError("HF down")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _BoomApi)
+    assert _latest_error_artifact_name("org/repo", "rl/r/seed0", "rl") == "error_rl_attempt0.txt"
+
+
+def test_worker_artifacts_fetches_console_and_latest_attempt_error(monkeypatch, tmp_path):
+    """The fetcher pulls the worker console plus the NEWEST attempt-scoped error file
+    (error_<phase>_attempt<N>.txt) — on a retried run only the highest attempt is the real crash."""
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "rl/r1/console_rl.txt": "worker console\n",
+        "rl/r1/error_rl_attempt0.txt": "stale first-attempt traceback\n",
+        "rl/r1/error_rl_attempt1.txt": "TRACEBACK latest\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert out["console_rl.txt"] == "worker console\n"
+    # The newest attempt's traceback surfaces; the superseded attempt0 is not fetched.
+    assert out["error_rl_attempt1.txt"] == "TRACEBACK latest\n"
+    assert "error_rl_attempt0.txt" not in out
 
 
 def test_local_env_path_rejected(api):
@@ -826,6 +915,80 @@ def test_chat_streams_deployed_run(api, monkeypatch):
     assert seen["messages"] == [{"role": "user", "content": "hello"}]
 
 
+def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkeypatch):
+    """A run cancelled mid-RL can deploy a per-step checkpoint (stays `cancelled`, listed active by
+    /v1/deployments). The chat route must SERVE that live adapter, not 409 on the cancelled state."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "cancelled"  # cancelled, but with a live checkpoint deployment
+    status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+    runner._save_status(status)
+
+    monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi", " there"]))
+    with api.stream(
+        "POST",
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    ) as resp:
+        text = resp.read().decode()
+    assert resp.status_code == 200, text
+    assert text == "hi there"
+
+
+def test_chat_cancelled_run_without_deployment_is_409(api):
+    """A cancelled run with no active deployment still 409s, pointing the user at `flash deploy`."""
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "cancelled"
+    runner._save_status(status)
+
+    r = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers=_bearer(key),
+    )
+    assert r.status_code == 409
+    assert "deploy a checkpoint" in r.json()["detail"]
+
+
+def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
+    """JSON `1e400`/`Infinity` parses to float('inf'); `int(inf)` raises OverflowError (an
+    ArithmeticError, NOT TypeError/ValueError) which used to escape the guard -> 500. A non-finite
+    max_tokens or temperature must be a clean 400, per the route's own bad-values-are-400 contract."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+    monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi"]))
+
+    headers = {**_bearer(key), "content-type": "application/json"}
+    for body in (
+        b'{"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1e400}',
+        b'{"messages": [{"role": "user", "content": "hi"}], "temperature": 1e400}',
+    ):
+        r = api.post(f"/v1/runs/{run_id}/chat", content=body, headers=headers)
+        assert r.status_code == 400, (body, r.status_code, r.text)
+
+
 def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     """An undeploy that hits a serving-backend failure surfaces as a clean 502 (same as deploy),
     not an unhandled 500: ServingError from undeploy_adapter is translated to HTTPException(502)."""
@@ -1013,7 +1176,7 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "nohandle-1",
     }
@@ -1070,7 +1233,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "bad-1",
     }
@@ -1078,7 +1241,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     good_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "good-2",
     }
@@ -1252,15 +1415,90 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     assert "must be a base64 string" in r2.text.lower()
 
 
+def test_delete_env_endpoint_removes_package(api, monkeypatch):
+    """DELETE /v1/envs/{id} removes the package and reports it deleted."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    seen: dict = {}
+
+    def fake_delete_package(*, slug, key):
+        seen.update(slug=slug, key=key)
+        return True
+
+    monkeypatch.setattr(envs_mod, "delete_package", fake_delete_package)
+    recorded: dict = {}
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda *, slug, key: recorded.update(slug=slug) or True,
+    )
+
+    resp = api.delete("/v1/envs/dev-clado-ai/my-env", headers=_bearer(_login()))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"id": "dev-clado-ai/my-env", "deleted": True}
+    assert seen["slug"] == "dev-clado-ai/my-env"
+    assert recorded["slug"] == "dev-clado-ai/my-env"
+
+    # Unauthenticated requests are rejected.
+    assert api.delete("/v1/envs/dev-clado-ai/my-env").status_code in (401, 403)
+
+
+def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
+    """A namespace-authorization EnvPublishError surfaces as its HTTP status (403)."""
+    import flash.server.envs as envs_mod
+
+    def fake_delete_package(*, slug, key):
+        raise envs_mod.EnvPublishError("not your namespace", status=403)
+
+    monkeypatch.setattr(envs_mod, "delete_package", fake_delete_package)
+    resp = api.delete("/v1/envs/someone-else/env", headers=_bearer(_login()))
+    assert resp.status_code == 403, resp.text
+
+
+def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
+    """A failing metadata-mirror delete must not turn a successful delete into a 500."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(envs_mod, "delete_package", lambda *, slug, key: True)
+
+    def boom(*, slug, key):
+        raise RuntimeError("backend down")
+
+    monkeypatch.setattr(environment_registry, "record_deleted_environment", boom)
+    resp = api.delete("/v1/envs/dev-clado-ai/my-env", headers=_bearer(_login()))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] is True
+
+
+def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
+    """A non-canonical id (uppercase / trailing slash) is rejected 400 before any storage call."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(
+        envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_k: pytest.fail("mirror must not be touched"),
+    )
+    for bad in ("Dev-Clado-Ai/My-Env", "dev-clado-ai/my-env/"):
+        resp = api.delete(f"/v1/envs/{bad}", headers=_bearer(_login()))
+        assert resp.status_code == 400, resp.text
+
+
 # --------------------------------------------------------------------------------------------
 # Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
 # --------------------------------------------------------------------------------------------
 _FAKE_CKPTS = [
-    {"step": 40, "adapter_prefix": "rl/X/seed0/checkpoints/step-40",
-     "subfolder": "rl/X/seed0/checkpoints/step-40/adapter",
+    {"step": 40, "adapter_prefix": "rl/X/checkpoints/step-40",
+     "subfolder": "rl/X/checkpoints/step-40/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
-    {"step": 80, "adapter_prefix": "rl/X/seed0/checkpoints/step-80",
-     "subfolder": "rl/X/seed0/checkpoints/step-80/adapter",
+    {"step": 80, "adapter_prefix": "rl/X/checkpoints/step-80",
+     "subfolder": "rl/X/checkpoints/step-80/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
 ]
 
@@ -1363,13 +1601,14 @@ def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
 
 
 def test_deploy_rejects_non_integer_step(api, monkeypatch):
-    """A bool (True->1) or non-integer step must be rejected, not silently coerced."""
+    """A bool (True->1) or non-integer step must be rejected, not silently coerced. An all-digit string
+    over Python's 4300-digit int()-conversion limit must also be a clean 400, not int()->uncaught 500."""
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
     run_id = _make_run(api, key, "done")
-    for bad in (True, 40.9, "40.9"):
+    for bad in (True, 40.9, "40.9", "1" * 5000):
         r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": bad}, headers=_bearer(key))
         assert r.status_code == 400, f"{bad!r} -> {r.status_code} {r.text}"
 
@@ -1470,14 +1709,66 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     body = resp.json()
     assert body["repository"] == "me/adapters"
     assert body["url"] == "https://huggingface.co/me/adapters"
-    assert body["source"] == f"{src_repo}:rl/{run_id}/seed0/adapter"
+    assert body["source"] == f"{src_repo}:rl/{run_id}/adapter"
     assert "step" not in body
     # Source = the run's private dataset repo + final-adapter subfolder; dest = the user's repo.
     assert seen["source_repo"] == src_repo
-    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/adapter"
+    assert seen["source_subfolder"] == f"rl/{run_id}/adapter"
     assert seen["dest_repo"] == "me/adapters"
     assert seen["dest_token"] == "hf_user"
     assert seen["private"] is True  # private by default
+
+
+def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
+    """The /export handler must take the per-run deploy lock FROM THE VERY TOP — before even the
+    payload-shape validation — and keep it across owned_run/the artifact read (mirroring /deploy,
+    which locks first). The always-on repo GC only spares a repo when it CAN'T acquire that same lock,
+    so taking the lock after the body validation left a window where the GC could delete the source
+    while the request was still validating its payload. Assert the lock is already held both during
+    the payload validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run
+    runs."""
+    import flash.server.app as app_mod
+    from flash.server.routes import serving as serving_routes
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    real_owned_run = serving_routes.owned_run
+    real_validate = serving_routes._validate_hf_repo_id
+    seen: dict = {}
+
+    def checking_validate(repository):
+        # The payload validation runs BEFORE owned_run; assert it too is inside the lock, so the GC
+        # cannot delete the source during the (cheap, local) body validation.
+        lk = app_mod._deploy_lock(run_id)
+        acquired = lk.acquire(blocking=False)
+        seen["locked_during_validation"] = not acquired
+        if acquired:
+            lk.release()
+        return real_validate(repository)
+
+    def checking_owned_run(rid, k):
+        # A non-blocking acquire from outside must FAIL (lock already held by the handler) — proving
+        # the handler is INSIDE the `with _deploy_lock(...)` block by the time owned_run runs.
+        lk = app_mod._deploy_lock(rid)
+        acquired = lk.acquire(blocking=False)
+        seen["locked_during_owned_run"] = not acquired
+        if acquired:
+            lk.release()
+        return real_owned_run(rid, k)
+
+    monkeypatch.setattr(serving_routes, "_validate_hf_repo_id", checking_validate)
+    monkeypatch.setattr(serving_routes, "owned_run", checking_owned_run)
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/a")
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["locked_during_validation"] is True
+    assert seen["locked_during_owned_run"] is True
 
 
 def test_export_public_flag_sets_private_false(api, monkeypatch):
@@ -1625,7 +1916,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
         lambda spec: [
             {
                 "step": 40,
-                "subfolder": f"rl/{run_id}/seed0/checkpoints/step-40/adapter",
+                "subfolder": f"rl/{run_id}/checkpoints/step-40/adapter",
                 "repo_id": "org/test-runs",
                 "repo_type": "dataset",
             }
@@ -1644,7 +1935,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     )
     assert ok.status_code == 200, ok.text
     assert ok.json()["step"] == 40
-    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/checkpoints/step-40/adapter"
+    assert seen["source_subfolder"] == f"rl/{run_id}/checkpoints/step-40/adapter"
 
     bad = api.post(
         f"/v1/runs/{run_id}/export",
