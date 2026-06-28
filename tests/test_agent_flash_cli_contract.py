@@ -56,7 +56,7 @@ from flash.spec import JobSpec
     ],
 )
 def test_agent_required_subcommands_exist(subcommand: str) -> None:
-    """The agent's worker drives the CLI's `train/status/runs/cancel/env install/...`
+    """The agent's worker drives the CLI's `train/status/runs/cancel/env/...`
     subcommands.
 
     argparse exits with code 2 and an 'invalid choice' message when a subcommand
@@ -68,13 +68,6 @@ def test_agent_required_subcommands_exist(subcommand: str) -> None:
         main([subcommand, "--help"])
     # --help exits 0 for an existing subcommand; an unknown subcommand exits 2.
     assert excinfo.value.code == 0, f"`flash {subcommand}` is missing from the CLI"
-
-
-def test_env_install_subcommand_exists() -> None:
-    """The agent records published Freesolo env ids via `flash env install`."""
-    with pytest.raises(SystemExit) as excinfo:
-        main(["env", "install", "--help"])
-    assert excinfo.value.code == 0, "`flash env install` is missing from the CLI"
 
 
 def test_env_push_subcommand_exists() -> None:
