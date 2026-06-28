@@ -172,6 +172,8 @@ def test_bootstrap_train_success(monkeypatch):
 
 def test_bootstrap_fails_without_metrics(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
+    # A genuine crash: no local metrics AND nothing on HF (stub keeps the check offline + deterministic).
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
     assert lb.main() == 1
     ok, error, retriable = markers[0]
     assert not ok
@@ -179,6 +181,38 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
     # A genuine no-metrics crash (the worker never produced metrics) is a REAL failure, not infra:
     # it must NOT be flagged retriable (that would loop a deterministically-broken run).
     assert retriable is False
+
+
+def test_bootstrap_missing_local_metrics_but_remote_confirmed_is_retriable(monkeypatch):
+    """No local /tmp/metrics.json but the run IS complete on HF (DONE+metrics uploaded) — e.g. the
+    idempotency replay hit a transient HF read. This is a SUCCEEDED run; the bootstrap must consult
+    remote completion BEFORE the missing-local-file RuntimeError and surface a RETRIABLE marker so a
+    fresh worker re-fetches the persisted metrics, never fail a confirmed-complete run."""
+    lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
+    assert lb.main() == 1
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert "complete on HF" in error
+    assert retriable is True  # confirmed-complete -> reschedule to re-fetch, not a fatal job_failed
+
+
+def test_bootstrap_fetch_code_failure_is_retriable(monkeypatch):
+    # A transient HF blip fetching the run's OWN code (the control plane uploaded it before submit) is
+    # infra-shaped, exactly like the already-wrapped fetch_spec_from_hf — it must surface as a
+    # retriable marker so the run walks to a fresh host, NOT a fatal job_failed (the asymmetry = bug).
+    lb, calls, markers = _bootstrap_env(monkeypatch)
+
+    def boom(_payload):
+        raise RuntimeError("HF 503 storm")
+
+    monkeypatch.setattr(lb, "fetch_code", boom)
+    assert lb.main() == 1
+    assert calls == []  # crashed before launching the worker subprocess
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert "fetch run code from HF" in error
+    assert retriable is True
 
 
 def test_bootstrap_sets_lambda_arm():
@@ -191,6 +225,22 @@ def test_bootstrap_sets_lambda_arm():
     # And Lambda's build_payload is what sets flash_arm='lambda'.
     from flash.providers.lambdalabs.jobs.builders import build_payload
     assert build_payload(_spec(), 0, 0)["flash_arm"] == "lambda"
+
+
+def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
+    # The instance bootstrap must stamp ATTEMPT into the worker env (RunPod does it in jobs.py) — the
+    # worker reads it into every heartbeat, and the poller's stale-heartbeat rejection is dead without
+    # it (a prior attempt's leftover heartbeat would disarm the new attempt's fast failover).
+    from flash.providers import _instance_bootstrap as lb
+    from flash.providers.lambdalabs.jobs.builders import build_payload
+
+    base = {"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}
+    assert lb.build_worker_env({**base, "attempt": 3})["ATTEMPT"] == "3"
+    # First attempt + a missing key both stamp "0" (matching RunPod's str(int(attempt))).
+    assert lb.build_worker_env({**base, "attempt": 0})["ATTEMPT"] == "0"
+    assert lb.build_worker_env(base)["ATTEMPT"] == "0"
+    # And the producer end actually carries the launched attempt into the payload bootstrap reads.
+    assert build_payload(_spec(), seed=0, attempt=2)["attempt"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +610,36 @@ def test_poll_caps_recovered_cost_at_done_timestamp(monkeypatch):
     assert res.metrics["cost_usd"] == round((9100.0 - 9000.0) / 3600.0 * 1.29, 6)
 
 
+def test_poll_retries_transient_metrics_blip_after_done(monkeypatch):
+    # A fresh DONE guarantees metrics.json was uploaded first, so a None read is a transient HF blip
+    # (the reader swallows 429/network and returns None) — it must be retried, not turned into a
+    # terminal job_failed that discards (while still billing) a successful run.
+    reads = {"n": 0}
+
+    def metrics():
+        reads["n"] += 1
+        return None if reads["n"] <= 2 else json.dumps({"wall_seconds": 100, "cost_usd": 0.0})
+
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], done="10500.0", metrics=metrics
+    )
+    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
+    assert res.ok, res
+    assert reads["n"] >= 3  # retried past the two transient None reads instead of failing
+
+
+def test_poll_persistent_metrics_unreadable_is_retriable_not_job_failed(monkeypatch):
+    # If metrics.json stays unreadable after retries, fail RETRIABLY (poll_error) so the run is
+    # re-attempted (a re-launch hits the worker's DONE-idempotency and restores the persisted
+    # metrics without re-training) — NEVER the terminal job_failed that drops a billed success.
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], done="10500.0", metrics=lambda: None
+    )
+    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "poll_error"
+
+
 def test_poll_marker_failure_is_job_failed(monkeypatch):
     jobs = _wire_poll(
         monkeypatch,
@@ -647,7 +727,7 @@ def test_poll_heartbeat_stall(monkeypatch):
     # A FRESH training heartbeat (ts >= launch 10_000) that then FROZE: it proves liveness (so the
     # fast first-liveness failover is satisfied) AND arms the tight training stall window, so the
     # subsequent no-progress gap past stall_after_s is the stall actually under test here.
-    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0}
+    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0, "attempt": "0"}
     res = jobs.poll_lambda_job(
         _handle(),
         _spec(),
@@ -793,7 +873,7 @@ def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
         seed=0,
         interval_s=0,
         first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0, "attempt": "0"},
     )
     assert res.failure == "job_preempted"
     assert "no worker liveness" not in (res.detail or "")
@@ -810,7 +890,7 @@ def test_poll_active_stale_heartbeat_does_not_satisfy_liveness(monkeypatch):
         seed=0,
         interval_s=0,
         first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 1.0},  # < launch
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 1.0, "attempt": "0"},
     )
     assert res.failure == "stalled"
     assert "no worker liveness" in res.detail
@@ -925,7 +1005,7 @@ def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     import re
 
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
-    hb = {"stage": "rl", "step": 7, "ts": 8500.0}
+    hb = {"stage": "rl", "step": 7, "ts": 8500.0, "attempt": "0"}
     res = jobs.poll_lambda_job(
         _handle(started_ts=8_000.0),
         _spec(),

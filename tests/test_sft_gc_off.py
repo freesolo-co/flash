@@ -146,8 +146,8 @@ def test_gate_keeps_gc_on_when_fused_ce_off():
     assert on is True
 
 
-def test_gate_unchanged_for_grpo_and_legacy_callers():
-    # No allow_disable -> the exact old behavior (memory-mode default): big model -> GC on.
+def test_gate_unchanged_without_disable_signal():
+    # No allow_disable -> memory-mode default: big model -> GC on.
     assert grad_checkpointing_on("Qwen/Qwen3.6-35B-A3B", 2368) is True
     # Even passing GPU signals positionally-free: without allow_disable they're ignored.
     assert (

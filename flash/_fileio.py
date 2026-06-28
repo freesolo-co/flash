@@ -9,21 +9,16 @@ from pathlib import Path
 
 
 def read_json_or_empty(path: Path) -> dict:
-    """Parse a JSON object file, returning ``{}`` if it's missing or unreadable."""
+    """Parse a JSON object file, returning ``{}`` on any error or if the root is not a dict."""
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def secure_json_write(path: Path, data: dict) -> None:
-    """Write ``data`` as JSON with private permissions (the file may hold a secret).
-
-    Creates the parent dir (0700) and opens the file 0600 from the start — never
-    write_text + chmod, which leaves it umask-readable in between. ``O_NOFOLLOW``
-    (where available) refuses to follow a symlink planted at ``path`` so the write
-    can't be redirected to clobber an arbitrary file.
-    """
+    """Write ``data`` as JSON 0600. Opens with O_CREAT|0o600 — never write_text+chmod (TOCTOU). O_NOFOLLOW blocks symlink redirect."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(path.parent, 0o700)

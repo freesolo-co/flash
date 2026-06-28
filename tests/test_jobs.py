@@ -55,6 +55,13 @@ def test_job_handle_roundtrip():
 
     h = JobHandle("ep123", "flash-5090-abc", "job456")
     assert JobHandle.from_dict(h.to_dict()) == h
+    # attempt persists so a cross-process reattach knows which attempt's heartbeats are current.
+    h2 = JobHandle("ep123", "flash-5090-abc", "job456", 2)
+    assert h2.to_dict()["attempt"] == 2
+    assert JobHandle.from_dict(h2.to_dict()) == h2
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).attempt == 0
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).endpoint_name == ""
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job", "attempt": "x"}).attempt == 0
 
 
 def test_decode_output_success():
@@ -458,7 +465,12 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         train=TrainSpec(steps=1, hf_repo=""),
         gpu=GpuSpec(type="A100"),
     )
-    base = {"provider": "runpod", "endpoint_id": "ep", "endpoint_name": "n", "job_id": "j"}
+    base = {
+        "provider": "runpod",
+        "endpoint_id": "ep",
+        "endpoint_name": "n",
+        "job_id": "j",
+    }
 
     PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True, "attempt": 2}), spec, 0)
     assert captured["queue_grace_s"] == 900.0
@@ -502,6 +514,51 @@ def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     h = jobs.JobHandle("ep", "name", "job")
     res = jobs.poll_job(h, interval_s=0, heartbeat_reader=lambda: None, queue_grace_s=900.0)
     assert res.ok
+
+
+def test_poll_job_throttled_timer_resets_on_leaving_queue(monkeypatch):
+    # A worker throttled in its FIRST queue window must not carry a stale arm-time across an
+    # IN_PROGRESS spell: if RunPod re-queues the job (still throttled), the throttled grace must be
+    # measured from the re-queue, not the original arm. Otherwise the first re-queue probe fires
+    # no_capacity instantly, defeating throttled_grace_s. Clock advances one tick per job_status poll.
+    import base64
+
+    import cloudpickle
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    ok = {"success": True, "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode()}
+    statuses = iter(
+        [
+            {"status": "IN_QUEUE"},  # arm throttled_timer (~t=100)
+            {"status": "IN_QUEUE"},  # accumulate (~t=200, still < grace 150 from t=100... fires at 250)
+            {"status": "IN_PROGRESS"},  # leaves the queue -> timer must reset
+            {"status": "IN_QUEUE"},  # re-queued, throttled: with a stale arm this would fire instantly
+            {"status": "COMPLETED", "output": ok},
+        ]
+    )
+    clock = {"t": 0.0}
+
+    def fake_job_status(eid, jid):
+        clock["t"] += 100.0
+        return next(statuses)
+
+    monkeypatch.setattr(runpod_api, "job_status", fake_job_status)
+    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: {"workers": {"throttled": 1}})
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        throttled_grace_s=150.0,
+        queue_grace_s=100_000.0,
+        setup_grace_s=100_000.0,
+        stall_after_s=100_000.0,
+    )
+    assert res.ok, res.detail  # completed; the re-queue throttle timer re-armed fresh, no false no_capacity
 
 
 def test_poll_job_setup_grace_before_first_heartbeat(monkeypatch):
@@ -550,6 +607,74 @@ def test_poll_job_tight_stall_after_first_heartbeat(monkeypatch):
     )
     assert res.failure == "stalled"
     assert "during training" in res.detail
+
+
+def test_poll_job_ignores_prior_attempt_heartbeat_keeps_setup_grace(monkeypatch):
+    # On a retry (current_attempt=1) the shared seed heartbeat path first returns the PRIOR attempt's
+    # leftover TRAINING heartbeat (attempt=0). It must be IGNORED so this cold start keeps the larger
+    # setup_grace_s instead of latching the dead attempt and dropping to the tight stall_after_s —
+    # otherwise a healthy-but-slow retry cold start (image pull + big snapshot_download) false-stalls.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    # Every read returns attempt 0's leftover training heartbeat; this poll is attempt 1.
+    leftover = {"stage": "train", "step": 5, "ts": 1, "attempt": 0}
+    h = jobs.JobHandle("ep", "name", "job", 1)
+    res = jobs.poll_job(
+        h,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: leftover,
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+        current_attempt=1,
+    )
+    assert res.failure == "stalled"
+    # The foreign-attempt heartbeat did NOT tighten the window: setup grace governed.
+    assert "during setup" in res.detail
+    assert "limit 5000s" in res.detail
+
+
+def test_reattach_passes_persisted_current_attempt(monkeypatch):
+    import types
+
+    from flash.providers import base
+    from flash.providers.runpod import RunpodProvider, jobs
+
+    captured = {}
+
+    def fake_poll_job(rh, **kw):
+        captured.clear()
+        captured.update(kw)
+        return base.PollResult(ok=True)
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+    spec = types.SimpleNamespace(phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None))
+
+    handle = base.JobHandle(
+        provider="runpod",
+        data={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "attempt": 2},
+    )
+    RunpodProvider().poll(handle, spec, 0)
+    assert captured["current_attempt"] == 2
+
+    for raw_attempt in ("", "x", None):
+        handle = base.JobHandle(
+            provider="runpod",
+            data={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "attempt": raw_attempt},
+        )
+        RunpodProvider().poll(handle, spec, 0)
+        assert captured["current_attempt"] is None
+
+    handle = base.JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j"})
+    RunpodProvider().poll(handle, spec, 0)
+    assert captured["current_attempt"] is None
 
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
@@ -938,6 +1063,32 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     assert res.metrics == {"acc": 1.0}
 
 
+def test_failure_detail_reader_is_attempt_scoped(monkeypatch, tmp_path):
+    """The failure-detail reader fetches error_<phase>_attempt<N>.txt (matching the worker's
+    error_artifact_name), so a retry can't surface a prior attempt's stale traceback as the crash."""
+    import huggingface_hub
+
+    from flash.providers.runpod.jobs import make_hf_failure_detail_reader
+
+    requested: list[str] = []
+    err_file = tmp_path / "err.txt"
+    err_file.write_text("BOOM traceback")
+
+    def fake_dl(repo, path_in_repo, **kw):
+        requested.append(path_in_repo)
+        if path_in_repo.endswith("error_sft_attempt2.txt"):
+            return str(err_file)
+        raise FileNotFoundError(path_in_repo)  # console + other attempts absent
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    reader = make_hf_failure_detail_reader("org/repo", "sft/run-1/seed0", "sft", attempt=2)
+    detail = reader(force=True)
+    assert "sft/run-1/seed0/error_sft_attempt2.txt" in requested
+    assert "sft/run-1/seed0/error_sft_attempt0.txt" not in requested
+    assert "--- error_sft_attempt2.txt ---" in detail
+    assert "BOOM traceback" in detail
+
+
 def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
     # Without a heartbeat_reader we can't tell setup from training, so the larger
     # setup_grace must NOT silently slow stall detection — stay on stall_after_s.
@@ -1018,7 +1169,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}", "attempt": attempt})
             if calls["n"] == 1:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1033,6 +1184,37 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert st.remote["job_id"] == "j2"  # latest handle persisted
 
 
+def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
+    """A cancel landing mid-attempt raised _RunCancelled straight out of the retry loop, skipping
+    _gc_seen_endpoints — leaking a walk-provisioned endpoint (one _gc_run_endpoints can't name, whose
+    `running` write lost the terminal-stickiness race so it's absent from status.remote). The cancel
+    path must now reap seen_endpoints."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.providers.runpod import api as runpod_api
+
+        deleted: list[str] = []
+        monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid))
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            orch._update(spec.run_id, "cancelled")  # cancel lands during provisioning
+            if on_handle:  # endpoint comes up anyway; its "running" write is rejected (terminal)
+                on_handle({"endpoint_id": "epWALK", "endpoint_name": "n", "job_id": "jW", "attempt": attempt})
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        orch.submit_job(_spec("cancel-reap"), dry_run=False, background=False)
+
+        assert orch.get_status("cancel-reap").state == "cancelled"
+        assert orch.get_status("cancel-reap").remote is None  # handle write lost the stickiness race
+        assert "epWALK" in deleted  # the walked endpoint was reaped on the cancel path
+
+
 def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
     # A "job_preempted" first attempt retries on a fresh endpoint and completes.
     with tempfile.TemporaryDirectory() as tmp:
@@ -1045,7 +1227,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}", "attempt": attempt})
             if calls["n"] == 1:
                 return jobs.PollResult(False, failure="job_preempted", detail="[CANCELLED] None")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1153,7 +1335,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1253,7 +1435,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1305,7 +1487,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
             last_flags.append(on_last_gpu)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1359,7 +1541,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
@@ -1433,7 +1615,7 @@ def test_cancel_uses_rest_handle(monkeypatch):
             run_id="c1",
             state="running",
             spec=_spec("c1").to_dict(),
-            remote={"endpoint_id": "epX", "endpoint_name": "n", "job_id": "jX"},
+            remote={"endpoint_id": "epX", "endpoint_name": "n", "job_id": "jX", "attempt": 0},
         )
         orch._save_status(status)
         cancelled, deleted = [], []

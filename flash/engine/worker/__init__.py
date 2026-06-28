@@ -1,55 +1,16 @@
-"""On-GPU fine-tuning worker (RunPod). Modes: sft | rl.
+"""On-GPU fine-tuning worker. Modes: sft | rl.
 
-This module runs on the provisioned RunPod GPU. It uses the shared recipe
-(``flash.engine.recipe``) so SFT targets and RL rewards are rendered and scored
-consistently.
-
-Artifacts (adapter, metrics.json, heartbeat.json, checkpoints) are streamed to a
-Hugging Face dataset repo. HF checkpoints give preemption resilience: if a worker is
-recycled mid-run we resume from the latest uploaded checkpoint. Metrics are also
-returned directly to the caller by the launching provider.
-
-Core environment variables (set by the launching provider / runner):
-  RUN_MODE      sft|rl
-  SEED          int
-  HF_REPO       Hugging Face dataset repo for artifacts, populated per-run from the
-                JobSpec's [train] hf_repo by whichever provider launches the worker
-  HF_TOKEN
-  RUN_ID        unique id for this run (namespacing in the repo)
-
-The FLASH_*/RL_*/SFT_* env vars are A/B overrides documented at their use sites; the
-JobSpec [train] table is the source of truth for per-run knobs.
-
-This package is split into cohesive submodules (``hf``/``heartbeat``/``decoding``/``wandb_log``/
-``grpo``/``gpu_setup``/``adapter``/``sft``/``rl``/``finalize``, plus the leaf ``lora``/``perf``);
-THIS module is the namespace hub. It (1) owns the run-scoped STATE module globals, (2) keeps
-``import os`` / ``import time`` at module level (tests patch ``worker.os._exit`` /
-``worker.time.sleep``), (3) defines ``main`` + ``_finalize``, and (4) re-exports every moved name.
-
-CRITICAL monkeypatch contract: tests do ``monkeypatch.setattr(worker, "<name>", ...)`` for both
-functions (``heartbeat``/``hf_api``/``run_sft``/``finalize_alloc_conf_for_sleep``/
-``lora_exclude_modules``/``_ensure_fla_fastpath_on_hopper``/``hf_upload_file`` ...) and STATE
-(``JOB_SPEC``/``HF_REPO``/``RUN_ID``/``RUN_MODE``/``PHASE``/``SEED``/``_HB_*`` ...). For a patch on
-``worker.<name>`` to reach a caller, the caller must resolve ``<name>`` THROUGH this package at call
-time, NOT via a bound local. The submodules therefore import the live-package proxy
-(``from flash.engine.worker._pkg import W as _w``) and call ``_w.heartbeat(...)`` / read
-``_w.JOB_SPEC`` etc.; the proxy always delegates to ``sys.modules['flash.engine.worker']`` so the
-patch is seen even across the ``sys.modules.pop + re-import`` / ``importlib.reload`` that some tests
-use. ``main``/``_finalize`` call the moved helpers via their bare (re-exported) names, which resolve
-to this module's globals.
+Namespace hub: owns run-scoped STATE globals, defines ``main`` + ``_finalize``, re-exports
+every submodule name. Submodules read state via ``_w.<name>`` (live-package proxy) so
+``monkeypatch.setattr(worker, "<name>", ...)`` is seen at call time, not captured at import.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
-import tempfile
 
-# Imported (unused in this hub) so ``worker.threading`` resolves to the stdlib module: tests patch
-# ``worker.threading.Thread`` to run the daemon HF-upload thread inline, and since ``threading`` is a
-# process-wide singleton the patch reaches the submodules' ``threading.Thread`` (e.g. hf.py). Dev's
-# pre-split monolith imported threading at top level, so this preserves that attribute on the package.
+# Unused here; ``worker.threading.Thread`` is patched by tests to run upload threads inline.
 import threading  # noqa: F401
 import time
 import traceback
@@ -112,11 +73,7 @@ from flash.engine.worker.hf import (
     publish_deployable_checkpoint,
     upload_debug_jsonl,
 )
-
-# Re-export the pure leaf helpers (``.lora`` / ``.perf``). The retained readers (main/_finalize)
-# and several submodules call some of these by their bare name, which resolves through THIS
-# module's namespace — so a test's ``monkeypatch.setattr(worker, "<name>", ...)`` still reaches
-# them. Every name is listed in ``__all__`` so the re-export is not flagged as unused.
+from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     _VL_EXCLUDE_SEGMENTS,
@@ -174,71 +131,38 @@ from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
 from flash.spec import FIXED_SEED, load_job_spec_from_env
 
-# ------------------------------------------------------------------------------------------------
-# Run-scoped STATE (module globals). Set once at import from the launch env / JobSpec; tests patch
-# these via ``monkeypatch.setattr(worker, "<name>", ...)``. The submodules read them as
-# ``_w.<name>`` so those patches take effect.
-# ------------------------------------------------------------------------------------------------
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
 SEED = int(os.environ.get("SEED", str(FIXED_SEED)))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = os.environ.get("ATTEMPT", "")
 JOB_SPEC = load_job_spec_from_env()
-# PHASE is the stable artifact namespace (sft|rl) and matches RUN_MODE for a train run.
 PHASE = os.environ.get(
     "PHASE",
     JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl") else "sft"),
 )
 
-# Heartbeat HF-commit throttle knobs (patched by tests; the heartbeat reader in ``heartbeat.py``
-# reads these as ``_w.<name>``). Each heartbeat() commits heartbeat.json to the HF artifact repo;
-# committing every training step blows HuggingFace's per-repo commit rate limit (128/hour), so the
-# per-step "rl_step"/"sft_step" stages are throttled to once per _HB_MIN_INTERVAL_S; terminal stages
-# always commit. _HB_TERMINAL_ONLY (benchmark fan-out) throttles every non-terminal stage. The stdout
-# HEARTBEAT line is always printed regardless — heartbeats are HF-only; there is no worker-local file.
 _HB_LAST_UPLOAD = 0.0
-# Wall-clock of the last REAL (non-liveness) heartbeat — the liveness daemon dumps stacks if this
-# goes stale (the provider stalls off the same signal: it skips liveness pings).
 _HB_LAST_PROGRESS_TS = 0.0
-# The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
-# 128 commits/hour-per-repo limit when concurrent runs share one HF_REPO.
+# 60s throttle keeps GRPO under HF's 128 commits/hour-per-repo limit.
 _HB_MIN_INTERVAL_S = 60.0
 _HB_TERMINAL_ONLY = False
 
-# wandb_finish() join timeout (s). On SUCCESS wandb.finish() must flush the whole run (a slow
-# network / large run can exceed the old 5s and leave the run "crashed"), so give it a
-# generous-but-bounded window; on FAILURE abort fast (the run is failing regardless and the worker
-# is hard-exiting). wandb_finish (in wandb_log.py) reads these THROUGH the worker package (_w.<name>)
-# so a test's monkeypatch.setattr(worker, "_WANDB_FINISH_FAIL_WAIT_S", ...) is honored.
 _WANDB_FINISH_WAIT_S = 120.0
 _WANDB_FINISH_FAIL_WAIT_S = 5.0
 
 
 def _load_active_env():
-    """Load the run's Freesolo environment from the JobSpec; require an explicit env.
-
-    There is no default/builtin environment: a run MUST name a published Freesolo
-    environment id. Failing here prevents a paid worker from training/evaluating the
-    wrong task.
-    """
+    """Load the run's Freesolo environment from the JobSpec; require an explicit env."""
     if JOB_SPEC is None:
-        # No JobSpec at all (e.g. the module imported for a non-run path / a unit test). There
-        # is nothing to select; defer the hard requirement to the JobSpec-present branch so the
-        # module stays importable. A real run always carries a JobSpec.
         return None
     env_id = JOB_SPEC.environment.id
     if not env_id:
-        # Every supported algorithm (sft/grpo) trains/evaluates against a Freesolo env, so a
-        # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
-        # default and burn a paid worker on the wrong task.
         raise RuntimeError(
             "JobSpec sets no environment: provide [environment] id "
             "(a Freesolo environment id like 'your-name/your-env', returned by "
             "`flash env push --name <name>`)."
         )
-    # Pass the control-plane-pinned commit sha (resolve-once hook) when present so the adapter
-    # skips the GitHub ref->sha resolve; "" (the default) keeps the worker resolving it itself.
     return load_environment(
         env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
     )
@@ -254,15 +178,7 @@ _VL_WARMSTART_SFT_DIR: str | None = None
 
 
 def require_active_env():
-    """Return the run's loaded environment, or raise a CLEAR error when there is none.
-
-    ``ACTIVE_ENV`` is None on the no-JobSpec path (the module is imported with no
-    FLASH_JOB_SPEC_JSON/PATH, e.g. a misconfigured worker launch). Every train/eval consumer
-    needs a real env; without this guard the first ``ACTIVE_ENV.<attr>`` access dies with an
-    opaque ``AttributeError: 'NoneType' object has no attribute ...``. Fail loudly with an
-    actionable message instead — mirrors the explicit RuntimeError raised when a JobSpec is
-    present but names no environment.
-    """
+    """Return the run's loaded environment, raising a clear error if none is loaded."""
     global ACTIVE_ENV
     if ACTIVE_ENV is None:
         ACTIVE_ENV = _load_active_env()
@@ -282,17 +198,12 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
     return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
 
 
-# Thinking/reasoning mode: one flag per run from the run config (TOML `thinking`), consumed
-# identically by SFT rendering, RL rollouts, and serving. Defaults off without a JobSpec.
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
-# Completion: train phase writes metrics.json + the DONE sentinel (see _finalize).
 def _finalize(metrics: RunMetrics):
     metrics.save("/tmp/metrics.json")
-    # Required: a swallowed upload would make the control plane fail/retry a finished run.
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
-    # DONE sentinel so the controller knows it's safe to tear down
     with open("/tmp/DONE", "w") as f:
         f.write(str(time.time()))
     hf_upload_file("/tmp/DONE", "DONE", required=True)
@@ -300,93 +211,9 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
-# Baked compiled-kernel cache (opt-in; see Dockerfile.worker + flash/engine/worker/kernel_warmup.py).
-# The Dockerfile points TRITON_CACHE_DIR/TORCHINDUCTOR_CACHE_DIR here and, when built with
-# --build-arg BUILD_KERNEL_CACHE=true, bakes a portable mega-cache produced on a real GPU. These
-# names are kept in lockstep with kernel_warmup.DEFAULT_CACHE_DIR / MEGA_CACHE_FILENAME.
-_KERNEL_CACHE_DIR = "/opt/flash/kernelcache"
-_KERNEL_CACHE_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.bin")
-_KERNEL_CACHE_META_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.json")
-
-
-def _current_cuda_sm(torch) -> str | None:
-    try:
-        if not torch.cuda.is_available():
-            return None
-        cap = torch.cuda.get_device_capability(0)
-        return f"sm{cap[0]}{cap[1]}"
-    except Exception:
-        return None
-
-
-def _load_kernel_cache_if_present() -> bool:
-    """Best-effort: if a baked mega-cache blob exists, load it so the worker skips first-run JIT.
-
-    Loads the portable cache that kernel_warmup.py wrote on a GPU builder via
-    ``torch.compiler.load_cache_artifacts()`` — measured cold compile ~124s -> warm load ~0.2s.
-    OPT-IN: when no baked cache is present (the default image build), this is a no-op and the worker
-    JITs on first use exactly as before (#163's init heartbeat covers that stall). Never raises:
-    a missing torch / missing file / unusable blob just logs and leaves the JIT path intact.
-    """
-    def _reject(reason: str) -> bool:
-        # a baked cache is present but unusable (no/garbled metadata or wrong arch): repoint
-        # triton/inductor OFF the baked trees (Dockerfile points them at /opt/flash/kernelcache)
-        # so the JIT fallback compiles fresh into scratch instead of reusing wrong-arch baked
-        # entries that would collide with this worker's arch.
-        print(f"[kernel-cache] {reason} -> first-run JIT fallback")
-        scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
-        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
-            d = os.path.join(scratch, sub)
-            os.makedirs(d, exist_ok=True)
-            os.environ[var] = d
-        return False
-
-    if not os.path.isfile(_KERNEL_CACHE_FILE):
-        print(f"[kernel-cache] no baked cache at {_KERNEL_CACHE_FILE} -> first-run JIT (expected default)")
-        return False
-    try:
-        import torch
-
-        current_sm = _current_cuda_sm(torch)
-        try:
-            with open(_KERNEL_CACHE_META_FILE) as f:
-                meta = json.load(f)
-        except FileNotFoundError:
-            return _reject("baked cache has no metadata")
-        except Exception as e:
-            return _reject(f"metadata unreadable ({e})")
-        cached_sm = str(meta.get("sm") or "")
-        if not current_sm:
-            # can't verify the worker's GPU arch -> don't risk loading a wrong-arch blob; JIT instead.
-            return _reject("worker GPU arch undetermined")
-        if cached_sm != current_sm:
-            return _reject(
-                f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
-            )
-        with open(_KERNEL_CACHE_FILE, "rb") as f:
-            blob = f.read()
-        torch.compiler.load_cache_artifacts(blob)
-        print(
-            f"[kernel-cache] loaded baked mega-cache for {cached_sm or 'unknown'} "
-            f"({len(blob)} bytes) -> skipping first-run JIT"
-        )
-        return True
-    except Exception as e:
-        # never block boot on a bad/absent cache: fall back to the normal JIT path. repoint off the
-        # baked trees too — if the mega blob was present + arch-matched but load raised, the on-disk
-        # triton/inductor entries may be partial/corrupt, so JIT fresh into scratch.
-        return _reject(f"load skipped ({e})")
-
-
 def main():
-    # Idempotency: if DONE was already uploaded, a re-delivered job re-fetches the final
-    # metrics from HF and returns them immediately. (The previous behavior — sleeping in
-    # an infinite loop — kept a billable GPU worker alive until the execution timeout.)
     try:
-        # Idempotency FIRST — before any env-mutating pip install / package removal: a re-delivered
-        # job whose DONE already exists must return the persisted metrics and exit WITHOUT running
-        # _ensure_fla_fastpath_on_hopper() (mutates the env: pip-installs tilelang/fla) — that wasted
-        # a worker mutating its env on an already-complete run. It runs after the DONE check below.
+        # Idempotency: check DONE before any env-mutating pip install (fla fast path).
         if HF_REPO:
             from huggingface_hub import hf_hub_download
 
@@ -403,65 +230,54 @@ def main():
             if done:
                 print("Run already complete (DONE present); returning persisted metrics.")
                 heartbeat("already_done", gpu=gpu_diagnostics(include_torch=False))
-                try:
-                    got = hf_hub_download(
-                        repo_id=HF_REPO,
-                        repo_type="dataset",
-                        filename=f"{hf_prefix()}/metrics.json",
-                        token=os.environ.get("HF_TOKEN"),
-                    )
-                    import shutil
+                # DONE is written only AFTER metrics.json uploads (required=True), so a failed read here
+                # is a transient HF blip, never a missing file. Retry, then signal RETRIABLE (reschedule)
+                # rather than SystemExit — a BaseException that bypasses the retriable-stamping handler
+                # below and would report a genuinely-succeeded run as a fatal failure.
+                last_err: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        got = hf_hub_download(
+                            repo_id=HF_REPO,
+                            repo_type="dataset",
+                            filename=f"{hf_prefix()}/metrics.json",
+                            token=os.environ.get("HF_TOKEN"),
+                        )
+                        import shutil
 
-                    shutil.copy(got, "/tmp/metrics.json")
-                    sys.stdout.flush()
-                    os._exit(0)
-                except Exception as e:
-                    raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
-        # Not a DONE re-delivery -> this worker will train. These must run before any model import:
-        _ensure_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
-        # Repoint tilelang's libcudart_stub.so at the real CUDA runtime so it can't shadow libcudart
-        # in vLLM's CudaRTLibrary (intermittent `undefined symbol: cudaDeviceReset` on GRPO vLLM
-        # init, any model size/arch). AFTER the fla fast path (a tilelang reinstall there rewrites
-        # the stub) and BEFORE the model/vLLM import. See perf.py / flash #184.
+                        shutil.copy(got, "/tmp/metrics.json")
+                        sys.stdout.flush()
+                        os._exit(0)
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(5 * (attempt + 1))
+                raise RetriableInfraError(
+                    f"DONE present but metrics.json unreadable after retries (transient HF): {last_err}"
+                )
+        _ensure_fla_fastpath_on_hopper()
+        # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
         _neutralize_tilelang_cudart_stub()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
-        finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
-        # Opt-in: load a baked compiled-kernel mega-cache (if the image shipped one) so the worker
-        # skips the ~10-15 min first-run JIT. Best-effort + no-op when absent (the default), so the
-        # normal JIT path is untouched. Runs AFTER finalize_alloc_conf_for_sleep: _load probes CUDA
-        # (_current_cuda_sm -> get_device_capability triggers CUDA init), so the allocator conf must be
-        # resolved first; still before any model/kernel import that would otherwise trigger compilation.
-        _load_kernel_cache_if_present()
-        # Dispatch table — register new algorithms (e.g. ppo) here as they land.
+        finalize_alloc_conf_for_sleep()
+        load_mega_cache()
         modes = {
-            "sft": run_sft,  # SFT (TRL SFTTrainer)
-            "rl": run_rl,  # GRPO (TRL GRPOTrainer + colocated vLLM)
+            "sft": run_sft,
+            "rl": run_rl,
         }
         handler = modes.get(RUN_MODE)
         if handler is None:
             raise SystemExit(f"unknown RUN_MODE {RUN_MODE}; known: {sorted(modes)}")
         handler()
-        # All artifacts (adapter, train_meta, metrics, DONE) are uploaded to HF *inside* the
-        # handler. The RL trainer's colocated vLLM can DEADLOCK at interpreter shutdown
-        # during NCCL/IPC/CUDA teardown — not segfault-and-exit (which `check=False` on the
-        # train subprocess already tolerates), but hang forever. That would block the Flash
-        # handler's *blocking* `subprocess.run` (heartbeat frozen at "rl_train_done") and the
-        # whole run stalls until the wall-clock cap. Hard-exit to bypass the hanging teardown now that
-        # every output is safely persisted.
-        wandb_finish(exit_code=0)  # mark the W&B run finished BEFORE os._exit (which skips wandb's atexit sync)
+        # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
+        wandb_finish(exit_code=0)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
-        # Structured retry signal both pollers read: an infra failure -> retry on a fresh worker.
-        # GitHubRateLimitError (env ref resolution hit a persistent GitHub rate limit) is retriable:
-        # reschedule on a fresh worker once the limit window resets rather than hard-failing. Env
-        # resolution runs lazily inside this try (require_active_env, called by the handlers above),
-        # never at import, so a rate-limit raise reaches here and is classified correctly.
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
-            err_name = error_artifact_name(RUN_MODE)
+            err_name = error_artifact_name(RUN_MODE, ATTEMPT)
             err_path = f"/tmp/{err_name}"
             with open(err_path, "w") as f:
                 f.write(tb)
@@ -475,17 +291,11 @@ def main():
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags)
-        # keep container alive briefly so logs flush, then exit non-zero -> restart
-        wandb_finish(exit_code=1)  # finalize the W&B run as failed (don't leave it dangling -> "crashed")
+        wandb_finish(exit_code=1)
         time.sleep(10)
         raise
 
 
-# A single flat, alphabetically-sorted list (enforced by ruff RUF022). It re-exports the worker's
-# own public names plus the leaf-module symbols pulled in above. We deliberately do NOT carry
-# semantic section headers ("# decoding", "# heartbeat", ...) here: RUF022 sorts the whole list
-# alphabetically, which scatters each semantic group across the alphabet, so any such header ends up
-# mislabeling whatever happens to sort beneath it (and silently rots as names are added/removed).
 __all__ = [
     "ACTIVE_ENV",
     "ATTEMPT",
@@ -514,6 +324,7 @@ __all__ = [
     "RetriableInfraError",
     "_GpuPeakSampler",
     "_attn_impl_for_capability",
+    "_current_cuda_sm",
     "_download_adapter",
     "_ensure_fla_fastpath_on_hopper",
     "_estimate_params",
@@ -562,6 +373,7 @@ __all__ = [
     "hf_upload_folder",
     "is_vl_checkpoint",
     "liger_on",
+    "load_mega_cache",
     "lora_exclude_modules",
     "loraplus_optimizer_cls",
     "main",
