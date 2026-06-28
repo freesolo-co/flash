@@ -461,6 +461,24 @@ def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
     assert w.rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 2
 
 
+def test_rl_per_device_fused_logits_lifts_budget(monkeypatch) -> None:
+    """When the fused GRPO loss is on (use_liger_kernel, unconditional on the GRPO path) the fp32
+    [pd, completion, vocab] logits are NEVER materialized, so the 6 GB logits budget should NOT bind
+    — it models a tensor that doesn't exist. ``fused_logits=True`` drops the budget term so the
+    ceiling / activation cap binds instead. The biggest beneficiary is a long multi-turn transcript,
+    where the unfused cap collapses to 1."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _no_cuda(monkeypatch)  # offline: result = min(default 8, logits_cap)
+    # A 4096-tok completion at 248k vocab: unfused budget ~= 6e9/(4096*248320*4) ~ 1.4 -> binds at 1.
+    assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True) == 1
+    # Fused: the 6 GB term is dropped -> the offline default (8) binds, NOT the phantom-logits cap.
+    assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, fused_logits=True) == 8
+    # Default is unfused (the safety net stays in force for the non-liger fallback path).
+    assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, fused_logits=False) == 1
+
+
 def _no_cuda(monkeypatch) -> None:
     """Force the offline path: a `torch` whose CUDA is unavailable, so rl_per_device_comps falls
     back to its historical default regardless of whether the test host has a GPU."""
@@ -512,6 +530,35 @@ def test_rl_per_device_grows_to_plateau_ceiling_on_roomy_card(monkeypatch) -> No
     monkeypatch.setattr(w, "THINKING", False, raising=False)
     _fake_cuda(monkeypatch, 79.3)
     assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
+
+
+def test_rl_per_device_moe_active_params_aware(monkeypatch) -> None:
+    """MoE (A3B): the per-device completion micro-batch's activation/VRAM cap must size on the
+    ACTIVE backbone (~3B for the 35B-A3B), not the 35B resident total. Without it, sqrt(35) crushes
+    vram_cap BELOW the dense default ceiling (8), throttling the A3B below dense models despite cheap
+    active compute + ~100 GB free VRAM during the sleep-offloaded backward (the 2-8% GPU-util bug).
+    On a B200-class card at the GRPO default sequence: total-width -> 5, active-width -> 8 (~1.6x),
+    a pure speed/VRAM knob (grad-accum holds the effective batch, so reward is identical)."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _fake_cuda(monkeypatch, 178.0)  # B200-class ~180 GB
+    # 35B total width throttles the A3B to 5 (below the dense default ceiling of 8) ...
+    assert (
+        w.rl_per_device_comps(384, vocab=248_320, use_vllm=True, params_b=35.0, seq_len=2368) == 5
+    )
+    # ... active 3B width lifts it to the dense-validated ceiling (8). ~1.6x bigger GEMMs / step.
+    assert (
+        w.rl_per_device_comps(
+            384, vocab=248_320, use_vllm=True, params_b=35.0, active_params_b=3.0, seq_len=2368
+        )
+        == 8
+    )
+    # Dense (no active_params_b) is byte-unaffected: falls back to params_b.
+    assert (
+        w.rl_per_device_comps(384, vocab=248_320, use_vllm=True, params_b=35.0, active_params_b=None, seq_len=2368)
+        == 5
+    )
 
 
 def test_rl_per_device_thinking_not_grown_by_short_seq(monkeypatch) -> None:
@@ -818,6 +865,63 @@ def test_run_rl_threads_prompt_opened_thinking_to_grading_and_penalty() -> None:
             "it the prompt-opened-<think> fix silently no-ops (the length penalty and <think> strip "
             "do nothing on the common enable_thinking=true path — PR #281)"
         )
+
+
+def test_run_rl_fused_logits_keeps_cap_when_vllm_importance_sampling_runs() -> None:
+    """Codex MtcPF: TRL's colocated-vLLM path runs a SEPARATE old_per_token_logps forward for its
+    importance-sampling (TIS) correction whenever vllm_importance_sampling_correction is on — TRL's
+    default, which run_rl only tunes (mode/clip) and never disables — even at mu==1. That unfused
+    [pd, completion, vocab] forward still materializes full logits, so the 6 GB cap must stay; dropping
+    it (fused_logits=True) sizes per_device too large and OOMs the IS forward on long completions. So
+    the fused_logits gate must ALSO require the vLLM IS forward to be off (``_vllm_is_logprob_forward``),
+    resolved BEFORE the sizer and from the correction's effective state + use_vllm. AST-based so it
+    survives reformatting (mirrors the resolved-mu wiring test above)."""
+    import ast
+    import inspect
+
+    import flash.engine.worker as w
+
+    src = inspect.getsource(w.run_rl)
+    tree = ast.parse(src)
+
+    def _is_sizer(call: ast.Call) -> bool:
+        f = call.func
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+        return name == "rl_per_device_comps"
+
+    sizer = next((n for n in ast.walk(tree) if isinstance(n, ast.Call) and _is_sizer(n)), None)
+    assert sizer is not None, "run_rl no longer calls rl_per_device_comps"
+    fused_kw = next((k for k in sizer.keywords if k.arg == "fused_logits"), None)
+    assert fused_kw is not None, "rl_per_device_comps call no longer passes fused_logits"
+
+    names = {n.id for n in ast.walk(fused_kw.value) if isinstance(n, ast.Name)}
+    assert "_vllm_is_logprob_forward" in names, (
+        "fused_logits must keep the 6 GB cap when TRL's vLLM importance-sampling correction runs an "
+        "old_per_token_logps forward (on by default even at mu==1) — gate on _vllm_is_logprob_forward"
+    )
+
+    gate_line = min(
+        (
+            t.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for t in node.targets
+            if isinstance(t, ast.Name) and t.id == "_vllm_is_logprob_forward"
+        ),
+        default=None,
+    )
+    assert gate_line is not None, "run_rl no longer assigns _vllm_is_logprob_forward"
+    assert gate_line < sizer.lineno, (
+        "_vllm_is_logprob_forward must be resolved BEFORE the rl_per_device_comps call"
+    )
+    # The gate must reflect BOTH the vLLM rollout path and the correction's effective state — the only
+    # vLLM path runs the forward, and the field name is what TRL keys the correction off of.
+    assert "use_vllm" in {
+        n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+    }, "the TIS gate must consider use_vllm (only the vLLM rollout path runs the IS forward)"
+    assert "vllm_importance_sampling_correction" in src, (
+        "run_rl must detect TRL's vllm_importance_sampling_correction state to gate the logits cap"
+    )
 
 
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:
