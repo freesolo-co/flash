@@ -26,11 +26,71 @@ def _memory_mode(model_id: str, max_length: int = 0) -> bool:
     return _liger_default_for_model(model_id)
 
 
-def grad_checkpointing_on(model_id: str, max_length: int = 0) -> bool:
-    """Gradient checkpointing recomputes the forward in backward (~25% slower) to save activation
-    memory — a MEMORY feature, not speed. ON for large models / long context that need the
-    headroom; OFF for small+short runs that fit without it (the speed win)."""
-    return _memory_mode(model_id, max_length)
+def grad_checkpointing_on(
+    model_id: str,
+    max_length: int = 0,
+    *,
+    allow_disable: bool = False,
+    card_vram_gb: float = 0.0,
+    capability: tuple[int, int] | None = None,
+    active_params_b: float | None = None,
+    hidden: int = 0,
+    num_layers: int = 0,
+    fused_ce: bool = False,
+    per_device_bs: int = 0,
+    lora_rank: int = 32,
+) -> bool:
+    """Gradient checkpointing recomputes the forward in backward (one extra forward ~= +33% compute)
+    to save activation memory — a MEMORY feature, not speed. ON for large models / long context that
+    need the headroom; OFF for small+short runs that fit without it (the speed win).
+
+    SFT GC-OFF opportunity (``allow_disable=True``, the SFT path only — NOT the colocated GRPO
+    trainer at rl.py, where two ~70 GB weight copies + KV leave no room to drop GC): for a big MoE
+    whose ACTIVE backbone is cheap (35B-A3B) on a BIG datacenter card (>=120 GB H200/B200, sm90+),
+    with fused CE removing the [B,T,vocab] logit spike, the no-recompute activations FIT with margin —
+    so GC is pure tax. Turn it OFF when ``sft_grad_checkpoint_can_disable`` confirms the GC-off peak
+    fits the REAL card (the allocator sized for the GC-*on* peak, so this is the independent guard).
+    Legacy / GRPO callers (``allow_disable=False``) keep the exact old behavior."""
+    base = _memory_mode(model_id, max_length)
+    if not allow_disable:
+        return base  # GRPO trainer + legacy callers: unchanged (memory-mode default)
+    if not base:
+        return False  # small + short -> already off (the speed default)
+    # Auto GC-off: big MoE (cheap active backbone) + fused CE + big datacenter card + the GC-off peak
+    # fits with margin. Every clause is conservative; any unknown keeps GC ON.
+    if (
+        fused_ce
+        and active_params_b
+        and card_vram_gb
+        and card_vram_gb >= 120.0
+        and (capability is None or capability >= (9, 0))
+    ):
+        from flash.catalog import MODELS
+
+        info = MODELS.get(model_id)
+        params_b = float(getattr(info, "params_b", 0.0) or 0.0) if info else 0.0
+        quant = (getattr(info, "quant", "bf16") or "bf16") if info else "bf16"
+        if params_b > 0:
+            from flash.engine.vram import sft_grad_checkpoint_can_disable
+
+            if sft_grad_checkpoint_can_disable(
+                params_b,
+                active_params_b=active_params_b,
+                seq_len=max_length,
+                hidden=hidden,
+                num_layers=num_layers,
+                card_vram_gb=card_vram_gb,
+                batch=per_device_bs or 4,
+                lora_rank=lora_rank,
+                quant=quant,
+            ):
+                print(
+                    f"[sft] gradient checkpointing OFF: GC-off peak fits {card_vram_gb:.0f} GB "
+                    f"(active={active_params_b}B, seq={max_length}, {num_layers}L x {hidden}h, "
+                    "fused CE) -> drop the ~+33% recompute tax"
+                )
+                return False
+    return True
 
 
 def grpo_sleep_mode(
@@ -42,6 +102,7 @@ def grpo_sleep_mode(
     lora_rank: int = 32,
     thinking: bool = False,
     card_vram_gb: float = 0.0,
+    fp8_kv: bool = False,
 ) -> bool:
     """Whether colocated-vLLM GRPO should enable vLLM sleep mode (offload the rollout engine
     between steps).
@@ -52,18 +113,22 @@ def grpo_sleep_mode(
     when the policy + colocated rollout engine + training peak all fit on ``card_vram_gb`` (the
     common case on an allocator-sized card), skip sleep mode entirely. Falls back to the
     size/context gate (``_memory_mode``) when the card VRAM is unknown."""
-    from flash.engine.vram import grpo_fits_resident, grpo_rollout_seq_len
-
     # Gate on the rollout length run_rl() ACTUALLY launches (max(1024, prompt+completion) when
     # [train].max_length is unset -- 2368 default / 3584 thinking), NOT the raw max_length. With
     # max_length unset (0) the size/context pre-filter would see a 0-length "short" run and early-
     # exit for a sub-3B model, skipping the resident-fit check that a long max_tokens rollout needs.
+    from flash.catalog import MODELS
+    from flash.engine.vram import grpo_fits_resident, grpo_rollout_seq_len
+
+    _info = MODELS.get(model_id)
+    _sleep_broken = bool(_info is not None and getattr(_info, "sleep_unsupported", False))
     seq_len = grpo_rollout_seq_len(max_length, max_tokens, thinking)
-    if not _memory_mode(model_id, seq_len):
+    if not _memory_mode(model_id, seq_len) and not _sleep_broken:
         return False  # small model AND genuinely short rollout -> never needed
+    _fits = None  # None = couldn't check (no card info)
     if card_vram_gb and card_vram_gb > 0:
         try:
-            if grpo_fits_resident(
+            _fits = grpo_fits_resident(
                 model_id,
                 seq_len=seq_len,
                 max_tokens=max_tokens,
@@ -71,10 +136,24 @@ def grpo_sleep_mode(
                 group_size=group_size,
                 thinking=thinking,
                 card_vram_gb=card_vram_gb,
-            ):
-                return False  # fits resident -> skip the (buggy, slow) sleep/wake cycle
+                fp8_kv=fp8_kv,
+            )
         except Exception as e:
             print("[rl] grpo sleep-mode resident check skipped:", e)
+    if _fits:
+        return False  # fits resident -> skip the (buggy, slow) sleep/wake cycle
+    if _sleep_broken:
+        # vLLM sleep is NON-FUNCTIONAL for this model (the wake/reload HANGS -- see ModelInfo
+        # .sleep_unsupported). NEVER return True (that would route to the hang). If we positively know
+        # it doesn't fit resident, REJECT with a clear error; if we couldn't check (no card info),
+        # attempt RESIDENT anyway -- a possible OOM beats a guaranteed wake-hang.
+        if _fits is False:
+            raise ValueError(
+                f"{model_id}: GRPO config (engine context ~{seq_len} tok, group={group_size}) does NOT "
+                f"fit RESIDENT on {card_vram_gb:.0f} GB and vLLM sleep mode HANGS this model "
+                f"(resident-only). Reduce [train].max_length and/or group_size to fit resident."
+            )
+        return False
     return True
 
 
