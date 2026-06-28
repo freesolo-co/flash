@@ -1,15 +1,13 @@
-"""Tests for the Freesolo SDK environment adapter + install manifest."""
+"""Tests for the Freesolo SDK environment adapter."""
 
 from __future__ import annotations
 
 import gzip
-import importlib
 import io
 import json
 import os
 import sys
 import tarfile
-import tempfile
 import tracemalloc
 import types
 from dataclasses import dataclass, field
@@ -184,8 +182,8 @@ def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch)
     # ex_a appears twice (a GRPO group) interleaved with ex_b -> grouping must preserve input order.
     items = [
         (ex_a, {"response_text": "the answer is 4"}),  # -> 1.0
-        (ex_b, {"response_text": "it is 6"}),           # -> 1.0
-        (ex_a, {"response_text": "nope"}),              # -> 0.0
+        (ex_b, {"response_text": "it is 6"}),  # -> 1.0
+        (ex_a, {"response_text": "nope"}),  # -> 0.0
     ]
     reference = [env.reward(st["response_text"], ex, st) for ex, st in items]
     sdk_env.score_responses_calls = 0
@@ -193,9 +191,9 @@ def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch)
 
     out = env.reward_many(items)
 
-    assert out == reference == [1.0, 1.0, 0.0]          # byte-identical + input order
-    assert sdk_env.score_responses_calls == 2           # grouped: {ex_a:2, ex_b:1}, not 3 serial calls
-    assert sorted(sdk_env.batch_sizes) == [1, 2]        # ex_a's two completions scored in ONE call
+    assert out == reference == [1.0, 1.0, 0.0]  # byte-identical + input order
+    assert sdk_env.score_responses_calls == 2  # grouped: {ex_a:2, ex_b:1}, not 3 serial calls
+    assert sorted(sdk_env.batch_sizes) == [1, 2]  # ex_a's two completions scored in ONE call
 
 
 def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
@@ -225,14 +223,14 @@ def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
     ex_b = {"id": "b", "input": "3+3?", "output": "6"}
     items = [
         (ex_a, {"response_text": "the answer is 4"}),  # -> 1.0
-        (ex_b, {"response_text": "it is 6"}),           # -> 1.0
-        (ex_a, {"response_text": "nope"}),              # -> 0.0
+        (ex_b, {"response_text": "it is 6"}),  # -> 1.0
+        (ex_a, {"response_text": "nope"}),  # -> 0.0
     ]
     sdk_env.batch_sizes = []
 
     out = env.reward_many(items)
 
-    assert out == [1.0, 1.0, 0.0]                        # correct + input order
+    assert out == [1.0, 1.0, 0.0]  # correct + input order
     # ex_a's two rollouts were NOT batched: every score_responses call carried exactly one response.
     assert sdk_env.batch_sizes == [1, 1, 1]
 
@@ -718,16 +716,8 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
     assert peak < 600 * 1024 * 1024, f"peak memory {peak} not bounded by the limit"
 
 
-def test_install_manifest_and_worker_deps():
-    with tempfile.TemporaryDirectory() as tmp:
-        os.environ["FLASH_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
-        import flash.envs.registry as registry
+def test_worker_deps():
+    import flash.envs.registry as registry
 
-        importlib.reload(registry)
-        env_id = "github:owner/repo@main:env/environment.py"
-        registry.record_installed_env(env_id, package="freesolo")
-        assert registry.worker_pip_for_env(env_id) == ["freesolo"]
-        assert registry.list_installed_environments() == [env_id]
-
-        os.environ.pop("FLASH_ENVS_MANIFEST", None)
-        importlib.reload(registry)
+    env_id = "github:owner/repo@main:env/environment.py"
+    assert registry.worker_pip_for_env(env_id) == ["freesolo"]
