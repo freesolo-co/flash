@@ -321,7 +321,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
             "run_id": "flash-1",
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
-            "train": {"steps": 1, "seeds": [0], "hf_repo": "Freesolo-Co/flashrun-flash-1"},
+            "train": {"steps": 1, "hf_repo": "Freesolo-Co/flashrun-flash-1"},
         }
     )
     runner._save_status(
@@ -335,9 +335,8 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
 
     ok = run_registry.record_training_checkpoint(
         spec=spec,
-        seed=0,
         metrics={"cost_usd": 0.25},
-        artifact_path="/tmp/seed0",
+        artifact_path="/tmp/artifacts",
     )
 
     assert ok is True
@@ -346,8 +345,8 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     body = json.loads(seen["body"])
     assert body["orgId"] == "org-1"
     assert body["runId"] == "flash-1"
-    assert body["checkpointId"] == "seed0"
-    assert body["adapterRef"] == "Freesolo-Co/flashrun-flash-1:rl/flash-1/seed0"
+    assert body["checkpointId"] == "final"
+    assert body["adapterRef"] == "Freesolo-Co/flashrun-flash-1:rl/flash-1"
     assert body["metrics"] == {"cost_usd": 0.25}
 
 

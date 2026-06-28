@@ -1,6 +1,5 @@
-"""Environment publish/install machinery for the `flash env` subcommands.
+"""Environment publish machinery for the `flash env` subcommands.
 
-`flash env install` records a Freesolo environment id locally;
 `flash env push` packages a local Freesolo environment and uploads it through the
 managed Flash control plane.
 """
@@ -17,24 +16,14 @@ if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
 
 
-def cmd_env_install(args) -> int:
-    from flash.envs.adapter import is_freesolo_environment_id
-    from flash.envs.registry import INSTALLED_MANIFEST, record_installed_env
+def _err(msg: str) -> int:
+    """Print a command error (themed red ✗ on a TTY, plain on the machine path) and return 1.
 
-    env_id = args.env_id
-    if not is_freesolo_environment_id(env_id):
-        print(
-            f'env id must be a Freesolo environment id, e.g. "your-name/your-env" (got {env_id!r})',
-            file=sys.stderr,
-        )
-        return 1
-    record_installed_env(env_id, package="freesolo")
-    if render.styled():
-        print(render.env_installed(env_id, str(INSTALLED_MANIFEST)))
-    else:
-        print(f"installed {env_id}; recorded in {INSTALLED_MANIFEST}")
-        print(f'use it via:  [environment]\\nid = "{env_id}"')
-    return 0
+    These `env` failures `return 1` directly rather than raising, so they never reach main()'s
+    themed handler; this keeps them on the same red ✗ idiom while leaving the machine path's exact
+    text untouched for scripts and the env tests."""
+    print(render.error(msg) if render.styled() else msg, file=sys.stderr)
+    return 1
 
 
 _ENV_ENTRYPOINT = "environment.py"
@@ -241,12 +230,12 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | No
         )
     except ClientError as exc:
         bar.clear()
-        print(str(exc), file=sys.stderr)
-        return 1
+        return _err(str(exc))
     bar.clear()
     slug = result.get("id")
     if not slug:
-        print("warning: the env was uploaded but the server returned no id", file=sys.stderr)
+        msg = "the env was uploaded but the server returned no id"
+        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
         return 1
     if render.styled():
         print(render.env_published(slug))
@@ -261,13 +250,11 @@ def cmd_env_push(args) -> int:
 
     env_name = _normalize_env_name(str(getattr(args, "name", "") or ""))
     if not env_name:
-        print("env name required: pass `--name <name>`", file=sys.stderr)
-        return 1
+        return _err("env name required: pass `--name <name>`")
 
     src = Path(args.path)
     if not src.exists():
-        print(f"no such path: {src}", file=sys.stderr)
-        return 1
+        return _err(f"no such path: {src}")
 
     if src.is_dir():
         canonical_entrypoint = src / _ENV_ENTRYPOINT
@@ -275,30 +262,23 @@ def cmd_env_push(args) -> int:
             entrypoint = canonical_entrypoint
             env_root = src
         elif (src / "pyproject.toml").is_file():
-            print(f"{src} has a pyproject.toml but no environment.py entrypoint", file=sys.stderr)
-            return 1
+            return _err(f"{src} has a pyproject.toml but no environment.py entrypoint")
         else:
             modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
             if len(modules) != 1:
-                print(
+                return _err(
                     f"{src} has no environment.py and "
                     f"{'no' if not modules else 'multiple'} top-level .py module(s); "
                     "add an environment.py entrypoint or pass the exact .py file "
-                    "for a single-file smoke test.",
-                    file=sys.stderr,
+                    "for a single-file smoke test."
                 )
-                return 1
             env_root = src
             entrypoint = modules[0]
     elif src.is_file() and src.suffix == ".py":
         env_root = src.parent
         entrypoint = src
     else:
-        print(
-            f"cannot publish {src}: expected a Freesolo .py module or an env directory.",
-            file=sys.stderr,
-        )
-        return 1
+        return _err(f"cannot publish {src}: expected a Freesolo .py module or an env directory.")
 
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
