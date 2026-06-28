@@ -1,10 +1,4 @@
-"""CLI command handlers for the managed Flash service.
-
-Every run-lifecycle command is a thin HTTP call to the Flash control plane —
-users authenticate with their freesolo API key (`flash login` verifies it against
-the freesolo backend), never with provider credentials. Config parsing/validation
-and `--dry-run` stay fully local.
-"""
+"""CLI command handlers for the managed Flash service."""
 
 from __future__ import annotations
 
@@ -38,8 +32,6 @@ from .training_doc import TRAINING_MD
 logger = get_logger("flash.cli")
 
 
-# Exceptions that represent expected user/config errors: report them as a clean one-line
-# message instead of a Python traceback (use --debug to see the full trace).
 _USER_ERRORS = (
     ConfigError,
     ClientError,
@@ -47,7 +39,6 @@ _USER_ERRORS = (
     ValueError,
 )
 
-# Run states after which nothing more will happen (polling can stop).
 _CLI_DONE_STATES = TERMINAL_STATES | {"deployed"}
 _OK_STATES = {"done", "dry_run", "deployed"}
 _SPINNER_FRAMES = "|/-\\"
@@ -108,9 +99,6 @@ def cmd_version(args) -> int:
 
 
 def cmd_login(args) -> int:
-    # Login is handled by the freesolo backend (not the flash control plane): the user
-    # supplies the freesolo API key they created at freesolo.co/sign-in, and we verify it against
-    # freesolo before storing it. The same key authenticates flash's control plane.
     try:
         env_api_key = os.environ.get("FREESOLO_API_KEY")
         api_key = args.api_key or env_api_key
@@ -121,23 +109,18 @@ def cmd_login(args) -> int:
             )
         verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
     except ClientError as exc:
-        # Login failed (no key, a rejected key, or an unreachable backend): say so plainly
-        # and point the user back at `flash login` to try again. `--debug` still surfaces
-        # the full traceback via the top-level handler.
         if getattr(args, "debug", False):
             raise
         print(render.login_failed(str(exc)), file=sys.stderr)
         return 1
     api_url = args.api_url or load_credentials()[0]
-    # save_credentials clears the stored url when it's the default, so logging into the
-    # default plane also drops a stale custom url from a previous custom-URL login.
     _ = save_credentials(api_key, api_url=api_url)
     if args.api_key and env_api_key and env_api_key != args.api_key:
-        print(
-            "warning: FREESOLO_API_KEY is set and will override this saved login for future "
-            "commands; unset FREESOLO_API_KEY to use the saved key.",
-            file=sys.stderr,
+        msg = (
+            "FREESOLO_API_KEY is set and will override this saved login for future "
+            "commands; unset FREESOLO_API_KEY to use the saved key."
         )
+        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
     # Show who they are right away (the same identity `flash whoami` prints) so they don't
     # have to run a second command. Never echo the key itself. The identity lookup is
     # best-effort: the key is already verified and stored, so a momentary control-plane
@@ -146,14 +129,11 @@ def cmd_login(args) -> int:
     return 0
 
 
-# A control-plane hiccup must not make a successful login appear to hang while we fetch a
-# nonessential card, so the best-effort identity lookup uses a short timeout.
 _IDENTITY_LOOKUP_TIMEOUT_S = 5.0
 
 
 def _identity_or_none(api_key: str, api_url: str) -> dict | None:
-    # Use the key/url we just verified and stored, not `client_from_config()`: an ambient
-    # FREESOLO_API_KEY would otherwise win over the file and render the wrong identity.
+    # Don't use client_from_config(): ambient FREESOLO_API_KEY would win and show wrong identity.
     try:
         return ApiClient(api_url, api_key, timeout=_IDENTITY_LOOKUP_TIMEOUT_S).me()
     except (ClientError, OSError, ValueError):
@@ -256,7 +236,6 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n"
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
@@ -269,16 +248,12 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "epochs = 1\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n"
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
-    # TRAINING.md is the playbook for the AI agent driving these runs: how to design the
-    # reward, what to read, and how to decide a run actually improved (not just finished).
     training = Path("TRAINING.md")
     if not training.exists():
-        # Explicit UTF-8: TRAINING_MD has non-ASCII (em dashes, ·, √, ≥, ≈), which would
-        # raise UnicodeEncodeError under a non-UTF-8 locale with write_text's default.
+        # Explicit UTF-8: TRAINING_MD has non-ASCII chars that raise UnicodeEncodeError under a non-UTF-8 locale.
         training.write_text(TRAINING_MD, encoding="utf-8")
     scaffolded = [
         "environment.py",
@@ -334,15 +309,11 @@ def cmd_gpus(args) -> int:
 
 
 def cmd_env_list(args) -> int:
-    from flash.envs.registry import list_installed_environments
-
-    installed = list_installed_environments()
     paths: list[str] = []
     if Path("environment.py").is_file():
         paths.append(".")
     local = Path("environments")
     if local.is_dir():
-        # Prefer publishing folders. Single-file modules remain supported for small smoke tests.
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
@@ -354,27 +325,20 @@ def cmd_env_list(args) -> int:
                     paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
-    # Decide the rendering up front so the themed panel and the legacy lines never both print.
     if render.styled():
-        print(render.env_list(list(installed), sorted(paths)))
+        print(render.env_list(sorted(paths)))
         return 0
-    if installed:
-        print("installed environments:")
-        for env_id in installed:
-            print(f"  {env_id}")
     if paths:
         print("local env sources (publish with `flash env push --name <name> <path>`):")
         for path in sorted(paths):
             print(f"  {path}")
+    else:
+        print("no environments yet - scaffold one with `flash env setup`")
     return 0
 
 
 def _cmd_train_cost(args) -> int:
-    """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
-
-    Catalog-only and deterministic; an uncapped SFT run tries to count the env's train split, and
-    falls back to a default example count (with a warning) when the environment isn't
-    importable here."""
+    """Print the pre-flight USD cost for the config and exit without submitting."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(
@@ -401,7 +365,6 @@ def cmd_train(args) -> int:
         extra_configs=args.extra_configs,
     )
     if args.dry_run:
-        # Fully local: validate the id-based config without credentials, a server, or a GPU.
         payload = {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
         if render.styled():
             print(
@@ -417,12 +380,11 @@ def cmd_train(args) -> int:
     )
     run_id = status["run_id"]
     logger.info(
-        "submitted run %s: model=%s algorithm=%s gpu=%s seeds=%s",
+        "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
         spec.model,
         spec.algorithm,
         spec.gpu.type,
-        list(spec.train.seeds),
     )
     if args.background:
         if render.styled():
@@ -483,15 +445,14 @@ def cmd_status(args) -> int:
             if not logs.endswith("\n"):
                 print()
             printed_any = True
-        # Always append the real train-subprocess output (the orchestrator log can't carry it);
-        # the server fetches console_/error_<phase>.txt from HF with the operator token.
         for name, text in (client.get_worker_output(args.run_id) or {}).items():
             if not text:
                 continue
-            # Separate sections with a blank line, but NOT before the first thing printed (an empty
-            # orchestrator log would otherwise leave a leading blank line above the first section).
             sep = "\n" if printed_any else ""
-            print(f"{sep}----- {name} -----")
+            if render.styled():
+                print(f"{sep}{render.log_section(name)}")
+            else:
+                print(f"{sep}----- {name} -----")
             print(text, end="" if text.endswith("\n") else "\n")
             printed_any = True
     status = client.get_run(args.run_id)
@@ -518,12 +479,7 @@ def cmd_runs(args) -> int:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        remote = r.get("remote") or {}
-        # the remote handle knows what actually ran; the spec is the parse-time pick
-        provider = remote.get("provider") or (
-            "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
-        )
-        gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+        gpu, provider = render._run_where(spec, r.get("remote") or {})
         where = f"{gpu}@{provider}" if provider else gpu
         print(
             f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
@@ -536,7 +492,7 @@ def cmd_cancel(args) -> int:
     status = client_from_config().cancel_run(args.run_id)
     payload = {"run_id": args.run_id, "state": status["state"]}
     if render.styled():
-        print(render.object_panel("cancel", payload))
+        print(render.cancelled(payload))
     else:
         print(json.dumps(payload, indent=2))
     return 0
@@ -545,11 +501,17 @@ def cmd_cancel(args) -> int:
 def cmd_checkpoints(args) -> int:
     checkpoints = client_from_config().checkpoints(args.run_id)
     if not checkpoints:
-        print(
+        message = (
             f"no deployable checkpoints for {args.run_id} yet "
-            "(RL streams one per save interval; SFT-only runs have none).",
-            file=sys.stderr,
+            "(RL streams one per save interval; SFT-only runs have none)."
         )
+        if render.styled():
+            print(render.empty("checkpoints", "0 deployable", message))
+        else:
+            print(message, file=sys.stderr)
+        return 0
+    if render.styled():
+        print(render.checkpoints_table(args.run_id, checkpoints))
         return 0
     for c in checkpoints:
         print(f"step {c['step']:>6}  {c['repo_id']}:{c['subfolder']}")
@@ -567,14 +529,16 @@ def cmd_deploy(args) -> int:
         step=getattr(args, "step", None),
     )
     if render.styled():
-        print(render.object_panel("deploy", dep))
+        print(render.deployed(dep))
     else:
         print(json.dumps(dep, indent=2))
-    print(
-        "note: serving is billed per token only; use "
-        f"`flash undeploy {args.run_id}` to deregister the adapter.",
-        file=sys.stderr,
-    )
+    # a dry run creates no deployment, so the billing / undeploy hint would be misleading.
+    if dep.get("state") != "dry_run":
+        note = (
+            f"serving is billed per token only; use `flash undeploy {args.run_id}` "
+            "to deregister the adapter."
+        )
+        print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
     return 0
 
 
@@ -589,11 +553,11 @@ def cmd_export(args) -> int:
         )
     client = client_from_config()
     where = f" (step {args.step})" if args.step is not None else ""
-    print(
+    progress = (
         f"exporting adapter {args.adapter_id}{where} to {args.repository} — "
-        "downloading then re-uploading; this can take a minute...",
-        file=sys.stderr,
+        "downloading then re-uploading; this can take a minute..."
     )
+    print(render.note(progress) if render.styled() else progress, file=sys.stderr)
     result = client.export(
         args.adapter_id,
         repository=args.repository,
@@ -602,17 +566,23 @@ def cmd_export(args) -> int:
         private=not args.public,
     )
     if render.styled():
-        print(render.object_panel("export", result))
+        # the control-plane result carries no `private` key, so reflect the privacy we requested
+        # (the server applies exactly this) rather than mislabeling a private export as public.
+        print(render.exported({**result, "private": not args.public}))
     else:
         print(json.dumps(result, indent=2))
-    print(f"exported to {result.get('url', args.repository)}", file=sys.stderr)
+    url = result.get("url", args.repository)
+    print(
+        render.arrow(f"exported to {url}") if render.styled() else f"exported to {url}",
+        file=sys.stderr,
+    )
     return 0
 
 
 def cmd_undeploy(args) -> int:
     result = client_from_config().undeploy(args.run_id)
     if render.styled():
-        print(render.object_panel("undeploy", result))
+        print(render.undeployed(result))
     else:
         print(json.dumps(result, indent=2))
     return 0
@@ -639,8 +609,6 @@ def cmd_deployments(args) -> int:
 def cmd_chat(args) -> int:
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
-    # A faint speaker label on a TTY; the reply text itself stays plain so a piped transcript
-    # is byte-for-byte the model's words.
     if render.styled():
         print(render.chat_label())
     stream = getattr(client, "chat_stream", None)

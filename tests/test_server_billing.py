@@ -18,7 +18,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
+    "train": {"steps": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 
@@ -290,7 +290,8 @@ def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch
     import flash.server.auth as auth_mod
 
     token = "fslo-user-spoof"
-    auth_mod._identity_cache[token] = (
+    auth_mod._verify_cache[token] = (
+        True,
         {"key_prefix": "internal", "email": "user@example.com", "org_id": "org-spoof"},
         time.time() + auth_mod._VERIFY_CACHE_TTL_S,
     )

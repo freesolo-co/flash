@@ -1,5 +1,4 @@
-"""Flash training-cost estimator: a deterministic, equation-based pre-flight estimate
-(``estimate_cost``) of cost = wall-clock hours x market $/hr. No output multiplier."""
+"""Flash training-cost estimator: deterministic pre-flight estimate of wall-clock hours x $/hr."""
 
 from __future__ import annotations
 

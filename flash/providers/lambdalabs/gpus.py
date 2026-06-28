@@ -1,9 +1,4 @@
-"""Lambda Cloud's GPU classes (its rows of the shared GPU table).
-
-The class table is provider-agnostic and lives in ``providers/base.py``. This module carves out
-Lambda's rows (``gpu_classes()`` == every class with a ``lambda_name``) and owns the
-friendly-name -> Lambda instance-type translation.
-"""
+"""Lambda GPU classes and friendly-name -> instance-type translation."""
 
 from __future__ import annotations
 

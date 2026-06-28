@@ -1,11 +1,4 @@
-"""Realized provider cost (COGS) for a finished run -- the cost side of estimator accuracy.
-
-RunPod's billing API gives the dollars it ACTUALLY charged, which the reconciliation job
-compares against the run's charged pre-flight estimate. This module owns the ``RealizedCost``
-shape and dispatches to the RunPod shaper by the run's persisted handle
-(``RunStatus.remote['provider']``). The HTTP calls live in the provider's ``api.py``; the pure
-shaping lives in its ``cost.py`` so it stays offline-testable.
-"""
+"""Realized provider COGS for a finished run; dispatches by ``RunStatus.remote['provider']``."""
 
 from __future__ import annotations
 
@@ -26,24 +19,14 @@ class RealizedCost:
 def realized_cost_for_remote(
     remote: dict | None, *, start: float, end: float, run_end: float | None = None
 ) -> RealizedCost | None:
-    """Pull realized cost for a run from its persisted provider handle, or None if unattributable.
+    """Return realized cost from the persisted provider handle, or None if unattributable.
 
-    ``remote`` is ``RunStatus.remote`` (the last/successful attempt's handle dict). Returns None
-    when there is no handle, no resource id, or an unknown provider -- the run then stays
-    unreconciled (and is retried).
-
-    Two distinct time bounds, because the two cost sources are different:
-      * ``start``/``end`` bound the RunPod BILLING-API query window. The caller pads ``end`` past the
-        run's terminal time so the settled invoice row is in range (see reconcile ``_SETTLE_SECONDS``).
-      * ``run_end`` is the run's ACTUAL terminal time (~teardown). The instance provider
-        (Lambda) has no billing endpoint: an instance bills at a flat $/hr from launch to
-        teardown, so its realized COGS is wall x rate over ``started_ts -> run_end`` — it must NOT
-        use the settle-padded ``end`` or it would over-bill by the padding (up to an hour). Defaults
-        to ``end`` for back-compat when the caller doesn't distinguish.
+    ``end`` is the settle-padded billing-query bound for RunPod; ``run_end`` is the true teardown
+    time for instance providers (Lambda) — using ``end`` there would overbill by the settle padding.
     """
     if not remote:
         return None
-    provider = remote.get("provider") or "runpod"
+    provider = remote.get("provider")
     if provider == "runpod":
         from flash.providers.runpod.cost import realized_cost as runpod_realized
 
@@ -56,16 +39,9 @@ def realized_cost_for_remote(
 def _instance_realized_cost(
     remote: dict, *, start: float, end: float
 ) -> RealizedCost | None:
-    """Realized COGS for an instance-billed provider: wall-clock x the instance's flat $/hr.
-
-    The instance billed from its launch (``started_ts`` on the handle) until teardown (``end``, the
-    run's true terminal time — NOT a settle-padded billing-query bound). Unattributable -> None (no
-    rate persisted) so the run stays unreconciled rather than booking $0.
-    """
+    """Realized COGS for an instance-billed provider: wall-clock x flat $/hr."""
     rate = remote.get("hourly_usd")
     rid = remote.get("instance_id")
-    # Honor the module contract: no rate OR no auditable resource id -> unattributable (None), so the
-    # run stays unreconciled rather than booking instance cost we can't tie to a resource.
     if not rate or not rid:
         return None
     launch = remote.get("started_ts") or start

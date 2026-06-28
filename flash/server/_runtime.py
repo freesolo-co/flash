@@ -13,7 +13,7 @@ import logging
 import os
 import threading
 
-from flash.runner import adapter_prefix, get_status, runs_file_path
+from flash.runner import adapter_prefix, runs_file_path
 from flash.spec import JobSpec
 
 from . import db
@@ -48,6 +48,50 @@ async def _reconcile_cost_loop() -> None:
             raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
         except Exception:
             _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
+
+
+async def _repo_cleanup_loop() -> None:
+    """Background loop: sweep ONCE on startup, then periodically delete per-run HF artifact repos
+    (``Freesolo-Co/flashrun-*``) that are NOT currently deployed and older than a fixed 30-day age,
+    reclaiming the org's private-storage quota. Currently-deployed repos are the only thing spared.
+    The age and the daily cadence are hardcoded constants (no env knobs) — see
+    ``flash.server.repo_cleanup``. Sweeping on startup (rather than after a full interval) keeps the
+    GC making progress even on a plane that restarts more often than the 24h cadence.
+
+    Fails CLOSED: each sweep aborts (deleting nothing) if the serving live set can't be confirmed, so
+    a serving blip never risks deleting a live adapter — it just retries next cycle. The HF + serving
+    calls are blocking, so each sweep is offloaded to a thread. Gated by ``repo_cleanup_enabled``
+    (needs an operator ``HF_TOKEN``)."""
+    from flash.server.repo_cleanup import CleanupAborted, run_scheduled_cleanup
+
+    # Daily sweep (fixed). The 30-day delete age makes the exact cadence non-critical — a repo a few
+    # hours past 30d is no different from one a few hours under.
+    interval = 24.0 * 3600.0
+    # Sweep IMMEDIATELY on startup, THEN sleep between subsequent sweeps (sleep is at the END of the
+    # loop). Sleeping first would let a control plane restarted — or crash-looping — more often than
+    # the 24h interval never reclaim anything: the GC would always be cancelled before its first
+    # sweep. The startup sweep is still off the critical path — this loop is a background task and the
+    # sweep itself runs in a worker thread (see app.lifespan), so it never delays accepting traffic.
+    while True:
+        # The blocking sweep runs in a worker thread that task.cancel() can't interrupt; a stop Event
+        # lets the lifespan signal it to halt BETWEEN deletes at shutdown, so a large in-flight sweep
+        # can't keep deleting repos after the server was told to stop (see _charge_retry_loop).
+        stop = threading.Event()
+        try:
+            deleted = await asyncio.to_thread(run_scheduled_cleanup, should_stop=stop.is_set)
+            if deleted:
+                _log.info("repo GC: deleted %d undeployed run repo(s) older than the GC age", deleted)
+        except asyncio.CancelledError:
+            stop.set()  # signal the worker thread to stop deleting between targets (see _charge_retry_loop)
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except CleanupAborted as exc:
+            # Serving live set unconfirmed -> the sweep deleted NOTHING by design. Expected during a
+            # serving outage; not an error. Retry next cycle when serving is back.
+            _log.warning("repo GC sweep skipped (serving live set unconfirmed); retrying next cycle: %s", exc)
+        except Exception:
+            _log.debug("repo GC sweep failed; retrying next cycle", exc_info=True)
+        # Sleep AFTER the sweep, so the first sweep runs at startup rather than a full interval later.
+        await asyncio.sleep(interval)
 
 
 async def _charge_retry_startup() -> None:
@@ -112,6 +156,32 @@ def _append_run_log(run_id: str, message: str) -> None:
         f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
 
 
+def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
+    """Newest attempt-scoped worker error file under prefix (error_<phase>_attempt<N>.txt).
+
+    The worker writes error_<phase>_attempt<N>.txt (see error_artifact_name); on a retried run only the
+    highest attempt is the real final crash. Falls back to attempt0 when the repo can't be listed.
+    """
+    import re
+
+    default = f"error_{phase}_attempt0.txt"
+    try:
+        from huggingface_hub import HfApi
+
+        files = HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
+            repo_id=repo, repo_type="dataset"
+        )
+    except Exception:
+        return default
+    pat = re.compile(rf"^{re.escape(prefix)}/error_{re.escape(phase)}_attempt(\d+)\.txt$")
+    best: int | None = None
+    for f in files:
+        m = pat.match(f)
+        if m and (best is None or int(m.group(1)) > best):
+            best = int(m.group(1))
+    return default if best is None else f"error_{phase}_attempt{best}.txt"
+
+
 def _worker_artifacts(spec) -> dict[str, str]:
     """The run's train-subprocess stdout + traceback, fetched from its HF artifact repo.
 
@@ -131,7 +201,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
         return {}
     prefix = adapter_prefix(spec)
     out: dict[str, str] = {}
-    for name in (f"console_{spec.phase}.txt", f"error_{spec.phase}.txt"):
+    for name in (f"console_{spec.phase}.txt", _latest_error_artifact_name(repo, prefix, spec.phase)):
         try:
             path = hf_hub_download(
                 repo_id=repo,
@@ -154,14 +224,14 @@ def _worker_artifacts(spec) -> dict[str, str]:
 
 def recover_runs() -> None:
     """Recover every in-flight run after a restart so a redeploy never loses a training session:
-    re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
-    ``queued``/``provisioning`` runs that never reached a worker."""
+    re-attach to ``running`` jobs, and resubmit ``queued``/``provisioning`` runs that never reached
+    a worker."""
     from flash.runner import (
         _gc_run_endpoints,
         _run_job_background,
         _update,
         attach_run,
-        resume_run,
+        get_status,
     )
 
     active: set[str] = set()
@@ -180,10 +250,6 @@ def recover_runs() -> None:
             # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
-        elif status.resume_seed_index is not None:
-            # Restarted between seeds: resume the remaining seeds, preserving the finished ones.
-            active.add(status.run_id)
-            threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
             # No handle yet: the restart hit the submit->provisioning window, so no worker exists.
             # A spec that won't parse can never be resubmitted -> mark it terminally failed
