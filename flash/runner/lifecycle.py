@@ -236,7 +236,24 @@ def _submit_seed_supervised(
     # (the fallback would silently steal the only user retry). ``walk_attempt`` = attempt index with the
     # cache-drop attempt(s) removed, so the GPU walk gets its full budget AFTER a cache drop.
     cache_drop_consumed = 0
-    for attempt in range(infra_budget + 1 + cache_fallback_attempts):
+    # Infra-shaped GPU-walk attempts (no_capacity/job_preempted/stalled/poll_error), EXCLUDED from the
+    # OOM-escalation budget (NOT from the infra budget). The OOM budget counts ONLY OOM-shaped attempts:
+    # without this offset an early infra retry would tick the shared ``walk_attempt`` and burn a CUDA
+    # OOM's allowed larger-GPU escalation (notably max_retries=1: an infra retry on attempt 0 then a real
+    # OOM on attempt 1 would read the OOM budget as already spent and refuse the one escalation the user
+    # allowed). Mirrors ``cache_drop_consumed`` — both peel non-OOM attempts off the OOM walk.
+    infra_walk_consumed = 0
+    # The infra-shaped budget (floored ``infra_budget`` retries) and the OOM-escalation budget (raw
+    # ``max_retries`` strictly-larger-GPU retries) are SEPARATE allowances, so the physical loop must
+    # provide a slot for EACH independently: with only ``infra_budget + 1`` slots a warranted OOM
+    # escalation that lands AFTER the infra budget is spent (e.g. five infra failures then a first CUDA
+    # OOM) would have no iteration to run on and the run would FAIL instead of escalating. The per-
+    # category budget BREAKS below still cap each allowance on its own (infra at the floored budget, OOM
+    # at ``max_retries``), so over-sizing the range never lets infra-only failures loop past their
+    # budget — it only guarantees the slot a separately-budgeted OOM escalation needs. ``max_retries == 0``
+    # (single-shot) adds 0, so a no-retry run still never escalates.
+    oom_escalation_slots = max_retries
+    for attempt in range(infra_budget + 1 + cache_fallback_attempts + oom_escalation_slots):
         walk_attempt = attempt - cache_drop_consumed
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
@@ -349,8 +366,17 @@ def _submit_seed_supervised(
                 and chosen is not None
                 and chosen.provider == "runpod"
             )
+            # Once a CUDA OOM has forced this run onto larger cards (``oom_vram_floor > 0``), the active
+            # walk is the OOM-escalation budget (raw ``max_retries``), NOT the floored infra budget — so
+            # compute "is this the last GPU attempt" against the OOM budget and the OOM walk index
+            # (``walk_attempt - infra_walk_consumed`` = OOM escalations so far). Otherwise the last
+            # OOM-eligible attempt would read non-final (``walk_attempt < infra_budget``), take the SHORT
+            # no-capacity grace, and fail fast into extra infra-shaped retries past the OOM cost cap.
+            escalating_oom = oom_vram_floor > 0
+            walk_budget = max_retries if escalating_oom else infra_budget
+            walk_spent = walk_attempt - infra_walk_consumed if escalating_oom else walk_attempt
             on_last_gpu = len(untried) <= 1 or (
-                walk_attempt >= infra_budget and not cache_fallback_available
+                walk_spent >= walk_budget and not cache_fallback_available
             )
             # Mirror into the closure cell so on_handle persists THIS attempt's value (see
             # current_on_last_gpu) for a recovery to reproduce the same stall tuning.
@@ -449,10 +475,15 @@ def _submit_seed_supervised(
         # OOM escalation is COST (a bigger, pricier GPU), so it respects the user's RAW max_retries
         # (max_retries=1 -> ONE larger attempt), not the INFRA_RETRY_FLOOR that infra retries get.
         retry_budget = max_retries if oom_shaped else infra_budget
-        # Retry while the budget remains, plus the ONE reserved cache-drop fallback that runs past it
-        # (first_cache_drop): a cache-attached no_capacity/poll_error retries once cache-less on the
-        # wider all-DC pool before the budget applies. A non-retry-shaped failure never retries.
-        will_retry = retry_shaped and (walk_attempt < retry_budget or first_cache_drop)
+        # The OOM-escalation budget counts ONLY OOM-shaped attempts: subtract the infra-shaped walk
+        # attempts already consumed (``infra_walk_consumed``, mirroring the ``cache_drop_consumed``
+        # exclusion in ``walk_attempt``) so an early infra retry can't burn a CUDA OOM's allowed larger-
+        # GPU escalation. Infra failures keep counting ALL walk attempts against the floored infra budget.
+        budget_spent = walk_attempt - infra_walk_consumed if oom_shaped else walk_attempt
+        # "retrying" is true when the budget remains OR a cache-drop fallback will retry this even past
+        # it (first_cache_drop) — else the log would say "not retrying" while the loop actually
+        # continues with the reserved cache-less fallback attempt.
+        will_retry = retry_shaped and (budget_spent < retry_budget or first_cache_drop)
         action = (
             f"retrying on a larger GPU (> {oom_vram_floor} GB)"
             if (will_retry and oom_shaped)
@@ -466,6 +497,10 @@ def _submit_seed_supervised(
             file=log,
             flush=True,
         )
+        # ``will_retry`` already folds in the per-category budget (OOM on ``budget_spent``, infra on
+        # ``walk_attempt``), ``not retry_shaped``, and the reserved cache-drop fallback, so a single
+        # stop test covers every case (a non-retry-shaped failure, an exhausted budget, and the one
+        # bonus cache-less attempt that runs past it).
         if not will_retry:
             break
         if first_cache_drop:
@@ -476,12 +511,21 @@ def _submit_seed_supervised(
             # Do NOT advance the GPU walk on this transition: the next attempt should retry the SAME
             # cheapest GPU without the volume on the wider all-DC pool first — the miss may have been
             # the cache's datacenter set, not the GPU class globally. Only walk if THAT also fails.
-        elif chosen is not None:
-            # Record what THIS attempt burned so the next pick avoids it. Infra also escapes the
-            # PROVIDER cross-provider; OOM does not (the host was fine — just grow the card).
+        else:
+            # A real GPU-walk retry (not the free cache-drop fallback). An INFRA-shaped one must NOT
+            # consume the OOM-escalation budget: track it so ``budget_spent`` peels it off the OOM walk
+            # (mirrors ``cache_drop_consumed``). Counted even when ``chosen is None`` (an allocation/
+            # deploy poll_error that never provisioned a card) so every infra attempt is excluded from
+            # the OOM count, not just provisioned ones.
             if not oom_shaped:
-                failed_providers.add(chosen.provider)
-            tried_classes.add((chosen.provider, chosen.gpu))
+                infra_walk_consumed += 1
+            if chosen is not None:
+                # Record what THIS attempt burned so the next pick avoids it. An infra failure also
+                # escapes the PROVIDER cross-provider; an OOM does NOT (the host was fine — just grow the
+                # card, which the oom_vram_floor filter already enforces).
+                if not oom_shaped:
+                    failed_providers.add(chosen.provider)
+                tried_classes.add((chosen.provider, chosen.gpu))
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
     # are only known here).
