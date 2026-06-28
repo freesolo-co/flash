@@ -438,10 +438,6 @@ def test_capacity_grace_scales_with_gpu_walk_position():
 
 
 def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
-    # A recovery (RunpodProvider.poll on a persisted handle) must reproduce the ORIGINAL submit's
-    # on_last_gpu stall tuning — the runner persists it into the handle, so a last-candidate run
-    # keeps its longer no-capacity grace after a control-plane restart instead of being judged on
-    # the shorter non-last window.
     from flash.providers.base import JobHandle
     from flash.providers.runpod import PROVIDER
     from flash.providers.runpod import jobs as jobs
@@ -464,18 +460,20 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
     )
     base = {"provider": "runpod", "endpoint_id": "ep", "endpoint_name": "n", "job_id": "j"}
 
-    # on_last_gpu=True persisted -> the longer (~15 min) capacity grace is reproduced.
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, 0)
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True, "attempt": 2}), spec, 0)
     assert captured["queue_grace_s"] == 900.0
     assert captured["throttled_grace_s"] == 900.0
+    assert captured["current_attempt"] == 2
 
-    # on_last_gpu=False (and a legacy handle with the key ABSENT) -> the default non-last grace.
     captured.clear()
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, 0)
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False, "attempt": 0}), spec, 0)
     assert captured["queue_grace_s"] == 300.0
+    assert captured["current_attempt"] == 0
+
     captured.clear()
-    PROVIDER.poll(JobHandle.from_dict(base), spec, 0)  # pre-persist handle: defaults to False
+    PROVIDER.poll(JobHandle.from_dict(base), spec, 0)
     assert captured["queue_grace_s"] == 300.0
+    assert captured["current_attempt"] is None
 
 
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
@@ -1400,6 +1398,8 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
                 "endpoint_name": "n",
                 "job_id": "jW",
                 "allocated_gpu": "RTX 5090",
+                "on_last_gpu": True,
+                "attempt": 2,
             },
         )
         orch._save_status(status)
@@ -1461,7 +1461,13 @@ def test_attach_completes_run(monkeypatch):
             run_id="a1",
             state="running",
             spec=_spec("a1").to_dict(),
-            remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA"},
+            remote={
+                "endpoint_id": "epA",
+                "endpoint_name": "n",
+                "job_id": "jA",
+                "on_last_gpu": False,
+                "attempt": 0,
+            },
         )
         orch._save_status(status)
         monkeypatch.setattr(
@@ -1499,7 +1505,13 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
                 state="running",
                 spec=_spec("i1").to_dict(),
                 cost_usd=0.0,
-                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA"},
+                remote={
+                    "endpoint_id": "epA",
+                    "endpoint_name": "n",
+                    "job_id": "jA",
+                    "on_last_gpu": False,
+                    "attempt": 0,
+                },
             )
         )
         # Poll reports a dead/abandoned job (the common redeploy-window outcome).
@@ -1538,7 +1550,13 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
                 run_id="g1",
                 state="running",
                 spec=_spec("g1").to_dict(),
-                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA"},
+                remote={
+                    "endpoint_id": "epA",
+                    "endpoint_name": "n",
+                    "job_id": "jA",
+                    "on_last_gpu": False,
+                    "attempt": 0,
+                },
             )
         )
         monkeypatch.setattr(

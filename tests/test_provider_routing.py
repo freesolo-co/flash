@@ -150,6 +150,87 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     assert "walking past the cheapest class" in log.getvalue()
 
 
+def _oom_candidates():
+    from flash.providers.base import Candidate
+
+    return (
+        Candidate("runpod", "A100", 1.0, 80),
+        Candidate("runpod", "Pro6000", 2.0, 96),
+        Candidate("runpod", "B200", 3.0, 180),
+    )
+
+
+def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=_oom_candidates()))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    submitted = []
+    on_last_gpu = []
+    failure_iter = iter(failures)
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted.append(run_spec.gpu.type)
+        on_last_gpu.append(kwargs.get("on_last_gpu", False))
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        failure = next(failure_iter)
+        detail = "CUDA out of memory" if failure == "oom" else "x"
+        return PollResult(False, failure=failure, detail=detail)
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=max_retries)
+    _seed_status(orch, spec)
+    with pytest.raises(RuntimeError):
+        orch._submit_seed_supervised(spec, 0, io.StringIO())
+    return submitted, on_last_gpu
+
+
+def test_oom_escalates_exactly_once_at_max_retries_1(orch, monkeypatch):
+    submitted, _on_last_gpu = _run_failed_oom_sequence(
+        orch,
+        monkeypatch,
+        ["oom", "oom"],
+        max_retries=1,
+    )
+    assert submitted == ["A100", "Pro6000"]
+
+
+def test_oom_after_infra_failure_still_escalates(orch, monkeypatch):
+    submitted, _on_last_gpu = _run_failed_oom_sequence(
+        orch,
+        monkeypatch,
+        ["no_capacity", "oom", "oom"],
+        max_retries=1,
+    )
+    assert submitted == ["A100", "Pro6000", "B200"]
+
+
+def test_infra_failure_after_oom_uses_infra_budget(orch, monkeypatch):
+    submitted, on_last_gpu = _run_failed_oom_sequence(
+        orch,
+        monkeypatch,
+        ["oom", "no_capacity", "oom"],
+        max_retries=1,
+    )
+    assert submitted == ["A100", "Pro6000", "B200"]
+    assert on_last_gpu == [False, False, True]
+
+
+def test_oom_never_escalates_at_max_retries_0(orch, monkeypatch):
+    submitted, _on_last_gpu = _run_failed_oom_sequence(
+        orch,
+        monkeypatch,
+        ["oom"],
+        max_retries=0,
+    )
+    assert submitted == ["A100"]
+
+
 def test_select_candidate_escapes_failed_provider_then_walks_classes():
     """The retry picker prefers cheapest first, escapes a failed provider cross-provider on retry,
     and only walks classes within a provider once every provider has been burned."""

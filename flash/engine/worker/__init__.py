@@ -277,6 +277,11 @@ def require_active_env():
     return ACTIVE_ENV
 
 
+def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
+    retriable = isinstance(exc, (RetriableInfraError, GitHubRateLimitError))
+    return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
+
+
 # Thinking/reasoning mode: one flag per run from the run config (TOML `thinking`), consumed
 # identically by SFT rendering, RL rollouts, and serving. Defaults off without a JobSpec.
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
@@ -453,7 +458,6 @@ def main():
         # reschedule on a fresh worker once the limit window resets rather than hard-failing. Env
         # resolution runs lazily inside this try (require_active_env, called by the handlers above),
         # never at import, so a rate-limit raise reaches here and is classified correctly.
-        retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
@@ -464,11 +468,9 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Gate on ``not
-        # retriable`` first so an infra error (same-size retry) is never reclassified as oom — oom wins
-        # over retriable in the poller, which would otherwise escalate a same-size retry to a bigger card.
-        oom = not retriable and is_cuda_oom(e)
-        hb_flags = {"retriable": retriable, "oom": oom}
+        # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Infra failures
+        # keep same-size retry semantics and must never be reclassified as OOM.
+        hb_flags = _worker_failure_flags(e)
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:
