@@ -1,10 +1,4 @@
-"""CLI for the managed Flash service.
-
-Every run-lifecycle command is a thin HTTP call to the Flash control plane —
-users authenticate with their freesolo API key (`flash login` verifies it against
-the freesolo backend), never with provider credentials. Config parsing/validation
-and `--dry-run` stay fully local.
-"""
+"""CLI for the managed Flash service."""
 
 from __future__ import annotations
 
@@ -405,8 +399,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
-    # Kick off a once-a-day PyPI version check in the background; the "new release available"
-    # notice (if any) prints to stderr after the command output (see emit_update_notice).
     update_check = maybe_start_update_check()
     try:
         return args.func(args)

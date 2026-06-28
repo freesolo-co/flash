@@ -1,10 +1,4 @@
-"""Shared poll-loop scaffolding for provider job pollers.
-
-Poll loops share a timestamped ``say()`` logger, a consecutive-poll-error retry/give-up
-counter, and the heartbeat progress-surfacing block (key on (stage, step, ts), log
-``worker: stage=… step=… reward=…``). Only those neutral pieces live here; each poller
-keeps its own status/terminal handling inline.
-"""
+"""Shared poll-loop scaffolding for provider job pollers."""
 
 from __future__ import annotations
 
@@ -14,76 +8,36 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-# Grace past a preload box's embedded wall deadline before an orphan sweep reaps it. A healthy warm
-# self-bounds at its wall cap (the in-box timer ``os._exit``s) and the driver's ``finally`` terminates
-# the instance; a box still alive THIS long past its deadline has lost its driver (the only thing that
-# tears instance providers down), so it is provably orphaned and safe to reap. Generous so clock skew /
-# a slow teardown / a near-deadline box mid-download is never reaped early.
+# Generous grace past embedded deadline before orphan sweep reaps a driver-lost warm box.
 PRELOAD_REAP_GRACE_S = 1800.0
 
 
 def preload_instance_run_id(provider: str, region: str, reap_deadline_epoch: int, suffix: str) -> str:
-    """Build a ``flash-preload-*`` run id that embeds its wall-clock reap deadline (``-d<epoch>-``).
+    """Build a ``flash-preload-*`` run id embedding its wall-clock reap deadline.
 
-    The epoch lets an orphan sweep reap a driver-lost warm box by NAME alone (no provider creation-time
-    field needed). ``reap_deadline_epoch`` is the box's wall-cap deadline in epoch seconds. Kept in sync
-    with ``preload_box_reap_due``'s parser — change both together.
-
-    The epoch is placed RIGHT AFTER ``flash-preload-`` (before provider/region) on purpose: the launched
-    instance NAME is bounded to the provider name budget by ``run_label_prefix``, which truncates the
-    TAIL and appends a hash. A long provider+region (e.g. a provider name + a long region) would otherwise
-    push the deadline token past the cut and the reap parser would never see it — front-loading keeps
-    ``-d<epoch>-`` inside the surviving prefix."""
+    Epoch placed right after ``flash-preload-`` so ``run_label_prefix`` tail-truncation never drops it.
+    Keep in sync with ``preload_box_reap_due``'s parser."""
     return f"flash-preload-d{int(reap_deadline_epoch)}-{provider}-{region.lower()}-{suffix}"
 
 
 def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GRACE_S) -> bool:
-    """True when a ``flash-preload-*`` instance name carries an embedded reap deadline (``-d<epoch>-``,
-    written by ``preload_instance_run_id``) that elapsed more than ``grace_s`` ago.
+    """True when a preload instance name's embedded deadline has elapsed past grace.
 
-    Used by the Lambda orphan sweep: warm boxes are normally driver-owned and exempt, but a
-    driver that died before its ``terminate_run_instances`` finally would leave one billing forever.
-    Reaping past deadline+grace bounds that leak. Names WITHOUT a parseable deadline (legacy launches)
-    return False — the unconditional driver-owned exemption still applies to them. The 10+ digit guard
-    keeps a region segment like ``us-east-1`` from being mistaken for the ``-d<epoch>-`` token."""
+    Names without a parseable deadline return False. 10+ digit guard avoids matching region segments."""
     m = re.search(r"-d(\d{10,})-", name)
     if not m:
         return False
     return float(m.group(1)) + grace_s < now
 
 
-# First-liveness deadline for the instance providers (e.g. Lambda). Once an instance reaches
-# OS-level ``active`` a healthy box that actually ran cloud-init pushes its ``<arm>_attempt<N>_boot.log``
-# to HF within ~2 min (the uploader starts BEFORE the image pull) and a live worker soon heartbeats.
-# So if a box is active for this long with NO attempt-scoped boot.log AND no fresh heartbeat, cloud-
-# init/the worker never started (a sick region / wedged host) — fail it over FAST (retriable
-# ``stalled`` that the runner escapes cross-provider) instead of burning the full ``SETUP_GRACE_S``
-# (~50 min). (The predicate is boot.log + heartbeat only; an ok/error attempt marker, if one exists,
-# is acted on earlier in the poll loop and never reaches this fast-fail.) Generous over the ~2 min
-# boot.log-appears time to absorb HF
-# upload/propagation lag and a slow host huggingface_hub install; the boot.log presence — not this
-# raw timer — is what protects a healthy-but-slow (large-image-pull) box from a false failover.
-# Applied uniformly per GPU (the instance providers ignore ``on_last_gpu`` in the submit/poll paths).
+# Fast-fail threshold: active box with no boot.log and no heartbeat this long means cloud-init never ran.
 FIRST_LIVENESS_S = 900.0
 
-# Minimum OBSERVED-active time (wall-clock since THIS poll session first saw the box ``active``) before
-# the fast-failover may fire. ``active_since`` is launch-anchored, so on a reattach whose very first
-# read is already ``active`` it can already exceed ``FIRST_LIVENESS_S`` even though the box only just
-# came up moments before the supervisor reattached (control plane was down through a long provision).
-# Gating ALSO on observed-active time hands such a genuinely-fresh box the documented ~2 min boot.log
-# window instead of failing it on the first reattach tick. Kept short (not a full ``FIRST_LIVENESS_S``)
-# so a box that has truly been silent since before the restart still fails over promptly — it gets at
-# most this floor of extra grace, never a fresh launch-length window.
+# Minimum observed-active time before fast-failover fires — protects a freshly-reattached box on
+# reattach whose launch-anchored active_since already exceeds FIRST_LIVENESS_S.
 FIRST_LIVENESS_OBSERVED_FLOOR_S = 120.0
 
-# Consecutive forced boot.log reads that must come back absent before the first-liveness check
-# declares a region sick. ``make_hf_text_reader`` returns ``None`` for ANY read failure — a genuinely
-# missing artifact OR a momentary HF/Hub network hiccup — so a single ``None`` at the deadline can't
-# be trusted to mean "cloud-init never ran". A transient error clears within a poll interval, while a
-# box whose worker never started stays absent indefinitely; requiring the absence to PERSIST across
-# this many polls (each ~``interval_s`` apart) distinguishes the two and keeps a Hub blip from
-# spuriously failing a healthy box over to another provider. The added failover latency is a few poll
-# intervals on top of the ~15 min ``FIRST_LIVENESS_S`` — negligible.
+# Require absence to persist this many polls before declaring sick — one None could be a Hub blip.
 BOOT_LOG_ABSENT_POLLS = 3
 
 
@@ -98,12 +52,7 @@ def make_say(log) -> Callable[[str], None]:
 
 
 class PollErrorTracker:
-    """Counts consecutive poll errors and decides when to give up.
-
-    Encapsulates the identical retry block both pollers use: on a transient fetch
-    error, log it, give up after ``max_errors`` consecutive failures, otherwise sleep
-    a linear backoff (capped at 60 s) before the caller retries.
-    """
+    """Counts consecutive poll errors; sleeps backoff or signals give-up."""
 
     def __init__(self, say: Callable[[str], None], interval_s: float, max_errors: int = 8) -> None:
         self._say = say
@@ -115,8 +64,7 @@ class PollErrorTracker:
         self._count = 0
 
     def record(self, exc: Exception) -> bool:
-        """Register a poll error. Returns True if the caller should give up (too many),
-        else sleeps the backoff and returns False (caller should ``continue``)."""
+        """Register a poll error; returns True to give up, False to continue after backoff sleep."""
         self._count += 1
         self._say(f"poll error ({self._count}): {exc}")
         if self._count >= self._max_errors:
@@ -268,23 +216,8 @@ def _record_heartbeat(hb: dict) -> None:
         pass
 
 
-# Heartbeat stages the worker emits DURING cold start, BEFORE the training loop begins. Receiving
-# one proves the worker is alive but NOT that the slow setup finished, so a poller must NOT let them
-# flip its stall detection from the wide setup grace to the tight training-stall window. The setup
-# timeline is:
-#   boot -> sft_start/rl_start -> model_prefetching/model_prefetched (snapshot_download, can pull
-#   tens of GB) -> sft_model_load/rl_train_start -> sft_initializing/rl_initializing (vLLM build +
-#   *Trainer.__init__) -> [dataset render/tokenize over the full -- possibly uncapped -- dataset,
-#   silent] -> first sft_step/rl_step (training has actually begun).
-# This set is specifically the COLD-START timeline above — it is what the first COMPLETED-step
-# sft_step/rl_step heartbeat flips OUT of into the tight training window. The POST-training stages
-# (*_trained / *_train_done / metrics) are non-setup too and ALSO tighten the window (see
-# STEP_GATED_STAGES) so a hung teardown / DONE upload is caught by the tight training stall, not the
-# wide setup grace. The prefetch + init pings were added so a long-but-LIVE cold start keeps re-arming
-# liveness, but they are still setup: omitting them here would latch the poller into the training stall
-# the moment the first one lands, then false-kill a healthy run whose silent dataset tokenization
-# outlives that tighter window. Canonical here so all three providers (runpod / lambdalabs /
-# hyperstack) share ONE definition.
+# Stages emitted during cold-start BEFORE training begins — must not flip stall detection to the tight
+# training window. Canonical here so all instance providers share one definition.
 SETUP_HEARTBEAT_STAGES = frozenset(
     {
         "boot",
@@ -299,34 +232,12 @@ SETUP_HEARTBEAT_STAGES = frozenset(
     }
 )
 
-# The per-step TRAINING heartbeats. These are the ONLY stages gated on a COMPLETED step (step >= 1)
-# before they tighten the stall window from setup grace: the train-loop daemon / reward callback can
-# emit rl_step/sft_step at step=0 throughout the silent cold FIRST step (a cold rollout runs minutes
-# before global_step ticks to 1), and tightening there would false-kill a healthy cold start. Every
-# OTHER non-setup stage — the POST-training rl_trained / sft_trained / <phase>_train_done + metrics/
-# upload pings, which carry no step field — means training is finished, so they tighten the window
-# immediately (a hung teardown/DONE upload should fall under the tight window, not the wide setup
-# grace). Canonical here so runpod / lambdalabs share ONE definition.
+# step=0 is emitted throughout the silent first rollout — only step>=1 tightens the stall window.
 STEP_GATED_STAGES = frozenset({"rl_step", "sft_step"})
 
 
 def is_training_heartbeat(stage: str | None, step: Any) -> bool:
-    """Whether a just-surfaced heartbeat means cold-start setup is OVER — i.e. the poller should
-    tighten its stall detection from the wide ``setup_grace_s`` to the tight training window.
-
-    - a SETUP stage (``SETUP_HEARTBEAT_STAGES``) or no stage -> False (still the cold start).
-    - a per-step training ping (``STEP_GATED_STAGES``: rl_step/sft_step) -> True ONLY at a COMPLETED
-      step (``step >= 1``). The train-loop daemon / reward callback can emit step=0 throughout the
-      silent cold FIRST step (a cold vLLM rollout runs many minutes before global_step ticks to 1);
-      tightening there would false-kill a healthy cold start, so step=0 keeps the setup grace.
-    - any OTHER non-setup stage -> True. These are the POST-training stages (rl_trained / sft_trained /
-      ``<phase>_train_done`` + metrics/DONE), which carry no ``step`` field; training has FINISHED, so a
-      hung teardown/upload must fall under the tight window, not the wide setup grace.
-
-    ``step`` is coerced via ``_attempt_int`` (a malformed/missing/non-numeric step must never raise
-    inside the poll loop, where no local handler would abort it) and treated as 0. Shared by runpod and
-    lambdalabs so their setup-vs-training transition stays identical.
-    """
+    """True when a heartbeat means cold-start setup is over and the tight stall window should apply."""
     if not stage or stage in SETUP_HEARTBEAT_STAGES:
         return False
     if stage in STEP_GATED_STAGES:
@@ -339,17 +250,7 @@ def surface_heartbeat(
     last_hb_key: tuple | None,
     say: Callable[[str], None],
 ) -> tuple[tuple | None, str | None]:
-    """Read a heartbeat and, if it advanced, log worker progress.
-
-    Returns ``(hb_key, stage)`` where ``hb_key`` is the new (stage, step, ts, attempt) key (or the
-    unchanged ``last_hb_key`` when nothing advanced) and ``stage`` is the stage of the new
-    heartbeat when it advanced (else None). Callers use the returned ``stage`` for their
-    own setup-vs-training stall bookkeeping.
-
-    ``attempt`` (the worker-stamped attempt number) is part of the key because the seed heartbeat
-    path is shared across attempts: ``heartbeat_progress_ts`` reads it to reject a prior attempt's
-    late heartbeat that would otherwise satisfy THIS attempt's first-liveness by timestamp alone.
-    """
+    """Read a heartbeat and, if it advanced, log worker progress. Returns (hb_key, stage)."""
     if heartbeat_reader is None:
         return last_hb_key, None
     try:
@@ -359,9 +260,7 @@ def surface_heartbeat(
     if not hb:
         return last_hb_key, None
     if hb.get("liveness"):
-        # A liveness ping proves the worker is alive (its alive ts is in the file for humans) but is
-        # NOT progress — it must not advance the stall key, else a wedged worker pinging "alive" would
-        # mask a stall. The provider stalls on the absence of REAL (non-liveness) heartbeats.
+        # Liveness pings must not advance the stall key — a wedged worker pinging "alive" would mask a stall.
         return last_hb_key, None
     key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
     if key == last_hb_key:
@@ -373,8 +272,7 @@ def surface_heartbeat(
 
 
 def _attempt_int(value: Any) -> int | None:
-    """Coerce an attempt number (worker stamps it as a str env var, default ""; poller passes an int)
-    to int, or None when empty/absent/unparseable (can't be used to date a heartbeat)."""
+    """Coerce attempt number to int, or None when empty/unparseable."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -390,28 +288,11 @@ def heartbeat_oom_for_attempt(hb: Any, current_attempt: int | None) -> bool:
 def heartbeat_progress_ts(
     hb_key: tuple | None, launch_ts: float | None, current_attempt: int | None = None
 ) -> tuple[float, bool]:
-    """Wall-clock to credit as 'last worker progress' for a just-surfaced heartbeat, plus whether
-    that heartbeat actually belongs to THIS attempt.
+    """Return (ts, fresh): ts is the heartbeat's own timestamp clamped to [launch, now]; fresh is
+    False for a prior-attempt leftover (retries reuse the same seed heartbeat path).
 
-    Use the heartbeat's OWN ``ts`` (key[2] = when the worker actually made progress), not the
-    poll time. On a delayed reattach after a control-plane restart, a heartbeat that was already
-    stale BEFORE the restart must not buy a fresh full stall window — crediting the poll time
-    would hand a hung worker another grace period while the instance keeps billing. Clamp to
-    ``[launch, now]`` so worker/control-plane clock skew can neither make a healthy worker look
-    ancient (premature stall) nor land its progress in the future.
-
-    Returns ``(ts, fresh)``. ``fresh`` is False when the heartbeat's ts predates this attempt's
-    launch, OR (when ``current_attempt`` is given) when it carries a different ``attempt`` — both
-    mean a LEFTOVER heartbeat from a prior attempt (retries reuse the same seed
-    heartbeat path), so the caller must NOT treat it as current progress — otherwise a stale
-    training-stage heartbeat would arm the tighter training stall window and fail a healthy new
-    attempt mid-setup before it has overwritten the old file. ``launch_ts`` uses truthiness (not
-    ``is not None``): the instance handles store started_ts as a non-Optional float coerced to 0.0
-    when missing, so 0.0 means "unknown launch" (a real launch is a large epoch ts). When launch is
-    UNKNOWN we cannot date heartbeats relative to it, so the clamp floor drops to 0.0 and every
-    heartbeat counts as fresh (the safe default: don't discard progress we can't date — clamping the
-    floor to ``now`` instead would mark every normal heartbeat, timestamped before it is read, stale
-    and stall a healthy recovered worker)."""
+    Use the heartbeat's own ts, not poll time — a stale-before-reattach heartbeat must not buy a fresh
+    stall window. launch_ts=0.0 means unknown; attempt mismatches are still rejected."""
     now = time.time()
     ts = hb_key[2] if (isinstance(hb_key, tuple) and len(hb_key) >= 3) else None
     try:
@@ -420,16 +301,9 @@ def heartbeat_progress_ts(
         return now, False
     lo = float(launch_ts) if launch_ts else 0.0  # unknown launch -> floor 0.0 (all heartbeats fresh)
     fresh = ts >= lo
-    # The seed heartbeat path is shared across attempts, so a prior attempt's worker still shutting
-    # down can upload a heartbeat with ts > this attempt's launch — fresh by timestamp, but belonging
-    # to a DIFFERENT attempt. It must NOT satisfy this attempt's first-liveness (else a silent active-
-    # but-never-booted replacement box waits the full setup grace instead of fast-failing). Reject on
-    # an EXPLICIT attempt mismatch only. The worker stamps ``attempt`` from an env var — a STRING,
-    # default "" — while the poller passes an int handle.attempt, so coerce BOTH to int before
-    # comparing (else "0" != 0 would reject every live heartbeat). An empty/unparseable attempt
-    # (older/unset worker) yields None and can't be dated, so keep the ts-based decision (back-compat).
+    # Worker stamps attempt as a str env var, poller passes int; coerce both before comparing.
     hb_attempt = _attempt_int(hb_key[3]) if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
     cur_attempt = _attempt_int(current_attempt)
-    if fresh and cur_attempt is not None and hb_attempt is not None and hb_attempt != cur_attempt:
+    if fresh and cur_attempt is not None and hb_attempt != cur_attempt:
         fresh = False
     return min(now, max(lo, ts)), fresh

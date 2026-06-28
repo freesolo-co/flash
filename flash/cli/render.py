@@ -1,10 +1,4 @@
-"""Human-facing rendering for `flash login` / `flash whoami` (stdlib only).
-
-The identity behind a stored key is shown as a small aligned card instead of raw
-``json.dumps`` output. ANSI styling and unicode glyphs are applied only when stdout is
-an interactive terminal that can encode them; piped, captured, or ASCII-locale output
-stays plain so it can be grepped or parsed and never raises ``UnicodeEncodeError``.
-"""
+"""Human-facing rendering for flash CLI commands (stdlib only)."""
 
 from __future__ import annotations
 
@@ -13,8 +7,6 @@ import sys
 
 from flash._channel import CLI_NAME
 
-# Identity fields the control plane may return (flash/server/app.py `/v1/me`), in the
-# order we show them. ``key_prefix``/``kind`` render separately on the key line.
 _ROWS = (
     ("email", "account"),
     ("org_id", "org"),
@@ -30,7 +22,7 @@ _KIND_LABEL = {
 
 
 def _flag(name: str) -> bool | None:
-    """Tri-state read of an env flag: True/False when set to a recognizable value, else None."""
+    """Tri-state env flag read: True/False when recognized, None otherwise."""
     raw = os.environ.get(name)
     if raw is None:
         return None
@@ -39,15 +31,11 @@ def _flag(name: str) -> bool | None:
         return True
     if val in {"", "0", "false", "no", "off"}:
         return False
-    # Unrecognized value (e.g. a typo): stay tri-state None so styled() falls back to isatty
-    # rather than silently forcing the theme on.
     return None
 
 
 def styled() -> bool:
-    """Whether to render the themed human layout (tables, badges, panels) instead of the plain
-    machine form. True on an interactive stdout; ``FLASH_STYLE=1``/``0`` forces it on or off
-    (used to render the docs preview, and to keep output deterministic in scripts)."""
+    """Whether to render the themed layout. ``FLASH_STYLE=1``/``0`` forces it; else uses isatty."""
     forced = _flag("FLASH_STYLE")
     if forced is not None:
         return forced
@@ -55,7 +43,7 @@ def styled() -> bool:
 
 
 def _color() -> bool:
-    """Whether ANSI color may be emitted: the themed layout, minus a NO_COLOR / dumb-terminal opt-out."""
+    """Themed layout minus NO_COLOR / dumb-terminal opt-outs."""
     return styled() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
 
 
@@ -64,7 +52,7 @@ def _style(code: str, text: str) -> str:
 
 
 def _glyph(unicode_glyph: str, ascii_fallback: str) -> str:
-    """Use the unicode glyph only if stdout can encode it (else an ASCII stand-in)."""
+    """Unicode glyph when stdout can encode it, else ASCII fallback."""
     enc = sys.stdout.encoding or "ascii"
     try:
         unicode_glyph.encode(enc)
@@ -73,9 +61,6 @@ def _glyph(unicode_glyph: str, ascii_fallback: str) -> str:
     return unicode_glyph
 
 
-# Common unicode punctuation we'd rather downgrade to a readable ASCII stand-in than to an
-# escape sequence when stdout can't encode it (e.g. an ASCII/non-UTF-8 locale). Written as
-# escapes so the source stays free of confusable characters.
 _ASCII_PUNCT = {
     0x2014: "-",  # em dash
     0x2013: "-",  # en dash
@@ -87,13 +72,7 @@ _ASCII_PUNCT = {
 
 
 def _safe(text: str) -> str:
-    """Guarantee ``text`` can be printed under the current stdout encoding.
-
-    Identity values from ``/v1/me`` (e.g. an internationalized email) or punctuation in our
-    own copy must never make ``print()`` raise ``UnicodeEncodeError`` after a login has
-    already succeeded. On a normal UTF-8 terminal the text is returned unchanged; only when
-    the active encoding can't represent it do we downgrade punctuation and escape the rest.
-    """
+    """Ensure text is printable under the current stdout encoding without UnicodeEncodeError."""
     enc = sys.stdout.encoding or "ascii"
     try:
         text.encode(enc)
@@ -123,7 +102,6 @@ def format_identity(me: dict) -> str:
 def login_ok(me: dict | None) -> str:
     head = f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {_bold('logged in to flash')}"
     if not me:
-        # The key is verified and stored; we just couldn't fetch the account card right now.
         return _safe(
             f"{head}\n{_dim('  account details unavailable right now — run `flash whoami` later')}"
         )
@@ -204,14 +182,12 @@ _ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT, _AMBER = (
 
 
 def _truecolor() -> bool:
-    """Whether the terminal advertises 24-bit color (so we can emit exact brand hex)."""
+    """Whether the terminal supports 24-bit color."""
     return os.environ.get("COLORTERM", "").lower() in {"truecolor", "24bit"}
 
 
 def _theme() -> str:
-    """Active theme: ``light`` or ``dark``. ``FLASH_THEME`` wins; otherwise a light terminal
-    background (via the de-facto ``COLORFGBG`` env) selects light. Defaults to ``dark`` (the
-    safe default for the colors, and unchanged behavior when nothing is set)."""
+    """Active theme: ``light`` or ``dark``. ``FLASH_THEME`` overrides; else inferred from ``COLORFGBG``."""
     forced = os.environ.get("FLASH_THEME", "").strip().lower()
     if forced in {"light", "dark"}:
         return forced
@@ -221,14 +197,12 @@ def _theme() -> str:
             bg = int(fgbg.split(";")[-1])
         except ValueError:
             return "dark"
-        # ANSI bg 7 (light grey) and 11-15 (bright/white) mean a light terminal background
         return "light" if bg == 7 or bg >= 11 else "dark"
     return "dark"
 
 
 def _sgr(part: str) -> str:
-    """Resolve one style token to an SGR parameter: a brand color name resolves to a truecolor
-    or 256-color foreground for the active theme; any other code (e.g. ``"1"``) passes through."""
+    """Resolve a style token: brand color name → SGR foreground for the active theme; others pass through."""
     color = _PALETTE.get(part)
     if color is None:
         return part
@@ -239,13 +213,12 @@ def _sgr(part: str) -> str:
 
 
 def _paint(text: str, *codes: str) -> str:
-    """Apply one or more style tokens (raw SGR codes and/or brand color names), honoring the gate."""
+    """Apply style tokens (SGR codes and/or brand color names)."""
     if not codes or not _color():
         return text
     return f"\x1b[{';'.join(_sgr(c) for c in codes)}m{text}\x1b[0m"
 
 
-# state -> (color, unicode dot, ascii dot) for status badges
 _STATE_STYLE: dict[str, tuple[str, str, str]] = {
     "queued": (_GRAY, "○", "o"),
     "provisioning": (_TEAL, "◐", "o"),
@@ -316,8 +289,7 @@ def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
 
 
 def _table(headers: list[str], rows: list[list], aligns: list[str] | None = None) -> str:
-    """Aligned table with a dim header and faint underline. Each cell is a plain string or a
-    ``(text, *sgr_codes)`` tuple; widths come from the plain text so color never skews them."""
+    """Aligned table; cells are plain strings or ``(text, *sgr_codes)`` tuples."""
     aligns = aligns or ["l"] * len(headers)
     cols = len(headers)
 
@@ -349,8 +321,7 @@ def _table(headers: list[str], rows: list[list], aligns: list[str] | None = None
 
 
 def _json(obj) -> str:
-    """Pretty JSON: plain ``json.dumps(indent=2)`` when color is off (byte-identical to the
-    legacy output), syntax-highlighted when it's on. No data is ever dropped."""
+    """Pretty JSON: plain when color is off, syntax-highlighted when on."""
     import json
 
     if not _color():
@@ -386,9 +357,6 @@ def _color_json(obj, depth: int) -> str:
     return _paint(json.dumps(obj), _GREEN)
 
 
-# Per-command renderers (themed view only; the command supplies the data).
-
-
 def version(value: str) -> str:
     """The wordmark + version."""
     mark = _paint(CLI_NAME, _ACCENT, "1")
@@ -420,6 +388,15 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
+def _run_where(spec: dict, remote: dict) -> tuple[str, str]:
+    """Return ``(gpu, provider)`` from remote (preferred) or spec fallback."""
+    provider = remote.get("provider") or (
+        "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
+    )
+    gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+    return gpu, provider
+
+
 def runs_table(runs: list[dict]) -> str:
     """Runs list: state badges + cost, newest first."""
     body = []
@@ -427,11 +404,7 @@ def runs_table(runs: list[dict]) -> str:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        remote = r.get("remote") or {}
-        provider = remote.get("provider") or (
-            "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
-        )
-        gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+        gpu, provider = _run_where(spec, r.get("remote") or {})
         where = f"{gpu}@{provider}" if provider else gpu
         color, uni, ascii_dot = _STATE_STYLE.get(str(r.get("state", "")).lower(), (_GRAY, "•", "-"))
         body.append(
@@ -498,10 +471,8 @@ def _humanize_ts(value) -> str | None:
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
-    remote = obj.get("remote") or {}
-    gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type")
-    provider = remote.get("provider")
-    where = f"{gpu} @ {provider}" if gpu and provider else gpu
+    gpu, provider = _run_where(spec, obj.get("remote") or {})
+    where = f"{gpu} @ {provider}" if gpu and provider else (gpu or None)
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),
@@ -672,8 +643,7 @@ def env_list(local: list[str]) -> str:
 
 
 def chat_label() -> str:
-    """A faint speaker label printed above a styled chat reply (the reply itself stays plain
-    text so a piped transcript is unchanged)."""
+    """Speaker label printed above a styled chat reply."""
     return _paint("assistant", _ACCENT2, "1")
 
 

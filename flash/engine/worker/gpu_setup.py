@@ -1,35 +1,17 @@
 """GPU/backend setup the worker runs at boot or just before TRL builds the rollout engine.
 
-Run-scoped state (``PHASE``/``JOB_SPEC``) is read through the worker package at CALL time so a
-test's ``monkeypatch.setattr(worker, ...)`` reaches these readers."""
+Run-scoped state is read through the worker package at CALL time so monkeypatch reaches these readers."""
 
 from __future__ import annotations
 
 import os
 
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.perf import grpo_sleep_mode
 
 
 def force_vllm_backend_for_sm120() -> str | None:
-    """On RTX 5090 / consumer Blackwell (sm120), force a PTX-independent vLLM attention backend.
-
-    vLLM's default rollout backend is flash-attn, whose PRE-BUILT PTX needs a newer driver JIT than
-    many 5090 RunPod hosts have — when the JIT fails the colocated rollout silently produces NO
-    completions (empty reward_history, ~1.4 s "done"; a whole 22-run sweep hit this on every 5090).
-    FLASHINFER is vLLM's Blackwell-native backend (no flash-attn PTX dependency) and trains on a 5090
-    (~116 s); TRITON_ATTN (also PTX-independent) is the fallback when flashinfer is unimportable. Both
-    are REGISTERED decoder backends on the pinned vllm 0.19.1 — unlike TORCH_SDPA, which that version
-    registers as ViT-only (empty decoder class path) so selecting it for the rollout engine would
-    raise. This mirrors the trainer's cuDNN-SDPA forcing on sm120 (``_attn_impl_for_capability``).
-
-    The pinned vLLM (0.19.1) dropped ``VLLM_ATTENTION_BACKEND`` from its env registry, so the backend
-    is no longer selectable via ``os.environ`` (that assignment would be a silent no-op). It is now an
-    ``LLM(...)`` constructor kwarg (``attention_backend``), so we inject it into TRL's colocate rollout
-    engine via ``patch_trl_colocate_llm_kwargs`` (which runs BEFORE GRPOTrainer builds the engine);
-    ``EngineArgs`` coerces the bare member name through ``AttentionConfig.validate_backend_before``. The
-    GRPO no-op guard remains the backstop. Returns the backend pinned (None if not sm120). Fixed — no
-    operator override."""
+    """Force FLASHINFER on sm120 (RTX 5090): flash-attn PTX is unreliable on consumer Blackwell hosts,
+    causing silent empty-rollout failures. Returns the backend set, or None if not sm120."""
     try:
         import torch
 
@@ -68,67 +50,16 @@ def force_vllm_backend_for_sm120() -> str | None:
 
 
 def finalize_alloc_conf_for_sleep() -> None:
-    """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default (RL runs only).
+    """Sync PYTORCH_ALLOC_CONF with the resolved GRPO sleep mode (RL only).
 
-    The launcher (providers/*/train.py build_worker_env) picks the sleep-SAFE non-expandable
-    PYTORCH_ALLOC_CONF for RL before this process starts, but it can't know the GRPO sleep decision:
-    for a small model the worker resolves sleep OFF (the speed default), so the non-expandable conf
-    is safe but fragments a long colocate run. Here (we have the model config + GPU) we resolve the
-    SAME deterministic sleep default (``grpo_sleep_mode``, exactly run_rl's gate) and, if sleep is
-    OFF, switch to expandable_segments — which only crashes WITH sleep on, a case we've just ruled
-    out. PYTORCH_ALLOC_CONF is read lazily at the first CUDA allocation, so this must run before any
-    allocation (it does — called at boot)."""
+    PYTORCH_ALLOC_CONF is read at first CUDA allocation — must run before any allocation."""
     if _w.PHASE != "rl":
         return
     try:
-        model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else ""
-        # Resolve the sleep decision EXACTLY as run_rl does (grpo_sleep_mode: the size/context gate
-        # PLUS the resident-fit check against the live card), so the alloc conf matches the sleep
-        # mode the trainer will actually use.
-        _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
-        ctx = 0
-        try:
-            if _t and _t.max_length:
-                ctx = int(_t.max_length)
-        except Exception:
-            ctx = 0
-        card_gb = 0.0
-        # fp8 KV (cc>=8.9) halves the resident KV bytes, so grpo_sleep_mode's resident-fit gate admits
-        # a LONGER context as fitting. Derive it EXACTLY as run_rl does (device capability >= (8, 9))
-        # and feed it to the SAME gate below -- else a long-context MoE that fits resident ONLY with
-        # fp8 KV resolves sleep ON here (keeping the non-expandable conf) while run_rl runs sleep OFF,
-        # diverging from this function's documented "exactly run_rl's gate" contract.
-        fp8_kv = False
-        try:
-            import torch as _torch_card
+        from flash.engine.worker.grpo import resolve_grpo_sleep_mode
 
-            if _torch_card.cuda.is_available():
-                # Decimal GB (/1e9) to match grpo_fits_resident's comparison target (see run_rl):
-                # estimate_vram_gb is decimal, so the card size fed to the same sleep gate must be
-                # decimal too or this alloc-conf decision would diverge from the trainer's.
-                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
-                fp8_kv = _torch_card.cuda.get_device_capability() >= (8, 9)
-        except Exception:
-            card_gb = 0.0
-        # Resolve group_size EXACTLY as run_rl does (gcfg override, else the recipe default), not a
-        # flat 8: if the recipe's rl.group_size differs from 8 the alloc-conf sleep decision here
-        # would diverge from the trainer's, picking the wrong expandable/non-expandable conf.
-        from flash.engine.recipe import RECIPE as _RECIPE
-        from flash.engine.worker.grpo import grpo_overrides
-
-        _gcfg = grpo_overrides()
-        _group_size = int(_gcfg.get("group_size") or _RECIPE.rl.group_size)
-        sleep_on = grpo_sleep_mode(
-            model_id,
-            max_length=ctx,
-            group_size=_group_size,
-            max_tokens=(_t.max_tokens if _t else None),
-            lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
-            thinking=_w.THINKING,
-            card_vram_gb=card_gb,
-            fp8_kv=fp8_kv,
-        )
-        if not sleep_on:  # sleep resolves OFF -> expandable is safe + better
+        sleep_on, _ctx, _card_gb, _fp8_kv = resolve_grpo_sleep_mode()
+        if not sleep_on:  # expandable_segments crashes only when sleep is ON
             conf = "expandable_segments:True"
             os.environ["PYTORCH_ALLOC_CONF"] = conf
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = conf
