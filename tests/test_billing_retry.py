@@ -591,7 +591,12 @@ def _identity_for_token(token: str) -> dict[str, str]:
     if not token.startswith(_USER_PREFIX):
         return {}
     suffix = token.removeprefix(_USER_PREFIX)
-    return {"email": f"u-{suffix}@x", "key_prefix": "fslo_test", "org_id": f"org-{suffix}"}
+    return {
+        "email": f"u-{suffix}@x",
+        "key_prefix": "fslo_test",
+        "org_id": f"org-{suffix}",
+        "org_slug": f"org-{suffix}",
+    }
 
 
 def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
