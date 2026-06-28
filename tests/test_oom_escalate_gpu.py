@@ -168,9 +168,12 @@ def test_detail_flags_cuda_oom_is_a_gated_fallback():
     assert detail_flags_cuda_oom("") is False
 
 
-def test_pollers_fall_back_to_detail_only_when_unflagged_and_not_retriable():
-    # The fallback is gated: it runs ONLY when the structured flag said neither oom nor retriable, so
-    # the primary path stays structured and an infra preemption can't be relabeled as oom.
+def test_oom_fallback_scans_only_attempt_fresh_text_not_the_shared_artifact():
+    # AVE/AVG/AVJ: the OOM fallback must scan only ATTEMPT-FRESH text — this attempt's live job output
+    # / its attempt-scoped marker — NEVER the shared per-seed error_<phase>.txt artifact (a prior
+    # attempt's lingering traceback would wrongly escalate). It is gated on ``not oom`` alone (NOT
+    # ``not retriable``) so a STALE retriable heartbeat can't block a real OOM; retriable-wins is
+    # preserved inside detail_flags_cuda_oom (it skips retriable-infra text).
     import re
 
     runpod = re.sub(
@@ -179,10 +182,18 @@ def test_pollers_fall_back_to_detail_only_when_unflagged_and_not_retriable():
     lam = re.sub(
         r"\s+", " ", pathlib.Path(__import__("flash.providers.lambdalabs.jobs", fromlist=["x"]).__file__).read_text()
     )
-    # RunPod: both terminal worker-fail paths add the gated fallback on the assembled detail
-    assert runpod.count("if not oom and not retriable: oom = detail_flags_cuda_oom(detail)") == 2
-    # Lambda dead-host crash path runs the same fallback on the error artifact
-    assert "if not oom and not retriable: oom = detail_flags_cuda_oom(err)" in lam
+    # RunPod: decode-error path scans the live handler error; TERMINAL_FAIL path scans the captured
+    # live_detail (st error + worker stdout tail), both BEFORE the HF artifact is appended.
+    assert "if not oom: oom = detail_flags_cuda_oom(str(e))" in runpod
+    assert "live_detail = detail" in runpod
+    assert "if not oom: oom = detail_flags_cuda_oom(live_detail)" in runpod
+    # the fallback never scans the shared, artifact-appended `detail` and never gates on `not retriable`
+    assert "detail_flags_cuda_oom(detail)" not in runpod
+    assert "not oom and not retriable" not in runpod
+    # Lambda: the fallback runs on the ATTEMPT-SCOPED marker's error text, and NOT on the shared
+    # error_<phase>.txt artifact (`err`) of the dead-host path.
+    assert 'if not oom and marker: oom = detail_flags_cuda_oom(str(marker.get("error") or ""))' in lam
+    assert "detail_flags_cuda_oom(err)" not in lam
 
 
 def test_worker_flagged_oom_ignores_a_prior_attempts_stale_flag():

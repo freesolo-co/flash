@@ -727,12 +727,15 @@ def poll_job(
                 last_hb_key, _ = surface_forced_heartbeat(hb_reader, last_hb_key, say)
                 retriable = worker_flagged_retriable(hb_reader)
                 oom = worker_flagged_oom(hb_reader, current_attempt)
+                # Fallback when the structured oom flag is absent: scan the LIVE handler error only
+                # (THIS attempt's output), NOT the HF error artifact appended below — that artifact is
+                # shared per-seed across attempts and could be a prior attempt's stale traceback (it
+                # would wrongly escalate, or raise the OOM floor on reattach). Gated on ``not oom``
+                # only: detail_flags_cuda_oom skips retriable-infra text, so a CURRENT retriable still
+                # wins, while a stale ``retriable`` heartbeat no longer blocks a real OOM here.
+                if not oom:
+                    oom = detail_flags_cuda_oom(str(e))
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
-                # Fallback when the structured flag is absent (heartbeat upload failed) or the OOM was
-                # in a subprocess the worker didn't classify: scan the assembled detail. Gated on
-                # ``not retriable`` so an infra retry that names a CUDA OOM still wins as preempt.
-                if not oom and not retriable:
-                    oom = detail_flags_cuda_oom(detail)
                 return PollResult(
                     False,
                     failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
@@ -747,6 +750,9 @@ def poll_job(
                 detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])[-2000:]
             elif not detail:
                 detail = str(out)[:1500]
+            # THIS attempt's live output (job error + worker stdout tail), captured BEFORE the shared
+            # per-seed HF artifact is appended below — the attempt-fresh text the OOM fallback scans.
+            live_detail = detail
             # Structural classification only ([{status}] prefix is for human-readable logs).
             # A platform termination (CANCELLED/TIMED_OUT) is already retryable — skip the worker
             # heartbeat read entirely (no worker error there, and it may not even exist yet).
@@ -758,12 +764,14 @@ def poll_job(
             last_hb_key, _ = surface_forced_heartbeat(hb_reader, last_hb_key, say)
             retriable = worker_flagged_retriable(hb_reader)
             oom = worker_flagged_oom(hb_reader, current_attempt)
+            # Fallback OOM detection on the attempt-fresh LIVE output only (a child-process OOM whose
+            # root cause is only in the worker stdout tail — e.g. vLLM EngineCore). NOT the shared
+            # per-seed HF artifact appended below (stale-prone across attempts). Gated on ``not oom``;
+            # detail_flags_cuda_oom skips retriable-infra text so a current retriable still wins and a
+            # stale retriable heartbeat no longer blocks a real OOM.
+            if not oom:
+                oom = detail_flags_cuda_oom(live_detail)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
-            # Fallback OOM detection (heartbeat-flag absent, or a child-process OOM whose root cause
-            # is only in the appended worker stdout tail — e.g. vLLM EngineCore). Gated on
-            # ``not retriable`` so an infra preemption that names a CUDA OOM still wins as preempt.
-            if not oom and not retriable:
-                oom = detail_flags_cuda_oom(detail)
             return PollResult(
                 False,
                 failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
@@ -1137,20 +1145,20 @@ def worker_flagged_oom(heartbeat_reader, current_attempt: int | None = None) -> 
 
 
 def detail_flags_cuda_oom(detail: str | None) -> bool:
-    """Fallback OOM classifier for the assembled failure ``detail``, for the two cases the structured
-    heartbeat ``oom`` flag misses:
+    """Fallback OOM classifier for the cases the structured heartbeat ``oom`` flag misses: the OOM
+    happened in a SUBPROCESS the worker didn't classify on its own exception (a vLLM EngineCore child
+    whose CUDA OOM only reaches the parent via stdout), or the terminal error heartbeat upload was
+    lost. Runs the SAME CUDA-specific predicate the worker uses (``is_cuda_oom``), so a host/library
+    OOM in the text does NOT escalate.
 
-    * the terminal error heartbeat upload FAILED (best-effort) while the error artifact made it, so
-      no ``oom`` flag is visible even though the traceback names a CUDA OOM; and
-    * the OOM happened in a SUBPROCESS the worker didn't classify on its own exception (a vLLM
-      EngineCore child whose CUDA OOM only reaches the parent via stdout, which the poller appends to
-      ``detail``).
-
-    Runs the SAME CUDA-specific predicate the worker uses (``is_cuda_oom``), so a host/library OOM in
-    the text does NOT escalate. Skips any detail carrying the retriable-infra marker so a host-
-    readiness RetriableInfraError that merely names a CUDA OOM still retries on a fresh same-size GPU
-    (mirrors the worker's retriable-wins rule). This is a fallback ONLY — callers gate it on the
-    structured flag being absent, so the primary path stays structured (no routine string parsing)."""
+    IMPORTANT — callers must pass only ATTEMPT-FRESH text (this attempt's live job output / its
+    attempt-scoped marker), NEVER the shared per-seed HF ``error_<phase>.txt`` artifact: that artifact
+    is not attempt-scoped, so a prior attempt's lingering traceback could otherwise label an unrelated
+    failure as an OOM and wrongly escalate (or raise the OOM floor on reattach). Skips any text
+    carrying the retriable-infra marker so a current RetriableInfraError that merely names a CUDA OOM
+    still retries on a fresh same-size GPU (the worker's retriable-wins rule); this lets callers gate
+    on ``not oom`` alone, so a STALE ``retriable`` heartbeat can't block a real OOM. Fallback ONLY —
+    the primary path stays the structured flag."""
     if not detail:
         return False
     from flash.engine.worker.perf.lifecycle import RETRIABLE_INFRA_MARKER, is_cuda_oom

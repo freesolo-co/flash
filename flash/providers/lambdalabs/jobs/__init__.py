@@ -457,6 +457,15 @@ def poll_lambda_job(
         hb_once = _once_forced(heartbeat_reader)
         oom = bool(marker and marker.get("oom")) or worker_flagged_oom(hb_once, handle.attempt)
         retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(hb_once)
+        # Fallback: the ATTEMPT-SCOPED marker's own error text may name a CUDA OOM even when its `oom`
+        # field and the heartbeat oom flag are both absent (the typical Lambda OOM finishes with an
+        # ok=false marker while the box is still up, and the terminal heartbeat upload can be lost).
+        # Safe because the marker is attempt-scoped (NOT the shared per-seed error artifact); gated on
+        # `not oom` (detail_flags_cuda_oom skips retriable-infra text so a current retriable wins).
+        from flash.providers.runpod.jobs import detail_flags_cuda_oom
+
+        if not oom and marker:
+            oom = detail_flags_cuda_oom(str(marker.get("error") or ""))
         return PollResult(
             False,
             failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
@@ -573,7 +582,6 @@ def poll_lambda_job(
             # retriable crash leaves a retriable heartbeat that keeps this path on job_preempted.
             from flash.providers.runpod.jobs import (
                 _once_forced,
-                detail_flags_cuda_oom,
                 worker_flagged_oom,
                 worker_flagged_retriable,
             )
@@ -586,11 +594,10 @@ def poll_lambda_job(
             oom = worker_flagged_oom(hb_once, handle.attempt)
             retriable = worker_flagged_retriable(hb_once)
             worker_crashed = bool(err and err.strip()) and not retriable
-            # Fallback when the heartbeat flag is absent (best-effort upload lost): the error
-            # artifact's traceback may name the CUDA OOM. Gated on not-retriable so an infra crash
-            # that mentions a CUDA OOM still retries on a fresh same-size host.
-            if not oom and not retriable:
-                oom = detail_flags_cuda_oom(err)
+            # NO text fallback here: the only text on this dead-host path is the shared per-seed
+            # error_<phase>.txt artifact, which is NOT attempt-scoped — scanning it for OOM could
+            # escalate off a prior attempt's traceback. The attempt-gated heartbeat oom flag (above)
+            # and the attempt-scoped marker in fail_from_marker are the attempt-safe OOM sources.
             return PollResult(
                 False,
                 failure="oom"
