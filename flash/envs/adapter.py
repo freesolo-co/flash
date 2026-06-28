@@ -451,7 +451,11 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     extracted_dir = dest / next(iter(top_dirs))
     if extracted_dir.exists() and not extracted_dir.is_dir():
         raise RuntimeError("environment archive had an unexpected layout")
-    extracted_dir.mkdir(parents=True, exist_ok=True)
+    if not extracted_dir.is_dir():
+        if want:
+            extracted_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            raise RuntimeError("environment archive did not extract to a directory")
     return extracted_dir
 
 
