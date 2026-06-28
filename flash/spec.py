@@ -306,9 +306,7 @@ class JobSpec:
                 max_retries=int(gpu.get("max_retries", 5)),
                 # network_volume/network_volume_gb round-trip so the runner-assigned weight cache
                 # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
-                # _assign_managed_hf_repo before deploy. A legacy ``datacenter`` key (from the
-                # reverted single-DC pin) is intentionally ignored — the DC set is deploy-time
-                # policy now, so stale specs carrying it are tolerated, never region-pinned.
+                # _assign_managed_hf_repo before deploy.
                 network_volume=gpu.get("network_volume"),
                 # Tolerant: null / "" / "0" / 0 / negative / non-numeric / missing -> the default.
                 # Platform-managed, so a stale or hand-edited spec must still load with a sane size.
