@@ -386,123 +386,6 @@ def strip_language_model_infix(key: str) -> str:
     return key[:i] + "." + key[i + len(_LANGUAGE_MODEL_INFIX) :]
 
 
-def remap_adapter_keys(keys):
-    """Map an iterable of adapter weight keys -> a dict {old_key: new_key} for keys that change.
-
-    Pure (no I/O); used both by the on-disk rewriter and by tests to assert the post-remap key set
-    matches an ``AutoModelForCausalLM``-named LoRA param set.
-    """
-    out = {}
-    for k in keys:
-        nk = strip_language_model_infix(k)
-        if nk != k:
-            out[k] = nk
-    return out
-
-
-def _rewrite_safetensors_header_keys(path: str, rename) -> int:
-    """Rename tensor keys in a ``.safetensors`` file IN PLACE, editing only the header.
-
-    safetensors layout: 8-byte little-endian header length, then a JSON header mapping
-    ``name -> {dtype, shape, data_offsets}`` (plus an optional ``__metadata__`` entry), then the
-    raw tensor data. ``data_offsets`` are relative to the data section, so a pure key rename leaves
-    every byte of the data section valid — we only rewrite the JSON header and its length prefix.
-
-    ``rename`` is a callable ``old_key -> new_key``. Returns the number of keys renamed. No torch /
-    safetensors dependency (keeps this module CPU-importable on the server venv).
-    """
-    import json
-    import os
-    import shutil
-    import struct
-
-    with open(path, "rb") as f:
-        len_bytes = f.read(8)
-        if len(len_bytes) < 8:
-            raise ValueError(f"{path}: too small to be a safetensors file")
-        (hdr_len,) = struct.unpack("<Q", len_bytes)
-        header_bytes = f.read(hdr_len)
-        if len(header_bytes) < hdr_len:
-            raise ValueError(f"{path}: truncated safetensors header")
-        try:
-            header = json.loads(header_bytes)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            # Re-raise with the file path so a corrupt adapter being rewritten is diagnosable
-            # (a bare JSONDecodeError/UnicodeDecodeError names no file). Non-UTF8 header bytes
-            # raise UnicodeDecodeError, not JSONDecodeError, so catch both to keep the context.
-            raise ValueError(
-                f"{path}: safetensors header is not valid JSON "
-                f"(corrupt or not a safetensors file): {exc}"
-            ) from exc
-    data_start = 8 + hdr_len
-
-    new_header = {}
-    renamed = 0
-    for k, v in header.items():
-        if k == "__metadata__":
-            new_header[k] = v
-            continue
-        nk = rename(k)
-        if nk != k:
-            if nk in header or nk in new_header:
-                raise ValueError(
-                    f"{path}: remapped key {nk!r} collides with an existing key; refusing to "
-                    f"overwrite (adapter may already be remapped or malformed)"
-                )
-            renamed += 1
-        new_header[nk] = v
-
-    if renamed == 0:
-        return 0
-
-    # Re-serialize compactly. safetensors does not require any specific key order or padding; the
-    # only constraint is that data_offsets stay consistent with the (unchanged) data section.
-    new_header_bytes = json.dumps(new_header, separators=(",", ":")).encode("utf-8")
-    # Stream the (possibly multi-GB) tensor data straight from the original to a temp file instead
-    # of slurping the whole file into memory; os.replace makes the swap atomic so an interrupted
-    # rewrite can't corrupt the adapter.
-    tmp = path + ".remap.tmp"
-    try:
-        with open(path, "rb") as src, open(tmp, "wb") as out:
-            src.seek(data_start)
-            out.write(struct.pack("<Q", len(new_header_bytes)))
-            out.write(new_header_bytes)
-            shutil.copyfileobj(src, out, 8 * 1024 * 1024)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        raise
-    os.replace(tmp, path)
-    return renamed
-
-
-def _rewrite_bin_keys(path: str, rename) -> int:
-    """Rename keys in a PyTorch ``.bin`` (pickled ``state_dict``) adapter IN PLACE.
-
-    Used only when the saved adapter is the legacy ``.bin`` format (no ``.safetensors``). Needs
-    torch to (de)serialize; that's fine because this path runs only on the GPU worker.
-    """
-    import torch
-
-    sd = torch.load(path, map_location="cpu", weights_only=True)
-    new_sd = {}
-    renamed = 0
-    for k, v in sd.items():
-        nk = rename(k)
-        if nk != k:
-            if nk in sd or nk in new_sd:
-                raise ValueError(
-                    f"{path}: remapped key {nk!r} collides with an existing key; refusing to "
-                    f"overwrite (adapter may already be remapped or malformed)"
-                )
-            renamed += 1
-        new_sd[nk] = v
-    if renamed == 0:
-        return 0
-    torch.save(new_sd, path)
-    return renamed
-
-
 # Substrings that identify a peft LoRA weight key (vs a base-model param). The whole adapter file
 # is LoRA weights, but a wrong-arch / corrupt checkpoint can contain non-LoRA tensors, so we filter.
 _LORA_KEY_MARKERS = (".lora_A.", ".lora_B.", ".lora_embedding_A.", ".lora_embedding_B.", "lora_")
@@ -519,20 +402,15 @@ _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
 
 def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
-    """Tensor key names in the downloaded adapter.
-
-    For ``.safetensors`` this reads ONLY the JSON header (pure stdlib, no tensor data — keeps this
-    module CPU-importable). For the legacy ``.bin`` format the pickled ``state_dict`` must be
-    materialized via ``torch.load`` to enumerate its keys (a pickle can't be read key-only without
-    unpickling the tensor payloads — GPU-worker only). Returns ``None`` when neither weight file
-    exists in ``adir``.
+    """Tensor key names in the downloaded adapter, read ONLY from the ``.safetensors`` JSON header
+    (pure stdlib, no tensor data — keeps this module CPU-importable). Returns ``None`` when no
+    ``adapter_model.safetensors`` exists in ``adir``.
     """
     import json
     import os
     import struct
 
     st_path = os.path.join(adir, "adapter_model.safetensors")
-    bin_path = os.path.join(adir, "adapter_model.bin")
     if os.path.isfile(st_path):
         # safetensors layout: 8-byte LE header length, then the JSON header, then the tensor data.
         # Bound the DECLARED header length against the real file size (and an absolute ceiling)
@@ -571,109 +449,7 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
                 "(corrupt or not a safetensors file)"
             )
         return [k for k in header if k != "__metadata__"]
-    if os.path.isfile(bin_path):
-        import torch
-
-        sd = torch.load(bin_path, map_location="cpu", weights_only=True)
-        return list(sd.keys())
     return None
-
-
-def remap_vl_adapter_dir(adir: str, model_id: str) -> int:
-    """For a VL warm-start, strip the ``.language_model.`` infix from the downloaded SFT adapter so
-    its keys match the ``AutoModelForCausalLM`` trainer used by ``_init_adapter_model``.
-
-    The remap decision is driven by the ADAPTER'S OWN keys, not only the ``is_vl_checkpoint`` config
-    probe. ``is_vl_checkpoint`` calls ``AutoConfig.from_pretrained`` and swallows EVERY exception to
-    return False, so an HF rate-limit / network hiccup / uncached config silently turned a genuine
-    VL warm-start into a no-op: the ``.language_model.`` keys were left in place, the text-only base
-    couldn't match them, peft kept the zero-init LoRA, and GRPO aborted at
-    ``assert_adapter_delta_nonzero`` with all-zero ``lora_B`` (issue #286). Any adapter that actually
-    carries ``.language_model.`` LoRA keys was saved against the full multimodal model and MUST be
-    stripped regardless of the probe, so we key off the file contents and only fall back to the probe
-    for the (already-stripped / text-only) no-infix case.
-
-    Fails LOUDLY instead of silently dropping a mismatched adapter:
-    - a VL warm-start whose adapter has NO LoRA keys at all (corrupt / wrong-architecture) raises;
-    - any ``.language_model.`` LoRA key that SURVIVES the rewrite raises (it would be silently
-      discarded by the text-only base -> all-zero ``lora_B``).
-
-    Returns the number of keys renamed. No-op (returns 0) for a genuinely text-only model, or an
-    already-remapped adapter. Idempotent: a second call finds nothing to strip.
-    """
-    import os
-
-    keys = _read_adapter_tensor_keys(adir)
-    if keys is None:
-        print(
-            f"[init-adapter] remap_vl_adapter_dir: no adapter_model.safetensors/.bin in {adir!r}; "
-            "nothing to remap"
-        )
-        return 0
-
-    lora_keys = [k for k in keys if _is_lora_key(k)]
-    infixed = [k for k in lora_keys if _LANGUAGE_MODEL_INFIX in k]
-
-    # No '.language_model.' LoRA keys -> nothing to strip from the file itself. The ONLY reason to act
-    # is the config probe, so it runs HERE (the fallback case) rather than on every warm-start: a key
-    # already in text-only form needs no network round-trip to confirm. is_vl distinguishes a genuine
-    # text-only model (return 0) from an already-remapped / text-only-SFT VL adapter (diagnostic).
-    if not infixed:
-        if not is_vl_checkpoint(model_id):
-            return 0  # genuinely text-only model with text-only adapter keys
-        if not lora_keys:
-            # A VL warm-start whose adapter carries no LoRA weights can't hold a real SFT delta — it
-            # would load as the all-zero identity. Fail here, before the base-model download.
-            raise RuntimeError(
-                f"warm-start adapter in {adir!r} for {model_id} contains NO LoRA weight keys "
-                f"(found {len(keys)} tensor(s), 0 with a lora_ marker) — the adapter is corrupt, "
-                "incomplete, or from a different architecture, so GRPO would train from the base "
-                "model. Re-export the SFT adapter, or omit train.init_from_adapter for a fresh LoRA."
-            )
-        # VL checkpoint but nothing to strip: legitimately already-remapped (idempotent re-run) or a
-        # text-only SFT. Surface the adapter's actual LoRA prefix so a real key mismatch isn't a
-        # silent no-op — if GRPO later aborts with all-zero lora_B, these keys didn't match the base.
-        sample_prefix = next(
-            (k.split(".lora_")[0] for k in lora_keys if ".lora_" in k), lora_keys[0]
-        )
-        print(
-            f"[init-adapter] remap_vl_adapter_dir: 0 '.language_model.' keys to strip for VL "
-            f"checkpoint {model_id} ({len(lora_keys)} LoRA key(s); e.g. prefix {sample_prefix!r}) — "
-            "treating as already-remapped/text-only. If the warm-start later aborts with all-zero "
-            "lora_B, these keys did not match the base model."
-        )
-        return 0
-
-    # The adapter carries '.language_model.' LoRA keys: it was saved against the full multimodal model
-    # and MUST be stripped to match the AutoModelForCausalLM trainer — regardless of the config probe
-    # (a flaky/failed AutoConfig probe must not silently skip a needed remap -> issue #286). We don't
-    # call is_vl_checkpoint at all on this path: the adapter's own keys are sufficient evidence.
-    # Fail CLOSED *before* touching disk: strip_language_model_infix removes only the FIRST infix, so a
-    # key carrying it twice would still match no text-only module and be silently discarded (the #286
-    # all-zero-lora_B failure). Predict the post-strip keys from the in-memory list (no file re-read).
-    survivors = [
-        nk for nk in (strip_language_model_infix(k) for k in infixed) if _LANGUAGE_MODEL_INFIX in nk
-    ]
-    if survivors:
-        raise RuntimeError(
-            f"remap_vl_adapter_dir: {len(survivors)} LoRA key(s) in {adir!r} for {model_id} would "
-            f"still carry '.language_model.' after the remap (e.g. {survivors[0]!r}) — they will NOT "
-            "match the AutoModelForCausalLM trainer and would be silently discarded -> all-zero "
-            "lora_B. The adapter's key layout is unexpected; verify it was saved by this SFT pipeline."
-        )
-
-    st_path = os.path.join(adir, "adapter_model.safetensors")
-    bin_path = os.path.join(adir, "adapter_model.bin")
-    if os.path.isfile(st_path):
-        n = _rewrite_safetensors_header_keys(st_path, strip_language_model_infix)
-    else:  # bin_path exists — keys were read from one of the two files above
-        n = _rewrite_bin_keys(bin_path, strip_language_model_infix)
-
-    print(
-        f"[init-adapter] remapped {n} VL SFT adapter key(s): stripped '.language_model.' infix "
-        f"to match the AutoModelForCausalLM trainer for {model_id}"
-    )
-    return n
 
 
 def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
@@ -684,9 +460,9 @@ def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
     rate-limit / network hiccup / uncached config could silently route a genuine VL warm-start down
     the text-only path and reintroduce the trainer<->vLLM mismatch — issue #286). An adapter that
     actually carries ``.language_model.`` LoRA keys was saved against the full multimodal model and
-    IS a VL warm-start regardless of the probe (the SAME authoritative file-content signal
-    ``remap_vl_adapter_dir`` keys off). Falls back to the config probe only when the adapter can't be
-    read or carries no ``.language_model.`` LoRA keys (already-text-only / non-VL)."""
+    IS a VL warm-start regardless of the probe (the adapter's own keys are the authoritative signal).
+    Falls back to the config probe only when the adapter can't be read or carries no
+    ``.language_model.`` LoRA keys (already-text-only / non-VL)."""
     try:
         keys = _read_adapter_tensor_keys(adir)
         if keys and any(_LANGUAGE_MODEL_INFIX in k for k in keys if _is_lora_key(k)):
@@ -728,20 +504,13 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     def _load(d: str):
         cfg_path = os.path.join(d, "adapter_config.json")
         st_path = os.path.join(d, "adapter_model.safetensors")
-        bin_path = os.path.join(d, "adapter_model.bin")
         if os.path.isfile(st_path):
             sd = load_file(st_path)
-        elif os.path.isfile(bin_path):
-            # Legacy PEFT save: a plain torch pickle of {name: tensor}. The warm-start INIT path
-            # (PeftModel.from_pretrained / _read_adapter_tensor_keys / remap_vl_adapter_dir) all
-            # accept .bin, so recombine must too — otherwise a loadable .bin warm-start trains a full
-            # paid GRPO run and only fails here at finalize. weights_only=True: pure tensor dicts.
-            sd = torch.load(bin_path, map_location="cpu", weights_only=True)
         else:
             raise ValueError(
-                f"recombine: {d!r} has no adapter_model.safetensors or adapter_model.bin "
+                f"recombine: {d!r} has no adapter_model.safetensors "
                 f"(dir contents: {sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING'}); "
-                "only safetensors / .bin LoRA adapters can be recombined"
+                "only safetensors LoRA adapters can be recombined"
             )
         if not os.path.isfile(cfg_path):
             raise ValueError(
@@ -904,8 +673,8 @@ def assert_lora_applied(model, model_id: str) -> int:
         raise RuntimeError(
             f"warm-start adapter for {model_id} loaded ZERO LoRA modules — the SFT adapter was NOT "
             "applied (key mismatch). GRPO would silently restart from the base model. For Qwen3.5/"
-            "3.6 VL this is usually the '.language_model.' key-mismatch (check remap_vl_adapter_dir "
-            "ran on the adapter); otherwise verify the adapter's keys match the model."
+            "3.6 VL this is usually a '.language_model.' key-mismatch; otherwise verify the adapter's "
+            "keys match the model."
         )
     print(f"[init-adapter] verified {count} LoRA submodule(s) applied for {model_id}")
     return count
@@ -942,8 +711,8 @@ def assert_adapter_load_clean(load_result, model_id: str) -> None:
             f"warm-start adapter for {model_id} did NOT load cleanly: {len(missing)} injected LoRA "
             f"module(s) got no saved weight (missing) and {len(unexpected)} saved adapter key(s) "
             "matched no module (unexpected). The adapter was silently discarded -> GRPO would restart "
-            "from the base model. For Qwen3.5/3.6 VL this is the '.language_model.' key mismatch "
-            "(check remap_vl_adapter_dir ran on the adapter); otherwise the adapter's keys don't match "
+            "from the base model. For Qwen3.5/3.6 VL this is the '.language_model.' key mismatch; "
+            "otherwise the adapter's keys don't match "
             f"the base. missing[:3]={missing[:3]} unexpected[:3]={unexpected[:3]}"
         )
     print(
@@ -976,8 +745,7 @@ def assert_adapter_delta_nonzero(model, model_id: str) -> int:
         raise RuntimeError(
             f"warm-start adapter for {model_id} has ALL-ZERO lora_B weights across {seen} module(s) — "
             "the adapter delta is identically zero (an unloaded / silently-discarded adapter). GRPO "
-            "would train from the base model. Verify the adapter's keys match the base (see "
-            "remap_vl_adapter_dir)."
+            "would train from the base model. Verify the adapter's keys match the base."
         )
     print(f"[init-adapter] verified non-zero lora_B in {nonzero}/{seen} module(s) for {model_id}")
     return nonzero
