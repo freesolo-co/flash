@@ -57,6 +57,14 @@ def _dump_thread_stacks(reason: str) -> None:
         faulthandler.dump_traceback(all_threads=True)
 
 
+def _rollback_throttle_slot(my_claim: int, prev_last_upload: float) -> None:
+    """Restore the throttle slot after a failed/abandoned upload, but only if this heartbeat still
+    owns the latest claim — a newer heartbeat that bumped the slot after us must not be rolled back."""
+    with _HB_LOCK:
+        if my_claim == _HB_CLAIM_SEQ:
+            _w._HB_LAST_UPLOAD = prev_last_upload
+
+
 def heartbeat(stage: str, *, liveness: bool = False, **kw):
     global _HB_CLAIM_SEQ
     ts = time.time()
@@ -109,16 +117,12 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
                         os.remove(up)
                 if committed is False:
                     # ``is False`` (not falsy) so a mock/None never trips the rollback.
-                    with _HB_LOCK:
-                        if my_claim == _HB_CLAIM_SEQ:
-                            _w._HB_LAST_UPLOAD = prev_last_upload
+                    _rollback_throttle_slot(my_claim, prev_last_upload)
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
-            with _HB_LOCK:
-                if my_claim == _HB_CLAIM_SEQ:
-                    _w._HB_LAST_UPLOAD = prev_last_upload
+            _rollback_throttle_slot(my_claim, prev_last_upload)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", snapshot)
 

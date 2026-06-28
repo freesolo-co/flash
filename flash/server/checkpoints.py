@@ -22,26 +22,9 @@ import urllib.request
 from flash.runner.checkpoints import list_checkpoints
 from flash.spec import JobSpec
 
-from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key
+from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key, run_org_id
 
 _RECORD_PATH = "/api/runs/internal/checkpoints"
-
-
-def _run_org_id(status) -> str:
-    """Org that owns the run, or "" if none.
-
-    Prefers the org persisted WITH the run — ``billing_context`` for user runs, THEN
-    ``platform_context`` for internal/operator runs (the submit-path order). Same
-    billing-then-platform precedence as ``routes/serving.py::_run_org``. (NB: this is the
-    OPPOSITE order to ``run_registry._context_from_status``, which prefers ``platform_context``
-    first — don't conflate them.) Each context is isinstance-guarded against a non-dict legacy
-    value."""
-    for ctx in (getattr(status, "billing_context", None), getattr(status, "platform_context", None)):
-        if isinstance(ctx, dict):
-            org = str(ctx.get("org_id") or "").strip()
-            if org:
-                return org
-    return ""
 
 
 def _post_checkpoints(*, token: str, body: dict) -> dict:
@@ -59,12 +42,12 @@ def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dic
     """Upsert ``checkpoints`` for one run into the backend store (idempotent by run_id+step).
 
     Pulls the org id from the run's persisted context (``billing_context`` then
-    ``platform_context``, via :func:`_run_org_id`). Raises ``ValueError`` when there's nothing
+    ``platform_context``, via :func:`run_org_id`). Raises ``ValueError`` when there's nothing
     to record or no org id; raises ``urllib`` errors through on a backend failure —
     ``register_checkpoints_best_effort`` is the guarded wrapper most callers use."""
     if not checkpoints:
         raise ValueError("no checkpoints to record")
-    org_id = _run_org_id(status)
+    org_id = run_org_id(status)
     if not org_id:
         raise ValueError("missing org id for run checkpoints")
     spec = status.spec or {}
@@ -96,7 +79,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
     except Exception as exc:
         _log(f"[ckpt] register skipped ({status.run_id}): bad spec: {exc}")
         return 0
-    if not _run_org_id(status):
+    if not run_org_id(status):
         # Internal/operator run with no org attribution: nothing to scope the rows to. Skip
         # quietly BEFORE the HF listing — HF stays the source of truth — so an expected-skip run
         # does no unnecessary network work and emits no `[ckpt] list warn` noise.
