@@ -23,6 +23,40 @@ class RetriableInfraError(RuntimeError):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
 
 
+def cuda_oom_count() -> int:
+    """torch's cumulative count of OOMs thrown by the caching allocator (``num_ooms``), summed across
+    visible CUDA devices. A fresh worker starts at 0, so a non-zero value at crash time means a CUDA
+    allocator OOM happened this run. 0 when torch/CUDA is unavailable."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0
+        return sum(
+            int(torch.cuda.memory_stats(i).get("num_ooms", 0))
+            for i in range(torch.cuda.device_count())
+        )
+    except Exception:
+        return 0
+
+
+def is_cuda_oom(exc: BaseException | None) -> bool:
+    """Whether ``exc`` is a CUDA out-of-memory crash — classified STRUCTURALLY (no message parsing):
+    torch's typed ``OutOfMemoryError`` or its ``num_ooms`` allocator counter having advanced. A host
+    ``MemoryError`` is never a GPU OOM (a bigger card can't fix it). The worker calls this on its live
+    exception and stamps an ``oom`` heartbeat flag so the runner retries on a larger GPU."""
+    if isinstance(exc, MemoryError):
+        return False
+    try:
+        import torch
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    return cuda_oom_count() > 0
+
+
 def detect_mig_slice() -> str | None:
     """Return a reason string if this worker was handed a MIG slice (a partitioned GPU), else None.
 
