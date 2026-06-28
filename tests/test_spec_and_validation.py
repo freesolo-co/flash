@@ -17,7 +17,7 @@ BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k"},
-    "train": {"steps": 10, "lora_rank": 8, "seeds": [0], "hf_repo": "owner/runs"},
+    "train": {"steps": 10, "lora_rank": 8, "hf_repo": "owner/runs"},
     "gpu": {"type": "RTX 4090"},
 }
 
@@ -41,7 +41,9 @@ def _raw(**overrides) -> dict:
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"train.seeds": []}, "at least one seed"),
+        # `seeds` is no longer a valid [train] key (multi-seed removed); it's now rejected
+        # as an unknown key rather than seed-validated.
+        ({"train.seeds": [0]}, "unknown key"),
         ({"train.steps": 0}, "steps must be >= 1"),
         # lora_rank/alpha now parse via _train_int(minimum=1), so out-of-range values
         # are rejected at parse time with the shared ">= 1" message (a non-positive int
@@ -53,6 +55,16 @@ def _raw(**overrides) -> dict:
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
+        # An unhashable model (TOML array / `[model]` table) used to TypeError on MODELS.get() -> 500;
+        # it must be a clean ConfigError like every other scalar.
+        ({"model": ["Qwen/Qwen3.5-4B"]}, "must be a model id string"),
+        ({"model": {"id": "x"}}, "must be a model id string"),
+        ({"model": "   "}, "must be a model id string"),
+        # A truthy non-string algorithm used to AttributeError on .lower() (uncaught 500); it must be
+        # a clean ConfigError (400) like seeds. Falsy values still default to "grpo" (tested below).
+        ({"algorithm": 5}, "algorithm must be a string"),
+        ({"algorithm": ["grpo"]}, "algorithm must be a string"),
+        ({"algorithm": True}, "algorithm must be a string"),
         # NOTE: model_policy is no longer a user knob (it's read from the FLASH_MODEL_POLICY env on
         # the control plane), so a bad user-supplied model_policy is ignored, not rejected here.
         # Unknown config sections/keys are rejected (not silently dropped → 16x-cost defaults).
@@ -67,9 +79,15 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
+def test_falsy_algorithm_defaults_to_grpo() -> None:
+    # The type guard must preserve the original `(value or "grpo")` semantics: falsy values default.
+    for falsy in (None, "", 0):
+        assert spec_from_dict(_raw(algorithm=falsy)).algorithm == "grpo"
+
+
 def test_sft_epochs_must_be_positive() -> None:
     raw = _raw(algorithm="sft")
-    raw["train"] = {"epochs": 0, "lora_rank": 8, "seeds": [0]}
+    raw["train"] = {"epochs": 0, "lora_rank": 8}
     with pytest.raises(ConfigError, match="epochs must be >= 1"):
         spec_from_dict(raw)
 
@@ -84,21 +102,10 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     # required NOR honored from a user config: a config without it parses fine, and a user-
     # supplied value is ignored (left blank for the control plane to assign at submit).
     raw = _raw()
-    raw["train"] = {"steps": 10, "lora_rank": 8, "seeds": [0]}
+    raw["train"] = {"steps": 10, "lora_rank": 8}
     assert spec_from_dict(raw).train.hf_repo == ""
     raw["train"]["hf_repo"] = "someone-else/their-repo"
     assert spec_from_dict(raw).train.hf_repo == ""
-
-
-def test_environment_path_is_rejected() -> None:
-    # Local environment paths are gone; a `path` (alone or alongside `id`) must fail loudly.
-    raw = _raw()
-    raw["environment"] = {"path": "./environment.py"}
-    with pytest.raises(ConfigError, match="local environment paths are no longer supported"):
-        spec_from_dict(raw)
-    raw["environment"] = {"id": "gsm8k", "path": "./environment.py"}
-    with pytest.raises(ConfigError, match="local environment paths are no longer supported"):
-        spec_from_dict(raw)
 
 
 def test_bare_environment_id_is_rejected() -> None:
@@ -129,6 +136,39 @@ def test_bare_environment_id_is_rejected() -> None:
         raw["environment"] = {"id": bad}
         with pytest.raises(ConfigError, match=r"Freesolo environment id"):
             spec_from_dict(raw)
+
+
+def test_env_ref_validator_matches_adapter_acceptor() -> None:
+    # The submit-time schema validator and the worker's environment acceptor parse ONE grammar;
+    # they must agree exactly (accept <-> no raise, reject <-> raise) or a ref accepted at submit
+    # could fail on the worker (or vice-versa). _require_environment_ref now delegates to the
+    # adapter's is_freesolo_environment_id; this pins that alignment across the grammar's corners.
+    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.schema.fields import _require_environment_ref
+
+    corpus = [
+        "ns/name",  # plain managed slug
+        "github:owner/repo",
+        "github:owner/repo@ref",
+        "https://github.com/owner/repo/blob/dev/envs/e/environment.py",  # blob URL
+        "  github:owner/repo@dev:envs/e/environment.py  ",  # whitespace-padded ref
+        "  ns/name  ",  # whitespace-padded slug
+        "https://github.com/owner/repo/blob/main/envs%2Fe/environment.py",  # %2F-encoded blob URL
+        "github:owner/repo@main:../../etc/passwd",  # traversal attempt
+        "https://github.com/owner/repo/blob/main/../x.py",  # traversal attempt
+        "../../etc/passwd",
+        "",
+    ]
+
+    def schema_accepts(value: str) -> bool:
+        try:
+            _require_environment_ref(value, "msg")
+            return True
+        except ConfigError:
+            return False
+
+    for value in corpus:
+        assert schema_accepts(value) is is_freesolo_environment_id(value), value
 
 
 def test_environment_must_be_a_table() -> None:
@@ -277,7 +317,6 @@ def test_job_spec_json_round_trip() -> None:
     spec = spec_from_dict(_raw(), run_id="rt-1")
     restored = JobSpec.from_json(spec.to_json())
     assert restored == spec
-    assert restored.train.seeds == (0,)
     assert restored.phase == "rl"  # grpo's internal phase id
 
 
@@ -338,8 +377,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw(), run_id="flash-1-x")
     assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "flash-1-x"))
-    assert orch.adapter_prefix(spec) == "rl/flash-1-x/seed0"
-    assert orch.adapter_prefix(spec, seed=3) == "rl/flash-1-x/seed3"
+    assert orch.adapter_prefix(spec) == "rl/flash-1-x"
     assert orch.adapter_ref(spec) is None
 
     d = spec.to_dict()
@@ -347,7 +385,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     spec_with_repo = JobSpec.from_dict(d)
     assert (
         orch.adapter_ref(spec_with_repo)
-        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x/seed0"
+        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
     )
 
 

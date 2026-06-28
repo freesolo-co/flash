@@ -130,7 +130,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"seeds": [0], **knobs},
+            "train": {**knobs},
         }
     )
     monkeypatch.setattr(w, "JOB_SPEC", spec)
@@ -141,7 +141,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py", "params": {"grpo_config": knobs}},
-            "train": {"seeds": [0]},
+            "train": {},
         }
     )
     monkeypatch.setattr(w, "JOB_SPEC", poisoned)
@@ -155,7 +155,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"seeds": [0], "group_size": 2},
+                "train": {"group_size": 2},
             }
         ),
     )
@@ -181,7 +181,6 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "steps": 10,
             "hf_repo": "owner/runs",
             "group_size": 4,
@@ -297,18 +296,17 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "steps": 10,
             "hf_repo": "owner/runs",
-            "init_from_adapter": "Freesolo-Co/flashrun-run-x:sft/run-x/seed0",
+            "init_from_adapter": "Freesolo-Co/flashrun-run-x:sft/run-x",
         },
     }
     spec = spec_from_dict(raw, run_id="grpo-x")
-    assert spec.train.init_from_adapter == "Freesolo-Co/flashrun-run-x:sft/run-x/seed0"
+    assert spec.train.init_from_adapter == "Freesolo-Co/flashrun-run-x:sft/run-x"
     # survives the JSON round-trip the worker reconstructs from
     assert (
         JobSpec.from_dict(spec.to_dict()).train.init_from_adapter
-        == "Freesolo-Co/flashrun-run-x:sft/run-x/seed0"
+        == "Freesolo-Co/flashrun-run-x:sft/run-x"
     )
     # absent -> empty string (train fresh from base)
     raw["train"].pop("init_from_adapter")
@@ -322,7 +320,6 @@ def test_init_from_adapter_rejects_repo_without_status_prefix() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "steps": 10,
             "init_from_adapter": "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff",
         },
@@ -344,7 +341,7 @@ def test_init_from_adapter_rejects_invalid_shape_or_path_traversal_ref(bad_adapt
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
-        "train": {"seeds": [0], "steps": 10, "init_from_adapter": bad_adapter_ref},
+        "train": {"steps": 10, "init_from_adapter": bad_adapter_ref},
     }
     with pytest.raises(ConfigError, match="full adapter_ref emitted by `flash status`"):
         spec_from_dict(raw, run_id="grpo-x")
@@ -365,7 +362,6 @@ def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "steps": 10,
             "init_from_adapter": bad_ref,
         },
@@ -382,7 +378,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "train": {"seeds": [0], "steps": 10},
+        "train": {"steps": 10},
     }
     # absent -> fine (no longer required); left blank for the control plane to assign
     spec = spec_from_dict(raw, run_id="hf-x")
@@ -390,7 +386,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == ""
     # user-supplied -> ignored (the control plane overrides it at submit)
     spec2 = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": "someone-else/their-repo"}},
+        {**raw, "train": {"steps": 10, "hf_repo": "someone-else/their-repo"}},
         run_id="hf-y",
     )
     assert spec2.train.hf_repo == ""
@@ -407,7 +403,6 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "hf_repo": "owner/runs",
             "learning_rate": 3e-5,
             "batch_size": 16,
@@ -427,26 +422,26 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         assert s.train.stop_sequences == ("</answer>", "\n\n")
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
     bare = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs"}}, run_id="grpo-w"
+        {**raw, "train": {"hf_repo": "owner/runs"}}, run_id="grpo-w"
     )
     assert bare.train.learning_rate is None
     assert bare.train.batch_size is None
     assert bare.train.stop_sequences == ()
     # a bare-string stop_sequences is ONE stop, never split into characters
     one = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": "</answer>"}},
+        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": "</answer>"}},
         run_id="grpo-s",
     )
     assert one.train.stop_sequences == ("</answer>",)
     assert JobSpec.from_dict(one.to_dict()).train.stop_sequences == ("</answer>",)
     # an empty string means "no stop configured" -> (), not ("",); empty list entries drop
     empty = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": ""}},
+        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": ""}},
         run_id="grpo-e",
     )
     assert empty.train.stop_sequences == ()
     dropped = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": ["x", ""]}},
+        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": ["x", ""]}},
         run_id="grpo-d",
     )
     assert dropped.train.stop_sequences == ("x",)
@@ -464,6 +459,24 @@ def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
     assert w.rl_per_device_comps(512, vocab=152_000, use_vllm=True) == 8
     # long completion: 6e9 / (4096*152000*4) ~ 2.4 -> capped to 2 (budget fixed at 6 GB, managed)
     assert w.rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 2
+
+
+def test_rl_per_device_fused_logits_lifts_budget(monkeypatch) -> None:
+    """When the fused GRPO loss is on (use_liger_kernel, unconditional on the GRPO path) the fp32
+    [pd, completion, vocab] logits are NEVER materialized, so the 6 GB logits budget should NOT bind
+    — it models a tensor that doesn't exist. ``fused_logits=True`` drops the budget term so the
+    ceiling / activation cap binds instead. The biggest beneficiary is a long multi-turn transcript,
+    where the unfused cap collapses to 1."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _no_cuda(monkeypatch)  # offline: result = min(default 8, logits_cap)
+    # A 4096-tok completion at 248k vocab: unfused budget ~= 6e9/(4096*248320*4) ~ 1.4 -> binds at 1.
+    assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True) == 1
+    # Fused: the 6 GB term is dropped -> the offline default (8) binds, NOT the phantom-logits cap.
+    assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, fused_logits=True) == 8
+    # Default is unfused (the safety net stays in force for the non-liger fallback path).
+    assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, fused_logits=False) == 1
 
 
 def _no_cuda(monkeypatch) -> None:
@@ -517,6 +530,35 @@ def test_rl_per_device_grows_to_plateau_ceiling_on_roomy_card(monkeypatch) -> No
     monkeypatch.setattr(w, "THINKING", False, raising=False)
     _fake_cuda(monkeypatch, 79.3)
     assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
+
+
+def test_rl_per_device_moe_active_params_aware(monkeypatch) -> None:
+    """MoE (A3B): the per-device completion micro-batch's activation/VRAM cap must size on the
+    ACTIVE backbone (~3B for the 35B-A3B), not the 35B resident total. Without it, sqrt(35) crushes
+    vram_cap BELOW the dense default ceiling (8), throttling the A3B below dense models despite cheap
+    active compute + ~100 GB free VRAM during the sleep-offloaded backward (the 2-8% GPU-util bug).
+    On a B200-class card at the GRPO default sequence: total-width -> 5, active-width -> 8 (~1.6x),
+    a pure speed/VRAM knob (grad-accum holds the effective batch, so reward is identical)."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _fake_cuda(monkeypatch, 178.0)  # B200-class ~180 GB
+    # 35B total width throttles the A3B to 5 (below the dense default ceiling of 8) ...
+    assert (
+        w.rl_per_device_comps(384, vocab=248_320, use_vllm=True, params_b=35.0, seq_len=2368) == 5
+    )
+    # ... active 3B width lifts it to the dense-validated ceiling (8). ~1.6x bigger GEMMs / step.
+    assert (
+        w.rl_per_device_comps(
+            384, vocab=248_320, use_vllm=True, params_b=35.0, active_params_b=3.0, seq_len=2368
+        )
+        == 8
+    )
+    # Dense (no active_params_b) is byte-unaffected: falls back to params_b.
+    assert (
+        w.rl_per_device_comps(384, vocab=248_320, use_vllm=True, params_b=35.0, active_params_b=None, seq_len=2368)
+        == 5
+    )
 
 
 def test_rl_per_device_thinking_not_grown_by_short_seq(monkeypatch) -> None:
@@ -619,7 +661,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
     ]
     for bad in bad_cases:
         with pytest.raises(ConfigError):
-            spec_from_dict({**base, "train": {"seeds": [0], **bad}}, run_id="bad")
+            spec_from_dict({**base, "train": {**bad}}, run_id="bad")
 
 
 def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
@@ -637,11 +679,11 @@ def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
     }
     for bad in ({"steps": 1.5}, {"epochs": 2.5}, {"steps": 0}, {"epochs": -1}):
         with pytest.raises(ConfigError):
-            spec_from_dict({**base, "train": {"seeds": [0], "hf_repo": "o/r", **bad}}, run_id="bad")
+            spec_from_dict({**base, "train": {"hf_repo": "o/r", **bad}}, run_id="bad")
 
     # Genuine integers still parse and round-trip.
     spec = spec_from_dict(
-        {**base, "train": {"seeds": [0], "hf_repo": "o/r", "steps": 10, "epochs": 3}},
+        {**base, "train": {"hf_repo": "o/r", "steps": 10, "epochs": 3}},
         run_id="ok",
     )
     assert spec.train.steps == 10
@@ -693,7 +735,7 @@ def test_grpo_masks_truncated_completions_by_default() -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "owner/env"},
-            "train": {"seeds": [0]},
+            "train": {},
         }
     )
     assert w.grpo_mask_truncated_completions(spec.train) is True
@@ -712,7 +754,7 @@ def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "owner/env"},
-            "train": {"seeds": [0], "stop_sequences": ["</answer>"]},
+            "train": {"stop_sequences": ["</answer>"]},
         }
     )
     assert spec.train.stop_sequences == ("</answer>",)
@@ -823,6 +865,63 @@ def test_run_rl_threads_prompt_opened_thinking_to_grading_and_penalty() -> None:
             "it the prompt-opened-<think> fix silently no-ops (the length penalty and <think> strip "
             "do nothing on the common enable_thinking=true path — PR #281)"
         )
+
+
+def test_run_rl_fused_logits_keeps_cap_when_vllm_importance_sampling_runs() -> None:
+    """Codex MtcPF: TRL's colocated-vLLM path runs a SEPARATE old_per_token_logps forward for its
+    importance-sampling (TIS) correction whenever vllm_importance_sampling_correction is on — TRL's
+    default, which run_rl only tunes (mode/clip) and never disables — even at mu==1. That unfused
+    [pd, completion, vocab] forward still materializes full logits, so the 6 GB cap must stay; dropping
+    it (fused_logits=True) sizes per_device too large and OOMs the IS forward on long completions. So
+    the fused_logits gate must ALSO require the vLLM IS forward to be off (``_vllm_is_logprob_forward``),
+    resolved BEFORE the sizer and from the correction's effective state + use_vllm. AST-based so it
+    survives reformatting (mirrors the resolved-mu wiring test above)."""
+    import ast
+    import inspect
+
+    import flash.engine.worker as w
+
+    src = inspect.getsource(w.run_rl)
+    tree = ast.parse(src)
+
+    def _is_sizer(call: ast.Call) -> bool:
+        f = call.func
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+        return name == "rl_per_device_comps"
+
+    sizer = next((n for n in ast.walk(tree) if isinstance(n, ast.Call) and _is_sizer(n)), None)
+    assert sizer is not None, "run_rl no longer calls rl_per_device_comps"
+    fused_kw = next((k for k in sizer.keywords if k.arg == "fused_logits"), None)
+    assert fused_kw is not None, "rl_per_device_comps call no longer passes fused_logits"
+
+    names = {n.id for n in ast.walk(fused_kw.value) if isinstance(n, ast.Name)}
+    assert "_vllm_is_logprob_forward" in names, (
+        "fused_logits must keep the 6 GB cap when TRL's vLLM importance-sampling correction runs an "
+        "old_per_token_logps forward (on by default even at mu==1) — gate on _vllm_is_logprob_forward"
+    )
+
+    gate_line = min(
+        (
+            t.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for t in node.targets
+            if isinstance(t, ast.Name) and t.id == "_vllm_is_logprob_forward"
+        ),
+        default=None,
+    )
+    assert gate_line is not None, "run_rl no longer assigns _vllm_is_logprob_forward"
+    assert gate_line < sizer.lineno, (
+        "_vllm_is_logprob_forward must be resolved BEFORE the rl_per_device_comps call"
+    )
+    # The gate must reflect BOTH the vLLM rollout path and the correction's effective state — the only
+    # vLLM path runs the forward, and the field name is what TRL keys the correction off of.
+    assert "use_vllm" in {
+        n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+    }, "the TIS gate must consider use_vllm (only the vLLM rollout path runs the IS forward)"
+    assert "vllm_importance_sampling_correction" in src, (
+        "run_rl must detect TRL's vllm_importance_sampling_correction state to gate the logits cap"
+    )
 
 
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:

@@ -23,7 +23,7 @@ def test_catalog_validation():
     from flash.catalog import MODELS, ModelInfo
 
     MODELS["test/sft-only"] = ModelInfo(
-        id="test/sft-only", display_name="x", params="1B", algos=("sft",), min_vram_gb=12
+        id="test/sft-only", display_name="x", params="1B", params_b=1.0, algos=("sft",), min_vram_gb=12
     )
     try:
         with pytest.raises(ValueError, match="not grpo"):
@@ -45,7 +45,6 @@ def test_config_to_job_spec():
                 'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
                 "[train]\n"
                 "steps = 10\n"
-                "seeds = [0, 1]\n"
                 'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
                 'type = "RTX 5090"\n'
@@ -53,7 +52,6 @@ def test_config_to_job_spec():
         spec = spec_from_file(path, run_id="test-run")
         assert spec.run_id == "test-run"
         assert spec.phase == "rl"
-        assert spec.train.seeds == (0, 1)
 
 
 def test_environment_registry():
@@ -93,7 +91,6 @@ def test_cli_train_dry_run():
                 # per-run); the dry-run still validates and the resolved hf_repo comes back blank.
                 "[train]\n"
                 "steps = 1\n"
-                "seeds = [0]\n"
                 'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
                 'type = "RTX 5090"\n'

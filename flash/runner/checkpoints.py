@@ -18,16 +18,16 @@ from flash.runner import adapter_prefix
 from flash.spec import JobSpec
 
 # The PEFT weights file a step must carry (alongside adapter_config.json) to be servable.
-_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors", "adapter_model.bin"})
+_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors"})
 
 
-def checkpoint_adapter_prefix(spec: JobSpec, step: int, seed: int | None = None) -> str:
+def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:
     """The ``adapter_prefix`` that serves checkpoint ``step``.
 
     ``deploy_adapter`` appends ``/adapter`` to whatever prefix it's given, so this returns the
     per-step root (``<run prefix>/checkpoints/step-<N>``) — matching the worker's upload path —
     and the existing deploy path needs no special-casing for checkpoints."""
-    return f"{adapter_prefix(spec, seed)}/checkpoints/step-{step}"
+    return f"{adapter_prefix(spec)}/checkpoints/step-{step}"
 
 
 def _adapter_file_re(base: str) -> re.Pattern[str]:
@@ -35,7 +35,7 @@ def _adapter_file_re(base: str) -> re.Pattern[str]:
     return re.compile(re.escape(base) + r"/checkpoints/step-(\d+)/adapter/([^/]+)$")
 
 
-def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
+def list_checkpoints(spec: JobSpec) -> list[dict]:
     """Deployable per-step adapter snapshots for ``spec``, ascending by step.
 
     A step is included only if its adapter folder carries BOTH ``adapter_config.json`` AND a
@@ -47,7 +47,7 @@ def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
     repo = spec.train.hf_repo
     if not repo:
         return []
-    base = adapter_prefix(spec, seed)
+    base = adapter_prefix(spec)
     pattern = _adapter_file_re(base)
     try:
         from huggingface_hub import HfApi
@@ -69,7 +69,7 @@ def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
         names = by_step[step]
         if "adapter_config.json" not in names or names.isdisjoint(_ADAPTER_WEIGHT_FILES):
             continue
-        prefix = checkpoint_adapter_prefix(spec, step, seed)
+        prefix = checkpoint_adapter_prefix(spec, step)
         out.append(
             {
                 "step": step,

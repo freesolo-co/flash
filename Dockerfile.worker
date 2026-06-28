@@ -25,9 +25,22 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # JIT on a cold worker writes here too. These ENVs are always set (cheap); whether the dir is
 # pre-populated is what the opt-in bake controls. engine.worker._load_kernel_cache_if_present reads
 # /opt/flash/kernelcache at boot.
+# FLASHINFER_CUBIN_DIR / FLASHINFER_CACHE_DIR / FLASHINFER_WORKSPACE_BASE: FlashInfer's attention-backend
+# cubins (the Blackwell sm120 / B200 rollout attention backend) are NOT bundled in the wheel — flashinfer
+# downloads them from NVIDIA Artifactory on first use. Bake the cubin store + JIT cache into the same
+# persistent kernelcache tree so
+# a baked/volume cache serves them and a cold worker never re-fetches from Artifactory (kernel_warmup
+# also sets these). FLASHINFER_WORKSPACE_BASE is the var flashinfer 0.6.x actually reads to relocate the
+# JIT host-wrapper cache (FLASHINFER_CACHE_DIR is a DERIVED constant there, not an env knob), so set it
+# too — otherwise a B200 path that touches flashinfer before kernel_warmup runs lands the wrapper under
+# the default home workspace and re-JITs instead of using the baked cache.
 ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
-    TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor
-RUN mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor
+    TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor \
+    FLASHINFER_CUBIN_DIR=/opt/flash/kernelcache/flashinfer_cubin \
+    FLASHINFER_CACHE_DIR=/opt/flash/kernelcache/flashinfer \
+    FLASHINFER_WORKSPACE_BASE=/opt/flash/kernelcache/flashinfer
+RUN mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor \
+    /opt/flash/kernelcache/flashinfer_cubin /opt/flash/kernelcache/flashinfer
 
 # build-essential for Triton/Inductor (Liger) + any source builds; git for pip VCS installs.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl \
@@ -39,6 +52,7 @@ RUN pip install --no-cache-dir \
     "trl>=1.6,<1.7" \
     "peft>=0.19" \
     "vllm==0.19.1" \
+    "flashinfer-python==0.6.6" \
     "bitsandbytes>=0.49" \
     "datasets>=4.7,<6" \
     "huggingface_hub>=0.25" \
@@ -187,10 +201,12 @@ fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
 fa3_ok = False; \
 exec('try:\n import flash_attn_interface\n fa3_ok = True\nexcept Exception:\n fa3_ok = False'); \
+fi_ok = False; \
+exec('try:\n import flashinfer\n fi_ok = True\nexcept Exception:\n fi_ok = False'); \
 cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into torch'; \
 ver = lambda n: M.version(n); \
-print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)'); \
-[print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','datasets','huggingface-hub', \
+print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
+[print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
 'accelerate','wandb','liger-kernel','flash-linear-attention','bitsandbytes', \
 'hf-transfer','freesolo','runpod']]"
 

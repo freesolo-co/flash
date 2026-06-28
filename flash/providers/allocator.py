@@ -1,23 +1,4 @@
-"""GPU allocation: the cheapest fitting class across the active providers.
-
-Given a base model (+ algorithm), compute the VRAM the FULL run needs — sized for the
-heavier phase, GRPO, since the typical pipeline is SFT followed by GRPO — then rank every
-fitting candidate by $/hr and pick the cheapest:
-
-  runpod      every validated Flash-provisionable class (static $/hr)
-  lambda      every fitting class that currently has LIVE regional capacity (live $/hr); opt-in,
-              available only when LAMBDA_API_KEY is set on the control plane
-
-RunPod's cheaper static rates almost always win on price, so the instance provider (Lambda)
-joins the ranked list as a capacity COMPLEMENT: when RunPod's cheapest fitting class is
-out of capacity (THROTTLED / queue backstop), the runner's gpu-walk steps down the ranked list and
-reaches an in-capacity instance class. The instance provider is capacity-filtered up front
-(``_lambda_candidates`` only offers a class a region can supply right now), so the walk never lands
-on a class that would just fail to launch.
-
-Allocation happens at SUBMIT time in the runner. The parse-time resolution in schema is a
-RunPod-static provisional for validation/dry-run display.
-"""
+"""GPU allocation: cheapest fitting (provider, GPU class) across active providers."""
 
 from __future__ import annotations
 
@@ -31,16 +12,8 @@ from flash.providers.base import (
 
 logger = get_logger(__name__)
 
-# "Comfortably" = the open-model VRAM estimate plus headroom, so a full SFT+GRPO run
-# never lands in check_fit's "tight" band by construction. Curated catalog entries
-# already carry measured minimums and are used as-is. The headroom (default 1.1 ==
-# model_required_vram_gb's own default) is read at call time via vram_headroom() so allocate()
-# and the parse-time provisional_gpu size identically.
-
-
 def vram_headroom() -> float:
-    """The sizing headroom multiplier, honored by both the submit-time allocator and the
-    parse-time provisional_gpu so they never disagree. A constant."""
+    """Sizing headroom multiplier; shared by submit-time allocator and parse-time provisional_gpu."""
     return 1.1
 
 
@@ -51,13 +24,7 @@ def required_vram_gb(
     train=None,
     thinking: bool = False,
 ) -> int:
-    """VRAM the full run needs, sized to the run's actual knobs (context length, LoRA
-    rank, batch / group size, thinking) via the shared ``model_required_vram_gb`` matrix.
-
-    Catalog GRPO floors stay hard floors (never under-provision a validated model); the
-    matrix sizes up from there for big contexts/groups and down to a cheaper card for
-    small runs. Unlisted open models size from HF metadata, falling back to the 24 GB tier
-    when unreadable (handled inside model_required_vram_gb)."""
+    """VRAM required for the full run, sized to actual knobs via model_required_vram_gb."""
     from flash.engine.vram import model_required_vram_gb
 
     return model_required_vram_gb(
@@ -70,11 +37,7 @@ def required_vram_gb(
 
 
 def _runpod_candidates(need: int) -> list[Candidate]:
-    """RunPod's fitting, validated classes priced by the static table.
-
-    Restricted to the validated pool (``g.validated``): the deployed control plane rejects a submit
-    for any non-validated class, so allocating one would only fail at submit time.
-    """
+    """RunPod validated classes fitting the VRAM requirement, priced by the static table."""
     provider = get_provider("runpod")
     return [
         Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb)
@@ -84,13 +47,9 @@ def _runpod_candidates(need: int) -> list[Candidate]:
 
 
 def _lambda_candidates(need: int) -> list[Candidate]:
-    """Lambda's fitting classes that currently have LIVE capacity, priced live.
+    """Lambda classes with live regional capacity fitting the VRAM requirement.
 
-    Capacity-aware by design: a Lambda class with no region advertising capacity is EXCLUDED, so
-    the allocator never hands the runner a Lambda class that would immediately fail to launch (and
-    burn a retry) — directly the "GPU allocation is good, doesn't randomly die" property. A Lambda
-    capacity-lookup failure (no key / network blip) degrades to the other providers: it is
-    non-fatal as long as another provider can supply a fitting class.
+    Capacity-lookup failure degrades gracefully (returns []) so other providers still run.
     """
     from flash.providers.lambdalabs.jobs import usable_instances
 
@@ -100,7 +59,6 @@ def _lambda_candidates(need: int) -> list[Candidate]:
         for g in provider.gpu_classes():
             if g.vram_gb < need:
                 continue
-            # usable_instances reads the cached /instance-types, so only the first call hits the API.
             if usable_instances(g.name):
                 out.append(Candidate("lambda", g.name, provider.hourly_rate(g.name), g.vram_gb))
     except Exception as exc:
@@ -116,17 +74,7 @@ def allocate(
     train=None,
     thinking: bool = False,
 ) -> Allocation:
-    """Pick the cheapest fitting (provider, GPU class) able to run the job.
-
-    There is no GPU pin — every fitting class on every available provider is eligible, and the
-    cheapest wins. RunPod is restricted to its validated pool (``GpuClass.validated``) because the
-    deployed control plane rejects a submit for any non-validated class; the instance provider
-    (Lambda via LAMBDA_API_KEY — opt-in) contributes
-    its fitting classes that currently have live capacity. RunPod's cheaper static rates
-    usually win, with Lambda joining as a capacity complement lower in the ranked list.
-    ``train``/``thinking`` size the requirement to the run's actual knobs (context, group, rank,
-    batch) via the matrix.
-    """
+    """Pick the cheapest fitting (provider, GPU class) able to run the job."""
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     available = available_providers()
     candidates: list[Candidate] = []
@@ -139,8 +87,7 @@ def allocate(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
             f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
         )
-    # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small job),
-    # then registry order.
+    # Cheapest first; ties broken by VRAM (prefer smaller), then registry order.
     order = {n: i for i, n in enumerate(PROVIDER_NAMES)}
     ranked = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, order.get(c.provider, 99)))
     best = ranked[0]

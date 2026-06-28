@@ -1,8 +1,4 @@
-"""Client-side runtime secrets for managed runs.
-
-These values are read on the user's machine and sent only with the submit request. They are not
-part of JobSpec/TOML, and the control plane must not persist them in run status or artifacts.
-"""
+"""Client-side runtime secrets — read locally, sent with submit, never persisted in the run spec."""
 
 from __future__ import annotations
 
@@ -38,12 +34,7 @@ def runtime_secrets_from_local_env(
     config_path: str | os.PathLike[str] | None = None,
     keys: tuple[str, ...] | list[str] | set[str] | None = None,
 ) -> dict[str, str]:
-    """Collect supported run secrets from the user's local env.
-
-    Process environment wins. As a convenience for local project workflows, also read `.env` and
-    `.env.local` in the current directory and next to the config file. This deliberately does not
-    scan arbitrary parent directories or serialize secrets into the run spec.
-    """
+    """Collect run secrets from the local env; process env wins over .env/.env.local files."""
 
     required = {str(key) for key in (keys or ())}
     wanted = set(DEFAULT_RUNTIME_SECRET_KEYS) | required
@@ -66,14 +57,7 @@ def runtime_secrets_from_local_env(
 
 
 def resolve_hf_token(explicit: str | None = None) -> str | None:
-    """Resolve the HuggingFace token `flash export` writes the destination repo with.
-
-    Order: an explicit value (the ``--api-key`` flag) > the process environment (HF_TOKEN) > a local
-    ``.env`` / ``.env.local`` in the cwd. Only HF_TOKEN is accepted — the convention the rest of flash
-    uses — not the huggingface_hub aliases, so the token source is unambiguous.
-    Returns ``None`` when none is set. Read on the user's machine and sent only with the export
-    request — never persisted in the run spec (same contract as the run secrets above).
-    """
+    """Resolve HF_TOKEN for flash export: --api-key > env > .env. Returns None if unset."""
     if explicit and explicit.strip():
         return explicit.strip()
     value = os.environ.get("HF_TOKEN")

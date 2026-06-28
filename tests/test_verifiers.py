@@ -1,14 +1,14 @@
-"""Tests for the Freesolo SDK environment adapter + install manifest."""
+"""Tests for the Freesolo SDK environment adapter."""
 
 from __future__ import annotations
 
-import importlib
+import gzip
 import io
 import json
 import os
 import sys
 import tarfile
-import tempfile
+import tracemalloc
 import types
 from dataclasses import dataclass, field
 from typing import ClassVar
@@ -19,9 +19,9 @@ import pytest
 @dataclass
 class _TaskExample:
     record: dict
-    task: str
-    task_id: str | None = None
-    expected_output: object | None = None
+    input: str
+    id: str | None = None
+    output: object | None = None
     metadata: dict = field(default_factory=dict)
 
 
@@ -92,13 +92,13 @@ class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
     def start_episode(self, example, prompt_text):
         return [
             {"role": "system", "content": prompt_text},
-            {"role": "user", "content": example.task},
+            {"role": "user", "content": example.input},
         ]
 
     def score_responses(self, example, response_texts):
         out = []
         for response in response_texts:
-            score = 1.0 if str(example.expected_output) in response else 0.0
+            score = 1.0 if str(example.output) in response else 0.0
             out.append(
                 _RewardResult(
                     score=score,
@@ -111,14 +111,14 @@ class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
 
 class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
     def start_episode(self, example, prompt_text):
-        return [{"role": "user", "content": f"{prompt_text}:{example.task}"}]
+        return [{"role": "user", "content": f"{prompt_text}:{example.input}"}]
 
     def step_episode(self, example, messages, assistant_response):
         return _EnvironmentStepResult(
             done=True,
             messages=({"role": "user", "content": f"observed {assistant_response}"},),
             final_response_text=f"final {assistant_response}",
-            metadata={"input": example.task},
+            metadata={"input": example.input},
         )
 
     def score_episodes(self, example, episodes):
@@ -152,6 +152,87 @@ class _BudgetMultiTurnEnv(_EnvironmentMultiTurn):
 
     def score_episodes(self, example, episodes):
         return [_RewardResult(score=0.0, success=False, metrics=()) for _ in episodes]
+
+
+def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch):
+    """Single-turn reward_many groups same-example rollouts into ONE score_responses() call
+    (env-concurrent, the win for judge/network rewards) while staying byte-identical and in input
+    order vs the per-item reward() reference. Without grouping, a GRPO step scored its whole
+    completion batch with serial per-rollout reward() calls (one blocking judge round-trip each)."""
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _CountingSingleTurnEnv(_FakeSingleTurnEnv):
+        def __init__(self):
+            self.score_responses_calls = 0
+            self.batch_sizes = []
+
+        def score_responses(self, example, response_texts):
+            self.score_responses_calls += 1
+            self.batch_sizes.append(len(response_texts))
+            return super().score_responses(example, response_texts)
+
+    sdk_env = _CountingSingleTurnEnv()
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    assert env.multi_turn is False
+
+    ex_a = {"id": "a", "input": "2+2?", "output": "4"}
+    ex_b = {"id": "b", "input": "3+3?", "output": "6"}
+    # ex_a appears twice (a GRPO group) interleaved with ex_b -> grouping must preserve input order.
+    items = [
+        (ex_a, {"response_text": "the answer is 4"}),  # -> 1.0
+        (ex_b, {"response_text": "it is 6"}),  # -> 1.0
+        (ex_a, {"response_text": "nope"}),  # -> 0.0
+    ]
+    reference = [env.reward(st["response_text"], ex, st) for ex, st in items]
+    sdk_env.score_responses_calls = 0
+    sdk_env.batch_sizes = []
+
+    out = env.reward_many(items)
+
+    assert out == reference == [1.0, 1.0, 0.0]  # byte-identical + input order
+    assert sdk_env.score_responses_calls == 2  # grouped: {ex_a:2, ex_b:1}, not 3 serial calls
+    assert sorted(sdk_env.batch_sizes) == [1, 2]  # ex_a's two completions scored in ONE call
+
+
+def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
+    """Codex MtMlT: an env that opts out with reward_thread_safe = False must NOT have a group's
+    completions batched into one env-concurrent score_responses call (a scorer with mutable/thread-
+    bound state would be raced). reward_many must score each rollout with its OWN single-item call,
+    byte-identical and in input order — the pre-batching serial behavior."""
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _UnsafeCountingSingleTurnEnv(_FakeSingleTurnEnv):
+        reward_thread_safe = False  # scorer keeps mutable/thread-bound state -> never race it
+
+        def __init__(self):
+            self.batch_sizes = []
+
+        def score_responses(self, example, response_texts):
+            self.batch_sizes.append(len(response_texts))
+            return super().score_responses(example, response_texts)
+
+    sdk_env = _UnsafeCountingSingleTurnEnv()
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    assert env.reward_thread_safe is False
+
+    ex_a = {"id": "a", "input": "2+2?", "output": "4"}
+    ex_b = {"id": "b", "input": "3+3?", "output": "6"}
+    items = [
+        (ex_a, {"response_text": "the answer is 4"}),  # -> 1.0
+        (ex_b, {"response_text": "it is 6"}),  # -> 1.0
+        (ex_a, {"response_text": "nope"}),  # -> 0.0
+    ]
+    sdk_env.batch_sizes = []
+
+    out = env.reward_many(items)
+
+    assert out == [1.0, 1.0, 0.0]  # correct + input order
+    # ex_a's two rollouts were NOT batched: every score_responses call carried exactly one response.
+    assert sdk_env.batch_sizes == [1, 1, 1]
 
 
 def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
@@ -210,9 +291,9 @@ def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
     def task_example_from_record(record):
         return _TaskExample(
             record=dict(record),
-            task=str(record["input"]),
-            task_id=record.get("id"),
-            expected_output=record.get("output"),
+            input=str(record["input"]),
+            id=record.get("id"),
+            output=record.get("output"),
             metadata=dict(record.get("metadata") or {}),
         )
 
@@ -335,9 +416,9 @@ def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
         dataset: ClassVar[list[_TaskExample]] = [
             _TaskExample(
                 record={},
-                task="2+2?",
-                task_id="ex-1",
-                expected_output="4",
+                input="2+2?",
+                id="ex-1",
+                output="4",
                 metadata={"split": "train"},
             )
         ]
@@ -452,7 +533,7 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
     monkeypatch.setattr(
         adapter,
         "_resolve_ref_sha",
-        lambda parsed: "b" * 40,
+        lambda parsed, **_: "b" * 40,
     )
 
     downloads: list[str] = []
@@ -474,7 +555,7 @@ def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, 
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
 
     downloads: list[str] = []
 
@@ -494,7 +575,7 @@ def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path,
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
 
     downloads: list[str] = []
 
@@ -519,7 +600,7 @@ def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, mon
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
     monkeypatch.setattr(
         adapter,
         "_download_github_tarball",
@@ -581,16 +662,62 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
     assert _safe_extract_archive(tar.getvalue(), dest) == dest / "repo-root"
 
 
-def test_install_manifest_and_worker_deps():
-    with tempfile.TemporaryDirectory() as tmp:
-        os.environ["FLASH_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
-        import flash.envs.registry as registry
+def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
+    # A GNU LONGNAME header payload is consumed inside tarfile.next() and never yielded, so per-member
+    # accounting can't see it. A tiny gzip declaring a 400MB name must be rejected with memory bounded
+    # near the limit, not OOM the worker.
+    from flash.envs.adapter import _safe_extract_archive
 
-        importlib.reload(registry)
-        env_id = "github:owner/repo@main:env/environment.py"
-        registry.record_installed_env(env_id, package="freesolo")
-        assert registry.worker_pip_for_env(env_id) == ["freesolo"]
-        assert registry.list_installed_environments() == [env_id]
+    def header(name: str, size: int, typeflag: str) -> bytes:
+        h = bytearray(512)
+        nb = name.encode()[:100]
+        h[0 : len(nb)] = nb
+        h[100:108] = b"0000644\0"
+        h[124 : 124 + 12] = f"{size:011o}\0".encode()
+        h[136:148] = b"00000000000\0"
+        h[156] = ord(typeflag)
+        h[257:263] = b"ustar\0"
+        h[263:265] = b"00"
+        chk = sum(h[:148]) + sum(h[156:]) + 32 * 8
+        h[148 : 148 + 8] = f"{chk:06o}\0 ".encode()
+        return bytes(h)
 
-        os.environ.pop("FLASH_ENVS_MANIFEST", None)
-        importlib.reload(registry)
+    name_len = 400 * 1024 * 1024
+    longlink = header("././@LongLink", name_len, "L")
+    pad = b"\0" * ((512 - name_len % 512) % 512)
+    tail = header("repo/environment.py", 1, "0") + b"x" + b"\0" * 511 + b"\0" * 1024
+    buf = io.BytesIO()
+    # Stream the 400 MB LONGNAME payload into gzip in fixed-size chunks instead of building it in
+    # RAM twice (once as b"A"*name_len, once via bytes(raw)) — that peaks ~1 GB and can OOM CI. The
+    # construction here also runs BEFORE tracemalloc.start() below, so it's pure setup overhead the
+    # peak-memory assertion never covers. Chunked writes feed one zlib stream, so output is identical.
+    block = b"A" * min(name_len, 1 << 20)
+    with gzip.GzipFile(fileobj=buf, mode="wb") as g:
+        g.write(longlink)
+        remaining = name_len
+        while remaining > 0:
+            n = min(remaining, len(block))
+            g.write(block if n == len(block) else block[:n])
+            remaining -= n
+        g.write(pad)
+        g.write(tail)
+    bomb = buf.getvalue()
+    assert len(bomb) < 2 * 1024 * 1024
+
+    dest = tmp_path / "extract_bomb"
+    dest.mkdir()
+    tracemalloc.start()
+    try:
+        with pytest.raises(RuntimeError, match="too large"):
+            _safe_extract_archive(bomb, dest)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 600 * 1024 * 1024, f"peak memory {peak} not bounded by the limit"
+
+
+def test_worker_deps():
+    import flash.envs.registry as registry
+
+    env_id = "github:owner/repo@main:env/environment.py"
+    assert registry.worker_pip_for_env(env_id) == ["freesolo"]
