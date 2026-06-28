@@ -374,13 +374,17 @@ def _console_flags_cuda_oom(mode: str | None) -> bool:
         # 'out of memory' can't be combined into a false GPU-escalating OOM marker.
         if _text_flags_cuda_oom(_terminal_exception_block(tail)):
             return True
-        # Backstop the no-traceback-framing case: when the 8000-byte slice has NO "Traceback" header,
-        # _terminal_exception_block falls back to the LAST 15 lines, so a bare subprocess CUDA OOM (a
-        # vLLM EngineCore child) dumped earlier in the slice — then buried under >15 lines of teardown
-        # noise — would be missed. Re-scan the whole slice per-LINE, requiring cuda+oom CO-LOCATED on
-        # one un-indented line, which catches that buried OOM WITHOUT re-opening the cross-line borrow
-        # (gated to the no-traceback case so the terminal-block scan still scopes any framed failure).
-        return "Traceback (most recent call last):" not in tail and _any_line_flags_cuda_oom(tail)
+        # Backstop a buried single-line CUDA OOM the terminal-block scan above cannot reach: that scan
+        # scopes to the LAST traceback, so a bare subprocess CUDA OOM (a vLLM EngineCore child) dumped
+        # EARLIER in the slice is invisible to it in TWO shapes — no "Traceback" header (the fallback
+        # sees only the last 15 lines, burying it under teardown noise) OR a later, UNRELATED traceback
+        # that shifts the terminal block past the real OOM. Re-scan the WHOLE slice per-LINE, requiring
+        # cuda+oom CO-LOCATED on one un-indented line. That same-line co-location can NEVER borrow a
+        # 'cuda' from one line and an 'out of memory' from another, so running it UNCONDITIONALLY (not
+        # just the no-traceback case) does NOT re-open the cross-line false-escalation the terminal-block
+        # narrowing guards against — a buried single-line CUDA OOM is a real OOM whether or not an
+        # unrelated traceback follows it.
+        return _any_line_flags_cuda_oom(tail)
     except Exception:
         return False
 

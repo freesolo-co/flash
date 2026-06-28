@@ -541,6 +541,48 @@ def test_console_oom_scan_catches_a_buried_subprocess_oom(tmp_path, monkeypatch)
     assert _read(cross) is False  # cross-line host OOM still not escalated
 
 
+def test_console_oom_scan_catches_early_oom_before_an_unrelated_later_traceback(tmp_path, monkeypatch):
+    # PRRT_kwDOS-63f86MxgUM: a real EARLY single-line CUDA OOM followed by a LATER, UNRELATED traceback
+    # used to be missed — the terminal-block scan scopes to the last traceback (no OOM there) and the
+    # per-line backstop was gated to the no-"Traceback" case, so neither fired. The backstop now runs
+    # over the WHOLE slice unconditionally, catching the early OOM WITHOUT re-opening the cross-line
+    # borrow (it still requires cuda+oom CO-LOCATED on one un-indented line).
+    import importlib
+
+    boot = importlib.import_module("flash.providers._instance_bootstrap")
+    later_tb = (
+        "Traceback (most recent call last):\n"
+        '  File "/x/teardown.py", line 1, in close\n'
+        "RuntimeError: connection reset by peer\n"
+    )
+    # early real CUDA OOM, then an unrelated later traceback whose terminal block carries NO OOM:
+    # the terminal-block scan alone misses it, so the unconditional backstop is what catches it.
+    early_oom = "ERROR EngineCore: torch.cuda.OutOfMemoryError: CUDA out of memory\n" + later_tb
+    assert boot._text_flags_cuda_oom(boot._terminal_exception_block(early_oom)) is False
+    # cross-line borrow must STILL be rejected even with a (benign) traceback in between: an early
+    # 'cuda' init line + a later UNRELATED host-RAM OOM on separate lines must NOT combine.
+    cross = "INFO: CUDA initialized on device 0\n" + later_tb + "DataLoader worker killed: out of memory\n"
+
+    monkeypatch.setattr(boot.os.path, "exists", lambda _p: True)
+    console = tmp_path / "console.txt"
+
+    def _read(mode_text):
+        console.write_text(mode_text)
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            return real_open(console, *a, **k) if path == "/tmp/console_x.txt" else real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        try:
+            return boot._console_flags_cuda_oom("x")
+        finally:
+            monkeypatch.setattr("builtins.open", real_open)
+
+    assert _read(early_oom) is True  # early OOM caught despite the later unrelated traceback
+    assert _read(cross) is False  # cross-line host OOM still not escalated
+
+
 def test_oom_recovery_respects_the_user_retry_budget():
     # BRa: a control-plane restart that reattaches to an in-flight OOM must NOT re-grant a fresh
     # larger-GPU escalation budget past max_retries. The consumed attempt count rides into the resumed
