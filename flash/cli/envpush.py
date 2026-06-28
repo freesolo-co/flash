@@ -234,9 +234,10 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | No
     bar.clear()
     slug = result.get("id")
     if not slug:
-        msg = "the env was uploaded but the server returned no id"
-        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
-        return 1
+        # a publish that can't report an id has not done its job (no `id = "..."` snippet to show),
+        # so this is a hard failure — route it through _err's red ✗ idiom, not the amber ⚠ warning
+        # idiom (which means "succeeded / still proceeding") it used to borrow.
+        return _err("the env was uploaded but the server returned no id")
     if render.styled():
         print(render.env_published(slug))
     else:
