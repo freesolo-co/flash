@@ -645,8 +645,17 @@ def poll_job(
     throttled_grace_s: float = 300.0,
     queue_grace_s: float = 300.0,
     deadline_s: float | None = None,
+    current_attempt: int | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
+
+    ``current_attempt`` (the attempt this poll is for) gates the ``oom`` flag against a STALE prior
+    attempt's heartbeat: the seed heartbeat path is SHARED across attempts, so after an OOM escalation
+    the prior attempt's ``{"oom": true}`` lingers until the new worker overwrites it. If the new attempt
+    dies before writing its own heartbeat, trusting that stale flag would misclassify a non-OOM failure
+    as an OOM and burn a larger-GPU retry. We honor the flag only when the heartbeat was stamped by THIS
+    attempt (``_oom_from_hb``). ``None`` keeps the historical trust-the-flag behavior (the reattach poll,
+    which has no expected attempt).
 
     Two stall windows: the cold-start phase (dep install, per-run env pip, model download,
     vLLM init) is slow and only emits *setup* heartbeats (``SETUP_HEARTBEAT_STAGES``).
@@ -716,7 +725,7 @@ def poll_job(
                 hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
                 last_hb_key, _ = surface_heartbeat(lambda hb=hb: hb, last_hb_key, say)
                 retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
-                oom = bool(hb.get("oom")) if isinstance(hb, dict) else False
+                oom = _oom_from_hb(hb, current_attempt)
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
                     False,
@@ -741,7 +750,7 @@ def poll_job(
             hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
             last_hb_key, _ = surface_heartbeat(lambda hb=hb: hb, last_hb_key, say)
             retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
-            oom = bool(hb.get("oom")) if isinstance(hb, dict) else False
+            oom = _oom_from_hb(hb, current_attempt)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
                 False,
@@ -968,6 +977,7 @@ def submit_run(
         log=log,
         heartbeat_reader=reader,
         failure_detail_reader=failure_reader,
+        current_attempt=int(attempt),
         **stall_kwargs(on_last_gpu=on_last_gpu),
     )
 
@@ -1067,13 +1077,24 @@ def worker_flagged_retriable(heartbeat_reader) -> bool:
     return bool(hb.get("retriable"))
 
 
-def worker_flagged_oom(heartbeat_reader) -> bool:
+def _oom_from_hb(hb, current_attempt: int | None) -> bool:
+    """True iff this heartbeat dict carries an ``oom`` flag stamped by ``current_attempt`` (the attempt
+    being polled). The seed heartbeat path is SHARED across attempts, so a prior attempt's lingering
+    ``{"oom": true}`` must NOT escalate a fresh non-OOM failure: trust the flag only when the heartbeat's
+    own worker-stamped ``attempt`` matches the one we're polling. ``current_attempt is None`` (the caller
+    has no expected attempt, e.g. the reattach poll) keeps the historical trust-the-flag behavior. OOM is
+    attempt-gated but ``retriable`` is not: a stale retriable flag only retries on a fresh worker (which a
+    platform failure warrants anyway), whereas a stale OOM wrongly burns a larger, costlier GPU class."""
+    if not isinstance(hb, dict) or not hb.get("oom"):
+        return False
+    return current_attempt is None or _attempt_int(hb.get("attempt")) == current_attempt
+
+
+def worker_flagged_oom(heartbeat_reader, current_attempt: int | None = None) -> bool:
     """True if the worker stamped ``oom`` (a CUDA out-of-memory crash) in its last heartbeat — the
     signal that lets the runner retry on a strictly LARGER GPU instead of failing fast on a too-small
-    card. Same fresh-read contract as ``worker_flagged_retriable``."""
+    card. Same fresh-read contract as ``worker_flagged_retriable``; ``current_attempt`` gates a STALE
+    prior-attempt flag (see ``_oom_from_hb``)."""
     if heartbeat_reader is None:
         return False
-    hb = heartbeat_reader(force=True)
-    if not isinstance(hb, dict):
-        return False
-    return bool(hb.get("oom"))
+    return _oom_from_hb(heartbeat_reader(force=True), current_attempt)
