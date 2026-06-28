@@ -478,11 +478,21 @@ def test_cmd_env_pull_token_hint_for_github_request_failure(monkeypatch, tmp_pat
 def test_download_github_tarball_uses_whole_repo_ceiling(monkeypatch):
     assert adapter._MAX_TARBALL_BYTES > adapter._MAX_ARCHIVE_BYTES
     big = b"x" * (adapter._MAX_ARCHIVE_BYTES + 10)
-    monkeypatch.setattr(adapter, "_urlopen", lambda req, timeout=None, max_bytes=None: big)
+
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+        assert max_bytes == adapter._MAX_TARBALL_BYTES
+        out.write(big)
+        return b""
+
+    monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
     monkeypatch.setattr(adapter, "_github_token", lambda: None)
     ref = env_pull._coerce_environment_github_ref("david-freesolo-co/stuff")
 
-    assert adapter._download_github_tarball(ref) == big
+    tarball = adapter._download_github_tarball(ref)
+    try:
+        assert tarball.read_bytes() == big
+    finally:
+        tarball.unlink()
 
 
 def test_urlopen_streams_and_aborts_over_max_bytes(monkeypatch):
@@ -510,6 +520,29 @@ def test_urlopen_streams_and_aborts_over_max_bytes(monkeypatch):
     with pytest.raises(RuntimeError, match="exceeded the maximum allowed size"):
         adapter._urlopen(req, max_bytes=16)
     assert served["n"] <= 16 + adapter._DOWNLOAD_CHUNK_BYTES
+
+
+def test_urlopen_returns_bytes_when_capped(monkeypatch):
+    class _Resp:
+        def __init__(self, data):
+            self._buf = io.BytesIO(data)
+
+        def read(self, size=-1):
+            return self._buf.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Resp(b"ok"))
+    req = urllib.request.Request("https://api.github.com/x")
+
+    data = adapter._urlopen(req, max_bytes=16)
+
+    assert isinstance(data, bytes)
+    assert data == b"ok"
 
 
 def test_resolve_github_env_extracts_repo_level_siblings(monkeypatch, tmp_path):
