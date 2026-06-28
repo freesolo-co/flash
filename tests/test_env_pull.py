@@ -628,6 +628,53 @@ def test_pull_overwrite_preserves_old_package_when_swap_fails(monkeypatch, tmp_p
     assert not (dest / "environment.py").exists()  # the new tree was not installed
 
 
+def test_pull_preserves_backup_when_swap_and_restore_both_fail(monkeypatch, tmp_path):
+    # Worst case: the staging->dest swap fails AND the restore-from-backup ALSO fails. The backup is
+    # then the ONLY surviving copy of the user's original, so the staging dir must NOT be rmtree'd in
+    # cleanup — the original data must remain recoverable on disk rather than be silently destroyed.
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    dest = tmp_path / "env"
+    dest.mkdir()
+    (dest / "old.txt").write_text("precious")
+
+    real_replace = adapter.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        # 1: move-aside dest->backup (succeed); 2: staging->dest swap (fail); 3: restore (fail too)
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise OSError("simulated failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(adapter.os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="simulated failure"):
+        pull_environment_package("david-freesolo-co/stuff", dest, overwrite=True)
+    # the staging dir was preserved (not deleted), so the backup copy of the original still exists
+    backups = list(tmp_path.glob(".flash-env-pull-*/env.old"))
+    assert backups, "the only surviving copy of the original must be preserved on swap+restore failure"
+    assert (backups[0] / "old.txt").read_text() == "precious"
+
+
+def test_merge_into_dir_refuses_to_move_aside_cwd(monkeypatch, tmp_path):
+    # Pulling with the destination an ANCESTOR of the cwd (e.g. `-o .. --force` from a subdir) must
+    # never move the current working directory aside as an ordinary same-named child — that would
+    # strand the process in a deleted dir. An incoming FILE colliding with the cwd dir is refused.
+    work = tmp_path / "proj" / "sub"
+    work.mkdir(parents=True)
+    (work / "keep.txt").write_text("precious")
+    monkeypatch.chdir(work)
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "sub").write_text("incoming file")  # a FILE that would land over /proj/sub (the cwd dir)
+    dest = tmp_path / "proj"  # ancestor of the cwd
+    with pytest.raises(RuntimeError, match="working directory"):
+        adapter._merge_into_dir(source, dest)
+    # the cwd and its contents survive — it was never moved aside
+    assert work.is_dir()
+    assert (work / "keep.txt").read_text() == "precious"
+
+
 def test_merge_into_dir_replaces_file_atomically(monkeypatch, tmp_path):
     # A failed copy during an in-place merge must not truncate the existing same-named file.
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
