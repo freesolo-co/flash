@@ -1480,6 +1480,41 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     assert seen["private"] is True  # private by default
 
 
+def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
+    """The /export handler must take the per-run deploy lock BEFORE resolving/validating the run
+    (mirroring /deploy, which locks first). The always-on repo GC only spares a repo when it CAN'T
+    acquire that same lock, so taking the lock late (after owned_run/validation) left a window where
+    the GC could delete the source between the local checks and the artifact read. Assert the lock is
+    already held the moment owned_run runs."""
+    import flash.server.app as app_mod
+    from flash.server.routes import serving as serving_routes
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    real_owned_run = serving_routes.owned_run
+    seen: dict = {}
+
+    def checking_owned_run(rid, k):
+        # A non-blocking acquire from outside must FAIL (lock already held by the handler) — proving
+        # the handler is INSIDE the `with _deploy_lock(...)` block by the time owned_run runs.
+        seen["locked_during_owned_run"] = (
+            app_mod._deploy_lock(rid).acquire(blocking=False) is False
+        )
+        return real_owned_run(rid, k)
+
+    monkeypatch.setattr(serving_routes, "owned_run", checking_owned_run)
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/a")
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["locked_during_owned_run"] is True
+
+
 def test_export_public_flag_sets_private_false(api, monkeypatch):
     import flash.server.app as app_mod
 

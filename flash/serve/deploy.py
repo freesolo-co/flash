@@ -290,7 +290,10 @@ def list_deployed_adapters() -> list[dict]:
         else:
             raise ServingError(
                 f"serving backend returned an unrecognized adapter-list envelope from {url} "
-                f"(keys: {sorted(data)[:8]}); refusing to treat it as an empty live set"
+                # ``sorted(data, key=str)`` not ``sorted(data)``: JSON object keys are always strings,
+                # but a hypothetical mixed-type keyset would make a bare ``sorted`` raise TypeError and
+                # MASK this fail-closed ServingError with a less actionable error. Sort defensively.
+                f"(keys: {sorted(data, key=str)[:8]}); refusing to treat it as an empty live set"
             )
     if not isinstance(data, list):
         raise ServingError(
