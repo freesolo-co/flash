@@ -18,7 +18,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         # Storage roots are fixed constants now; redirect via monkeypatch (auto-restored).
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
-        # _run_job_inner uploads the run code before the seed loop; stub it (no HF).
+        # _run_job_inner uploads the run code before training; stub it (no HF).
         monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "mock/repo")
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
@@ -38,16 +38,16 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                 "notes": {},
             }
 
-        # Stub the per-seed submit/poll path (the seam that used to be the in-process
+        # Stub the submit/poll path (the seam that used to be the in-process
         # offline shortcut) so the run completes without provisioning a GPU.
-        # _run_seed_loop resolves it via `from flash.runner import _submit_seed_supervised`.
+        # _run_training resolves it via `from flash.runner import _submit_seed_supervised`.
         monkeypatch.setattr(runner, "_submit_seed_supervised", fake_submit)
 
         spec = JobSpec(
             run_id="flash-run",
             model="Qwen/Qwen3.5-4B",
             algorithm="grpo",
-            train=TrainSpec(steps=2, seeds=(0,)),
+            train=TrainSpec(steps=2),
             gpu=GpuSpec(type="RTX 4090"),
         )
         status = runner.submit_job(spec, dry_run=False, background=False)
@@ -61,7 +61,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         # Metrics are namespaced by run id so same-phase runs cannot collide.
         metrics_path = os.path.join(
-            tmp, "results", "runpod", "rl", status.run_id, "seed0", "metrics.json"
+            tmp, "results", "runpod", "rl", status.run_id, "metrics.json"
         )
         assert os.path.exists(metrics_path)
         with open(metrics_path) as f:
