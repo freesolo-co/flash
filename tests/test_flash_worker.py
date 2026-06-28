@@ -18,7 +18,7 @@ def _spec():
     return JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        train=TrainSpec(steps=10, hf_repo="owner/runs"),
     )
 
 
@@ -100,7 +100,7 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
-        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        train=TrainSpec(steps=10, hf_repo="owner/runs"),
     )
 
     env = build_worker_env(
@@ -182,7 +182,7 @@ def _spec_worker_env(worker_env: dict):
     return JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        train=TrainSpec(steps=10, hf_repo="owner/runs"),
         worker_env=dict(worker_env),
     )
 
@@ -257,7 +257,7 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     per_run = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, seeds=(0,), hf_repo="myorg/runs"),
+        train=TrainSpec(steps=10, hf_repo="myorg/runs"),
     )
     assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
     # still the per-run value even with no operator HF_REPO at all
@@ -287,7 +287,7 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(steps=2, seeds=(0,)))
+    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(steps=2))
     env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
@@ -493,7 +493,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
         console_uploads = [u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")]
         assert console_uploads, f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
-        assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/seed0/console_sft.txt"
+        assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
     finally:
         # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
         # doesn't leak state across tests (flaky under isolated/parallel runners).
