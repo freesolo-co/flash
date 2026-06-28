@@ -47,6 +47,21 @@ def test_deploy_9b_dry_run_is_not_rejected():
     assert dep.to_dict()["state"] == "dry_run"
 
 
+def test_deploy_rejects_lora_rank_above_serving_cap():
+    from flash.serve.deploy import deploy_adapter
+
+    with pytest.raises(ValueError, match="max_lora_rank=32"):
+        deploy_adapter(
+            run_id="r64",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r64/seed0",
+            gpu_name="RTX 5090",
+            dry_run=True,
+            lora_rank=64,
+        )
+
+
 def test_deploy_rejects_unsupported_gpu():
     from flash.providers.base import UnsupportedGpuError
     from flash.serve.deploy import deploy_adapter
