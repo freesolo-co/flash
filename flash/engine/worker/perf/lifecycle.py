@@ -102,6 +102,27 @@ def text_flags_cuda_oom(text: str | None) -> bool:
     return "cuda" in blob or "triton" in blob
 
 
+def any_line_flags_cuda_oom(text: str | None) -> bool:
+    """True iff a SINGLE un-indented (exception-type) line NAMES both an out-of-memory marker AND
+    CUDA/Triton context - a real ``CUDA out of memory`` / ``Triton Error [CUDA]: out of memory`` /
+    ``torch.cuda.OutOfMemoryError`` crash line. The CONTROL-PLANE backstop for a buried single-line
+    CUDA OOM the terminal-block narrowing (``text_flags_cuda_oom`` on ``_terminal_exception_block``)
+    cannot reach: a vLLM EngineCore child OOM dumped EARLIER than the last 15 lines (no traceback
+    framing) or shifted past the terminal block by a later, UNRELATED traceback. Same-line
+    CO-LOCATION can NEVER borrow a 'cuda' from one line and an 'out of memory' from another, so
+    scanning the WHOLE text is safe - it does NOT re-open the cross-line false escalation the
+    terminal-block scoping guards against. Mirrors the inlined bootstrap copy."""
+    if not text:
+        return False
+    for ln in text.splitlines():
+        if ln[:1] in (" ", "\t"):
+            continue  # indented frame line - a torch/cuda file PATH is not GPU context
+        low = ln.lower()
+        if any(m in low for m in _CUDA_OOM_MARKERS) and ("cuda" in low or "triton" in low):
+            return True
+    return False
+
+
 def detect_mig_slice() -> str | None:
     """Return a reason string if this worker was handed a MIG slice (a partitioned GPU), else None.
 

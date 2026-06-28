@@ -369,6 +369,15 @@ def _console_flags_cuda_oom(mode: str | None) -> bool:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - tail_bytes))
             tail = f.read().decode(errors="replace")
+        # Retriable-infra WINS over OOM: a worker RetriableInfraError from GPU readiness can print
+        # 'RETRIABLE_INFRA_GPU: ... CUDA out of memory' to the child console (the last readiness error
+        # rides in its message). That is a host/GPU readiness failure to RETRY on a fresh SAME-size
+        # GPU, NOT a workload OOM to escalate onto a larger, costlier card. Mirror the worker's
+        # retriable-wins rule (oom = is_cuda_oom(e) and not retriable) and
+        # runpod.jobs.detail_flags_cuda_oom (which skips retriable-infra text). Inlined marker string -
+        # the bootstrap can't import flash's RETRIABLE_INFRA_MARKER; the worker emits it verbatim.
+        if "retriable_infra_gpu" in tail.lower():
+            return False
         # Scan the TERMINAL exception block (last traceback), not the whole tail — mirrors the worker's
         # runpod.jobs.detail_flags_cuda_oom narrowing so an early 'cuda' init line plus a later host-RAM
         # 'out of memory' can't be combined into a false GPU-escalating OOM marker.

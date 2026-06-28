@@ -1149,6 +1149,71 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         assert gpus_seen[0] == "RTX A6000"
 
 
+def test_supervisor_infra_retry_does_not_consume_the_oom_escalation_budget(monkeypatch):
+    # PRRT...XG: an early INFRA retry must NOT burn a later CUDA OOM's allowed larger-GPU escalation.
+    # walk_attempt counts every non-cache retry, but the OOM-escalation budget (max_retries) counts
+    # ONLY OOM-shaped attempts (mirroring the cache-drop exclusion via infra_walk_consumed). With
+    # max_retries=1 a STALL on attempt 0 then an OOM on attempt 1 must STILL escalate to a strictly
+    # larger card on attempt 2 — before the fix the stall ticked the shared budget and the OOM was
+    # refused its one allowed escalation (budget_spent==1 >= max_retries==1).
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        # Three candidates with DISTINCT, ascending VRAM and ascending price so the walk is
+        # deterministic and an 80 GB OOM has a strictly-larger 141 GB card to escalate onto.
+        trio = ("RTX A6000", "A100 PCIe", "H200")  # 48 / 80 / 141 GB
+        real_allocate = allocator.allocate
+
+        def trio_allocate(*a, **k):
+            alloc = real_allocate(*a, **k)
+            best: dict = {}
+            for c in sorted(
+                (c for c in alloc.candidates if c.gpu in trio), key=lambda c: c.hourly_usd
+            ):
+                best.setdefault(c.gpu, c)  # one (cheapest) per class
+            keep = tuple(sorted(best.values(), key=lambda c: c.hourly_usd))
+            return dataclasses.replace(
+                alloc, gpu=keep[0].gpu, hourly_usd=keep[0].hourly_usd, candidates=keep
+            )
+
+        monkeypatch.setattr(allocator, "allocate", trio_allocate)
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            if attempt == 0:
+                return jobs.PollResult(False, failure="stalled", detail="frozen")  # infra retry
+            if attempt == 1:
+                return jobs.PollResult(False, failure="oom", detail="CUDA out of memory")  # escalate
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="infra-then-oom",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(steps=1),
+            gpu=GpuSpec(type="cheapest", max_retries=1),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("infra-then-oom").state == "done"
+        # stall on the cheapest, OOM on the 80 GB, then ESCALATE to the strictly-larger 141 GB card —
+        # the infra retry did NOT consume the single OOM escalation that max_retries=1 allows.
+        assert gpus_seen == ["RTX A6000", "A100 PCIe", "H200"]
+
+
 def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
     # A plain job_failed (no retriable flag — a genuine code crash) is NOT retried: the retry
     # budget exists only for infra-shaped failures, not code bugs.

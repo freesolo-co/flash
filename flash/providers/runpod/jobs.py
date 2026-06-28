@@ -1186,13 +1186,16 @@ def detail_flags_cuda_oom(detail: str | None) -> bool:
     """Fallback OOM classifier for the cases the structured heartbeat ``oom`` flag misses: the OOM
     happened in a SUBPROCESS the worker didn't classify on its own exception (a vLLM EngineCore child
     whose CUDA OOM only reaches the parent via stdout), or the terminal error heartbeat upload was
-    lost. Runs the SAME CUDA-specific predicate the worker uses (``is_cuda_oom``), so a host/library
-    OOM in the text does NOT escalate.
+    lost (the control plane has no GPU to read the structured ``num_ooms`` signal from). Runs the
+    shared CUDA-specific text predicate (``text_flags_cuda_oom``), so a host/library OOM in the text
+    does NOT escalate.
 
-    Scans only the TERMINAL exception block (the last traceback) of ``detail``, never the whole tail:
-    ``is_cuda_oom`` ANDs an OOM marker with CUDA/Triton context across the text, so an unrelated earlier
-    'cuda' line plus a later host-RAM/DataLoader 'out of memory' would otherwise falsely escalate onto
-    a larger card (more VRAM can't fix that failure).
+    Scans the TERMINAL exception block (the last traceback) of ``detail`` so an unrelated earlier
+    'cuda' line plus a later host-RAM/DataLoader 'out of memory' can't combine across lines into a
+    false escalate, THEN backstops a buried single-line CUDA OOM anywhere in the FULL tail (cuda+oom
+    CO-LOCATED on one un-indented line - a vLLM EngineCore child OOM dumped earlier than the last 15
+    lines, or before a later unrelated traceback - which same-line co-location keeps from re-opening
+    the cross-line borrow).
 
     IMPORTANT — callers must pass only ATTEMPT-FRESH text (this attempt's live job output / its
     attempt-scoped marker), NEVER the shared per-seed HF ``error_<phase>.txt`` artifact: that artifact
@@ -1204,8 +1207,18 @@ def detail_flags_cuda_oom(detail: str | None) -> bool:
     the primary path stays the structured flag."""
     if not detail:
         return False
-    from flash.engine.worker.perf.lifecycle import RETRIABLE_INFRA_MARKER, text_flags_cuda_oom
+    from flash.engine.worker.perf.lifecycle import (
+        RETRIABLE_INFRA_MARKER,
+        any_line_flags_cuda_oom,
+        text_flags_cuda_oom,
+    )
 
     if RETRIABLE_INFRA_MARKER.lower() in detail.lower():
         return False
-    return text_flags_cuda_oom(_terminal_exception_block(detail))
+    # Terminal-block scan (last traceback) for a framed failure, THEN a same-line backstop over the
+    # FULL detail: a buried single-line CUDA OOM (a vLLM EngineCore child) dumped EARLIER than the last
+    # 15 lines — when there is no traceback framing — or shifted past the terminal block by a later,
+    # UNRELATED traceback, is invisible to the terminal-block scan but caught here. cuda+oom CO-LOCATED
+    # on one un-indented line can't cross-borrow, so the full-tail scan does NOT re-open the cross-line
+    # false escalation the terminal-block narrowing guards against (mirrors the bootstrap console scan).
+    return text_flags_cuda_oom(_terminal_exception_block(detail)) or any_line_flags_cuda_oom(detail)

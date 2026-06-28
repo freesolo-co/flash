@@ -177,6 +177,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     # OOM budget off it alone over-counts; subtract the persisted bonus count to mirror the live walk
     # accounting. Popped (like the other budget/meta fields) so JobHandle.from_dict sees only transport.
     persisted_cache_drops = int(remote.pop("cache_drop_consumed", 0) or 0)
+    # The infra-shaped walk attempt(s) the live loop EXCLUDES from the OOM-escalation budget (only
+    # OOM-shaped attempts count). The persisted ``attempt`` is the PHYSICAL id (it counts infra
+    # attempts), so seeding the OOM budget off it alone over-counts an earlier infra retry against the
+    # escalation cap; subtract the persisted infra count to mirror the live-loop OOM accounting. Popped
+    # (like the other budget/meta fields) so JobHandle.from_dict sees only transport.
+    persisted_infra_walks = int(remote.pop("infra_walk_consumed", 0) or 0)
     log = log_stream or sys.stderr
     # Dispatch the poll generically via the handle's provider (the provider owns its
     # heartbeat reader + poll loop); the orchestrator stays provider-agnostic.
@@ -224,7 +230,13 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 # 2 spent and FAIL the entry guard instead of taking its one allowed escalation. The
                 # persistence invariant keeps this non-negative (a cache drop is always one attempt, and
                 # the in-flight OOM attempt itself is never a cache drop, so drops <= persisted_attempt).
-                resumed_oom_attempts = persisted_attempt + 1 - persisted_cache_drops
+                # Subtract the infra-shaped walk attempt(s) too: the OOM budget counts ONLY OOM-shaped
+                # attempts (the live loop peels infra off via infra_walk_consumed), so an earlier infra
+                # retry across the restart must not consume a CUDA OOM's allowed escalation. The in-flight
+                # OOM attempt is not infra, so infra walks <= persisted_attempt -> still non-negative.
+                resumed_oom_attempts = (
+                    persisted_attempt + 1 - persisted_cache_drops - persisted_infra_walks
+                )
             elif persisted_oom_floor > 0:
                 # The reattached attempt ended infra-shaped (preempt/stall), but an EARLIER OOM created
                 # the persisted floor and ALREADY spent escalation budget. Without seeding it here, a
@@ -235,7 +247,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 # the OOM count, unlike the oom branch) so any remaining escalation honors max_retries.
                 # Subtract the cache-drop bonus here too (mirrors the live walk accounting); drops <=
                 # persisted_attempt (the in-flight infra attempt is not a cache drop), so non-negative.
-                resumed_oom_attempts = persisted_attempt - persisted_cache_drops
+                # Subtract the earlier infra-shaped walk attempt(s) as well (the OOM budget counts only
+                # OOM-shaped attempts) so a prior OOM's spent escalations are remembered WITHOUT also
+                # counting infra retries against the cap; infra walks <= persisted_attempt -> non-negative.
+                resumed_oom_attempts = (
+                    persisted_attempt - persisted_cache_drops - persisted_infra_walks
+                )
             _run_training(
                 spec,
                 log,

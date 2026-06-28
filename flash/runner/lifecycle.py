@@ -210,6 +210,13 @@ def _submit_seed_supervised(
                 # failing a run's allowed escalation (notably max_retries=1: cache attempt 0 -> cacheless
                 # OOM attempt 1 would resume as 2 spent and trip the entry guard).
                 "cache_drop_consumed": int(cache_drop_consumed),
+                # Infra-shaped walk attempts already consumed, EXCLUDED from the OOM-escalation budget
+                # here in the live loop (only OOM-shaped attempts count). Persist the count alongside the
+                # physical attempt + cache-drop count so an OOM-aware resume (attach_run) subtracts it
+                # too — else a restart would seed the OOM budget off the physical attempt id and count an
+                # earlier infra retry against the escalation cap, failing a run's allowed escalation
+                # (max_retries=1: infra attempt 0 -> OOM attempt 1 would resume as 2 spent vs the true 1).
+                "infra_walk_consumed": int(infra_walk_consumed),
                 "on_last_gpu": bool(current_on_last_gpu["value"]),
             },
         )
@@ -276,6 +283,15 @@ def _submit_seed_supervised(
     # (the fallback would silently steal the only user retry). ``walk_attempt`` = attempt index with the
     # cache-drop attempt(s) removed, so the GPU walk gets its full budget AFTER a cache drop.
     cache_drop_consumed = 0
+    # Infra-shaped GPU-walk attempts (no_capacity/job_preempted/stalled/poll_error), EXCLUDED from the
+    # OOM-escalation budget (NOT from the infra budget). The OOM budget counts only OOM-shaped attempts:
+    # without this offset an early infra retry would tick the shared ``walk_attempt`` and burn a CUDA
+    # OOM's allowed larger-GPU escalation (notably max_retries=1: an infra retry on attempt 0 then a
+    # real OOM on attempt 1 would read budget_spent==1 and refuse the one escalation the user allowed).
+    # Mirrors ``cache_drop_consumed`` — both peel non-OOM attempts off the OOM walk. Persisted into the
+    # handle (on_handle) and subtracted on an OOM-aware resume (attach_run) so the accounting survives a
+    # control-plane restart, exactly like the cache-drop count.
+    infra_walk_consumed = 0
     for attempt in range(infra_budget + 1 + cache_fallback_attempts):
         # The CUMULATIVE/monotonic physical attempt id: the local loop index OFFSET by the attempts a
         # pre-restart process already spent before this (OOM-aware) resume. The endpoint suffix, the
@@ -527,7 +543,17 @@ def _submit_seed_supervised(
         # re-grant a fresh full set of larger-GPU escalations beyond ``max_retries`` (the entry guard
         # above already rejects an outright-exhausted budget; this caps any REMAINING escalations).
         # Infra retries are unaffected — a restart legitimately re-leases the infra budget.
-        budget_spent = walk_attempt + (resume_oom_attempts if oom_shaped else 0)
+        #
+        # The OOM-escalation budget counts ONLY OOM-shaped attempts: subtract the infra-shaped walk
+        # attempts already consumed (``infra_walk_consumed``, mirroring the ``cache_drop_consumed``
+        # exclusion in ``walk_attempt``) so an early infra retry can't burn a CUDA OOM's allowed
+        # larger-GPU escalation. Infra failures keep counting ALL walk attempts against the (floored)
+        # infra budget below — only the OOM walk peels off the non-OOM attempts.
+        budget_spent = (
+            walk_attempt - infra_walk_consumed + resume_oom_attempts
+            if oom_shaped
+            else walk_attempt
+        )
         # "retrying" is true when the GPU-walk budget remains OR a cache-drop fallback will retry this
         # even past it (first_cache_drop) — else the log would say "not retrying" while the loop actually
         # continues with the reserved cache-less fallback attempt.
@@ -567,14 +593,23 @@ def _submit_seed_supervised(
             # Do NOT advance the GPU walk on this transition: the next attempt should retry the SAME
             # cheapest GPU without the volume on the wider all-DC pool first — the miss may have been
             # the cache's datacenter set, not the GPU class globally. Only walk if THAT also fails.
-        elif chosen is not None:
-            # Record what THIS attempt burned so the next pick avoids it — only when an attempt
-            # actually provisioned a class and lost it (chosen is None never tried a card). An infra
-            # failure also escapes the PROVIDER cross-provider; an OOM does NOT (the host was fine —
-            # just grow the card, which the oom_vram_floor filter already enforces).
+        else:
+            # A real GPU-walk retry (not the free cache-drop fallback). An INFRA-shaped one
+            # (no_capacity/job_preempted/stalled/poll_error — here ``not oom_shaped`` since retry_shaped
+            # held and it wasn't the cache drop) must NOT consume the OOM-escalation budget: track it so
+            # ``budget_spent`` peels it off the OOM walk (mirrors ``cache_drop_consumed``). Counted even
+            # when ``chosen is None`` (an allocation/deploy poll_error that never provisioned a card), so
+            # every infra attempt is excluded from the OOM count, not just provisioned ones.
             if not oom_shaped:
-                failed_providers.add(chosen.provider)
-            tried_classes.add((chosen.provider, chosen.gpu))
+                infra_walk_consumed += 1
+            if chosen is not None:
+                # Record what THIS attempt burned so the next pick avoids it — only when an attempt
+                # actually provisioned a class and lost it (chosen is None never tried a card). An infra
+                # failure also escapes the PROVIDER cross-provider; an OOM does NOT (the host was fine —
+                # just grow the card, which the oom_vram_floor filter already enforces).
+                if not oom_shaped:
+                    failed_providers.add(chosen.provider)
+                tried_classes.add((chosen.provider, chosen.gpu))
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
     # are only known here).

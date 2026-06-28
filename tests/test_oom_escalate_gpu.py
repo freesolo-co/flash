@@ -14,7 +14,9 @@ import pathlib
 
 
 def test_is_cuda_oom_is_structured_not_string_based(monkeypatch):
-    import torch
+    import pytest
+
+    torch = pytest.importorskip("torch")  # this file is CPU-only; the typed-error case needs torch
 
     from flash.engine.worker.perf import lifecycle as lc
 
@@ -258,6 +260,35 @@ def test_detail_flags_cuda_oom_scans_only_the_terminal_exception_block():
         "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
     )
     assert detail_flags_cuda_oom(real) is True
+
+
+def test_detail_flags_cuda_oom_backstops_a_buried_single_line_stdout_oom():
+    # PRRT...XE: when the live RunPod detail has NO traceback framing, the terminal-block fallback keeps
+    # only the last 15 lines, so a real single-line CUDA OOM (a vLLM EngineCore child) dumped EARLIER —
+    # then buried under teardown noise — is missed. A same-line backstop over the FULL tail catches it
+    # WITHOUT re-opening the cross-line borrow (it requires cuda+oom CO-LOCATED on one un-indented line).
+    from flash.providers.runpod.jobs import detail_flags_cuda_oom
+
+    # a single-line CUDA OOM, then > 15 lines of un-framed teardown noise (no "Traceback" header):
+    buried = "ERROR EngineCore: torch.cuda.OutOfMemoryError: CUDA out of memory\n" + "".join(
+        f"shutting down worker {i}\n" for i in range(40)
+    )
+    assert detail_flags_cuda_oom(buried) is True
+    # the same shape but the buried OOM is a host-RAM OOM (cuda + 'out of memory' on SEPARATE lines)
+    # must NOT escalate — the same-line co-location requirement rejects the cross-line borrow.
+    host = (
+        "INFO: CUDA device 0 ready\n"
+        "DataLoader worker killed: out of memory\n" + "".join(f"closing fd {i}\n" for i in range(40))
+    )
+    assert detail_flags_cuda_oom(host) is False
+    # a real single-line CUDA OOM shifted PAST the terminal block by a later, unrelated traceback:
+    early = (
+        "ERROR EngineCore: torch.cuda.OutOfMemoryError: CUDA out of memory\n"
+        "Traceback (most recent call last):\n"
+        '  File "/x/teardown.py", line 1, in close\n'
+        "RuntimeError: connection reset by peer\n"
+    )
+    assert detail_flags_cuda_oom(early) is True
 
 
 def test_worker_flagged_crash_is_attempt_scoped_to_a_terminal_error_heartbeat():
@@ -593,6 +624,39 @@ def test_console_oom_scan_catches_early_oom_before_an_unrelated_later_traceback(
     assert _read(cross) is False  # cross-line host OOM still not escalated
 
 
+def test_console_oom_scan_yields_to_a_retriable_infra_marker(tmp_path, monkeypatch):
+    # PRRT...XK: a worker RetriableInfraError from GPU readiness can print 'RETRIABLE_INFRA_GPU: ...
+    # CUDA out of memory' to the child console (the last readiness error rides in its message). That is
+    # a host/GPU readiness failure to RETRY on a fresh SAME-size GPU, NOT a workload OOM to escalate
+    # onto a larger card. The console scanner must YIELD to the retriable marker (retriable wins),
+    # mirroring the worker's classifier (oom = is_cuda_oom(e) and not retriable) and
+    # runpod.jobs.detail_flags_cuda_oom (which skips retriable-infra text).
+    import importlib
+
+    boot = importlib.import_module("flash.providers._instance_bootstrap")
+    retriable_oom = "RETRIABLE_INFRA_GPU: GPU never became ready after 12 tries: CUDA out of memory\n"
+    plain_oom = "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+
+    monkeypatch.setattr(boot.os.path, "exists", lambda _p: True)
+    console = tmp_path / "console.txt"
+
+    def _read(mode_text):
+        console.write_text(mode_text)
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            return real_open(console, *a, **k) if path == "/tmp/console_x.txt" else real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        try:
+            return boot._console_flags_cuda_oom("x")
+        finally:
+            monkeypatch.setattr("builtins.open", real_open)
+
+    assert _read(retriable_oom) is False  # retriable infra wins -> NOT an OOM escalation
+    assert _read(plain_oom) is True  # a plain CUDA OOM (no retriable marker) still escalates
+
+
 def test_oom_recovery_respects_the_user_retry_budget():
     # BRa: a control-plane restart that reattaches to an in-flight OOM must NOT re-grant a fresh
     # larger-GPU escalation budget past max_retries. The consumed attempt count rides into the resumed
@@ -607,10 +671,18 @@ def test_oom_recovery_respects_the_user_retry_budget():
     # the supervisor takes the consumed-attempt count and enforces it
     assert "resume_oom_attempts: int = 0" in life
     assert "resume_oom_attempts > max_retries" in life  # entry guard (fail-fast when exhausted)
-    assert "budget_spent = walk_attempt + (resume_oom_attempts if oom_shaped else 0)" in life
+    # the OOM budget counts only OOM-shaped attempts: subtract the infra-shaped walk attempts (the
+    # infra-vs-OOM exclusion) AND the resumed count, but ONLY when oom_shaped (infra uses raw walk).
+    assert "walk_attempt - infra_walk_consumed + resume_oom_attempts" in life
+    assert "else walk_attempt" in life  # infra failures keep counting all walk attempts
     assert "budget_spent < retry_budget" in life
     assert "if budget_spent >= retry_budget and not first_cache_drop:" in life
-    # infra retries are unaffected (the offset only applies when oom_shaped)
+    # infra-shaped walk attempts are tracked + EXCLUDED from the OOM budget (mirrors cache_drop_consumed)
+    assert "infra_walk_consumed = 0" in life
+    assert "infra_walk_consumed += 1" in life
+    assert '"infra_walk_consumed": int(infra_walk_consumed)' in life  # persisted on every submit
+    assert 'persisted_infra_walks = int(remote.pop("infra_walk_consumed", 0) or 0)' in deploy
+    assert "- persisted_infra_walks" in deploy  # subtracted on an OOM-aware resume (both branches)
     # recovery computes the consumed count from the persisted handle attempt and threads it in
     assert 'persisted_attempt = int(remote.get("attempt", 0) or 0)' in deploy
     assert "resume_oom_attempts=resumed_oom_attempts" in deploy
@@ -622,11 +694,13 @@ def test_oom_recovery_respects_the_user_retry_budget():
     # 2 spent and trip the entry guard instead of taking its one allowed escalation.
     assert '"cache_drop_consumed": int(cache_drop_consumed)' in life  # persisted on every submit
     assert 'persisted_cache_drops = int(remote.pop("cache_drop_consumed", 0) or 0)' in deploy
-    assert "resumed_oom_attempts = persisted_attempt + 1 - persisted_cache_drops" in deploy  # oom reattach
+    # oom reattach: count every prior physical attempt (+1 for the in-flight OOM) MINUS the cache-drop
+    # bonus AND the infra-shaped walks (only OOM-shaped attempts count against the escalation budget).
+    assert "persisted_attempt + 1 - persisted_cache_drops - persisted_infra_walks" in deploy
     # an INFRA-shaped reattach must STILL remember a spent OOM budget when a prior OOM created the
     # floor (else a subsequent OOM after a preempted larger attempt re-escalates past max_retries).
     assert "elif persisted_oom_floor > 0:" in deploy
-    assert "resumed_oom_attempts = persisted_attempt - persisted_cache_drops" in deploy
+    assert "persisted_attempt - persisted_cache_drops - persisted_infra_walks" in deploy
     # the resumed attempts get a MONOTONIC physical-id base so a recovered attempt's heartbeat can't
     # collide with a prior physical attempt's lingering OOM flag (independent of the budget accounting)
     assert "resume_attempt_base=persisted_attempt + 1" in deploy
