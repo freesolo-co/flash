@@ -238,7 +238,7 @@ class ApiClient:
         The timeout matches publish's (1800s): the server-side delete may retry the git workflow
         multiple times, and each attempt includes several git commands with a 180s per-command
         timeout (clone/pull/push can dominate). Keep the client timeout at least as large as the
-        server's so the CLI doesn't time out while a destructive delete is still in progress.
+        server's so the CLI doesn't time out while a destructive delete is still in progress."""
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request("DELETE", f"/v1/envs/{quoted}", timeout=1800.0)
 
