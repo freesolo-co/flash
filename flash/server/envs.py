@@ -141,7 +141,14 @@ def _credentialed_repo_url(repo: str, token: str) -> str:
     return f"https://x-access-token:{quoted}@github.com/{repo}.git"
 
 
-def _run_git(cwd: Path, args: list[str], *, token: str) -> subprocess.CompletedProcess[str]:
+def _run_git(
+    cwd: Path, args: list[str], *, token: str, operation: str = "upload"
+) -> subprocess.CompletedProcess[str]:
+    # ``operation`` is the user-facing verb for the action that ran this git command ("upload" for
+    # publish, "delete" for delete) so a git failure reports what the caller actually attempted
+    # instead of a misleading "upload" on the delete path. The trailing preposition mirrors the
+    # wording used elsewhere in this module ("environments to Freesolo" for upload, "from Freesolo"
+    # for delete — see `_staged_has_changes` / `delete_package`).
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
         proc = subprocess.run(
@@ -153,19 +160,22 @@ def _run_git(cwd: Path, args: list[str], *, token: str) -> subprocess.CompletedP
             timeout=_GIT_TIMEOUT_S,
         )
     except FileNotFoundError as exc:
+        direction = "from" if operation == "delete" else "to"
         raise EnvPublishError(
-            "git is required to upload environments to Freesolo", status=503
+            f"git is required to {operation} environments {direction} Freesolo", status=503
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise EnvPublishError(
-            f"Freesolo environment upload git command timed out after {_GIT_TIMEOUT_S}s",
+            f"Freesolo environment {operation} git command timed out after {_GIT_TIMEOUT_S}s",
             status=504,
         ) from exc
     if proc.returncode != 0:
         output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
         cmd = "git " + " ".join(args)
         raise EnvPublishError(
-            _redact(f"Freesolo environment upload failed during `{cmd}`: {output[:1000]}", token),
+            _redact(
+                f"Freesolo environment {operation} failed during `{cmd}`: {output[:1000]}", token
+            ),
             status=502,
         )
     return proc
@@ -258,13 +268,20 @@ def _push_environment_delete(*, checkout: Path, publish_root: str, token: str) -
     directory still exists partially. Re-run ``git rm -r`` against the freshly rebased tree and fold
     any newly-tracked paths into the delete commit so the pushed state has the slug fully removed.
     """
-    _run_git(checkout, ["pull", "--rebase", "origin", _GITHUB_BRANCH], token=token)
     _run_git(
-        checkout, ["rm", "-r", "--quiet", "--ignore-unmatch", "--", publish_root], token=token
+        checkout, ["pull", "--rebase", "origin", _GITHUB_BRANCH], token=token, operation="delete"
+    )
+    _run_git(
+        checkout,
+        ["rm", "-r", "--quiet", "--ignore-unmatch", "--", publish_root],
+        token=token,
+        operation="delete",
     )
     if _staged_has_changes(checkout):
-        _run_git(checkout, ["commit", "--amend", "--no-edit"], token=token)
-    _run_git(checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token)
+        _run_git(checkout, ["commit", "--amend", "--no-edit"], token=token, operation="delete")
+    _run_git(
+        checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token, operation="delete"
+    )
 
 
 def _github_publish_once(
@@ -454,6 +471,7 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
                 str(checkout),
             ],
             token=token,
+            operation="delete",
         )
         target = checkout / publish_root
         checkout_root = checkout.resolve()
@@ -463,15 +481,20 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
         if not target.exists():
             # Idempotent: nothing published under this slug, so there is nothing to remove.
             return False
-        _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token)
-        _run_git(checkout, ["config", "user.email", "bot@freesolo.co"], token=token)
+        _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token, operation="delete")
         _run_git(
-            checkout, ["rm", "-r", "--quiet", "--ignore-unmatch", "--", publish_root], token=token
+            checkout, ["config", "user.email", "bot@freesolo.co"], token=token, operation="delete"
+        )
+        _run_git(
+            checkout,
+            ["rm", "-r", "--quiet", "--ignore-unmatch", "--", publish_root],
+            token=token,
+            operation="delete",
         )
         if not _staged_has_changes(checkout):
             # The directory was present on disk but untracked (never committed) — nothing to push.
             return False
-        _run_git(checkout, ["commit", "-m", message], token=token)
+        _run_git(checkout, ["commit", "-m", message], token=token, operation="delete")
         _push_environment_delete(checkout=checkout, publish_root=publish_root, token=token)
         return True
 
