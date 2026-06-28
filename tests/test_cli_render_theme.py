@@ -330,7 +330,7 @@ def test_unexpected_error_themed_on_tty_traceback_on_machine(monkeypatch, capsys
     err = capsys.readouterr().err
     assert err.startswith("✗")  # red ✗ idiom, not a raw traceback
     assert "disk full" in err
-    assert "runs --debug" in err  # the pointer names the exact command to re-run, copy-pasteable
+    assert "--debug runs" in err  # names the exact command, with --debug BEFORE the subcommand
     assert "Traceback (most recent call last)" not in err
 
     # machine path: the raw exception propagates (a traceback), exactly as before this handler

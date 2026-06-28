@@ -398,11 +398,12 @@ def main(argv: list[str] | None = None) -> int:
         # which is the bug signal CI and `--debug` bug reports rely on.
         if debug or not render.styled():
             raise
-        # point at the exact command to re-run, so the user can copy `<their command> --debug`
-        # straight from the hint (raw_args never contains --debug here — that path re-raises above).
-        cmd = " ".join([CLI_NAME, *(shlex.quote(a) for a in raw_args)])
+        # point at the exact command to re-run, copy-pasteable. --debug is a root-level flag, so it
+        # must come BEFORE the subcommand (argparse rejects `flash runs --debug`); place it right
+        # after the program name. raw_args never contains --debug here — that path re-raises above.
+        cmd = " ".join([CLI_NAME, "--debug", *(shlex.quote(a) for a in raw_args)])
         print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
-        print(render.arrow(f"run `{cmd} --debug` for the full traceback"), file=sys.stderr)
+        print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
         return 1
     finally:
         emit_update_notice(update_check)
