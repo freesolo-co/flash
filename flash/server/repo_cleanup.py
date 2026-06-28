@@ -41,6 +41,19 @@ from flash.runner import _ARTIFACT_NAMESPACE
 
 logger = get_logger(__name__)
 
+# huggingface_hub is an OPTIONAL server extra (see pyproject ``[server]``). The rest of the control
+# plane already treats it as optional — ``_worker_artifacts()`` and ``_validate_hf_repo_id()`` guard
+# their HF imports — so mirror that here: without the extra there is no way to list or delete repos,
+# so the always-on GC degrades to a logged no-op instead of crashing the loop with a
+# ``ModuleNotFoundError`` on every cycle.
+try:
+    from huggingface_hub import HfApi
+except ModuleNotFoundError:  # pragma: no cover - the test venv always has the server extra
+    HfApi = None  # type: ignore[assignment,misc]
+
+# Latch so a plane missing the extra warns ONCE (the sweep runs daily — don't spam the log).
+_warned_hf_unavailable = False
+
 RUN_REPO_PREFIX = "flashrun-"
 DELETE_AGE_SECONDS = 30.0 * 86400.0  # delete an undeployed repo once it is this old (fixed: 30 days)
 _DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
@@ -189,9 +202,19 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
     runs in a worker thread that ``task.cancel()`` cannot interrupt, so at shutdown the caller sets a
     stop flag and this loop halts promptly instead of churning through more destructive deletes long
     after the server was told to stop (mirrors the completion-charge retry sweeps)."""
-    from huggingface_hub import HfApi
-
-    api = api or HfApi()
+    if api is None:
+        if HfApi is None:
+            # No HF client on this plane -> nothing to list or delete. Degrade to a no-op (warn
+            # ONCE so a misconfigured plane is visible without the daily sweep spamming the log)
+            # rather than crash the always-on loop with ModuleNotFoundError every cycle.
+            global _warned_hf_unavailable
+            if not _warned_hf_unavailable:
+                logger.warning(
+                    "repo GC: huggingface_hub not installed (server extra absent); skipping sweeps"
+                )
+                _warned_hf_unavailable = True
+            return 0
+        api = HfApi()
     max_age_s = DELETE_AGE_SECONDS
 
     deployed = _confirm_live_set()  # fail closed before we even list

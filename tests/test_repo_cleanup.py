@@ -14,6 +14,10 @@ from flash.server import repo_cleanup as rc
 # tests below can exercise the genuine functions.
 _REAL_KNOWN_RUN_REPO_IDS = rc._known_run_repo_ids
 _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
+# The global offline conftest stubs run_scheduled_cleanup to a no-op (so the always-on GC sweep
+# never reaches serving/HF in offline TestClient startups). Capture the genuine function so this
+# file's fixture can restore it — these unit tests exercise the real sweep.
+_REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
 NS = rc._ARTIFACT_NAMESPACE
 NOW = datetime(2026, 6, 28, 12, 0, 0, tzinfo=UTC)
@@ -45,6 +49,10 @@ def _fast_and_frozen(monkeypatch):
     # Default: the per-run deploy/export lock is always free (nothing in progress) — the sweep
     # acquires-and-holds a dummy. The acquire-and-hold guard is exercised explicitly below.
     monkeypatch.setattr(rc, "_hold_run_lock", lambda repo_id: _DummyHeld())
+    # The global offline conftest stubs run_scheduled_cleanup to a no-op (keeps the GC sweep off the
+    # network in offline TestClient startups); restore the genuine function so these unit tests
+    # exercise the real sweep. Mirrors the _REAL_* restores above.
+    monkeypatch.setattr(rc, "run_scheduled_cleanup", _REAL_RUN_SCHEDULED_CLEANUP)
     # Clear HF_TOKEN so the enablement check is deterministic (the policy itself has no env knobs).
     monkeypatch.delenv("HF_TOKEN", raising=False)
 
@@ -96,6 +104,19 @@ def test_enabled_requires_hf_token(monkeypatch):
     assert rc.repo_cleanup_enabled() is False  # no HF_TOKEN -> never runs
     monkeypatch.setenv("HF_TOKEN", "tok")
     assert rc.repo_cleanup_enabled() is True  # credential present -> always on (no off switch)
+
+
+def test_sweep_noops_when_huggingface_hub_unavailable(monkeypatch):
+    # huggingface_hub is an OPTIONAL server extra. On a plane without it the always-on GC must
+    # degrade to a logged no-op (returns 0, touches no serving/HF) instead of crashing the loop with
+    # ModuleNotFoundError every cycle — mirroring _worker_artifacts()/_validate_hf_repo_id().
+    monkeypatch.setattr(rc, "HfApi", None)
+    monkeypatch.setattr(rc, "_warned_hf_unavailable", False)  # reset the warn-once latch
+    # If the sweep tried to confirm the live set or list repos it would call these; make them blow up
+    # so a regression that doesn't short-circuit is caught rather than silently passing.
+    monkeypatch.setattr(rc, "_confirm_live_set", lambda: (_ for _ in ()).throw(AssertionError("called")))
+    monkeypatch.setattr(rc, "list_run_repos", lambda *a, **k: (_ for _ in ()).throw(AssertionError("called")))
+    assert rc.run_scheduled_cleanup(dry_run=False, api=None) == 0  # no-op, no network
 
 
 # ---- the policy predicate ---------------------------------------------------------------------
