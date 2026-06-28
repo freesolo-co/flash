@@ -79,6 +79,38 @@ def test_fits_resident_is_conservative_when_unknown():
     assert grpo_fits_resident("some/unlisted-model", card_vram_gb=80) is False
 
 
+def test_moe_grpo_fits_resident_sizes_compute_on_active_params():
+    # Cursor High: grpo_fits_resident must size the resident peak's COMPUTE terms (KV pool,
+    # activations, rank-linear LoRA) on the MoE's ~3B ACTIVE backbone — like model_required_vram_gb
+    # does — not the 35B TOTAL. Keying them on the total inflates the resident estimate above the
+    # 180 GB B200 (~186 GB w/ margin) and wrongly forces vLLM sleep mode on a B200 MoE GRPO run,
+    # where the sleep/wake cycle stalls the colocated rollout — the very failure the gate prevents.
+    from flash.catalog import MODELS, vocab_size_for
+
+    moe = "Qwen/Qwen3.6-35B-A3B"
+    info = MODELS[moe]
+    assert info.active_params_b  # it's an MoE...
+    assert info.active_params_b < info.params_b  # ...with active < total
+    kw = {"seq_len": 1024, "max_tokens": 64, "group_size": 8, "lora_rank": 32}
+    # active-aware (the fix) admits the run resident on the 180 GB B200; the 141 GB H200 still can't
+    # hold the two ~70 GB weight copies, so sleep stays on there.
+    assert grpo_fits_resident(moe, card_vram_gb=180, **kw) is True
+    assert grpo_fits_resident(moe, card_vram_gb=141, **kw) is False
+    # Had the gate kept sizing compute on the 35B total, the 1.15-margined resident estimate would
+    # exceed 180 and the B200 case above would be False. Prove the active-aware estimate is materially
+    # leaner than the (buggy) total-based one — that gap is what flips the B200 verdict.
+    active_aware = estimate_vram_gb(
+        info.params_b, "grpo", "bf16", sleep_offload=False,
+        active_params_b=info.active_params_b, vocab=vocab_size_for(moe), **kw,
+    )
+    total_based = estimate_vram_gb(
+        info.params_b, "grpo", "bf16", sleep_offload=False,
+        active_params_b=None, vocab=vocab_size_for(moe), **kw,
+    )
+    assert active_aware < total_based
+    assert active_aware * 1.15 <= 180 < total_based * 1.15  # only the active-aware fit clears the B200
+
+
 def test_sleep_gate_resolves_unset_max_length_against_real_rollout_length():
     # Cursor High / Codex P2: a sub-3B model with [train].max_length UNSET (0) but a real rollout
     # (max_tokens) must NOT short-circuit the size/context pre-filter as a 0-length "short" run --
