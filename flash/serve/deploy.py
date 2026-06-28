@@ -126,7 +126,7 @@ def validate_serving_lora_rank(
     if int(lora_rank) > serving.max_lora_rank:
         raise ValueError(
             f"{model} serving supports max_lora_rank={serving.max_lora_rank}; "
-            f"{rank_source} rank {int(lora_rank)} cannot be deployed"
+            f"{rank_source} has rank {int(lora_rank)} and cannot be deployed"
         )
 
 

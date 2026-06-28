@@ -86,6 +86,17 @@ def test_public_rows_include_serving_capacity():
     row = get_model("Qwen/Qwen3.5-4B").to_dict()
     assert row["serving"]["gpu"] == "L40S"
     assert row["serving"]["max_loras"] == 256
+    assert row["serving"]["serve_model_id"] == "lovedheart/Qwen3.5-4B-FP8"
+
+
+def test_public_rows_prune_unset_serving_capacity_fields():
+    row = get_model("openbmb/MiniCPM5-1B").to_dict()
+    assert row["serving"] == {
+        "gpu": "L4",
+        "max_loras": 16,
+        "max_lora_rank": 32,
+        "max_model_len": 32768,
+    }
 
 
 def test_default_model_is_thinking_capable():

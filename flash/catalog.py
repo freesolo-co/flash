@@ -96,8 +96,18 @@ class ModelInfo:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        if data.get("serving") is None:
+        serving = data.get("serving")
+        if serving is None:
             data.pop("serving", None)
+        else:
+            for key in (
+                "serve_model_id",
+                "max_num_seqs",
+                "max_num_batched_tokens",
+                "gpu_memory_utilization",
+            ):
+                if serving.get(key) in ("", 0, 0.0, None):
+                    serving.pop(key, None)
         return data
 
 
