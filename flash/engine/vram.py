@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 from dataclasses import dataclass
 
 
@@ -254,15 +253,6 @@ def grpo_seq_escalation_gb(params_b: float | None, seq_len: int) -> int:
     if seq_len <= seq_thresh:
         return 0
     return math.ceil(coef * params_b * (seq_len / seq_thresh - 1))
-
-
-def params_b_from_str(s: str | None) -> float | None:
-    """Leading param count (billions) from a catalog ``params`` string, e.g.
-    "4.7B (text-only fine-tune)" -> 4.7, "9.7B (text-only fine-tune)" -> 9.7."""
-    if not s:
-        return None
-    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*B", s)
-    return float(m.group(1)) if m else None
 
 
 @dataclass(frozen=True)
@@ -513,7 +503,7 @@ def model_required_vram_gb(
     model_vocab = vocab_size_for(model_id)
     is_grpo = (algorithm or "").lower() in ("grpo", "rl")
     if info is not None:
-        params_b = params_b_from_str(info.params)
+        params_b = info.params_b  # curated, authoritative (required field) — no string parsing
         quant = getattr(info, "quant", "bf16") or "bf16"
         # GRPO always runs the rollout on a colocated vLLM engine, so sizing must reserve room for
         # the 2nd (rollout) weight copy on the same card.
@@ -597,8 +587,8 @@ def fetch_hf_params_b(model_id: str) -> float | None:
 
 def resolve_params_b(model_id: str) -> float | None:
     """Model size in billions, resolved the ONE way the worker and the cost estimator agree on:
-    the curated catalog ``params_b`` (else its ``params`` display string), else the real HF
-    safetensors param count for an open-policy (uncataloged) model. Best-effort: returns None only
+    the curated catalog ``params_b`` (the required numeric field), else the real HF safetensors
+    param count for an open-policy (uncataloged) model. Best-effort: returns None only
     when the model is uncataloged AND HF metadata is unavailable, so callers degrade to the
     size-unknown path (e.g. the fused-CE gate stays memory-safe, the colocate cap stays loose).
     The single source of truth for "how big is this model" -- run_sft, run_rl and cost.spec all
@@ -606,10 +596,8 @@ def resolve_params_b(model_id: str) -> float | None:
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
-    if info is not None:
-        pb = getattr(info, "params_b", 0.0) or params_b_from_str(getattr(info, "params", None))
-        if pb:
-            return pb
+    if info is not None and info.params_b:
+        return info.params_b  # curated, authoritative (required field) — no string parsing
     return fetch_hf_params_b(model_id)
 
 

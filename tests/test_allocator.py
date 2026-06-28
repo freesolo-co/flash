@@ -301,7 +301,7 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
 
     from flash.catalog import MODELS, vocab_size_for
     from flash.engine import vram
-    from flash.engine.vram import params_b_from_str, sft_logits_fused, sft_per_device
+    from flash.engine.vram import sft_logits_fused, sft_per_device
     from flash.providers.allocator import required_vram_gb
     from flash.providers.base import GPU_INFO
 
@@ -324,7 +324,7 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
     for mid, info in MODELS.items():
         if "sft" not in info.algos:
             continue
-        pb = info.params_b or params_b_from_str(info.params) or 0.0
+        pb = info.params_b  # required curated field
         active_b = float(getattr(info, "active_params_b", 0.0) or 0.0)
         vocab, quant = vocab_size_for(mid), getattr(info, "quant", "bf16") or "bf16"
         for seq in (512, 1024, 1536, 2047, 2048, 4096, 32768):
