@@ -1,16 +1,27 @@
-"""Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count / estimate."""
+"""Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count / estimate.
+
+Used by ``flash train --cost`` for a pre-flight quote. The control plane bills completed runs
+from their final recorded ``cost_usd`` instead of charging this estimate at submit time."""
 
 from __future__ import annotations
 
 from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
 
-# Fallback when the env dataset can't be counted locally; keeps the quote in the right ballpark.
+# Fallback SFT dataset size when an uncapped run's env can't be counted locally. Most Freesolo
+# training datasets land in the
+# low-thousands of rows; this is a representative middle estimate so the quote is in the right
+# ballpark rather than hard-failing.
 DEFAULT_UNCOUNTED_SFT_EXAMPLES = 1000
 
 
 def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
-    """Training rows in ``env_id``'s dataset, or ``None`` if it can't be loaded."""
+    """Training rows in ``env_id``'s dataset (the worker's train split), or ``None`` if it can't
+    be loaded. Best-effort -- prices an uncapped SFT run on the real dataset size, not a guess.
+
+    Loading may need network access for managed Freesolo environments. If the environment
+    cannot be loaded in this interpreter, this returns ``None`` and the caller falls back to a
+    default count instead of hard-failing."""
     if not env_id:
         return None
     try:
@@ -23,7 +34,9 @@ def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
 
 
 def spec_steps(spec) -> int:
-    """Per-seed optimizer steps implied by a train spec (mirrors the worker)."""
+    """Optimizer steps implied by a train spec (mirrors the worker). GRPO: ``train.steps``
+    (else recipe default). SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by
+    ``max_steps``, where ``num_examples`` is ``max_examples`` if pinned else the real env size."""
     from flash.catalog import vocab_size_for
     from flash.engine.recipe import RECIPE
     from flash.engine.vram import resolve_params_b, sft_logits_fused, sft_realized_batch
@@ -33,24 +46,36 @@ def spec_steps(spec) -> int:
         if t.steps is not None:
             return max(1, int(t.steps))
         return RECIPE.rl.num_steps
-    cap = int(t.max_steps) if t.max_steps else 0  # 0 = uncapped
+    cap = int(t.max_steps) if t.max_steps else 0  # SFT-only optimizer-step cap (0 = uncapped)
     epochs = int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
     requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
-    # Mirror the worker's per-device micro-batch exactly so the priced step count matches.
+    # Mirror the worker's per-device micro-batch EXACTLY, incl. the big-vocab logits cap: when the
+    # fused CE is OFF the worker vocab-sizes the micro-batch (engine.worker), which (with CEIL'd
+    # grad-accum) can change the realized global batch and thus the step count. Feed the same
+    # seq/vocab/fused so the priced step count matches what actually runs.
     sft_seq = (
         int(t.max_length)
         if t.max_length is not None
         else (RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
     )
+    # Resolve params_b via the shared helper (catalog stat else HF safetensors for an open model) —
+    # the SAME resolution the worker's run_sft uses. The fused-CE decision (and thus the big-vocab
+    # micro-batch cap) hinges on the >=3B threshold, so an uncataloged >=3B model must not be priced
+    # as <3B (which would flip fused off, change the realized batch via the cap, and misprice the
+    # step count). Best-effort: no network -> None -> the prior <3B (cap-on) behavior.
     sft_fused = sft_logits_fused(resolve_params_b(spec.model), sft_seq)
     batch = sft_realized_batch(
         requested_batch, seq_len=sft_seq, vocab=vocab_size_for(spec.model), fused=sft_fused
     )
-    # max_examples=0 means "no cap" — don't treat it as zero examples.
+    # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
+    # don't let max_examples=0 price a single step.
     pinned_examples = int(t.max_examples) if t.max_examples else 0
     if pinned_examples > 0:
         examples = pinned_examples
     else:
+        # No cap: the worker trains the FULL env dataset, so price its real size when we can
+        # count it. A managed Freesolo environment may not be reachable in this interpreter, so
+        # counting can return None. Fall back to a representative default instead of hard-failing.
         examples = count_env_examples(spec.environment.id, spec.environment.params)
         if examples is None:
             examples = DEFAULT_UNCOUNTED_SFT_EXAMPLES
@@ -68,7 +93,6 @@ def runconfig_from_spec(spec) -> RunConfig:
         model_id=spec.model,
         method=spec.algorithm,
         steps=spec_steps(spec),
-        setup_repeats=1,
         seq_len=t.max_length,
         completion_len=t.max_tokens if is_grpo else None,
         batch_size=t.batch_size,

@@ -1,4 +1,13 @@
-"""List a run's deployable per-step RL checkpoints from its HF artifact repo."""
+"""List a run's deployable per-step RL checkpoints from its HF artifact repo.
+
+The GPU worker publishes each trainer save's LoRA adapter to a stable, NON-pruned path
+(``<adapter_prefix>/checkpoints/step-<N>/adapter``; see
+``flash.engine.worker.publish_deployable_checkpoint``). This module is the control-plane
+reader: it enumerates those snapshots so ``flash checkpoints`` can list them and
+``flash deploy --step N`` can serve a specific one — including for a run that was cancelled or
+failed mid-RL and so never sealed a final adapter. HF (not the backend DB) is the source of
+truth for what's deployable; backend persistence is a mirror (see
+``flash.server.checkpoints``)."""
 
 from __future__ import annotations
 
@@ -8,7 +17,8 @@ import re
 from flash.runner import adapter_prefix
 from flash.spec import JobSpec
 
-_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors", "adapter_model.bin"})
+# The PEFT weights file a step must carry (alongside adapter_config.json) to be servable.
+_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors"})
 
 
 def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:
@@ -48,6 +58,7 @@ def list_checkpoints(spec: JobSpec) -> list[dict]:
     except Exception as exc:  # listing is best-effort; never raise into a run/route
         print(f"[ckpt] list warn for {spec.run_id}: {exc}")
         return []
+    # Collect each step's adapter-folder filenames, then keep only steps with config + weights.
     by_step: dict[int, set[str]] = {}
     for path in files:
         match = pattern.search(path)

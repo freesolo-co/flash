@@ -83,7 +83,9 @@ def _opt_float(value: Any) -> float | None:
 class EnvironmentSpec:
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    # Filled client-side; empty means derive on server.
+    # Pip requirements the GPU worker needs for this environment; empty means "use defaults"
+    # (resolved via worker_pip_for_env in spec_payload / provider submit). An explicit
+    # [environment] pip is the escape hatch.
     pip: tuple[str, ...] = ()
     # Names only — values sent out-of-band via runtime_secrets, never stored in spec.
     secrets: tuple[str, ...] = ()
@@ -214,6 +216,9 @@ class JobSpec:
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),
+                # network_volume/network_volume_gb round-trip so the runner-assigned weight cache
+                # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
+                # _assign_managed_hf_repo before deploy.
                 network_volume=gpu.get("network_volume"),
                 network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
             ),

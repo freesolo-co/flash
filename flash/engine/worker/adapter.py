@@ -192,7 +192,7 @@ def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
         # Skip trainer state — for the per-step path src is a `checkpoint-<n>` dir carrying optimizer/
         # scheduler state that the deployable adapter must not duplicate.
         for name in os.listdir(src_adapter_dir):
-            if name in ("adapter_model.safetensors", "adapter_config.json", "adapter_model.bin"):
+            if name in ("adapter_model.safetensors", "adapter_config.json"):
                 continue
             if any(fnmatch.fnmatch(name, pat) for pat in _CHECKPOINT_TRAINER_STATE):
                 continue
