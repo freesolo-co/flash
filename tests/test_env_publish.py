@@ -578,3 +578,319 @@ def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypat
     assert (verify / "ns/env/publish-1/environment.py").read_text() == (
         "def load_environment(**k): pass\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# delete
+# ---------------------------------------------------------------------------
+
+
+def test_delete_package_user_can_delete_own_namespace(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    seen: dict[str, object] = {}
+
+    def fake_github_delete(slug, *, token):
+        seen.update(slug=slug, token=token)
+        return True
+
+    monkeypatch.setattr(envs, "_github_delete", fake_github_delete)
+    assert (
+        envs.delete_package(slug="dev-clado-ai/my-env", key={"email": "dev@clado.ai"}) is True
+    )
+    assert seen == {"slug": "dev-clado-ai/my-env", "token": "ghp-test"}
+
+
+def test_delete_package_rejects_other_users_namespace(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setattr(
+        envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
+    )
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.delete_package(slug="someone-else/env", key={"email": "dev@clado.ai"})
+    assert excinfo.value.status == 403
+
+
+def test_delete_package_internal_key_can_delete_any_namespace(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        envs, "_github_delete", lambda slug, *, token: seen.update(slug=slug) or True
+    )
+    assert (
+        envs.delete_package(slug="dev-clado-ai/paper-foo", key={"auth_kind": "internal"}) is True
+    )
+    assert seen["slug"] == "dev-clado-ai/paper-foo"
+
+
+def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch):
+    # The internal key bypasses the namespace-ownership check, so _validate_slug is the ONLY barrier
+    # before `git rm -r -- <namespace>/<name>`. A GENUINE repo-control top-level path (a dir at the
+    # root of the hub checkout) must be rejected so e.g. DELETE /v1/envs/.github/workflows can't
+    # remove tracked repo infrastructure. Only `.git`/`.github` qualify — `namespace_for` can never
+    # slugify an email to a dot-prefixed namespace, so these are never publishable.
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setattr(
+        envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
+    )
+    assert {".git", ".github"} == envs._REPO_CONTROL_TOP_LEVEL_PATHS
+    assert "source" not in envs._REPO_CONTROL_TOP_LEVEL_PATHS
+    for blocked in envs._REPO_CONTROL_TOP_LEVEL_PATHS:
+        with pytest.raises(envs.EnvPublishError, match="invalid env id segment"):
+            envs.delete_package(slug=f"{blocked}/workflows", key={"auth_kind": "internal"})
+
+
+def test_delete_package_allows_publishable_source_namespace(monkeypatch):
+    # Regression guard for publish/delete symmetry: `source` is in publish's package-CONTENT
+    # blocklist (_BLOCKED_TOP_LEVEL_PATHS via _safe_extract) but is a legitimate user NAMESPACE —
+    # `namespace_for` slugifies an email like `source@` to `source` and publish writes `source/<name>`
+    # without objection. Delete must therefore reach storage for `source/<name>` (not 400), or those
+    # envs would be publishable-but-undeletable.
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    seen: dict[str, str] = {}
+
+    def fake_delete(canonical, *, token):
+        seen["slug"] = canonical
+        return True
+
+    monkeypatch.setattr(envs, "_github_delete", fake_delete)
+    # A user key whose email normalizes to the `source` namespace deletes its OWN `source/<name>`.
+    source_key = {"email": "source@"}
+    assert envs.namespace_for(source_key) == "source"
+    assert "source" in envs._BLOCKED_TOP_LEVEL_PATHS  # still barred from package CONTENTS
+    assert envs.delete_package(slug="source/my-env", key=source_key) is True
+    assert seen["slug"] == "source/my-env"
+    # And the internal key (which may delete any namespace) reaches storage too.
+    assert envs.delete_package(slug="source/other", key={"auth_kind": "internal"}) is True
+    assert seen["slug"] == "source/other"
+
+
+def test_delete_package_validates_slug(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setattr(
+        envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
+    )
+    # incl. a VALID two-segment id with a trailing/leading slash (e.g. from a `:path` route capture)
+    # or surrounding/embedded whitespace (e.g. an encoded `ns/env%20` decoded to `ns/env `): each
+    # must be REJECTED, not silently normalized to ns/env (which would leak a non-canonical id that
+    # the response / metadata mirror would then carry while deletion targets the trimmed slug).
+    for bad in (
+        "noslash", "a/b/c", "ns/..", "../escape", "ns/", "/name", "ns/bad name", "ns/env/", "/ns/env",
+        "ns/env ", " ns/env", "ns/env\t", "ns /env", "  ns/env  ",
+    ):
+        with pytest.raises(envs.EnvPublishError):
+            envs.delete_package(slug=bad, key={"auth_kind": "internal"})
+
+
+def test_canonical_env_id_accepts_only_canonical_form():
+    assert envs.canonical_env_id("dev-clado-ai/my-env") == "dev-clado-ai/my-env"
+    for bad in ("ns/env/", " ns/env", "ns/env ", "ns/env%20", "Ns/Env", "noslash"):
+        with pytest.raises(envs.EnvPublishError):
+            envs.canonical_env_id(bad)
+
+
+def test_delete_package_requires_github_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.delete_package(slug="internal-freesolo-co/x", key={"auth_kind": "internal"})
+    assert excinfo.value.status == 503
+    assert "GITHUB_TOKEN" in str(excinfo.value)
+
+
+def test_github_delete_once_removes_dir_and_pushes(tmp_path, monkeypatch):
+    remote = tmp_path / "hub.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "--initial-branch", "main")
+    _git(seed, "config", "user.name", "test")
+    _git(seed, "config", "user.email", "test@example.com")
+    (seed / "README.md").write_text("hub\n")
+    env_dir = seed / "ns" / "env"
+    env_dir.mkdir(parents=True)
+    (env_dir / "environment.py").write_text("def load_environment(**k): pass\n")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-m", "seed")
+    _git(seed, "init", "--bare", str(remote))
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main")
+
+    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    removed = envs._github_delete_once(
+        repo="ignored/repo", token="tok", publish_root="ns/env", message="Delete test env"
+    )
+
+    assert removed is True
+    verify = tmp_path / "verify"
+    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
+    assert not (verify / "ns" / "env").exists()
+    # unrelated content is untouched
+    assert (verify / "README.md").read_text() == "hub\n"
+
+
+def test_github_delete_once_idempotent_when_absent(tmp_path, monkeypatch):
+    remote = tmp_path / "hub.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "--initial-branch", "main")
+    _git(seed, "config", "user.name", "test")
+    _git(seed, "config", "user.email", "test@example.com")
+    (seed / "README.md").write_text("hub\n")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-m", "seed")
+    _git(seed, "init", "--bare", str(remote))
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main")
+
+    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    removed = envs._github_delete_once(
+        repo="ignored/repo", token="tok", publish_root="ns/absent", message="Delete absent"
+    )
+    assert removed is False
+
+
+def test_staged_has_changes_maps_exit_codes(monkeypatch, tmp_path):
+    # 1 => staged changes, 0 => clean; any other code (e.g. 128 for a broken repo) is a controlled
+    # error, never a "go ahead and commit/push" signal, and a missing git binary is a 503.
+    def fake_run(returncode):
+        def _run(*_a, **_k):
+            return subprocess.CompletedProcess(["git"], returncode, "", "fatal: not a git repo")
+
+        return _run
+
+    monkeypatch.setattr(envs.subprocess, "run", fake_run(1))
+    assert envs._staged_has_changes(tmp_path) is True
+    monkeypatch.setattr(envs.subprocess, "run", fake_run(0))
+    assert envs._staged_has_changes(tmp_path) is False
+
+    monkeypatch.setattr(envs.subprocess, "run", fake_run(128))
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs._staged_has_changes(tmp_path)
+    assert excinfo.value.status == 502
+
+    def _missing(*_a, **_k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(envs.subprocess, "run", _missing)
+    with pytest.raises(envs.EnvPublishError) as exc_missing:
+        envs._staged_has_changes(tmp_path)
+    assert exc_missing.value.status == 503
+
+
+def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path, monkeypatch):
+    # A concurrent publish adds a NEW sidecar under the SAME slug after our checkout clones but
+    # before the push. The rebase only replays our original removal, so without re-running `git rm`
+    # the sidecar would survive and the slug would be only partially deleted while we report success.
+    remote = tmp_path / "hub.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "--initial-branch", "main")
+    _git(seed, "config", "user.name", "test")
+    _git(seed, "config", "user.email", "test@example.com")
+    (seed / "README.md").write_text("hub\n")
+    env_dir = seed / "ns" / "env"
+    env_dir.mkdir(parents=True)
+    (env_dir / "environment.py").write_text("def load_environment(**k): pass\n")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-m", "seed")
+    _git(seed, "init", "--bare", str(remote))
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main")
+
+    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+
+    # Inject the concurrent publish exactly once, right as the original delete commit is staged
+    # (the first `_staged_has_changes` call) — before `_push_environment_delete` rebases — by pushing
+    # a sidecar under ns/env through a separate clone.
+    real_staged = envs._staged_has_changes
+    state = {"injected": False}
+
+    def staged_with_injection(checkout):
+        result = real_staged(checkout)
+        if not state["injected"]:
+            state["injected"] = True
+            other = tmp_path / "other"
+            _git(tmp_path, "clone", "--branch", "main", str(remote), str(other))
+            _git(other, "config", "user.name", "other")
+            _git(other, "config", "user.email", "other@example.com")
+            (other / "ns" / "env" / "extra.py").write_text("# concurrently added sidecar\n")
+            _git(other, "add", "-A")
+            _git(other, "commit", "-m", "concurrent publish under same slug")
+            _git(other, "push", "origin", "main")
+        return result
+
+    monkeypatch.setattr(envs, "_staged_has_changes", staged_with_injection)
+
+    removed = envs._github_delete_once(
+        repo="ignored/repo", token="tok", publish_root="ns/env", message="Delete ns/env"
+    )
+    assert removed is True
+
+    verify = tmp_path / "verify"
+    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
+    # The slug directory is FULLY gone despite the concurrent re-add under it.
+    assert not (verify / "ns" / "env").exists()
+    assert (verify / "README.md").read_text() == "hub\n"
+
+
+def test_github_delete_retries_concurrent_push(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_delete_once(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise envs.EnvPublishError("failed to push some refs")
+        return True
+
+    monkeypatch.setattr(envs, "_github_delete_once", fake_delete_once)
+    monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
+    assert envs._github_delete("ns/env", token="tok") is True
+    assert calls["count"] == 2
+
+
+def test_record_deleted_environment_sends_delete(monkeypatch):
+    from flash.server import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["method"] = req.get_method()
+        seen["headers"] = dict(req.header_items())
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
+
+    ok = environment_registry.record_deleted_environment(
+        slug="dev-clado-ai/my-env",
+        key={"org_id": "org-1"},
+    )
+
+    assert ok is True
+    assert seen["url"] == "https://backend.test/api/flash/environments/internal"
+    assert seen["method"] == "DELETE"
+    assert seen["headers"]["Authorization"] == "Bearer internal-test"
+    assert json.loads(seen["body"]) == {"orgId": "org-1", "slug": "dev-clado-ai/my-env"}
+
+
+def test_record_deleted_environment_is_best_effort(monkeypatch):
+    from flash.server import environment_registry
+
+    monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
+    assert (
+        environment_registry.record_deleted_environment(
+            slug="dev-clado-ai/my-env",
+            key={"org_id": "org-1"},
+        )
+        is False
+    )

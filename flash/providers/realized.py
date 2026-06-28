@@ -26,7 +26,7 @@ def realized_cost_for_remote(
     """
     if not remote:
         return None
-    provider = remote.get("provider") or "runpod"
+    provider = remote.get("provider")
     if provider == "runpod":
         from flash.providers.runpod.cost import realized_cost as runpod_realized
 

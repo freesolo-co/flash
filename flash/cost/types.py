@@ -17,9 +17,8 @@ class RunConfig:
     method: str  # "sft" | "grpo"
     steps: int
 
-    # Multi-seed runs reprovision (and re-pay boot) per seed.
-    setup_repeats: int = 1
-
+    # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
+    # GRPO default mirrors the worker's max(1024, max_prompt_len + completion); see normalized().
     seq_len: int | None = None
     completion_len: int | None = None  # GRPO only (max_tokens)
     batch_size: int | None = None  # SFT effective batch / GRPO prompts_per_step
@@ -29,26 +28,23 @@ class RunConfig:
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
 
-    max_wall_seconds: int | None = None  # per-seed wall cap (spec gpu.max_wall_seconds); None = 24h
+    max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
     environment: str | None = None  # Freesolo environment id; descriptive only
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
+        # Normalize like the allocator (case/whitespace, empty -> "auto") and reject an unknown
+        # substrate up front (else it filters out every candidate -> confusing "no GPU fits").
         prov = (self.provider or "auto").strip().lower() or "auto"
         if prov not in ("auto", *PROVIDER_NAMES):
             raise ValueError(f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})")
         object.__setattr__(self, "provider", prov)
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
-        if self.setup_repeats < 1:
-            raise ValueError(f"setup_repeats must be >= 1, got {self.setup_repeats}")
-        # Steps split evenly across seeds; fractional split is impossible in a real run.
-        if self.steps % self.setup_repeats != 0:
-            raise ValueError(
-                f"steps ({self.steps}) must be a multiple of setup_repeats ({self.setup_repeats})"
-            )
-        # max_wall_seconds is intentionally absent: estimate_cost floors it to 60s like the runner.
+        # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
+        # runner floors it to max(60, ...) and estimate_cost mirrors that, so a non-positive cap
+        # is accepted (floored to 60s), not rejected.
         for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank"):
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
@@ -69,7 +65,8 @@ class RunConfig:
                     if self.thinking
                     else RECIPE.rl.max_completion_len
                 )
-            # Mirror allocator: max(1024, prompt+completion), not bare prompt (would under-size).
+            # Explicit pin wins; else mirror the allocator's GRPO sizing of an unset max_length:
+            # max(1024, max_prompt_len + completion), not bare max_prompt_len (which under-sizes).
             seq = (
                 self.seq_len
                 if self.seq_len is not None
@@ -87,8 +84,9 @@ class RunConfig:
         return replace(self, seq_len=seq, completion_len=comp, batch_size=batch, group_size=group, lora_rank=lora)
 
     def train_knobs(self) -> dict[str, int]:
-        """Knob dict for ``model_required_vram_gb``. Omitted SFT batch_size is NOT forwarded — it
-        would use recipe effective batch (32) instead of the worker micro-batch (4), over-provisioning."""
+        """The knob dict ``model_required_vram_gb`` consumes. Only an EXPLICIT batch_size is
+        forwarded -- an omitted SFT batch sizes as the worker's micro-batch (4), not the recipe's
+        effective batch (32), which would over-provision."""
         n = self.normalized()
         knobs: dict[str, int] = {"lora_rank": n.lora_rank}
         if self.batch_size is not None:

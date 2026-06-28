@@ -1,4 +1,4 @@
-"""Run-execution machinery: the submit -> seed-loop -> per-seed supervised job -> GC flow.
+"""Run-execution machinery: the submit -> supervised training job -> GC flow.
 
 Sibling helpers are imported function-locally to avoid the flash.runner.__init__ import cycle
 and to keep monkeypatches reachable (``monkeypatch.setattr(runner, ...)`` vs a static copy).

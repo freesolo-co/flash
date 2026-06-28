@@ -45,7 +45,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.envpush import cmd_env_push
+from flash.cli.envpush import cmd_env_delete, cmd_env_push
 
 logger = get_logger("flash.cli")
 
@@ -139,7 +139,9 @@ class _ThemedParser(argparse.ArgumentParser):
         # then a dimmed pointer at this parser's own --help instead of the raw usage block. An
         # "invalid choice" becomes a short "did you mean" suggestion (see _friendly_message).
         print(render.error(_friendly_message(message)), file=sys.stderr)
-        print(render.usage_hint(self.prog), file=sys.stderr)
+        # dimmed pointer at THIS parser's own --help (argparse sets prog per parser: `flash --help`
+        # for the root, `flash <cmd> --help` for a subcommand) instead of the raw usage block.
+        print(render.arrow(f"run `{self.prog} --help` for usage"), file=sys.stderr)
         self.exit(2)  # keep argparse's usage-error exit code
 
 
@@ -237,6 +239,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
+
+    env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")
+    env_delete.add_argument("env_id", help="the Freesolo environment id to delete, e.g. you/your-env")
+    env_delete.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt",
+    )
+    env_delete.set_defaults(func=cmd_env_delete)
 
     train = sub.add_parser("train", help="submit a managed training run from a TOML config")
     train.add_argument("config")
