@@ -511,7 +511,12 @@ def _run_training(
     # work for an already-terminal run. _RunCancelled is the terminal signal; callers swallow it.
     if get_status(spec.run_id).state in TERMINAL_STATES:
         raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting")
-    _update(spec.run_id, "running")
+    # The pre-check above closes most of the window, but a concurrent flip can still land between
+    # it and this transition. _update is a compare-and-set: it returns False when the run is already
+    # terminal and leaves the state untouched. Gate the PAID supervised submit on that result so a
+    # run cancelled in this last instant is never resumed onto a GPU.
+    if not _update(spec.run_id, "running"):
+        raise _RunCancelled(f"run {spec.run_id} went terminal before submit; not submitting")
     print(
         f"starting phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
         file=log,
