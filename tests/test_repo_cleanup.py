@@ -372,7 +372,11 @@ def test_sweep_holds_deploy_lock_across_delete(monkeypatch):
     class _CheckApi(FakeApi):
         def delete_repo(self, repo_id=None, repo_type=None, missing_ok=None):
             # A non-blocking acquire from outside must FAIL (return False) while the GC holds it.
-            seen["held_during_delete"] = _locks._deploy_lock("held").acquire(blocking=False) is False
+            lk = _locks._deploy_lock("held")
+            acquired = lk.acquire(blocking=False)
+            seen["held_during_delete"] = not acquired
+            if acquired:
+                lk.release()
             super().delete_repo(repo_id=repo_id, repo_type=repo_type, missing_ok=missing_ok)
 
     api = _CheckApi([_DS(rid, _days_ago(45))])
