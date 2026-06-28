@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import random
 import time
@@ -77,12 +78,16 @@ def run_rl():
     _kl_beta = float(gcfg.get("kl_penalty_coef") or 0.0)
     _adv_clip = float(gcfg.get("advantage_clip") or 0.0)
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
-    sleep_mode, _grpo_ctx, _card_vram_gb = resolve_grpo_sleep_mode()
+    sleep_mode, _grpo_ctx, _card_vram_gb, _fp8_kv = resolve_grpo_sleep_mode()
     print(
         f"[rl] vLLM sleep mode = {sleep_mode} "
         f"(model={model_id}, ctx={_grpo_ctx}, card={_card_vram_gb:.0f}GB)"
     )
     use_vllm = True
+    # vLLM colocate LLM overrides actually applied (recorded in train_meta for observability — the
+    # console is only uploaded on failure, so a SUCCESSFUL run otherwise can't confirm fp8 KV engaged).
+    _kv_dtype = None
+    _mnbt = None
     print("[rl] rollout backend: colocated vLLM")
     from flash.catalog import MODELS as _CATALOG
 
@@ -256,12 +261,66 @@ def run_rl():
     # Multi-turn accumulates a full transcript up to the engine context, so size the fp32 logits
     # cap against the worst-case (engine context), not the per-turn _max_completion, or it OOMs.
     _cap_completion_len = vllm_max_len if is_multi_turn else _max_completion
+    # num_iterations / KL decide whether the trainer runs EXTRA unfused logprob forwards beyond the
+    # Liger-fused loss: num_iterations>1 caches old_per_token_logps via a separate full-logits forward,
+    # and kl_penalty_coef>0 adds a ref_per_token_logps forward. Liger fuses only the LOSS, so those
+    # passes still materialize [pd, completion, vocab] logits and the 6 GB logits cap must bind for
+    # them. So the fused loss is the SOLE logits pass (cap safe to drop) only when the RESOLVED mu == 1
+    # (no old_per_token_logps forward) AND KL is off. The full GRPOConfig field set is feature-
+    # detected ONCE here at function scope (not inside the vLLM-only block below) because the TIS
+    # rollout-correction knobs read it unconditionally -- they run even when use_vllm is False, so a
+    # vLLM-gated definition would NameError on the CPU/non-vLLM path. getattr(__dataclass_fields__)
+    # is safe on any class (-> empty set on a non-dataclass TRL, so num_iterations stays 1 and every
+    # feature-gated kwarg is simply skipped).
+    _grpo_fields = set(getattr(GRPOConfig, "__dataclass_fields__", {}))
+    _grpo_has_num_iter = "num_iterations" in _grpo_fields
+    # mu (num_iterations) is fixed at 2 when the field exists (the standard GRPO config -- reuse each
+    # rollout for 2 optimizer steps; set at the canonical block below). So mu==1 only when the field is
+    # ABSENT (old / non-dataclass TRL -> implicit 1): that is the one case the Liger-fused loss can be
+    # the sole logits pass, so the cap-drop keys off field existence.
+    _mu_one = not _grpo_has_num_iter
+    # ...but TRL's COLOCATED-vLLM path ALSO runs a separate old_per_token_logps forward for its
+    # importance-sampling (TIS) correction whenever vllm_importance_sampling_correction is enabled —
+    # TRL's DEFAULT, which we only tune (mode/clip, below) and never disable — even at mu==1. That
+    # unfused [pd, completion, vocab] forward materializes full logits the 6 GB cap must still bound
+    # (else a long-completion / multi-turn run sized to a larger per-device batch OOMs in it). Detect
+    # whether it runs: prefer the explicit correction field's DECLARED DEFAULT (we never set it in
+    # grpo_kwargs, so the default IS the effective value); fall back to the presence of the TIS
+    # mode/clip fields (older TRL where the correction is implicitly on for the vLLM path). Only the
+    # vLLM rollout path runs this forward, so gate on use_vllm too.
+    _corr_field = getattr(GRPOConfig, "__dataclass_fields__", {}).get(
+        "vllm_importance_sampling_correction"
+    )
+    if _corr_field is not None and _corr_field.default is not dataclasses.MISSING:
+        _tis_correction_on = bool(_corr_field.default)
+    else:
+        _tis_correction_on = any(
+            f in _grpo_fields
+            for f in (
+                "vllm_importance_sampling_mode",
+                "vllm_importance_sampling_clip_max",
+                "vllm_importance_sampling_cap",
+            )
+        )
+    _vllm_is_logprob_forward = use_vllm and _tis_correction_on
     per_device_comps = _w.rl_per_device_comps(
         _cap_completion_len,
         vocab=vocab_size_for(model_id),
         use_vllm=use_vllm,
         params_b=_params_b,
+        active_params_b=(float(getattr(_info, "active_params_b", 0.0) or 0.0) or None),
         seq_len=vllm_max_len,
+        # The 6 GB logits cap is droppable only when the Liger-fused loss is the SOLE logits-
+        # materializing pass: liger fuses the LOSS, but num_iterations>1 (old_per_token_logps), kl>0
+        # (ref_per_token_logps), AND TRL's vLLM TIS correction (a per-step old_per_token_logps forward,
+        # on by default even at mu==1) each add an unfused full-logits forward the cap must still bound
+        # (else a long multi-turn transcript OOMs that forward at pd>1). mu is fixed at 2 (>1) whenever
+        # the field exists, so _mu_one is only True on an old TRL with no num_iterations field; combined
+        # with _vllm_is_logprob_forward (TIS on by default), the cap is in practice always kept on the
+        # colocated-vLLM path. liger_on (True) is also False off-GPU/without the liger wheel -> cap stays.
+        fused_logits=(
+            liger_on(True) and _mu_one and _kl_beta == 0 and not _vllm_is_logprob_forward
+        ),
     )
     if is_multi_turn and _cap_completion_len != _max_completion:
         print(
@@ -269,6 +328,30 @@ def run_rl():
             f"{_cap_completion_len} (engine context), not the per-turn budget {_max_completion}"
         )
     batching = _w.compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
+    # A FORCED per_device (FLASH_RL_PER_DEVICE_COMPS) can differ from the value TRL actually runs for
+    # TWO distinct reasons in compute_grpo_batching, and an MFU sweep that logs/probes a per_device it
+    # never ran needs to know WHICH: (1) overshoot -- a forced value ABOVE the per-step completion
+    # batch (prompts_per_step*group_size) is clamped DOWN to it via min(); (2) non-divisibility -- a
+    # forced value at/below the target that doesn't divide it is shrunk to the largest divisor <= it.
+    if os.environ.get("FLASH_RL_PER_DEVICE_COMPS", "").strip():
+        _used_pd = batching["per_device_train_batch_size"]
+        if _used_pd != per_device_comps:
+            _target = prompts_per_step * group_size
+            if per_device_comps > _target:
+                _why = (
+                    f"exceeds the per-step completion batch "
+                    f"(prompts_per_step*group_size={_target}) and was clamped down to it"
+                )
+            else:
+                _why = (
+                    f"does not divide prompts_per_step*group_size={_target} and was shrunk to the "
+                    f"largest divisor <= it"
+                )
+            print(
+                f"WARN: forced FLASH_RL_PER_DEVICE_COMPS={per_device_comps} {_why}; TRL will run "
+                f"per_device={_used_pd}. Pick a per_device that divides {_target} (and is <= it) "
+                f"to probe the exact value."
+            )
     if not batching["divisible_by_group"]:
         print(
             "WARN: generation batch not divisible by group size; check prompts_per_step/group_size"
@@ -349,6 +432,7 @@ def run_rl():
                 sleep_mode,
                 num_generations=group_size,
                 active_params_b=_active_b,
+                fp8_kv=_fp8_kv,
             )
         except Exception:
             _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10
@@ -358,9 +442,6 @@ def run_rl():
             vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
             vllm_enable_sleep_mode=sleep_mode,
         )
-        # Apply each knob only if this TRL exposes the field, so an older TRL never crashes.
-        _grpo_fields = set(getattr(GRPOConfig, "__dataclass_fields__", {}))
-
         def _set_vllm_field(names, value, label):
             for _f in names:
                 if _f in _grpo_fields:
@@ -369,16 +450,19 @@ def run_rl():
                     return True
             return False
 
-        # fp8 KV cache only where silicon has native fp8 (cc >= 8.9: Ada/Hopper/Blackwell).
         try:
             import torch as _torch
 
-            _want_fp8 = _torch.cuda.get_device_capability() >= (8, 9)
+            _cc = _torch.cuda.get_device_capability()
+            _card_gb = _torch.cuda.get_device_properties(0).total_memory / 1e9
         except Exception:
-            _want_fp8 = False
-        if _want_fp8:
-            _set_vllm_field(("vllm_kv_cache_dtype", "kv_cache_dtype"), "fp8", "fp8 KV cache")
-        # Prefix caching reuses the shared GRPO prompt KV; chunked prefill avoids long-prompt stalls.
+            _cc, _card_gb = (0, 0), 0.0
+        _kv_dtype = "fp8" if _cc >= (8, 9) else None
+        _mnbt = max(8192, vllm_max_len) if _card_gb >= 140 else None
+        if _kv_dtype or _mnbt:
+            _w.patch_trl_colocate_llm_kwargs(
+                kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt
+            )
         _set_vllm_field(
             ("vllm_enable_prefix_caching", "enable_prefix_caching"),
             True,
@@ -404,11 +488,25 @@ def run_rl():
                     "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
                     "crash workaround; update vLLM to a TRL-supported version to re-enable)"
                 )
-                # vLLM 0.19.1 also hits "aot_compile is not supported" on some arches; force eager
-                # execution to prevent the AOT path. Don't override an operator-set value.
-                if "VLLM_TORCH_COMPILE_LEVEL" not in os.environ:
-                    os.environ["VLLM_TORCH_COMPILE_LEVEL"] = "0"
-                    print("[rl][warn] VLLM_TORCH_COMPILE_LEVEL=0 (prevent aot_compile on vLLM 0.19.1)")
+                try:
+                    import torch as _t_cc
+
+                    _cc = _t_cc.cuda.get_device_capability()
+                except Exception:
+                    _cc = (0, 0)
+                _is_b200 = _cc == (10, 0)  # sm100, the only arch validated for cudagraphs here
+                if not _is_b200:
+                    _w.patch_trl_colocate_llm_kwargs(enforce_eager=True)
+                    print(
+                        f"[rl][warn] enforce_eager=True on the colocate rollout (cc={_cc[0]}.{_cc[1]} "
+                        "-> prevent 0.19.1 aot_compile/slot-mapping crash; the removed "
+                        "VLLM_TORCH_COMPILE_LEVEL env no longer applies on this vLLM)"
+                    )
+                else:
+                    print(
+                        f"[rl] cc={_cc[0]}.{_cc[1]} (B200/sm100): keeping vLLM CUDA graphs for the "
+                        "rollout (validated; MoE-decode speedup)"
+                    )
         except Exception:
             pass
         if _cudagraph_safe:
@@ -435,14 +533,7 @@ def run_rl():
     # TRL has no advantage-value clip knob (it clips the importance ratio); just note the request.
     if _adv_clip > 0:
         print(f"[rl] advantage_clip={_adv_clip} recorded; TRL centers advantages (no value clip)")
-    # num_iterations=2 reuses each rollout batch for 2 optimizer steps (~1.38x); feature-detected.
-    import dataclasses as _dc
-
-    try:
-        _grpo_fields = {f.name for f in _dc.fields(GRPOConfig)}
-    except TypeError:
-        _grpo_fields = set()
-    if "num_iterations" in _grpo_fields:
+    if _grpo_has_num_iter:
         grpo_kwargs["num_iterations"] = 2
         print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
     # Truncated importance sampling: adopt the verl recipe (token-level, c_max=2.0) over TRL's
@@ -642,6 +733,10 @@ def run_rl():
             "download_seconds": download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
+            # vLLM colocate-rollout overrides actually applied (the trl-LLM monkeypatch): confirms
+            # fp8 KV / the raised prefill batch engaged on a SUCCESSFUL run, without the console.
+            "vllm_kv_cache_dtype": _kv_dtype,
+            "vllm_max_num_batched_tokens": _mnbt,
             "loss_curve": _metric_curve(trainer, "loss"),
             # peak_gpu_gb = torch-allocated; device_peak_gpu_gb = true device footprint (incl. vLLM).
             "peak_gpu_gb": rl_peak_gpu_gb,

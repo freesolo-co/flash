@@ -464,3 +464,76 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
         "full reply"
     ]
+
+
+# ---- list_deployed_adapters: the operator-GC keep-set must fail closed -------------------------
+
+def _patch_get(monkeypatch, resp):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    monkeypatch.setattr(d.httpx, "get", lambda *a, **k: resp)
+    return d
+
+
+class _GetResp:
+    def __init__(self, payload, *, raises=None):
+        self._payload = payload
+        self._raises = raises
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        if self._raises is not None:
+            raise self._raises
+        return self._payload
+
+
+def test_list_deployed_adapters_accepts_bare_list(monkeypatch):
+    d = _patch_get(monkeypatch, _GetResp([{"repoId": "org/a"}, {"repoId": "org/b"}]))
+    assert d.list_deployed_adapters() == [{"repoId": "org/a"}, {"repoId": "org/b"}]
+
+
+def test_list_deployed_adapters_accepts_envelope(monkeypatch):
+    d = _patch_get(monkeypatch, _GetResp({"adapters": [{"repoId": "org/a"}]}))
+    assert d.list_deployed_adapters() == [{"repoId": "org/a"}]
+    d = _patch_get(monkeypatch, _GetResp({"data": [{"repoId": "org/c"}]}))
+    assert d.list_deployed_adapters() == [{"repoId": "org/c"}]
+
+
+def test_list_deployed_adapters_empty_list_is_genuinely_empty(monkeypatch):
+    # A real "nothing deployed" answer must return [], NOT raise.
+    d = _patch_get(monkeypatch, _GetResp([]))
+    assert d.list_deployed_adapters() == []
+    d = _patch_get(monkeypatch, _GetResp({"adapters": []}))
+    assert d.list_deployed_adapters() == []
+
+
+def test_list_deployed_adapters_raises_on_non_json(monkeypatch):
+    # A 200 with an undecodable body must NOT degrade to "nothing deployed".
+    d = _patch_get(monkeypatch, _GetResp(None, raises=ValueError("bad json")))
+    with pytest.raises(d.ServingError):
+        d.list_deployed_adapters()
+
+
+def test_list_deployed_adapters_raises_on_unrecognized_envelope(monkeypatch):
+    # An unknown dict shape would otherwise coerce to [] and green-light deleting live repos.
+    d = _patch_get(monkeypatch, _GetResp({"unexpected": "shape"}))
+    with pytest.raises(d.ServingError):
+        d.list_deployed_adapters()
+
+
+def test_list_deployed_adapters_raises_on_non_list_body(monkeypatch):
+    d = _patch_get(monkeypatch, _GetResp("a string, somehow"))
+    with pytest.raises(d.ServingError):
+        d.list_deployed_adapters()
+
+
+def test_list_deployed_adapters_raises_on_non_dict_item(monkeypatch):
+    # A list containing non-record items (strings/None) must fail closed, not be filtered to a
+    # smaller/empty keep-set that could green-light deleting live repos.
+    d = _patch_get(monkeypatch, _GetResp([{"repoId": "org/a"}, "not-a-record"]))
+    with pytest.raises(d.ServingError):
+        d.list_deployed_adapters()

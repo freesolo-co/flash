@@ -119,7 +119,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
+                    f"run {run_id} has no [train].hf_repo; its adapter artifacts "
                     "cannot be located, so it cannot be deployed"
                 ),
             )
@@ -187,54 +187,54 @@ def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
 def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
     """Copy a run's trained adapter into a user-owned HuggingFace repo."""
     payload = payload or {}
-    repository = str(payload.get("repository") or "").strip()
-    if not repository:
-        raise HTTPException(
-            status_code=400,
-            detail="repository is required: the destination HuggingFace repo 'owner/name'",
-        )
-    if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
-        raise HTTPException(
-            status_code=400,
-            detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
-        )
-    repository = "/".join(parts)
-    _validate_hf_repo_id(repository)
-    hf_token = str(payload.get("hf_token") or "").strip()
-    if not hf_token:
-        raise HTTPException(
-            status_code=400,
-            detail="hf_token is required: a HuggingFace token with write access to the destination repo",
-        )
-    # _require_bool: reject non-bool like "false" that would silently flip visibility.
-    private = _require_bool(payload, "private", True)
+    with _app._deploy_lock(run_id):
+        repository = str(payload.get("repository") or "").strip()
+        if not repository:
+            raise HTTPException(
+                status_code=400,
+                detail="repository is required: the destination HuggingFace repo 'owner/name'",
+            )
+        if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
+            raise HTTPException(
+                status_code=400,
+                detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
+            )
+        repository = "/".join(parts)
+        _validate_hf_repo_id(repository)
+        hf_token = str(payload.get("hf_token") or "").strip()
+        if not hf_token:
+            raise HTTPException(
+                status_code=400,
+                detail="hf_token is required: a HuggingFace token with write access to the destination repo",
+            )
+        private = _require_bool(payload, "private", True)
 
-    status = owned_run(run_id, key)
-    spec = JobSpec.from_dict(status.spec)
-    if not spec.train.hf_repo:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
-                "cannot be located, so it cannot be exported"
-            ),
+        status = owned_run(run_id, key)
+        spec = JobSpec.from_dict(status.spec)
+        if not spec.train.hf_repo:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run_id} has no [train].hf_repo; its adapter artifacts "
+                    "cannot be located, so it cannot be exported"
+                ),
+            )
+        checkpoint_step, is_checkpoint, prefix = _resolve_deployable_target(
+            run_id, spec, status, payload.get("step"), action="export", enforce_state=True
         )
-    checkpoint_step, is_checkpoint, prefix = _resolve_deployable_target(
-        run_id, spec, status, payload.get("step"), action="export", enforce_state=True
-    )
-    subfolder = f"{prefix}/adapter"
-    try:
-        url = _app.export_adapter(
-            source_repo=spec.train.hf_repo,
-            source_subfolder=subfolder,
-            dest_repo=repository,
-            dest_token=hf_token,
-            private=private,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ServingError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        subfolder = f"{prefix}/adapter"
+        try:
+            url = _app.export_adapter(
+                source_repo=spec.train.hf_repo,
+                source_subfolder=subfolder,
+                dest_repo=repository,
+                dest_token=hf_token,
+                private=private,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ServingError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
     result = {
         "run_id": run_id,
         "adapter_id": run_id,
@@ -286,7 +286,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     if not spec.train.hf_repo:
         raise HTTPException(
             status_code=409,
-            detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
+            detail=f"run {run_id} has no [train].hf_repo; its adapter cannot be served",
         )
     # Parse sampling params before the broad try so bad values are 400, not 502.
     try:

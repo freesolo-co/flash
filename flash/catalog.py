@@ -50,6 +50,14 @@ class ModelInfo:
     grpo_min_vram_gb: int = 0
     # 0 => SFT sizes from param-based estimate; set only when a model must not down-route to the cheapest card.
     sft_min_vram_gb: int = 0
+    # vLLM sleep mode (offload the colocate rollout engine between GRPO steps) is NON-FUNCTIONAL for
+    # this model: the wake/reload HANGS the rollout (a ~70 GB weight reallocation can't be placed in
+    # the fragmented non-expandable allocator sleep forces -- live-confirmed on the 35B-A3B, every
+    # attempt stalled). So this model is RESIDENT-ONLY: a config that doesn't fit resident must be
+    # REJECTED (model_required_vram_gb sizes it on the resident peak) rather than routed to the hanging
+    # sleep path. grpo_sleep_mode raises for it instead of ever returning True. Dense/small models that
+    # sleep cleanly leave this False.
+    sleep_unsupported: bool = False
     notes: str = ""
     # 0 = platform default (64 GB) suffices. Runner raises gpu.disk_gb to at least this.
     min_disk_gb: int = 0
@@ -61,6 +69,14 @@ class ModelInfo:
     # this (a token exercises only the active params), while VRAM/disk/download keep using the total
     # ``params_b``. 0.0 (the dense default) means "same as params_b" — every token hits every param.
     active_params_b: float = 0.0
+    # Transformer geometry (decoder layers x hidden width) — the SFT gradient-checkpointing-OFF gate
+    # sizes the no-recompute activation peak from these (engine.vram.sft_gc_off_peak_gb). 0/0 (the
+    # default) means "unknown": the worker falls back to reading the HF config at runtime, and the
+    # GC-off gate stays conservative (keeps GC on) if neither is available. Curated for the MoE whose
+    # SFT runs the gate — a live B200 SFT showed the runtime AutoConfig probe returning (0, 0) on the
+    # multimodal-nested config, so the curated values are what actually engage the gate.
+    num_layers: int = 0
+    hidden_size: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -141,6 +157,10 @@ MODELS: dict[str, ModelInfo] = {
         # 35.0 not 35.95: the marketing figure tips the SFT equation over the B200 budget (see test_sft_equation_covers_honest_peak_across_seq_boundary).
         params_b=35.0,
         active_params_b=3.0,
+        # Geometry for the SFT GC-off activation estimate (config.json text_config): 40 decoder
+        # layers x 2048 hidden (hybrid GatedDeltaNet + full-attention, 256 experts / 8 active).
+        num_layers=40,
+        hidden_size=2048,
         vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=141,
@@ -148,6 +168,10 @@ MODELS: dict[str, ModelInfo] = {
         sft_min_vram_gb=100,
         # Floor also engages grpo_seq_escalation_gb: long (>16k) rollouts are rejected at parse time instead of OOMing in vLLM.
         grpo_min_vram_gb=180,
+        # vLLM sleep mode HANGS the 35B colocate rollout (wake/reload stalls — live-confirmed, every
+        # attempt). So GRPO is RESIDENT-ONLY: model_required_vram_gb sizes on the resident peak and a
+        # config too long to fit resident is REJECTED at parse time (not routed to the hanging sleep).
+        sleep_unsupported=True,
         quant="bf16",
         recommended_gpu="H200",
         thinking="hybrid",

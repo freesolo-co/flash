@@ -14,6 +14,42 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def test_touch_warmstart_source_bumps_only_managed_source(monkeypatch):
+    # The repo GC's age gate is age-reset for a warm-start SOURCE repo by writing a reference marker
+    # into it (cross-plane-safe). Only managed Freesolo-Co/flashrun-* sources are touched.
+    import huggingface_hub
+
+    from flash.runner import lifecycle
+    from flash.spec import JobSpec
+
+    calls = []
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def upload_file(self, **kw):
+            calls.append(kw)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    def _spec(run_id, ref):
+        return JobSpec.from_dict(
+            {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": run_id, "train": {"init_from_adapter": ref}}
+        )
+
+    lifecycle._touch_warmstart_source(_spec("flash-grpo-1", "Freesolo-Co/flashrun-sft0:sft/sft0"))
+    assert len(calls) == 1
+    assert calls[0]["repo_id"] == "Freesolo-Co/flashrun-sft0"
+    assert calls[0]["path_in_repo"] == "referenced_by/flash-grpo-1"
+    assert calls[0]["repo_type"] == "dataset"
+
+    calls.clear()
+    lifecycle._touch_warmstart_source(_spec("flash-grpo-2", "someuser/somerepo:sft/x"))  # user ref
+    lifecycle._touch_warmstart_source(_spec("flash-grpo-3", ""))  # no warm-start
+    assert calls == []
+
+
 def test_job_handle_roundtrip():
     from flash.providers.runpod.jobs import JobHandle
 
@@ -23,8 +59,6 @@ def test_job_handle_roundtrip():
     h2 = JobHandle("ep123", "flash-5090-abc", "job456", 2)
     assert h2.to_dict()["attempt"] == 2
     assert JobHandle.from_dict(h2.to_dict()) == h2
-    # An old handle dict persisted before the attempt field defaults to 0.
-    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).attempt == 0
 
 
 def test_decode_output_success():
@@ -432,19 +466,25 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         train=TrainSpec(steps=1, hf_repo=""),
         gpu=GpuSpec(type="A100"),
     )
-    base = {"provider": "runpod", "endpoint_id": "ep", "endpoint_name": "n", "job_id": "j"}
+    base = {
+        "provider": "runpod",
+        "endpoint_id": "ep",
+        "endpoint_name": "n",
+        "job_id": "j",
+        "attempt": 0,
+    }
 
     # on_last_gpu=True persisted -> the longer (~15 min) capacity grace is reproduced.
     PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, 0)
     assert captured["queue_grace_s"] == 900.0
     assert captured["throttled_grace_s"] == 900.0
 
-    # on_last_gpu=False (and a legacy handle with the key ABSENT) -> the default non-last grace.
+    # on_last_gpu=False or absent -> the default non-last grace.
     captured.clear()
     PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, 0)
     assert captured["queue_grace_s"] == 300.0
     captured.clear()
-    PROVIDER.poll(JobHandle.from_dict(base), spec, 0)  # pre-persist handle: defaults to False
+    PROVIDER.poll(JobHandle.from_dict(base), spec, 0)
     assert captured["queue_grace_s"] == 300.0
 
 
@@ -601,11 +641,7 @@ def test_poll_job_ignores_prior_attempt_heartbeat_keeps_setup_grace(monkeypatch)
     assert "limit 5000s" in res.detail
 
 
-def test_reattach_legacy_handle_passes_current_attempt_none(monkeypatch):
-    # A handle persisted before the attempt field has no "attempt" key. Reattach must pass
-    # current_attempt=None (keep poll_job's relative logic); coercing to 0 would treat a live
-    # worker's attempt>=1 heartbeats as foreign and false-stall a healthy run. A round-3 handle
-    # carries the int and gates on it.
+def test_reattach_passes_persisted_current_attempt(monkeypatch):
     import types
 
     from flash.providers import base
@@ -621,22 +657,12 @@ def test_reattach_legacy_handle_passes_current_attempt_none(monkeypatch):
     monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
     spec = types.SimpleNamespace(phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None))
 
-    legacy = base.JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j"})
-    RunpodProvider().poll(legacy, spec, 0)
-    assert captured["current_attempt"] is None
-
-    fresh = base.JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j", "attempt": 2})
-    RunpodProvider().poll(fresh, spec, 0)
+    handle = base.JobHandle(
+        provider="runpod",
+        data={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "attempt": 2},
+    )
+    RunpodProvider().poll(handle, spec, 0)
     assert captured["current_attempt"] == 2
-
-    # A corrupt/legacy non-int attempt ("" or other junk) must coerce to None via _attempt_int, NOT
-    # crash attach with ValueError (a bare int("") would). Mirrors the poller's heartbeat handling.
-    for junk in ("", "x", None):
-        corrupt = base.JobHandle(
-            provider="runpod", data={"endpoint_id": "ep", "job_id": "j", "attempt": junk}
-        )
-        RunpodProvider().poll(corrupt, spec, 0)
-        assert captured["current_attempt"] is None, junk
 
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
@@ -1131,7 +1157,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}", "attempt": attempt})
             if calls["n"] == 1:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1163,7 +1189,7 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             orch._update(spec.run_id, "cancelled")  # cancel lands during provisioning
             if on_handle:  # endpoint comes up anyway; its "running" write is rejected (terminal)
-                on_handle({"endpoint_id": "epWALK", "endpoint_name": "n", "job_id": "jW"})
+                on_handle({"endpoint_id": "epWALK", "endpoint_name": "n", "job_id": "jW", "attempt": attempt})
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
@@ -1189,7 +1215,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}", "attempt": attempt})
             if calls["n"] == 1:
                 return jobs.PollResult(False, failure="job_preempted", detail="[CANCELLED] None")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1297,7 +1323,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1397,7 +1423,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1449,7 +1475,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
             last_flags.append(on_last_gpu)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1503,7 +1529,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
@@ -1537,12 +1563,13 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
             run_id="walked",
             state="running",
             spec=_spec("walked").to_dict(),  # provisional spec.gpu.type == "RTX 4090"
-            remote={
-                "endpoint_id": "epW",
-                "endpoint_name": "n",
-                "job_id": "jW",
-                "allocated_gpu": "RTX 5090",
-            },
+                remote={
+                    "endpoint_id": "epW",
+                    "endpoint_name": "n",
+                    "job_id": "jW",
+                    "attempt": 0,
+                    "allocated_gpu": "RTX 5090",
+                },
         )
         orch._save_status(status)
         # Worker output carries wall time but neither cost nor allocated_gpu (the in-process
@@ -1575,7 +1602,7 @@ def test_cancel_uses_rest_handle(monkeypatch):
             run_id="c1",
             state="running",
             spec=_spec("c1").to_dict(),
-            remote={"endpoint_id": "epX", "endpoint_name": "n", "job_id": "jX"},
+            remote={"endpoint_id": "epX", "endpoint_name": "n", "job_id": "jX", "attempt": 0},
         )
         orch._save_status(status)
         cancelled, deleted = [], []
@@ -1603,7 +1630,7 @@ def test_attach_completes_run(monkeypatch):
             run_id="a1",
             state="running",
             spec=_spec("a1").to_dict(),
-            remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA"},
+            remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "attempt": 0},
         )
         orch._save_status(status)
         monkeypatch.setattr(
@@ -1641,7 +1668,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
                 state="running",
                 spec=_spec("i1").to_dict(),
                 cost_usd=0.0,
-                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA"},
+                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "attempt": 0},
             )
         )
         # Poll reports a dead/abandoned job (the common redeploy-window outcome).
@@ -1680,7 +1707,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
                 run_id="g1",
                 state="running",
                 spec=_spec("g1").to_dict(),
-                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA"},
+                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "attempt": 0},
             )
         )
         monkeypatch.setattr(

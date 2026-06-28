@@ -36,6 +36,17 @@ def _offline(monkeypatch):
     # opts back in with ``monkeypatch.setenv(...)``.
     monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
 
+    # The always-on repo GC (flash.server.repo_cleanup.run_scheduled_cleanup) sweeps on control-plane
+    # startup and reaches BOTH serving (GET /adapters) and Hugging Face (HfApi.list_datasets). The
+    # offline API fixtures set HF_TOKEN so preflight passes, which also ARMS this sweep in the
+    # TestClient lifespan (repo_cleanup_enabled() -> True) — so stub the sweep entry to a no-op here
+    # (a serving/HF network boundary, like list_endpoints above) to keep those startups hermetic. A
+    # test exercising the real sweep re-patches it (tests/test_repo_cleanup.py restores the genuine
+    # function in its own fixture).
+    import flash.server.repo_cleanup as repo_cleanup
+
+    monkeypatch.setattr(repo_cleanup, "run_scheduled_cleanup", lambda **_kw: 0, raising=False)
+
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every
     # test so a key set/collapsed by one test can't leak into the next.

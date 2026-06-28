@@ -1719,6 +1719,58 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     assert seen["private"] is True  # private by default
 
 
+def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
+    """The /export handler must take the per-run deploy lock FROM THE VERY TOP — before even the
+    payload-shape validation — and keep it across owned_run/the artifact read (mirroring /deploy,
+    which locks first). The always-on repo GC only spares a repo when it CAN'T acquire that same lock,
+    so taking the lock after the body validation left a window where the GC could delete the source
+    while the request was still validating its payload. Assert the lock is already held both during
+    the payload validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run
+    runs."""
+    import flash.server.app as app_mod
+    from flash.server.routes import serving as serving_routes
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    real_owned_run = serving_routes.owned_run
+    real_validate = serving_routes._validate_hf_repo_id
+    seen: dict = {}
+
+    def checking_validate(repository):
+        # The payload validation runs BEFORE owned_run; assert it too is inside the lock, so the GC
+        # cannot delete the source during the (cheap, local) body validation.
+        lk = app_mod._deploy_lock(run_id)
+        acquired = lk.acquire(blocking=False)
+        seen["locked_during_validation"] = not acquired
+        if acquired:
+            lk.release()
+        return real_validate(repository)
+
+    def checking_owned_run(rid, k):
+        # A non-blocking acquire from outside must FAIL (lock already held by the handler) — proving
+        # the handler is INSIDE the `with _deploy_lock(...)` block by the time owned_run runs.
+        lk = app_mod._deploy_lock(rid)
+        acquired = lk.acquire(blocking=False)
+        seen["locked_during_owned_run"] = not acquired
+        if acquired:
+            lk.release()
+        return real_owned_run(rid, k)
+
+    monkeypatch.setattr(serving_routes, "_validate_hf_repo_id", checking_validate)
+    monkeypatch.setattr(serving_routes, "owned_run", checking_owned_run)
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/a")
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["locked_during_validation"] is True
+    assert seen["locked_during_owned_run"] is True
+
+
 def test_export_public_flag_sets_private_false(api, monkeypatch):
     import flash.server.app as app_mod
 

@@ -79,17 +79,13 @@ def test_heartbeat_progress_same_attempt_string_vs_int_is_fresh():
     assert fresh is True
 
 
-def test_heartbeat_progress_attempt_check_is_backcompat_when_unstamped():
-    # An empty/absent attempt can't be dated, so the ts-based decision stands (back-compat). The
-    # worker's default ATTEMPT is "" (env var unset), which must NOT be read as a mismatch.
+def test_heartbeat_progress_rejects_unstamped_when_attempt_known():
     now = time.time()
     launch = now - 100
-    for attempt_field in ("", None):  # empty-string default and explicit None
+    for attempt_field in ("", None):
         _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, attempt_field), launch, current_attempt=1)
-        assert fresh is True
-    # 3-tuple key (no attempt element at all) -> fresh
+        assert fresh is False
     _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10), launch, current_attempt=1)
-    assert fresh is True
-    # and with no current_attempt supplied, attempt is ignored entirely
+    assert fresh is False
     _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "0"), launch)
     assert fresh is True

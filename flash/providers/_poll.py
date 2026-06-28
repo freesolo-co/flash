@@ -23,7 +23,7 @@ def preload_instance_run_id(provider: str, region: str, reap_deadline_epoch: int
 def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GRACE_S) -> bool:
     """True when a preload instance name's embedded deadline has elapsed past grace.
 
-    Names without a parseable deadline (legacy) return False. 10+ digit guard avoids matching region segments."""
+    Names without a parseable deadline return False. 10+ digit guard avoids matching region segments."""
     m = re.search(r"-d(\d{10,})-", name)
     if not m:
         return False
@@ -286,7 +286,7 @@ def heartbeat_progress_ts(
     False for a prior-attempt leftover (retries reuse the same seed heartbeat path).
 
     Use the heartbeat's own ts, not poll time — a stale-before-reattach heartbeat must not buy a fresh
-    stall window. launch_ts=0.0 means unknown; treat all heartbeats as fresh in that case."""
+    stall window. launch_ts=0.0 means unknown; attempt mismatches are still rejected."""
     now = time.time()
     ts = hb_key[2] if (isinstance(hb_key, tuple) and len(hb_key) >= 3) else None
     try:
@@ -295,21 +295,9 @@ def heartbeat_progress_ts(
         return now, False
     lo = float(launch_ts) if launch_ts else 0.0  # unknown launch -> floor 0.0 (all heartbeats fresh)
     fresh = ts >= lo
-    # Reject explicit attempt mismatch — worker stamps attempt as a str env var, poller passes int;
-    # coerce both so "0" != 0 doesn't discard every live heartbeat.
+    # Worker stamps attempt as a str env var, poller passes int; coerce both before comparing.
     hb_attempt = _attempt_int(hb_key[3]) if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
     cur_attempt = _attempt_int(current_attempt)
-    if fresh and cur_attempt is not None and hb_attempt is not None and hb_attempt != cur_attempt:
+    if fresh and cur_attempt is not None and hb_attempt != cur_attempt:
         fresh = False
     return min(now, max(lo, ts)), fresh
-
-
-def surface_forced_heartbeat(
-    heartbeat_reader: Callable[..., Any] | None,
-    last_hb_key: tuple | None,
-    say: Callable[[str], None],
-) -> tuple[tuple | None, str | None]:
-    """Force-read the latest heartbeat on terminal statuses, bypassing reader rate limits."""
-    if heartbeat_reader is None:
-        return last_hb_key, None
-    return surface_heartbeat(lambda: heartbeat_reader(force=True), last_hb_key, say)
