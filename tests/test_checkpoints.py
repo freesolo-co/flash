@@ -21,7 +21,7 @@ SPEC_DICT = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
+    "train": {"steps": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
     "run_id": "flash-ckpt-1",
 }
@@ -76,10 +76,10 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatc
 
     subfolder = worker.publish_deployable_checkpoint(str(ckpt), 80)
 
-    assert subfolder == "rl/flash-ckpt-1/seed0/checkpoints/step-80/adapter"
+    assert subfolder == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
     assert len(rec.uploads) == 1
     up = rec.uploads[0]
-    assert up["path_in_repo"] == "rl/flash-ckpt-1/seed0/checkpoints/step-80/adapter"
+    assert up["path_in_repo"] == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
     assert up["repo_type"] == "dataset"
     # Trainer-state files are excluded so each per-step snapshot is just the small LoRA adapter.
     assert "optimizer.pt" in up["ignore_patterns"]
@@ -289,8 +289,8 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
     )
     paths = [u["path_in_repo"] for u in rec.uploads]
     assert paths == [
-        "rl/flash-ckpt-1/seed0/checkpoints/step-4/adapter",  # deployable first
-        "rl/flash-ckpt-1/seed0/checkpoint/checkpoint-4",  # resume second
+        "rl/flash-ckpt-1/checkpoints/step-4/adapter",  # deployable first
+        "rl/flash-ckpt-1/checkpoint/checkpoint-4",  # resume second
     ]
 
 
@@ -300,7 +300,7 @@ def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
     dirs are pruned explicitly. The plural deployable tree (checkpoints/) must be left intact."""
     import flash.engine.worker.hf as worker_hf
 
-    prefix = "rl/flash-ckpt-1/seed0"
+    prefix = "rl/flash-ckpt-1"
     files = [
         f"{prefix}/checkpoint/checkpoint-20/optimizer.pt",
         f"{prefix}/checkpoint/checkpoint-20/adapter_model.safetensors",
@@ -325,7 +325,7 @@ def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
 def test_prune_stale_resume_checkpoints_no_repo_is_noop(monkeypatch):
     import flash.engine.worker.hf as worker_hf
 
-    rec = _RecordingHfApi(["rl/r/seed0/checkpoint/checkpoint-1/optimizer.pt"])
+    rec = _RecordingHfApi(["rl/r/checkpoint/checkpoint-1/optimizer.pt"])
     _prime_worker(monkeypatch, rec, repo="")  # local run, no HF repo
     worker_hf._prune_stale_resume_checkpoints(5)
     assert rec.deleted == []
@@ -365,7 +365,7 @@ def test_on_save_skips_deployable_when_vl_recombine_fails(tmp_path, monkeypatch,
     # NO deployable adapter advertised for this step...
     assert not any(p.endswith("checkpoints/step-4/adapter") for p in paths), paths
     # ...but the resume checkpoint is still uploaded so the run can resume and re-merge.
-    assert "rl/flash-ckpt-1/seed0/checkpoint/checkpoint-4" in paths
+    assert "rl/flash-ckpt-1/checkpoint/checkpoint-4" in paths
 
 
 # --------------------------------------------------------------------------------------------
@@ -391,12 +391,12 @@ def _patch_hf_files(monkeypatch, files):
 def test_checkpoint_adapter_prefix():
     assert (
         checkpoint_adapter_prefix(_spec(), 60)
-        == "rl/flash-ckpt-1/seed0/checkpoints/step-60"
+        == "rl/flash-ckpt-1/checkpoints/step-60"
     )
 
 
 def test_list_checkpoints_parses_and_sorts(monkeypatch):
-    base = "rl/flash-ckpt-1/seed0"
+    base = "rl/flash-ckpt-1"
     files = [
         f"{base}/checkpoints/step-80/adapter/adapter_config.json",
         f"{base}/checkpoints/step-80/adapter/adapter_model.safetensors",
@@ -420,7 +420,7 @@ def test_list_checkpoints_parses_and_sorts(monkeypatch):
 
 def test_list_checkpoints_skips_step_without_weights(monkeypatch):
     """A step with adapter_config.json but no weights file is NOT advertised as deployable."""
-    base = "rl/flash-ckpt-1/seed0"
+    base = "rl/flash-ckpt-1"
     files = [
         # step-40 is complete; step-60 has config only (half-uploaded) and must be excluded.
         f"{base}/checkpoints/step-40/adapter/adapter_config.json",
@@ -432,7 +432,7 @@ def test_list_checkpoints_skips_step_without_weights(monkeypatch):
 
 
 def test_list_checkpoints_no_repo(monkeypatch):
-    spec = JobSpec.from_dict({**SPEC_DICT, "train": {"steps": 1, "seeds": [0], "hf_repo": ""}})
+    spec = JobSpec.from_dict({**SPEC_DICT, "train": {"steps": 1, "hf_repo": ""}})
     assert list_checkpoints(spec) == []
 
 
@@ -464,9 +464,9 @@ def _status(**kw):
 
 
 _CKPTS = [
-    {"step": 40, "subfolder": "rl/flash-ckpt-1/seed0/checkpoints/step-40/adapter",
+    {"step": 40, "subfolder": "rl/flash-ckpt-1/checkpoints/step-40/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
-    {"step": 80, "subfolder": "rl/flash-ckpt-1/seed0/checkpoints/step-80/adapter",
+    {"step": 80, "subfolder": "rl/flash-ckpt-1/checkpoints/step-80/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
 ]
 
@@ -488,8 +488,8 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
     assert body["repoId"] == "org/test-runs"
     assert body["repoType"] == "dataset"
     assert body["checkpoints"] == [
-        {"step": 40, "subfolder": "rl/flash-ckpt-1/seed0/checkpoints/step-40/adapter"},
-        {"step": 80, "subfolder": "rl/flash-ckpt-1/seed0/checkpoints/step-80/adapter"},
+        {"step": 40, "subfolder": "rl/flash-ckpt-1/checkpoints/step-40/adapter"},
+        {"step": 80, "subfolder": "rl/flash-ckpt-1/checkpoints/step-80/adapter"},
     ]
 
 

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 
 @dataclass
 class RunMetrics:
-    """Standard metrics record written per phase/seed."""
+    """Standard metrics record written per phase."""
 
     arm: str = "runpod"
     phase: str = ""  # "sft" | "rl"
