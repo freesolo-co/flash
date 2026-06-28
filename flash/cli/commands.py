@@ -359,7 +359,7 @@ def cmd_env_list(args) -> int:
         for path in sorted(paths):
             print(f"  {path}")
     else:
-        print("no environments yet — scaffold one with `flash env setup`")
+        print("no environments yet - scaffold one with `flash env setup`")
     return 0
 
 
