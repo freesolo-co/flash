@@ -1204,8 +1204,8 @@ def detail_flags_cuda_oom(detail: str | None) -> bool:
     the primary path stays the structured flag."""
     if not detail:
         return False
-    from flash.engine.worker.perf.lifecycle import RETRIABLE_INFRA_MARKER, is_cuda_oom
+    from flash.engine.worker.perf.lifecycle import RETRIABLE_INFRA_MARKER, text_flags_cuda_oom
 
     if RETRIABLE_INFRA_MARKER.lower() in detail.lower():
         return False
-    return is_cuda_oom(None, _terminal_exception_block(detail))
+    return text_flags_cuda_oom(_terminal_exception_block(detail))

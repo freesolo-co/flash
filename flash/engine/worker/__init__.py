@@ -458,16 +458,16 @@ def main():
         tb = traceback.format_exc()
         traceback.print_exc()
         # A CUDA out-of-memory crash means THIS card was too small for the run's peak. Stamp a
-        # structured ``oom`` flag (off the LIVE exception + traceback, the one place the real cause is
-        # in hand) so the runner ESCALATES the retry to a strictly larger GPU instead of failing fast
-        # (it's NOT infra) or re-rolling the same too-small card. Checked on str(e)+tb so the
-        # fla/Triton "[CUDA]: out of memory" RuntimeError counts, not just torch's typed error.
-        # ``and not retriable``: a RetriableInfraError raised by wait_for_gpu carries the LAST CUDA
-        # readiness error in its message, which can be "CUDA out of memory" — but that's a host/GPU
-        # READINESS failure that should retry on a fresh SAME-size GPU, not a workload OOM. Since the
-        # pollers give oom precedence over retriable, retriable must win HERE (don't stamp oom) so an
-        # infra readiness flake doesn't escalate onto a larger, costlier card.
-        oom = is_cuda_oom(e, tb) and not retriable
+        # structured ``oom`` flag so the runner ESCALATES the retry to a strictly larger GPU instead of
+        # failing fast (it's NOT infra) or re-rolling the same too-small card. Classified off STRUCTURED
+        # signals — torch's typed OutOfMemoryError + its ``num_ooms`` allocator counter — never by
+        # matching the exception message; a host-RAM OOM moves neither, so it can't escalate the GPU. A
+        # driver/kernel-launch OOM (fla/Triton) bypasses torch's allocator and is invisible here — the
+        # poller's ``text_flags_cuda_oom`` fallback catches that residual on the control plane.
+        # ``and not retriable``: a RetriableInfraError raised by wait_for_gpu is a host/GPU READINESS
+        # failure that should retry on a fresh SAME-size GPU; the pollers give oom precedence over
+        # retriable, so retriable must win HERE (don't stamp oom) -> no escalation onto a costlier card.
+        oom = is_cuda_oom(e) and not retriable
         try:
             err_name = error_artifact_name(RUN_MODE)
             err_path = f"/tmp/{err_name}"

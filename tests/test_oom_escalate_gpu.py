@@ -13,22 +13,30 @@ import ast
 import pathlib
 
 
-def test_is_cuda_oom_matches_the_real_traceback_not_generic_errors():
-    from flash.engine.worker.perf.lifecycle import is_cuda_oom
+def test_is_cuda_oom_is_structured_not_string_based(monkeypatch):
+    import torch
 
-    # the actual prod crash (fla/Triton raises a plain RuntimeError, not torch's typed OOM)
-    assert is_cuda_oom(RuntimeError("Triton Error [CUDA]: out of memory")) is True
-    assert is_cuda_oom(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")) is True
-    # detection also works off the traceback text when the top exception is a wrapper
-    tb = "...\n  File fla/modules/l2norm.py ...\nRuntimeError: Triton Error [CUDA]: out of memory\n"
-    assert is_cuda_oom(None, tb) is True
-    # genuine NON-oom training/config errors must NOT escalate (they'd waste a bigger GPU)
-    assert is_cuda_oom(ValueError("bad config")) is False
-    assert is_cuda_oom(RuntimeError("loss became nan")) is False
-    # an OOM with NO CUDA/Triton context is a host-RAM / other-library OOM — must NOT trigger GPU
-    # escalation just because the substring "out of memory" appears.
-    assert is_cuda_oom(RuntimeError("DataLoader worker (pid 1) killed: out of memory")) is False
-    assert is_cuda_oom(MemoryError("Unable to allocate array: out of memory")) is False
+    from flash.engine.worker.perf import lifecycle as lc
+
+    # 1) torch's TYPED OutOfMemoryError -> OOM, regardless of message text.
+    assert lc.is_cuda_oom(torch.cuda.OutOfMemoryError("anything")) is True
+
+    # 2) NO string matching: a RuntimeError whose message literally SAYS "out of memory" is NOT
+    #    classified by text — with no allocator-counter advance it's False. (A driver/kernel-launch OOM
+    #    behind such a RuntimeError is caught later by the poller's text fallback, not here.) Host-RAM
+    #    OOMs (DataLoader kill, MemoryError) are likewise NOT GPU OOMs and stay False.
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
+    assert lc.is_cuda_oom(RuntimeError("Triton Error [CUDA]: out of memory")) is False
+    assert lc.is_cuda_oom(RuntimeError("DataLoader worker (pid 1) killed: out of memory")) is False
+    assert lc.is_cuda_oom(MemoryError("Unable to allocate array: out of memory")) is False
+    assert lc.is_cuda_oom(ValueError("bad config")) is False
+
+    # 3) torch's num_ooms allocator counter advancing -> OOM (the structured "error code" signal).
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 3)
+    assert lc.is_cuda_oom(RuntimeError("whatever"), oom_count_before=0) is True
+    assert lc.is_cuda_oom(RuntimeError("whatever"), oom_count_before=3) is False  # no advance
+    # ...but a host MemoryError stays False even with the counter pinned >0 (short-circuited).
+    assert lc.is_cuda_oom(MemoryError("host ram")) is False
 
 
 def _card(gpu, vram, provider="runpod", price=1.0):
@@ -114,11 +122,13 @@ def test_lambda_poller_escalates_oom_for_cross_provider_parity():
     assert '"job_failed" if worker_crashed else "job_preempted"' in src
 
 
-def test_is_cuda_oom_ignores_cuda_only_in_traceback_file_paths():
-    # 8bM: the CUDA-context signal must come from the exception MESSAGE, not stack frame file paths.
-    # A host-RAM OOM whose traceback merely traverses torch/cuda/* must NOT be treated as a GPU OOM
-    # (more VRAM can't fix it), even though "cuda" appears in a `File ".../torch/cuda/..."` frame.
-    from flash.engine.worker.perf.lifecycle import is_cuda_oom
+def test_text_flags_cuda_oom_ignores_cuda_only_in_traceback_file_paths():
+    # 8bM: the control-plane text scanner's CUDA-context signal must come from the exception-type
+    # (un-indented) lines, not stack frame file paths. A host-RAM OOM whose traceback merely traverses
+    # torch/cuda/* must NOT be treated as a GPU OOM (more VRAM can't fix it), even though "cuda"
+    # appears in a `File ".../torch/cuda/..."` frame. (The worker path is structural; this is the
+    # control-plane fallback that DOES read text — so the disambiguation lives here now.)
+    from flash.engine.worker.perf.lifecycle import text_flags_cuda_oom
 
     host_oom_tb = (
         "Traceback (most recent call last):\n"
@@ -126,7 +136,7 @@ def test_is_cuda_oom_ignores_cuda_only_in_traceback_file_paths():
         "    return _do()\n"
         "MemoryError: Unable to allocate 8.00 GiB: out of memory\n"
     )
-    assert is_cuda_oom(MemoryError("Unable to allocate 8.00 GiB: out of memory"), host_oom_tb) is False
+    assert text_flags_cuda_oom(host_oom_tb) is False
     # a DataLoader host OOM whose stack also passes through torch/cuda frames — still NOT a CUDA OOM
     dl_tb = (
         "Traceback (most recent call last):\n"
@@ -134,16 +144,16 @@ def test_is_cuda_oom_ignores_cuda_only_in_traceback_file_paths():
         "    loss.backward()\n"
         "RuntimeError: DataLoader worker (pid 7) is killed by signal: out of memory\n"
     )
-    assert is_cuda_oom(RuntimeError("DataLoader worker (pid 7) is killed by signal: out of memory"), dl_tb) is False
+    assert text_flags_cuda_oom(dl_tb) is False
     # a REAL CUDA OOM whose root cause is on the (un-indented) exception line of a wrapper traceback
-    # is still detected (the message, not a file path, supplies the context).
+    # is still detected (the message line, not a file path, supplies the context).
     real_tb = (
         "Traceback (most recent call last):\n"
         '  File "/x/fla/modules/l2norm.py", line 3, in bwd\n'
         "    k()\n"
         "RuntimeError: Triton Error [CUDA]: out of memory\n"
     )
-    assert is_cuda_oom(RuntimeError("boom"), real_tb) is True
+    assert text_flags_cuda_oom(real_tb) is True
 
 
 def test_worker_does_not_stamp_oom_for_a_retriable_infra_exception():
@@ -152,7 +162,7 @@ def test_worker_does_not_stamp_oom_for_a_retriable_infra_exception():
     # stamp oom when the exception is already retriable — else a host-readiness flake escalates onto a
     # larger, costlier card instead of retrying on a fresh same-size GPU.
     src, _ = _src("flash.engine.worker", "")
-    assert "oom = is_cuda_oom(e, tb) and not retriable" in src
+    assert "oom = is_cuda_oom(e) and not retriable" in src
 
 
 def test_detail_flags_cuda_oom_is_a_gated_fallback():
@@ -300,11 +310,11 @@ def test_instance_bootstrap_oom_scanner_is_self_contained():
     # host-RAM OOM can't be combined into a false escalating marker (and stays self-contained).
     assert "def _terminal_exception_block" in boot  # inlined narrower
     assert "if _text_flags_cuda_oom(_terminal_exception_block(tail)):" in boot
-    # the inlined predicate matches the worker's CUDA-OOM behavior (string branch of is_cuda_oom)
+    # the inlined predicate matches the shared control-plane text scanner (text_flags_cuda_oom)
     import importlib
 
     boot_mod = importlib.import_module("flash.providers._instance_bootstrap")
-    from flash.engine.worker.perf.lifecycle import is_cuda_oom
+    from flash.engine.worker.perf.lifecycle import text_flags_cuda_oom
 
     for text in (
         "RuntimeError: Triton Error [CUDA]: out of memory",
@@ -312,7 +322,7 @@ def test_instance_bootstrap_oom_scanner_is_self_contained():
         "DataLoader worker (pid 1) killed: out of memory",  # host OOM -> False both
         "ValueError: bad config",
     ):
-        assert boot_mod._text_flags_cuda_oom(text) == is_cuda_oom(None, text)
+        assert boot_mod._text_flags_cuda_oom(text) == text_flags_cuda_oom(text)
     # the terminal-block narrower mirrors the worker: a mixed tail (early 'cuda' init log + a later
     # host-RAM OOM in the terminal traceback) is NOT a CUDA OOM, while a real CUDA OOM in the
     # terminal traceback still flags. This is the bootstrap analog of detail_flags_cuda_oom narrowing.
@@ -340,10 +350,10 @@ def _src(modfile_attr, name):
 
 
 def test_worker_stamps_oom_flag_in_its_failure_heartbeat():
-    # The worker classifies OOM off its LIVE exception and stamps it alongside `retriable`, so the
-    # poller never has to parse the failure detail string.
+    # The worker classifies OOM off its LIVE exception (structured signals, not the message text) and
+    # stamps it alongside `retriable`, so the poller reads a flag rather than parsing the detail.
     src, _ = _src("flash.engine.worker", "")
-    assert "oom = is_cuda_oom(e, tb)" in src
+    assert "oom = is_cuda_oom(e)" in src
     assert '{"retriable": retriable, "oom": oom}' in src
 
 

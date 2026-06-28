@@ -23,25 +23,43 @@ class RetriableInfraError(RuntimeError):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
 
 
-# Substrings that identify a CUDA out-of-memory crash in an exception message / traceback. The worker
-# stamps a structured ``oom`` heartbeat flag off ``is_cuda_oom`` (NOT the runner parsing detail
-# strings), so the runner can ESCALATE the retry to a strictly LARGER GPU instead of failing fast or
-# re-rolling the same too-small card.
-_CUDA_OOM_MARKERS = (
-    "out of memory",  # "CUDA out of memory" AND fla/Triton's "Triton Error [CUDA]: out of memory"
-    "cuda_error_out_of_memory",
-    "outofmemoryerror",
-)
+def cuda_oom_count() -> int:
+    """torch's cumulative count of OOMs THROWN by the caching allocator, summed across visible CUDA
+    devices (``memory_stats()['num_ooms']``). A STRUCTURED signal — NOT error text — that increments
+    whenever a torch allocation fails OOM (model load, activations, the 248k-vocab logits, do_bench's
+    own torch buffers). A fresh worker process starts at 0, so a non-zero value at crash time means an
+    allocator OOM occurred this run; a HOST-RAM OOM (MemoryError / DataLoader kill) never touches the
+    CUDA allocator and so never moves it. 0 when torch/CUDA is unavailable."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0
+        return sum(
+            int(torch.cuda.memory_stats(i).get("num_ooms", 0))
+            for i in range(torch.cuda.device_count())
+        )
+    except Exception:
+        return 0
 
 
-def is_cuda_oom(exc: BaseException | None, tb_text: str = "") -> bool:
-    """True when ``exc`` (or its traceback) is a CUDA out-of-memory crash.
+def is_cuda_oom(exc: BaseException | None, oom_count_before: int = 0) -> bool:
+    """STRUCTURED CUDA-OOM classification — NO error-text parsing. True when EITHER:
 
-    Catches torch's typed ``OutOfMemoryError`` AND a plain ``RuntimeError`` whose message names OOM
-    (e.g. the ``Triton Error [CUDA]: out of memory`` that fla's backward kernels raise — the 9B-GRPO
-    autotune crash). The worker calls this on its LIVE exception (the one place the real cause is in
-    hand) and stamps a structured ``oom`` flag the poller reads, so classification never relies on
-    runner-side detail-string parsing. Best-effort and torch-import-safe."""
+      * ``exc`` is torch's typed ``OutOfMemoryError`` (the caching allocator's own signal), OR
+      * torch's allocator OOM counter advanced past ``oom_count_before`` (``cuda_oom_count`` — a fresh
+        worker starts at 0, so the default 0 means "any allocator OOM this process").
+
+    Both are CUDA-allocator signals, so a host-RAM OOM (MemoryError / a DataLoader "out of memory")
+    can NEVER trip them — no message disambiguation needed. The worker calls this on its LIVE
+    exception and stamps the structured ``oom`` heartbeat flag the poller reads. A driver/kernel-LAUNCH
+    OOM (fla/Triton) bypasses torch's allocator and so is invisible HERE; the poller's
+    ``text_flags_cuda_oom`` text fallback (the only signal available on the GPU-less control plane)
+    catches that residual. Best-effort and torch-import-safe."""
+    # A host-RAM OOM (the builtin MemoryError) is definitionally NOT a CUDA allocator OOM — a bigger
+    # GPU can't fix it — so never escalate on it, whatever the counter says.
+    if isinstance(exc, MemoryError):
+        return False
     try:
         import torch
 
@@ -49,21 +67,38 @@ def is_cuda_oom(exc: BaseException | None, tb_text: str = "") -> bool:
             return True
     except Exception:
         pass
-    # Build the signal from the exception MESSAGE text only: the exception's own str() plus the
-    # UN-INDENTED exception-type lines of the traceback (e.g. "RuntimeError: Triton Error [CUDA]: out
-    # of memory"). The INDENTED frame lines (``  File ".../torch/cuda/x.py" ...`` and their source/
-    # caret continuations) are dropped — a HOST-RAM OOM (a MemoryError, a DataLoader "out of memory")
-    # whose stack merely traverses torch/cuda/* file PATHS must not borrow that "cuda" as GPU context
-    # and trip the expensive larger-GPU escalation (more VRAM can't fix a host/library OOM).
-    exc_lines = "\n".join(ln for ln in tb_text.splitlines() if ln[:1] not in (" ", "\t"))
-    blob = f"{type(exc).__name__ if exc is not None else ''}: {exc}\n{exc_lines}".lower()
+    return cuda_oom_count() > oom_count_before
+
+
+# Substrings that NAME a CUDA out-of-memory crash in failure text. Used ONLY by the control-plane text
+# fallback below (the worker classifies structurally via ``is_cuda_oom``) — kept narrow + CUDA-gated
+# so a host-RAM OOM in the text doesn't escalate.
+_CUDA_OOM_MARKERS = (
+    "out of memory",  # "CUDA out of memory" AND fla/Triton's "Triton Error [CUDA]: out of memory"
+    "cuda_error_out_of_memory",
+    "outofmemoryerror",
+)
+
+
+def text_flags_cuda_oom(text: str | None) -> bool:
+    """True when ``text`` (an assembled failure detail / console tail) NAMES a CUDA out-of-memory
+    crash. The CONTROL-PLANE fallback: when the worker's structured ``oom`` heartbeat flag is absent
+    (lost upload) or the OOM was in a SUBPROCESS the worker couldn't classify on its own exception (a
+    vLLM EngineCore child whose CUDA OOM only reaches the parent via stdout), the control plane has no
+    GPU to read ``num_ooms`` from, so scanning the text is the only signal left. NOT the primary path —
+    ``is_cuda_oom`` (structured) is. Drops INDENTED traceback frame lines so a host-RAM OOM whose stack
+    merely traverses ``torch/cuda/*`` file PATHS isn't mistaken for a GPU OOM, and requires CUDA/Triton
+    context for a bare 'out of memory' (a host/library OOM must not escalate)."""
+    if not text:
+        return False
+    # Only the UN-INDENTED lines (the exception-type lines, e.g. "RuntimeError: Triton Error [CUDA]:
+    # out of memory") — never the "  File .../torch/cuda/x.py" frame paths.
+    exc_lines = "\n".join(ln for ln in text.splitlines() if ln[:1] not in (" ", "\t"))
+    blob = exc_lines.lower()
     if not any(m in blob for m in _CUDA_OOM_MARKERS):
         return False
-    # An OOM substring alone is not enough: a HOST-RAM OOM or another library's OOM would otherwise
-    # trip the expensive GPU-tier escalation. Require CUDA/Triton context (the typed
-    # torch.cuda.OutOfMemoryError above is the unambiguous fast-path that skips this). The CUDA marker
-    # "cuda_error_out_of_memory" already carries "cuda"; "out of memory"/"outofmemoryerror" must be
-    # accompanied by it — and only from the exception message now, never a stack file path.
+    # "cuda_error_out_of_memory" already carries "cuda"; a bare "out of memory" / "outofmemoryerror"
+    # must be accompanied by CUDA/Triton context (else a host/library OOM in the text would escalate).
     return "cuda" in blob or "triton" in blob
 
 
