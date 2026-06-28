@@ -382,7 +382,7 @@ def test_cleanup_loop_signals_worker_stop_on_cancel(monkeypatch):
     calls = {"sleep": 0}
 
     async def fake_sleep(_interval):
-        calls["sleep"] += 1  # 1st sleep enters the body; the sweep then cancels
+        calls["sleep"] += 1  # never reached: the sweep runs FIRST and cancels before any sleep
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
@@ -392,6 +392,36 @@ def test_cleanup_loop_signals_worker_stop_on_cancel(monkeypatch):
     assert callable(seen["should_stop"])
     assert seen["stopped_while_running"] is False  # the worker saw a live (un-set) stop flag
     assert seen["should_stop"]() is True           # the loop set it on cancel -> worker will halt
+
+
+def test_cleanup_loop_sweeps_on_startup_before_sleeping(monkeypatch):
+    # The loop must run its FIRST sweep immediately on startup, then sleep between subsequent sweeps —
+    # so a control plane that restarts (or crash-loops) more often than the 24h interval still reclaims
+    # repos instead of always being cancelled before its first sleep elapses. Assert the sweep fires
+    # before any sleep, and that the post-sweep sleep is what runs next.
+    import asyncio
+
+    from flash.server import _runtime
+
+    order: list[str] = []
+
+    def fake_sweep(*, should_stop=None, **_kw):
+        order.append("sweep")
+        return 0  # nothing deleted
+
+    monkeypatch.setattr(rc, "run_scheduled_cleanup", fake_sweep)
+
+    async def fake_sleep(_interval):
+        order.append("sleep")
+        raise asyncio.CancelledError  # stop the loop after one full sweep+sleep cycle
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_runtime._repo_cleanup_loop())
+
+    # Sweep happened FIRST (startup), then the interval sleep — not the other way around.
+    assert order == ["sweep", "sleep"]
 
 
 # ---- malformed live-record fail-closed (deployed_repo_ids) -------------------------------------
