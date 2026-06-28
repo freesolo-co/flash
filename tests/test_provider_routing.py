@@ -153,8 +153,6 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
 def _oom_candidates():
     from flash.providers.base import Candidate
 
-    # price- AND VRAM-ascending tiers so an OOM escalates to the next-larger card; >2 tiers exist so a
-    # broken budget could (wrongly) walk through several pricier GPUs.
     return (
         Candidate("runpod", "A100", 1.0, 80),
         Candidate("runpod", "Pro6000", 2.0, 96),
@@ -163,8 +161,6 @@ def _oom_candidates():
 
 
 def test_oom_escalates_exactly_once_at_max_retries_1(orch, monkeypatch):
-    """OOM escalation is COST, so it respects the user's RAW max_retries: max_retries=1 grants ONE
-    strictly-larger-GPU escalation, then fails terminally — NOT a walk through every pricier tier."""
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import api as runpod_api
@@ -186,15 +182,10 @@ def test_oom_escalates_exactly_once_at_max_retries_1(orch, monkeypatch):
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError):
         orch._submit_seed_supervised(spec, 0, io.StringIO())
-    # smallest card + ONE strictly-larger escalation, then terminal (no third, pricier B200 attempt).
     assert submitted == ["A100", "Pro6000"]
 
 
 def test_oom_after_infra_failure_still_escalates(orch, monkeypatch):
-    """REGRESSION: an infra-shaped retry must NOT consume the OOM-escalation budget. A CUDA OOM that
-    lands AFTER an earlier no_capacity still earns its larger-GPU escalation (the budgets are SEPARATE).
-    Pre-fix the shared walk counter made the OOM read as budget-exhausted at max_retries=1, so the run
-    stopped WITHOUT escalating (submitted would be ['A100', 'Pro6000'] — never reaching B200)."""
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import api as runpod_api
@@ -217,13 +208,36 @@ def test_oom_after_infra_failure_still_escalates(orch, monkeypatch):
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError):
         orch._submit_seed_supervised(spec, 0, io.StringIO())
-    # infra(A100) -> infra-walk(Pro6000) OOMs -> ONE escalation to the strictly-larger B200 -> stop.
-    # The load-bearing assertion: B200 (>96GB) was tried AFTER the OOM, i.e. the escalation happened.
     assert submitted == ["A100", "Pro6000", "B200"]
 
 
+def test_oom_budget_caps_capacity_retry_after_escalation(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=_oom_candidates()))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    submitted = []
+    failures = iter(["oom", "no_capacity"])
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        return PollResult(False, failure=next(failures), detail="x")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=1)
+    _seed_status(orch, spec)
+    with pytest.raises(RuntimeError):
+        orch._submit_seed_supervised(spec, 0, io.StringIO())
+    assert submitted == ["A100", "Pro6000"]
+
+
 def test_oom_never_escalates_at_max_retries_0(orch, monkeypatch):
-    """A deliberate single-shot run (max_retries=0) NEVER escalates a CUDA OOM onto a pricier card."""
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import api as runpod_api
@@ -245,7 +259,7 @@ def test_oom_never_escalates_at_max_retries_0(orch, monkeypatch):
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError):
         orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert submitted == ["A100"]  # one shot, no larger-GPU escalation
+    assert submitted == ["A100"]
 
 
 def test_select_candidate_escapes_failed_provider_then_walks_classes():
