@@ -685,7 +685,7 @@ class _MergeJournal:
             shutil.rmtree(self._scratch, ignore_errors=True)
 
     def rollback(self) -> None:
-        all_restored = True
+        clean = True  # the destination is fully back to its pre-merge state
         for entry in reversed(self._undo):
             try:
                 if entry[0] == "restore":
@@ -698,9 +698,13 @@ class _MergeJournal:
                     if target.is_symlink() or target.exists():
                         _rm_path(target)  # remove the freshly-created path
             except OSError:
-                if entry[0] == "restore":
-                    all_restored = False  # backup is the only surviving copy — keep the scratch
-        if all_restored and self._scratch is not None:
+                # ANY failed undo step means the rollback did NOT fully restore the pre-merge state:
+                # a failed "restore" leaves the moved-aside backup as the only surviving copy of the
+                # user's original; a failed "remove" leaves a freshly-created path behind. In both
+                # cases the merge is half-undone, so keep the scratch (don't claim a clean rollback by
+                # dropping it) — the retained scratch is the signal that this destination needs a look.
+                clean = False
+        if clean and self._scratch is not None:
             shutil.rmtree(self._scratch, ignore_errors=True)
 
 
