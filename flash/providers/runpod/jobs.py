@@ -21,7 +21,6 @@ from flash.providers._poll import (
     _attempt_int,
     is_training_heartbeat,
     make_say,
-    surface_forced_heartbeat,
     surface_heartbeat,
 )
 from flash.providers.base import PollResult, canonical_gpu
@@ -160,14 +159,11 @@ class JobHandle:
 
     @classmethod
     def from_dict(cls, d: dict) -> JobHandle:
-        # Coerce attempt via _attempt_int (not a bare int()) so a legacy/corrupt non-int value (""/
-        # junk) deserializes to the 0 default instead of crashing attach. The handle field is an int,
-        # so None -> 0; the poll() path separately maps legacy/corrupt to current_attempt=None.
         return cls(
             d["endpoint_id"],
-            d.get("endpoint_name", ""),
+            d["endpoint_name"],
             d["job_id"],
-            _attempt_int(d.get("attempt")) or 0,
+            int(d["attempt"]),
         )
 
 
@@ -208,7 +204,7 @@ def _sweep_idle_flash_endpoints(
     - ``known`` — when supplied, the endpoint names for EVERY run THIS control plane has a record
       of. Only endpoints in this set are reapable; one whose name this plane has never issued
       belongs to ANOTHER control plane sharing the account and is left alone (multi-plane safety).
-      ``None`` keeps the legacy unscoped behavior. Unlike ``protected`` this guards a second plane's
+      ``None`` keeps unscoped behavior. Unlike ``protected`` this guards a second plane's
       *idle/between-jobs* endpoint — a busy one is already safe (it never reads as idle).
     - ``protected`` — endpoint names tied to a LIVE run (both the bare ``flash-...`` and the SDK's
       ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between jobs).
@@ -524,13 +520,11 @@ def poll_job(
             try:
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:
-                # COMPLETED but output decodes as error; check retriable flag (infra failures can surface here).
-                last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
-                retriable = worker_flagged_retriable(heartbeat_reader)
+                last_hb_key, retriable, oom = surfaced_worker_flags(heartbeat_reader, last_hb_key, say)
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
                     False,
-                    failure="job_preempted" if retriable else "job_failed",
+                    failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
                     detail=detail,
                 )
         if status in TERMINAL_FAIL:
@@ -542,12 +536,11 @@ def poll_job(
                 detail = str(out)[:1500]
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
-            last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
-            retriable = worker_flagged_retriable(heartbeat_reader)
+            last_hb_key, retriable, oom = surfaced_worker_flags(heartbeat_reader, last_hb_key, say)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
                 False,
-                failure="job_preempted" if retriable else "job_failed",
+                failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
                 detail=f"[{status}] {detail}",
             )
         now = time.time()
@@ -609,12 +602,8 @@ def poll_job(
             hb_step = new_key[1] if new_key else None
             hb_attempt = _attempt_int(new_key[3]) if new_key else None
             is_training_hb = is_training_heartbeat(stage, hb_step)
-            if (
-                current_attempt is not None
-                and hb_attempt is not None
-                and hb_attempt != current_attempt
-            ):
-                # Prior-attempt leftover: ignore to avoid latching seen_heartbeat and losing setup grace.
+            if current_attempt is not None and hb_attempt != current_attempt:
+                # Non-current heartbeat: ignore so stale progress never tightens the stall window.
                 pass
             elif hb_attempt is not None and hb_attempt > last_hb_attempt:
                 # Fresh attempt: reset ts baseline and re-derive seen_heartbeat so cold-start grace rearms.
@@ -797,3 +786,14 @@ def worker_flagged_retriable(heartbeat_reader) -> bool:
     if not isinstance(hb, dict):
         return False
     return bool(hb.get("retriable"))
+
+
+def surfaced_worker_flags(heartbeat_reader, last_hb_key, say) -> tuple[tuple | None, bool, bool]:
+    """ONE forced heartbeat read shared by progress-surfacing and the two structured failure flags,
+    returning ``(last_hb_key, retriable, oom)`` — ``retriable`` retries a fresh same-size GPU, ``oom``
+    escalates to a larger one. One read avoids redundant HF downloads at the failure edge."""
+    hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
+    last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
+    if not isinstance(hb, dict):
+        return last_hb_key, False, False
+    return last_hb_key, bool(hb.get("retriable")), bool(hb.get("oom"))

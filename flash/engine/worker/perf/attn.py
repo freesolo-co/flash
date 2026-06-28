@@ -8,10 +8,7 @@ import contextlib
 def _attn_impl_for_capability(
     major: int, minor: int = 0, *, fa3_available: bool = False, fa2_available: bool = False
 ) -> str | None:
-    """Map CUDA compute capability to best attn_implementation string (None = leave transformers default).
-
-    Returning "sdpa" for Blackwell (not None) keeps sm100 out of run_sft's FA2 packing fallback;
-    flip to a flash impl once FA is validated on sm100/sm120."""
+    """Map CUDA compute capability to a Transformers attn_implementation override."""
     if major == 9 and fa3_available:
         return "flash_attention_3"
     if major == 8 and minor in (0, 6, 9) and fa2_available:  # gate minor: exclude sm87 Jetson Orin

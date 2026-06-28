@@ -35,6 +35,7 @@ from flash.engine.worker.finalize import write_train_meta
 from flash.engine.worker.gpu_setup import (
     finalize_alloc_conf_for_sleep,
     force_vllm_backend_for_sm120,
+    patch_trl_colocate_llm_kwargs,
 )
 from flash.engine.worker.grpo import (
     _grpo_is_no_op_failure,
@@ -111,6 +112,7 @@ from flash.engine.worker.perf import (
     gpu_diagnostics,
     grad_checkpointing_on,
     grpo_sleep_mode,
+    is_cuda_oom,
     liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
@@ -282,7 +284,11 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        hb_flags = {"retriable": retriable}
+        # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Gate on ``not
+        # retriable`` first so an infra error (same-size retry) is never reclassified as oom — oom wins
+        # over retriable in the poller, which would otherwise escalate a same-size retry to a bigger card.
+        oom = not retriable and is_cuda_oom(e)
+        hb_flags = {"retriable": retriable, "oom": oom}
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:
@@ -349,6 +355,7 @@ __all__ = [
     "assert_lora_applied",
     "build_grpo_prompt_dataset",
     "compute_grpo_batching",
+    # gpu/backend setup
     "disable_liger_grpo_torch_compile",
     "error_artifact_name",
     "finalize_alloc_conf_for_sleep",
@@ -379,6 +386,7 @@ __all__ = [
     "make_sft_heartbeat_callback",
     "optimal_attn_impl",
     "patch_grpo_mask_aware_lm_head",
+    "patch_trl_colocate_llm_kwargs",
     "patch_vllm_language_model_only",
     "patch_vllm_lm_weight_sync",
     "prefetch_model",

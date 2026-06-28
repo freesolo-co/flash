@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from flash.engine.worker._pkg import W as _w
 
 
@@ -70,7 +72,9 @@ def rl_per_device_comps(
     *,
     use_vllm: bool = True,
     params_b: float | None = None,
+    active_params_b: float | None = None,
     seq_len: int = 0,
+    fused_logits: bool = False,
 ) -> int:
     """Per-device completion micro-batch for GRPO (TRL counts completions, not prompts).
 
@@ -82,8 +86,19 @@ def rl_per_device_comps(
     """
     default = 2 if _w.THINKING else 8
 
+    _ovr = os.environ.get("FLASH_RL_PER_DEVICE_COMPS", "").strip()
+    if _ovr:
+        try:
+            forced = int(_ovr)
+            if forced >= 1:
+                print(f"rl_per_device_comps: FLASH_RL_PER_DEVICE_COMPS override -> per_device={forced}")
+                return forced
+            print(f"rl_per_device_comps: ignoring non-positive FLASH_RL_PER_DEVICE_COMPS={_ovr!r}")
+        except ValueError:
+            print(f"rl_per_device_comps: ignoring non-integer FLASH_RL_PER_DEVICE_COMPS={_ovr!r}")
+
     logits_cap = _RL_PER_DEVICE_MAX
-    if completion_len > 0:
+    if completion_len > 0 and not fused_logits:
         logits_cap = max(1, int(6.0e9 / (max(1, completion_len) * vocab * 4)))
 
     short_seq = (seq_len or _RL_ACT_SEQ_REF) < _RL_ACT_SEQ_REF
@@ -94,8 +109,9 @@ def rl_per_device_comps(
             import torch
 
             if torch.cuda.is_available():
-                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9  # decimal GB, not GiB
-                width = (max(float(params_b), 0.1) ** 0.5) if params_b else 1.41
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                _eff_b = float(active_params_b) if active_params_b else params_b
+                width = (max(float(_eff_b), 0.1) ** 0.5) if _eff_b else 1.41
                 seq_scale = min(
                     _RL_ACT_SEQ_SCALE_CEIL,
                     max(_RL_ACT_SEQ_SCALE_FLOOR, (seq_len or _RL_ACT_SEQ_REF) / _RL_ACT_SEQ_REF),
@@ -145,11 +161,11 @@ def card_vram_gb() -> float | None:
         return None
 
 
-def resolve_grpo_sleep_mode() -> tuple[bool, int, float]:
+def resolve_grpo_sleep_mode() -> tuple[bool, int, float, bool]:
     """Resolve vLLM sleep-mode for colocated GRPO from JOB_SPEC + live card.
 
     Single source shared by run_rl and finalize_alloc_conf_for_sleep so they never drift.
-    Returns (sleep_mode, ctx, card_gb).
+    Returns (sleep_mode, ctx, card_gb, fp8_kv).
     """
     from flash.engine.recipe import RECIPE
     from flash.engine.worker.perf import grpo_sleep_mode
@@ -162,6 +178,13 @@ def resolve_grpo_sleep_mode() -> tuple[bool, int, float]:
     group_size = int(gcfg.get("group_size") or RECIPE.rl.group_size)
     lora_rank = int(train.lora_rank) if train and train.lora_rank else 32
     card_gb = card_vram_gb() or 0.0
+    fp8_kv = False
+    try:
+        import torch
+
+        fp8_kv = bool(torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9))
+    except Exception:
+        pass
     sleep_mode = grpo_sleep_mode(
         model_id,
         max_length=ctx,
@@ -170,8 +193,9 @@ def resolve_grpo_sleep_mode() -> tuple[bool, int, float]:
         lora_rank=lora_rank,
         thinking=_w.THINKING,
         card_vram_gb=card_gb,
+        fp8_kv=fp8_kv,
     )
-    return sleep_mode, ctx, card_gb
+    return sleep_mode, ctx, card_gb, fp8_kv
 
 
 def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int) -> bool:

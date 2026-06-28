@@ -70,10 +70,13 @@ def grpo_rollout_seq_len(
     return int(max_length or max(1024, rl.max_prompt_len + completion))
 
 
-def _resident_kv_gb(params_b: float | None, vllm_max_len: int, num_generations: int = 8) -> float:
-    """Resident KV (GB) for the engine context and generation group; shared by fit-gate and colocate budget."""
+def _resident_kv_gb(
+    params_b: float | None, vllm_max_len: int, num_generations: int = 8, fp8_kv: bool = False
+) -> float:
+    """Resident KV GB for the rollout context and generation group."""
     width = math.sqrt(max(float(params_b or 1.0), 0.1))
-    return _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width * (max(1, num_generations) / 8.0)
+    kv = _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width * (max(1, num_generations) / 8.0)
+    return kv * 0.5 if fp8_kv else kv
 
 
 def colocate_kv_util(
@@ -83,6 +86,7 @@ def colocate_kv_util(
     sleep_mode: bool,
     num_generations: int = 8,
     active_params_b: float | None = None,
+    fp8_kv: bool = False,
 ) -> float:
     """vllm_gpu_memory_utilization for the colocated GRPO rollout engine.
 
@@ -104,6 +108,24 @@ def colocate_kv_util(
     # counted, so the gate could disable sleep while the engine reserves more KV than it sized — the
     # near-margin 35B-A3B GRPO mismatch. Dense models leave active_params_b unset -> full params_b.
     kv_params_b = float(active_params_b) if active_params_b else params_b
+    # Utilization ceiling. The blanket 0.45 was tuned on 80 GB cards, where it leaves healthy
+    # headroom. On a BIG card carrying a BIG colocate weight copy (the 35B MoE on a 180 GB B200:
+    # 70 GB vLLM weights + the trainer's 70 GB base both resident during rollout) it instead STARVES
+    # the KV pool: 0.45 x 180 = 81 GB executor budget = 70 GB weights + only ~11 GB KV, with ~29 GB
+    # of the card sitting unused. KV bounds rollout concurrency, so the cheap-active A3B can't fill
+    # the card. Lift the cap to 0.55 ONLY when (a) the weight copy is big (>=60 GB) AND (b) the card
+    # actually has room for it -- the trainer's resident weight copy must still fit alongside the 0.55
+    # executor budget with margin: 0.45*total - weights >= ~10 GB. That holds on the 180 GB B200
+    # (0.45*180 - 70 = 11) -> vLLM budget 99 GB = 70 weights + ~29 KV, resident 70 (trainer) + 99 =
+    # 169 GB (~11 GB margin), but NOT the 141 GB H200 (0.45*141 - 70 = -6.5): there 0.55 x 141 = 78 GB
+    # executor + the trainer's 70 GB copy = 148 GB > 141 GB -> overflow. So the H200 -- and ANY card
+    # where the weight copy wouldn't fit alongside the 0.55 budget -- correctly STAYS at 0.45. Keying
+    # off the real headroom (not a >=140 GB card threshold, which ALSO catches the H200) is what makes
+    # the lift safe. The GRPO step's _GpuPeakSampler verifies the headroom holds. Every other
+    # card/model is byte-for-byte unchanged at 0.45.
+    _big_weight_copy = weights_gb >= 60
+    _055_leaves_room_for_trainer_copy = (0.45 * total_vram_gb - weights_gb) >= 10.0
+    _util_cap = 0.55 if (_big_weight_copy and _055_leaves_room_for_trainer_copy) else 0.45
     if not sleep_mode:
         # Resident KV ON TOP of the weight copy: gpu_memory_utilization is the WHOLE executor budget,
         # so budgeting KV alone (the old _KV_CAP/total) starved the weights and vLLM raised "No
@@ -113,12 +135,17 @@ def colocate_kv_util(
         # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
         # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
         # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
-        kv_gb = max(_KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations))
-        return max(0.10, min(0.45, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
+        kv_gb = max(_KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations, fp8_kv=fp8_kv))
+        return max(0.10, min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
-    kv_pool_gb = max(_KV_CAP, 1.5 * _resident_kv_gb(kv_params_b, vllm_max_len, num_generations))
-    return min(0.45, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
+    kv_pool_gb = max(
+        _KV_CAP,
+        1.5 * _resident_kv_gb(kv_params_b, vllm_max_len, num_generations, fp8_kv=fp8_kv),
+    )
+    return min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
+
+
 _TRAIN_COEF = 0.27
 # Small-model colocated GRPO floor: 0.8B OOMs 20 GB; 2B OOMs 24 GB -> both need 32 GB tier.
 _VLLM_COLOCATE_FLOOR_GB = 28.0
@@ -197,6 +224,7 @@ def estimate_vram_gb(
     vocab: int = _VOCAB_DEFAULT,
     sleep_offload: bool = True,
     active_params_b: float | None = None,
+    fp8_kv: bool = False,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU.
 
@@ -213,10 +241,11 @@ def estimate_vram_gb(
         # Sleep mode: peak = max(rollout, train). Resident: both live at once, peak = sum.
         rollout = 0.0
         if use_vllm:
+            _kv_fp8_factor = 0.5 if fp8_kv else 1.0  # fp8 KV halves bytes/token (cc>=8.9)
             if sleep_offload:
-                rollout = weights + min(_KV_COEF * (seq_len / 1024.0) * width, _KV_CAP)
+                rollout = weights + min(_KV_COEF * (seq_len / 1024.0) * width * _kv_fp8_factor, _KV_CAP)
             else:
-                rollout = weights + _resident_kv_gb(eff_b, seq_len, group_size)
+                rollout = weights + _resident_kv_gb(eff_b, seq_len, group_size, fp8_kv=fp8_kv)
         group_factor = max(1.0, (max(1, group_size) / 4.0) ** 0.5)
         think_factor = 1.3 if thinking else 1.0
         activations = _TRAIN_COEF * (seq_len / 1024.0) * width * group_factor * think_factor
@@ -241,6 +270,7 @@ def grpo_fits_resident(
     group_size: int = 8,
     thinking: bool = False,
     card_vram_gb: float = 0.0,
+    fp8_kv: bool = False,
     margin: float = 1.15,
 ) -> bool:
     """True when GRPO fits resident (no sleep-mode offload); False on unknown model/card (safe default)."""
@@ -273,8 +303,87 @@ def grpo_fits_resident(
         vocab=vocab_size_for(model_id),
         sleep_offload=False,
         active_params_b=active_b,
+        fp8_kv=fp8_kv,
     )
     return resident * margin <= card_vram_gb
+
+
+# Activations retained for the backward when gradient checkpointing is OFF. With GC, each layer's
+# intra-block activations are RECOMPUTED in the backward (one extra forward ~= +33% compute); with GC
+# OFF they all stay resident -- so this term is ~num_layers x the per-layer (residual stream + qkv/out
+# + MoE SwiGLU intermediate) activations per token. With FlashAttention / cuDNN-SDPA there is NO s^2
+# attention-score tensor, and the GatedDeltaNet linear layers store only a small recurrent/conv state,
+# so it is LINEAR in seq. K folds the per-layer multiplier (relative to hidden) into one constant. It
+# is set ABOVE the Megatron FlashAttention factor (~34 bytes/(s.b.h) == K 17) so we OVER-reserve and
+# keep GC ON rather than risk an OOM; the MoE's small active FFN (8 x 512 vs a dense 4 x 2048) makes
+# the true value lower still. bf16 activations (2 bytes/elem). Calibrate K from the live H200 peak.
+_GC_OFF_ACT_K = 18.0
+
+
+def sft_gc_off_peak_gb(
+    params_b: float,
+    *,
+    active_params_b: float | None,
+    seq_len: int,
+    hidden: int,
+    num_layers: int,
+    batch: int = _SFT_PER_DEVICE_BS_DEFAULT,
+    lora_rank: int = 32,
+    quant: str = "bf16",
+) -> float:
+    """Estimated peak VRAM (GB) for a FUSED-CE LoRA SFT step with gradient checkpointing OFF: the
+    resident weights + optimizer/base + the no-recompute activations held across ALL ``num_layers``.
+    Fused CE (Liger FLCE) is assumed, so there is no ``[B, T, vocab]`` logits term (the thing that
+    made GC-off impossible at a 248k vocab). Unknown architecture dims -> ``inf`` (caller keeps GC on).
+
+    MoE: the activation backbone scales with the model's real ``hidden`` x ``num_layers`` (geometry),
+    NOT params_b -- the ~3B-active expert FFN is already folded into ``_GC_OFF_ACT_K``. ``weights``
+    still reserves the FULL ``params_b`` (every expert is resident)."""
+    if not (hidden and num_layers and seq_len):
+        return float("inf")
+    bpp = _BYTES_PER_PARAM.get(quant, 2.0)
+    eff_b = float(active_params_b) if active_params_b else float(params_b)
+    weights = float(params_b) * bpp
+    lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * eff_b)
+    base = weights + _BASE_OVERHEAD_GB + lora_opt
+    act = _GC_OFF_ACT_K * int(num_layers) * int(batch) * int(seq_len) * int(hidden) * 2.0 / 1e9
+    return base + act
+
+
+def sft_grad_checkpoint_can_disable(
+    params_b: float,
+    *,
+    active_params_b: float | None,
+    seq_len: int,
+    hidden: int,
+    num_layers: int,
+    card_vram_gb: float,
+    batch: int = _SFT_PER_DEVICE_BS_DEFAULT,
+    lora_rank: int = 32,
+    quant: str = "bf16",
+    margin_gb: float = 18.0,
+) -> bool:
+    """True when a FUSED-CE LoRA SFT step fits a ``card_vram_gb`` card WITHOUT gradient checkpointing,
+    so GC -- a ~+33% recompute tax on every step -- can be turned off for the speed win.
+
+    Conservative by construction: an unknown card / unknown architecture dims, or a peak that doesn't
+    clear the ``margin_gb`` headroom, returns False (keep GC ON). The estimate over-reserves (high
+    ``_GC_OFF_ACT_K`` + a fixed margin) precisely because the allocator sized the card for the
+    GC-*on* peak -- this is the independent check that the larger GC-off peak still fits the REAL
+    card (mirrors ``grpo_fits_resident``'s resident-fit guard)."""
+    if not card_vram_gb or card_vram_gb <= 0 or not (hidden and num_layers and seq_len):
+        return False
+    peak = sft_gc_off_peak_gb(
+        params_b,
+        active_params_b=active_params_b,
+        seq_len=seq_len,
+        hidden=hidden,
+        num_layers=num_layers,
+        batch=batch,
+        lora_rank=lora_rank,
+        quant=quant,
+    )
+    return peak + float(margin_gb) <= float(card_vram_gb)
 
 
 def model_required_vram_gb(
@@ -363,7 +472,36 @@ def model_required_vram_gb(
         # Escalate on active_params_b for MoE: keying on total would over-reject (35B total's
         # threshold is below default rollout length); ~3B active gives ~16k headroom.
         if is_grpo and floor:
-            floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
+            if getattr(info, "sleep_unsupported", False):
+                # Sleep is non-functional for this model (it HANGS) -> it MUST fit RESIDENT. Size the
+                # requirement on the RESIDENT peak (engine live through the backward, fp8 KV on the big
+                # floor card which is sm100) instead of the sleep estimate + grpo_seq_escalation_gb, so
+                # a config too long to fit resident is pushed PAST every GPU and REJECTED at parse time
+                # -- rather than admitted-then-HUNG in the broken sleep path between the resident wall
+                # and the old ~16k sleep ceiling.
+                resident_need = math.ceil(
+                    estimate_vram_gb(
+                        params_b or 4.0,
+                        "grpo",
+                        quant,
+                        seq_len=seq_len,
+                        max_tokens=max_tokens,
+                        lora_rank=lora_rank,
+                        group_size=group_size,
+                        thinking=thinking,
+                        use_vllm=True,
+                        vocab=model_vocab,
+                        sleep_offload=False,
+                        active_params_b=active_b,
+                        fp8_kv=True,
+                    )
+                    # match grpo_fits_resident's 1.15 margin (NOT the looser 1.1 headroom) so the
+                    # parse-time reject lands at the SAME resident wall the worker gate enforces.
+                    * 1.15
+                )
+                floor = max(floor, resident_need)
+            else:
+                floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
         need = max(need, floor)
         if is_grpo and use_vllm:
             floor_gb = 24 if (params_b or 0.0) <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)

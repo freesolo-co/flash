@@ -1,4 +1,4 @@
-"""Environment publish machinery for the `flash env` subcommands.
+"""Environment publish/pull machinery for the `flash env` subcommands.
 
 `flash env push` packages a local Freesolo environment and uploads it through the
 managed Flash control plane.
@@ -6,7 +6,10 @@ managed Flash control plane.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,6 +17,20 @@ from . import render
 
 if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
+
+
+def _atomic_write_bytes(out: Path, data: bytes | bytearray) -> None:
+    """Write data via a sibling temp file so existing files are not truncated on failure."""
+    fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=".flash-env-pull-")
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _err(msg: str) -> int:
@@ -24,6 +41,74 @@ def _err(msg: str) -> int:
     text untouched for scripts and the env tests."""
     print(render.error(msg) if render.styled() else msg, file=sys.stderr)
     return 1
+
+
+def cmd_env_pull(args) -> int:
+    """Download a published Freesolo environment (or a single file from it) to local disk.
+
+    Pulls via GitHub's tarball / raw media type rather than the JSON "contents" API, so files
+    larger than 1 MB (e.g. ``datasets/train.jsonl``) come back intact instead of empty.
+    """
+    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.envs.pull import (
+        download_environment_file,
+        environment_local_dirname,
+        pull_environment_package,
+    )
+
+    env_id = args.env_id
+    if not is_freesolo_environment_id(env_id):
+        print(
+            'env id must be a Freesolo environment id — a managed slug "your-name/your-env", '
+            f'a "github:owner/repo@ref:path" ref, or a github.com URL (got {env_id!r})',
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        if args.path:
+            default_name = Path(args.path.replace("\\", "/")).name
+            out = Path(args.output) if args.output else Path(default_name)
+            if out.is_dir() and not out.is_symlink():
+                print(
+                    f"refusing to overwrite directory {out} with a file "
+                    "(a single-file pull needs -o to be a FILE path, not a directory)",
+                    file=sys.stderr,
+                )
+                return 1
+            if (out.exists() or out.is_symlink()) and not args.force:
+                print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
+                return 1
+            data = download_environment_file(env_id, args.path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_bytes(out, data)
+            if render.styled():
+                print(render.env_pulled(str(out), f"{args.path} · {len(data):,} bytes"))
+            else:
+                print(f"pulled {args.path} from {env_id} -> {out} ({len(data):,} bytes)")
+        else:
+            out = Path(args.output) if args.output else Path(environment_local_dirname(env_id))
+            pull_environment_package(env_id, out, overwrite=args.force)
+            if render.styled():
+                print(render.env_pulled(f"{out}/", env_id))
+            else:
+                print(f"pulled {env_id} -> {out}/")
+        return 0
+    except FileExistsError:
+        print(
+            f"refusing to overwrite existing {args.output or environment_local_dirname(env_id)!r} "
+            "(pass --force)",
+            file=sys.stderr,
+        )
+        return 1
+    except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+        print(f"env pull failed: {exc}", file=sys.stderr)
+        if "GitHub environment request failed" in str(exc) and not os.environ.get("GITHUB_TOKEN"):
+            print(
+                "hint: private/internal environments need a GitHub token; set GITHUB_TOKEN "
+                "(e.g. `export GITHUB_TOKEN=$(gh auth token)`).",
+                file=sys.stderr,
+            )
+        return 1
 
 
 def cmd_env_delete(args) -> int:
@@ -64,11 +149,7 @@ def cmd_env_delete(args) -> int:
     # A missing env deletes to `deleted: false` (idempotent); default True so an older server that
     # omits the field still reads as success.
     deleted = bool(result.get("deleted", True))
-    msg = (
-        f"deleted {env_id}"
-        if deleted
-        else f"{env_id} was not found on the hub (already deleted)"
-    )
+    msg = f"deleted {env_id}" if deleted else f"{env_id} was not found on the hub (already deleted)"
     print(render.ok(msg) if render.styled() else msg)
     return 0
 
