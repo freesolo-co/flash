@@ -73,34 +73,31 @@ def _pkg_b64(files: dict[str, str]) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def test_namespace_is_stable_and_repo_safe():
-    assert envs.namespace_for({"email": "Dev@Clado.ai"}) == "dev-clado-ai"
-    assert envs.namespace_for({"email": "dev@clado.ai"}) == "dev-clado-ai"
+def test_namespace_uses_org_slug():
+    assert envs.namespace_for({"org_slug": "acme"}) == "acme"
+    assert envs.namespace_for({"org": {"slug": "freesolo-co"}}) == "freesolo-co"
+    assert envs.namespace_for({"email": "dev@clado.ai", "org_slug": "acme"}) == "acme"
 
 
-def test_namespace_requires_email():
-    for key in ({"id": 7}, {"key_prefix": "fslo-abc"}, {}, {"email": "missing-email"}):
-        with pytest.raises(envs.EnvPublishError, match="email"):
+def test_namespace_requires_org_slug():
+    for key in (
+        {"id": 7},
+        {"key_prefix": "fslo-abc"},
+        {},
+        {"email": "dev@clado.ai"},
+        {"org_name": "Acme"},
+        {"org_slug": "Bad Slug"},
+    ):
+        with pytest.raises(envs.EnvPublishError, match="org slug"):
             envs.namespace_for(key)
 
 
-def test_internal_key_gets_reserved_namespace_without_email():
-    # The internal/operator service key has a synthetic/shared identity (no per-user email) but is
-    # trusted to submit runs and read everything, so it must be able to publish too. It gets a
-    # fixed reserved namespace instead of raising — regardless of whether its row carries an email.
-    assert envs.namespace_for({"auth_kind": "internal"}) == envs._INTERNAL_NAMESPACE
-    assert envs.namespace_for({"auth_kind": "internal", "email": ""}) == envs._INTERNAL_NAMESPACE
-    assert (
-        envs.namespace_for({"auth_kind": "internal", "email": "missing-email"})
-        == envs._INTERNAL_NAMESPACE
-    )
-
-
-def test_internal_special_case_does_not_loosen_user_keys():
-    # The bypass is reserved for auth_kind == "internal" ONLY: a user key (any other auth_kind, or
-    # none) without a valid email must still be rejected so two users can't collide on a namespace.
-    for key in ({"auth_kind": "external"}, {"auth_kind": "user", "email": "no-at"}, {"email": ""}):
-        with pytest.raises(envs.EnvPublishError, match="email"):
+def test_internal_key_does_not_get_publish_namespace_fallback():
+    for key in (
+        {"auth_kind": "internal"},
+        {"auth_kind": "internal", "email": "internal@freesolo.co"},
+    ):
+        with pytest.raises(envs.EnvPublishError, match="org slug"):
             envs.namespace_for(key)
 
 
@@ -130,15 +127,15 @@ def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
     ref = envs.publish_package(
         package_b64=_pkg_b64(_MINIMAL),
         name="My Env!",
-        key={"email": "dev@clado.ai"},
+        key={"email": "dev@clado.ai", "org_slug": "acme"},
     )
 
-    root = "dev-clado-ai/my-env"
+    root = "acme/my-env"
     assert ref == root
     assert captured["repo"] == "freesolo-co/environment-hub"
     assert captured["token"] == "ghp-test"
     assert captured["publish_root"] == root
-    assert captured["message"] == "Upload Flash environment dev-clado-ai/my-env"
+    assert captured["message"] == "Upload Flash environment acme/my-env"
     assert captured["files"] == ["environment.py", "pyproject.toml"]
 
 
@@ -155,7 +152,7 @@ def test_publish_rejects_bad_input(monkeypatch):
         envs.publish_package(
             package_b64=_pkg_b64({"pyproject.toml": "[project]\nname='e'\n"}),
             name="e",
-            key={"email": "dev@clado.ai"},
+            key={"org_slug": "acme"},
         )
 
 
@@ -201,7 +198,7 @@ def test_record_published_environment_posts_to_backend(monkeypatch):
     monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
 
     ok = environment_registry.record_published_environment(
-        slug="dev-clado-ai/my-env",
+        slug="acme/my-env",
         name="My Env",
         key={"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"},
     )
@@ -212,11 +209,11 @@ def test_record_published_environment_posts_to_backend(monkeypatch):
     body = json.loads(seen["body"])
     assert body == {
         "orgId": "org-1",
-        "slug": "dev-clado-ai/my-env",
+        "slug": "acme/my-env",
         "name": "My Env",
         "hubRepo": "freesolo-co/environment-hub",
         "hubRef": "main",
-        "hubPath": "dev-clado-ai/my-env/environment.py",
+        "hubPath": "acme/my-env/environment.py",
         "publishedByUserId": "user-1",
         "apiKeyId": "key-1",
         "metadata": {"source": "flash.env.push"},
@@ -229,7 +226,7 @@ def test_record_published_environment_is_best_effort(monkeypatch):
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     assert (
         environment_registry.record_published_environment(
-            slug="dev-clado-ai/my-env",
+            slug="acme/my-env",
             name="My Env",
             key={"org_id": "org-1"},
         )
@@ -262,7 +259,7 @@ def test_record_environment_use_posts_to_backend(monkeypatch):
     monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
 
     ok = environment_registry.record_environment_use(
-        slug="dev-clado-ai/my-env",
+        slug="acme/my-env",
         run_id="flash-1",
         key={"org_id": "org-1"},
     )
@@ -272,7 +269,7 @@ def test_record_environment_use_posts_to_backend(monkeypatch):
     assert seen["headers"]["Authorization"] == "Bearer internal-test"
     assert json.loads(seen["body"]) == {
         "orgId": "org-1",
-        "slug": "dev-clado-ai/my-env",
+        "slug": "acme/my-env",
         "runId": "flash-1",
     }
 
@@ -310,7 +307,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "grpo",
                 "phase": "rl",
-                "environment": {"id": "dev-clado-ai/my-env"},
+                "environment": {"id": "acme/my-env"},
                 "gpu": {"type": "RTX 5090"},
             },
             platform_context={
@@ -328,7 +325,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     assert body["orgId"] == "org-1"
     assert body["runId"] == "flash-1"
     assert body["status"] == "running"
-    assert body["environmentSlug"] == "dev-clado-ai/my-env"
+    assert body["environmentSlug"] == "acme/my-env"
     assert body["model"] == "Qwen/Qwen3.5-4B"
 
 
@@ -571,10 +568,10 @@ def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
     monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
     monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
 
-    ref = envs._github_publish(tmp_path, name="e", key={"email": "dev@clado.ai"})
+    ref = envs._github_publish(tmp_path, name="e", key={"org_slug": "acme"})
 
     assert calls["count"] == 2
-    assert ref == "dev-clado-ai/e"
+    assert ref == "acme/e"
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -631,9 +628,9 @@ def test_delete_package_user_can_delete_own_namespace(monkeypatch):
 
     monkeypatch.setattr(envs, "_github_delete", fake_github_delete)
     assert (
-        envs.delete_package(slug="dev-clado-ai/my-env", key={"email": "dev@clado.ai"}) is True
+        envs.delete_package(slug="acme/my-env", key={"org_slug": "acme"}) is True
     )
-    assert seen == {"slug": "dev-clado-ai/my-env", "token": "ghp-test"}
+    assert seen == {"slug": "acme/my-env", "token": "ghp-test"}
 
 
 def test_delete_package_rejects_other_users_namespace(monkeypatch):
@@ -642,7 +639,7 @@ def test_delete_package_rejects_other_users_namespace(monkeypatch):
         envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
     )
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.delete_package(slug="someone-else/env", key={"email": "dev@clado.ai"})
+        envs.delete_package(slug="someone-else/env", key={"org_slug": "acme"})
     assert excinfo.value.status == 403
 
 
@@ -652,18 +649,16 @@ def test_delete_package_internal_key_can_delete_any_namespace(monkeypatch):
     monkeypatch.setattr(
         envs, "_github_delete", lambda slug, *, token: seen.update(slug=slug) or True
     )
-    assert (
-        envs.delete_package(slug="dev-clado-ai/paper-foo", key={"auth_kind": "internal"}) is True
-    )
-    assert seen["slug"] == "dev-clado-ai/paper-foo"
+    assert envs.delete_package(slug="acme/paper-foo", key={"auth_kind": "internal"}) is True
+    assert seen["slug"] == "acme/paper-foo"
 
 
 def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch):
     # The internal key bypasses the namespace-ownership check, so _validate_slug is the ONLY barrier
     # before `git rm -r -- <namespace>/<name>`. A GENUINE repo-control top-level path (a dir at the
     # root of the hub checkout) must be rejected so e.g. DELETE /v1/envs/.github/workflows can't
-    # remove tracked repo infrastructure. Only `.git`/`.github` qualify — `namespace_for` can never
-    # slugify an email to a dot-prefixed namespace, so these are never publishable.
+    # remove tracked repo infrastructure. Only `.git`/`.github` qualify because org slugs can never
+    # be dot-prefixed, so these are never publishable.
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(
         envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
@@ -677,10 +672,9 @@ def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch)
 
 def test_delete_package_allows_publishable_source_namespace(monkeypatch):
     # Regression guard for publish/delete symmetry: `source` is in publish's package-CONTENT
-    # blocklist (_BLOCKED_TOP_LEVEL_PATHS via _safe_extract) but is a legitimate user NAMESPACE —
-    # `namespace_for` slugifies an email like `source@` to `source` and publish writes `source/<name>`
-    # without objection. Delete must therefore reach storage for `source/<name>` (not 400), or those
-    # envs would be publishable-but-undeletable.
+    # blocklist (_BLOCKED_TOP_LEVEL_PATHS via _safe_extract) but is a legitimate org namespace.
+    # Delete must therefore reach storage for `source/<name>` (not 400), or those envs would be
+    # publishable-but-undeletable.
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     seen: dict[str, str] = {}
 
@@ -689,8 +683,8 @@ def test_delete_package_allows_publishable_source_namespace(monkeypatch):
         return True
 
     monkeypatch.setattr(envs, "_github_delete", fake_delete)
-    # A user key whose email normalizes to the `source` namespace deletes its OWN `source/<name>`.
-    source_key = {"email": "source@"}
+    # A user key whose org slug is `source` deletes its OWN `source/<name>`.
+    source_key = {"org_slug": "source"}
     assert envs.namespace_for(source_key) == "source"
     assert "source" in envs._BLOCKED_TOP_LEVEL_PATHS  # still barred from package CONTENTS
     assert envs.delete_package(slug="source/my-env", key=source_key) is True
@@ -718,7 +712,7 @@ def test_delete_package_validates_slug(monkeypatch):
 
 
 def test_canonical_env_id_accepts_only_canonical_form():
-    assert envs.canonical_env_id("dev-clado-ai/my-env") == "dev-clado-ai/my-env"
+    assert envs.canonical_env_id("acme/my-env") == "acme/my-env"
     for bad in ("ns/env/", " ns/env", "ns/env ", "ns/env%20", "Ns/Env", "noslash"):
         with pytest.raises(envs.EnvPublishError):
             envs.canonical_env_id(bad)
@@ -727,7 +721,7 @@ def test_canonical_env_id_accepts_only_canonical_form():
 def test_delete_package_requires_github_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.delete_package(slug="internal-freesolo-co/x", key={"auth_kind": "internal"})
+        envs.delete_package(slug="acme/x", key={"auth_kind": "internal"})
     assert excinfo.value.status == 503
     assert "GITHUB_TOKEN" in str(excinfo.value)
 
@@ -908,7 +902,7 @@ def test_record_deleted_environment_sends_delete(monkeypatch):
     monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
 
     ok = environment_registry.record_deleted_environment(
-        slug="dev-clado-ai/my-env",
+        slug="acme/my-env",
         key={"org_id": "org-1"},
     )
 
@@ -916,7 +910,7 @@ def test_record_deleted_environment_sends_delete(monkeypatch):
     assert seen["url"] == "https://backend.test/api/flash/environments/internal"
     assert seen["method"] == "DELETE"
     assert seen["headers"]["Authorization"] == "Bearer internal-test"
-    assert json.loads(seen["body"]) == {"orgId": "org-1", "slug": "dev-clado-ai/my-env"}
+    assert json.loads(seen["body"]) == {"orgId": "org-1", "slug": "acme/my-env"}
 
 
 def test_record_deleted_environment_is_best_effort(monkeypatch):
@@ -925,7 +919,7 @@ def test_record_deleted_environment_is_best_effort(monkeypatch):
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     assert (
         environment_registry.record_deleted_environment(
-            slug="dev-clado-ai/my-env",
+            slug="acme/my-env",
             key={"org_id": "org-1"},
         )
         is False
