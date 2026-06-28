@@ -41,11 +41,15 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
     }
 )
 _ENV_PUSH_SIDECAR_DIRS = frozenset({"datasets"})
+# ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
+# user-authored README/NOTES) travels with the env into the hub and back out through
+# ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
 _ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
     {
         ".csv",
         ".json",
         ".jsonl",
+        ".md",
         ".parquet",
         ".tsv",
         ".txt",
@@ -286,7 +290,11 @@ def cmd_env_push(args) -> int:
         module_source = entrypoint.read_text()
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
         _copy_env_sidecars(env_root, pkg, entrypoint=entrypoint)
-        (pkg / "README.md").write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
+        # Only synthesize a stub README when the env didn't ship its own (now carried as a
+        # ``.md`` sidecar) — don't clobber a user-authored README with boilerplate.
+        readme = pkg / "README.md"
+        if not readme.exists():
+            readme.write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
         # One progress widget spans both phases the user otherwise waits through silently:
         # packaging (walk + gzip, slow for large datasets) and the upload itself.
         bar = _UploadProgress(env_name)
