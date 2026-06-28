@@ -122,8 +122,8 @@ def cmd_env_pull(args) -> int:
                 file=sys.stderr,
             )
         return 1
-      
- 
+
+
 def cmd_env_delete(args) -> int:
     import re
 
