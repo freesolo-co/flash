@@ -447,10 +447,14 @@ def _submit_seed_supervised(
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
         )
-        # "retrying" is true when the GPU-walk budget remains OR a cache-drop fallback will retry this
-        # even past it (first_cache_drop) — else the log would say "not retrying" while the loop actually
+        # OOM escalation is COST (each retry is a strictly bigger, pricier GPU), so it respects the
+        # user's RAW max_retries — NOT the INFRA_RETRY_FLOOR that lets infra bad-luck retries exceed it
+        # (so max_retries=1 grants ONE larger-GPU attempt, not five). Infra keeps the floored budget.
+        retry_budget = max_retries if oom_shaped else infra_budget
+        # "retrying" is true when the budget remains OR a cache-drop fallback will retry this even past
+        # it (first_cache_drop) — else the log would say "not retrying" while the loop actually
         # continues with the reserved cache-less fallback attempt.
-        will_retry = retry_shaped and (walk_attempt < infra_budget or first_cache_drop)
+        will_retry = retry_shaped and (walk_attempt < retry_budget or first_cache_drop)
         action = (
             f"retrying on a larger GPU (> {oom_vram_floor} GB)"
             if (will_retry and oom_shaped)
@@ -470,7 +474,7 @@ def _submit_seed_supervised(
         # available. The bonus attempt granted above is reserved for exactly this transition; once the
         # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
         # and the loop cannot spin past its one extra cache-less attempt.
-        if walk_attempt >= infra_budget and not first_cache_drop:
+        if walk_attempt >= retry_budget and not first_cache_drop:
             break
         if first_cache_drop:
             drop_weight_cache = True
