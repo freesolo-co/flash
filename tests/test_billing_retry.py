@@ -19,7 +19,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
+    "train": {"steps": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 
@@ -94,12 +94,12 @@ def test_needs_charge_predicate():
     assert billing_retry._needs_charge(
         st(state="cancelled", billing_context=ctx, billing_state="charging")
     )
-    # PARTIAL MULTI-SEED ATTACH (must NOT charge): attach_run sets `artifacts_dir` + partial
-    # `cost_usd` for an intermediate seed while the run is still `running` (deploy.py:232-238). Such a
-    # run -- still running, or later cancelled -- has NOT finished all training, so the predicate must
-    # leave it alone. `artifacts_dir`/`cost_usd` are deliberately NOT eligibility signals here: only
-    # `state in {done,deployed}` or a started charge (`charging`/`failed`) qualifies, neither of which
-    # this partial run has. Charging it would bill a partial amount and pre-empt the real final charge.
+    # PARTIAL ATTACH (must NOT charge): a recovery can set `artifacts_dir` + partial `cost_usd`
+    # while the run is still `running`. Such a run -- still running, or later cancelled -- has NOT
+    # finished training, so the predicate must leave it alone. `artifacts_dir`/`cost_usd` are
+    # deliberately NOT eligibility signals here: only `state in {done,deployed}` or a started charge
+    # (`charging`/`failed`) qualifies, neither of which this partial run has. Charging it would bill a
+    # partial amount and pre-empt the real final charge.
     assert not billing_retry._needs_charge(
         st(
             state="running",
@@ -107,7 +107,6 @@ def test_needs_charge_predicate():
             billing_state="pending",
             artifacts_dir="/results/runpod/rl/run-1",
             cost_usd=0.5,
-            resume_seed_index=1,
         )
     )
     assert not billing_retry._needs_charge(
@@ -283,56 +282,6 @@ def test_sweep_skips_charged_failed_and_internal_runs(monkeypatch, tmp_path):
         lambda **_: (_ for _ in ()).throw(AssertionError("no eligible run should be charged")),
     )
     assert billing_retry.retry_completion_charges_once() == 0
-
-
-def test_sweep_never_charges_partial_multiseed_attach_run(monkeypatch, tmp_path):
-    """Regression for the over-charge the artifacts_dir anchor caused: attach_run sets `artifacts_dir`
-    and a partial per-seed `cost_usd` for a multi-seed run while it is still `running` after recovering
-    ONE intermediate seed (deploy.py:232-238). That run has NOT finished all training, so the sweep
-    must NEVER charge it -- charging would bill a partial amount and pre-empt the real final charge.
-    The same holds if that partial run is then cancelled mid-recovery (still `pending`, no charge
-    attempt). The conservative predicate (state in {done,deployed} OR billing_state in
-    {charging,failed}) leaves both alone."""
-    import flash.runner as runner
-
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-
-    # mid-recovery: one seed done so artifacts_dir + partial cost are set, but still running
-    runner._save_status(
-        runner.RunStatus(
-            run_id="partial-running",
-            state="running",
-            spec=_spec().to_dict(),
-            cost_usd=0.5,
-            artifacts_dir="/results/runpod/rl/partial-running",
-            resume_seed_index=1,
-            billing_context={"org_id": "org-A"},
-            billing_state="pending",
-        )
-    )
-    # the same partial run cancelled mid-recovery: artifacts_dir set, charge never attempted
-    runner._save_status(
-        runner.RunStatus(
-            run_id="partial-cancelled",
-            state="cancelled",
-            spec=_spec().to_dict(),
-            cost_usd=0.5,
-            artifacts_dir="/results/runpod/rl/partial-cancelled",
-            billing_context={"org_id": "org-A"},
-            billing_state="pending",
-        )
-    )
-
-    monkeypatch.setattr(
-        "flash.server.billing.charge_completed_run",
-        lambda **_: (_ for _ in ()).throw(
-            AssertionError("a partial multi-seed run must not be charged")
-        ),
-    )
-    assert billing_retry.retry_completion_charges_once() == 0
-    assert runner.get_status("partial-running").billing_state == "pending"
-    assert runner.get_status("partial-cancelled").billing_state == "pending"
 
 
 def test_sweep_charges_completed_then_cancelled_run(monkeypatch, tmp_path):
