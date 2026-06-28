@@ -372,7 +372,16 @@ def _validate_slug(slug: str) -> tuple[str, str]:
     for segment in parts:
         if segment in {".", ".."} or not _SLUG_SEGMENT_RE.match(segment):
             raise EnvPublishError(f"invalid env id segment: {segment!r}")
-    return parts[0], parts[1]
+    namespace, name = parts
+    # The delete path runs `git rm -r -- <namespace>/<name>` directly against the hub checkout, so
+    # the top-level path component (the namespace) must never be a repo-control directory. Publish
+    # blocks these same names from environment packages (_safe_extract); apply the SAME guard here
+    # because an internal-key delete bypasses the namespace-ownership check in delete_package — this
+    # validator is then the only barrier, and a request like `DELETE /v1/envs/.github/workflows`
+    # would otherwise remove tracked repo infrastructure.
+    if namespace in _BLOCKED_TOP_LEVEL_PATHS:
+        raise EnvPublishError(f"invalid env id segment: {namespace!r}")
+    return namespace, name
 
 
 def _staged_has_changes(checkout: Path) -> bool:
