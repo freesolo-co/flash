@@ -261,8 +261,11 @@ def deployed_repo_ids() -> tuple[set[str], bool]:
     """The HF repo ids serving is currently loading adapters from (the live keep-set), plus a
     ``complete`` flag.
 
-    ``complete`` is ``False`` when a live record could NOT be mapped to a repo id (missing
-    ``repoId``/``repo_id`` — a schema drift). The two callers treat that differently:
+    ``complete`` is ``False`` when a live record could NOT be mapped to a repo id — either the
+    ``repoId``/``repo_id`` key is missing, or it carries a truthy but non-string / blank value from
+    schema drift (``str()``-ifying that would add a token that can't match the real
+    ``Freesolo-Co/flashrun-*`` id, so the live repo would look un-deployed and become delete-
+    eligible). The two callers treat that differently:
     destructive tiers (``--checkpoints``/``--repos``) abort on an incomplete set (an unidentifiable
     live repo could be deleted), while the serving-safe ``--code`` purge proceeds with the
     best-effort set — it still protects every identifiable deployed repo, and code/flash is never
@@ -274,10 +277,13 @@ def deployed_repo_ids() -> tuple[set[str], bool]:
     complete = True
     for rec in deploy.list_deployed_adapters():
         repo = rec.get("repoId") or rec.get("repo_id")
-        if not repo:
+        # Fail closed on anything that isn't a usable repo-id string — a missing key OR a truthy
+        # non-string/blank value (schema drift). NOT `str(repo)`: that would coerce e.g. a dict/int
+        # into a token that can never match the real Freesolo-Co/flashrun-* id, masking a live repo.
+        if not isinstance(repo, str) or not repo.strip():
             complete = False  # an unidentifiable live repo — caller decides whether to abort
             continue
-        ids.add(str(repo))
+        ids.add(repo)
     return ids, complete
 
 
