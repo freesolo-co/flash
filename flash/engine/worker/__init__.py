@@ -74,6 +74,7 @@ from flash.engine.worker.finalize import write_train_meta
 from flash.engine.worker.gpu_setup import (
     finalize_alloc_conf_for_sleep,
     force_vllm_backend_for_sm120,
+    patch_trl_colocate_llm_kwargs,
 )
 from flash.engine.worker.grpo import (
     _grpo_is_no_op_failure,
@@ -535,6 +536,7 @@ __all__ = [
     "assert_lora_applied",
     "build_grpo_prompt_dataset",
     "compute_grpo_batching",
+    # gpu/backend setup
     "disable_liger_grpo_torch_compile",
     "error_artifact_name",
     "finalize_alloc_conf_for_sleep",
@@ -564,6 +566,7 @@ __all__ = [
     "make_sft_heartbeat_callback",
     "optimal_attn_impl",
     "patch_grpo_mask_aware_lm_head",
+    "patch_trl_colocate_llm_kwargs",
     "patch_vllm_language_model_only",
     "patch_vllm_lm_weight_sync",
     "prefetch_model",
