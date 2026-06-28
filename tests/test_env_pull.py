@@ -926,6 +926,38 @@ def test_merge_into_dir_rolls_back_earlier_children_on_later_failure(monkeypatch
     assert not any(p.name.startswith(".flash-env-merge-") for p in tmp_path.iterdir())
 
 
+def test_merge_journal_rollback_keeps_scratch_when_a_remove_undo_fails(monkeypatch, tmp_path):
+    # Rollback is all-or-nothing across BOTH undo kinds. If undoing a CREATED child fails (an OSError
+    # removing the freshly-created path), the destination is NOT back to its pre-merge state, so the
+    # scratch must be KEPT as the signal -- a swallowed "remove" failure previously dropped the scratch
+    # and reported a clean rollback while leaving the new file/dir behind.
+    journal = adapter._MergeJournal(tmp_path)
+    # a REPLACED child: an existing file moved aside (recorded as a "restore")
+    replaced = tmp_path / "environment.py"
+    replaced.write_text("ORIG")
+    journal.back_up(replaced)  # moves it into the scratch; the replaced path is now absent
+    assert journal._scratch is not None
+    assert journal._scratch.exists()
+    # a CREATED child: a brand-new path the merge produced (recorded as a "remove")
+    created = tmp_path / "datasets"
+    created.mkdir()
+    journal.record_created(created)
+
+    real_rm = adapter._rm_path
+
+    def boom_on_created(p):
+        if p.name == "datasets":
+            raise OSError("cannot remove")
+        real_rm(p)
+
+    monkeypatch.setattr(adapter, "_rm_path", boom_on_created)
+    journal.rollback()  # reverse order: the "remove" fails first, then the "restore" succeeds
+    assert replaced.read_text() == "ORIG"  # the user's original was restored from the scratch
+    assert created.exists()  # the stray created path genuinely remains (the remove really failed)
+    # because the rollback was NOT clean, the scratch is retained (not silently dropped)
+    assert journal._scratch.exists()
+
+
 def test_pull_rechecks_destination_after_download_window(monkeypatch, tmp_path):
     # TOCTOU: the no-overwrite refusal must hold ACROSS the download window. If ``dest`` is created
     # while the tarball is downloading, a no-``--force`` pull must still refuse rather than clobber it.
