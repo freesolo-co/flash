@@ -86,7 +86,10 @@ class FakeApi:
 
     def __init__(self, datasets: list[_DS], info_lm: dict | None = None):
         self._datasets = datasets
-        self._info_lm = info_lm or {}  # repo_id -> last_modified for the repo_info fallback
+        # repo_id -> last_modified the repo_info call returns: defaults to each dataset's own value,
+        # overridden by info_lm (used both for the listing lm-fallback AND the per-delete re-stat).
+        self._info_lm = {ds.id: ds.last_modified for ds in datasets}
+        self._info_lm.update(info_lm or {})
         self.deleted: list[str] = []
 
     def list_datasets(self, author=None):
@@ -176,6 +179,20 @@ def test_sweep_deletes_only_old_undeployed(monkeypatch):
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
     assert n == 1
     assert api.deleted == [f"{NS}/flashrun-old-undeployed"]
+
+
+def test_sweep_rechecks_age_and_spares_repo_refreshed_since_enumeration(monkeypatch):
+    # A repo old at enumeration but REFRESHED before its delete (e.g. a cross-plane warm-start run
+    # wrote a reference marker, bumping last_modified) must be spared by the per-delete re-stat.
+    rid = f"{NS}/flashrun-refreshed"
+    api = FakeApi(
+        [_DS(rid, _days_ago(45))],     # enumerated as old -> a delete target
+        info_lm={rid: _days_ago(1)},   # but the per-delete re-stat sees it freshly bumped
+    )
+    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 0
+    assert api.deleted == []
 
 
 def test_dry_run_deletes_nothing(monkeypatch):
