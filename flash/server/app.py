@@ -40,6 +40,7 @@ from ._runtime import (
     _charge_retry_loop,
     _charge_retry_startup,
     _reconcile_cost_loop,
+    _repo_cleanup_loop,
     _worker_artifacts,
     recover_runs,
 )
@@ -64,6 +65,7 @@ __all__ = [
     "_charge_retry_startup",
     "_deploy_lock",
     "_reconcile_cost_loop",
+    "_repo_cleanup_loop",
     "_worker_artifacts",
     "create_app",
     "deploy_adapter",
@@ -86,7 +88,7 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
     from its spec, so a run is covered even in the submit -> handle-persisted window.
 
     ``include_terminal=False`` yields the PROTECTED set (live, non-terminal runs only) — endpoints
-    the reaper must never delete, even when momentarily idle between seeds. ``include_terminal=True``
+    the reaper must never delete, even when momentarily idle. ``include_terminal=True``
     yields the KNOWN set (every run this plane has a record of) — used to SCOPE the reaper to this
     plane's own endpoints (multi-plane safety; see ``_sweep_idle_flash_endpoints``)."""
     from flash.providers.base import canonical_gpu
@@ -165,8 +167,8 @@ async def _reap_idle_endpoints_loop() -> None:
 
 # Run states that may still OWN a live, billing training instance, so their provider instances must
 # be PROTECTED from the orphan sweep. Deliberately EXCLUDES ``deployed``: a run only reaches
-# ``deployed`` after it went ``done`` (the seed loop's ``finally`` already tore every training
-# instance down), so a deployed run owns no training worker — keeping it in the protection set would
+# ``deployed`` after it went ``done`` (which already tore its training instance down), so a deployed
+# run owns no training worker — keeping it in the protection set would
 # instead SHIELD a genuine leaked instance under its prefix from the sweep (the very thing the sweep
 # exists to reap). Terminal states are excluded for the same reason. This is exactly ``_RECOVERABLE``
 # — a run is recoverable on restart iff it may still have an in-flight worker — so it is ALIASED
@@ -182,7 +184,7 @@ def _active_run_ids() -> set[str]:
     *names*).
 
     Why this is a safe protection set with no idle grace: a run's status is flipped to an
-    instance-owning state BEFORE its first instance is ever launched (``_run_seed_loop`` writes
+    instance-owning state BEFORE its first instance is ever launched (``_run_training`` writes
     ``running`` ahead of ``_submit_seed_supervised``), and the launched instance is torn down BEFORE
     the run can leave these states for ``done``/``deployed``/terminal (the provider lifecycle's
     ``finally``). So a billed instance exists ONLY while its run is in this set — ownership is a
@@ -303,6 +305,7 @@ def create_app():
         from flash.providers.preflight import check_run_preflight
         from flash.server.billing_retry import charge_retry_enabled
         from flash.server.reconcile import reconcile_enabled
+        from flash.server.repo_cleanup import repo_cleanup_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
@@ -346,10 +349,17 @@ def create_app():
             if _instance_providers_configured()
             else None
         )
+        # Periodic repo GC: delete per-run HF artifact repos that aren't currently deployed once
+        # they pass the fixed 30-day age, reclaiming the operator org's private-storage quota. Runs
+        # wherever an operator HF_TOKEN is configured; each sweep fails closed (deletes nothing) if
+        # the serving live set can't be confirmed.
+        repo_gc_task = (
+            asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
+        )
         try:
             yield
         finally:
-            for task in (startup_charge_task, cost_task, charge_task, reap_task, sweep_task):
+            for task in (startup_charge_task, cost_task, charge_task, reap_task, sweep_task, repo_gc_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):

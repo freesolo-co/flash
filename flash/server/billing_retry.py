@@ -62,15 +62,16 @@ def _needs_charge(status: runner.RunStatus) -> bool:
     stays ineligible: a run that never trained is never charged.
 
     KNOWN RESIDUAL LEAK (intentionally NOT closed here): a run that completed ALL training but whose
-    FIRST charge attempt never ran (e.g. attach_run completes the last seed via deploy.py:255 without
-    the inline charge, so billing_state stays `pending`) and is THEN deployed and cancelled ends up
-    `cancelled`+`pending` and is skipped. It cannot be safely recovered without wrongly charging a
-    PARTIAL multi-seed run: attach_run also writes `artifacts_dir`/partial `cost_usd` for an
-    intermediate seed while still `running` (deploy.py:232-238), so no durable field distinguishes
-    "fully completed then cancelled" from "one seed recovered, still running, then cancelled" once the
-    state is overwritten by cancel. Closing this needs a new persistent "training completed" column
-    (set ONLY at the terminal done hook, lifecycle.py:551). Flagged for a schema follow-up; charging
-    a partial/incomplete run is worse than this narrow leak, so the predicate stays conservative."""
+    FIRST charge attempt never ran (e.g. attach_run finishes the run without the inline charge, so
+    billing_state stays `pending`) and is THEN deployed and cancelled ends up `cancelled`+`pending`
+    and is skipped. Post multi-seed-removal, `artifacts_dir`/`cost_usd` are written ONLY at the
+    terminal `done` hook (deploy.py attach_run + lifecycle.py), never mid-`running` -- so in principle
+    a `cancelled`+`pending` run that HAS `artifacts_dir` set provably reached `done` and could be
+    recovered, while one without it never completed (no separate "training completed" column is
+    needed -- `artifacts_dir` already is that durable marker). Gating the predicate on that changes
+    who gets charged, so it is deliberately left as a billing-reviewed follow-up rather than bundled
+    into cleanup; charging a partial/incomplete run is worse than this narrow leak, so the predicate
+    stays conservative."""
     if not status.billing_context:
         return False
     if status.billing_state == "charged":

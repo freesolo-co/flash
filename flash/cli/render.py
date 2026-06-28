@@ -1,10 +1,4 @@
-"""Human-facing rendering for `flash login` / `flash whoami` (stdlib only).
-
-The identity behind a stored key is shown as a small aligned card instead of raw
-``json.dumps`` output. ANSI styling and unicode glyphs are applied only when stdout is
-an interactive terminal that can encode them; piped, captured, or ASCII-locale output
-stays plain so it can be grepped or parsed and never raises ``UnicodeEncodeError``.
-"""
+"""Human-facing rendering for flash CLI commands (stdlib only)."""
 
 from __future__ import annotations
 
@@ -13,8 +7,6 @@ import sys
 
 from flash._channel import CLI_NAME
 
-# Identity fields the control plane may return (flash/server/app.py `/v1/me`), in the
-# order we show them. ``key_prefix``/``kind`` render separately on the key line.
 _ROWS = (
     ("email", "account"),
     ("org_id", "org"),
@@ -30,7 +22,7 @@ _KIND_LABEL = {
 
 
 def _flag(name: str) -> bool | None:
-    """Tri-state read of an env flag: True/False when set to a recognizable value, else None."""
+    """Tri-state env flag read: True/False when recognized, None otherwise."""
     raw = os.environ.get(name)
     if raw is None:
         return None
@@ -39,15 +31,11 @@ def _flag(name: str) -> bool | None:
         return True
     if val in {"", "0", "false", "no", "off"}:
         return False
-    # Unrecognized value (e.g. a typo): stay tri-state None so styled() falls back to isatty
-    # rather than silently forcing the theme on.
     return None
 
 
 def styled() -> bool:
-    """Whether to render the themed human layout (tables, badges, panels) instead of the plain
-    machine form. True on an interactive stdout; ``FLASH_STYLE=1``/``0`` forces it on or off
-    (used to render the docs preview, and to keep output deterministic in scripts)."""
+    """Whether to render the themed layout. ``FLASH_STYLE=1``/``0`` forces it; else uses isatty."""
     forced = _flag("FLASH_STYLE")
     if forced is not None:
         return forced
@@ -55,7 +43,7 @@ def styled() -> bool:
 
 
 def _color() -> bool:
-    """Whether ANSI color may be emitted: the themed layout, minus a NO_COLOR / dumb-terminal opt-out."""
+    """Themed layout minus NO_COLOR / dumb-terminal opt-outs."""
     return styled() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
 
 
@@ -64,7 +52,7 @@ def _style(code: str, text: str) -> str:
 
 
 def _glyph(unicode_glyph: str, ascii_fallback: str) -> str:
-    """Use the unicode glyph only if stdout can encode it (else an ASCII stand-in)."""
+    """Unicode glyph when stdout can encode it, else ASCII fallback."""
     enc = sys.stdout.encoding or "ascii"
     try:
         unicode_glyph.encode(enc)
@@ -73,9 +61,6 @@ def _glyph(unicode_glyph: str, ascii_fallback: str) -> str:
     return unicode_glyph
 
 
-# Common unicode punctuation we'd rather downgrade to a readable ASCII stand-in than to an
-# escape sequence when stdout can't encode it (e.g. an ASCII/non-UTF-8 locale). Written as
-# escapes so the source stays free of confusable characters.
 _ASCII_PUNCT = {
     0x2014: "-",  # em dash
     0x2013: "-",  # en dash
@@ -87,13 +72,7 @@ _ASCII_PUNCT = {
 
 
 def _safe(text: str) -> str:
-    """Guarantee ``text`` can be printed under the current stdout encoding.
-
-    Identity values from ``/v1/me`` (e.g. an internationalized email) or punctuation in our
-    own copy must never make ``print()`` raise ``UnicodeEncodeError`` after a login has
-    already succeeded. On a normal UTF-8 terminal the text is returned unchanged; only when
-    the active encoding can't represent it do we downgrade punctuation and escape the rest.
-    """
+    """Ensure text is printable under the current stdout encoding without UnicodeEncodeError."""
     enc = sys.stdout.encoding or "ascii"
     try:
         text.encode(enc)
@@ -123,7 +102,6 @@ def format_identity(me: dict) -> str:
 def login_ok(me: dict | None) -> str:
     head = f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {_bold('logged in to flash')}"
     if not me:
-        # The key is verified and stored; we just couldn't fetch the account card right now.
         return _safe(
             f"{head}\n{_dim('  account details unavailable right now — run `flash whoami` later')}"
         )
@@ -141,6 +119,27 @@ def login_failed(reason: str) -> str:
         f"  {_dim('then run `flash login --api-key <key>` to try again')}\n"
         f"  {_dim('if it keeps failing, email founders@freesolo.co')}"
     )
+
+
+def error(msg: str) -> str:
+    """Themed twin of the plain ``error: {msg}`` line — the red ✗ idiom of ``login_failed``, used
+    by main()'s catch-all so every command's failure is styled on a TTY, not just ``flash login``.
+    The machine path keeps the plain ``error: {msg}`` prefix that scripts and tests match on."""
+    mark = _paint(_glyph("✗", "x:"), _RED, "1")
+    return _safe(f"{mark} {_paint('error:', _RED, '1')} {msg}")
+
+
+def warn(msg: str) -> str:
+    """A themed warning (amber ⚠) — distinct from the red error idiom: the command still
+    proceeds or succeeded. Machine path keeps the plain ``warning: {msg}`` text."""
+    mark = _paint(_glyph("⚠", "!"), _AMBER, "1")
+    return _safe(f"{mark} {_paint('warning:', _AMBER, '1')} {msg}")
+
+
+def note(msg: str) -> str:
+    """A quiet, dimmed line for transient progress / info (e.g. ``exporting ...``). The
+    machine path prints the same text undimmed."""
+    return _safe(_dim(msg))
 
 
 # These renderers are only ever called when `styled()` is true (an interactive stdout, or
@@ -166,9 +165,10 @@ _PALETTE: dict[str, dict[str, tuple[str, int]]] = {
     "violet": {"dark": ("9a8cff", 105), "light": ("6d28d9", 92)},  # JSON literals
     "gray": {"dark": ("8a93a8", 245), "light": ("5b6472", 242)},  # neutral
     "faint": {"dark": ("4d5470", 240), "light": ("9aa1b5", 248)},  # rules, punctuation
+    "amber": {"dark": ("ffb454", 215), "light": ("b45309", 130)},  # warnings (non-fatal)
 }
 # semantic handles used throughout the renderers (resolved per mode at paint time)
-_ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT = (
+_ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT, _AMBER = (
     "accent",
     "accent2",
     "green",
@@ -177,18 +177,17 @@ _ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT = (
     "violet",
     "gray",
     "faint",
+    "amber",
 )
 
 
 def _truecolor() -> bool:
-    """Whether the terminal advertises 24-bit color (so we can emit exact brand hex)."""
+    """Whether the terminal supports 24-bit color."""
     return os.environ.get("COLORTERM", "").lower() in {"truecolor", "24bit"}
 
 
 def _theme() -> str:
-    """Active theme: ``light`` or ``dark``. ``FLASH_THEME`` wins; otherwise a light terminal
-    background (via the de-facto ``COLORFGBG`` env) selects light. Defaults to ``dark`` (the
-    safe default for the colors, and unchanged behavior when nothing is set)."""
+    """Active theme: ``light`` or ``dark``. ``FLASH_THEME`` overrides; else inferred from ``COLORFGBG``."""
     forced = os.environ.get("FLASH_THEME", "").strip().lower()
     if forced in {"light", "dark"}:
         return forced
@@ -198,14 +197,12 @@ def _theme() -> str:
             bg = int(fgbg.split(";")[-1])
         except ValueError:
             return "dark"
-        # ANSI bg 7 (light grey) and 11-15 (bright/white) mean a light terminal background
         return "light" if bg == 7 or bg >= 11 else "dark"
     return "dark"
 
 
 def _sgr(part: str) -> str:
-    """Resolve one style token to an SGR parameter: a brand color name resolves to a truecolor
-    or 256-color foreground for the active theme; any other code (e.g. ``"1"``) passes through."""
+    """Resolve a style token: brand color name → SGR foreground for the active theme; others pass through."""
     color = _PALETTE.get(part)
     if color is None:
         return part
@@ -216,13 +213,12 @@ def _sgr(part: str) -> str:
 
 
 def _paint(text: str, *codes: str) -> str:
-    """Apply one or more style tokens (raw SGR codes and/or brand color names), honoring the gate."""
+    """Apply style tokens (SGR codes and/or brand color names)."""
     if not codes or not _color():
         return text
     return f"\x1b[{';'.join(_sgr(c) for c in codes)}m{text}\x1b[0m"
 
 
-# state -> (color, unicode dot, ascii dot) for status badges
 _STATE_STYLE: dict[str, tuple[str, str, str]] = {
     "queued": (_GRAY, "○", "o"),
     "provisioning": (_TEAL, "◐", "o"),
@@ -234,6 +230,9 @@ _STATE_STYLE: dict[str, tuple[str, str, str]] = {
     "error": (_RED, "●", "*"),
     "cancelled": (_GRAY, "●", "*"),
     "canceled": (_GRAY, "●", "*"),
+    "cancelling": (_GRAY, "◐", "o"),
+    "deploying": (_TEAL, "◐", "o"),
+    "torn_down": (_GRAY, "○", "o"),
     "dry_run": (_ACCENT2, "○", "o"),
 }
 
@@ -290,8 +289,7 @@ def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
 
 
 def _table(headers: list[str], rows: list[list], aligns: list[str] | None = None) -> str:
-    """Aligned table with a dim header and faint underline. Each cell is a plain string or a
-    ``(text, *sgr_codes)`` tuple; widths come from the plain text so color never skews them."""
+    """Aligned table; cells are plain strings or ``(text, *sgr_codes)`` tuples."""
     aligns = aligns or ["l"] * len(headers)
     cols = len(headers)
 
@@ -323,8 +321,7 @@ def _table(headers: list[str], rows: list[list], aligns: list[str] | None = None
 
 
 def _json(obj) -> str:
-    """Pretty JSON: plain ``json.dumps(indent=2)`` when color is off (byte-identical to the
-    legacy output), syntax-highlighted when it's on. No data is ever dropped."""
+    """Pretty JSON: plain when color is off, syntax-highlighted when on."""
     import json
 
     if not _color():
@@ -360,9 +357,6 @@ def _color_json(obj, depth: int) -> str:
     return _paint(json.dumps(obj), _GREEN)
 
 
-# Per-command renderers (themed view only; the command supplies the data).
-
-
 def version(value: str) -> str:
     """The wordmark + version."""
     mark = _paint(CLI_NAME, _ACCENT, "1")
@@ -394,6 +388,15 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
+def _run_where(spec: dict, remote: dict) -> tuple[str, str]:
+    """Return ``(gpu, provider)`` from remote (preferred) or spec fallback."""
+    provider = remote.get("provider") or (
+        "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
+    )
+    gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+    return gpu, provider
+
+
 def runs_table(runs: list[dict]) -> str:
     """Runs list: state badges + cost, newest first."""
     body = []
@@ -401,11 +404,7 @@ def runs_table(runs: list[dict]) -> str:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        remote = r.get("remote") or {}
-        provider = remote.get("provider") or (
-            "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
-        )
-        gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+        gpu, provider = _run_where(spec, r.get("remote") or {})
         where = f"{gpu}@{provider}" if provider else gpu
         color, uni, ascii_dot = _STATE_STYLE.get(str(r.get("state", "")).lower(), (_GRAY, "•", "-"))
         body.append(
@@ -441,6 +440,20 @@ def deployments_table(rows: list[dict]) -> str:
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
+def checkpoints_table(run_id: str, rows: list[dict]) -> str:
+    """Deployable per-step RL checkpoints: the step number + the stable repo path it lives at."""
+    body = [
+        [
+            (str(c.get("step", "")), _TEAL),
+            (f"{c.get('repo_id', '')}:{c.get('subfolder', '')}", _ACCENT2),
+        ]
+        for c in sorted(rows, key=lambda c: c.get("step", 0))
+    ]
+    table = _table(["STEP", "CHECKPOINT"], body, aligns=["r", "l"])
+    foot = arrow(f"deploy one with: flash deploy {run_id} --step <STEP>")
+    return _safe(f"{header('checkpoints', f'{len(rows)} deployable')}\n{table}\n\n{foot}")
+
+
 def empty(cmd: str, desc: str, message: str) -> str:
     """A styled empty state (e.g. no runs yet)."""
     return _safe(f"{header(cmd, desc)}\n{_dim('  ' + message)}")
@@ -458,10 +471,8 @@ def _humanize_ts(value) -> str | None:
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
-    remote = obj.get("remote") or {}
-    gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type")
-    provider = remote.get("provider")
-    where = f"{gpu} @ {provider}" if gpu and provider else gpu
+    gpu, provider = _run_where(spec, obj.get("remote") or {})
+    where = f"{gpu} @ {provider}" if gpu and provider else (gpu or None)
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),
@@ -486,7 +497,11 @@ def run_status(obj: dict) -> str:
 
 
 def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
-    """Header (+ state badge when present) over syntax-highlighted JSON. Lossless."""
+    """Header (+ state badge when present) over syntax-highlighted JSON. Lossless.
+
+    Used for `flash train --dry-run` / `--background`, where the full validated spec is the
+    point. The run-lifecycle mutations (cancel/deploy/undeploy/export) instead use the curated
+    confirmation cards below — their machine path still emits the full JSON for scripts."""
     parts = [header(cmd, desc)]
     if isinstance(obj, dict) and obj.get("state"):
         rid = obj.get("run_id")
@@ -496,6 +511,69 @@ def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
         parts.append(line + "\n")
     parts.append(_json(obj))
     return _safe("\n".join(parts))
+
+
+# Run-lifecycle mutation confirmations — the curated `✓ ... + detail card` idiom (same as
+# login_ok / env_published), not a raw JSON dump. The machine path keeps json.dumps untouched.
+
+
+def cancelled(payload: dict) -> str:
+    """`flash cancel`: a green confirmation only when the run actually flips to `cancelled`. A
+    no-op cancel of an already-terminal run (done/failed/dry_run) shows a neutral "already ..."
+    line instead, so a finished or failed run is never dressed up as a fresh cancellation."""
+    state = payload.get("state", "cancelled")
+    rid = _paint(payload.get("run_id", ""), _ACCENT2)
+    if state == "cancelled":
+        head = ok(f"cancel requested for {rid}")
+    else:
+        head = note(f"{payload.get('run_id', '')} already {state} — nothing to cancel")
+    return _safe(f"{head}\n  {badge(state)}")
+
+
+def deployed(dep: dict) -> str:
+    """`flash deploy`: the endpoint, gpu, and serving url as an aligned card (not a JSON dump)."""
+    pairs = [
+        ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
+        ("endpoint", _paint(dep["endpoint_name"], _GREEN) if dep.get("endpoint_name") else None),
+        ("gpu", dep.get("gpu")),
+        ("url", _paint(dep["url"], _ACCENT2) if dep.get("url") else None),
+    ]
+    state = dep.get("state", "deployed")
+    if state == "dry_run":
+        # a dry run validates and shapes the deployment without creating one, so don't dress it
+        # up as a successful deploy — a neutral validation line instead of the green ✓.
+        head = note(
+            f"validated {_paint(dep.get('run_id', ''), _ACCENT2)} (dry run — nothing deployed)"
+        )
+    elif state == "deployed":
+        head = ok("deployed")
+    else:
+        head = f"{ok('deploy')}  {badge(state)}"
+    return _safe(f"{head}\n{_kv(pairs)}")
+
+
+def undeployed(result: dict) -> str:
+    """`flash undeploy`: confirm the run's serving deployment was torn down. The server clears the
+    deployment record idempotently (an already-absent serving adapter that 404s still counts as a
+    teardown), and the response can't distinguish that from a true no-op, so we always confirm;
+    when the serving backend actually deregistered endpoints we name them."""
+    rid = _paint(result.get("run_id", ""), _ACCENT2)
+    deleted = result.get("deleted_endpoints") or []
+    line = ok(f"torn down {rid}")
+    if deleted:
+        line += "\n" + _dim(f"  deregistered {', '.join(deleted)}")
+    return _safe(line)
+
+
+def exported(result: dict) -> str:
+    """`flash export`: where the adapter landed on HuggingFace, as an aligned card."""
+    pairs = [
+        ("adapter", _paint(result.get("adapter_id", ""), _ACCENT2)),
+        ("repo", _paint(result.get("repository", ""), _ACCENT2)),
+        ("url", _paint(result["url"], _ACCENT2) if result.get("url") else None),
+        ("visibility", "private" if result.get("private") else "public"),
+    ]
+    return _safe(f"{ok('exported to HuggingFace')}\n{_kv(pairs)}")
 
 
 def cost_panel(est) -> str:
@@ -551,40 +629,30 @@ def env_setup(paths: list[str]) -> str:
     return _safe(f"{head}\n{tree}\n\n{nxt}")
 
 
-def env_list(installed: list[str], local: list[str]) -> str:
-    parts = [header("env list", "installed + local environments")]
-    if installed:
-        parts.append(_paint("installed", _GRAY, "1"))
-        parts.extend(
-            f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(e, _ACCENT2)}" for e in installed
-        )
+def env_list(local: list[str]) -> str:
+    parts = [header("env list", "local environments")]
     if local:
-        if installed:
-            parts.append("")
         parts.append(
             _paint("local sources", _GRAY, "1")
             + _dim("  (publish with flash env push --name <name> <path>)")
         )
         parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
-    if not installed and not local:
+    else:
         parts.append(_dim("  no environments yet — scaffold one with `flash env setup`"))
     return _safe("\n".join(parts))
 
 
-def env_installed(env_id: str, manifest: str) -> str:
-    snippet = f'[environment]\nid = "{env_id}"'
-    body = "\n".join(f"  {_paint(line, _ACCENT2)}" for line in snippet.splitlines())
-    return _safe(
-        f"{ok(f'recorded {_bold(env_id)}')}\n"
-        f"{_dim(f'  manifest: {manifest}')}\n\n"
-        f"{_dim('use it in your config:')}\n{body}"
-    )
-
-
 def chat_label() -> str:
-    """A faint speaker label printed above a styled chat reply (the reply itself stays plain
-    text so a piped transcript is unchanged)."""
+    """Speaker label printed above a styled chat reply."""
     return _paint("assistant", _ACCENT2, "1")
+
+
+def log_section(name: str) -> str:
+    """A themed divider above a passthrough worker-log section in `flash status --logs` — the same
+    idiom as chat_label sitting above a raw chat reply (the log body stays raw). The machine path
+    keeps the plain ``----- name -----`` divider that scripts and tests match on."""
+    rule = _paint(_glyph("─", "-") * 3, _FAINT)
+    return _safe(f"{rule} {_paint(name, _ACCENT2, '1')} {rule}")
 
 
 def env_published(slug: str) -> str:
@@ -593,3 +661,51 @@ def env_published(slug: str) -> str:
     return _safe(
         f"{ok(f'published {_bold(slug)}')}\n\n{_dim('reference it in your config:')}\n{body}"
     )
+
+
+def env_pulled(dest: str, detail: str = "") -> str:
+    line = ok(f"pulled {_bold(dest)}")
+    if detail:
+        line += f"\n{_dim(f'  {detail}')}"
+    return _safe(line)
+
+
+def help_page(
+    tagline: str,
+    usage: str,
+    groups: list[tuple[str, list[tuple[str, str]]]],
+    options: list[tuple[str, str]],
+    footers: list[str],
+) -> str:
+    """The themed ``flash --help`` page — the styled twin of argparse's flat default.
+
+    Mirrors the rest of the CLI: brand banner + faint rule (like ``header``), dim-bold
+    section titles (like ``env_list``), accent command names with dimmed summaries (like
+    ``env_setup``), and ``arrow`` next-step hints. Commands arrive pre-grouped as
+    ``(title, [(command, summary)])`` so the workflow ordering lives with the parser, not
+    here. Only ever called on the styled path; piped/scripted ``--help`` keeps argparse's
+    plain text (see ``flash.cli._FlashParser``), so existing greps stay byte-for-byte.
+    """
+    mark = _paint(CLI_NAME, _ACCENT, "1")
+    banner = f"{mark}  {_paint(tagline, _GRAY)}"
+    usage_line = f"{_dim('usage:')} {_paint(usage, _GRAY)}"
+    # one name-column width across every group AND the options block, so every summary lines up
+    # down the whole page (same single-shared-width discipline as _table).
+    names = [name for _, rows in groups for name, _ in rows] + [flag for flag, _ in options]
+    width = max((len(n) for n in names), default=0)
+
+    def section(title: str, rows: list[tuple[str, str]]) -> str:
+        head = _paint(title, _GRAY, "1")
+        body = "\n".join(
+            f"  {_paint(name.ljust(width), _ACCENT2)}  {_dim(summary)}" for name, summary in rows
+        )
+        return f"{head}\n{body}"
+
+    blocks = [section(title, rows) for title, rows in groups]
+    blocks.append(section("options", options))
+
+    body = "\n\n".join(blocks)
+    foot = "\n".join(arrow(line) for line in footers)
+    # trailing newline so the styled page matches argparse's newline-terminated help (argparse
+    # writes format_help() verbatim via print_help, with no print() to add one).
+    return _safe(f"{banner}\n{_rule()}\n{usage_line}\n\n{body}\n\n{foot}\n")
