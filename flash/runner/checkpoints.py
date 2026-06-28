@@ -18,7 +18,7 @@ from flash.runner import adapter_prefix
 from flash.spec import JobSpec
 
 # The PEFT weights file a step must carry (alongside adapter_config.json) to be servable.
-_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors", "adapter_model.bin"})
+_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors"})
 
 
 def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:
