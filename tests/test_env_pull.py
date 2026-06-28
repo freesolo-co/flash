@@ -71,11 +71,17 @@ def test_download_environment_file_uses_raw_media_type(monkeypatch):
     captured: dict[str, object] = {}
     payload = b'{"prompt":"x","answer":"y"}\n' * 100_000
 
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
     def fake_urlopen(req, timeout):
         captured["url"] = req.full_url
         captured["accept"] = req.headers.get("Accept")
-        return io.BytesIO(payload)
-
+        return _Resp(payload)
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
