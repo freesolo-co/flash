@@ -1,12 +1,29 @@
 """CPU test for ``colocate_kv_util`` — the need-based vLLM KV-pool utilization for colocated GRPO.
 
 ``gpu_memory_utilization`` is vLLM's whole model-executor budget (weights + KV), so the helper budgets
-both, scales the KV with context + the generation group, and caps the utilization at 0.45.
+both, scales the KV with context + the generation group, and caps the utilization at 0.45 (lifted to
+0.55 only for the big-card + big-weight colocate regime, e.g. the 35B MoE on a 180 GB B200, where the
+flat 0.45 demonstrably starved the KV pool).
 """
 
 from __future__ import annotations
 
 from flash.engine.vram import _KV_CAP, _resident_kv_gb, colocate_kv_util
+
+
+def test_fp8_kv_halves_the_resident_kv_estimate():
+    # fp8 KV (e4m3, cc>=8.9) halves the bytes/token, so the same token working set needs HALF the pool.
+    bf16 = _resident_kv_gb(3.0, 4096, num_generations=8)
+    fp8 = _resident_kv_gb(3.0, 4096, num_generations=8, fp8_kv=True)
+    assert fp8 == bf16 * 0.5
+
+
+def test_fp8_kv_lowers_the_colocate_budget():
+    # With fp8 KV the KV term is half, so the budgeted utilization drops (frees the over-reserved pool)
+    # -- on the big colocate regime (35B on a 180 GB B200) this is what makes a longer ctx fit resident.
+    u_bf16 = colocate_kv_util(35.0, 4096, 179.0, sleep_mode=False, num_generations=8)
+    u_fp8 = colocate_kv_util(35.0, 4096, 179.0, sleep_mode=False, num_generations=8, fp8_kv=True)
+    assert u_fp8 < u_bf16
 
 
 def test_validated_4b_config_is_025():
@@ -68,6 +85,31 @@ def test_non_sleep_bigger_model_gets_a_bigger_budget():
 def test_caps_at_045_on_small_or_weight_heavy_configs():
     assert colocate_kv_util(4.0, 2048, 32.0, sleep_mode=True, num_generations=8) == 0.45  # small card
     assert colocate_kv_util(9.0, 2048, 80.0, sleep_mode=True, num_generations=8) == 0.45  # weight-heavy
+
+
+def test_big_card_big_weight_colocate_lifts_cap_to_055():
+    # The 35B MoE colocate on a 180 GB B200 (70 GB vLLM weights + the trainer's 70 GB resident during
+    # rollout). When the KV the rollout needs is large enough to PUSH PAST 0.45 (a realistic GRPO
+    # context/group: >=2048 ctx or >=group-8), the flat 0.45 cap clamped KV to ~11 GB with ~29 GB of
+    # card unused. The lifted 0.55 cap (>=60 GB weights AND the card leaves room for the trainer's
+    # resident copy: 0.45*total - weights >= ~10 GB, true on the 180 GB B200) lets KV grow to ~29 GB.
+    u_capped = colocate_kv_util(35.0, 2048, 180.0, sleep_mode=True, num_generations=8)
+    assert u_capped == 0.55  # was clamped to 0.45 before the lift
+    assert u_capped > 0.45
+    # also lifts on the non-sleep resident path for the same regime
+    assert colocate_kv_util(35.0, 4096, 180.0, sleep_mode=False, num_generations=8) == 0.55
+    # A short-context / small-group run is KV-ESTIMATE-limited, BELOW even 0.45, so the lift is a
+    # no-op there (the cap never binds) — the change only ever RAISES a run that was being clamped.
+    assert colocate_kv_util(35.0, 1024, 180.0, sleep_mode=True, num_generations=4) < 0.45
+    # GATE BOUNDARIES — everything outside the regime stays at the old 0.45 ceiling:
+    #   small weights on a big card (a dense 9B on a B200): weights 18 < 60 -> ceiling stays 0.45
+    assert colocate_kv_util(9.0, 8192, 180.0, sleep_mode=True, num_generations=16) == 0.45
+    #   big weights on a small card: 0.45*130 - 70 = -11.5 < 10 GB -> no room for the trainer copy -> 0.45
+    assert colocate_kv_util(35.0, 8192, 130.0, sleep_mode=True, num_generations=16) == 0.45
+    #   big weights on a 141 GB H200: 0.55*141 = 78 GB executor + the trainer's 70 GB copy = 148 > 141
+    #   -> overflow, so the H200 must STAY at 0.45. The old >=140 GB threshold wrongly lifted it; the
+    #   headroom gate (0.45*141 - 70 = -6.5 < 10) keeps it down. Cursor MrXiS.
+    assert colocate_kv_util(35.0, 8192, 141.0, sleep_mode=True, num_generations=16) == 0.45
 
 
 def test_robust_to_missing_params_and_zero_context():
