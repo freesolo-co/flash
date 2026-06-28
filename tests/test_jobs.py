@@ -629,6 +629,15 @@ def test_reattach_legacy_handle_passes_current_attempt_none(monkeypatch):
     RunpodProvider().poll(fresh, spec, 0)
     assert captured["current_attempt"] == 2
 
+    # A corrupt/legacy non-int attempt ("" or other junk) must coerce to None via _attempt_int, NOT
+    # crash attach with ValueError (a bare int("") would). Mirrors the poller's heartbeat handling.
+    for junk in ("", "x", None):
+        corrupt = base.JobHandle(
+            provider="runpod", data={"endpoint_id": "ep", "job_id": "j", "attempt": junk}
+        )
+        RunpodProvider().poll(corrupt, spec, 0)
+        assert captured["current_attempt"] is None, junk
+
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
     # A cold-start (setup) heartbeat like "boot" proves liveness but must NOT switch to the

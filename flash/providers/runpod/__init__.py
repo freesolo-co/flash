@@ -75,8 +75,12 @@ class RunpodProvider:
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         on_last_gpu = bool(hd.get("on_last_gpu", False))
-        # Legacy handle (no "attempt") -> None; coercing to 0 would false-stall a healthy run.
-        current_attempt = int(hd["attempt"]) if hd.get("attempt") is not None else None
+        # Legacy handle (no "attempt") OR a corrupt/non-int value -> None; coercing to 0 would
+        # false-stall a healthy run, and a bare int() would crash attach on legacy/corrupt data.
+        # _attempt_int is the same coercer the poller uses for heartbeat attempt keys.
+        from flash.providers._poll import _attempt_int
+
+        current_attempt = _attempt_int(hd.get("attempt"))
         return poll_job(
             rh,
             log=log,
