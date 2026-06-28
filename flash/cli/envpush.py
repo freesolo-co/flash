@@ -1,6 +1,5 @@
 """Environment publish/pull machinery for the `flash env` subcommands.
 
-`flash env pull` downloads a published environment's files (whole env, or a single file);
 `flash env push` packages a local Freesolo environment and uploads it through the
 managed Flash control plane.
 """
@@ -21,10 +20,7 @@ if TYPE_CHECKING:
 
 
 def _atomic_write_bytes(out: Path, data: bytes | bytearray) -> None:
-    """Write ``data`` to ``out`` atomically and symlink-safely: stage to a temp file in the same
-    directory, then ``os.replace`` it into place. A mid-write failure (disk full / quota) therefore
-    never truncates an existing file, and ``os.replace`` swaps the path itself — replacing a symlink
-    at ``out`` rather than writing through it to the link target."""
+    """Write data via a sibling temp file so existing files are not truncated on failure."""
     fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=".flash-env-pull-")
     os.close(fd)
     try:
@@ -53,10 +49,10 @@ def cmd_env_pull(args) -> int:
     Pulls via GitHub's tarball / raw media type rather than the JSON "contents" API, so files
     larger than 1 MB (e.g. ``datasets/train.jsonl``) come back intact instead of empty.
     """
-    from flash.envs.adapter import (
+    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.envs.pull import (
         download_environment_file,
         environment_local_dirname,
-        is_freesolo_environment_id,
         pull_environment_package,
     )
 
@@ -73,19 +69,12 @@ def cmd_env_pull(args) -> int:
             default_name = Path(args.path.replace("\\", "/")).name
             out = Path(args.output) if args.output else Path(default_name)
             if out.is_dir() and not out.is_symlink():
-                # a single file can't replace a REAL directory; refuse instead of crashing on write.
-                # A symlink-to-a-dir is NOT rejected here — it's handled by the symlink/--force check
-                # below, and _atomic_write_bytes replaces the link itself (os.replace), never the
-                # target dir, so `pull -o <symlink-to-dir> --force` is safe.
                 print(
                     f"refusing to overwrite directory {out} with a file "
                     "(a single-file pull needs -o to be a FILE path, not a directory)",
                     file=sys.stderr,
                 )
                 return 1
-            # ``out.is_symlink()`` is checked explicitly: a dangling symlink has ``exists()==False``,
-            # so without this a pull would proceed and write THROUGH the link to its target, outside
-            # the requested path. Treat any symlink as occupied → require --force.
             if (out.exists() or out.is_symlink()) and not args.force:
                 print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
                 return 1
@@ -113,10 +102,6 @@ def cmd_env_pull(args) -> int:
         return 1
     except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
         print(f"env pull failed: {exc}", file=sys.stderr)
-        # A GitHub HTTP request failure surfaces as RuntimeError carrying "GitHub environment
-        # request failed" (see envs/adapter._urlopen); a missing token is the usual cause for a
-        # private/internal env. Gate the hint on THAT message so non-auth RuntimeErrors (e.g. "too
-        # large", "too many members", "unsafe path") don't print a misleading token hint.
         if "GitHub environment request failed" in str(exc) and not os.environ.get("GITHUB_TOKEN"):
             print(
                 "hint: private/internal environments need a GitHub token; set GITHUB_TOKEN "
@@ -164,11 +149,7 @@ def cmd_env_delete(args) -> int:
     # A missing env deletes to `deleted: false` (idempotent); default True so an older server that
     # omits the field still reads as success.
     deleted = bool(result.get("deleted", True))
-    msg = (
-        f"deleted {env_id}"
-        if deleted
-        else f"{env_id} was not found on the hub (already deleted)"
-    )
+    msg = f"deleted {env_id}" if deleted else f"{env_id} was not found on the hub (already deleted)"
     print(render.ok(msg) if render.styled() else msg)
     return 0
 
