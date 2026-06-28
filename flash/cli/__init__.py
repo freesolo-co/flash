@@ -338,10 +338,15 @@ def main(argv: list[str] | None = None) -> int:
     except _USER_ERRORS as exc:
         if debug:
             raise
-        print(f"error: {exc}", file=sys.stderr)
+        # themed red ✗ on a styled terminal (same idiom as `flash login` failures); the machine
+        # path keeps the plain `error: {exc}` prefix that scripts and tests match on.
+        if render.styled():
+            print(render.error(str(exc)), file=sys.stderr)
+        else:
+            print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("aborted", file=sys.stderr)
+        print(render.note("aborted") if render.styled() else "aborted", file=sys.stderr)
         return 130
     finally:
         emit_update_notice(update_check)
