@@ -673,6 +673,20 @@ def _replace_opposite_type(target: Path, build) -> None:
             shutil.rmtree(scratch, ignore_errors=True)
 
 
+def _is_cwd_or_ancestor(target: Path) -> bool:
+    """True when ``target`` is the current working directory or an ancestor of it.
+
+    Moving such a path aside (``os.replace``/``rmtree``) would strand the process in a directory that
+    no longer exists, so an in-place merge refuses rather than silently relocate the cwd. Both sides
+    are ``resolve()``d so a cwd reached through a symlink still compares equal."""
+    try:
+        cwd = Path.cwd().resolve()
+        resolved = target.resolve()
+    except OSError:
+        return False
+    return resolved == cwd or resolved in cwd.parents
+
+
 def _merge_into_dir(source: Path, dest: Path) -> None:
     """Recursively copy ``source``'s contents into existing ``dest``, overwriting same-named
     children. Unlike ``shutil.copytree(dirs_exist_ok=True)``, a child of ``dest`` that is a SYMLINK is
@@ -704,6 +718,15 @@ def _merge_into_dir(source: Path, dest: Path) -> None:
         else:
             if target.is_dir():
                 # incoming file over an existing dir: keep the dir until the file copy succeeds.
+                # But never move aside a dir that IS (or CONTAINS) the cwd — e.g. merging into an
+                # ancestor of the cwd (``-o .. --force`` from a subdir) where an incoming file is named
+                # like the cwd's segment. Relocating it would leave the process in a deleted directory,
+                # so refuse with a clear error instead of stranding the cwd.
+                if _is_cwd_or_ancestor(target):
+                    raise RuntimeError(
+                        f"refusing to replace {target} with a file because it is the current working "
+                        "directory (or an ancestor of it); rerun the pull from outside the destination"
+                    )
                 _replace_opposite_type(target, build)
             else:
                 _atomic_copy2(child, target)
@@ -790,18 +813,29 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             # package or link is never removed until the replacement is ready, and is restored intact if
             # the swap fails.
             staging_parent = Path(tempfile.mkdtemp(prefix=".flash-env-pull-", dir=dest_path.parent))
+            preserve_backup = False
             try:
                 staging = staging_parent / dest_path.name
                 shutil.copytree(source, staging)
                 backup = staging_parent / (dest_path.name + ".old")
                 os.replace(dest_path, backup)  # atomic move-aside (works for a file, dir, or symlink)
+                preserve_backup = True  # backup is now the ONLY copy of the original
                 try:
                     os.replace(staging, dest_path)
                 except BaseException:
                     os.replace(backup, dest_path)  # restore the original on failure
+                    preserve_backup = False  # restored to dest_path; backup consumed
                     raise
+                preserve_backup = False  # replacement installed; backup is a now-stale copy
             finally:
-                shutil.rmtree(staging_parent, ignore_errors=True)
+                # Drop the staging dir ONLY once the user's original is provably safe — either the
+                # replacement was installed (backup is a now-stale copy) or it was restored to
+                # ``dest_path``. If the swap failed AND the restore (os.replace back) ALSO failed, the
+                # backup is the ONLY surviving copy of the original, so leave the staging dir (with its
+                # preserved backup) in place rather than delete the user's data. Mirrors the
+                # ``preserve_scratch`` guard in ``_replace_opposite_type``.
+                if not preserve_backup:
+                    shutil.rmtree(staging_parent, ignore_errors=True)
         return dest_path
     finally:
         shutil.rmtree(tmp_parent, ignore_errors=True)

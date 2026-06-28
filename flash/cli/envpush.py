@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
 
 
-def _atomic_write_bytes(out: Path, data: bytes) -> None:
+def _atomic_write_bytes(out: Path, data: bytes | bytearray) -> None:
     """Write ``data`` to ``out`` atomically and symlink-safely: stage to a temp file in the same
     directory, then ``os.replace`` it into place. A mid-write failure (disk full / quota) therefore
     never truncates an existing file, and ``os.replace`` swaps the path itself — replacing a symlink
@@ -76,7 +76,8 @@ def cmd_env_pull(args) -> int:
                 # below, and _atomic_write_bytes replaces the link itself (os.replace), never the
                 # target dir, so `pull -o <symlink-to-dir> --force` is safe.
                 print(
-                    f"refusing to overwrite directory {out} with a file (pass an explicit -o path)",
+                    f"refusing to overwrite directory {out} with a file "
+                    "(a single-file pull needs -o to be a FILE path, not a directory)",
                     file=sys.stderr,
                 )
                 return 1
