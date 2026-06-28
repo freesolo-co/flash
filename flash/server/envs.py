@@ -23,18 +23,17 @@ _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
 # Genuine repo-control directories that live at the ROOT of the environment-hub checkout. A DELETE
-# runs `git rm -r -- <namespace>/<name>` directly against that checkout, so a slug whose namespace is
+# runs `git rm -r -- <org-slug>/<name>` directly against that checkout, so a slug whose namespace is
 # one of these would target tracked repo infrastructure (e.g. `DELETE /v1/envs/.github/workflows`).
-# `namespace_for` slugifies an email and can NEVER emit a dot-prefixed namespace, so these are never
-# publishable namespaces and are always safe to reject on delete.
+# Org slugs can never be dot-prefixed, so these are never publishable namespaces and are always safe
+# to reject on delete.
 _REPO_CONTROL_TOP_LEVEL_PATHS = {
     ".github",
     ".git",
 }
 # Top-level segments barred from env-package CONTENTS by `_safe_extract`. A strict SUPERSET of the
 # repo-control set: it also bars a top-level `source/` dir inside a package. `source` is intentionally
-# NOT a repo-control namespace — `namespace_for` can slugify a user email to the `source` namespace
-# and publish writes `source/<name>` without objection — so the delete validator must reject only
+# NOT a repo-control namespace, so the delete validator must reject only
 # `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
 _BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
 _TAR_METADATA_TYPES = {
@@ -57,21 +56,18 @@ class EnvPublishError(Exception):
         self.status = status
 
 
-# Internal service key has no per-user email; fixed namespace keeps it stable.
-_INTERNAL_NAMESPACE = "internal-freesolo-co"
-
-
 def namespace_for(key: dict) -> str:
-    if key.get("auth_kind") == "internal":
-        return _INTERNAL_NAMESPACE
-    email = str(key.get("email") or "")
-    if "@" not in email:
+    org = key.get("org") if isinstance(key.get("org"), dict) else {}
+    raw = key.get("org_slug") or org.get("slug")
+    slug = str(raw or "").strip()
+    if not slug:
         raise EnvPublishError(
-            "authenticated Freesolo key must include an email (used to derive the hub namespace) — "
+            "authenticated Freesolo key must include an org slug (used to derive the hub namespace) — "
             "publish with a key created at https://freesolo.co/sign-in (`flash login`)"
         )
-    slug = re.sub(r"[^a-z0-9]+", "-", email.lower()).strip("-")
-    return slug or "user"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", slug):
+        raise EnvPublishError("authenticated Freesolo key has an invalid org slug")
+    return slug
 
 
 def _sanitize_name(name: str) -> str:
@@ -458,9 +454,8 @@ def _validate_slug(slug: str) -> tuple[str, str]:
     # An internal-key delete bypasses the namespace-ownership check in delete_package, so this
     # validator is the only barrier, and a request like `DELETE /v1/envs/.github/workflows` would
     # otherwise remove tracked repo infrastructure. Reject ONLY `_REPO_CONTROL_TOP_LEVEL_PATHS`, NOT
-    # the wider publish-content blocklist: `source` is a legitimately publishable namespace
-    # (`namespace_for` can slugify an email to it and publish writes `source/<name>` without
-    # objection), so blocking it here would leave those envs publishable-but-undeletable.
+    # the wider publish-content blocklist: `source` is a legitimately publishable org slug, so
+    # blocking it here would leave those envs publishable-but-undeletable.
     if namespace in _REPO_CONTROL_TOP_LEVEL_PATHS:
         raise EnvPublishError(f"invalid env id segment: {namespace!r}")
     return namespace, name
@@ -587,13 +582,13 @@ def delete_package(*, slug: str, key: dict) -> bool:
 
     Returns ``True`` when a package was removed and ``False`` when it was already absent
     (idempotent). Authorization mirrors publish's namespace isolation: a user key may delete
-    only environments in its own ``namespace_for(key)`` namespace, while the internal service
-    key (``auth_kind == "internal"``) may delete any environment.
+    only environments in its own org-slug namespace, while the internal service key
+    (``auth_kind == "internal"``) may delete any environment.
     """
     namespace, name = _validate_slug(slug)
     canonical = f"{namespace}/{name}"
-    caller_namespace = namespace_for(key)
-    if key.get("auth_kind") != "internal" and namespace != caller_namespace:
+    caller_namespace = None if key.get("auth_kind") == "internal" else namespace_for(key)
+    if caller_namespace is not None and namespace != caller_namespace:
         raise EnvPublishError(
             "you can only delete environments in your own namespace "
             f"({caller_namespace}/…); got {canonical!r}",

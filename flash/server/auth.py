@@ -85,6 +85,8 @@ def _identity_from_verify_body(raw: bytes) -> dict[str, Any]:
             or _str_field(user.get("id"))
         ),
         "org_id": _str_field(body.get("org_id")) or _str_field(org.get("id")),
+        "org_slug": _str_field(body.get("org_slug")) or _str_field(org.get("slug")),
+        "org_name": _str_field(body.get("org_name")) or _str_field(org.get("name")),
         "api_key_id": (
             _str_field(body.get("api_key_id"))
             or _str_field(body.get("key_id"))
@@ -124,7 +126,15 @@ def _external_row(row: dict, token: str, identity: dict[str, Any]) -> dict:
     out["key_prefix"] = _external_key_prefix(token, identity)
     if identity.get("email"):
         out["email"] = identity["email"]
-    for key in ("user_id", "org_id", "api_key_id", "training_agent_job_id", "project_id"):
+    for key in (
+        "user_id",
+        "org_id",
+        "org_slug",
+        "org_name",
+        "api_key_id",
+        "training_agent_job_id",
+        "project_id",
+    ):
         if identity.get(key):
             out[key] = identity[key]
     return out
@@ -184,13 +194,13 @@ def authenticate(authorization: str | None) -> dict | None:
         return out
     if _freesolo_verify(token):
         identity = _cached_identity(token)
-        email = _identity_email(identity)
-        if not email:
+        if not identity.get("org_slug"):
             return None
+        email = _identity_email(identity)
         row = db.lookup_key(token) or db.ensure_external_key(
             token,
             key_prefix=_external_key_prefix(token, identity),
-            email=email,
+            email=email or None,
         )
         return _external_row(row, token, identity) if row is not None else None
     return None
