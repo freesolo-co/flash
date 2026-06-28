@@ -167,6 +167,7 @@ def _build_notice() -> str | None:
         return None
     return _red(
         f"A new release of {PACKAGE_NAME} is available: {__version__} -> {latest}\n"
+        "You may be missing newer functionality and fixes.\n"
         f"Update with `{UPGRADE_COMMAND}`."
     )
 

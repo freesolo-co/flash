@@ -13,6 +13,7 @@ import urllib.error
 import pytest
 
 import flash._update_check as uc
+import flash.cli as cli
 from flash import __version__
 
 
@@ -282,6 +283,30 @@ def test_emit_update_notice_prints_to_stderr_when_enabled(capsys, cache_path, mo
     assert captured.out == ""  # never pollutes stdout
     assert "99.0.0" in captured.err
     assert "uv tool upgrade freesolo-flash" in captured.err
+
+
+# -- CLI wiring ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("argv", "exit_code"),
+    [
+        (["--help"], 0),
+        (["--version"], 0),
+        (["definitely-not-a-real-command"], 2),
+    ],
+)
+def test_cli_emits_update_notice_for_argparse_early_exits(argv, exit_code, monkeypatch):
+    token = object()
+    calls = []
+    monkeypatch.setattr(cli, "maybe_start_update_check", lambda: token)
+    monkeypatch.setattr(cli, "emit_update_notice", lambda notifier: calls.append(notifier))
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv)
+
+    assert exc.value.code == exit_code
+    assert calls == [token]
 
 
 # -- hardening: must never crash a command, never emit untrusted escape codes ----------------

@@ -402,39 +402,40 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
-    args = parser.parse_args(argv)
-    configure_logging(verbosity=getattr(args, "verbose", 0))
-    debug = getattr(args, "debug", False)
     update_check = maybe_start_update_check()
     try:
-        return args.func(args)
-    except _USER_ERRORS as exc:
-        if debug:
-            raise
-        # themed red ✗ on a styled terminal (same idiom as `flash login` failures); the machine
-        # path keeps the plain `error: {exc}` prefix that scripts and tests match on.
-        if render.styled():
-            print(render.error(str(exc)), file=sys.stderr)
-        else:
-            print(f"error: {exc}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print(render.note("aborted") if render.styled() else "aborted", file=sys.stderr)
-        return 130
-    except Exception as exc:
-        # anything outside _USER_ERRORS — e.g. a read-only ~/.flash when `flash login` saves the
-        # key, or a non-writable cwd on `flash env setup` — would otherwise dump a raw Python
-        # traceback, the least themed output there is. On a styled terminal show the red ✗ idiom
-        # + a `--debug` pointer instead; the machine path (and --debug) keep the full traceback,
-        # which is the bug signal CI and `--debug` bug reports rely on.
-        if debug or not render.styled():
-            raise
-        # point at the exact command to re-run, copy-pasteable. --debug is a root-level flag, so it
-        # must come BEFORE the subcommand (argparse rejects `flash runs --debug`); place it right
-        # after the program name. raw_args never contains --debug here — that path re-raises above.
-        cmd = " ".join([CLI_NAME, "--debug", *(shlex.quote(a) for a in raw_args)])
-        print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
-        print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
-        return 1
+        args = parser.parse_args(argv)
+        configure_logging(verbosity=getattr(args, "verbose", 0))
+        debug = getattr(args, "debug", False)
+        try:
+            return args.func(args)
+        except _USER_ERRORS as exc:
+            if debug:
+                raise
+            # themed red ✗ on a styled terminal (same idiom as `flash login` failures); the machine
+            # path keeps the plain `error: {exc}` prefix that scripts and tests match on.
+            if render.styled():
+                print(render.error(str(exc)), file=sys.stderr)
+            else:
+                print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print(render.note("aborted") if render.styled() else "aborted", file=sys.stderr)
+            return 130
+        except Exception as exc:
+            # anything outside _USER_ERRORS — e.g. a read-only ~/.flash when `flash login` saves the
+            # key, or a non-writable cwd on `flash env setup` — would otherwise dump a raw Python
+            # traceback, the least themed output there is. On a styled terminal show the red ✗ idiom
+            # + a `--debug` pointer instead; the machine path (and --debug) keep the full traceback,
+            # which is the bug signal CI and `--debug` bug reports rely on.
+            if debug or not render.styled():
+                raise
+            # point at the exact command to re-run, copy-pasteable. --debug is a root-level flag, so it
+            # must come BEFORE the subcommand (argparse rejects `flash runs --debug`); place it right
+            # after the program name. raw_args never contains --debug here — that path re-raises above.
+            cmd = " ".join([CLI_NAME, "--debug", *(shlex.quote(a) for a in raw_args)])
+            print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
+            print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
+            return 1
     finally:
         emit_update_notice(update_check)
