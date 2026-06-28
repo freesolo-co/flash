@@ -28,7 +28,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
+    "train": {"steps": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 
@@ -1013,7 +1013,7 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "nohandle-1",
     }
@@ -1070,7 +1070,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "bad-1",
     }
@@ -1078,7 +1078,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     good_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "good-2",
     }
@@ -1331,11 +1331,11 @@ def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
 # Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
 # --------------------------------------------------------------------------------------------
 _FAKE_CKPTS = [
-    {"step": 40, "adapter_prefix": "rl/X/seed0/checkpoints/step-40",
-     "subfolder": "rl/X/seed0/checkpoints/step-40/adapter",
+    {"step": 40, "adapter_prefix": "rl/X/checkpoints/step-40",
+     "subfolder": "rl/X/checkpoints/step-40/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
-    {"step": 80, "adapter_prefix": "rl/X/seed0/checkpoints/step-80",
-     "subfolder": "rl/X/seed0/checkpoints/step-80/adapter",
+    {"step": 80, "adapter_prefix": "rl/X/checkpoints/step-80",
+     "subfolder": "rl/X/checkpoints/step-80/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
 ]
 
@@ -1545,11 +1545,11 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     body = resp.json()
     assert body["repository"] == "me/adapters"
     assert body["url"] == "https://huggingface.co/me/adapters"
-    assert body["source"] == f"{src_repo}:rl/{run_id}/seed0/adapter"
+    assert body["source"] == f"{src_repo}:rl/{run_id}/adapter"
     assert "step" not in body
     # Source = the run's private dataset repo + final-adapter subfolder; dest = the user's repo.
     assert seen["source_repo"] == src_repo
-    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/adapter"
+    assert seen["source_subfolder"] == f"rl/{run_id}/adapter"
     assert seen["dest_repo"] == "me/adapters"
     assert seen["dest_token"] == "hf_user"
     assert seen["private"] is True  # private by default
@@ -1700,7 +1700,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
         lambda spec: [
             {
                 "step": 40,
-                "subfolder": f"rl/{run_id}/seed0/checkpoints/step-40/adapter",
+                "subfolder": f"rl/{run_id}/checkpoints/step-40/adapter",
                 "repo_id": "org/test-runs",
                 "repo_type": "dataset",
             }
@@ -1719,7 +1719,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     )
     assert ok.status_code == 200, ok.text
     assert ok.json()["step"] == 40
-    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/checkpoints/step-40/adapter"
+    assert seen["source_subfolder"] == f"rl/{run_id}/checkpoints/step-40/adapter"
 
     bad = api.post(
         f"/v1/runs/{run_id}/export",

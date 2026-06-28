@@ -658,34 +658,17 @@ def env_setup(paths: list[str]) -> str:
     return _safe(f"{head}\n{tree}\n\n{nxt}")
 
 
-def env_list(installed: list[str], local: list[str]) -> str:
-    parts = [header("env list", "installed + local environments")]
-    if installed:
-        parts.append(_paint("installed", _GRAY, "1"))
-        parts.extend(
-            f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(e, _ACCENT2)}" for e in installed
-        )
+def env_list(local: list[str]) -> str:
+    parts = [header("env list", "local environments")]
     if local:
-        if installed:
-            parts.append("")
         parts.append(
             _paint("local sources", _GRAY, "1")
             + _dim("  (publish with flash env push --name <name> <path>)")
         )
         parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
-    if not installed and not local:
+    else:
         parts.append(_dim("  no environments yet — scaffold one with `flash env setup`"))
     return _safe("\n".join(parts))
-
-
-def env_installed(env_id: str, manifest: str) -> str:
-    snippet = f'[environment]\nid = "{env_id}"'
-    body = "\n".join(f"  {_paint(line, _ACCENT2)}" for line in snippet.splitlines())
-    return _safe(
-        f"{ok(f'recorded {_bold(env_id)}')}\n"
-        f"{_dim(f'  manifest: {manifest}')}\n\n"
-        f"{_dim('use it in your config:')}\n{body}"
-    )
 
 
 def chat_label() -> str:
