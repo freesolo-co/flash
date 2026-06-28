@@ -41,8 +41,10 @@ Tiers (conservative defaults; each opt-in beyond ``--code``)
                                   ``resume_run`` (no re-upload), so it must survive until the whole
                                   run is provably finished — a later seed or a resume after a long
                                   inter-seed capacity gap still needs it. Deployed repos are skipped
-                                  wholesale, and serving never reads ``code/flash`` regardless.
-                                  Reclaims little; safe.
+                                  wholesale *when the live set is confirmed*; with an
+                                  unavailable/incomplete live set ``--code`` still proceeds on the
+                                  best-effort set (see the Safety model above) — harmless because
+                                  serving never reads ``code/flash`` regardless. Reclaims little; safe.
 * ``--checkpoints`` (default off) T2: on terminal + undeployed + older than ``--trim-age-days`` and
                                   carrying a FINAL ``adapter/``, delete ``checkpoints/`` while
                                   **keeping** that final adapter. The big byte win; you lose only
@@ -189,7 +191,7 @@ class Action:
     """One planned mutation against a repo."""
 
     repo_id: str
-    kind: str  # "delete_folder" | "delete_repo"
+    kind: str  # "delete_folder" | "delete_repo" | "skip" (skip sets skipped=True, mutates nothing)
     path: str | None  # folder for delete_folder, None for delete_repo
     reclaim_bytes: int
     reason: str
@@ -432,12 +434,24 @@ def _print_report(plan: Plan, cfg: Config, *, dry_run: bool, live_set_known: boo
     by_kind: dict[str, int] = {}
     for a in plan.actions:
         by_kind[a.kind if a.path is None else f"{a.kind}:{a.path}"] = by_kind.get(a.kind if a.path is None else f"{a.kind}:{a.path}", 0) + 1
-    if not live_set_known:
-        live_set_status = "UNAVAILABLE (code-only tier)"
-    elif not live_set_complete:
-        live_set_status = "INCOMPLETE — a live record had no repo id (code-only tier)"
-    else:
+    if live_set_known and live_set_complete:
         live_set_status = "confirmed"
+    else:
+        base = "UNAVAILABLE" if not live_set_known else "INCOMPLETE — a live record had no repo id"
+        # Spell out the consequence by the tiers actually requested rather than hard-coding
+        # "code-only": a non-confirmed live set aborts the destructive tiers (--checkpoints/--repos),
+        # while a --code purge still proceeds (serving never reads code/flash). Don't imply --code
+        # when the operator passed --no-code.
+        active_destructive = cfg.checkpoints or cfg.repos
+        if cfg.code and active_destructive:
+            consequence = "destructive tiers abort; --code still proceeds"
+        elif cfg.code:
+            consequence = "--code still proceeds"
+        elif active_destructive:
+            consequence = "destructive tiers abort"
+        else:
+            consequence = "no tiers active"
+        live_set_status = f"{base} ({consequence})"
     print(f"\n=== flashrun-* repo cleanup ({'DRY-RUN' if dry_run else 'APPLY'}) ===", file=out)
     print(f"namespace={cfg.namespace}  tiers: code={cfg.code} checkpoints={cfg.checkpoints} repos={cfg.repos}", file=out)
     print(f"serving live set: {live_set_status}", file=out)
