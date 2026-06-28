@@ -2,7 +2,7 @@
 
 `flash train cfg.toml --set wandb.project=… --set wandb.run_name=…` (or a `[wandb]` table) lets a
 run land in its own W&B project / run name instead of the hardcoded `flash` /
-`flash-<phase>-<run_id>-seed<N>` defaults. The naming is first-class spec config (round-tripped in
+`flash-<phase>-<run_id>` defaults. The naming is first-class spec config (round-tripped in
 the job-spec JSON the worker reads), NOT environment variables; the WANDB_API_KEY secret stays env.
 """
 
@@ -21,7 +21,7 @@ def _base(**extra: object) -> dict:
         "model": "openbmb/MiniCPM5-1B",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:some-env/environment.py"},
-        "train": {"seeds": [0], "hf_repo": "me/repo"},
+        "train": {"hf_repo": "me/repo"},
     }
     cfg.update(extra)
     return cfg
@@ -105,7 +105,6 @@ def _toml(tmp_path) -> str:
         "[environment]\n"
         'id = "github:owner/repo@main:some-env/environment.py"\n'
         "[train]\n"
-        "seeds = [0]\n"
         'hf_repo = "me/repo"\n'
     )
     return str(cfg)

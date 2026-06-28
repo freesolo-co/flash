@@ -256,7 +256,6 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n"
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
@@ -269,7 +268,6 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "epochs = 1\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n"
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
@@ -334,9 +332,6 @@ def cmd_gpus(args) -> int:
 
 
 def cmd_env_list(args) -> int:
-    from flash.envs.registry import list_installed_environments
-
-    installed = list_installed_environments()
     paths: list[str] = []
     if Path("environment.py").is_file():
         paths.append(".")
@@ -354,18 +349,15 @@ def cmd_env_list(args) -> int:
                     paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
-    # Decide the rendering up front so the themed panel and the legacy lines never both print.
     if render.styled():
-        print(render.env_list(list(installed), sorted(paths)))
+        print(render.env_list(sorted(paths)))
         return 0
-    if installed:
-        print("installed environments:")
-        for env_id in installed:
-            print(f"  {env_id}")
     if paths:
         print("local env sources (publish with `flash env push --name <name> <path>`):")
         for path in sorted(paths):
             print(f"  {path}")
+    else:
+        print("no environments yet - scaffold one with `flash env setup`")
     return 0
 
 
@@ -417,12 +409,11 @@ def cmd_train(args) -> int:
     )
     run_id = status["run_id"]
     logger.info(
-        "submitted run %s: model=%s algorithm=%s gpu=%s seeds=%s",
+        "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
         spec.model,
         spec.algorithm,
         spec.gpu.type,
-        list(spec.train.seeds),
     )
     if args.background:
         if render.styled():
