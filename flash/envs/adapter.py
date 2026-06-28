@@ -37,7 +37,17 @@ _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 # the whole repo; this ceiling must therefore bound the entire hub, NOT a single env. The per-env
 # uncompressed extract stays capped at _MAX_ARCHIVE_BYTES after filtering to the requested subtree.
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
+# Bytes pulled per streaming read. The download helpers read the response in chunks (rather than one
+# resp.read()) so an oversize body aborts after at most one chunk past the limit, never buffering the
+# full (up to _MAX_TARBALL_BYTES) body in a single allocation.
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
+# Upper bound on the TOTAL number of tar headers iterated (not just extracted). The whole-repo
+# tarball can hold far more entries than the requested subtree extracts, so the per-subtree
+# _MAX_ARCHIVE_MEMBERS cap alone leaves the scan loop unbounded: a tarball of many tiny/empty files
+# compresses to well under _MAX_TARBALL_BYTES yet would force iterating millions of headers. This
+# caps that CPU/time DoS while staying generous enough for a large shared hub of many envs.
+_MAX_ARCHIVE_SCAN_MEMBERS = 200_000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _TAR_METADATA_TYPES = {
@@ -259,8 +269,33 @@ def _resolve_ref_sha(
     return sha
 
 
+def _read_capped(resp: object, max_bytes: int) -> bytes:
+    """Read ``resp`` in ``_DOWNLOAD_CHUNK_BYTES`` chunks, aborting once the accumulated size exceeds
+    ``max_bytes``. This bounds peak memory at ``max_bytes`` (+ one chunk) instead of the single huge
+    allocation a bare ``resp.read()`` would make for a near-``_MAX_TARBALL_BYTES`` body, and it lets
+    an oversize download bail out early rather than fetching the whole thing only to reject it."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError(
+                f"GitHub response body exceeded the maximum allowed size ({max_bytes} bytes); "
+                "download aborted"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _urlopen(
-    req: urllib.request.Request, *, timeout: float = 60.0, max_rate_limit_retries: int = 5
+    req: urllib.request.Request,
+    *,
+    timeout: float = 60.0,
+    max_rate_limit_retries: int = 5,
+    max_bytes: int | None = None,
 ) -> bytes:
     """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
 
@@ -274,6 +309,10 @@ def _urlopen(
     ``max_rate_limit_retries=0`` makes it fail fast (one request, no sleeps): the control plane uses
     that for its best-effort resolve-once pin so a persistent limit can never block run creation —
     the long retry belongs on the worker, which can afford to wait.
+
+    When ``max_bytes`` is set the body is streamed in chunks and aborts early once it exceeds that
+    ceiling (see ``_read_capped``), so a large/hostile response can't be buffered whole in one
+    allocation. Callers that download whole bodies (tarball, raw file) pass their size cap here.
     """
     import random
     import time
@@ -283,7 +322,7 @@ def _urlopen(
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+                return _read_capped(resp, max_bytes) if max_bytes is not None else resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
             # GitHub signals an exhausted primary limit with a 403 + `X-RateLimit-Remaining: 0`
@@ -327,10 +366,14 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
-    # Bound the whole-repo tarball (the per-env subtree is filtered + capped later, in
-    # _safe_extract_archive). Use the larger whole-repo ceiling so a small env pull from a big
-    # shared hub isn't rejected just because unrelated siblings make the repo tarball large.
+    # Stream-cap the whole-repo tarball at the larger whole-repo ceiling (the per-env subtree is
+    # filtered + capped later, in _safe_extract_archive) so a small env pull from a big shared hub
+    # isn't rejected just because unrelated siblings make the repo tarball large — while still
+    # bailing out early (in _urlopen) instead of buffering a near-1 GiB body whole. The post-read
+    # length check stays as defense-in-depth for any path that bypasses the streaming cap.
+    data = _urlopen(
+        urllib.request.Request(url, headers=headers), timeout=120.0, max_bytes=_MAX_TARBALL_BYTES
+    )
     if len(data) > _MAX_TARBALL_BYTES:
         raise RuntimeError(
             f"repository tarball is too large ({len(data)} bytes; limit {_MAX_TARBALL_BYTES} bytes)"
@@ -352,8 +395,18 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path, subdir: str = "") -> Pat
     top_dirs: set[str] = set()
     total = 0
     extracted = 0
+    scanned = 0
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
         for member in tar:
+            # Bound the TOTAL headers iterated, not just the extracted subset: filtering to a small
+            # subtree still walks every member of a (possibly huge) whole-repo tarball, so without
+            # this a tarball packed with many tiny entries is a CPU/time DoS even when extraction is
+            # tiny. Count every member yielded, before the metadata/subtree skips below.
+            scanned += 1
+            if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
+                raise RuntimeError(
+                    f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
+                )
             if member.type in _TAR_METADATA_TYPES:
                 continue
             raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
@@ -541,7 +594,9 @@ def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 1
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+    data = _urlopen(
+        urllib.request.Request(url, headers=headers), timeout=timeout, max_bytes=_MAX_ARCHIVE_BYTES
+    )
     if len(data) > _MAX_ARCHIVE_BYTES:
         raise RuntimeError(
             f"environment file is too large ({len(data)} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
