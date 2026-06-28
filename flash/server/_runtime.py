@@ -50,6 +50,42 @@ async def _reconcile_cost_loop() -> None:
             _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
 
 
+async def _repo_cleanup_loop() -> None:
+    """Background loop: periodically delete per-run HF artifact repos (``Freesolo-Co/flashrun-*``)
+    that are NOT currently deployed and older than the configured age (default 30d), reclaiming the
+    org's private-storage quota. Currently-deployed repos are the only thing spared.
+
+    Fails CLOSED: each sweep aborts (deleting nothing) if the serving live set can't be confirmed, so
+    a serving blip never risks deleting a live adapter — it just retries next cycle. The HF + serving
+    calls are blocking, so each sweep is offloaded to a thread. Gated by ``repo_cleanup_enabled``
+    (needs an operator ``HF_TOKEN``; killable via ``FLASH_REPO_GC_ENABLED=0``)."""
+    from flash.server.repo_cleanup import CleanupAborted, run_scheduled_cleanup
+
+    # Sweep cadence (default daily; floored at 1h). The 30-day delete age makes the exact cadence
+    # non-critical — a repo a few hours past 30d is no different from one a few hours under. Parse
+    # defensively: a non-numeric env value must fall back to the default, not kill the loop (which
+    # would also re-raise through the lifespan shutdown await).
+    try:
+        interval = max(3600.0, float(os.environ.get("FLASH_REPO_GC_INTERVAL_HOURS") or 24.0) * 3600.0)
+    except ValueError:
+        _log.warning("ignoring non-numeric FLASH_REPO_GC_INTERVAL_HOURS; using 24h")
+        interval = 24.0 * 3600.0
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            deleted = await asyncio.to_thread(run_scheduled_cleanup)
+            if deleted:
+                _log.info("repo GC: deleted %d undeployed run repo(s) older than the GC age", deleted)
+        except asyncio.CancelledError:
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except CleanupAborted as exc:
+            # Serving live set unconfirmed -> the sweep deleted NOTHING by design. Expected during a
+            # serving outage; not an error. Retry next cycle when serving is back.
+            _log.warning("repo GC sweep skipped (serving live set unconfirmed); retrying next cycle: %s", exc)
+        except Exception:
+            _log.debug("repo GC sweep failed; retrying next cycle", exc_info=True)
+
+
 async def _charge_retry_startup() -> None:
     """Run ONE completion-charge recovery sweep off the startup critical path.
 
