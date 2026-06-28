@@ -62,7 +62,7 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
     payload = builders.build_payload(_spec(), seed=0, attempt=1)
     assert payload["phase"] == "sft"
     assert payload["attempt"] == 1
-    assert payload["hf_prefix"] == "sft/flash-1700000000-abcd1234/seed0"
+    assert payload["hf_prefix"] == "sft/flash-1700000000-abcd1234"
     assert payload["max_wall_s"] == 3600
     assert payload["hf_repo"] == "org/repo"
     assert payload["flash_arm"] == "vast"

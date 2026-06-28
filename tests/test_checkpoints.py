@@ -21,7 +21,7 @@ SPEC_DICT = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
+    "train": {"steps": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
     "run_id": "flash-ckpt-1",
 }
@@ -68,10 +68,10 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatc
 
     subfolder = worker.publish_deployable_checkpoint(str(ckpt), 80)
 
-    assert subfolder == "rl/flash-ckpt-1/seed0/checkpoints/step-80/adapter"
+    assert subfolder == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
     assert len(rec.uploads) == 1
     up = rec.uploads[0]
-    assert up["path_in_repo"] == "rl/flash-ckpt-1/seed0/checkpoints/step-80/adapter"
+    assert up["path_in_repo"] == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
     assert up["repo_type"] == "dataset"
     # Trainer-state files are excluded so each per-step snapshot is just the small LoRA adapter.
     assert "optimizer.pt" in up["ignore_patterns"]
@@ -281,9 +281,46 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
     )
     paths = [u["path_in_repo"] for u in rec.uploads]
     assert paths == [
-        "rl/flash-ckpt-1/seed0/checkpoints/step-4/adapter",  # deployable first
-        "rl/flash-ckpt-1/seed0/checkpoint/checkpoint-4",  # resume second
+        "rl/flash-ckpt-1/checkpoints/step-4/adapter",  # deployable first
+        "rl/flash-ckpt-1/checkpoint/checkpoint-4",  # resume second
     ]
+
+
+def test_on_save_skips_deployable_when_vl_recombine_fails(tmp_path, monkeypatch, fake_trainer_callback):
+    """A VL warm-start whose recorded SFT dir was evicted makes recombined_warmstart_adapter_dir
+    RAISE. The raw checkpoint adapter is GRPO-only / SFT-less, so the deployable publish must be
+    SKIPPED (not fall back to the raw adapter and advertise a known-broken step). The resume
+    checkpoint is still uploaded so the run can resume and re-merge."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+
+    def _raise(_ckpt):
+        raise RuntimeError("recombine: ... SFT-less adapter cannot be recombined")
+
+    monkeypatch.setattr(worker, "recombined_warmstart_adapter_dir", _raise)
+
+    class _SyncThread:
+        def __init__(self, target=None, daemon=None, **kw):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr(worker.threading, "Thread", _SyncThread)
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)
+    cb = worker.make_checkpoint_upload_callback()
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+
+    paths = [u["path_in_repo"] for u in rec.uploads]
+    # NO deployable adapter advertised for this step...
+    assert not any(p.endswith("checkpoints/step-4/adapter") for p in paths), paths
+    # ...but the resume checkpoint is still uploaded so the run can resume and re-merge.
+    assert "rl/flash-ckpt-1/checkpoint/checkpoint-4" in paths
 
 
 # --------------------------------------------------------------------------------------------
@@ -309,12 +346,12 @@ def _patch_hf_files(monkeypatch, files):
 def test_checkpoint_adapter_prefix():
     assert (
         checkpoint_adapter_prefix(_spec(), 60)
-        == "rl/flash-ckpt-1/seed0/checkpoints/step-60"
+        == "rl/flash-ckpt-1/checkpoints/step-60"
     )
 
 
 def test_list_checkpoints_parses_and_sorts(monkeypatch):
-    base = "rl/flash-ckpt-1/seed0"
+    base = "rl/flash-ckpt-1"
     files = [
         f"{base}/checkpoints/step-80/adapter/adapter_config.json",
         f"{base}/checkpoints/step-80/adapter/adapter_model.safetensors",
@@ -338,7 +375,7 @@ def test_list_checkpoints_parses_and_sorts(monkeypatch):
 
 def test_list_checkpoints_skips_step_without_weights(monkeypatch):
     """A step with adapter_config.json but no weights file is NOT advertised as deployable."""
-    base = "rl/flash-ckpt-1/seed0"
+    base = "rl/flash-ckpt-1"
     files = [
         # step-40 is complete; step-60 has config only (half-uploaded) and must be excluded.
         f"{base}/checkpoints/step-40/adapter/adapter_config.json",
@@ -350,7 +387,7 @@ def test_list_checkpoints_skips_step_without_weights(monkeypatch):
 
 
 def test_list_checkpoints_no_repo(monkeypatch):
-    spec = JobSpec.from_dict({**SPEC_DICT, "train": {"steps": 1, "seeds": [0], "hf_repo": ""}})
+    spec = JobSpec.from_dict({**SPEC_DICT, "train": {"steps": 1, "hf_repo": ""}})
     assert list_checkpoints(spec) == []
 
 
@@ -382,9 +419,9 @@ def _status(**kw):
 
 
 _CKPTS = [
-    {"step": 40, "subfolder": "rl/flash-ckpt-1/seed0/checkpoints/step-40/adapter",
+    {"step": 40, "subfolder": "rl/flash-ckpt-1/checkpoints/step-40/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
-    {"step": 80, "subfolder": "rl/flash-ckpt-1/seed0/checkpoints/step-80/adapter",
+    {"step": 80, "subfolder": "rl/flash-ckpt-1/checkpoints/step-80/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
 ]
 
@@ -406,8 +443,8 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
     assert body["repoId"] == "org/test-runs"
     assert body["repoType"] == "dataset"
     assert body["checkpoints"] == [
-        {"step": 40, "subfolder": "rl/flash-ckpt-1/seed0/checkpoints/step-40/adapter"},
-        {"step": 80, "subfolder": "rl/flash-ckpt-1/seed0/checkpoints/step-80/adapter"},
+        {"step": 40, "subfolder": "rl/flash-ckpt-1/checkpoints/step-40/adapter"},
+        {"step": 80, "subfolder": "rl/flash-ckpt-1/checkpoints/step-80/adapter"},
     ]
 
 
@@ -416,8 +453,28 @@ def test_register_run_checkpoints_requires_org():
 
     with pytest.raises(ValueError, match="org id"):
         ck.register_run_checkpoints(
-            internal_key="k", status=_status(billing_context={}), checkpoints=_CKPTS
+            internal_key="k",
+            status=_status(billing_context={}, platform_context=None),
+            checkpoints=_CKPTS,
         )
+
+
+def test_register_run_checkpoints_falls_back_to_platform_context(monkeypatch):
+    # Internal/operator runs carry org only in platform_context (billing_context is None):
+    # registration must still scope rows to that org. _run_org_id falls back to billing-then-platform
+    # (same order as routes/serving.py::_run_org; NOT run_registry, which is platform-first).
+    import flash.server.checkpoints as ck
+
+    captured = {}
+    monkeypatch.setattr(
+        ck, "_post_checkpoints", lambda *, token, body: captured.update(body=body) or {}
+    )
+    ck.register_run_checkpoints(
+        internal_key="int-key",
+        status=_status(billing_context=None, platform_context={"org_id": "org-plat"}),
+        checkpoints=_CKPTS,
+    )
+    assert captured["body"]["orgId"] == "org-plat"
 
 
 def test_best_effort_noop_without_internal_key(monkeypatch):
@@ -442,6 +499,7 @@ def test_best_effort_registers(monkeypatch):
 
 
 def test_best_effort_swallows_backend_failure(monkeypatch):
+    import io
     import urllib.error
 
     import flash.server.checkpoints as ck
@@ -453,7 +511,39 @@ def test_best_effort_swallows_backend_failure(monkeypatch):
         raise urllib.error.URLError("backend down")
 
     monkeypatch.setattr(ck, "_post_checkpoints", boom)
-    assert ck.register_checkpoints_best_effort(_status()) == 0  # never raises
+    log = io.StringIO()
+    assert ck.register_checkpoints_best_effort(_status(), log=log) == 0  # never raises
+    # A genuine backend failure MUST stay visible.
+    assert "warn" in log.getvalue()
+
+
+def test_best_effort_skips_silently_when_no_org(monkeypatch):
+    # Internal/operator run with no org in either context: skip quietly, do NOT warn, do NOT hit the
+    # backend, and (Copilot Msbm-) do NOT perform the HF checkpoint listing — the org check
+    # short-circuits BEFORE the network call. Regression guard for the noisy "missing org id" log and
+    # the wasted HF listing on an expected-skip run.
+    import io
+
+    import flash.server.checkpoints as ck
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
+    listed = {"called": False}
+
+    def fake_list(spec):
+        listed["called"] = True
+        return _CKPTS
+
+    monkeypatch.setattr(ck, "list_checkpoints", fake_list)
+
+    def fail(*, token, body):  # pragma: no cover - must never be called
+        raise AssertionError("_post_checkpoints must not be called without an org")
+
+    monkeypatch.setattr(ck, "_post_checkpoints", fail)
+    log = io.StringIO()
+    status = _status(billing_context={}, platform_context=None)
+    assert ck.register_checkpoints_best_effort(status, log=log) == 0
+    assert "warn" not in log.getvalue()
+    assert listed["called"] is False  # org check short-circuits before the HF listing
 
 
 def test_best_effort_no_checkpoints(monkeypatch):
@@ -482,9 +572,15 @@ def _finalize_src(module_name: str, fn_name: str) -> str:
 
 def test_run_rl_publishes_final_step_as_deployable_checkpoint():
     src = _finalize_src("flash.engine.worker.rl", "run_rl")
-    # Final adapter is saved, then published as a deployable checkpoint keyed by the final step.
+    # Final adapter is saved, recombined for a VL warm-start (SFT⊕GRPO so the deploy isn't SFT-less),
+    # then both the default upload and the deployable checkpoint ship that recombined dir — and the
+    # recombined temp dir is cleaned up afterwards so finalize doesn't leak /tmp.
     assert 'save_pretrained(adapter_dir)' in src
-    assert 'publish_deployable_checkpoint(adapter_dir, _steps_run)' in src
+    assert 'recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)' in src
+    assert 'deploy_dir = recombined or adapter_dir' in src
+    assert 'hf_upload_folder(deploy_dir, "adapter"' in src
+    assert 'publish_deployable_checkpoint(deploy_dir, _steps_run)' in src
+    assert 'shutil.rmtree(recombined' in src
 
 
 def test_run_sft_publishes_final_step_as_deployable_checkpoint():

@@ -451,7 +451,7 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         run_id="reattach",
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
-        train=TrainSpec(seeds=(0,), steps=1, hf_repo=""),
+        train=TrainSpec(steps=1, hf_repo=""),
         gpu=GpuSpec(type="A100"),
     )
     base = {"provider": "runpod", "endpoint_id": "ep", "endpoint_name": "n", "job_id": "j"}
@@ -996,7 +996,7 @@ def _spec(run_id):
         run_id=run_id,
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
-        train=TrainSpec(seeds=(0,), steps=1),
+        train=TrainSpec(steps=1),
         gpu=GpuSpec(type="RTX 4090", max_retries=2),
     )
 
@@ -1123,7 +1123,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id="no-retry", model="Qwen/Qwen3.5-0.8B", algorithm="grpo",
-            train=TrainSpec(seeds=(0,), steps=1), gpu=GpuSpec(type="RTX 4090", max_retries=0),
+            train=TrainSpec(steps=1), gpu=GpuSpec(type="RTX 4090", max_retries=0),
         )
         with pytest.raises(RuntimeError):
             orch.submit_job(spec, dry_run=False, background=False)
@@ -1160,7 +1160,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             run_id="walk",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(seeds=(0,), steps=1),
+            train=TrainSpec(steps=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
@@ -1202,7 +1202,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
             run_id="code-crash",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(seeds=(0,), steps=1),
+            train=TrainSpec(steps=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         with pytest.raises(RuntimeError, match="bad reward fn"):
@@ -1260,7 +1260,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
             run_id="clamp",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(seeds=(0,), steps=1),
+            train=TrainSpec(steps=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
@@ -1312,7 +1312,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
             run_id="lastgpu",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(seeds=(0,), steps=1),
+            train=TrainSpec(steps=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
@@ -1364,7 +1364,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             run_id="alloc-blip",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(seeds=(0,), steps=1),
+            train=TrainSpec(steps=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
@@ -1467,48 +1467,6 @@ def test_attach_completes_run(monkeypatch):
         assert abs(st.cost_usd - 0.2) < 1e-9
 
 
-def test_attach_clears_stale_handle_before_resuming_seeds(monkeypatch):
-    # After a recovered seed of a multi-seed run completes, the stale completed
-    # handle must be cleared before the remaining seeds run: a restart in the
-    # provisioning gap must not reattach recovery to the finished job.
-    with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.train as flash_train
-        from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-        spec = JobSpec(
-            run_id="m1",
-            model="Qwen/Qwen3.5-0.8B",
-            algorithm="grpo",
-            train=TrainSpec(seeds=(0, 1), steps=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
-        )
-        orch._save_status(
-            orch.RunStatus(
-                run_id="m1",
-                state="running",
-                spec=spec.to_dict(),
-                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "seed": 0},
-            )
-        )
-        monkeypatch.setattr(
-            jobs, "poll_job", lambda *a, **k: jobs.PollResult(True, metrics={"cost_usd": 0.2})
-        )
-        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-        seen = {}
-
-        def fake_loop(spec, log, *, start_index, prior_cost):
-            seen["remote"] = orch.get_status(spec.run_id).remote
-            seen["start_index"] = start_index
-            orch._update(spec.run_id, "done", cost_usd=prior_cost)
-
-        monkeypatch.setattr(orch, "_run_seed_loop", fake_loop)
-        orch.attach_run("m1", log_stream=sys.stderr)
-        assert seen["start_index"] == 1
-        assert seen["remote"] is None, "stale completed handle must be cleared before resuming"
-
-
 def test_attach_requires_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -1519,10 +1477,9 @@ def test_attach_requires_handle(monkeypatch):
 
 def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
     # A recovered run whose remote job ended not-ok (it died while the control plane was down for
-    # the redeploy) must NOT be failed — reattach resumes the in-flight seed on a fresh host
-    # (worker resumes from the latest HF checkpoint), exactly like the fresh-submit retry loop. It
-    # also records resume_seed_index + clears the stale handle so a second restart during the
-    # fresh allocation resumes the right seed.
+    # the redeploy) must NOT be failed — reattach resumes training on a fresh host (worker resumes
+    # from the latest HF checkpoint), exactly like the fresh-submit retry loop. It also clears the
+    # stale handle so a second restart during the fresh allocation re-resumes cleanly.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
@@ -1534,7 +1491,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
                 state="running",
                 spec=_spec("i1").to_dict(),
                 cost_usd=0.0,
-                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "seed": 0},
+                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA"},
             )
         )
         # Poll reports a dead/abandoned job (the common redeploy-window outcome).
@@ -1546,26 +1503,22 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         seen = {}
 
-        def fake_loop(spec, log, *, start_index, prior_cost):
-            seen["start_index"] = start_index
+        def fake_training(spec, log, *, prior_cost, runtime_secrets=None):
             seen["remote"] = orch.get_status(spec.run_id).remote
-            seen["resume_seed_index"] = orch.get_status(spec.run_id).resume_seed_index
             orch._update(spec.run_id, "done", cost_usd=prior_cost)
 
-        monkeypatch.setattr(orch, "_run_seed_loop", fake_loop)
+        monkeypatch.setattr(orch, "_run_training", fake_training)
 
         st = orch.attach_run("i1", log_stream=sys.stderr)
 
-        assert seen["start_index"] == 0, "must resume the in-flight seed (index 0), not skip it"
         assert seen["remote"] is None, "stale dead handle must be cleared before resuming"
-        assert seen["resume_seed_index"] == 0, "resume marker must be set for a second restart"
         assert st.state != "failed", "a job lost to the redeploy must be resumed, not failed"
         assert st.state == "done"
 
 
 def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
-    # The resume delegates the genuine-vs-infra decision to the seed loop (unchanged): a run that
-    # is truly broken reproduces the failure on the resumed attempt, the seed loop fails it, and
+    # The resume delegates the genuine-vs-infra decision to the training submit (unchanged): a run
+    # that is truly broken reproduces the failure on the resumed attempt, _run_training fails it, and
     # attach surfaces that terminal `failed` — so a broken run still terminates (nothing hangs).
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -1577,7 +1530,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
                 run_id="g1",
                 state="running",
                 spec=_spec("g1").to_dict(),
-                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "seed": 0},
+                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA"},
             )
         )
         monkeypatch.setattr(
@@ -1590,13 +1543,13 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         resumed = {"called": False}
 
-        def fake_loop(spec, log, *, start_index, prior_cost):
-            # The seed loop re-runs the seed; a genuinely broken run fails there (matches
+        def fake_training(spec, log, *, prior_cost, runtime_secrets=None):
+            # The training submit re-runs the run; a genuinely broken run fails there (matches
             # _submit_seed_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True
-            raise RuntimeError("seed 0 failed after retries: worker_error: bad reward fn")
+            raise RuntimeError("run failed after retries: worker_error: bad reward fn")
 
-        monkeypatch.setattr(orch, "_run_seed_loop", fake_loop)
+        monkeypatch.setattr(orch, "_run_training", fake_training)
 
         st = orch.attach_run("g1", log_stream=sys.stderr)
 
@@ -1608,7 +1561,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
 def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
     # Codex: a recovered Vast run whose poll ended not-ok must CONFIRM the in-flight instance is gone
     # before resuming. If destroy() raises (unconfirmed DELETE — the old worker may still be running and
-    # writing this seed's HF artifacts), attach must NOT launch a second worker (double-bill + corrupt
+    # writing this run's HF artifacts), attach must NOT launch a second worker (double-bill + corrupt
     # the shared DONE/metrics); it keeps the handle and leaves the run non-terminal so a later
     # recovery/sweep reconciles. Mirrors the retry-loop MtzrH guard.
     with tempfile.TemporaryDirectory() as tmp:
@@ -1651,10 +1604,10 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
 
         resumed = {"called": False}
 
-        def fake_loop(spec, log, *, start_index, prior_cost):
+        def fake_loop(spec, log, *, prior_cost, runtime_secrets=None):
             resumed["called"] = True
 
-        monkeypatch.setattr(orch, "_run_seed_loop", fake_loop)
+        monkeypatch.setattr(orch, "_run_training", fake_loop)
 
         st = orch.attach_run("v1", log_stream=sys.stderr)
 
@@ -1973,7 +1926,7 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
 
 def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
     """reap_warm=False (the deploy-time reactive sweep, which protects only the current run) reaps
-    ONLY fully scaled-to-zero endpoints — never another run's warm idle/ready between-seeds one."""
+    ONLY fully scaled-to-zero endpoints — never another run's warm idle/ready leftover one."""
     import flash.providers.runpod.api as runpod_api
     import flash.providers.runpod.jobs as jobs
 

@@ -1,6 +1,6 @@
 """Deploy / cancel / recover state transitions for a run.
 
-Store helpers and the lifecycle functions (``_run_seed_loop`` / ``_gc_run_endpoints``) are
+Store helpers and the lifecycle functions (``_run_training`` / ``_gc_run_endpoints``) are
 pulled in via FUNCTION-LOCAL lazy ``from flash.runner import ...`` imports — never at module
 level — for the same two reasons as ``lifecycle.py``: avoid a partially-initialized-package
 import cycle, and keep the test monkeypatches (e.g. ``flash.runner._gc_run_endpoints``)
@@ -136,10 +136,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     import sys
 
     from flash.runner import (
+        FIXED_SEED,
         TERMINAL_STATES,
         _gc_run_endpoints,
         _persist_metrics,
-        _run_seed_loop,
+        _run_training,
         _RunCancelled,
         _update,
         artifacts_dir,
@@ -154,7 +155,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
 
     spec = JobSpec.from_dict(status.spec)
     remote = dict(status.remote)
-    seed = int(remote.pop("seed", spec.train.seeds[0]))
+    seed = int(remote.pop("seed", FIXED_SEED))
     # The class the run actually provisioned (a policy retry may have walked past the
     # provisional spec.gpu.type). The in-process success path stamps this into metrics;
     # on recovery the worker output carries no such field, so recover it from the handle
@@ -176,19 +177,15 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
-            # Job ended not-ok — usually because it was abandoned during the redeploy. Resume the
-            # in-flight seed from its last HF checkpoint instead of failing; the seed loop
-            # (unchanged) still terminates a genuinely broken run when it re-fails.
-            try:
-                seed_index = list(spec.train.seeds).index(seed)
-            except ValueError:
-                seed_index = 0
+            # Job ended not-ok — usually because it was abandoned during the redeploy. Resume from
+            # the last HF checkpoint (fresh allocation, worker resumes mid-training) instead of
+            # failing; _run_training still terminates a genuinely broken run when it re-fails.
             print(
-                f"attach: {run_id} seed {seed} ended ({res.failure}); resuming from checkpoint",
+                f"attach: {run_id} ended ({res.failure}); resuming from checkpoint",
                 file=log,
             )
             # Before resuming, the in-flight instance MUST be CONFIRMED torn down. Resubmitting while
-            # it may still be alive runs TWO workers against this seed's shared HF artifacts
+            # it may still be alive runs TWO workers against this run's shared HF artifacts
             # (DONE/metrics/checkpoints) — double bill AND corrupted state. An instance provider's
             # destroy() raises only on an UNCONFIRMED teardown (Vast: DELETE success:false / network
             # breakdown — a real 404 is now treated as confirmed-gone). The poll loop's own finally
@@ -210,8 +207,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                         file=log,
                     )
             # GC the dead endpoint / any label-named instances (a second force-reap attempt when the
-            # teardown above was unconfirmed), then clear the stale handle and record the seed so a
-            # second restart mid-allocation resumes the right one.
+            # teardown above was unconfirmed), then clear the stale handle.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
             if not teardown_confirmed:
@@ -220,66 +216,24 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 return get_status(run_id)
             # Bail if the run was raced to terminal during the long poll above: _update's CAS
             # returns False, and resuming would submit paid work for a dead run.
-            if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
+            if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
-            _run_seed_loop(
-                spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
-            )
+            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0))
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the
         # run actually used (the in-process path stamps this; recovery must restore it).
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
-        # Earlier seeds of a multi-seed run already persisted their cost into
-        # status.cost_usd; add this seed's so recovery doesn't underreport spend.
-        total = float(status.cost_usd or 0.0) + _persist_metrics(spec, seed, res.metrics)
-        # A cancel can land while this thread persists the recovered seed's metrics
-        # (after the late-cancel check above). Re-read before the post-seed writes so
-        # the "running" update and the terminal "done" below can't resurrect a
-        # user-cancelled run (mirrors the fresh seed loop). _RunCancelled is caught
-        # below, leaving the cancellation intact.
+        # Add the recovered run's cost to any already booked before the restart so recovery
+        # doesn't underreport spend.
+        total = float(status.cost_usd or 0.0) + _persist_metrics(spec, res.metrics)
+        # A cancel can land while this thread persists the recovered metrics (after the late-cancel
+        # check above). Re-read before the terminal "done" so a late worker success can't resurrect
+        # a user-cancelled run. _RunCancelled is caught below, leaving the cancellation intact.
         if get_status(run_id).state == "cancelled":
             raise _RunCancelled(f"run {run_id} was cancelled")
-        # The remote handle only identifies the seed that was in flight. For a
-        # multi-seed run, resume the remaining seeds instead of terminally
-        # completing the whole run after just this one.
-        try:
-            resumed_index = list(spec.train.seeds).index(seed) + 1
-        except ValueError:
-            resumed_index = len(spec.train.seeds)
-        more_seeds = resumed_index < len(spec.train.seeds)
-        # Clear the now-stale completed handle before resuming. In the
-        # allocation/provisioning gap before the next seed's on_handle() persists a
-        # fresh handle, a server restart must not reattach recovery to this finished
-        # job — that would double-count its cost and replay the wrong seed. Record the
-        # next seed index so a restart in that gap resumes the remaining seeds rather
-        # than failing the run. (The last seed keeps its handle for post-run
-        # observability, mirroring the fresh-submit seed loop.)
-        applied = _update(
-            run_id,
-            "running",
-            cost_usd=total,
-            artifacts_dir=artifacts_dir(spec),
-            **({"remote": None, "resume_seed_index": resumed_index} if more_seeds else {}),
-        )
-        # Same TOCTOU guard as the not-ok recovery path: a concurrent thread can flip this
-        # run terminal (e.g. failed/done from another recovery) between the cancel re-check
-        # above and here. The sticky CAS rejects the `running` write (applied is False) — so
-        # don't resume the remaining seeds and submit paid GPU work for an already-terminal
-        # run. (The non-multi-seed arm writes the terminal `done`; the CAS protects a racing
-        # terminal there too, so no extra guard is needed.)
-        if more_seeds:
-            if not applied:
-                print(
-                    f"attach: {run_id} went terminal during recovery; "
-                    "not resuming the remaining seeds",
-                    file=log,
-                )
-                return get_status(run_id)
-            _run_seed_loop(spec, log, start_index=resumed_index, prior_cost=total)
-        else:
-            _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
+        _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
     except _RunCancelled:
         # Intentional: cancel_run already wrote the terminal `cancelled` state; leave it.
         pass
@@ -287,55 +241,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
     finally:
-        _gc_run_endpoints(spec)
-    return get_status(run_id)
-
-
-def resume_run(run_id: str, log_stream=None) -> RunStatus:
-    """Resume the remaining seeds of a multi-seed run after a restart in the inter-seed gap.
-
-    Between two seeds the completed seed's handle is cleared and ``resume_seed_index`` is
-    recorded (see ``_run_seed_loop``). A control-plane restart in that handle-less window
-    must RESUME from that index rather than fail the run and discard the finished seeds.
-    Unlike ``attach_run`` there is no live job to poll — the prior process already tore the
-    seed's endpoint down — so we start a fresh seed loop from the recorded index. The flash
-    package was uploaded to HF on the original submit, so the worker can still fetch it; no
-    re-upload is needed.
-    """
-    import sys
-
-    from flash.runner import (
-        TERMINAL_STATES,
-        _gc_run_endpoints,
-        _run_seed_loop,
-        _RunCancelled,
-        _update,
-        get_status,
-    )
-
-    status = get_status(run_id)
-    if status.state in TERMINAL_STATES:
-        return status
-    if status.resume_seed_index is None:
-        raise ValueError(f"run {run_id} has no resume_seed_index; cannot resume")
-    spec = JobSpec.from_dict(status.spec)
-    log = log_stream or sys.stderr
-    print(f"resuming {run_id}: remaining seeds from index {status.resume_seed_index}", file=log)
-    try:
-        _run_seed_loop(
-            spec,
-            log,
-            start_index=status.resume_seed_index,
-            prior_cost=float(status.cost_usd or 0.0),
-        )
-    except _RunCancelled:
-        pass  # cancel_run already set the terminal state
-    except Exception as exc:
-        if get_status(run_id).state != "cancelled":
-            _update(run_id, "failed", error=str(exc))
-    finally:
-        # Mirror _run_job: GC any endpoint a transient destroy left behind rather than
-        # leaking a billable RunPod endpoint.
         _gc_run_endpoints(spec)
     return get_status(run_id)
 

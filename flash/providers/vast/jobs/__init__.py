@@ -414,7 +414,7 @@ def poll_vast_job(
     _dating_launch = handle.started_ts or 0.0
 
     hf_repo = spec.train.hf_repo
-    prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+    prefix = f"{spec.phase}/{spec.run_id}"
     done_reader = _make_hf_file_reader(hf_repo, f"{prefix}/DONE")
     marker_reader = _make_hf_file_reader(
         hf_repo, f"{prefix}/vast_attempt{handle.attempt}.json", min_interval_s=60.0
@@ -620,7 +620,7 @@ def poll_vast_job(
             # left error_{phase}.txt (a bad env id, a config/code error, an OOM): that is DETERMINISTIC,
             # so fail FAST. A crash the worker flagged retriable still retries.
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
-            # ``error_{phase}.txt`` and the heartbeat are BOTH seed-scoped (shared across this seed's
+            # ``error_{phase}.txt`` and the heartbeat are BOTH run-scoped (shared across this run's
             # retries), so a prior attempt can leave either behind. The worker's crash handler uploads
             # the error file AND a heartbeat stamped with THIS attempt + ts together (and error-stage
             # heartbeats are force-uploaded, never throttled), so a genuine current-attempt crash always
@@ -780,7 +780,7 @@ def submit_run_vast(
         if on_handle is not None:
             on_handle(handle.to_dict())
         hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+        prefix = f"{spec.phase}/{spec.run_id}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         # Wall cap + provision/cold-start grace; Vast has no server-side execution timeout, so the
         # client deadline (and the bootstrap's own cap) bound spend.
@@ -795,14 +795,13 @@ def submit_run_vast(
         )
     finally:
         # The teardown can't raise here (it would mask the poll result / original exception). But an
-        # UNCONFIRMED single-instance destroy (success:false / breakdown) on a SUCCESSFUL seed is
-        # dangerous for a multi-seed run: the success propagates, _run_seed_loop clears ``remote`` and
-        # launches the next seed, and while the run stays ``running`` the active-run orphan sweep SHIELDS
-        # this run's label — so the previous seed's possibly-billing box can survive across every
-        # remaining seed with no persisted handle. Escalate to a run-scoped reap by label
-        # (destroy_run_instances re-lists + retries and is NOT active-shielded) so this seed's box is
-        # cleared before the next seed launches; the warning above stays for the operator if even that
-        # can't confirm (Codex).
+        # UNCONFIRMED single-instance destroy (success:false / breakdown) on an abandoned/retriable run is
+        # dangerous: while the run stays ``running`` across a retry/recovery the active-run orphan sweep
+        # SHIELDS this run's label — so this attempt's possibly-billing box can survive into the next
+        # attempt (a fresh box, this handle cleared) with no persisted handle. Escalate to a run-scoped
+        # reap by label (destroy_run_instances re-lists + retries and is NOT active-shielded) so this
+        # attempt's box is cleared before the next launches; the warning above stays for the operator if
+        # even that can't confirm (Codex).
         if not _best_effort_destroy(handle.instance_id, context="submit_run_vast teardown"):
             with contextlib.suppress(Exception):
                 destroy_run_instances(spec.run_id)

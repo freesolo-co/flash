@@ -13,10 +13,11 @@ import re
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.lora import (
+    adapter_is_vl_warmstart,
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
-    remap_vl_adapter_dir,
+    recombine_lora_adapters,
 )
 from flash.engine.worker.perf import optimal_attn_impl
 
@@ -106,34 +107,73 @@ def _init_adapter_model(model_id: str):
             "init_from_adapter to train a fresh LoRA."
         )
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM
 
     print(f"[init-adapter] initializing LoRA from {prefix}")
-    # VL checkpoints (Qwen3.5/3.6): the SFT step saved the adapter against the FULL multimodal model
-    # (keys under ``base_model.model.model.language_model.layers.*``), but we load the base here via
-    # AutoModelForCausalLM (text-only tree, ``base_model.model.model.layers.*``). Strip the
-    # ``.language_model.`` infix on disk so PeftModel.from_pretrained matches the SFT keys —
-    # otherwise peft only WARNS about missing keys and silently trains a fresh LoRA, discarding the
-    # SFT. No-op for non-VL checkpoints. See flash/engine/worker/lora.py.
-    remap_vl_adapter_dir(adir, model_id)
     _attn = optimal_attn_impl()
+    attn_kw = {"attn_implementation": _attn} if _attn else {}
+
+    if adapter_is_vl_warmstart(adir, model_id):
+        # VL checkpoints (Qwen3.5/3.6): MERGE the SFT into the base and train a FRESH LoRA on the
+        # merged weights, instead of continuing the live SFT LoRA. Continuing it makes the colocated
+        # vLLM rollout engine AND the KL reference key off the BARE base — the SFT only reaches vLLM
+        # through the text-trainer<->VL-vLLM weight-sync, which round-trips poorly for these
+        # `*ForConditionalGeneration` models, so GRPO rolls out base-verbose and collapses a working
+        # concise-thinking SFT back to base (observed: every Qwen3.5 GRPO reverts; non-VL MiniCPM
+        # does not). We merge into the FULL multimodal model (NOT the text-only tree) so the saved
+        # checkpoint keeps the VL config + ``language_model.*`` keys that BOTH the trainer reload and
+        # vLLM's VL loader (language_model_only skips the vision weights) expect — a text-only
+        # AutoModelForCausalLM merge saves a Qwen3_5TextConfig that vLLM's VL loader rejects. The SFT
+        # adapter was trained against the full VL model, so its keys match here WITHOUT the infix strip.
+        from transformers import AutoModelForImageTextToText
+
+        base = AutoModelForImageTextToText.from_pretrained(
+            model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
+        )
+        model = PeftModel.from_pretrained(base, adir, is_trainable=False)
+        key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+        load_result = model.load_adapter(
+            adir, adapter_name="default", is_trainable=False, key_mapping=key_mapping
+        )
+        assert_adapter_load_clean(load_result, model_id)
+        assert_lora_applied(model, model_id)
+        assert_adapter_delta_nonzero(model, model_id)
+        import gc
+        import tempfile
+
+        merged = model.merge_and_unload()
+        # UNIQUE per call (mkdtemp): a fixed /tmp/flash_sft_merged would let two GRPO warm-starts on
+        # the SAME host clobber each other's merged weights (or load a partially-written tree). The
+        # dir is the run's training base, so it persists for the run (the worker is ephemeral); the
+        # old fixed path never cleaned up either, so uniqueness adds no leak it didn't already have.
+        merged_dir = tempfile.mkdtemp(prefix="flash_sft_merged_")
+        merged.save_pretrained(merged_dir, safe_serialization=True)
+        from transformers import AutoProcessor
+
+        # processor (preferred for VL) so vLLM/loaders find tokenizer + image-processor config; fall
+        # back to the bare tokenizer if no processor is published.
+        try:
+            AutoProcessor.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
+        except Exception:
+            from transformers import AutoTokenizer
+
+            AutoTokenizer.from_pretrained(model_id, trust_remote_code=True).save_pretrained(merged_dir)
+        del base, model, merged
+        gc.collect()
+        print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
+        # Record the SFT adapter dir: the saved GRPO LoRA will be SFT-less (trained on the merged
+        # base), so finalize MUST recombine it with this SFT before deploy (recombined_warmstart_
+        # adapter_dir). The dir persists for the run (worker is ephemeral; init's download stays).
+        _w._VL_WARMSTART_SFT_DIR = adir
+        return merged_dir, make_lora(merged_dir)
+
+    # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
+    # so keep it — TRL trains the LOADED adapter (peft_config=None).
+    from transformers import AutoModelForCausalLM
+
     base = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype="bfloat16",
-        trust_remote_code=True,
-        **({"attn_implementation": _attn} if _attn else {}),
+        model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
     )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
-    # Fail loudly if the adapter didn't actually apply (a key mismatch would otherwise silently start
-    # GRPO from the base model again). from_pretrained loads with load_state_dict(strict=False) and
-    # only WARNS on a mismatch, discarding the load result — so re-run load_adapter to CAPTURE which
-    # keys matched and assert matched==saved (peft injects the LoRA modules from target_modules BEFORE
-    # loading weights, so the module-count check alone can't see a silent weight discard). The reload
-    # is idempotent: same weights into the same "default" adapter. See flash/engine/worker/lora.py.
-    # Mirror from_pretrained's key_mapping: for transformers models that define a
-    # ``_checkpoint_conversion_mapping`` (renamed-arch checkpoints), from_pretrained remaps the adapter
-    # keys before loading; the reload must apply the SAME mapping or it would reinterpret valid keys as
-    # mismatched and falsely abort. peft reads it off the base model (peft_model.py from_pretrained).
     key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
     load_result = model.load_adapter(
         adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
@@ -144,29 +184,89 @@ def _init_adapter_model(model_id: str):
     return model, None
 
 
+def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
+    """For a VL merge-into-base warm-start GRPO run, return a NEW dir holding the SFT⊕GRPO
+    recombined adapter (deployable on the ORIGINAL catalog base); otherwise ``None``.
+
+    ``_init_adapter_model`` (VL path, #296) merges the SFT into the base and trains a FRESH LoRA on
+    the merged weights — so ``src_adapter_dir`` (the just-saved trainer adapter) is GRPO-ONLY and,
+    deployed on the catalog base, drops the SFT (served output collapses to ~base: malformed,
+    SFT-less filters). Recombining the original SFT LoRA back in produces a rank-(r_sft+r_grpo)
+    adapter that reproduces ``base + SFT + GRPO`` on the unmodified base.
+
+    Gated on the SFT dir ``_init_adapter_model`` recorded when (and only when) it took the VL merge
+    path — so this is a NO-OP for the continued-adapter (non-VL) path, which already carries the SFT
+    in its saved adapter, and for fresh-LoRA runs (no ``init_from_adapter``). When the merge DID
+    happen, the recombine is REQUIRED: if the recorded SFT dir has vanished, raise rather than
+    silently ship the SFT-less GRPO adapter (the exact broken deploy this guards against).
+    """
+    sft_adir = getattr(_w, "_VL_WARMSTART_SFT_DIR", None)
+    if not sft_adir:
+        return None
+    if not os.path.isdir(sft_adir):
+        raise RuntimeError(
+            f"VL warm-start merged the SFT into the base at init but its adapter dir {sft_adir!r} is "
+            "gone at finalize — the saved GRPO adapter is SFT-less and cannot be recombined. Refusing "
+            "to deploy an SFT-less adapter (re-run; check /tmp/evdl was not evicted mid-run)."
+        )
+
+    import fnmatch
+    import shutil
+    import tempfile
+
+    from flash.engine.worker.hf import _CHECKPOINT_TRAINER_STATE
+
+    out_dir = tempfile.mkdtemp(prefix="flash_recomb_adapter_")
+    try:
+        rank = recombine_lora_adapters(sft_adir, src_adapter_dir, out_dir)
+        # Carry tokenizer/aux files from the raw save (serving uses the base tokenizer, but keep the
+        # deployed dir at parity with the un-recombined save); the recombined config+weights stay.
+        # Skip trainer state — for the per-step path src is a `checkpoint-<n>` dir carrying optimizer/
+        # scheduler state that the deployable adapter must not duplicate.
+        for name in os.listdir(src_adapter_dir):
+            if name in ("adapter_model.safetensors", "adapter_config.json", "adapter_model.bin"):
+                continue
+            if any(fnmatch.fnmatch(name, pat) for pat in _CHECKPOINT_TRAINER_STATE):
+                continue
+            src = os.path.join(src_adapter_dir, name)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(out_dir, name))
+    except Exception:
+        # recombine (or the aux copy) raised — remove the just-created temp dir so a caller that
+        # catches and continues (the per-step publish in hf.py) doesn't accumulate
+        # flash_recomb_adapter_* dirs under /tmp across repeated failures.
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
+    print(
+        f"[recombine] VL warm-start: stacked SFT⊕GRPO -> rank-{rank} deployable adapter at "
+        f"{out_dir} (reproduces base+SFT+GRPO on the catalog base)"
+    )
+    return out_dir
+
+
 def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     """Resolve init_from_adapter into (repo, prefix).
 
     The only public form is the exact adapter_ref emitted by ``flash status``:
-    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
+    ``<owner>/<repo>:<phase>/<run_id>``.
     """
     adapter_ref = adapter_ref.strip()
     match = re.fullmatch(
         r"(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*):"
-        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})/seed(?P<seed>\d+)",
+        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})",
         adapter_ref,
     )
     if not match:
         return None
-    repo, phase, run_id, seed = match.groups()
-    return repo, f"{phase}/{run_id}/seed{seed}"
+    repo, phase, run_id = match.groups()
+    return repo, f"{phase}/{run_id}"
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
     """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
 
     ``adapter_prefix`` must be the full ``adapter_ref`` string emitted by ``flash status``:
-    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
+    ``<owner>/<repo>:<phase>/<run_id>``.
     """
     if not adapter_prefix:
         return None

@@ -676,6 +676,217 @@ def remap_vl_adapter_dir(adir: str, model_id: str) -> int:
     return n
 
 
+def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
+    """Whether a warm-start adapter should take the VL merge-into-base path.
+
+    Robust to a transient ``is_vl_checkpoint`` config-probe failure (it calls
+    ``AutoConfig.from_pretrained`` and swallows EVERY exception to return False, so an HF
+    rate-limit / network hiccup / uncached config could silently route a genuine VL warm-start down
+    the text-only path and reintroduce the trainer<->vLLM mismatch — issue #286). An adapter that
+    actually carries ``.language_model.`` LoRA keys was saved against the full multimodal model and
+    IS a VL warm-start regardless of the probe (the SAME authoritative file-content signal
+    ``remap_vl_adapter_dir`` keys off). Falls back to the config probe only when the adapter can't be
+    read or carries no ``.language_model.`` LoRA keys (already-text-only / non-VL)."""
+    try:
+        keys = _read_adapter_tensor_keys(adir)
+        if keys and any(_LANGUAGE_MODEL_INFIX in k for k in keys if _is_lora_key(k)):
+            return True
+    except Exception as e:  # best-effort: never let a key-read failure abort the launch
+        # Name the adapter dir + model so a transient failure is tied to the specific warm-start
+        # when several workers log into the same stream.
+        print(
+            f"[init-adapter] adapter VL-key probe failed for adir={adir!r} model={model_id!r}; "
+            f"deferring to the config probe: {e}"
+        )
+    return is_vl_checkpoint(model_id)
+
+
+def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
+    """Stack two LoRA adapters (SFT ⊕ GRPO) into ONE rank-(r_sft+r_grpo) adapter in ``out_dir``.
+
+    The VL warm-start path (#296) MERGES the SFT into the base and trains a FRESH LoRA on the merged
+    weights, so the saved GRPO adapter is a delta RELATIVE TO base+SFT. Deploying it alone on the
+    catalog base drops the SFT entirely (served output collapses to ~base). Concatenating the two
+    LoRAs reproduces ``base + SFT_delta + GRPO_delta`` — the exact model GRPO trained — on the
+    ORIGINAL base: for each module, ``A_out = cat([A_sft, A_grpo], 0)`` and
+    ``B_out = cat([s_sft·B_sft, s_grpo·B_grpo], 1)`` with each adapter's own scale (``alpha/r``, or
+    ``alpha/√r`` under rsLoRA) BAKED into its ``B`` and the combined adapter set to unit scale
+    (``alpha=r`` ⇒ ``alpha/r=1``). Then ``delta_out = B_out @ A_out = s_sft·B_sft@A_sft +
+    s_grpo·B_grpo@A_grpo`` exactly, for ANY input scales. Returns the combined rank.
+
+    Both adapters must target the SAME modules (true for managed flash: target_modules is
+    model-derived, not user-set) and be plain LoRA — DoRA / ``modules_to_save`` / non-LoRA tensors
+    raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead).
+    """
+    import json
+    import math
+    import os
+
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    def _load(d: str):
+        cfg_path = os.path.join(d, "adapter_config.json")
+        st_path = os.path.join(d, "adapter_model.safetensors")
+        bin_path = os.path.join(d, "adapter_model.bin")
+        if os.path.isfile(st_path):
+            sd = load_file(st_path)
+        elif os.path.isfile(bin_path):
+            # Legacy PEFT save: a plain torch pickle of {name: tensor}. The warm-start INIT path
+            # (PeftModel.from_pretrained / _read_adapter_tensor_keys / remap_vl_adapter_dir) all
+            # accept .bin, so recombine must too — otherwise a loadable .bin warm-start trains a full
+            # paid GRPO run and only fails here at finalize. weights_only=True: pure tensor dicts.
+            sd = torch.load(bin_path, map_location="cpu", weights_only=True)
+        else:
+            raise ValueError(
+                f"recombine: {d!r} has no adapter_model.safetensors or adapter_model.bin "
+                f"(dir contents: {sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING'}); "
+                "only safetensors / .bin LoRA adapters can be recombined"
+            )
+        if not os.path.isfile(cfg_path):
+            raise ValueError(
+                f"recombine: {d!r} has no adapter_config.json "
+                f"(dir contents: {sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING'}); "
+                "the adapter config is required to read its rank/alpha/scale"
+            )
+        with open(cfg_path) as f:
+            return json.load(f), sd
+
+    sft_cfg, sft_sd = _load(sft_dir)
+    grpo_cfg, grpo_sd = _load(grpo_dir)
+
+    # Normalize the ``.language_model.`` infix on BOTH adapters' keys before comparing/stacking.
+    # The VL merge warm-start (#296) trains the SFT against the FULL multimodal model, so the SFT
+    # adapter's keys carry the infix (``base_model.model.model.language_model.layers...``), while the
+    # fresh GRPO LoRA is saved by the text-only ``AutoModelForCausalLM`` trainer with no infix
+    # (``base_model.model.model.layers...`` — see _remap_vl_sync_weights / the warm-start remap note).
+    # Without this, the equivalent LM modules compare as DIFFERENT targets and the recombine wrongly
+    # aborts for the default Qwen3.5 warm-start path. Stripping is idempotent (a no-op for an already
+    # text-only adapter) and emits the text-only key form serving deploys on the catalog base.
+    def _normalize_infix(sd, which):
+        norm: dict = {}
+        for k, v in sd.items():
+            nk = strip_language_model_infix(k)
+            # Fail closed on ANY post-normalization collision. A malformed adapter carrying BOTH the
+            # infixed and the already-text-only form of a key would otherwise let the second write
+            # silently overwrite the first (the text-only key has nk == k, so a ``nk != k`` guard
+            # would skip it) — recombining whichever duplicate wins instead of rejecting the mix.
+            if nk in norm:
+                raise ValueError(
+                    f"recombine: {which} adapter key {k!r} collides with another after stripping "
+                    "the '.language_model.' infix — cannot normalize a mixed VL adapter"
+                )
+            norm[nk] = v
+        return norm
+
+    sft_sd = _normalize_infix(sft_sd, "SFT")
+    grpo_sd = _normalize_infix(grpo_sd, "GRPO")
+
+    for name, cfg in (("SFT", sft_cfg), ("GRPO", grpo_cfg)):
+        # peft_type defaults to LORA for older configs that omit it; anything else (e.g. ADALORA)
+        # has different tensor/scale semantics the cat-recombine math doesn't model.
+        peft_type = (cfg.get("peft_type") or "LORA").upper()
+        if peft_type != "LORA":
+            raise ValueError(
+                f"recombine: {name} adapter peft_type={peft_type!r} (not plain LORA) — "
+                "cat-recombine is unsupported"
+            )
+        if cfg.get("use_dora"):
+            raise ValueError(f"recombine: {name} adapter uses DoRA — cat-recombine is unsupported")
+        if cfg.get("modules_to_save"):
+            raise ValueError(
+                f"recombine: {name} adapter has modules_to_save={cfg['modules_to_save']!r} "
+                "(full-weight tensors) — cat-recombine is unsupported"
+            )
+        # Per-module rank/alpha overrides break the single-(r, alpha) assumption _scale() and the
+        # rank-stacking below rely on — and out_cfg blanks both, which would SILENTLY drop them.
+        for key in ("rank_pattern", "alpha_pattern"):
+            if cfg.get(key):
+                raise ValueError(
+                    f"recombine: {name} adapter has a non-empty {key}={cfg[key]!r} (per-module "
+                    "rank/alpha) — cat-recombine assumes a uniform rank and is unsupported"
+                )
+
+    # Real PEFT adapters embed the adapter NAME in the saved key (``...lora_A.default.weight`` — see
+    # tests/test_vl_warmstart_adapter_keys.py and _is_lora_key), not the bare ``...lora_A.weight``
+    # form. Match the ``.lora_A.``/``.lora_B.`` weight tensors by infix so BOTH the ``.default.`` and
+    # the bare form are recognized — otherwise real keys fall into ``extra`` below and the recombine
+    # wrongly aborts as "non-LoRA tensors present", blocking the VL warm-start deploy.
+    def _is_lora_a(k):
+        return ".lora_A." in k and k.endswith(".weight")
+
+    def _is_lora_b(k):
+        return ".lora_B." in k and k.endswith(".weight")
+
+    def _ab(sd):
+        return {k for k in sd if _is_lora_a(k) or _is_lora_b(k)}
+
+    sft_ab, grpo_ab = _ab(sft_sd), _ab(grpo_sd)
+    extra = (set(sft_sd) - sft_ab) | (set(grpo_sd) - grpo_ab)
+    if extra:
+        raise ValueError(
+            f"recombine: non-LoRA tensors present (e.g. {sorted(extra)[:4]}) — only plain "
+            "lora_A/lora_B adapters can be recombined"
+        )
+    if sft_ab != grpo_ab:
+        only_sft, only_grpo = sorted(sft_ab - grpo_ab)[:3], sorted(grpo_ab - sft_ab)[:3]
+        raise ValueError(
+            "recombine: SFT and GRPO adapters target DIFFERENT modules "
+            f"(only-SFT={only_sft}, only-GRPO={only_grpo}); their target_modules must match for a "
+            "rank-stacked recombine"
+        )
+
+    def _scale(cfg) -> float:
+        r, alpha = int(cfg["r"]), float(cfg["lora_alpha"])
+        return alpha / math.sqrt(r) if cfg.get("use_rslora") else alpha / r
+
+    s_sft, s_grpo = _scale(sft_cfg), _scale(grpo_cfg)
+    r_sft, r_grpo = int(sft_cfg["r"]), int(grpo_cfg["r"])
+    r_out = r_sft + r_grpo
+
+    out: dict[str, torch.Tensor] = {}
+    # Sorted so ``out``'s insertion order — and thus the serialized safetensors byte layout — is
+    # deterministic across runs (``sft_ab`` is a set; its iteration order is not). Stable output
+    # keeps the recombined adapter content-addressable for uploads/caching.
+    for ak in sorted(k for k in sft_ab if _is_lora_a(k)):
+        # Pair B by swapping the A/B marker — robust to the ``.default.`` adapter-name segment that
+        # bare ``lora_A.weight`` -> ``lora_B.weight`` suffix slicing would miss.
+        bk = ak.replace(".lora_A.", ".lora_B.", 1)
+        # Both adapters carry the same A/B key set (asserted above), but a malformed adapter could
+        # have a lora_A with no paired lora_B — name the missing key rather than throw a bare
+        # KeyError on the indexing below. (``bk in sft_ab`` ⇒ present in both state dicts.)
+        if bk not in sft_ab:
+            raise ValueError(
+                f"recombine: lora_A key {ak!r} has no matching lora_B key {bk!r} — the adapter is "
+                "malformed (unpaired LoRA tensors)"
+            )
+        # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
+        out[ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
+        # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
+        # combined adapter carries unit scale, so the per-component scales survive intact.
+        dt = sft_sd[bk].dtype
+        b_sft = sft_sd[bk].to(torch.float32) * s_sft
+        b_grpo = grpo_sd[bk].to(torch.float32) * s_grpo
+        out[bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
+
+    out_cfg = dict(grpo_cfg)
+    out_cfg["r"] = r_out
+    out_cfg["lora_alpha"] = r_out  # alpha/r == 1.0 (scales already baked into each B block)
+    out_cfg["use_rslora"] = False
+    out_cfg["rank_pattern"] = {}
+    out_cfg["alpha_pattern"] = {}
+    # The GRPO adapter was trained on the ephemeral SFT-merged temp dir, so its
+    # base_model_name_or_path points there; name the real catalog base (from the SFT config) instead.
+    if sft_cfg.get("base_model_name_or_path"):
+        out_cfg["base_model_name_or_path"] = sft_cfg["base_model_name_or_path"]
+
+    os.makedirs(out_dir, exist_ok=True)
+    save_file(out, os.path.join(out_dir, "adapter_model.safetensors"), metadata={"format": "pt"})
+    with open(os.path.join(out_dir, "adapter_config.json"), "w") as f:
+        json.dump(out_cfg, f, indent=2)
+    return r_out
+
+
 def assert_lora_applied(model, model_id: str) -> int:
     """After ``PeftModel.from_pretrained``, verify the adapter's LoRA actually loaded (non-empty)
     so a future key-mismatch regression fails LOUDLY instead of silently training a fresh LoRA.

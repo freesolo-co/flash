@@ -84,7 +84,7 @@ class VastProvider:
         )
 
         hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+        prefix = f"{spec.phase}/{spec.run_id}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         vh = VastJobHandle.from_dict(handle.to_dict())
         if log is not None:
@@ -104,15 +104,15 @@ class VastProvider:
             )
         finally:
             # Recovery (attach_run) has no submit_run_vast teardown ``finally``; destroy the reattached
-            # instance here so a finished/abandoned recovered seed stops billing immediately. Best-effort
+            # instance here so a finished/abandoned recovered run stops billing immediately. Best-effort
             # (warns on an unconfirmed teardown so a leak is visible now, not just at the next sweep).
             from flash.providers.vast.jobs import _best_effort_destroy, destroy_run_instances
 
             with contextlib.suppress(Exception):
                 if not _best_effort_destroy(vh.instance_id, context="poll recovery teardown"):
-                    # Unconfirmed single-instance teardown on a recovered seed: while the run stays
-                    # ``running`` the active-run orphan sweep SHIELDS its label, so a successful multi-seed
-                    # ATTACH that clears ``remote`` and resumes the next seed could leave this box billing
+                    # Unconfirmed single-instance teardown on a recovered run: while the run stays
+                    # ``running`` the active-run orphan sweep SHIELDS its label, so an attach that clears
+                    # ``remote`` and resumes from checkpoint on a fresh box could leave this box billing
                     # unreaped with no persisted handle. Escalate to a run-scoped reap by label
                     # (destroy_run_instances re-lists + retries and is NOT active-shielded), mirroring the
                     # submit_run_vast teardown finally (Cursor).

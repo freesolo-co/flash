@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 from dataclasses import dataclass
 
 
@@ -133,6 +132,7 @@ def colocate_kv_util(
     total_vram_gb: float,
     sleep_mode: bool,
     num_generations: int = 8,
+    active_params_b: float | None = None,
 ) -> float:
     """``vllm_gpu_memory_utilization`` for the colocated GRPO rollout engine, sized to the ACTUAL need
     rather than a blanket fraction of the card.
@@ -149,6 +149,12 @@ def colocate_kv_util(
     4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward byte-identical, train_wall neutral; a
     tighter 12 GB budget preempts, confirming this as the floor."""
     weights_gb = max(0.5, float(params_b or 1.0)) * 2.0  # vLLM's bf16 weight copy lives in the budget
+    # MoE: the KV pool scales with the per-token COMPUTE width (the ~3B active backbone), NOT the 35B
+    # total — exactly the split estimate_vram_gb/grpo_fits_resident use (active for KV, full for the
+    # weight copy). Keying the KV off total here would budget a LARGER pool than the resident-fit gate
+    # counted, so the gate could disable sleep while the engine reserves more KV than it sized — the
+    # near-margin 35B-A3B GRPO mismatch. Dense models leave active_params_b unset -> full params_b.
+    kv_params_b = float(active_params_b) if active_params_b else params_b
     if not sleep_mode:
         # Resident KV ON TOP of the weight copy: gpu_memory_utilization is the WHOLE executor budget,
         # so budgeting KV alone (the old _KV_CAP/total) starved the weights and vLLM raised "No
@@ -158,11 +164,11 @@ def colocate_kv_util(
         # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
         # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
         # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
-        kv_gb = max(_KV_CAP, _resident_kv_gb(params_b, vllm_max_len, num_generations))
+        kv_gb = max(_KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations))
         return max(0.10, min(0.45, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
-    kv_pool_gb = max(_KV_CAP, 1.5 * _resident_kv_gb(params_b, vllm_max_len, num_generations))
+    kv_pool_gb = max(_KV_CAP, 1.5 * _resident_kv_gb(kv_params_b, vllm_max_len, num_generations))
     return min(0.45, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
 # GRPO backward (activations + fp32 logits over the completion micro-batch) per unit
 # context x model width. Grad checkpointing makes this MILD in seq -- calibrated to
@@ -254,15 +260,6 @@ def grpo_seq_escalation_gb(params_b: float | None, seq_len: int) -> int:
     if seq_len <= seq_thresh:
         return 0
     return math.ceil(coef * params_b * (seq_len / seq_thresh - 1))
-
-
-def params_b_from_str(s: str | None) -> float | None:
-    """Leading param count (billions) from a catalog ``params`` string, e.g.
-    "4.7B (text-only fine-tune)" -> 4.7, "9.7B (text-only fine-tune)" -> 9.7."""
-    if not s:
-        return None
-    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*B", s)
-    return float(m.group(1)) if m else None
 
 
 @dataclass(frozen=True)
@@ -407,6 +404,13 @@ def grpo_fits_resident(
     if params_b <= 0:
         return False  # unknown size (open-model path) -> keep the safe default
     quant = (getattr(info, "quant", "bf16") or "bf16") if info else "bf16"
+    # MoE: size the resident peak's COMPUTE terms (KV pool, activations, rank-linear LoRA) on the ~3B
+    # ACTIVE backbone, exactly as model_required_vram_gb does — keying them on the 35B TOTAL inflates
+    # the resident estimate above the card and wrongly forces vLLM sleep mode on a B200 MoE GRPO run,
+    # where the sleep/wake cycle stalls the colocated rollout (the very failure this gate exists to
+    # avoid). The ``weights`` term still sizes the full params_b. Dense models leave active_params_b
+    # unset -> estimate_vram_gb falls back to params_b for every term (unchanged).
+    active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
     resident = estimate_vram_gb(
         params_b,
         "grpo",
@@ -419,6 +423,7 @@ def grpo_fits_resident(
         use_vllm=True,
         vocab=vocab_size_for(model_id),
         sleep_offload=False,
+        active_params_b=active_b,
     )
     return resident * margin <= card_vram_gb
 
@@ -513,7 +518,7 @@ def model_required_vram_gb(
     model_vocab = vocab_size_for(model_id)
     is_grpo = (algorithm or "").lower() in ("grpo", "rl")
     if info is not None:
-        params_b = params_b_from_str(info.params)
+        params_b = info.params_b  # curated, authoritative (required field) — no string parsing
         quant = getattr(info, "quant", "bf16") or "bf16"
         # GRPO always runs the rollout on a colocated vLLM engine, so sizing must reserve room for
         # the 2nd (rollout) weight copy on the same card.
@@ -597,8 +602,8 @@ def fetch_hf_params_b(model_id: str) -> float | None:
 
 def resolve_params_b(model_id: str) -> float | None:
     """Model size in billions, resolved the ONE way the worker and the cost estimator agree on:
-    the curated catalog ``params_b`` (else its ``params`` display string), else the real HF
-    safetensors param count for an open-policy (uncataloged) model. Best-effort: returns None only
+    the curated catalog ``params_b`` (the required numeric field), else the real HF safetensors
+    param count for an open-policy (uncataloged) model. Best-effort: returns None only
     when the model is uncataloged AND HF metadata is unavailable, so callers degrade to the
     size-unknown path (e.g. the fused-CE gate stays memory-safe, the colocate cap stays loose).
     The single source of truth for "how big is this model" -- run_sft, run_rl and cost.spec all
@@ -606,10 +611,8 @@ def resolve_params_b(model_id: str) -> float | None:
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
-    if info is not None:
-        pb = getattr(info, "params_b", 0.0) or params_b_from_str(getattr(info, "params", None))
-        if pb:
-            return pb
+    if info is not None and info.params_b > 0:
+        return info.params_b  # curated, authoritative (required field) — no string parsing
     return fetch_hf_params_b(model_id)
 
 

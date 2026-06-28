@@ -661,16 +661,55 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
         """Reward for many ``(example, state)`` rollouts at once, in input order.
 
-        For multi-turn, episodes that share a task go through ONE ``score_episodes`` call, which the
-        env scores concurrently (``Environment.max_score_concurrency``) — replacing one blocking
-        scoring call per rollout. For a judge / network-reward env (where scoring dominates) this is
-        the multi-turn analogue of batched generation. Equals one :meth:`reward` per item:
-        ``score_episodes`` scores each episode independently, so batching changes only concurrency,
-        not values. Single-turn falls back to per-item :meth:`reward`."""
-        if not self.multi_turn:
-            # Single-turn scoring ignores state and grades the completion, so pass the rollout's
-            # actual response (stored on the state) — not "" (which would score every item empty).
+        Rollouts that share a task go through ONE batched scoring call, which the env scores
+        concurrently (``Environment.max_score_concurrency``) — replacing one blocking scoring call
+        per rollout. For a judge / network-reward env (where scoring dominates) this is the analogue
+        of batched generation: a GRPO group's whole completion set overlaps its judge round-trips
+        instead of N serial GPU-idle calls. Multi-turn groups go through ``score_episodes``,
+        single-turn through ``score_responses`` (an episode's reward is just ``score_response`` on
+        its final text, so the two are equivalent for the one-prompt-one-response case). Equals one
+        :meth:`reward` per item: each path scores every rollout independently — ``score_responses``
+        runs ``score_response`` per completion and ``_reward_to_breakdown(...)['total']`` is exactly
+        ``reward.score`` — so batching changes only concurrency, not values.
+
+        Honors ``reward_thread_safe``: an env whose scorer keeps mutable or thread-bound state opts out
+        with ``reward_thread_safe = False`` and MUST NOT be raced. Batching a group's whole completion
+        set into one ``score_responses`` / ``score_episodes`` call hands them to the env's concurrent
+        scorer (``max_score_concurrency``), so for an opted-out env we fall back to the proven serial
+        path — one single-item :meth:`reward` per rollout, in input order — exactly as the pre-batching
+        code did. Same values; only the concurrency is dropped."""
+        if not self.reward_thread_safe:
+            # Single-item scoring per rollout (each reward() makes a ONE-element score_responses /
+            # score_episodes call, so the env's concurrent scorer never sees a batch to parallelize).
+            # reward() reads the rollout's own response_text/episode from its state, like the batched
+            # paths below — passing it as the completion is a no-op for the multi-turn (state) branch.
             return [self.reward(str(st.get("response_text") or ""), ex, st) for ex, st in items]
+        if not self.multi_turn:
+            # Single-turn: group rollouts of the same example so their completions go through ONE
+            # score_responses() call (env-concurrent), mirroring the multi-turn score_episodes()
+            # batching below. Without this, a GRPO step's whole completion batch was scored by
+            # serial per-rollout reward() calls — one blocking judge/API round-trip at a time, with
+            # the GPU idle throughout. Scoring grades the rollout's actual response (stored on the
+            # state), not "" (which would score every item empty).
+            groups: dict[str, dict] = {}
+            order: list[str] = []
+            for i, (ex, st) in enumerate(items):
+                key = json.dumps(ex, sort_keys=True, default=str)
+                grp = groups.get(key)
+                if grp is None:
+                    grp = groups[key] = {"task": self._task_example(ex), "idxs": [], "responses": []}
+                    order.append(key)
+                grp["idxs"].append(i)
+                grp["responses"].append(str(st.get("response_text") or ""))
+            out: list[float] = [0.0] * len(items)
+            for key in order:
+                grp = groups[key]
+                rewards = self._env.score_responses(grp["task"], grp["responses"])
+                if len(rewards) != len(grp["responses"]):
+                    raise RuntimeError("Freesolo environment score_responses returned the wrong length")
+                for idx, rw in zip(grp["idxs"], rewards, strict=True):
+                    out[idx] = float(rw.score)
+            return out
         groups: dict[str, dict] = {}
         order: list[str] = []
         for i, (ex, st) in enumerate(items):

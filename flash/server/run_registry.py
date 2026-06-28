@@ -120,7 +120,6 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
 def record_training_checkpoint(
     *,
     spec: Any,
-    seed: int,
     metrics: dict[str, Any],
     artifact_path: str,
 ) -> bool:
@@ -128,7 +127,7 @@ def record_training_checkpoint(
         from flash.runner import adapter_ref, get_status
 
         status = get_status(spec.run_id)
-        ref = adapter_ref(spec, seed=seed)
+        ref = adapter_ref(spec)
     except Exception:
         return False
     context = _context_from_status(status)
@@ -138,8 +137,7 @@ def record_training_checkpoint(
     body = {
         "orgId": org_id,
         "runId": spec.run_id,
-        "checkpointId": f"seed{seed}",
-        "seed": seed,
+        "checkpointId": "final",
         "phase": getattr(spec, "phase", None),
         "adapterRef": ref,
         "artifactPath": artifact_path,
