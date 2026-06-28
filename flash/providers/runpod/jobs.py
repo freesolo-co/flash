@@ -161,9 +161,9 @@ class JobHandle:
     def from_dict(cls, d: dict) -> JobHandle:
         return cls(
             d["endpoint_id"],
-            d["endpoint_name"],
+            d.get("endpoint_name", ""),
             d["job_id"],
-            int(d["attempt"]),
+            _attempt_int(d.get("attempt")) or 0,
         )
 
 
