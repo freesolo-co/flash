@@ -47,7 +47,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.envpush import cmd_env_install, cmd_env_push
+from flash.cli.envpush import cmd_env_delete, cmd_env_install, cmd_env_push
 
 logger = get_logger("flash.cli")
 
@@ -202,6 +202,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
+
+    env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")
+    env_delete.add_argument("env_id", help="the Freesolo environment id to delete, e.g. you/your-env")
+    env_delete.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt",
+    )
+    env_delete.set_defaults(func=cmd_env_delete)
 
     train = sub.add_parser("train", help="submit a managed training run from a TOML config")
     train.add_argument("config")

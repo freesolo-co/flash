@@ -224,6 +224,14 @@ class ApiClient:
             return self._request("POST", "/v1/envs", body=body, timeout=1800.0)
         return self._post_with_progress("/v1/envs", body, progress=progress, timeout=1800.0)
 
+    def delete_env(self, env_id: str) -> dict:
+        """Delete a published Freesolo environment by its ``namespace/name`` id.
+
+        The id carries a slash, which the server route matches with a ``:path`` converter, so it
+        goes straight into the URL. The server removes the hub package and best-effort drops the
+        platform metadata mirror; deleting an already-absent env is a no-op (``deleted: false``)."""
+        return self._request("DELETE", f"/v1/envs/{env_id}", timeout=600.0)
+
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
         if runtime_secrets:

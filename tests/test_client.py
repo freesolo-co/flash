@@ -59,6 +59,16 @@ def stub():
                 return
             self._send(200, {"run_id": "r1", "state": "queued"})
 
+        def do_DELETE(self):
+            seen["auth"] = self.headers.get("Authorization")
+            seen["path"] = self.path
+            seen["method"] = "DELETE"
+            if self.path.startswith("/v1/envs/"):
+                slug = self.path[len("/v1/envs/") :]
+                self._send(200, {"id": slug, "deleted": True})
+                return
+            self._send(200, {})
+
         def log_message(self, *a):
             pass
 
@@ -171,6 +181,17 @@ def test_publish_env_plain_without_progress(stub):
     assert out["id"] == "freesolo-co/e"
     assert seen["path"] == "/v1/envs"
     assert seen["body"] == {"name": "e", "package_b64": "QQ=="}
+
+
+def test_delete_env_sends_delete_to_slug_path(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    out = client.delete_env("dev-clado-ai/my-env")
+    assert out == {"id": "dev-clado-ai/my-env", "deleted": True}
+    assert seen["method"] == "DELETE"
+    # the namespace/name slug (with its slash) goes straight into the path
+    assert seen["path"] == "/v1/envs/dev-clado-ai/my-env"
+    assert seen["auth"] == "Bearer fslo-user-test"
 
 
 def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
