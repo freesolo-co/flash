@@ -72,7 +72,11 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "environments",
         [
-            ("env", "manage Freesolo environments"),
+            ("env setup", "scaffold a starter Freesolo environment"),
+            ("env list", "list local environment sources"),
+            ("env push", "upload a local environment"),
+            ("env pull", "download a published environment or file"),
+            ("env delete", "delete a published environment"),
         ],
     ),
     (
@@ -160,7 +164,9 @@ class _FlashParser(_ThemedParser):
             return super().format_help()
         usage = f"{CLI_NAME} [--debug] [-v] <command> [args]"
         footers = [
-            f"new here? run `{CLI_NAME} login`, then `{CLI_NAME} train configs/rl.toml`",
+            f"new here? run `{CLI_NAME} login`, then `{CLI_NAME} env setup`",
+            f"train after publishing: `{CLI_NAME} env push --name my-env .`, "
+            f"then `{CLI_NAME} train configs/rl.toml`",
             f"any command in depth: `{CLI_NAME} <command> --help`",
             "docs: https://freesolo.co/docs",
         ]
