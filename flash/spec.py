@@ -120,9 +120,9 @@ class EnvironmentSpec:
     # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    # Pip requirements the GPU worker needs for this environment.
-    # Filled in client-side from the local install manifest so the managed control
-    # plane never depends on client-local state; empty means "derive on the server".
+    # Pip requirements the GPU worker needs for this environment; empty means "use defaults"
+    # (resolved via worker_pip_for_env in spec_payload / provider submit). An explicit
+    # [environment] pip is the escape hatch.
     pip: tuple[str, ...] = ()
     # Secret env var names the environment requires on the worker. Values are never stored in the
     # spec; the client reads matching local env/.env values and sends them out-of-band via
