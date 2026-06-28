@@ -596,7 +596,7 @@ def resolve_params_b(model_id: str) -> float | None:
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
-    if info is not None and info.params_b:
+    if info is not None and info.params_b > 0:
         return info.params_b  # curated, authoritative (required field) — no string parsing
     return fetch_hf_params_b(model_id)
 
