@@ -256,7 +256,6 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n"
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
@@ -269,7 +268,6 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "epochs = 1\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n"
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
@@ -411,12 +409,11 @@ def cmd_train(args) -> int:
     )
     run_id = status["run_id"]
     logger.info(
-        "submitted run %s: model=%s algorithm=%s gpu=%s seeds=%s",
+        "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
         spec.model,
         spec.algorithm,
         spec.gpu.type,
-        list(spec.train.seeds),
     )
     if args.background:
         if render.styled():
