@@ -713,10 +713,7 @@ def poll_job(
             except RuntimeError as e:
                 # COMPLETED but the output decodes as an error (a handler exception). Consult the
                 # worker flag too: an infra failure can surface here and must still retry.
-                hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
-                last_hb_key, _ = surface_heartbeat(lambda hb=hb: hb, last_hb_key, say)
-                retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
-                oom = bool(hb.get("oom")) if isinstance(hb, dict) else False
+                last_hb_key, retriable, oom = surfaced_worker_flags(heartbeat_reader, last_hb_key, say)
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
                     False,
@@ -738,10 +735,7 @@ def poll_job(
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
             # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
-            hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
-            last_hb_key, _ = surface_heartbeat(lambda hb=hb: hb, last_hb_key, say)
-            retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
-            oom = bool(hb.get("oom")) if isinstance(hb, dict) else False
+            last_hb_key, retriable, oom = surfaced_worker_flags(heartbeat_reader, last_hb_key, say)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
                 False,
@@ -1067,13 +1061,15 @@ def worker_flagged_retriable(heartbeat_reader) -> bool:
     return bool(hb.get("retriable"))
 
 
-def worker_flagged_oom(heartbeat_reader) -> bool:
-    """True if the worker stamped ``oom`` (a CUDA out-of-memory crash) in its last heartbeat — the
-    signal that lets the runner retry on a strictly LARGER GPU instead of failing fast on a too-small
-    card. Same fresh-read contract as ``worker_flagged_retriable``."""
-    if heartbeat_reader is None:
-        return False
-    hb = heartbeat_reader(force=True)
+def surfaced_worker_flags(heartbeat_reader, last_hb_key, say) -> tuple:
+    """ONE forced heartbeat read, shared by progress-surfacing AND the structured failure flags.
+
+    Returns ``(last_hb_key, retriable, oom)``. On a worker-FAILED edge the runner needs both flags —
+    ``retriable`` (retry on a fresh same-size GPU) and ``oom`` (a CUDA OOM -> escalate to a LARGER
+    GPU) — and reading once avoids the redundant HF downloads that separate ``worker_flagged_*`` calls
+    would incur right at the failure point."""
+    hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
+    last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
     if not isinstance(hb, dict):
-        return False
-    return bool(hb.get("oom"))
+        return last_hb_key, False, False
+    return last_hb_key, bool(hb.get("retriable")), bool(hb.get("oom"))
