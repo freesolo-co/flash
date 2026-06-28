@@ -123,6 +123,7 @@ class EnvironmentSpec:
     # Pip requirements the GPU worker needs for this environment; empty means "use defaults"
     # (resolved via worker_pip_for_env in spec_payload / provider submit). An explicit
     # [environment] pip is the escape hatch.
+    pip: tuple[str, ...] = ()
     # Secret env var names the environment requires on the worker. Values are never stored in the
     # spec; the client reads matching local env/.env values and sends them out-of-band via
     # runtime_secrets.
