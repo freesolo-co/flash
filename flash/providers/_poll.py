@@ -427,18 +427,3 @@ def heartbeat_progress_ts(
     if fresh and cur_attempt is not None and hb_attempt is not None and hb_attempt != cur_attempt:
         fresh = False
     return min(now, max(lo, ts)), fresh
-
-
-def surface_forced_heartbeat(
-    heartbeat_reader: Callable[..., Any] | None,
-    last_hb_key: tuple | None,
-    say: Callable[[str], None],
-) -> tuple[tuple | None, str | None]:
-    """Force-read and surface the latest heartbeat, bypassing reader rate limits.
-
-    Used on terminal provider statuses so a fast worker failure still leaves the last worker/GPU
-    snapshot in both the run log and status JSON.
-    """
-    if heartbeat_reader is None:
-        return last_hb_key, None
-    return surface_heartbeat(lambda: heartbeat_reader(force=True), last_hb_key, say)
