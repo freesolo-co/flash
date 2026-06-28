@@ -164,14 +164,6 @@ def note(msg: str) -> str:
     return _safe(_dim(msg))
 
 
-def usage_hint(prog: str) -> str:
-    """A dimmed next-step pointer shown under a themed argparse usage error (a missing argument,
-    unknown flag, or bad subcommand). Points at the right ``--help`` for whichever parser raised —
-    ``flash --help`` for the root, ``flash <cmd> --help`` for a subcommand (argparse sets ``prog``
-    per parser). Styled path only; the machine path keeps argparse's raw ``usage: ...`` block."""
-    return arrow(f"run `{prog} --help` for usage")
-
-
 # These renderers are only ever called when `styled()` is true (an interactive stdout, or
 # FLASH_STYLE=1). Each command keeps its exact plain/JSON output on the machine path, so
 # `jq`, scripts, and the agent contract are untouched; this is purely the human view.
