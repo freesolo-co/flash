@@ -90,11 +90,12 @@ A managed run references a **published** environment by id — so push your fold
 
 ```bash
 flash env push --name my-env .       # uploads this project; prints an env id like "your-org/my-env"
-flash env list                       # installed envs + local sources you can push
-flash env install your-org/their-env # record an env someone else published, to train against it
+flash env list                       # local env sources you can push
 ```
 
-Paste the returned id into `[environment] id` in **both** configs. Re-push after any
+To train against an env someone else published, just set its slug as `[environment] id` —
+no separate step is needed. Paste the returned id into `[environment] id` in **both** configs.
+Re-push after any
 edit to `environment.py` or `datasets/` so the managed run uses your change.
 
 ### 3. Configure the run (TOML)
