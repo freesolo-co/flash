@@ -9,7 +9,6 @@ from flash.providers.base import GPU_INFO, GpuClass, providers_for
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "RTX 4090": 165.0,
     "RTX 5090": 210.0,
-    "RTX A6000": 155.0,
     "A100 PCIe": 312.0,
     "A100 SXM": 312.0,
     "H100": 990.0,

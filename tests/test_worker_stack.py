@@ -531,7 +531,7 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     assert f(9, 0, fa3_available=False, fa2_available=False) is None
     # Ampere (8.0/8.6) + Ada (8.9): FA2 when the wheel is present, else SDPA. FA3 never applies.
     assert f(8, 0, fa2_available=True) == "flash_attention_2"  # A100
-    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A6000
+    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A10
     assert f(8, 9, fa2_available=True) == "flash_attention_2"  # Ada 4090
     assert f(8, 7, fa2_available=True) is None  # sm87 Jetson Orin: NOT a validated FA2 arch -> SDPA
     assert f(8, 0, fa2_available=False) is None
