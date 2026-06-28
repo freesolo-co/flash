@@ -34,7 +34,7 @@ def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
 
 
 def spec_steps(spec) -> int:
-    """Per-seed optimizer steps implied by a train spec (mirrors the worker). GRPO: ``train.steps``
+    """Optimizer steps implied by a train spec (mirrors the worker). GRPO: ``train.steps``
     (else recipe default). SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by
     ``max_steps``, where ``num_examples`` is ``max_examples`` if pinned else the real env size."""
     from flash.catalog import vocab_size_for
@@ -93,7 +93,6 @@ def runconfig_from_spec(spec) -> RunConfig:
         model_id=spec.model,
         method=spec.algorithm,
         steps=spec_steps(spec),
-        setup_repeats=1,
         seq_len=t.max_length,
         completion_len=t.max_tokens if is_grpo else None,
         batch_size=t.batch_size,
