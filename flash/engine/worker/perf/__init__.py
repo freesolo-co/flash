@@ -39,7 +39,6 @@ from flash.engine.worker.perf.lifecycle import (
     RETRIABLE_INFRA_MARKER,
     RetriableInfraError,
     _metric_curve,
-    detect_mig_slice,
     free_gpu,
     wait_for_gpu,
 )
@@ -349,7 +348,6 @@ __all__ = [
     "_reset_peak_gpu",
     "_round_gb_from_mib",
     "_sdpa_cudnn_ctx",
-    "detect_mig_slice",
     "free_gpu",
     "fused_optim_name",
     "gpu_diagnostics",

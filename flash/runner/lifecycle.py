@@ -379,8 +379,6 @@ def _run_training(
         if get_status(spec.run_id).state == "cancelled":
             raise _RunCancelled(f"run {spec.run_id} was cancelled")
     # Gate side effects on the CAS succeeding — a concurrent cancel rejects the `done` write.
-    # Restore the winning handle onto the terminal record (None on the empty resume-recovery path,
-    # where the completion charge instead recovers provider/gpu from the last seed's metrics.json).
     applied = _update(
         spec.run_id,
         "done",

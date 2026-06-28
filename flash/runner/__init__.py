@@ -415,10 +415,6 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     the run was already in a terminal state (the sticky compare-and-set below). Callers
     that gate PAID work on a transition (e.g. the recovery path resuming ``_run_training``)
     must check this return so a run concurrently flipped terminal does not get resumed.
-
-    ``allow_from_terminal`` is the NARROW escape hatch used ONLY by cancel_run's final
-    ``cancelled`` write over a racing ``done`` from mark_undeployed — never for a genuine
-    training-completion race.
     """
     report_status: RunStatus | None = None
     with _STATUS_LOCK:

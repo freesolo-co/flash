@@ -667,10 +667,9 @@ def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
     assert _latest_error_artifact_name("org/repo", "rl/r/seed0", "rl") == "error_rl_attempt0.txt"
 
 
-def test_worker_artifacts_reads_console_and_latest_attempt_error(monkeypatch, tmp_path):
-    """A run streams its console + attempt-scoped error under the single ``<phase>/<run_id>`` prefix;
-    the fetcher reads the console and the LATEST ``error_<phase>_attempt<N>.txt`` so the real crash
-    (highest attempt) surfaces, fetched with the operator token."""
+def test_worker_artifacts_fetches_console_and_latest_attempt_error(monkeypatch, tmp_path):
+    """The fetcher pulls the worker console plus the NEWEST attempt-scoped error file
+    (error_<phase>_attempt<N>.txt) — on a retried run only the highest attempt is the real crash."""
     import types
 
     import huggingface_hub
@@ -683,9 +682,9 @@ def test_worker_artifacts_reads_console_and_latest_attempt_error(monkeypatch, tm
         train=types.SimpleNamespace(hf_repo="org/repo"),
     )
     content = {
-        "rl/r1/console_rl.txt": "console\n",
-        "rl/r1/error_rl_attempt0.txt": "stale first attempt\n",
-        "rl/r1/error_rl_attempt1.txt": "TRACEBACK final\n",
+        "rl/r1/console_rl.txt": "worker console\n",
+        "rl/r1/error_rl_attempt0.txt": "stale first-attempt traceback\n",
+        "rl/r1/error_rl_attempt1.txt": "TRACEBACK latest\n",
     }
 
     def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
@@ -706,9 +705,10 @@ def test_worker_artifacts_reads_console_and_latest_attempt_error(monkeypatch, tm
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
     out = _worker_artifacts(spec)
-    assert out["console_rl.txt"] == "console\n"
-    assert out["error_rl_attempt1.txt"] == "TRACEBACK final\n"  # latest attempt = the real crash
-    assert "error_rl_attempt0.txt" not in out  # the stale earlier attempt is not surfaced
+    assert out["console_rl.txt"] == "worker console\n"
+    # The newest attempt's traceback surfaces; the superseded attempt0 is not fetched.
+    assert out["error_rl_attempt1.txt"] == "TRACEBACK latest\n"
+    assert "error_rl_attempt0.txt" not in out
 
 
 def test_local_env_path_rejected(api):

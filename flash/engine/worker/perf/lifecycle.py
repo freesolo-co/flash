@@ -14,32 +14,6 @@ class RetriableInfraError(RuntimeError):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
 
 
-def detect_mig_slice() -> str | None:
-    """Return a reason string if this worker has a MIG slice (crashes CUDA allocator), else None."""
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20
-        ).stdout
-        for line in out.splitlines():
-            s = line.strip()
-            if s.startswith("MIG ") or "UUID: MIG-" in s:
-                return f"MIG slice detected (nvidia-smi -L: {s[:120]!r})"
-    except Exception:
-        pass
-    try:
-        q = subprocess.run(
-            ["nvidia-smi", "--query-gpu=mig.mode.current", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=20,
-        ).stdout.strip()
-        if q and "enabled" in q.lower():
-            return f"MIG mode enabled on the assigned GPU (mig.mode.current={q!r})"
-    except Exception:
-        pass
-    return None
-
-
 def _sm_major(sm: str | None) -> int | None:
     """Major compute capability from an sm token ('sm89'->8, 'sm120'->12), or None."""
     import re
@@ -155,12 +129,8 @@ def _nvml_alive() -> bool:
 
 
 def wait_for_gpu(requested_gpu: str | None = None):
-    """Poll until CUDA is live; raise RetriableInfraError if MIG slice detected, host NVML dead, or never ready."""
+    """Poll until CUDA is live; raise RetriableInfraError if the host NVML is dead or it never readies."""
     import time as _t
-
-    mig = detect_mig_slice()
-    if mig:
-        raise RetriableInfraError(f"{mig}; retrying on a fresh full (non-MIG) GPU")
 
     last = None
     for i in range(12):
