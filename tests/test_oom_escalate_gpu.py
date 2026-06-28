@@ -94,8 +94,9 @@ def test_runner_escalates_on_oom():
     body = ast.get_source_segment(src, fn)
     assert 'oom_shaped = res.failure == "oom"' in body
     assert "retry_shaped = infra_shaped or oom_shaped" in body
-    assert "if not retry_shaped:" in body  # oom retries, not fail-fast
-    assert "oom_vram_floor = max(oom_vram_floor, int(chosen.vram_gb))" in body
+    assert "retry_shaped = infra_shaped or oom_shaped" in body  # oom folds into the retry decision
+    assert "if not will_retry:" in body  # single exit check (oom retries, not fail-fast)
+    assert "oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)" in body
     assert "_oom_escalated(alloc.candidates, oom_vram_floor)" in body
     assert "if not oom_shaped:" in body  # oom grows the card, doesn't escape the provider
     # OOM escalation is cost -> bounded by the user's RAW max_retries, not the floored infra budget.
