@@ -998,3 +998,27 @@ def test_safe_extract_archive_spills_to_tempfile_not_bytesio(monkeypatch, tmp_pa
     assert not isinstance(fileobj, io.BytesIO)  # opened from disk, not an in-memory copy
     assert hasattr(fileobj, "fileno")  # a real on-disk temp file
     assert (out / "wanted" / "environment.py").is_file()
+
+
+def test_safe_extract_archive_skipped_symlinks_do_not_count_toward_member_limit(monkeypatch, tmp_path):
+    # _MAX_ARCHIVE_MEMBERS bounds the EXTRACTED members ("only its members count"); skipped
+    # symlinks/hardlinks/unsupported types must NOT consume that budget -- the total headers walked
+    # are bounded separately by _MAX_ARCHIVE_SCAN_MEMBERS. With a tiny member limit, a tree of one
+    # real file plus many symlinks must still extract; counting the skipped symlinks would wrongly
+    # trip the limit (it did before the count was moved past the symlink skip).
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"# env\n"
+        info = tarfile.TarInfo("repo-sha/environment.py")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        for i in range(6):  # far more symlinks than the limit below
+            link = tarfile.TarInfo(f"repo-sha/link{i}")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "environment.py"
+            tar.addfile(link)
+
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_MEMBERS", 1)  # room for exactly the one real file
+    out = adapter._safe_extract_archive(bytearray(buf.getvalue()), tmp_path)
+    assert (out / "environment.py").read_text() == "# env\n"  # the real member extracted
+    assert not (out / "link0").exists()  # symlinks were skipped, never extracted
