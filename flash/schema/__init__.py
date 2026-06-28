@@ -180,12 +180,16 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
-    if env_raw.get("path"):
-        raise ConfigError(
-            "local environment paths are no longer supported — remove `path` and reference a "
-            "Freesolo environment `id` returned by `flash env push --name <name>`"
-        )
-    # Validate sub-fields explicitly: pip="x" would char-split into bogus packages; params=1 crashes opaquely.
+    # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
+    # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
+    # value (false -> {}/()) but a present-but-wrong-typed value otherwise crashes opaquely or
+    # silently misbehaves: ``params = "x"`` -> ``dict("x")`` ValueError, ``params = 1`` ->
+    # ``dict(1)`` TypeError (a 500), and ``pip = "x"`` is char-split into ('x',) (the worker then
+    # tries to install bogus one-char packages). A MISSING sub-field — absent OR ``None`` (e.g.
+    # JSON ``null``) — keeps its default; any present, NON-None value must be the right type. A
+    # falsy ``params = false`` is still rejected, mirroring the section-level rule that
+    # ``environment = false`` must fail rather than silently coerce. Mirrors the ``must be a
+    # table`` style; a string is never char-split.
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
     if env_raw.get("pip") is not None and not isinstance(env_raw["pip"], (list, tuple)):
