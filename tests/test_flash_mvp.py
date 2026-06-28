@@ -23,7 +23,7 @@ def test_catalog_validation():
     from flash.catalog import MODELS, ModelInfo
 
     MODELS["test/sft-only"] = ModelInfo(
-        id="test/sft-only", display_name="x", params="1B", algos=("sft",), min_vram_gb=12
+        id="test/sft-only", display_name="x", params="1B", params_b=1.0, algos=("sft",), min_vram_gb=12
     )
     try:
         with pytest.raises(ValueError, match="not grpo"):
