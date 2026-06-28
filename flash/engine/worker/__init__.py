@@ -193,6 +193,11 @@ def require_active_env():
     return ACTIVE_ENV
 
 
+def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
+    retriable = isinstance(exc, (RetriableInfraError, GitHubRateLimitError))
+    return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
+
+
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
@@ -204,10 +209,6 @@ def _finalize(metrics: RunMetrics):
     hf_upload_file("/tmp/DONE", "DONE", required=True)
     heartbeat("done", gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
-
-
-# Back-compat alias for the old private name.
-_load_kernel_cache_if_present = load_mega_cache
 
 
 def main():
@@ -273,7 +274,6 @@ def main():
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
-        retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
@@ -284,11 +284,9 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Gate on ``not
-        # retriable`` first so an infra error (same-size retry) is never reclassified as oom — oom wins
-        # over retriable in the poller, which would otherwise escalate a same-size retry to a bigger card.
-        oom = not retriable and is_cuda_oom(e)
-        hb_flags = {"retriable": retriable, "oom": oom}
+        # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Infra failures
+        # keep same-size retry semantics and must never be reclassified as OOM.
+        hb_flags = _worker_failure_flags(e)
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:
@@ -340,7 +338,6 @@ __all__ = [
     "_latest_checkpoint_dir",
     "_liger_default_for_model",
     "_load_active_env",
-    "_load_kernel_cache_if_present",
     "_memory_mode",
     "_metric_curve",
     "_neutralize_tilelang_cudart_stub",

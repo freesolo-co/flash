@@ -9,12 +9,48 @@ from __future__ import annotations
 import contextlib
 import os
 import time
+from dataclasses import dataclass
 
 from flash.spec import JobSpec
 
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
 INFRA_RETRY_FLOOR = 5
+INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
+RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
+
+
+@dataclass
+class _RetryBudget:
+    infra_retries: int
+    oom_retries: int
+    cache_fallbacks: int
+    infra_used: int = 0
+    oom_used: int = 0
+
+    @property
+    def max_attempts(self) -> int:
+        return 1 + self.infra_retries + self.oom_retries + self.cache_fallbacks
+
+    def infra_exhausted(self, *, cache_fallback_available: bool) -> bool:
+        return self.infra_used >= self.infra_retries and not cache_fallback_available
+
+    def can_retry(self, failure: str | None, *, cache_drop: bool) -> bool:
+        if failure not in RETRY_FAILURES:
+            return False
+        if cache_drop:
+            return True
+        if failure == "oom":
+            return self.oom_used < self.oom_retries
+        return self.infra_used < self.infra_retries
+
+    def record_retry(self, failure: str | None, *, cache_drop: bool) -> None:
+        if cache_drop:
+            return
+        if failure == "oom":
+            self.oom_used += 1
+        elif failure in INFRA_RETRY_FAILURES:
+            self.infra_used += 1
 
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
@@ -110,6 +146,7 @@ def _submit_seed_supervised(
     current_gpu: dict = {}
     # Persisted into the run handle so attach_run recovery polls with the same stall tuning.
     current_on_last_gpu: dict = {"value": False}
+    current_attempt: dict = {"value": 0}
     # Tracks rN-suffixed retry endpoint ids that _gc_run_endpoints can't reconstruct by name.
     seen_endpoints: set[str] = set()
 
@@ -126,6 +163,7 @@ def _submit_seed_supervised(
                 "seed": int(seed),
                 "allocated_gpu": current_gpu.get("name"),
                 "on_last_gpu": bool(current_on_last_gpu["value"]),
+                "attempt": int(current_attempt["value"]),
             },
         )
 
@@ -156,14 +194,12 @@ def _submit_seed_supervised(
 
     started_with_shared_cache = getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     cache_fallback_attempts = 1 if started_with_shared_cache else 0
-    # Grow only when an attempt that actually provisioned a class lost it to infra — never on failed alloc.
+    retry_budget = _RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
+    # Grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
     oom_vram_floor = 0
-    # Exclude cache-drop attempts so the GPU walk keeps its full retry budget.
-    cache_drop_consumed = 0
-    for attempt in range(infra_budget + 1 + cache_fallback_attempts):
-        walk_attempt = attempt - cache_drop_consumed
+    for attempt in range(retry_budget.max_attempts):
         if attempt > 0 and last_handle:
             if last_handle.get("endpoint_id"):
                 try:
@@ -244,7 +280,7 @@ def _submit_seed_supervised(
                 and chosen.provider == "runpod"
             )
             on_last_gpu = len(untried) <= 1 or (
-                walk_attempt >= infra_budget and not cache_fallback_available
+                retry_budget.infra_exhausted(cache_fallback_available=cache_fallback_available)
             )
             current_on_last_gpu["value"] = on_last_gpu
             print(allocation_summary(alloc), file=log, flush=True)
@@ -259,6 +295,7 @@ def _submit_seed_supervised(
             if drop_weight_cache:
                 run_spec = _drop_weight_cache(run_spec)
             current_gpu["name"] = chosen.gpu
+            current_attempt["value"] = attempt
             provider = get_provider(chosen.provider)
             try:
                 submit_kwargs = {
@@ -286,11 +323,9 @@ def _submit_seed_supervised(
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
-        infra_shaped = res.failure in ("stalled", "no_capacity", "poll_error", "job_preempted")
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
             oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)
-        retry_shaped = infra_shaped or oom_shaped
         # Cancel wins over any retry-shaped failure.
         try:
             if get_status(spec.run_id).state == "cancelled":
@@ -307,11 +342,14 @@ def _submit_seed_supervised(
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
         )
-        retry_budget = max_retries if oom_shaped else infra_budget
-        will_retry = retry_shaped and (walk_attempt < retry_budget or first_cache_drop)
+        oom_mode = oom_vram_floor > 0
+        will_retry = retry_budget.can_retry(
+            res.failure,
+            cache_drop=first_cache_drop,
+        )
         action = (
             f"retrying on a larger GPU (> {oom_vram_floor} GB)"
-            if (will_retry and oom_shaped)
+            if (will_retry and oom_mode)
             else "retrying (resume from last checkpoint)"
             if will_retry
             else "not retrying"
@@ -326,13 +364,13 @@ def _submit_seed_supervised(
             break
         if first_cache_drop:
             drop_weight_cache = True
-            # Exclude from budget so max_retries GPU-walk retries remain after the cache-drop.
-            cache_drop_consumed += 1
-            # Retry the same GPU class without the volume first; only walk the class if that also fails.
-        elif chosen is not None:
-            if not oom_shaped:
-                failed_providers.add(chosen.provider)
-            tried_classes.add((chosen.provider, chosen.gpu))
+            retry_budget.record_retry(res.failure, cache_drop=True)
+        else:
+            retry_budget.record_retry(res.failure, cache_drop=False)
+            if chosen is not None:
+                if not oom_shaped:
+                    failed_providers.add(chosen.provider)
+                tried_classes.add((chosen.provider, chosen.gpu))
     _gc_seen_endpoints()
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
 

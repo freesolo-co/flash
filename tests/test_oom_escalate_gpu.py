@@ -1,15 +1,7 @@
-"""CUDA-OOM -> retry on a strictly LARGER GPU (CPU-only; no GPU/network).
-
-A training CUDA OOM means the card was too small. The worker classifies it STRUCTURALLY (torch's
-typed OutOfMemoryError + its num_ooms allocator counter — never the message text) and stamps an
-``oom`` heartbeat flag; the poller maps it to ``failure="oom"``; the runner retries on a card with
-more VRAM (bounded by the available tiers). These cover the pieces + the wiring.
-"""
+"""CUDA-OOM escalation coverage (CPU-only; no GPU/network)."""
 
 from __future__ import annotations
 
-import ast
-import pathlib
 import types
 
 import pytest
@@ -38,6 +30,13 @@ def test_is_cuda_oom_typed_torch_error():
     assert is_cuda_oom(torch.cuda.OutOfMemoryError("x")) is True  # typed allocator signal
 
 
+def test_is_cuda_oom_none_is_never_oom(monkeypatch):
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 5)
+    assert lc.is_cuda_oom(None) is False
+
+
 def _card(gpu, vram):
     return types.SimpleNamespace(gpu=gpu, vram_gb=vram, provider="runpod", hourly_usd=1.0)
 
@@ -59,45 +58,64 @@ def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
 
     def reader(force=False):
         reads["n"] += 1
-        return {"oom": True, "retriable": False, "stage": "rl_train"}
+        return {"oom": True, "attempt": "0", "retriable": False, "stage": "rl_train"}
 
-    _key, retriable, oom = surfaced_worker_flags(reader, None, say)
+    _key, retriable, oom = surfaced_worker_flags(reader, None, say, 0)
     assert (retriable, oom) == (False, True)
     assert reads["n"] == 1  # surfacing + both flags share ONE forced read
     assert surfaced_worker_flags(lambda force=False: {"retriable": True}, None, say)[1:] == (True, False)
     assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
+    stale = lambda force=False: {"oom": True, "attempt": "0", "retriable": False}  # noqa: E731
+    assert surfaced_worker_flags(stale, None, say, 0)[1:] == (False, True)
+    assert surfaced_worker_flags(stale, None, say, 1)[1:] == (False, False)
 
 
-def _read(mod):
-    return pathlib.Path(__import__(mod, fromlist=["x"]).__file__).read_text()
+def test_heartbeat_oom_for_attempt_gates_stale_flag():
+    from flash.providers._poll import heartbeat_oom_for_attempt
+
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": "0"}, 0) is True
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": "0"}, 1) is False
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": "1"}, 1) is True
+    assert heartbeat_oom_for_attempt({"oom": True}, 1) is False
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": "0"}, None) is False
+    assert heartbeat_oom_for_attempt(None, 0) is False
+    assert heartbeat_oom_for_attempt({"retriable": True}, 0) is False
 
 
-def test_worker_stamps_oom_flag():
-    src = _read("flash.engine.worker")
-    assert "oom = not retriable and is_cuda_oom(e)" in src  # short-circuits on retriable infra
-    assert '{"retriable": retriable, "oom": oom}' in src
+def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
 
+    monkeypatch.setattr(jobs.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(runpod_api, "job_status", lambda _eid, _jid: {"status": "FAILED", "error": "x"})
+    handle = jobs.JobHandle("ep", "name", "job")
 
-def test_poller_maps_oom_flag_to_oom_failure():
-    src = _read("flash.providers.runpod.jobs")
-    assert src.count('"oom" if oom else') == 2  # oom wins in both worker-fail paths
-    assert "def surfaced_worker_flags" in src  # single-read helper feeds both paths
-
-
-def test_runner_escalates_on_oom():
-    src = _read("flash.runner.lifecycle")
-    fn = next(
-        n
-        for n in ast.walk(ast.parse(src))
-        if isinstance(n, ast.FunctionDef) and n.name == "_submit_seed_supervised"
+    res = jobs.poll_job(
+        handle,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: {"oom": True, "attempt": "2"},
+        current_attempt=2,
     )
-    body = ast.get_source_segment(src, fn)
-    assert 'oom_shaped = res.failure == "oom"' in body
-    assert "retry_shaped = infra_shaped or oom_shaped" in body
-    assert "retry_shaped = infra_shaped or oom_shaped" in body  # oom folds into the retry decision
-    assert "if not will_retry:" in body  # single exit check (oom retries, not fail-fast)
-    assert "oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)" in body
-    assert "_oom_escalated(alloc.candidates, oom_vram_floor)" in body
-    assert "if not oom_shaped:" in body  # oom grows the card, doesn't escape the provider
-    # OOM escalation is cost -> bounded by the user's RAW max_retries, not the floored infra budget.
-    assert "retry_budget = max_retries if oom_shaped else infra_budget" in body
+    assert res.failure == "oom"
+
+    res = jobs.poll_job(
+        handle,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: {"oom": True, "attempt": "1"},
+        current_attempt=2,
+    )
+    assert res.failure == "job_failed"
+
+
+def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):
+    import flash.engine.worker as worker
+
+    monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: True)
+    assert worker._worker_failure_flags(RuntimeError("cuda oom")) == {
+        "retriable": False,
+        "oom": True,
+    }
+    assert worker._worker_failure_flags(worker.RetriableInfraError("bad host")) == {
+        "retriable": True,
+        "oom": False,
+    }
