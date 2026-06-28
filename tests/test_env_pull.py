@@ -170,9 +170,7 @@ def test_pull_environment_package_populates_empty_dir(monkeypatch, tmp_path):
     assert dest.stat().st_mode & 0o777 == 0o700
 
 
-def test_pull_environment_package_populates_empty_dir_with_internal_staging(
-    monkeypatch, tmp_path
-):
+def test_pull_environment_package_populates_empty_dir_with_internal_staging(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
     real_mkdtemp = env_pull.tempfile.mkdtemp
     staging_dirs: list[Path] = []
