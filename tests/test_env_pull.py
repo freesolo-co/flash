@@ -881,19 +881,65 @@ def test_merge_into_dir_preserves_child_symlink_on_copy_failure(monkeypatch, tmp
     assert [p.name for p in dest.iterdir()] == ["datasets"]  # scratch backup dir cleaned up
 
 
-def test_replace_opposite_type_does_not_clobber_existing_flash_old(tmp_path):
-    # The move-aside must use a UNIQUE scratch name, never a fixed ``.<name>.flash-old`` sibling that
-    # could collide with — and delete — unrelated user content that happens to bear that name.
-    (tmp_path / "data").write_text("ORIGINAL")  # existing FILE; incoming is a DIR (opposite type)
-    sentinel = tmp_path / ".data.flash-old"
+def test_merge_into_dir_does_not_clobber_existing_flash_old(tmp_path):
+    # The move-aside backup must use a UNIQUE scratch name, never a fixed ``.<name>.flash-old`` sibling
+    # that could collide with — and delete — unrelated user content that happens to bear that name.
+    source = tmp_path / "src"
+    (source / "data").mkdir(parents=True)  # incoming is a DIR
+    (source / "data" / "f.txt").write_text("new")
+    dest = tmp_path / "dst"
+    dest.mkdir()
+    (dest / "data").write_text("ORIGINAL")  # existing FILE (opposite type) — gets moved aside
+    sentinel = dest / ".data.flash-old"
     sentinel.write_text("user's own file, unrelated")
 
-    def build():
-        (tmp_path / "data").mkdir()
-
-    adapter._replace_opposite_type(tmp_path / "data", build)
+    adapter._merge_into_dir(source, dest)
     assert sentinel.read_text() == "user's own file, unrelated"  # not clobbered
-    assert (tmp_path / "data").is_dir()  # replacement installed
+    assert (dest / "data").is_dir()  # replacement installed
+    assert (dest / "data" / "f.txt").read_text() == "new"
+
+
+def test_merge_into_dir_rolls_back_earlier_children_on_later_failure(monkeypatch, tmp_path):
+    # A merge is ALL-OR-NOTHING: if a LATER child fails (disk full part-way), an EARLIER same-named
+    # child that was already replaced must be rolled back to its original — not left half-updated
+    # (e.g. a new environment.py paired with an old/missing datasets).
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "environment.py").write_text("ORIG")  # collides with the env's environment.py
+    (tmp_path / "datasets").mkdir()
+    (tmp_path / "datasets" / "train.jsonl").write_text("ORIGDS")  # collides with the env's dataset
+
+    real_copy = adapter._atomic_copy2
+
+    def selective_boom(src, dst):
+        if dst.name == "train.jsonl":  # force the SECOND-touched child to fail
+            raise OSError("disk full")
+        real_copy(src, dst)
+
+    monkeypatch.setattr(adapter, "_atomic_copy2", selective_boom)
+    with pytest.raises(OSError, match="disk full"):
+        pull_environment_package("david-freesolo-co/stuff", ".", overwrite=True)
+    # both originals are intact — neither the top-level file nor the nested dataset was left replaced
+    assert (tmp_path / "environment.py").read_text() == "ORIG"
+    assert (tmp_path / "datasets" / "train.jsonl").read_text() == "ORIGDS"
+    # the scratch backup dir was cleaned up after a successful rollback
+    assert not any(p.name.startswith(".flash-env-merge-") for p in tmp_path.iterdir())
+
+
+def test_pull_rechecks_destination_after_download_window(monkeypatch, tmp_path):
+    # TOCTOU: the no-overwrite refusal must hold ACROSS the download window. If ``dest`` is created
+    # while the tarball is downloading, a no-``--force`` pull must still refuse rather than clobber it.
+    dest = tmp_path / "out"
+
+    def racing_download(ref):
+        # simulate a file appearing at ``dest`` during the (now in-flight) download
+        dest.write_text("created during the download window")
+        return _make_hub_tarball()
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", racing_download)
+    with pytest.raises(FileExistsError, match="already exists"):
+        pull_environment_package("david-freesolo-co/stuff", dest)  # no overwrite
+    assert dest.read_text() == "created during the download window"  # untouched, not clobbered
 
 
 def test_safe_extract_archive_spills_to_tempfile_not_bytesio(monkeypatch, tmp_path):

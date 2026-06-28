@@ -10,7 +10,6 @@ low-level refs remain parseable for compatibility. The canonical generated envir
 from __future__ import annotations
 
 import contextlib
-import functools
 import hashlib
 import json
 import os
@@ -640,37 +639,69 @@ def _rm_path(p: Path) -> None:
         shutil.rmtree(p)
 
 
-def _replace_opposite_type(target: Path, build) -> None:
-    """Replace an existing ``target`` (a file/dir being swapped for the OPPOSITE type, or a symlink)
-    without destroying it until the replacement is ready: move it aside into a fresh UNIQUE scratch
-    dir, run ``build()`` to create the new ``target``, drop the backup on success, and RESTORE the
-    original if ``build`` raises (a mid-copy disk/quota/read error). The naive
-    ``unlink()``/``rmtree()``-then-copy would leave the user with nothing if the copy failed. A unique
-    scratch dir (NOT a fixed ``.<name>.flash-old`` sibling) is used so a pre-existing user file/dir of
-    that conventional name is never clobbered."""
-    scratch = Path(tempfile.mkdtemp(prefix=".flash-env-old-", dir=target.parent))
-    backup = scratch / target.name
-    preserve_scratch = False
-    try:
-        os.replace(target, backup)  # atomic move-aside (file, dir, or symlink)
-        preserve_scratch = True  # backup is now the ONLY copy of the original
-        try:
-            build()
-        except BaseException:
-            if target.is_symlink() or target.exists():
-                _rm_path(target)  # drop any partial replacement
-            os.replace(backup, target)  # restore the original intact
-            preserve_scratch = False  # restored back to target; backup no longer needed
-            raise
-        preserve_scratch = False  # replacement succeeded; backup is a now-stale copy
-    finally:
-        # Drop the scratch dir ONLY once the user's original is provably safe — either the
-        # replacement succeeded (backup is a now-stale copy) or it was restored to ``target``. If
-        # ``build`` failed AND the restore (_rm_path / os.replace back) also failed, the backup is the
-        # ONLY surviving copy of the original, so leave the scratch dir (and its preserved original)
-        # in place rather than delete the user's data.
-        if not preserve_scratch:
-            shutil.rmtree(scratch, ignore_errors=True)
+class _MergeJournal:
+    """Makes an in-place ``_merge_into_dir`` ALL-OR-NOTHING across children.
+
+    ``_merge_into_dir`` replaces same-named children one at a time, so without a journal a later child
+    failing (e.g. disk full) would leave the user's environment half-updated — earlier children already
+    replaced (a new ``environment.py`` paired with an old/missing ``datasets``). The journal records
+    every mutation so any failure rolls the WHOLE destination back to its pre-merge state:
+
+    * a REPLACED child is moved aside (atomically) into one UNIQUE scratch dir and restored on
+      rollback — the naive ``unlink()``/``rmtree()``-then-copy would leave the user with nothing if the
+      copy failed. The scratch lives under the merge root (same filesystem, so ``os.replace`` is a pure
+      rename) and uses a unique ``mkdtemp`` name (NOT a fixed ``.<name>.flash-old`` sibling), so a
+      pre-existing user file/dir of that conventional name is never clobbered;
+    * a CREATED child (no prior same-named entry) is recorded for removal on rollback.
+
+    ``commit`` drops the scratch once the whole merge succeeds; ``rollback`` replays the undo log in
+    reverse. If a restore itself fails, the moved-aside backup is the ONLY surviving copy of the user's
+    original, so the scratch is kept (not deleted) rather than lose their data."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._scratch: Path | None = None
+        self._undo: list[tuple] = []  # replayed in REVERSE on rollback
+        self._seq = 0
+
+    def _ensure_scratch(self) -> Path:
+        if self._scratch is None:
+            self._scratch = Path(tempfile.mkdtemp(prefix=".flash-env-merge-", dir=self._root))
+        return self._scratch
+
+    def back_up(self, target: Path) -> None:
+        """Move an existing ``target`` (file, dir, or symlink) aside; restore it on rollback."""
+        self._seq += 1
+        backup = self._ensure_scratch() / f"{self._seq}-{target.name}"
+        os.replace(target, backup)  # atomic move-aside
+        self._undo.append(("restore", backup, target))
+
+    def record_created(self, target: Path) -> None:
+        """Remember a path the merge is about to create, to delete on rollback."""
+        self._undo.append(("remove", target))
+
+    def commit(self) -> None:
+        if self._scratch is not None:
+            shutil.rmtree(self._scratch, ignore_errors=True)
+
+    def rollback(self) -> None:
+        all_restored = True
+        for entry in reversed(self._undo):
+            try:
+                if entry[0] == "restore":
+                    _, backup, target = entry
+                    if target.is_symlink() or target.exists():
+                        _rm_path(target)  # drop any partial replacement
+                    os.replace(backup, target)  # restore the original intact
+                else:
+                    _, target = entry
+                    if target.is_symlink() or target.exists():
+                        _rm_path(target)  # remove the freshly-created path
+            except OSError:
+                if entry[0] == "restore":
+                    all_restored = False  # backup is the only surviving copy — keep the scratch
+        if all_restored and self._scratch is not None:
+            shutil.rmtree(self._scratch, ignore_errors=True)
 
 
 def _is_cwd_or_ancestor(target: Path) -> bool:
@@ -687,49 +718,84 @@ def _is_cwd_or_ancestor(target: Path) -> bool:
     return resolved == cwd or resolved in cwd.parents
 
 
-def _merge_into_dir(source: Path, dest: Path) -> None:
+def _merge_into_dir(source: Path, dest: Path, _journal: _MergeJournal | None = None) -> None:
     """Recursively copy ``source``'s contents into existing ``dest``, overwriting same-named
     children. Unlike ``shutil.copytree(dirs_exist_ok=True)``, a child of ``dest`` that is a SYMLINK is
     replaced (never followed) — so a pre-existing ``datasets -> /elsewhere`` link in the destination
     (e.g. the cwd, when merging in place with ``--force``) can't redirect writes outside the requested
-    output tree. Each file is replaced atomically (stage + ``os.replace``) so a failed merge never
-    leaves an existing file truncated. A child being replaced by one of the OPPOSITE type (existing
-    file vs incoming dir, or vice versa) OR a child symlink is swapped via move-aside/restore, so a
-    mid-copy failure can neither destroy the user's existing child nor lose their symlink."""
+    output tree.
+
+    The whole merge is ALL-OR-NOTHING via a ``_MergeJournal``: each file is replaced atomically (stage
+    + ``os.replace``) so a mid-copy failure never truncates an existing file, AND every replaced/created
+    child is journaled so a LATER child failing (disk full part-way) rolls the entire destination back
+    to its pre-merge state instead of leaving it half-updated. An existing same-named child is moved
+    aside (restored on rollback) before its replacement is built — so a failure can neither destroy the
+    user's existing child nor lose their symlink. A directory being merged over an existing directory is
+    NEVER moved aside (its children are journaled individually), so merging into an ancestor of the cwd
+    can't strand the process in a relocated directory."""
     dest.mkdir(parents=True, exist_ok=True)
-    for child in source.iterdir():
-        target = dest / child.name
-        build = (
-            functools.partial(_merge_into_dir, child, target)
-            if child.is_dir()
-            else functools.partial(_atomic_copy2, child, target)
-        )
-        if target.is_symlink():
-            # Replace the link ITSELF (never write through it), but keep it until the replacement
-            # succeeds: move it aside and restore on a mid-copy failure, exactly like the
-            # opposite-type paths below. An eager unlink would lose the link if the copy then failed.
-            _replace_opposite_type(target, build)
-        elif child.is_dir():
-            if target.exists() and not target.is_dir():
-                # incoming dir over an existing file: keep the file until the subtree is fully built.
-                _replace_opposite_type(target, build)
-            else:
-                _merge_into_dir(child, target)
-        else:
-            if target.is_dir():
-                # incoming file over an existing dir: keep the dir until the file copy succeeds.
-                # But never move aside a dir that IS (or CONTAINS) the cwd — e.g. merging into an
-                # ancestor of the cwd (``-o .. --force`` from a subdir) where an incoming file is named
-                # like the cwd's segment. Relocating it would leave the process in a deleted directory,
-                # so refuse with a clear error instead of stranding the cwd.
+    top = _journal is None
+    journal = _MergeJournal(dest) if top else _journal
+    try:
+        for child in source.iterdir():
+            target = dest / child.name
+            if target.is_symlink():
+                # Replace the link ITSELF (never write through it): move it aside (restored on
+                # rollback) and build the replacement where it used to be. An eager unlink would lose
+                # the link if the copy then failed.
+                journal.back_up(target)
+                if child.is_dir():
+                    _merge_into_dir(child, target, journal)
+                else:
+                    _atomic_copy2(child, target)
+            elif not target.exists():
+                # brand-new child: nothing to preserve, just remember it for rollback (recorded BEFORE
+                # the copy so a partially-written dir/file is still cleaned up on failure).
+                journal.record_created(target)
+                if child.is_dir():
+                    shutil.copytree(child, target)
+                else:
+                    _atomic_copy2(child, target)
+            elif child.is_dir() and target.is_dir():
+                # dir over dir: MERGE in place (keep dest-only files) — never move the dir itself aside,
+                # so an ancestor-of-cwd merge can't strand the process; its children are journaled.
+                _merge_into_dir(child, target, journal)
+            elif child.is_dir():
+                # incoming dir over an existing FILE (opposite type): keep the file until the subtree is
+                # fully built.
+                journal.back_up(target)
+                _merge_into_dir(child, target, journal)
+            elif target.is_dir():
+                # incoming file over an existing dir: keep the dir until the file copy succeeds. But
+                # never move aside a dir that IS (or CONTAINS) the cwd — e.g. merging into an ancestor of
+                # the cwd (``-o .. --force`` from a subdir) where an incoming file is named like the
+                # cwd's segment. Relocating it would leave the process in a deleted directory, so refuse
+                # with a clear error instead of stranding the cwd.
                 if _is_cwd_or_ancestor(target):
                     raise RuntimeError(
                         f"refusing to replace {target} with a file because it is the current working "
                         "directory (or an ancestor of it); rerun the pull from outside the destination"
                     )
-                _replace_opposite_type(target, build)
-            else:
+                journal.back_up(target)
                 _atomic_copy2(child, target)
+            else:
+                # file over file.
+                journal.back_up(target)
+                _atomic_copy2(child, target)
+        if top:
+            journal.commit()
+    except BaseException:
+        if top:
+            journal.rollback()
+        raise
+
+
+def _dest_occupied(dest_path: Path) -> bool:
+    """True when overwriting ``dest_path`` needs explicit consent: a symlink (replacing a link), a
+    file, or a NON-empty directory. An empty real dir is free to populate in place."""
+    return dest_path.is_symlink() or (
+        dest_path.exists() and (not dest_path.is_dir() or any(dest_path.iterdir()))
+    )
 
 
 def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool = False) -> Path:
@@ -756,12 +822,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             "specify a managed environment id (namespace/name) or a github ref to its subdirectory"
         )
     dest_path = Path(dest)
-    # "occupied" = a symlink (replacing a link needs explicit consent), a file, or a non-empty
-    # directory; an empty real dir is fine to populate in place.
-    occupied = dest_path.is_symlink() or (
-        dest_path.exists() and (not dest_path.is_dir() or any(dest_path.iterdir()))
-    )
-    if occupied and not overwrite:
+    if _dest_occupied(dest_path) and not overwrite:
         raise FileExistsError(
             f"destination {dest_path} already exists (pass overwrite=True to replace)"
         )
@@ -782,6 +843,14 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             raise FileNotFoundError(
                 f"environment entrypoint {entrypoint!r} not found in "
                 f"{env_dir or '.'!r} of {ref.repo_full_name}@{ref.ref}"
+            )
+        # Re-check the destination AFTER the download, immediately before mutating it: the initial
+        # guard ran before the (slow) tarball fetch, so without a recheck a no-``overwrite`` pull could
+        # still clobber a file/dir that appeared in ``dest`` during the download window (TOCTOU). The
+        # refusal must remain true across that window.
+        if _dest_occupied(dest_path) and not overwrite:
+            raise FileExistsError(
+                f"destination {dest_path} already exists (pass overwrite=True to replace)"
             )
         # Create any missing parent dirs (mirrors the single-file download) so a nested output path
         # works.
@@ -833,7 +902,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
                 # ``dest_path``. If the swap failed AND the restore (os.replace back) ALSO failed, the
                 # backup is the ONLY surviving copy of the original, so leave the staging dir (with its
                 # preserved backup) in place rather than delete the user's data. Mirrors the
-                # ``preserve_scratch`` guard in ``_replace_opposite_type``.
+                # keep-the-scratch-on-failed-restore guard in ``_MergeJournal.rollback``.
                 if not preserve_backup:
                     shutil.rmtree(staging_parent, ignore_errors=True)
         return dest_path
