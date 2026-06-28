@@ -399,7 +399,7 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
 
     return JobSpec.from_dict({
         "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": run_id,
-        "train": {"hf_repo": _PRELOAD_STATUS_REPO, "seeds": [0]},
+        "train": {"hf_repo": _PRELOAD_STATUS_REPO},
         "gpu": {"type": gpu, "max_wall_seconds": max(60, int(wall_s)),
                 "network_volume": WEIGHT_CACHE_VOLUME_NAME, "network_volume_gb": WEIGHT_CACHE_VOLUME_GB},
     })
@@ -422,7 +422,7 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
     reap_deadline = int(time.time()) + effective_s
     run_id = preload_instance_run_id(provider, region, reap_deadline, uuid.uuid4().hex[:6])
     spec = _preload_instance_spec(gpu, run_id, wall_s=effective_s)
-    prefix = f"{spec.phase}/{run_id}/seed0"
+    prefix = f"{spec.phase}/{run_id}"
     reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
                                  min_interval_s=max(5.0, poll_interval_s))
     # ALSO watch the attempt-failure marker (<arm>_attempt0.json): if the box dies BEFORE run_preload
