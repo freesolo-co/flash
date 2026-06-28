@@ -196,17 +196,20 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             )
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_is_real_dir = dest_path.is_dir() and not dest_path.is_symlink()
+        dest_is_empty_dir = dest_is_real_dir and not any(dest_path.iterdir())
         if not dest_path.exists() and not dest_path.is_symlink():
             shutil.copytree(source, dest_path)
-        elif dest_path.is_dir() and not dest_path.is_symlink() and not any(dest_path.iterdir()):
-            _populate_empty_dir(source, dest_path)
-        elif dest_path.is_dir() and not dest_path.is_symlink() and _cwd_is_inside(dest_path):
-            raise RuntimeError(
-                f"refusing to overwrite {dest_path} because it contains the current working directory; "
-                "choose a separate output path"
-            )
+        elif dest_is_real_dir and _cwd_is_inside(dest_path):
+            if dest_is_empty_dir:
+                _populate_empty_dir(source, dest_path)
+            else:
+                raise RuntimeError(
+                    f"refusing to overwrite {dest_path} because it contains the current working directory; "
+                    "choose a separate output path"
+                )
         else:
-            if not overwrite:
+            if not overwrite and not dest_is_empty_dir:
                 raise FileExistsError(
                     f"destination {dest_path} already exists (pass overwrite=True to replace)"
                 )
