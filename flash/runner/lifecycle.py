@@ -123,6 +123,15 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     )
 
 
+def _oom_escalated(candidates, oom_vram_floor: int):
+    """Candidates strictly LARGER than the VRAM that just OOM'd. ``oom_vram_floor == 0`` (no prior OOM)
+    leaves the list unchanged; otherwise an 80GB OOM leaves only the >80GB classes (a same-size retry
+    would just OOM again). EMPTY means the run already OOM'd the largest available class."""
+    if not oom_vram_floor:
+        return list(candidates)
+    return [c for c in candidates if c.vram_gb > oom_vram_floor]
+
+
 def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
@@ -218,6 +227,8 @@ def _submit_seed_supervised(
     # retry before walking classes within it.
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
+    # Largest GPU VRAM (GB) that OOM'd this run: a CUDA-OOM retry must land on a STRICTLY larger card.
+    oom_vram_floor = 0
     # Attempts spent on the cache-drop fallback, EXCLUDED from the GPU-walk budget. The bonus slot
     # ``cache_fallback_attempts`` widens the loop range, but the budget checks below use the raw attempt
     # counter; without this offset the cache-drop attempt would still tick the budget, so a run that
@@ -303,11 +314,19 @@ def _submit_seed_supervised(
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
+            # After a CUDA OOM, restrict to cards STRICTLY larger than the one that OOM'd (a same-size
+            # retry just OOMs again). Empty => already OOM'd the biggest class -> fail terminally.
+            cands = _oom_escalated(alloc.candidates, oom_vram_floor)
+            if not cands:
+                last_detail = f"oom: exceeded the largest available GPU ({oom_vram_floor} GB)"
+                print(f"seed={seed} OOM on the largest GPU class ({oom_vram_floor} GB); not retrying",
+                      file=log, flush=True)
+                break
             # Pick this attempt's (provider, class) from the cross-provider ranked list: the first
             # attempt takes the cheapest; each retry that provisioned a class and lost it to an infra
             # failure ESCAPES that provider before walking classes within it (see _select_candidate),
             # so a congested/sick provider can't burn the whole budget.
-            chosen = _select_candidate(alloc.candidates, failed_providers, tried_classes)
+            chosen = _select_candidate(cands, failed_providers, tried_classes)
             # ``on_last_gpu`` == NO further GPU attempt will be made after this one — either the
             # candidate list is exhausted (``len(untried) <= 1``) OR the retry budget is exhausted
             # (``attempt >= max_retries``, including the single-attempt ``max_retries == 0`` case).
@@ -316,7 +335,7 @@ def _submit_seed_supervised(
             # Tell the provider so its no-capacity backstops wait longer before giving up rather than
             # failing fast into a retry that will never happen. A pinned/single-candidate run is
             # "last" from attempt 0, which is what we want.
-            untried = [c for c in alloc.candidates if (c.provider, c.gpu) not in tried_classes]
+            untried = [c for c in cands if (c.provider, c.gpu) not in tried_classes]
             # The cache-drop fallback (cache_fallback_attempts) is a reserved attempt PAST the retry
             # budget, so when it's still available a cache-attached RunPod attempt is not "last" by
             # BUDGET — don't let ``attempt >= max_retries`` mark it last-GPU (long no-capacity grace),
@@ -391,6 +410,13 @@ def _submit_seed_supervised(
         # Retry only on a structured failure category the provider already classified; a real job
         # failure fails fast. No detail-string parsing. (USER cancels are caught below, not here.)
         infra_shaped = res.failure in ("stalled", "no_capacity", "poll_error", "job_preempted")
+        # A CUDA OOM retries too, but on a STRICTLY larger card: record the failed card's VRAM as the
+        # escalation floor for the next attempt's candidate filter. It is NOT infra (the host was
+        # fine), so it must NOT escape the provider (the record block below skips that for oom).
+        oom_shaped = res.failure == "oom"
+        if oom_shaped and chosen is not None:
+            oom_vram_floor = max(oom_vram_floor, int(chosen.vram_gb))
+        retry_shaped = infra_shaped or oom_shaped
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
@@ -421,23 +447,34 @@ def _submit_seed_supervised(
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
         )
-        # "retrying" is true when the GPU-walk budget remains OR a cache-drop fallback will retry this
-        # even past it (first_cache_drop) — else the log would say "not retrying" while the loop actually
+        # OOM escalation is COST (each retry is a strictly bigger, pricier GPU), so it respects the
+        # user's RAW max_retries — NOT the INFRA_RETRY_FLOOR that lets infra bad-luck retries exceed it
+        # (so max_retries=1 grants ONE larger-GPU attempt, not five). Infra keeps the floored budget.
+        retry_budget = max_retries if oom_shaped else infra_budget
+        # "retrying" is true when the budget remains OR a cache-drop fallback will retry this even past
+        # it (first_cache_drop) — else the log would say "not retrying" while the loop actually
         # continues with the reserved cache-less fallback attempt.
+        will_retry = retry_shaped and (walk_attempt < retry_budget or first_cache_drop)
+        action = (
+            f"retrying on a larger GPU (> {oom_vram_floor} GB)"
+            if (will_retry and oom_shaped)
+            else "retrying (resume from last checkpoint)"
+            if will_retry
+            else "not retrying"
+        )
         print(
-            f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < infra_budget or first_cache_drop) else 'not retrying'}"
+            f"seed={seed} attempt={attempt} failed ({res.failure}); {action}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
         )
-        if not infra_shaped:
+        if not retry_shaped:
             break
         # Stop when the GPU-walk retry budget is exhausted — UNLESS a cache-drop fallback is still
         # available. The bonus attempt granted above is reserved for exactly this transition; once the
         # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
         # and the loop cannot spin past its one extra cache-less attempt.
-        if walk_attempt >= infra_budget and not first_cache_drop:
+        if walk_attempt >= retry_budget and not first_cache_drop:
             break
         if first_cache_drop:
             drop_weight_cache = True
@@ -448,16 +485,51 @@ def _submit_seed_supervised(
             # cheapest GPU without the volume on the wider all-DC pool first — the miss may have been
             # the cache's datacenter set, not the GPU class globally. Only walk if THAT also fails.
         elif chosen is not None:
-            # Record what THIS attempt burned so the next pick escapes it cross-provider — only when
-            # an attempt actually provisioned a class and lost it infra-shaped. An allocation/pricing
-            # failure (chosen is None) never tried a card, so it must not poison the next pick.
-            failed_providers.add(chosen.provider)
+            # Record what THIS attempt burned so the next pick avoids it. An infra failure also escapes
+            # the PROVIDER cross-provider; an OOM does NOT (the host was fine — just grow the card,
+            # which the oom_vram_floor filter already enforces).
+            if not oom_shaped:
+                failed_providers.add(chosen.provider)
             tried_classes.add((chosen.provider, chosen.gpu))
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
     # are only known here).
     _gc_seen_endpoints()
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
+
+
+def _touch_warmstart_source(spec: JobSpec) -> None:
+    """Refresh a managed warm-start SOURCE repo's ``last_modified`` so the repo GC's age gate spares
+    it while THIS run depends on it.
+
+    A run can ``init_from_adapter = "<owner>/<repo>:<phase>/<run_id>"`` from a prior managed run's
+    adapter, which the worker ``snapshot_download``s at boot. The GC deletes undeployed ``flashrun-*``
+    repos older than 30 days, and the source's ISSUING control plane may differ from this one
+    (multi-plane), so a purely-local protected set on this plane can't shield it. Writing a small
+    marker into the source repo bumps its HF ``last_modified`` — shared state that EVERY plane's GC
+    reads — age-resetting it for another GC window, long enough for this run to fetch it. Best-effort:
+    if the source is already gone the failure surfaces at worker boot (where it would anyway)."""
+    from flash.runner import _ARTIFACT_NAMESPACE
+
+    ref = (spec.train.init_from_adapter or "").strip()
+    if ":" not in ref:
+        return
+    source_repo = ref.split(":", 1)[0]
+    # Only managed per-run artifact repos are ever GC'd; a user/base ref needs no touch.
+    if not source_repo.startswith(f"{_ARTIFACT_NAMESPACE}/flashrun-"):
+        return
+    import io
+
+    from huggingface_hub import HfApi
+
+    with contextlib.suppress(Exception):
+        HfApi(token=os.environ.get("HF_TOKEN")).upload_file(
+            path_or_fileobj=io.BytesIO(spec.run_id.encode()),
+            path_in_repo=f"referenced_by/{spec.run_id}",
+            repo_id=source_repo,
+            repo_type="dataset",
+            commit_message=f"warm-start reference from {spec.run_id}",
+        )
 
 
 def _run_job_inner(
@@ -469,6 +541,10 @@ def _run_job_inner(
     from flash.runner import _run_training, _RunCancelled, _update, get_status
 
     try:
+        # Keep a warm-start SOURCE repo alive against the repo GC's age gate while we depend on it
+        # (cross-plane-safe: bumps the source's shared HF last_modified). Before upload_code so the
+        # source is protected as early as possible.
+        _touch_warmstart_source(spec)
         # Ship the flash package to the run's HF repo (the per-run [train] hf_repo) so the GPU
         # worker — which fetches code/** from that same repo — can run it.
         upload_code(spec.train.hf_repo)

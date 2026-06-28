@@ -26,7 +26,12 @@ def _attn_impl_for_capability(
         fastest exact attention on Hopper; transformers routes it to the LOCAL ``flash_attn_interface``
         (no HF Kernels-Hub, whose torch2.10 versions break ``import transformers``). FA3 is baked into
         the worker image by default (Dockerfile FLASH_ATTN_3_SPEC), so ``fa3_available`` is normally
-        True; absent -> plain SDPA, same as every other arch.
+        True; absent -> plain SDPA, same as every other arch. NOTE datacenter Blackwell (sm100, B200)
+        is deliberately NOT here even though it has the TMEM/tcgen05 units FA3 needs: the baked FA3
+        wheel is a HOPPER-ONLY build (``flash-attention/hopper/...``), so selecting FA3 on sm100
+        crashes the first forward with "no kernel image" (LIVE-CONFIRMED on a B200). FA3 on sm100
+        needs a Blackwell-built FA3/FA4 wheel in the image first (see Dockerfile follow-up); until
+        then B200 falls through to SDPA below (major 10 hits no branch).
       * Ampere (sm80 A100 / sm86 3090·A6000) + Ada (sm89 4090·L40S): "flash_attention_2" when the
         ``flash_attn`` wheel is importable (``fa2_available``) — FA3 does NOT support these archs.
       * Blackwell (consumer sm120 5090 / RTX Pro; datacenter sm100 B200): "sdpa" forced to the cuDNN
