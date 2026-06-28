@@ -350,9 +350,9 @@ def create_app():
             else None
         )
         # Periodic repo GC: delete per-run HF artifact repos that aren't currently deployed once
-        # they pass the GC age (default 30d), reclaiming the operator org's private-storage quota.
-        # Default-on where an operator HF_TOKEN is configured; each sweep fails closed (deletes
-        # nothing) if the serving live set can't be confirmed. Killable via FLASH_REPO_GC_ENABLED=0.
+        # they pass the fixed 30-day age, reclaiming the operator org's private-storage quota. Runs
+        # wherever an operator HF_TOKEN is configured; each sweep fails closed (deletes nothing) if
+        # the serving live set can't be confirmed.
         repo_gc_task = (
             asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
         )

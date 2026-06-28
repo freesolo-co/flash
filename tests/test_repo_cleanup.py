@@ -27,9 +27,8 @@ def _fast_and_frozen(monkeypatch):
     # Default: no in-flight runs (isolate the sweep tests from the local run registry / db). The
     # in-flight guard is exercised explicitly below.
     monkeypatch.setattr(rc, "_inflight_repo_ids", lambda: set())
-    # A clean env so FLASH_REPO_GC_* from the host can't perturb thresholds/gating.
-    for k in ("FLASH_REPO_GC_ENABLED", "FLASH_REPO_GC_DELETE_AGE_DAYS", "HF_TOKEN"):
-        monkeypatch.delenv(k, raising=False)
+    # Clear HF_TOKEN so the enablement check is deterministic (the policy itself has no env knobs).
+    monkeypatch.delenv("HF_TOKEN", raising=False)
 
 
 def _days_ago(d: float) -> datetime:
@@ -68,16 +67,14 @@ class FakeApi:
 # ---- gating -----------------------------------------------------------------------------------
 
 def test_enabled_requires_hf_token(monkeypatch):
-    assert rc.repo_cleanup_enabled() is False  # no HF_TOKEN
+    assert rc.repo_cleanup_enabled() is False  # no HF_TOKEN -> never runs
     monkeypatch.setenv("HF_TOKEN", "tok")
-    assert rc.repo_cleanup_enabled() is True
-    monkeypatch.setenv("FLASH_REPO_GC_ENABLED", "0")
-    assert rc.repo_cleanup_enabled() is False
+    assert rc.repo_cleanup_enabled() is True  # credential present -> always on (no off switch)
 
 
 # ---- the policy predicate ---------------------------------------------------------------------
 
-AGE = rc.DEFAULT_DELETE_AGE_DAYS
+AGE = rc.DELETE_AGE_SECONDS / 86400.0  # the fixed 30-day threshold, in days
 
 
 def test_deletable_old_undeployed_is_deleted():
@@ -139,15 +136,6 @@ def test_dry_run_deletes_nothing(monkeypatch):
     n = rc.run_scheduled_cleanup(dry_run=True, api=api)
     assert n == 0
     assert api.deleted == []
-
-
-def test_age_threshold_env_override(monkeypatch):
-    # Lower the age to 2d: the 3-day-old "young" repo now ages out too.
-    monkeypatch.setenv("FLASH_REPO_GC_DELETE_AGE_DAYS", "2")
-    api = _sweep_api()
-    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: ({f"{NS}/flashrun-old-deployed"}, True))
-    rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert set(api.deleted) == {f"{NS}/flashrun-old-undeployed", f"{NS}/flashrun-young"}
 
 
 # ---- fail-closed safety -----------------------------------------------------------------------
