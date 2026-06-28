@@ -21,9 +21,32 @@ def _registered_subcommands() -> set[str]:
     return set(sub.choices)
 
 
+def _registered_env_subcommands() -> set[str]:
+    """The nested environment commands argparse registers under `flash env`."""
+    parser = cli._build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    env_parser = sub.choices["env"]
+    env_sub = next(a for a in env_parser._actions if isinstance(a, argparse._SubParsersAction))
+    return {f"env {name}" for name in env_sub.choices}
+
+
 def _catalog_commands() -> set[str]:
-    """The commands listed in the themed help grid (_HELP_GROUPS)."""
+    """The root commands represented by the themed help grid (_HELP_GROUPS).
+
+    Rows may show nested commands such as `env push`, but argparse only registers `env`
+    at the root level.
+    """
+    return {cmd.split()[0] for _, rows in cli._HELP_GROUPS for cmd, _ in rows}
+
+
+def _catalog_rows() -> set[str]:
+    """The display rows listed in the themed help grid (_HELP_GROUPS)."""
     return {cmd for _, rows in cli._HELP_GROUPS for cmd, _ in rows}
+
+
+def _catalog_env_rows() -> set[str]:
+    """The nested environment rows listed in the themed help grid."""
+    return {cmd for cmd in _catalog_rows() if cmd.startswith("env ")}
 
 
 def test_help_catalog_matches_registered_subcommands() -> None:
@@ -41,6 +64,10 @@ def test_help_catalog_matches_registered_subcommands() -> None:
     assert len(flat) == len(set(flat)), "a command is listed under more than one help group"
 
 
+def test_help_catalog_matches_registered_env_subcommands() -> None:
+    assert _catalog_env_rows() == _registered_env_subcommands()
+
+
 def test_help_styled_is_themed_and_exits_zero(monkeypatch, capsys) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")  # layout kept, color dropped — assert on contiguous text
@@ -53,8 +80,10 @@ def test_help_styled_is_themed_and_exits_zero(monkeypatch, capsys) -> None:
     assert "managed LoRA post-training" in out  # themed banner (lowercase) vs argparse description
     for title in ("getting started", "catalog", "environments", "training", "serving & export"):
         assert title in out  # grouped, not a flat dump
-    for cmd in _catalog_commands():
+    for cmd in _catalog_rows():
         assert cmd in out
+    assert f"{cli.CLI_NAME} env setup" in out
+    assert f"{cli.CLI_NAME} env push --name my-env ." in out
     assert "usage:" in out
     assert f"{cli.CLI_NAME} <command> --help" in out  # next-step hint
 
