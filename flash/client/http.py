@@ -97,6 +97,18 @@ class _ProgressReader:
         return chunk
 
 
+def _validate_checkpoint_step(step: int | float) -> int:
+    """Validate a checkpoint step before the request: reject bool (int(True)==1) and fractional floats
+    (int(2.7)==2 would target the WRONG checkpoint), then return the int — fail fast before the server."""
+    if isinstance(step, bool):
+        raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
+    if isinstance(step, float) and not step.is_integer():
+        raise ClientError(
+            f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
+        )
+    return int(step)
+
+
 class ApiClient:
     def __init__(
         self,
@@ -221,15 +233,7 @@ class ApiClient:
         deploy_timeout = 30 * 60 if not dry_run else None
         body: dict = {"dry_run": dry_run}
         if step is not None:
-            # int(True/False) silently coerces to 1/0 — fail fast before the server 400s.
-            if isinstance(step, bool):
-                raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
-            # int() silently truncates floats (2.7 -> 2 deploys the wrong checkpoint).
-            if isinstance(step, float) and not step.is_integer():
-                raise ClientError(
-                    f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
-                )
-            body["step"] = int(step)
+            body["step"] = _validate_checkpoint_step(step)
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/deploy",
@@ -249,15 +253,7 @@ class ApiClient:
         """Copy a run's adapter into a user-owned HuggingFace repo."""
         body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
         if step is not None:
-            # int(True/False) silently coerces to 1/0 — fail fast before the server 400s.
-            if isinstance(step, bool):
-                raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
-            # int() silently truncates floats (2.7 -> 2 exports the wrong checkpoint).
-            if isinstance(step, float) and not step.is_integer():
-                raise ClientError(
-                    f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
-                )
-            body["step"] = int(step)
+            body["step"] = _validate_checkpoint_step(step)
         return self._request(
             "POST", f"/v1/runs/{run_id}/export", body=body, timeout=30 * 60
         )

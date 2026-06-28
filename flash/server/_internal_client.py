@@ -32,6 +32,19 @@ def org_id_of(context: dict[str, Any] | None) -> str:
     return str((context or {}).get("org_id") or "").strip()
 
 
+def run_org_id(status: Any) -> str:
+    """The org that owns a run: its ``billing_context`` then ``platform_context`` (the submit-path
+    order), each isinstance-guarded against a non-dict legacy value; ``""`` if none. NOTE: this is the
+    OPPOSITE order to ``run_registry`` (which prefers ``platform_context`` — see its comment); the two
+    are intentionally different, do not conflate them."""
+    for ctx in (getattr(status, "billing_context", None), getattr(status, "platform_context", None)):
+        if isinstance(ctx, dict):
+            org = str(ctx.get("org_id") or "").strip()
+            if org:
+                return org
+    return ""
+
+
 def build_internal_request(path: str, body: dict[str, Any], *, token: str) -> urllib.request.Request:
     """Build a POST ``Request`` to ``<backend>{path}`` with Bearer token and JSON body."""
     return urllib.request.Request(
