@@ -44,6 +44,32 @@ def _point_backends_at(cache_dir: str) -> None:
     os.makedirs(os.path.join(cache_dir, "inductor"), exist_ok=True)
     os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache_dir, "inductor")
+    # FlashInfer's attention kernels (the Blackwell rollout attention backend on sm120 / B200) ship as
+    # CUBINS that are NOT bundled in the flashinfer-python wheel: on the FIRST rollout step flashinfer
+    # DOWNLOADS them from NVIDIA Artifactory and JIT-builds
+    # a small host wrapper. Left unredirected that store lands in ~/.flashinfer (lost on every cold
+    # worker), so each B200 worker re-fetches from Artifactory — a network dependency + multi-second
+    # first-step stall that hard-fails if Artifactory is unreachable or region-restricted. Point the
+    # cubin store + JIT workspace at DISTINCT subdirs of the SAME persistent cache tree the worker
+    # reads (and that the bake/network-volume populate), so the cubins are served locally and the
+    # Artifactory fetch happens at most once. Distinct subdirs keep these from colliding with the
+    # triton/inductor trees above.
+    fi_cubin = os.path.join(cache_dir, "flashinfer_cubin")
+    fi_cache = os.path.join(cache_dir, "flashinfer")
+    os.makedirs(fi_cubin, exist_ok=True)
+    os.makedirs(fi_cache, exist_ok=True)
+    # FLASHINFER_CUBIN_DIR is the var flashinfer actually honors for the downloaded trtllm-gen cubins
+    # (flashinfer/jit/env.py reads it directly); FLASHINFER_CACHE_DIR is set for explicitness/forward
+    # compat. FLASHINFER_WORKSPACE_BASE is what flashinfer 0.6.x reads to relocate the JIT host-wrapper
+    # cache (FLASHINFER_CACHE_DIR itself is a derived constant there, not an env knob), so set it too —
+    # otherwise the compiled wrapper still lands in ~/.cache and is lost on a cold worker. All three are
+    # FORCE-set (not setdefault) so they always point at THIS redirect target: a stale value carried in
+    # from the image ENV or a prior run must not win over the workspace base flashinfer derives from
+    # (which would silently defeat the redirect, since the base — not FLASHINFER_CACHE_DIR — is what
+    # flashinfer actually reads).
+    os.environ["FLASHINFER_CUBIN_DIR"] = fi_cubin
+    os.environ["FLASHINFER_CACHE_DIR"] = fi_cache
+    os.environ["FLASHINFER_WORKSPACE_BASE"] = fi_cache
 
 
 def _torch_sm(torch) -> str:
