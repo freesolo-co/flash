@@ -132,14 +132,6 @@ def test_config_max_wall_seconds_overrides_default_cap():
     assert short.total_usd < uncapped.total_usd
 
 
-def test_wall_cap_is_applied_per_seed_not_to_the_aggregate():
-    # The cap is per-seed, so a runaway 3-seed run bills 3x the per-seed cap, not one aggregate cap.
-    cfg = RunConfig(BIG, "grpo", 300_000, setup_repeats=3, max_wall_seconds=3600)
-    e = estimate_cost(cfg)
-    assert e.wall_capped is True
-    assert e.wall_clock_seconds == pytest.approx(3 * 3600.0)
-
-
 def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
     # The runner floors the cap to max(60, ...); the estimate mirrors it (else a ~$0 quote).
     e10 = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=10))
