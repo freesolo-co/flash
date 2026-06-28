@@ -66,7 +66,8 @@ def test_gdn_dims_none_for_non_gdn(monkeypatch):
 
 
 def test_gdn_dims_reads_text_config(monkeypatch):
-    # VL checkpoints nest the GDN dims under text_config; read head_dim + num_key_heads there.
+    # VL checkpoints nest the GDN dims under text_config; read head_dim + head count there. With no
+    # value-head attr the count falls back to key heads.
     inner = types.SimpleNamespace(linear_key_head_dim=128, linear_num_key_heads=16)
     cfg = types.SimpleNamespace(text_config=inner)
     fake_tf = types.SimpleNamespace(
@@ -74,6 +75,20 @@ def test_gdn_dims_reads_text_config(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_tf)
     assert kw._gdn_dims_from_config("some/qwen35-vl") == (128, 16)
+
+
+def test_gdn_dims_uses_value_heads_not_key_heads(monkeypatch):
+    # GatedDeltaNet repeat_interleaves q/k up to the VALUE-head count before chunk_gated_delta_rule,
+    # and l2norm flattens that repeated tensor — so the head count driving NB is num_value_heads
+    # (>= num_key_heads). Sizing by key heads would under-count rows and stop the sweep early.
+    cfg = types.SimpleNamespace(
+        linear_key_head_dim=128, linear_num_key_heads=16, linear_num_value_heads=32
+    )
+    fake_tf = types.SimpleNamespace(
+        AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg)
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_tf)
+    assert kw._gdn_dims_from_config("some/qwen35") == (128, 32)  # value heads, not the 16 key heads
 
 
 def _fake_cuda_torch(available=True):

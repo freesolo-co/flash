@@ -296,10 +296,18 @@ _L2NORM_AUTOTUNE_MAX_D = 512
 
 
 def _gdn_dims_from_config(model_id: str):
-    """``(head_dim, num_key_heads)`` of the model's GatedDeltaNet block, read from its HF config WITHOUT
+    """``(head_dim, l2norm_heads)`` of the model's GatedDeltaNet block, read from its HF config WITHOUT
     loading weights — or ``None`` when the model has no linear-attention layer (a plain Llama / MiniCPM
-    checkpoint has no l2norm kernel to warm). Mirrors ``packing.py``'s probe: the GDN dims live on
-    ``linear_key_head_dim`` / ``linear_num_key_heads`` (under ``text_config`` for VL checkpoints)."""
+    checkpoint has no l2norm kernel to warm). ``head_dim`` is ``linear_key_head_dim`` (the dim l2norm
+    normalizes over); ``l2norm_heads`` is the HEAD COUNT the l2norm kernel actually sees at train time.
+
+    That count is the number of VALUE heads, not key heads: Qwen3.5/3.6's GatedDeltaNet.forward
+    ``repeat_interleave``s q/k from ``linear_num_key_heads`` up to ``linear_num_value_heads`` BEFORE
+    ``chunk_gated_delta_rule``, and (with ``use_qk_l2norm_in_kernel=True``) fla applies l2norm to that
+    already-repeated tensor — so its ``NB = cdiv(B*seq*heads, ...)`` key is driven by value heads. Sizing
+    by key heads would under-count rows and stop the sweep several NB buckets early, leaving the first
+    real backward to cold-benchmark exactly what this prewarm avoids. (For VL checkpoints the dims nest
+    under ``text_config``; mirrors ``packing.py``'s probe.)"""
     try:
         from transformers import AutoConfig
 
@@ -308,8 +316,11 @@ def _gdn_dims_from_config(model_id: str):
         d = getattr(cfg, "linear_key_head_dim", None)
         if not d:
             return None  # not a GatedDeltaNet hybrid -> no l2norm kernel to warm
-        h = getattr(cfg, "linear_num_key_heads", None) or 4
-        return int(d), int(h)
+        h_key = getattr(cfg, "linear_num_key_heads", None) or 4
+        # value heads (>= key heads) is what l2norm flattens after the repeat; max() guards a config
+        # where the value-head attr is missing/smaller (over-covering buckets on the free card is safe).
+        h_val = getattr(cfg, "linear_num_value_heads", None) or h_key
+        return int(d), int(max(h_key, h_val))
     except Exception as e:
         _log(f"GDN dim probe failed for {model_id} ({e}); skipping autotune prewarm")
         return None
@@ -354,9 +365,11 @@ def prewarm_gdn_autotune(
     ``do_bench``, NOT in steady-state training). Benchmarking HERE — before the engine/optimizer load —
     has the whole card free, and the in-process autotune cache then serves every training step.
 
-    NB depends on the ROW count (``B*seq*num_key_heads``), not just head_dim, so a single shape would
+    NB depends on the ROW count (``B*seq*l2norm_heads``), not just head_dim, so a single shape would
     cover only one bucket; we sweep ``seq`` across the buckets bounded by the run's
-    ``max(group_size, per_device_comps) x max_length x num_key_heads`` rows. ``B`` is the per-device
+    ``max(group_size, per_device_comps) x max_length x l2norm_heads`` rows (``l2norm_heads`` = the
+    model's VALUE-head count, what l2norm flattens after GDN's q/k repeat; see _gdn_dims_from_config).
+    ``B`` is the per-device
     COMPLETION micro-batch of TRL's logprob forward (``per_device_train_batch_size``), which
     ``rl_per_device_comps`` can grow ABOVE ``group_size`` on short non-thinking runs — so the caller
     passes that bound via ``per_device_comps`` and we sweep to whichever is larger (sizing by
@@ -366,7 +379,7 @@ def prewarm_gdn_autotune(
     dims = _gdn_dims_from_config(model_id)
     if not dims:
         return False
-    head_dim, num_key_heads = dims
+    head_dim, l2norm_heads = dims
     if head_dim > _L2NORM_AUTOTUNE_MAX_D:
         _log(f"head_dim={head_dim} uses fla's non-autotuned l2norm kernel; no prewarm needed")
         return False
@@ -381,10 +394,10 @@ def prewarm_gdn_autotune(
     # group_size — so take the larger of the two; the seq is <= the run's engine context (max_length).
     # Size the bucket sweep to that worst case so every NB key the training forward reaches is warm.
     rows_per_micro_batch = max(1, int(group_size), int(per_device_comps))
-    max_rows = rows_per_micro_batch * max(256, int(max_length or 1024)) * num_key_heads
-    seqs = gdn_autotune_nb_buckets(num_key_heads, max_rows)
+    max_rows = rows_per_micro_batch * max(256, int(max_length or 1024)) * l2norm_heads
+    seqs = gdn_autotune_nb_buckets(l2norm_heads, max_rows)
     _log(
-        f"pre-warming GatedDeltaNet l2norm autotuner: head_dim={head_dim}, num_key_heads={num_key_heads}, "
+        f"pre-warming GatedDeltaNet l2norm autotuner: head_dim={head_dim}, l2norm_heads={l2norm_heads}, "
         f"NB buckets via seq_lens={seqs} (free VRAM; avoids a train-time benchmark OOM on the colocate step)"
     )
     warmed = False
@@ -392,7 +405,7 @@ def prewarm_gdn_autotune(
         # varlen only on the first pass: GRPO rollouts are unpacked, so the plain path is what the
         # training backward hits — the bucket sweep just needs that one.
         warmed = warm_fla_gdn(
-            torch, head_dim=head_dim, num_heads=num_key_heads, seq_len=seq, varlen=(i == 0)
+            torch, head_dim=head_dim, num_heads=l2norm_heads, seq_len=seq, varlen=(i == 0)
         ) or warmed
     return warmed
 
