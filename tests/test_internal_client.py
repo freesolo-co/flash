@@ -1,8 +1,8 @@
 """flash.server._internal_client key gate: whitespace-strip/normalize + shared enabled() definition.
 
-Copilot Mr6nr/Mr6n4: a stray trailing newline or a whitespace-only INTERNAL key must not masquerade
-as "enabled" (which would emit an invalid ``Authorization: Bearer <whitespace>`` header), and
-``enabled()`` must share ONE definition with ``internal_key()``.
+A stray trailing newline or a whitespace-only INTERNAL key must not masquerade as "enabled" (which
+would emit an invalid ``Authorization: Bearer <whitespace>`` header), and ``enabled()`` must share ONE
+definition with ``internal_key()`` so the two can't disagree on what counts as a usable key.
 """
 
 from __future__ import annotations
