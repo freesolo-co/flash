@@ -38,6 +38,15 @@ def test_is_cuda_oom_typed_torch_error():
     assert is_cuda_oom(torch.cuda.OutOfMemoryError("x")) is True  # typed allocator signal
 
 
+def test_is_cuda_oom_none_is_never_oom(monkeypatch):
+    # No exception object must NEVER classify as OOM — not even when the allocator counter is pinned >0
+    # (e.g. an OOM the run already recovered from). A missing exception => no spurious larger-GPU escalation.
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "cuda_oom_count", lambda: 5)
+    assert lc.is_cuda_oom(None) is False
+
+
 def _card(gpu, vram):
     return types.SimpleNamespace(gpu=gpu, vram_gb=vram, provider="runpod", hourly_usd=1.0)
 
@@ -66,6 +75,27 @@ def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
     assert reads["n"] == 1  # surfacing + both flags share ONE forced read
     assert surfaced_worker_flags(lambda force=False: {"retriable": True}, None, say)[1:] == (True, False)
     assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
+    # A prior attempt's lingering {"oom": true} must NOT be honored for a DIFFERENT attempt: when the
+    # caller passes the attempt it is polling, trust the oom flag only when the heartbeat's own
+    # worker-stamped `attempt` matches (retriable is NOT attempt-gated — see surfaced_worker_flags).
+    stale = lambda force=False: {"oom": True, "attempt": "0", "retriable": False}  # noqa: E731
+    assert surfaced_worker_flags(stale, None, say, 0)[1:] == (False, True)  # this attempt's own flag
+    assert surfaced_worker_flags(stale, None, say, 1)[1:] == (False, False)  # STALE prior-attempt flag
+
+
+def test_oom_from_hb_attempt_gates_stale_flag():
+    from flash.providers.runpod.jobs import _oom_from_hb
+
+    # The seed heartbeat path is SHARED across attempts, so a prior attempt's lingering {"oom": true}
+    # must not escalate a fresh non-OOM failure — gate on the heartbeat's own worker-stamped `attempt`
+    # (a str env var) matching the attempt being polled.
+    assert _oom_from_hb({"oom": True, "attempt": "0"}, 0) is True  # this attempt's own flag
+    assert _oom_from_hb({"oom": True, "attempt": "0"}, 1) is False  # STALE prior-attempt flag
+    assert _oom_from_hb({"oom": True, "attempt": "1"}, 1) is True
+    assert _oom_from_hb({"oom": True}, 1) is False  # no attempt stamp -> can't confirm it's ours
+    assert _oom_from_hb({"oom": True, "attempt": "0"}, None) is True  # no expected attempt -> trust
+    assert _oom_from_hb(None, 0) is False
+    assert _oom_from_hb({"retriable": True}, 0) is False
 
 
 def _read(mod):
@@ -73,15 +103,56 @@ def _read(mod):
 
 
 def test_worker_stamps_oom_flag():
+    # AST-based (not an exact source string) so it survives ruff/black reflow while still proving the
+    # SHORT-CIRCUIT STRUCTURE: `oom = not retriable and is_cuda_oom(e)` — the `not retriable` guard is the
+    # FIRST `and` operand, so is_cuda_oom (which can touch torch/CUDA) runs only for non-retriable fails.
+    tree = ast.parse(_read("flash.engine.worker"))
+    oom_assigns = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "oom" for t in n.targets)
+    ]
+    assert oom_assigns, "worker never assigns an `oom` flag"
+    val = oom_assigns[0].value
+    assert isinstance(val, ast.BoolOp), "`oom` must be a boolean (`and`) expression"
+    assert isinstance(val.op, ast.And), "`oom` must short-circuit via `and`"
+    first, second = val.values[0], val.values[1]
+    # First `and` operand must be `not retriable` (short-circuit BEFORE is_cuda_oom).
+    assert isinstance(first, ast.UnaryOp), "first operand must be a `not ...` guard"
+    assert isinstance(first.op, ast.Not), "first operand must be `not retriable`"
+    assert isinstance(first.operand, ast.Name), "first operand must negate a bare name"
+    assert first.operand.id == "retriable", "first operand must be `not retriable`"
+    # Second `and` operand must be the is_cuda_oom(...) probe (only reached for non-retriable fails).
+    assert isinstance(second, ast.Call), "second operand must be a call"
+    assert isinstance(second.func, ast.Name), "second operand must call a bare name"
+    assert second.func.id == "is_cuda_oom", "second operand must be is_cuda_oom(...)"
+    # The flag ships to the poller in the error heartbeat alongside ``retriable`` (order-independent).
     src = _read("flash.engine.worker")
-    assert "oom = not retriable and is_cuda_oom(e)" in src  # short-circuits on retriable infra
-    assert '{"retriable": retriable, "oom": oom}' in src
+    assert '"oom": oom' in src
+    assert '"retriable": retriable' in src
 
 
 def test_poller_maps_oom_flag_to_oom_failure():
     src = _read("flash.providers.runpod.jobs")
     assert src.count('"oom" if oom else') == 2  # oom wins in both worker-fail paths
     assert "def surfaced_worker_flags" in src  # single-read helper feeds both paths
+    assert "def _oom_from_hb" in src  # the attempt-gating helper exists
+    assert "_oom_from_hb(hb, current_attempt)" in src  # surfaced_worker_flags gates the oom flag
+    assert "current_attempt=int(attempt)" in src  # submit_run forwards the polled attempt
+    # Both worker-fail poll paths thread the attempt being polled into the single-read helper so a
+    # stale prior-attempt heartbeat can't escalate (AST: surfaced_worker_flags is called twice and each
+    # call forwards a ``current_attempt`` positional arg — robust to formatting/reflow).
+    calls = [
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "surfaced_worker_flags"
+    ]
+    assert len(calls) == 2
+    for c in calls:
+        assert any(isinstance(a, ast.Name) and a.id == "current_attempt" for a in c.args)
 
 
 def test_runner_escalates_on_oom():
