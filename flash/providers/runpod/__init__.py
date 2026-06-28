@@ -80,7 +80,7 @@ class RunpodProvider:
         )
 
         hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+        prefix = f"{spec.phase}/{spec.run_id}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         failure_reader = (
             make_hf_failure_detail_reader(hf_repo, prefix, spec.phase) if hf_repo else None

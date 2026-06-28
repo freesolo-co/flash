@@ -6,32 +6,7 @@ The canonical generated environment entrypoint is ``environment.py:load_environm
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
-from .._fileio import read_json_or_empty, secure_json_write
 from .base import Environment
-
-# Manifest of local Freesolo environment ids (written by `flash env install`).
-INSTALLED_MANIFEST = Path(
-    os.environ.get("FLASH_ENVS_MANIFEST", str(Path.home() / ".flash" / "envs.json"))
-)
-
-
-def load_installed_manifest() -> dict:
-    return read_json_or_empty(INSTALLED_MANIFEST)
-
-
-def list_installed_environments() -> list[str]:
-    """Freesolo environment ids recorded via `flash env install`."""
-    return sorted(load_installed_manifest())
-
-
-def record_installed_env(env_id: str, package: str, extras: dict | None = None) -> None:
-    manifest = load_installed_manifest()
-    manifest[env_id] = {"package": package, **(extras or {})}
-    # The manifest can hold a credentialed --extra-index-url, so write it with private perms.
-    secure_json_write(INSTALLED_MANIFEST, manifest)
 
 
 def worker_pip_for_env(env_id: str) -> list[str]:

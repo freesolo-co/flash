@@ -64,12 +64,12 @@ def wandb_run_name() -> str:
     """W&B run name, from the typed ``[wandb] run_name`` config (``JOB_SPEC.wandb.run_name``) only —
     no WANDB_NAME environment variable. An explicit name is used verbatim (the user owns the
     naming); otherwise a stable id tying the dashboard run to the Flash run
-    (``flash-<phase>-<run_id>-seed<N>``). Passed to the Trainer via ``TrainingArguments.run_name``
+    (``flash-<phase>-<run_id>``). Passed to the Trainer via ``TrainingArguments.run_name``
     and to ``wandb.init`` above."""
     configured = _w.JOB_SPEC.wandb.run_name if _w.JOB_SPEC else None
     if configured and configured.strip():
         return configured.strip()
-    return f"flash-{_w.PHASE}-{_w.RUN_ID}-seed{_w.SEED}"
+    return f"flash-{_w.PHASE}-{_w.RUN_ID}"
 
 
 def wandb_run_info() -> dict:

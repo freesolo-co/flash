@@ -284,12 +284,11 @@ def test_oom_escalation_floor_survives_a_control_plane_restart():
     # the seed supervisor accepts a starting floor and seeds oom_vram_floor from it (not a hard 0)
     assert "oom_vram_floor_start: int = 0" in life
     assert "oom_vram_floor = int(oom_vram_floor_start)" in life
-    # the seed loop forwards it ONLY to the in-flight (first) seed; later seeds start fresh
+    # _run_training (single fixed-seed adapter) forwards the resumed floor to the supervised submit
     assert "resume_oom_vram_floor: int = 0" in life
-    assert "seed_oom_floor = resume_oom_vram_floor if i == start_index else 0" in life
-    assert "oom_vram_floor_start=seed_oom_floor" in life
+    assert "oom_vram_floor_start=resume_oom_vram_floor" in life
     # recovery reads the persisted floor, bumps it by the reattached card's VRAM on an OOM, and
-    # threads it into the resumed seed loop
+    # threads it into the resumed training submit
     assert 'persisted_oom_floor = int(remote.pop("oom_vram_floor", 0) or 0)' in deploy
     assert 'allocated_vram_gb = int(remote.pop("allocated_vram_gb", 0) or 0)' in deploy
     assert "resumed_floor = max(resumed_floor, allocated_vram_gb)" in deploy

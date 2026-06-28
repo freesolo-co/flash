@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field
 
 @dataclass
 class RunMetrics:
-    """Standard metrics record written per phase/seed."""
+    """Standard metrics record written per phase."""
 
     arm: str = "runpod"  # compute substrate
     phase: str = ""  # "sft" | "rl"

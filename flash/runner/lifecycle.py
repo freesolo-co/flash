@@ -311,7 +311,7 @@ def _submit_seed_supervised(
         res = None
         alloc = None
         chosen = None
-        # A cancel can land after _run_seed_loop's pre-submit check but while
+        # A cancel can land after _run_training's pre-submit check but while
         # allocation/pricing runs, when no handle exists yet for cancel_run() to
         # delete. Re-read state right before paid provisioning so a cancelled run
         # never launches a worker (the later checks only stop the final-state
@@ -565,20 +565,14 @@ def _run_job_inner(
     upload_code,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
-    from flash.runner import _run_seed_loop, _RunCancelled, _update, get_status
+    from flash.runner import _run_training, _RunCancelled, _update, get_status
 
     try:
         # Ship the flash package to the run's HF repo (the per-run [train] hf_repo) so the GPU
         # worker — which fetches code/** from that same repo — can run it.
         upload_code(spec.train.hf_repo)
         with open(log_path, "a") as log:
-            _run_seed_loop(
-                spec,
-                log,
-                start_index=0,
-                prior_cost=0.0,
-                runtime_secrets=runtime_secrets,
-            )
+            _run_training(spec, log, prior_cost=0.0, runtime_secrets=runtime_secrets)
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
@@ -587,27 +581,27 @@ def _run_job_inner(
         raise
 
 
-def _run_seed_loop(
+def _run_training(
     spec: JobSpec,
     log,
     *,
-    start_index: int,
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
     resume_oom_vram_floor: int = 0,
     resume_oom_attempts: int = 0,
 ) -> None:
-    """Run spec.train.seeds[start_index:] under supervision; finalize the run.
+    """Train the run's single adapter under supervision; finalize the run.
 
-    Shared by a fresh submit (start_index=0) and post-restart recovery, which
-    resumes the remaining seeds after the in-flight one completes.
+    Shared by a fresh submit and post-restart recovery (the worker resumes from its last HF
+    checkpoint on a fresh allocation). ``prior_cost`` carries spend already booked before a
+    recovery so the total isn't under-reported.
 
-    ``resume_oom_vram_floor`` (>0 only on an OOM-aware recovery) seeds the GPU-escalation floor for
-    the FIRST seed run here — the in-flight seed being resumed, which may have already escalated past
-    a too-small card before the restart. Later seeds in the loop start fresh (floor 0): an OOM is a
-    per-run property but the floor is rebuilt empirically per seed, and a seed that hasn't OOM'd yet
-    must not be pinned onto an expensive card it might fit under."""
+    ``resume_oom_vram_floor`` / ``resume_oom_attempts`` (>0 only on an OOM-aware recovery) seed the
+    GPU-escalation floor and the already-consumed escalation-attempt count for the resumed adapter, so
+    recovery escalates PAST the too-small card that OOM'd before the restart without re-granting a
+    fresh escalation budget beyond the user's ``max_retries``."""
     from flash.runner import (
+        FIXED_SEED,
         TERMINAL_STATES,
         _persist_metrics,
         _RunCancelled,
@@ -617,66 +611,37 @@ def _run_seed_loop(
         get_status,
     )
 
-    total_cost = prior_cost
-    seeds = spec.train.seeds
-    for i in range(start_index, len(seeds)):
-        seed = seeds[i]
-        # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped
-        # into ANY terminal state — not just `cancelled` — by a concurrent thread/process
-        # (e.g. another recovery marking it failed/done) between the resume decision and here.
-        # Bail before _update + _submit_seed_supervised so we never submit PAID GPU work for an
-        # already-terminal run. (The `running` _update below would be CAS-rejected anyway, but
-        # the supervised submit would still have spent.) _RunCancelled is the loop's terminal
-        # signal; its callers already swallow it / leave the existing terminal state intact.
-        if get_status(spec.run_id).state in TERMINAL_STATES:
-            raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting seed")
-        _update(spec.run_id, "running")
-        print(
-            f"starting seed={seed} phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
-            file=log,
-            flush=True,
-        )
-        # The resumed escalation floor + consumed-OOM-attempt count apply ONLY to the in-flight seed
-        # (the first iteration after a restart); subsequent seeds rebuild their own from scratch.
-        seed_oom_floor = resume_oom_vram_floor if i == start_index else 0
-        seed_oom_attempts = resume_oom_attempts if i == start_index else 0
-        metrics = _submit_seed_supervised(
-            spec,
-            seed,
-            log,
-            runtime_secrets=runtime_secrets,
-            oom_vram_floor_start=seed_oom_floor,
-            resume_oom_attempts=seed_oom_attempts,
-        )
-        total_cost += _persist_metrics(spec, seed, metrics)
-        # A cancel can land while this thread writes metrics — after the supervised
-        # late-cancel check. Re-read before the post-seed status writes so a late
-        # worker success doesn't resurrect a user-cancelled run via this "running"
-        # update (or the final "done" below).
-        with contextlib.suppress(FileNotFoundError):
-            if get_status(spec.run_id).state == "cancelled":
-                raise _RunCancelled(f"run {spec.run_id} was cancelled")
-        # If more seeds follow, this seed's endpoint/instance is already torn down, so
-        # clear the now-stale remote handle: a restart in the gap before the next
-        # seed's on_handle must not make recover_runs reattach to a deleted handle and
-        # fail the run. Record the next seed index so a restart in that handle-less gap
-        # RESUMES the remaining seeds (recover_runs) instead of discarding the completed
-        # ones. The last seed keeps its handle for post-run observability (the run is
-        # about to go terminal, which recover_runs never reattaches).
-        more_seeds = (i + 1) < len(seeds)
-        _update(
-            spec.run_id,
-            "running",
-            cost_usd=total_cost,
-            **({"remote": None, "resume_seed_index": i + 1} if more_seeds else {}),
-        )
-        print(
-            f"seed={seed} done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
-            file=log,
-            flush=True,
-        )
-    # Final guard: a cancel landing after the last seed's check must not be overwritten
-    # by the terminal "done".
+    # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped into ANY
+    # terminal state — not just `cancelled` — by a concurrent thread/process between the resume
+    # decision and here. Bail before _update + the supervised submit so we never submit PAID GPU
+    # work for an already-terminal run. _RunCancelled is the terminal signal; callers swallow it.
+    if get_status(spec.run_id).state in TERMINAL_STATES:
+        raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting")
+    # The pre-check above closes most of the window, but a concurrent flip can still land between
+    # it and this transition. _update is a compare-and-set: it returns False when the run is already
+    # terminal and leaves the state untouched. Gate the PAID supervised submit on that result so a
+    # run cancelled in this last instant is never resumed onto a GPU.
+    if not _update(spec.run_id, "running"):
+        raise _RunCancelled(f"run {spec.run_id} went terminal before submit; not submitting")
+    print(
+        f"starting phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
+        file=log,
+        flush=True,
+    )
+    # Carry the OOM-escalation floor + already-consumed escalation-attempt count into the resumed
+    # adapter (both 0 on a fresh submit) so an OOM recovery escalates past the too-small card without
+    # re-granting a fresh escalation budget past max_retries.
+    metrics = _submit_seed_supervised(
+        spec,
+        FIXED_SEED,
+        log,
+        runtime_secrets=runtime_secrets,
+        oom_vram_floor_start=resume_oom_vram_floor,
+        resume_oom_attempts=resume_oom_attempts,
+    )
+    total_cost = prior_cost + _persist_metrics(spec, metrics)
+    # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
+    # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.
     with contextlib.suppress(FileNotFoundError):
         if get_status(spec.run_id).state == "cancelled":
             raise _RunCancelled(f"run {spec.run_id} was cancelled")
@@ -685,7 +650,11 @@ def _run_seed_loop(
         "done",
         cost_usd=total_cost,
         artifacts_dir=artifacts_dir(spec),
-        resume_seed_index=None,
+    )
+    print(
+        f"done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
+        file=log,
+        flush=True,
     )
     _charge_completed_run_best_effort(spec, log)
     _register_checkpoints_best_effort(spec, log)
