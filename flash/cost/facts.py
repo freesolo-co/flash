@@ -11,6 +11,9 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "RTX 5090": 210.0,
     "A100 PCIe": 312.0,
     "A100 SXM": 312.0,
+    # A100 SXM 40GB: same SMs/tensor cores as the 80GB A100 SXM, less HBM only (Lambda-only class).
+    # Without this, removing A6000 leaves the 33-40 GB Lambda pick falling back to _DEFAULT_TFLOPS.
+    "A100 SXM 40GB": 312.0,
     "H100": 990.0,
     # H200: same SMs/tensor cores as H100, more HBM only.
     "H200": 990.0,
@@ -55,7 +58,9 @@ def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     candidates = [g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)]
     if not candidates:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
-    best = min(candidates, key=lambda g: (gpu_hourly_usd(g.name, provider=provider), g.vram_gb, g.name))
+    best = min(
+        candidates, key=lambda g: (gpu_hourly_usd(g.name, provider=provider), g.vram_gb, g.name)
+    )
     return best.name
 
 
