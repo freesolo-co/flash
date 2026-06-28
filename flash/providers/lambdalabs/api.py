@@ -1,18 +1,7 @@
 """Thin Lambda Cloud REST client (no SDK state): instance-types + instance lifecycle.
 
-Mirrors ``providers/runpod/api.py`` / the historical Vast client: stdlib urllib only (via the
-shared ``RestClient``), hardened retries, and nothing persisted locally — a fresh process can
-list/terminate any instance using only the persisted ids + ``LAMBDA_API_KEY``.
-
-Two Lambda-specific quirks the rest of the provider relies on:
-
-* **Cloudflare WAF.** Lambda's API sits behind Cloudflare, which 403s the stdlib default
-  ``Python-urllib/<v>`` User-Agent. The client therefore sends a real UA (``extra_headers``);
-  without it EVERY call fails 403 (verified live).
-* **Non-idempotent launch.** ``POST /instance-operations/launch`` provisions a NEW (billed)
-  instance every time it succeeds, so it is NEVER retried — a blind retry on a timeout where
-  Lambda actually accepted the first request would double-provision. Idempotent calls
-  (instance-types, list, detail, terminate) keep their retries.
+Two gotchas: Cloudflare 403s the stdlib UA (use real UA via ``extra_headers``); launch is
+NON-IDEMPOTENT so it is never retried (blind retry = double-provision + double-bill).
 """
 
 from __future__ import annotations
@@ -26,7 +15,7 @@ from flash.providers._http import RestClient, is_not_found
 logger = get_logger(__name__)
 
 LAMBDA_BASE = "https://cloud.lambdalabs.com/api/v1"
-# A real User-Agent: Lambda's Cloudflare edge rejects the stdlib default with 403 (verified live).
+# Cloudflare rejects Python-urllib UA with 403 — must use a real UA.
 _USER_AGENT = "flash-lambda/1.0 (+https://freesolo.co)"
 
 
@@ -63,20 +52,12 @@ def _data(out: Any) -> Any:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Instance types + capacity (cached: pricing, the allocator, and the launcher all read this)
-# ---------------------------------------------------------------------------
 _TYPES_TTL_S = 45.0
 _types_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 
 
 def list_instance_types(force: bool = False) -> dict[str, dict]:
-    """Map of ``instance_type_name -> {instance_type, regions_with_capacity_available}``.
-
-    Cached for ``_TYPES_TTL_S`` so pricing + allocation + the launch path share one fetch within an
-    allocation pass. ``force`` bypasses the cache. Raises ``LambdaApiError`` on a hard failure;
-    callers that must degrade gracefully (pricing) catch it.
-    """
+    """Map of ``instance_type_name -> {instance_type, regions_with_capacity_available}`` (cached)."""
     now = time.time()
     if not force and _types_cache["data"] is not None and now - _types_cache["ts"] < _TYPES_TTL_S:
         return _types_cache["data"]
@@ -88,8 +69,7 @@ def list_instance_types(force: bool = False) -> dict[str, dict]:
 
 
 def regions_with_capacity(instance_type: str, force: bool = False) -> list[str]:
-    """Region names that currently have capacity for ``instance_type`` (cheapest source of truth
-    for whether a launch can succeed at all)."""
+    """Region names that currently have capacity for ``instance_type``."""
     info = list_instance_types(force=force).get(instance_type) or {}
     return [
         r.get("name")
@@ -99,16 +79,7 @@ def regions_with_capacity(instance_type: str, force: bool = False) -> list[str]:
 
 
 def all_regions(force: bool = False) -> list[str]:
-    """Every Lambda region with at least one capacity-available instance type — the UNION of the
-    ``regions_with_capacity_available`` lists across all instance types (the API has no standalone
-    region list, so this is the only way to enumerate reachable regions). Used by the eager
-    weight-cache provision step to create the ``flash-weights`` filesystem in those regions.
-
-    This is therefore capacity-DEPENDENT: a region that currently advertises ZERO capacity for every
-    instance type won't appear (Lambda only surfaces regions through the per-type capacity list); the
-    launch-time ``ensure_filesystem`` backstop covers any such region the moment a run lands there.
-    Sorted for a stable provision order.
-    """
+    """Union of all regions with capacity across instance types (Lambda has no standalone region API)."""
     regions: set[str] = set()
     for info in list_instance_types(force=force).values():
         for r in (info or {}).get("regions_with_capacity_available", []):
@@ -124,17 +95,11 @@ def instance_type_price_usd_hr(instance_type: str) -> float | None:
     return float(cents) / 100.0 if cents else None
 
 
-# ---------------------------------------------------------------------------
-# SSH keys (launch requires exactly one; the box is bootstrapped via user_data, not SSH)
-# ---------------------------------------------------------------------------
 def list_ssh_keys() -> list[dict]:
     out = _data(request_with_retries("/ssh-keys"))
     return out if isinstance(out, list) else []
 
 
-# ---------------------------------------------------------------------------
-# Instances
-# ---------------------------------------------------------------------------
 def launch_instance(
     *,
     region_name: str,
@@ -144,21 +109,11 @@ def launch_instance(
     user_data: str,
     file_system_names: list[str] | None = None,
 ) -> str:
-    """Launch one instance -> its id. Raises ``LambdaApiError`` on rejection (no capacity, etc.).
-
-    NON-IDEMPOTENT (see module docstring): never retried. A transient failure surfaces to the
-    launcher, which walks to the next region/class.
-
-    ``file_system_names`` attaches persistent filesystems (the weight cache) AT LAUNCH — Lambda can
-    only attach at launch, and each must already exist in ``region_name`` (auto-mounted on the host
-    at ``/lambda/nfs/<name>``).
-    """
+    """Launch one instance -> its id. NON-IDEMPOTENT: never retried (blind retry = double-provision)."""
     body = {
         "region_name": region_name,
         "instance_type_name": instance_type_name,
         "ssh_key_names": list(ssh_key_names),
-        # ``name`` is bounded <=60 by ``_instance.run_label_prefix`` (NOT truncated here) so the
-        # stored name always equals the prefix ``sweep_orphans`` matches on.
         "name": name,
         "quantity": 1,
         "user_data": user_data,
@@ -172,20 +127,11 @@ def launch_instance(
     return str(ids[0])
 
 
-# ---------------------------------------------------------------------------
-# Persistent filesystems (the weight cache). Region-scoped, NFS, multi-attach; auto-mounted on the
-# host at /lambda/nfs/<name>. Created via the Cloud API, attached at launch via file_system_names.
-# ---------------------------------------------------------------------------
-# NB: Lambda's filesystem API paths are ASYMMETRIC and this is intentional/correct, not a typo —
-# verified LIVE against cloud.lambdalabs.com/api/v1 with a real create->ensure->delete probe (the FS
-# was created, reused idempotently, then confirmed deleted, no stranded resources). LIST is the
-# hyphenated GET /file-systems; CREATE/DELETE are the un-hyphenated POST /filesystems and
-# DELETE /filesystems/{id}. Lambda's own surface differs from its other (hyphenated) resources here,
-# so DO NOT "unify" these to /file-systems — that 404s the working create/delete endpoints and
-# silently disables the cache. (Reviewers keep flagging the inconsistency; it's the real API.)
+# IMPORTANT: Lambda filesystem paths are ASYMMETRIC by design — LIST uses /file-systems (hyphenated),
+# CREATE/DELETE use /filesystems (no hyphen). DO NOT unify them; /file-systems 404s for write ops.
 def list_filesystems() -> list[dict]:
     """All filesystems on the account: ``[{id, name, mount_point, region:{name}, is_in_use}, ...]``."""
-    out = _data(request_with_retries("/file-systems"))  # LIST: hyphenated (verified live)
+    out = _data(request_with_retries("/file-systems"))
     return out if isinstance(out, list) else []
 
 
@@ -193,7 +139,6 @@ def create_filesystem(name: str, region_name: str) -> dict:
     """Create filesystem ``name`` in ``region_name`` -> its object (incl. ``mount_point``)."""
     out = _data(
         request_with_retries(
-            # CREATE: un-hyphenated /filesystems (NOT /file-systems) — verified live; see note above.
             "/filesystems", method="POST", body={"name": name, "region": region_name}, retries=2
         )
     )
@@ -203,7 +148,6 @@ def create_filesystem(name: str, region_name: str) -> dict:
 def delete_filesystem(filesystem_id: str) -> bool:
     """Delete a filesystem by id (best-effort). Returns True if the request didn't raise."""
     try:
-        # DELETE: un-hyphenated /filesystems/{id} (NOT /file-systems/{id}) — verified live; see note.
         request_with_retries(f"/filesystems/{filesystem_id}", method="DELETE", retries=2)
         return True
     except Exception as exc:
@@ -239,13 +183,8 @@ def list_instances() -> list[dict]:
 
 
 def terminate_instances(instance_ids: list[str]) -> list[str]:
-    """Terminate (and stop billing for) instances; return the ids that ACTUALLY terminated.
-
-    PER-ID ISOLATED (one POST per id), so a single stale/invalid/race-deleted id can't abort
-    teardown of the rest — this is the crash-backstop path (``sweep_orphans`` /
-    ``terminate_run_instances`` pass many ids at once, where stale ids are common). Lambda's
-    terminate endpoint validates the whole request, so a batch of N ids with one bad id 4xx's and
-    terminates NONE; isolating per id removes that money-leak. Best-effort: never raises."""
+    """Terminate instances; return ids that succeeded. Per-id isolation: Lambda's batch endpoint
+    rejects the whole request if any id is invalid, so one stale id would leak billing for the rest."""
     deleted: list[str] = []
     for iid in [str(i) for i in instance_ids if i]:
         try:

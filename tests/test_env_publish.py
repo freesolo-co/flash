@@ -3,15 +3,58 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import io
 import json
 import subprocess
 import tarfile
+import tracemalloc
 from pathlib import Path
 
 import pytest
 
 from flash.server import envs
+
+
+def _gnu_longname_bomb(name_len: int) -> bytes:
+    """A tiny gzip whose GNU LONGNAME header declares ``name_len`` bytes of highly-compressible name
+    payload — consumed inside ``tarfile.next()`` before any member is yielded, so per-member size
+    accounting never sees it. Models a decompression bomb that would OOM the control plane."""
+
+    def header(name: str, size: int, typeflag: str) -> bytes:
+        h = bytearray(512)
+        nb = name.encode()[:100]
+        h[0 : len(nb)] = nb
+        h[100:108] = b"0000644\0"
+        h[124 : 124 + 12] = f"{size:011o}\0".encode()
+        h[136:148] = b"00000000000\0"
+        h[156] = ord(typeflag)
+        h[257:263] = b"ustar\0"
+        h[263:265] = b"00"
+        chk = sum(h[:148]) + sum(h[156:]) + 32 * 8
+        h[148 : 148 + 8] = f"{chk:06o}\0 ".encode()
+        return bytes(h)
+
+    longlink = header("././@LongLink", name_len, "L")
+    pad = b"\0" * ((512 - name_len % 512) % 512)
+    tail = header("pkg/environment.py", 1, "0") + b"x" + b"\0" * 511 + b"\0" * 1024
+    buf = io.BytesIO()
+    # Stream the LONGNAME payload into the gzip writer in fixed-size chunks rather than
+    # materializing all ``name_len`` bytes (plus a second copy via ``bytes(raw)``) in RAM — at
+    # 400 MB that peaks ~1 GB and can OOM/slow CI before the extraction code under test runs.
+    # Chunked writes feed one continuous zlib stream (no flushes between), so the gzip output is
+    # byte-identical to a single write of the concatenation.
+    block = b"A" * min(name_len, 1 << 20)
+    with gzip.GzipFile(fileobj=buf, mode="wb") as g:
+        g.write(longlink)
+        remaining = name_len
+        while remaining > 0:
+            n = min(remaining, len(block))
+            g.write(block if n == len(block) else block[:n])
+            remaining -= n
+        g.write(pad)
+        g.write(tail)
+    return buf.getvalue()
 
 _MINIMAL = {
     "pyproject.toml": "[project]\nname = 'e'\n",
@@ -397,6 +440,42 @@ def test_safe_extract_extracts_regular_files_and_dirs(tmp_path):
     assert (tmp_path / "pkg" / "pyproject.toml").read_text() == "[project]\nname='e'\n"
 
 
+def test_safe_extract_skips_tar_metadata_entries(tmp_path):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        pax = tarfile.TarInfo("pax_global_header")
+        pax.type = tarfile.XGLTYPE
+        tar.addfile(pax)
+        data = b"ok"
+        info = tarfile.TarInfo("pkg/environment.py")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    envs._safe_extract(buf.getvalue(), tmp_path)
+
+    assert (tmp_path / "pkg" / "environment.py").read_bytes() == b"ok"
+
+
+def test_safe_extract_metadata_entries_do_not_count_toward_member_cap(monkeypatch, tmp_path):
+    metadata_type = b"Z"
+    monkeypatch.setattr(envs, "_MAX_MEMBERS", 2)
+    monkeypatch.setattr(envs, "_TAR_METADATA_TYPES", envs._TAR_METADATA_TYPES | {metadata_type})
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for idx in range(3):
+            pax = tarfile.TarInfo(f"metadata-{idx}")
+            pax.type = metadata_type
+            tar.addfile(pax)
+        data = b"ok"
+        info = tarfile.TarInfo("pkg/environment.py")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    envs._safe_extract(buf.getvalue(), tmp_path)
+
+    assert (tmp_path / "pkg" / "environment.py").read_bytes() == b"ok"
+
+
 def test_safe_extract_rejects_special_members(tmp_path):
     for typeflag, label in ((tarfile.FIFOTYPE, "fifo"), (tarfile.CHRTYPE, "char-device")):
         buf = io.BytesIO()
@@ -409,6 +488,22 @@ def test_safe_extract_rejects_special_members(tmp_path):
         with pytest.raises(envs.EnvPublishError, match="special file"):
             envs._safe_extract(buf.getvalue(), tmp_path)
         assert not (tmp_path / f"evil-{label}").exists()
+
+
+def test_safe_extract_rejects_longname_decompression_bomb(tmp_path):
+    # A ~400KB upload declaring a 400MB GNU LONGNAME header must be rejected with memory bounded near
+    # the uncompressed limit (256MB), not the declared size — the header payload is read inside
+    # tarfile.next() and is invisible to per-member size accounting.
+    bomb = _gnu_longname_bomb(400 * 1024 * 1024)
+    assert len(bomb) < 2 * 1024 * 1024
+    tracemalloc.start()
+    try:
+        with pytest.raises(envs.EnvPublishError, match="too large uncompressed"):
+            envs._safe_extract(bomb, tmp_path)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 600 * 1024 * 1024, f"peak memory {peak} not bounded by the limit"
 
 
 def test_safe_extract_rejects_repo_control_and_source_paths(tmp_path):

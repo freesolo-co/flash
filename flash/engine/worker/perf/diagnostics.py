@@ -1,8 +1,4 @@
-"""GPU memory sampling + live telemetry for the fine-tuning worker's run logs / status.
-
-Peak-memory probes (torch caching allocator + a background true-device sampler that counts bnb
-managed pages) and an ``nvidia-smi`` parser. Torch is imported lazily so this is CPU-importable.
-"""
+"""GPU memory sampling + live telemetry for the fine-tuning worker's run logs / status."""
 
 from __future__ import annotations
 
@@ -11,8 +7,7 @@ import time
 
 
 def _reset_peak_gpu() -> None:
-    """Reset the CUDA peak-memory counter so a subsequent ``_peak_gpu_gb`` measures only the work
-    that follows (e.g. the train loop, isolating the optimizer-state A/B from setup/model load)."""
+    """Reset the CUDA peak-memory counter."""
     try:
         import torch
 
@@ -23,14 +18,9 @@ def _reset_peak_gpu() -> None:
 
 
 def _peak_gpu_gb() -> float:
-    """Peak torch-allocated CUDA memory (binary GiB) since the last reset; 0.0 if no CUDA. Note: bnb
-    paged 8-bit optimizer state lives in unified/managed memory outside torch's caching allocator and
-    is NOT counted here — so this OVERSTATES the 8-bit saving. _GpuPeakSampler measures the true
-    device footprint (incl. bnb managed pages) for the honest A/B number.
+    """Peak torch-allocated CUDA memory (binary GiB) since last reset; 0.0 if no CUDA.
 
-    Binary GiB (/(1024**3)) to match this diagnostics module's other torch memory fields
-    (torch_memory_total_gb etc. + _round_gb_from_mib), so every reported memory number shares one
-    unit. (This is telemetry, NOT VRAM sizing — the sizing subsystem is decimal GB by design.)"""
+    bnb paged optimizer state is NOT counted here — use _GpuPeakSampler for the true device peak."""
     try:
         import torch
 
@@ -42,9 +32,7 @@ def _peak_gpu_gb() -> float:
 
 
 class _GpuPeakSampler:
-    """Background sampler of true device memory (GB) = (total - free) from cuda.mem_get_info, which
-    DOES include bitsandbytes managed/paged optimizer pages while they're GPU-resident (torch's
-    max_memory_allocated does not). This is the honest peak for the fp32-vs-8-bit optimizer A/B."""
+    """Background sampler of true device memory via cuda.mem_get_info (includes bnb managed pages)."""
 
     def __init__(self, interval: float = 0.25):
         self.interval = interval
@@ -81,8 +69,6 @@ class _GpuPeakSampler:
         self._stop = True
         if self._thread is not None:
             self._thread.join(timeout=2)
-        # Binary GiB (/(1024**3)) to match this module's other torch memory fields (telemetry
-        # convention; the VRAM-sizing subsystem is decimal GB and stays separate).
         return round(self.peak_used / (1024**3), 3)
 
 
