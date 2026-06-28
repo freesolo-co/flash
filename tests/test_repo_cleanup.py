@@ -507,6 +507,26 @@ def test_incomplete_live_set_reports_incomplete_not_confirmed(monkeypatch, capsy
     out = capsys.readouterr().out
     assert "INCOMPLETE" in out
     assert "live set: confirmed" not in out
+    # cfg has --code on, so the consequence names it
+    assert "--code still proceeds" in out
+
+
+def test_unavailable_live_set_report_no_code_does_not_imply_code_tier(monkeypatch, capsys):
+    # With --no-code and no destructive tiers, an unavailable live set must NOT print the old
+    # hard-coded "code-only tier" — it should report the consequence for the tiers actually
+    # requested (destructive tiers need the live set and would abort, so they can't co-occur here).
+    from flash.serve import deploy
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("serving down")
+
+    monkeypatch.setattr(deploy, "list_deployed_adapters", _raise)
+    api = FakeApi({f"{NS}/flashrun-c": (_days_ago(90), SUCCEEDED)})
+    rc.run(_cfg(code=False, checkpoints=False, repos=False), dry_run=True, sleep=0, api=api)
+    out = capsys.readouterr().out
+    assert "UNAVAILABLE" in out
+    assert "--code" not in out  # never imply the code tier the operator disabled
+    assert "no tiers active" in out
 
 
 # ---- unknown age + invalid retention windows --------------------------------------------------
