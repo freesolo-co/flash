@@ -182,7 +182,7 @@ def _active_run_ids() -> set[str]:
     *names*).
 
     Why this is a safe protection set with no idle grace: a run's status is flipped to an
-    instance-owning state BEFORE its first instance is ever launched (``_run_seed_loop`` writes
+    instance-owning state BEFORE its first instance is ever launched (``_run_training`` writes
     ``running`` ahead of ``_submit_seed_supervised``), and the launched instance is torn down BEFORE
     the run can leave these states for ``done``/``deployed``/terminal (the provider lifecycle's
     ``finally``). So a billed instance exists ONLY while its run is in this set — ownership is a
