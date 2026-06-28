@@ -30,6 +30,11 @@ class _RunLock:
     def __exit__(self, *exc: object) -> None:
         self._lock.release()
 
+    def locked(self) -> bool:
+        """Whether the lock is currently held — a best-effort read (used by the repo GC to skip a
+        repo whose run is mid deploy/undeploy). Does not acquire."""
+        return self._lock.locked()
+
 
 # Per-run lock serializing deploy vs undeploy: registration with the freesolo serving app
 # is slow and runs OUTSIDE the status lock, so without this the two could interleave —
@@ -52,3 +57,15 @@ def _deploy_lock(run_id: str) -> _RunLock:
             lk = _RunLock()
             _DEPLOY_LOCKS[run_id] = lk
         return lk
+
+
+def _deploy_in_progress(run_id: str) -> bool:
+    """Whether a deploy/undeploy is currently holding this run's lock — i.e. registering the adapter
+    with serving, INCLUDING the window before the repo appears in serving's live ``/adapters`` set.
+
+    The repo GC reads this to skip deleting a run's HF source mid-deploy. Best-effort and never
+    blocks: if no request holds (or has recently created) the lock the weak entry is gone and this
+    returns ``False``. A held lock keeps a strong entry, so a concurrent deploy is always observed."""
+    with _DEPLOY_LOCKS_GUARD:
+        lk = _DEPLOY_LOCKS.get(run_id)
+    return bool(lk and lk.locked())
