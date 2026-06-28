@@ -31,9 +31,7 @@ def cuda_oom_count() -> int:
 
 def is_cuda_oom(exc: BaseException | None) -> bool:
     """Whether a failure was a CUDA OOM, without message parsing."""
-    if exc is None:
-        return False
-    if isinstance(exc, MemoryError):
+    if exc is None or isinstance(exc, MemoryError):
         return False
     try:
         import torch
