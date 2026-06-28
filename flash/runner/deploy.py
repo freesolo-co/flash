@@ -213,12 +213,26 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 # OOM'd), so the resumed submit must count them against the escalation budget — else a
                 # restart would hand out a fresh full set of larger-GPU escalations past max_retries.
                 resumed_oom_attempts = persisted_attempt + 1
+            elif persisted_oom_floor > 0:
+                # The reattached attempt ended infra-shaped (preempt/stall), but an EARLIER OOM created
+                # the persisted floor and ALREADY spent escalation budget. Without seeding it here, a
+                # resume after a preempted larger attempt would forget that spend and hand a SUBSEQUENT
+                # OOM a fresh budget — e.g. max_retries=1: an 80GB OOM escalates to 96GB, the 96GB is
+                # preempted, recovery resumes, and a fresh 96GB OOM would walk to 141GB past the cap.
+                # Count the attempts already spent (the in-flight INFRA attempt itself does NOT add to
+                # the OOM count, unlike the oom branch) so any remaining escalation honors max_retries.
+                resumed_oom_attempts = persisted_attempt
             _run_training(
                 spec,
                 log,
                 prior_cost=float(status.cost_usd or 0.0),
                 resume_oom_vram_floor=resumed_floor,
                 resume_oom_attempts=resumed_oom_attempts,
+                # Make the resumed attempts' physical ids MONOTONIC past every pre-restart attempt so a
+                # recovered (larger) attempt's heartbeat can't collide with a prior physical attempt's
+                # lingering OOM flag (worker_flagged_oom gates on the attempt). Independent of the OOM
+                # budget accounting above — applies on every resume, oom- or infra-shaped.
+                resume_attempt_base=persisted_attempt + 1,
             )
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the

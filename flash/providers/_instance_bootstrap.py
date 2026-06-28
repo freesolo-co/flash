@@ -270,16 +270,37 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     return proc.returncode
 
 
+# CUDA-OOM marker substrings — kept IN SYNC with
+# flash.engine.worker.perf.lifecycle._CUDA_OOM_MARKERS. INLINED (not imported) because the bootstrap
+# must stay self-contained: it runs as /root/flash/bootstrap.py with flash NOT importable (only the
+# CHILD worker gets PYTHONPATH=/runcode/code), so a ``from flash...`` here would raise, the broad
+# except below would swallow it, and a child-process CUDA OOM seen only in console_<phase>.txt would
+# write a marker WITHOUT ``oom`` — the poller would then mislabel it job_failed instead of escalating.
+_CUDA_OOM_MARKERS = ("out of memory", "cuda_error_out_of_memory", "outofmemoryerror")
+
+
+def _text_flags_cuda_oom(text: str) -> bool:
+    """True iff ``text`` names a CUDA out-of-memory crash — the SAME predicate the worker's
+    ``is_cuda_oom`` applies to a traceback (with no live exception in hand). Build the signal from the
+    UN-INDENTED lines only (the exception-type lines), so a host-RAM OOM whose stack merely traverses
+    ``torch/cuda/*`` file PATHS does not borrow that 'cuda' as GPU context and wrongly escalate
+    (more VRAM can't fix a host/library OOM). Mirrors lifecycle.is_cuda_oom's string branch."""
+    exc_lines = "\n".join(ln for ln in text.splitlines() if ln[:1] not in (" ", "\t"))
+    blob = exc_lines.lower()
+    if not any(m in blob for m in _CUDA_OOM_MARKERS):
+        return False
+    return "cuda" in blob or "triton" in blob
+
+
 def _console_flags_cuda_oom(mode: str | None) -> bool:
     """True if THIS attempt's training console (``/tmp/console_<mode>.txt``) names a CUDA OOM — a
     subprocess OOM (e.g. a vLLM EngineCore child) the worker's own exception classifier missed
     because the parent exception is just a wrapper. Attempt-safe: the console is local to this
     instance, which ran only this attempt (unlike the shared per-seed HF artifacts). Runs the SAME
-    CUDA-specific predicate as the worker (``is_cuda_oom``), so a host/library OOM does not escalate.
-    Best-effort: never raises (absent console / odd encoding -> not an OOM)."""
+    CUDA-specific predicate as the worker (the INLINED ``_text_flags_cuda_oom``, NOT a flash import —
+    flash is not importable from this self-contained bootstrap), so a host/library OOM does not
+    escalate. Best-effort: never raises (absent console / odd encoding -> not an OOM)."""
     try:
-        from flash.engine.worker.perf.lifecycle import is_cuda_oom
-
         path = f"/tmp/console_{mode}.txt"
         if not mode or not os.path.exists(path):
             return False
@@ -290,7 +311,7 @@ def _console_flags_cuda_oom(mode: str | None) -> bool:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - tail_bytes))
             tail = f.read().decode(errors="replace")
-        return is_cuda_oom(None, tail)
+        return _text_flags_cuda_oom(tail)
     except Exception:
         return False
 

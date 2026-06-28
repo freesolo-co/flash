@@ -1144,12 +1144,55 @@ def worker_flagged_oom(heartbeat_reader, current_attempt: int | None = None) -> 
     return current_attempt is None or _attempt_int(hb.get("attempt")) == current_attempt
 
 
+def worker_flagged_crash(heartbeat_reader, current_attempt: int | None = None) -> bool:
+    """True iff the worker stamped a TERMINAL error heartbeat (stage ``error_*``) for
+    ``current_attempt`` — i.e. THIS attempt's worker actually ran and crashed, not a prior attempt's
+    leftover. The worker always commits its ``error_*`` heartbeat (a terminal stage, never throttled),
+    stamped with ``attempt``, so this is an attempt-scoped crash signal.
+
+    Lets a dead-host crash/preempt split key on THIS attempt's own crash rather than the SHARED
+    per-seed ``error_<phase>.txt`` artifact: that file is not attempt-scoped, so a prior attempt's
+    traceback (e.g. an OOM that ESCALATED to a larger GPU rather than ending the run) lingers, and a
+    host loss before this attempt's worker produced its own error would otherwise be read as this
+    attempt's deterministic crash and failed fast instead of continuing recovery. ``None``
+    current_attempt keeps the historical 'trust any error heartbeat' behavior."""
+    if heartbeat_reader is None:
+        return False
+    hb = heartbeat_reader(force=True)
+    if not isinstance(hb, dict):
+        return False
+    if not str(hb.get("stage") or "").startswith("error_"):
+        return False
+    return current_attempt is None or _attempt_int(hb.get("attempt")) == current_attempt
+
+
+def _terminal_exception_block(detail: str) -> str:
+    """The LAST traceback in a multi-line stdout/error tail — i.e. the terminal exception.
+
+    ``is_cuda_oom`` ANDs an OOM marker with CUDA/Triton context anywhere in the text it is given, so
+    feeding it the WHOLE tail lets the two come from UNRELATED lines: a 'cuda' from an early init log
+    plus an 'out of memory' from a later host-RAM/DataLoader OOM would falsely escalate. Restricting
+    the scan to the final traceback forces both signals to come from the SAME terminal failure. When
+    there is no traceback framing (a bare one-line handler error), fall back to the last few lines,
+    where the terminal exception lives, rather than the whole tail."""
+    marker = "Traceback (most recent call last):"
+    idx = detail.rfind(marker)
+    if idx != -1:
+        return detail[idx:]
+    return "\n".join(detail.splitlines()[-15:])
+
+
 def detail_flags_cuda_oom(detail: str | None) -> bool:
     """Fallback OOM classifier for the cases the structured heartbeat ``oom`` flag misses: the OOM
     happened in a SUBPROCESS the worker didn't classify on its own exception (a vLLM EngineCore child
     whose CUDA OOM only reaches the parent via stdout), or the terminal error heartbeat upload was
     lost. Runs the SAME CUDA-specific predicate the worker uses (``is_cuda_oom``), so a host/library
     OOM in the text does NOT escalate.
+
+    Scans only the TERMINAL exception block (the last traceback) of ``detail``, never the whole tail:
+    ``is_cuda_oom`` ANDs an OOM marker with CUDA/Triton context across the text, so an unrelated earlier
+    'cuda' line plus a later host-RAM/DataLoader 'out of memory' would otherwise falsely escalate onto
+    a larger card (more VRAM can't fix that failure).
 
     IMPORTANT — callers must pass only ATTEMPT-FRESH text (this attempt's live job output / its
     attempt-scoped marker), NEVER the shared per-seed HF ``error_<phase>.txt`` artifact: that artifact
@@ -1165,4 +1208,4 @@ def detail_flags_cuda_oom(detail: str | None) -> bool:
 
     if RETRIABLE_INFRA_MARKER.lower() in detail.lower():
         return False
-    return is_cuda_oom(None, detail)
+    return is_cuda_oom(None, _terminal_exception_block(detail))

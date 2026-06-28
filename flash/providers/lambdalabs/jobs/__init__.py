@@ -576,12 +576,17 @@ def poll_lambda_job(
             # (a bad env id, a config/code error, an OOM). That is a DETERMINISTIC worker error, so
             # fail FAST: classifying it job_preempted burns fresh GPUs re-running a crash that will
             # repeat. A crash the worker flagged retriable (RetriableInfraError, stamped in the
-            # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is not
-            # attempt-scoped, but this can't flip a genuine preemption to job_failed: a prior
-            # attempt's NON-retriable crash already ended the run via this same branch, and a prior
-            # retriable crash leaves a retriable heartbeat that keeps this path on job_preempted.
+            # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is the SHARED
+            # per-seed artifact (no attempt segment), so on a RETRY a prior attempt's traceback can
+            # linger — notably an OOM that ESCALATED rather than ending the run (the "prior crash
+            # already ended the run" argument does NOT cover the OOM-escalation case). To keep a host
+            # loss AFTER an OOM escalation on the recovery path (job_preempted) instead of failing it
+            # fast off that stale text, require an ATTEMPT-SCOPED crash signal — this attempt's own
+            # terminal error heartbeat — before trusting err as a current crash. Attempt 0 has no prior
+            # attempt, so its err can only be this attempt's: keep the original fail-fast there.
             from flash.providers.runpod.jobs import (
                 _once_forced,
+                worker_flagged_crash,
                 worker_flagged_oom,
                 worker_flagged_retriable,
             )
@@ -589,11 +594,12 @@ def poll_lambda_job(
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
             # A CUDA OOM here is its own escalation category (grow the GPU), not a fail-fast crash —
             # parity with fail_from_marker / RunPod. It takes precedence over the crash/preempt split.
-            # One shared heartbeat snapshot for both flag reads (see fail_from_marker).
+            # One shared heartbeat snapshot for all flag reads (see fail_from_marker).
             hb_once = _once_forced(heartbeat_reader)
             oom = worker_flagged_oom(hb_once, handle.attempt)
             retriable = worker_flagged_retriable(hb_once)
-            worker_crashed = bool(err and err.strip()) and not retriable
+            crashed_this_attempt = handle.attempt == 0 or worker_flagged_crash(hb_once, handle.attempt)
+            worker_crashed = bool(err and err.strip()) and crashed_this_attempt and not retriable
             # NO text fallback here: the only text on this dead-host path is the shared per-seed
             # error_<phase>.txt artifact, which is NOT attempt-scoped — scanning it for OOM could
             # escalate off a prior attempt's traceback. The attempt-gated heartbeat oom flag (above)

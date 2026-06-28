@@ -1475,7 +1475,9 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         seen = {}
 
-        def fake_training(spec, log, *, prior_cost, runtime_secrets=None):
+        def fake_training(spec, log, *, prior_cost, runtime_secrets=None, **_kw):
+            # ``**_kw`` absorbs the resume_oom_* / resume_attempt_base kwargs attach_run threads in
+            # (an OOM-aware recovery): this test exercises an INFRA resume and ignores them.
             seen["remote"] = orch.get_status(spec.run_id).remote
             orch._update(spec.run_id, "done", cost_usd=prior_cost)
 
@@ -1515,7 +1517,8 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         resumed = {"called": False}
 
-        def fake_training(spec, log, *, prior_cost, runtime_secrets=None):
+        def fake_training(spec, log, *, prior_cost, runtime_secrets=None, **_kw):
+            # ``**_kw`` absorbs the resume_oom_* / resume_attempt_base kwargs attach_run threads in.
             # The training submit re-runs the run; a genuinely broken run fails there (matches
             # _submit_seed_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True

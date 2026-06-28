@@ -223,6 +223,94 @@ def test_worker_flagged_oom_ignores_a_prior_attempts_stale_flag():
     assert worker_flagged_oom(stale) is True
 
 
+def test_detail_flags_cuda_oom_scans_only_the_terminal_exception_block():
+    # 5Wq: is_cuda_oom ANDs an OOM marker with CUDA/Triton context across whatever text it's given.
+    # Feeding the WHOLE tail lets the two come from UNRELATED lines (an early 'cuda' init log + a
+    # later host-RAM/DataLoader OOM) -> a false escalate. The fallback must restrict the scan to the
+    # LAST traceback so both signals come from the SAME terminal failure.
+    from flash.providers.runpod.jobs import detail_flags_cuda_oom
+
+    mixed = (
+        "INFO: CUDA initialized on device 0 (NVIDIA A100)\n"  # unrelated early 'cuda'
+        "... lots of training output ...\n"
+        "Traceback (most recent call last):\n"
+        '  File "/x/torch/utils/data/_utils.py", line 9, in _try_get\n'
+        "RuntimeError: DataLoader worker (pid 7) killed by signal: out of memory\n"  # host-RAM OOM
+    )
+    # whole-tail scanning would see 'cuda' (line 1) + 'out of memory' (terminal) and falsely escalate;
+    # restricting to the terminal traceback keeps it a non-CUDA (host) OOM -> no escalation.
+    assert detail_flags_cuda_oom(mixed) is False
+    # a REAL CUDA OOM in the terminal block is still caught (both signals on the terminal line)
+    real = (
+        "INFO: starting vLLM EngineCore\n"
+        "Traceback (most recent call last):\n"
+        '  File "/x/vllm/engine.py", line 3, in step\n'
+        "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+    )
+    assert detail_flags_cuda_oom(real) is True
+
+
+def test_worker_flagged_crash_is_attempt_scoped_to_a_terminal_error_heartbeat():
+    # The dead-host crash/preempt split keys on THIS attempt's own terminal error heartbeat, not the
+    # SHARED per-seed error_<phase>.txt artifact (which a prior attempt's OOM-escalation can leave).
+    from flash.providers.runpod.jobs import worker_flagged_crash
+
+    err_hb = lambda force=False: {"stage": "error_rl", "attempt": "1"}  # noqa: E731
+    # THIS attempt (1) crashed -> True; a prior attempt's (0) error heartbeat does NOT count for 1
+    assert worker_flagged_crash(err_hb, 1) is True
+    assert worker_flagged_crash(lambda force=False: {"stage": "error_rl", "attempt": "0"}, 1) is False
+    # a NON-error heartbeat (mid-training) is not a crash even when it's this attempt's (host loss)
+    assert worker_flagged_crash(lambda force=False: {"stage": "rl_step", "attempt": "1"}, 1) is False
+    # empty / non-dict / missing reader
+    assert worker_flagged_crash(lambda force=False: {}, 1) is False
+    assert worker_flagged_crash(lambda force=False: "x", 1) is False
+    assert worker_flagged_crash(None, 1) is False
+    # current_attempt=None keeps the historical 'trust any error heartbeat' behavior
+    assert worker_flagged_crash(err_hb, None) is True
+
+
+def test_lambda_dead_host_stale_error_after_oom_escalation_stays_preempted():
+    # The fix's behavioral core (5x-): on attempt > 0 a prior attempt's lingering SHARED error_*.txt
+    # (e.g. an OOM that ESCALATED) must NOT flip a host loss to a fail-fast job_failed. The dead-host
+    # crash verdict requires THIS attempt's own terminal error heartbeat (handle.attempt==0 exempt).
+    src, _ = _src("flash.providers.lambdalabs.jobs", "")
+    assert "crashed_this_attempt = handle.attempt == 0 or worker_flagged_crash(hb_once, handle.attempt)" in src
+    assert "worker_crashed = bool(err and err.strip()) and crashed_this_attempt and not retriable" in src
+
+
+def test_instance_bootstrap_oom_scanner_is_self_contained():
+    # 6Mx: the bootstrap runs as /root/flash/bootstrap.py with flash NOT importable (only the child
+    # worker gets PYTHONPATH=/runcode/code). The console OOM scanner must NOT import flash — an import
+    # error under the broad except would silently drop a child-process CUDA OOM and mislabel the job.
+    boot_path = pathlib.Path(
+        __import__("flash.providers._instance_bootstrap", fromlist=["x"]).__file__
+    )
+    boot = boot_path.read_text()
+    # No ACTUAL import statement (module- OR function-level) pulls in flash (the docstring/comments
+    # mention the word "flash", so scan the parsed import nodes, not raw substrings).
+    tree = ast.parse(boot)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "flash":
+            raise AssertionError(f"bootstrap imports flash: from {node.module}")
+        if isinstance(node, ast.Import):
+            assert not any(a.name.split(".")[0] == "flash" for a in node.names)
+    assert "def _text_flags_cuda_oom" in boot  # inlined predicate
+    assert "return _text_flags_cuda_oom(tail)" in boot
+    # the inlined predicate matches the worker's CUDA-OOM behavior (string branch of is_cuda_oom)
+    import importlib
+
+    boot_mod = importlib.import_module("flash.providers._instance_bootstrap")
+    from flash.engine.worker.perf.lifecycle import is_cuda_oom
+
+    for text in (
+        "RuntimeError: Triton Error [CUDA]: out of memory",
+        "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB",
+        "DataLoader worker (pid 1) killed: out of memory",  # host OOM -> False both
+        "ValueError: bad config",
+    ):
+        assert boot_mod._text_flags_cuda_oom(text) == is_cuda_oom(None, text)
+
+
 def _src(modfile_attr, name):
     import importlib
 
@@ -310,7 +398,10 @@ def test_runpod_reattach_poll_gates_oom_on_the_persisted_attempt():
     rp = pathlib.Path(
         __import__("flash.providers.runpod", fromlist=["x"]).__file__
     ).read_text()
-    assert '"attempt": int(attempt)' in life  # persisted on every submit
+    # persisted on every submit as the CUMULATIVE/monotonic id (local loop index + resume base) so a
+    # recovered attempt's heartbeat can't collide with a prior physical attempt's stale OOM flag.
+    assert '"attempt": int(submit_attempt)' in life
+    assert "submit_attempt = attempt + resume_attempt_base" in life
     assert 'current_attempt = _attempt_int(handle.to_dict().get("attempt"))' in rp
     assert "current_attempt=current_attempt" in rp
 
@@ -361,5 +452,15 @@ def test_oom_recovery_respects_the_user_retry_budget():
     # infra retries are unaffected (the offset only applies when oom_shaped)
     # recovery computes the consumed count from the persisted handle attempt and threads it in
     assert 'persisted_attempt = int(remote.get("attempt", 0) or 0)' in deploy
-    assert "resumed_oom_attempts = persisted_attempt + 1" in deploy
+    assert "resumed_oom_attempts = persisted_attempt + 1" in deploy  # oom-shaped reattach
     assert "resume_oom_attempts=resumed_oom_attempts" in deploy
+    # an INFRA-shaped reattach must STILL remember a spent OOM budget when a prior OOM created the
+    # floor (else a subsequent OOM after a preempted larger attempt re-escalates past max_retries).
+    assert "elif persisted_oom_floor > 0:" in deploy
+    assert "resumed_oom_attempts = persisted_attempt" in deploy
+    # the resumed attempts get a MONOTONIC physical-id base so a recovered attempt's heartbeat can't
+    # collide with a prior physical attempt's lingering OOM flag (independent of the budget accounting)
+    assert "resume_attempt_base=persisted_attempt + 1" in deploy
+    assert "resume_attempt_base: int = 0" in life
+    assert "submit_attempt = attempt + resume_attempt_base" in life
+    assert '"attempt": submit_attempt' in life  # the cumulative id is what is submitted/heartbeated

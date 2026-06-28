@@ -140,6 +140,7 @@ def _submit_seed_supervised(
     runtime_secrets: dict[str, str] | None = None,
     oom_vram_floor_start: int = 0,
     resume_oom_attempts: int = 0,
+    resume_attempt_base: int = 0,
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
@@ -194,10 +195,13 @@ def _submit_seed_supervised(
                 # here predates this attempt's card; recovery bumps it by allocated_vram_gb on an OOM).
                 "allocated_vram_gb": current_gpu.get("vram_gb"),
                 "oom_vram_floor": int(oom_vram_floor),
-                # This endpoint's attempt number (matches the worker-stamped heartbeat ``attempt``), so
-                # the reattach poll can gate worker_flagged_oom on it and NOT trust a PRIOR attempt's
-                # lingering {"oom": true} on the shared-prefix heartbeat (RunpodProvider.poll).
-                "attempt": int(attempt),
+                # This endpoint's CUMULATIVE attempt number (matches the worker-stamped heartbeat
+                # ``attempt``), so the reattach poll can gate worker_flagged_oom on it and NOT trust a
+                # PRIOR attempt's lingering {"oom": true} on the shared-prefix heartbeat. It is the
+                # monotonic ``attempt + resume_attempt_base`` (NOT the local loop index reset to 0 on
+                # an OOM-recovery resume), so a recovered larger attempt's id can never collide with a
+                # prior physical attempt's heartbeat (RunpodProvider.poll / worker_flagged_oom).
+                "attempt": int(submit_attempt),
                 "on_last_gpu": bool(current_on_last_gpu["value"]),
             },
         )
@@ -265,6 +269,13 @@ def _submit_seed_supervised(
     # cache-drop attempt(s) removed, so the GPU walk gets its full budget AFTER a cache drop.
     cache_drop_consumed = 0
     for attempt in range(infra_budget + 1 + cache_fallback_attempts):
+        # The CUMULATIVE/monotonic physical attempt id: the local loop index OFFSET by the attempts a
+        # pre-restart process already spent before this (OOM-aware) resume. The endpoint suffix, the
+        # worker ATTEMPT env (-> heartbeat ``attempt``), the persisted handle attempt, and the poll's
+        # current_attempt all key off THIS so a recovered attempt's heartbeat can never collide with a
+        # prior physical attempt's lingering {"oom": true}. The budget/walk math below stays on the
+        # LOCAL ``attempt`` (resume_oom_attempts already accounts for the spent budget separately).
+        submit_attempt = attempt + resume_attempt_base
         walk_attempt = attempt - cache_drop_consumed
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
@@ -411,7 +422,7 @@ def _submit_seed_supervised(
                 submit_kwargs = {
                     "log": log,
                     "on_handle": on_handle,
-                    "attempt": attempt,
+                    "attempt": submit_attempt,
                     "on_last_gpu": on_last_gpu,
                 }
                 if runtime_secrets:
@@ -589,6 +600,7 @@ def _run_training(
     runtime_secrets: dict[str, str] | None = None,
     resume_oom_vram_floor: int = 0,
     resume_oom_attempts: int = 0,
+    resume_attempt_base: int = 0,
 ) -> None:
     """Train the run's single adapter under supervision; finalize the run.
 
@@ -599,7 +611,9 @@ def _run_training(
     ``resume_oom_vram_floor`` / ``resume_oom_attempts`` (>0 only on an OOM-aware recovery) seed the
     GPU-escalation floor and the already-consumed escalation-attempt count for the resumed adapter, so
     recovery escalates PAST the too-small card that OOM'd before the restart without re-granting a
-    fresh escalation budget beyond the user's ``max_retries``."""
+    fresh escalation budget beyond the user's ``max_retries``. ``resume_attempt_base`` (>0 only on a
+    recovery) makes the resumed attempts' physical ids MONOTONIC past the pre-restart attempts so a
+    recovered attempt's heartbeat can't collide with a prior physical attempt's stale OOM flag."""
     from flash.runner import (
         FIXED_SEED,
         TERMINAL_STATES,
@@ -638,6 +652,7 @@ def _run_training(
         runtime_secrets=runtime_secrets,
         oom_vram_floor_start=resume_oom_vram_floor,
         resume_oom_attempts=resume_oom_attempts,
+        resume_attempt_base=resume_attempt_base,
     )
     total_cost = prior_cost + _persist_metrics(spec, metrics)
     # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
