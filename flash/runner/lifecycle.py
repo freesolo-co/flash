@@ -82,6 +82,15 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     )
 
 
+def _oom_escalated(candidates, oom_vram_floor: int):
+    """Candidates strictly LARGER than the VRAM that just OOM'd. ``oom_vram_floor == 0`` (no prior OOM)
+    leaves the list unchanged; otherwise an 80GB OOM leaves only the >80GB classes (a same-size retry
+    would just OOM again). EMPTY means the run already OOM'd the largest available class."""
+    if not oom_vram_floor:
+        return list(candidates)
+    return [c for c in candidates if c.vram_gb > oom_vram_floor]
+
+
 def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
@@ -150,7 +159,8 @@ def _submit_seed_supervised(
     # Grow only when an attempt that actually provisioned a class lost it to infra — never on failed alloc.
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
-    # walk_attempt excludes cache-drop attempts so the GPU walk gets its full max_retries budget.
+    oom_vram_floor = 0
+    # Exclude cache-drop attempts so the GPU walk keeps its full retry budget.
     cache_drop_consumed = 0
     for attempt in range(infra_budget + 1 + cache_fallback_attempts):
         walk_attempt = attempt - cache_drop_consumed
@@ -216,10 +226,17 @@ def _submit_seed_supervised(
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
                     raise _cancel()
-            chosen = _select_candidate(alloc.candidates, failed_providers, tried_classes)
-            untried = [c for c in alloc.candidates if (c.provider, c.gpu) not in tried_classes]
-            # Don't let the budget clause mark last-GPU when a cache-drop fallback is still available;
-            # class exhaustion (len(untried) <= 1) still marks it regardless.
+            cands = _oom_escalated(alloc.candidates, oom_vram_floor)
+            if not cands:
+                last_detail = f"oom: exceeded the largest available GPU ({oom_vram_floor} GB)"
+                print(
+                    f"seed={seed} OOM on the largest GPU class ({oom_vram_floor} GB); not retrying",
+                    file=log,
+                    flush=True,
+                )
+                break
+            chosen = _select_candidate(cands, failed_providers, tried_classes)
+            untried = [c for c in cands if (c.provider, c.gpu) not in tried_classes]
             cache_fallback_available = (
                 started_with_shared_cache
                 and not drop_weight_cache
@@ -270,14 +287,16 @@ def _submit_seed_supervised(
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
         infra_shaped = res.failure in ("stalled", "no_capacity", "poll_error", "job_preempted")
-        # A cancel deletes the endpoint, which the poller sees as infra-shaped; cancel wins.
+        oom_shaped = res.failure == "oom"
+        if oom_shaped and chosen is not None:
+            oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)
+        retry_shaped = infra_shaped or oom_shaped
+        # Cancel wins over any retry-shaped failure.
         try:
             if get_status(spec.run_id).state == "cancelled":
                 raise _cancel()
         except FileNotFoundError:
             pass
-        # Drop the shared weight-cache volume on no_capacity/poll_error so the retry runs unrestricted.
-        # Non-volume flakes (stall/preempt) keep the cache. Lambda no_capacity isn't cache-caused.
         run_had_cache = bool(
             chosen is not None
             and chosen.provider == "runpod"
@@ -288,16 +307,22 @@ def _submit_seed_supervised(
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
         )
+        retry_budget = max_retries if oom_shaped else infra_budget
+        will_retry = retry_shaped and (walk_attempt < retry_budget or first_cache_drop)
+        action = (
+            f"retrying on a larger GPU (> {oom_vram_floor} GB)"
+            if (will_retry and oom_shaped)
+            else "retrying (resume from last checkpoint)"
+            if will_retry
+            else "not retrying"
+        )
         print(
-            f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < infra_budget or first_cache_drop) else 'not retrying'}"
+            f"seed={seed} attempt={attempt} failed ({res.failure}); {action}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
         )
-        if not infra_shaped:
-            break
-        if walk_attempt >= infra_budget and not first_cache_drop:
+        if not will_retry:
             break
         if first_cache_drop:
             drop_weight_cache = True
@@ -305,10 +330,45 @@ def _submit_seed_supervised(
             cache_drop_consumed += 1
             # Retry the same GPU class without the volume first; only walk the class if that also fails.
         elif chosen is not None:
-            failed_providers.add(chosen.provider)
+            if not oom_shaped:
+                failed_providers.add(chosen.provider)
             tried_classes.add((chosen.provider, chosen.gpu))
     _gc_seen_endpoints()
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
+
+
+def _touch_warmstart_source(spec: JobSpec) -> None:
+    """Refresh a managed warm-start SOURCE repo's ``last_modified`` so the repo GC's age gate spares
+    it while THIS run depends on it.
+
+    A run can ``init_from_adapter = "<owner>/<repo>:<phase>/<run_id>"`` from a prior managed run's
+    adapter, which the worker ``snapshot_download``s at boot. The GC deletes undeployed ``flashrun-*``
+    repos older than 30 days, and the source's ISSUING control plane may differ from this one
+    (multi-plane), so a purely-local protected set on this plane can't shield it. Writing a small
+    marker into the source repo bumps its HF ``last_modified`` — shared state that EVERY plane's GC
+    reads — age-resetting it for another GC window, long enough for this run to fetch it. Best-effort:
+    if the source is already gone the failure surfaces at worker boot (where it would anyway)."""
+    from flash.runner import _ARTIFACT_NAMESPACE
+
+    ref = (spec.train.init_from_adapter or "").strip()
+    if ":" not in ref:
+        return
+    source_repo = ref.split(":", 1)[0]
+    # Only managed per-run artifact repos are ever GC'd; a user/base ref needs no touch.
+    if not source_repo.startswith(f"{_ARTIFACT_NAMESPACE}/flashrun-"):
+        return
+    import io
+
+    from huggingface_hub import HfApi
+
+    with contextlib.suppress(Exception):
+        HfApi(token=os.environ.get("HF_TOKEN")).upload_file(
+            path_or_fileobj=io.BytesIO(spec.run_id.encode()),
+            path_in_repo=f"referenced_by/{spec.run_id}",
+            repo_id=source_repo,
+            repo_type="dataset",
+            commit_message=f"warm-start reference from {spec.run_id}",
+        )
 
 
 def _run_job_inner(
@@ -320,6 +380,7 @@ def _run_job_inner(
     from flash.runner import _run_training, _RunCancelled, _update, get_status
 
     try:
+        _touch_warmstart_source(spec)
         upload_code(spec.train.hf_repo)
         with open(log_path, "a") as log:
             _run_training(spec, log, prior_cost=0.0, runtime_secrets=runtime_secrets)

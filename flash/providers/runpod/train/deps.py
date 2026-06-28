@@ -21,6 +21,12 @@ WORKER_DEPS = [
     "trl>=1.6,<1.7",
     "peft>=0.19",
     "vllm==0.19.1",
+    # FlashInfer: vLLM's Blackwell-native attention backend. vllm 0.19.1 pins flashinfer-python==0.6.6
+    # but treats it as an OPTIONAL extra (the plain `vllm` install does not pull it), so a consumer-
+    # Blackwell (sm120) / B200 rollout would silently fall back to a PTX-fragile default attention
+    # without it. Pin the matching 0.6.6 so the worker image carries the FLASHINFER attention backend
+    # (force_vllm_backend_for_sm120). No-op on non-Blackwell archs.
+    "flashinfer-python==0.6.6",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
     # >=0.2.49: first version with Environment.sft_completion + datasets.target_messages (multi-turn SFT).

@@ -40,6 +40,7 @@ from flash.engine.worker.perf.lifecycle import (
     RetriableInfraError,
     _metric_curve,
     free_gpu,
+    is_cuda_oom,
     wait_for_gpu,
 )
 from flash.engine.worker.perf.liger import (
@@ -353,6 +354,7 @@ __all__ = [
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "grpo_sleep_mode",
+    "is_cuda_oom",
     "liger_on",
     "loraplus_optimizer_cls",
     "optimal_attn_impl",

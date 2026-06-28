@@ -19,9 +19,9 @@ import pytest
 @dataclass
 class _TaskExample:
     record: dict
-    task: str
-    task_id: str | None = None
-    expected_output: object | None = None
+    input: str
+    id: str | None = None
+    output: object | None = None
     metadata: dict = field(default_factory=dict)
 
 
@@ -92,13 +92,13 @@ class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
     def start_episode(self, example, prompt_text):
         return [
             {"role": "system", "content": prompt_text},
-            {"role": "user", "content": example.task},
+            {"role": "user", "content": example.input},
         ]
 
     def score_responses(self, example, response_texts):
         out = []
         for response in response_texts:
-            score = 1.0 if str(example.expected_output) in response else 0.0
+            score = 1.0 if str(example.output) in response else 0.0
             out.append(
                 _RewardResult(
                     score=score,
@@ -111,14 +111,14 @@ class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
 
 class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
     def start_episode(self, example, prompt_text):
-        return [{"role": "user", "content": f"{prompt_text}:{example.task}"}]
+        return [{"role": "user", "content": f"{prompt_text}:{example.input}"}]
 
     def step_episode(self, example, messages, assistant_response):
         return _EnvironmentStepResult(
             done=True,
             messages=({"role": "user", "content": f"observed {assistant_response}"},),
             final_response_text=f"final {assistant_response}",
-            metadata={"input": example.task},
+            metadata={"input": example.input},
         )
 
     def score_episodes(self, example, episodes):
@@ -291,9 +291,9 @@ def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
     def task_example_from_record(record):
         return _TaskExample(
             record=dict(record),
-            task=str(record["input"]),
-            task_id=record.get("id"),
-            expected_output=record.get("output"),
+            input=str(record["input"]),
+            id=record.get("id"),
+            output=record.get("output"),
             metadata=dict(record.get("metadata") or {}),
         )
 
@@ -416,9 +416,9 @@ def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
         dataset: ClassVar[list[_TaskExample]] = [
             _TaskExample(
                 record={},
-                task="2+2?",
-                task_id="ex-1",
-                expected_output="4",
+                input="2+2?",
+                id="ex-1",
+                output="4",
                 metadata={"split": "train"},
             )
         ]
