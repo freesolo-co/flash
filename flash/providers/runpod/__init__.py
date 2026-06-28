@@ -75,12 +75,14 @@ class RunpodProvider:
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         on_last_gpu = bool(hd.get("on_last_gpu", False))
+        from flash.providers._poll import _attempt_int
+
         return poll_job(
             rh,
             log=log,
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
-            current_attempt=rh.attempt,
+            current_attempt=_attempt_int(hd.get("attempt")),
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

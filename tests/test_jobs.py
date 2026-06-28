@@ -59,6 +59,9 @@ def test_job_handle_roundtrip():
     h2 = JobHandle("ep123", "flash-5090-abc", "job456", 2)
     assert h2.to_dict()["attempt"] == 2
     assert JobHandle.from_dict(h2.to_dict()) == h2
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).attempt == 0
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).endpoint_name == ""
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job", "attempt": "x"}).attempt == 0
 
 
 def test_decode_output_success():
@@ -663,6 +666,18 @@ def test_reattach_passes_persisted_current_attempt(monkeypatch):
     )
     RunpodProvider().poll(handle, spec, 0)
     assert captured["current_attempt"] == 2
+
+    for raw_attempt in ("", "x", None):
+        handle = base.JobHandle(
+            provider="runpod",
+            data={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "attempt": raw_attempt},
+        )
+        RunpodProvider().poll(handle, spec, 0)
+        assert captured["current_attempt"] is None
+
+    handle = base.JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j"})
+    RunpodProvider().poll(handle, spec, 0)
+    assert captured["current_attempt"] is None
 
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
