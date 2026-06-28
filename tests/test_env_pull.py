@@ -32,6 +32,16 @@ def _tarball(entries: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
+def _top_level_file_tarball() -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"not a directory\n"
+        info = tarfile.TarInfo(_TOP)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 def _hub_tarball() -> bytes:
     return _tarball(
         {
@@ -152,10 +162,12 @@ def test_pull_environment_package_populates_empty_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
     dest = tmp_path / "stuff"
     dest.mkdir()
+    dest.chmod(0o700)
 
     pull_environment_package("david-freesolo-co/stuff", dest)
 
     assert (dest / "environment.py").is_file()
+    assert dest.stat().st_mode & 0o777 == 0o700
 
 
 def test_pull_environment_package_replaces_file_with_force(monkeypatch, tmp_path):
@@ -347,6 +359,11 @@ def test_safe_extract_archive_bounds_total_members_scanned(monkeypatch, tmp_path
 
     with pytest.raises(RuntimeError, match="too many entries to scan"):
         adapter._safe_extract_archive(_tarball(entries), tmp_path, subdir="wanted")
+
+
+def test_safe_extract_archive_rejects_top_level_file(tmp_path):
+    with pytest.raises(RuntimeError, match="unexpected layout"):
+        adapter._safe_extract_archive(_top_level_file_tarball(), tmp_path)
 
 
 def test_pull_rechecks_destination_after_download(monkeypatch, tmp_path):
