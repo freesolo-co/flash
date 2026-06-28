@@ -63,6 +63,7 @@ def _identity_for_token(token: str) -> dict[str, str]:
         "email": f"user-{suffix}@example.com",
         "key_prefix": "fslo_test",
         "org_id": f"org-{suffix}",
+        "org_slug": f"org-{suffix}",
     }
 
 
@@ -176,6 +177,7 @@ def test_health_and_identity_roundtrip(make_client) -> None:
     # the JSON body back into a dict the CLI prints.
     assert me["key_prefix"]
     assert "email" in me
+    assert "org_slug" in me
 
 
 def test_create_status_list_cancel_lifecycle(make_client) -> None:
