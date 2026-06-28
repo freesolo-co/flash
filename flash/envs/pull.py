@@ -56,9 +56,7 @@ def environment_local_dirname(env_ref: str) -> str:
     return env_dir.rsplit("/", 1)[-1] if env_dir else ref.repo
 
 
-def download_environment_file(
-    env_ref: str, rel_path: str, *, timeout: float = 120.0
-) -> bytes | bytearray:
+def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 120.0) -> bytes:
     """Download one file from an environment using GitHub's raw media type."""
     ref = _coerce_environment_github_ref(env_ref)
     safe_rel = _safe_repo_relative_path(rel_path)
@@ -175,9 +173,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
 
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
     try:
-        extracted = adapter._safe_extract_archive(
-            adapter._download_github_tarball(ref), tmp_parent, subdir=env_dir
-        )
+        extracted = adapter._extract_github_tarball(ref, tmp_parent, subdir=env_dir)
         source = extracted / env_dir if env_dir else extracted
         if not source.is_dir():
             raise FileNotFoundError(

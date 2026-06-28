@@ -9,6 +9,7 @@ low-level refs remain parseable for compatibility. The canonical generated envir
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from flash.envs.base import BaseEnvironment
 
@@ -255,19 +256,24 @@ def _resolve_ref_sha(
     return sha
 
 
-def _read_capped(resp: object, max_bytes: int) -> bytearray:
-    buf = bytearray()
+def _read_capped(resp: object, max_bytes: int, out: BinaryIO | None = None) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
     while True:
         chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
         if not chunk:
             break
-        if len(buf) + len(chunk) > max_bytes:
+        if total + len(chunk) > max_bytes:
             raise RuntimeError(
                 f"GitHub response body exceeded the maximum allowed size ({max_bytes} bytes); "
                 "download aborted"
             )
-        buf.extend(chunk)
-    return buf
+        total += len(chunk)
+        if out is None:
+            chunks.append(chunk)
+        else:
+            out.write(chunk)
+    return b"".join(chunks)
 
 
 def _urlopen(
@@ -276,7 +282,8 @@ def _urlopen(
     timeout: float = 60.0,
     max_rate_limit_retries: int = 5,
     max_bytes: int | None = None,
-) -> bytes | bytearray:
+    out: BinaryIO | None = None,
+) -> bytes:
     """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
 
     On a 429 or a 403 whose body says "rate limit" (a cold spawn wave of workers all hitting the
@@ -301,7 +308,12 @@ def _urlopen(
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return _read_capped(resp, max_bytes) if max_bytes is not None else resp.read()
+                if max_bytes is not None:
+                    return _read_capped(resp, max_bytes, out=out)
+                if out is not None:
+                    shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
+                    return b""
+                return resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
             # GitHub signals an exhausted primary limit with a 403 + `X-RateLimit-Remaining: 0`
@@ -331,7 +343,7 @@ def _urlopen(
             raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
-def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes | bytearray:
+def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -340,17 +352,50 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes | bytearray:
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    data = _urlopen(
-        urllib.request.Request(url, headers=headers), timeout=120.0, max_bytes=_MAX_TARBALL_BYTES
-    )
-    if len(data) > _MAX_TARBALL_BYTES:
-        raise RuntimeError(
-            f"repository tarball is too large ({len(data)} bytes; limit {_MAX_TARBALL_BYTES} bytes)"
-        )
-    return data
+    tar_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="flash-env-tar-", suffix=".tar.gz", delete=False
+        ) as spill:
+            tar_path = Path(spill.name)
+            _urlopen(
+                urllib.request.Request(url, headers=headers),
+                timeout=120.0,
+                max_bytes=_MAX_TARBALL_BYTES,
+                out=spill,
+            )
+    except BaseException:
+        if tar_path is not None:
+            with contextlib.suppress(OSError):
+                tar_path.unlink()
+        raise
+    return tar_path
 
 
-def _safe_extract_archive(tar_bytes: bytes | bytearray, dest: Path, subdir: str = "") -> Path:
+def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path, subdir: str = "") -> Path:
+    tarball = _download_github_tarball(ref)
+    try:
+        return _safe_extract_archive(tarball, dest, subdir=subdir)
+    finally:
+        if isinstance(tarball, Path):
+            with contextlib.suppress(OSError):
+                tarball.unlink()
+
+
+def _safe_extract_archive(
+    tar_source: bytes | bytearray | Path, dest: Path, subdir: str = ""
+) -> Path:
+    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
+    if isinstance(tar_source, (bytes, bytearray)):
+        with tempfile.NamedTemporaryFile(prefix="flash-env-tar-", suffix=".tar.gz") as spill:
+            spill.write(tar_source)
+            spill.seek(0)
+            return _safe_extract_archive_file(spill, dest, subdir)
+    with tar_source.open("rb") as spill:
+        return _safe_extract_archive_file(spill, dest, subdir)
+
+
+def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
     """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
     root = dest.resolve()
     want = [p for p in subdir.split("/") if p] if subdir else []
@@ -358,44 +403,41 @@ def _safe_extract_archive(tar_bytes: bytes | bytearray, dest: Path, subdir: str 
     total = 0
     extracted = 0
     scanned = 0
-    with tempfile.NamedTemporaryFile(prefix="flash-env-tar-", suffix=".tar.gz") as spill:
-        spill.write(tar_bytes)
-        spill.seek(0)
-        with tarfile.open(fileobj=spill, mode="r:gz") as tar:
-            for member in tar:
-                scanned += 1
-                if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
-                    raise RuntimeError(
-                        f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
-                    )
-                if member.type in _TAR_METADATA_TYPES:
-                    continue
-                raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
-                if not raw:
-                    continue
-                top_dirs.add(raw[0])
-                if want and raw[1 : 1 + len(want)] != want:
-                    continue
-                if ".." in raw:
-                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-                normalized_name = "/".join(raw)
-                target = (dest / normalized_name).resolve()
-                if target != root and root not in target.parents:
-                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-                if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
-                    continue
-                extracted += 1
-                if extracted > _MAX_ARCHIVE_MEMBERS:
-                    raise RuntimeError(
-                        f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
-                    )
-                total += max(0, member.size)
-                if total > _MAX_ARCHIVE_BYTES:
-                    raise RuntimeError(
-                        f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
-                    )
-                member.name = normalized_name
-                tar.extract(member, dest)
+    with tarfile.open(fileobj=tar_file, mode="r:gz") as tar:
+        for member in tar:
+            scanned += 1
+            if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
+                raise RuntimeError(
+                    f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
+                )
+            if member.type in _TAR_METADATA_TYPES:
+                continue
+            raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
+            if not raw:
+                continue
+            top_dirs.add(raw[0])
+            if want and raw[1 : 1 + len(want)] != want:
+                continue
+            if ".." in raw:
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+            normalized_name = "/".join(raw)
+            target = (dest / normalized_name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+            if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
+                continue
+            extracted += 1
+            if extracted > _MAX_ARCHIVE_MEMBERS:
+                raise RuntimeError(
+                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
+                )
+            total += max(0, member.size)
+            if total > _MAX_ARCHIVE_BYTES:
+                raise RuntimeError(
+                    f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+                )
+            member.name = normalized_name
+            tar.extract(member, dest)
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")
     extracted_dir = dest / next(iter(top_dirs))
@@ -433,7 +475,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     try:
         # Runtime loading keeps repo-level sidecars available to relative paths/imports.
         # User-facing pulls filter to the requested env subtree in flash.envs.pull.
-        extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
+        extracted = _extract_github_tarball(resolved, tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
