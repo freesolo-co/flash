@@ -23,7 +23,6 @@ GRPO_RAW = {
         "batch_size": 16,
         "max_tokens": 512,
         "max_length": 2048,
-        "seeds": [0],
         "hf_repo": "owner/runs",
     },
     "gpu": {"type": "RTX 5090"},
@@ -54,12 +53,6 @@ def test_runconfig_from_grpo_spec_maps_fields():
     assert cfg.environment == "github:freesolo-co/envs@main:gsm8k/environment.py"
 
 
-def test_multi_seed_scales_steps_and_setup():
-    cfg = _runconfig_from_spec(_spec(**{"train.seeds": [0, 1, 2]}))
-    assert cfg.setup_repeats == 3
-    assert cfg.steps == 50 * 3  # per-seed steps x seeds (each seed re-pays cold start)
-
-
 def test_grpo_uses_recipe_steps_when_omitted():
     spec = _spec()
     object.__setattr__(spec.train, "steps", None)
@@ -76,7 +69,6 @@ def test_sft_steps_derived_from_examples():
                 "max_examples": 320,
                 "batch_size": 16,
                 "epochs": 2,
-                "seeds": [0],
                 "hf_repo": "owner/runs",
             },
             "gpu": {"type": "RTX 4090"},
@@ -96,7 +88,7 @@ def _sft_spec(**train):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "sft",
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
-        "train": {"seeds": [0], "hf_repo": "owner/runs", **train},
+        "train": {"hf_repo": "owner/runs", **train},
         "gpu": {"type": "RTX 4090"},
     }
     return spec_from_dict(raw)
@@ -207,7 +199,7 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
         "algorithm": "sft",
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
         "train": {
-            "seeds": [0], "hf_repo": "owner/runs",
+            "hf_repo": "owner/runs",
             "max_examples": 320, "batch_size": 6, "epochs": 2, "max_length": 1024,
         },
         "gpu": {"type": "RTX 4090"},

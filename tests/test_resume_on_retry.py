@@ -121,7 +121,7 @@ def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, mon
     (no ignore_patterns dropping optimizer.pt) and (b) prune older checkpoint dirs AFTER the new one
     lands so hf_resume_checkpoint never disambiguates (or re-downloads) stale state.
     """
-    prefix = "rl/flash-resume-1/seed0"
+    prefix = "rl/flash-resume-1"
     rec = _RecordingHfApi(
         files=[
             f"{prefix}/checkpoint/checkpoint-40/optimizer.pt",  # stale prior step
@@ -292,7 +292,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "hf_repo": "owner/runs"},
             "gpu": gpu,
         }
     )

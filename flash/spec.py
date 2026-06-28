@@ -61,13 +61,6 @@ def _volume_gb(value: Any, default: int = 100) -> int:
     return gb if gb > 0 else default
 
 
-def _seed_tuple(value: Any) -> tuple[int, ...]:
-    """Parse seeds list; rejects non-iterables (str/bytes) with ValueError; dedupes preserving order."""
-    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
-        raise ValueError(f"train.seeds must be a list of integers, got {type(value).__name__}")
-    return tuple(dict.fromkeys(int(s) for s in value))
-
-
 def _opt_int(value: Any) -> int | None:
     """Parse optional int; rejects bools (bool is int subclass — int(True)==1 is a footgun)."""
     if value is None:
@@ -98,13 +91,20 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
+# The single RNG seed every training job uses. Flash trains exactly one adapter per run (no
+# multi-seed); the value is fixed so runs are reproducible and the artifact path carries no seed
+# segment. It still reaches the worker via the ``SEED`` env (data shuffling / init in sft.py/rl.py).
+FIXED_SEED = 42
+
+
 @dataclass(frozen=True)
 class TrainSpec:
     steps: int | None = None
     epochs: int | None = None
     lora_rank: int = 32
     lora_alpha: int = 64
-    seeds: tuple[int, ...] = (0,)
+    # Artifact-store adapter ref output by `flash status`:
+    # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = ""
     # PLATFORM-MANAGED: control-plane-assigned HF artifact repo; user-supplied values are ignored.
     hf_repo: str = ""
@@ -193,7 +193,6 @@ class JobSpec:
                 epochs=_opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),
-                seeds=_seed_tuple(train.get("seeds", (0,))),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),

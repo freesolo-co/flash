@@ -83,17 +83,42 @@ def colocate_kv_util(
     total_vram_gb: float,
     sleep_mode: bool,
     num_generations: int = 8,
+    active_params_b: float | None = None,
 ) -> float:
     """vllm_gpu_memory_utilization for the colocated GRPO rollout engine.
 
-    Budgets the WHOLE executor (bf16 weight copy + KV), capped at 0.45."""
-    weights_gb = max(0.5, float(params_b or 1.0)) * 2.0
+    ``gpu_memory_utilization`` is vLLM's WHOLE model-executor budget — its (2nd) bf16 weight copy PLUS
+    the KV cache — so we budget BOTH (budgeting KV alone would starve the weights and, for big models,
+    under-size the engine). The KV a GRPO rollout needs scales with the engine context AND the
+    concurrent generation group (``num_generations`` simultaneous sequences), so we size the pool as
+    ``_KV_COEF x seq x sqrt(params) x group/8`` with a 1.5x margin and an 8 GB floor — NOT capped, so
+    long-context / large-group runs keep a big pool (the 0.45 utilization cap bounds it like the old
+    blanket did). The old blanket sleep-path 0.45 reserved ~36 GB on an 80 GB A100 — MEASURED as the
+    dominant resident allocation that set the GRPO step peak (~46 GB). BOTH paths budget the weight
+    copy + KV; the non-sleep path uses the leaner resident-KV target (_KV_CAP). MEASURED at
+    4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward byte-identical, train_wall neutral; a
+    tighter 12 GB budget preempts, confirming this as the floor."""
+    weights_gb = max(0.5, float(params_b or 1.0)) * 2.0  # vLLM's bf16 weight copy lives in the budget
+    # MoE: the KV pool scales with the per-token COMPUTE width (the ~3B active backbone), NOT the 35B
+    # total — exactly the split estimate_vram_gb/grpo_fits_resident use (active for KV, full for the
+    # weight copy). Keying the KV off total here would budget a LARGER pool than the resident-fit gate
+    # counted, so the gate could disable sleep while the engine reserves more KV than it sized — the
+    # near-margin 35B-A3B GRPO mismatch. Dense models leave active_params_b unset -> full params_b.
+    kv_params_b = float(active_params_b) if active_params_b else params_b
     if not sleep_mode:
-        # Non-sleep: engine stays resident through backward; scale KV with context+group.
-        kv_gb = max(_KV_CAP, _resident_kv_gb(params_b, vllm_max_len, num_generations))
+        # Resident KV ON TOP of the weight copy: gpu_memory_utilization is the WHOLE executor budget,
+        # so budgeting KV alone (the old _KV_CAP/total) starved the weights and vLLM raised "No
+        # available memory for the cache blocks" on >=3B models whose weights exceed an 8 GB budget.
+        # The KV must ALSO cover the rollout context -- a flat _KV_CAP starves the cache blocks on a
+        # long-context run (vLLM's blocks must span vllm_max_model_length), so scale it with the
+        # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
+        # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
+        # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
+        kv_gb = max(_KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations))
         return max(0.10, min(0.45, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
-    # Sleep mode: 1.5x KV margin; engine is offloaded during backward so it doesn't compete.
-    kv_pool_gb = max(_KV_CAP, 1.5 * _resident_kv_gb(params_b, vllm_max_len, num_generations))
+    # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
+    # bigger rollout-phase KV does not compete with the training peak.
+    kv_pool_gb = max(_KV_CAP, 1.5 * _resident_kv_gb(kv_params_b, vllm_max_len, num_generations))
     return min(0.45, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
 _TRAIN_COEF = 0.27
 # Small-model colocated GRPO floor: 0.8B OOMs 20 GB; 2B OOMs 24 GB -> both need 32 GB tier.
@@ -237,6 +262,13 @@ def grpo_fits_resident(
     if params_b <= 0:
         return False
     quant = (getattr(info, "quant", "bf16") or "bf16") if info else "bf16"
+    # MoE: size the resident peak's COMPUTE terms (KV pool, activations, rank-linear LoRA) on the ~3B
+    # ACTIVE backbone, exactly as model_required_vram_gb does — keying them on the 35B TOTAL inflates
+    # the resident estimate above the card and wrongly forces vLLM sleep mode on a B200 MoE GRPO run,
+    # where the sleep/wake cycle stalls the colocated rollout (the very failure this gate exists to
+    # avoid). The ``weights`` term still sizes the full params_b. Dense models leave active_params_b
+    # unset -> estimate_vram_gb falls back to params_b for every term (unchanged).
+    active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
     resident = estimate_vram_gb(
         params_b,
         "grpo",
@@ -249,6 +281,7 @@ def grpo_fits_resident(
         use_vllm=True,
         vocab=vocab_size_for(model_id),
         sleep_offload=False,
+        active_params_b=active_b,
     )
     return resident * margin <= card_vram_gb
 
@@ -319,7 +352,13 @@ def model_required_vram_gb(
     model_vocab = vocab_size_for(model_id)
     is_grpo = (algorithm or "").lower() in ("grpo", "rl")
     if info is not None:
-        params_b = params_b_from_str(info.params)
+        # Total weight size comes from the CURATED ``params_b`` (the single source of truth
+        # resolve_params_b and the cost model read directly), falling back to the ``params`` display
+        # string only when it's unset. Re-parsing the string is fragile for an MoE whose string lists
+        # BOTH the total and the ~3B active count ("35B total / ~3B active"): a reordering could make
+        # params_b_from_str pick up the active count and size the resident weights ~10x too small,
+        # under-provisioning the card. The calibrated params_b (the MoE's 35.0) is authoritative.
+        params_b = float(getattr(info, "params_b", 0.0) or 0.0) or params_b_from_str(info.params)
         quant = getattr(info, "quant", "bf16") or "bf16"
         use_vllm = True
         active_b = float(getattr(info, "active_params_b", 0.0) or 0.0)
