@@ -39,11 +39,9 @@ def cuda_oom_count() -> int:
         return 0
 
 
-def is_cuda_oom(exc: BaseException) -> bool:
-    """Whether ``exc`` is a CUDA out-of-memory crash, classified STRUCTURALLY (no message parsing):
-    torch's typed ``OutOfMemoryError``, or its ``num_ooms`` allocator counter having advanced. A host
-    ``MemoryError`` is never a GPU OOM. Torch-import-safe."""
-    if isinstance(exc, MemoryError):
+def is_cuda_oom(exc: BaseException | None) -> bool:
+    """Whether ``exc`` is a CUDA out-of-memory crash, without message parsing."""
+    if exc is None or isinstance(exc, MemoryError):
         return False
     try:
         import torch
