@@ -156,6 +156,7 @@ from flash.engine.worker.perf import (
     gpu_diagnostics,
     grad_checkpointing_on,
     grpo_sleep_mode,
+    is_cuda_oom,
     liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
@@ -464,7 +465,12 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        hb_flags = {"retriable": retriable}
+        # A CUDA OOM means this card was too small -> stamp a structured ``oom`` flag so the runner
+        # retries on a strictly larger GPU (not infra; not a re-roll of the same size). Classified off
+        # torch's typed OutOfMemoryError + its num_ooms counter, never the message. ``and not
+        # retriable``: a RetriableInfraError (e.g. wait_for_gpu readiness) retries same-size, not oom.
+        oom = is_cuda_oom(e) and not retriable
+        hb_flags = {"retriable": retriable, "oom": oom}
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:
