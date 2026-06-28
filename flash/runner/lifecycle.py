@@ -286,6 +286,15 @@ def _submit_seed_supervised(
             # CONFIRMED. On an unconfirmed instance teardown we keep it (see below). The next on_handle()
             # records the new one.
             if teardown_confirmed:
+                # Drop the IN-MEMORY handle too, not just the persisted remote: the previous instance
+                # is CONFIRMED gone, so the next on_handle() records the fresh one. Leaving last_handle
+                # populated lets a retry that fails BEFORE provisioning a new handle (allocation/search
+                # error -> no on_handle) re-enter THIS teardown on the next iteration and destroy the
+                # already-cleared box again; a transient Vast destroy/list failure on that phantom
+                # re-teardown would then take the unconfirmed-teardown FATAL path though no prior worker
+                # remains (Codex). Cleared here so `attempt > 0 and last_handle` is false until a real
+                # new handle exists.
+                last_handle.clear()
                 with contextlib.suppress(FileNotFoundError):
                     st = get_status(spec.run_id)
                     if st.state not in TERMINAL_STATES and st.remote is not None:

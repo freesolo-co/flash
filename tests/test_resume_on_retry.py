@@ -408,6 +408,48 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     assert remote.get("instance_id") == "i0"
 
 
+def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, monkeypatch):
+    """Codex: after a CONFIRMED teardown the in-memory last_handle must be cleared, not just the
+    persisted remote. Otherwise a retry that fails BEFORE provisioning a new handle (allocation/search
+    error -> on_handle never fires) leaves the prior, already-torn-down handle live, so the NEXT retry
+    re-tears-down that already-gone resource. For an instance provider a transient destroy/list failure
+    on that phantom re-teardown would mis-classify as the unconfirmed-teardown FATAL path though no
+    prior worker remains; for RunPod it re-issues a redundant cancel/delete. Sequence: attempt 0
+    provisions ep0 then fails infra; attempt 1 confirms ep0's teardown then fails no_capacity (no new
+    handle); attempt 2 must NOT touch ep0 again (last_handle cleared) and must succeed."""
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # cancel_job fires ONLY in the inter-attempt teardown block (never in the success _gc_seen_endpoints
+    # sweep, which only delete_endpoints), so counting it cleanly isolates re-teardown.
+    cancels: list[str] = []
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda eid, jid: cancels.append(eid))
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        if attempt == 0:
+            on_handle(_runpod_handle("ep0", "j0"))  # provisioned, then lost infra-shaped
+            return PollResult(False, failure="stalled", detail="infra")
+        if attempt == 1:
+            # Allocation/search-shaped failure BEFORE a new handle is recorded (on_handle never fires).
+            # last_handle must already be EMPTY here (ep0's teardown was confirmed at the top of this
+            # attempt), so the next retry has no stale handle to re-tear-down.
+            return PollResult(False, failure="no_capacity", detail="search flaked")
+        on_handle(_runpod_handle("ep2", "j2"))  # fresh endpoint on the final retry
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+
+    assert metrics["train_tokens"] == 4096, "the run must reach the successful final retry"
+    assert cancels == ["ep0"], "ep0 must be torn down exactly once, never re-torn after confirmed clear"
+
+
 def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
     """A genuine worker error (the run's own code crashed) must NOT consume a retry.
 

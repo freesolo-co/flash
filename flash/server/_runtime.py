@@ -134,12 +134,24 @@ def _confirm_run_clear(spec) -> bool:
     today) is NOT a "can't confirm -> False" case: it has no standing-billing label to enumerate, so it
     is skipped and the run stays eligible to resubmit on the other providers' verdicts. This guard is
     therefore scoped to instance providers that DO expose the capability (Vast); only a provider that
-    HAS the method and can't return a clean ``[]`` blocks the resubmit (Copilot)."""
-    from flash.providers import INSTANCE_PROVIDERS, configured_providers
+    HAS the method and can't return a clean ``[]`` blocks the resubmit (Copilot).
 
+    BILLING-SAFETY (Codex): a provider that COULD have owned this run's lost create but is now
+    UNCONFIGURABLE must also block the resubmit. A handle-less run's pre-handle non-idempotent create
+    (Vast's ``PUT /asks``) may have left a phantom; if ``VAST_API_KEY`` was dropped before this restart,
+    ``configured_providers()`` omits Vast, so iterating only the configured set returns "clear" and lets
+    a second worker resubmit on another provider while the phantom keeps billing + writing the same HF
+    prefix. We therefore ALSO fail closed for any provider recorded as available when the run was
+    submitted (``submitted_instance_providers``) that owns the standing-instance capability yet can't be
+    enumerated now. Scoping to the recorded set is what keeps this correct on planes that never
+    configure Vast: such a run never recorded Vast, so its handle-less recovery is never blocked (it
+    can't have left a Vast phantom)."""
+    from flash.providers import INSTANCE_PROVIDERS, configured_providers, get_provider
+
+    configured = {getattr(p, "name", None): p for p in configured_providers()}
     clear = True
-    for prov in configured_providers():
-        if getattr(prov, "name", None) not in INSTANCE_PROVIDERS:
+    for name, prov in configured.items():
+        if name not in INSTANCE_PROVIDERS:
             continue
         with contextlib.suppress(Exception):
             prov.gc(spec)
@@ -151,6 +163,17 @@ def _confirm_run_clear(spec) -> bool:
                 clear = False  # an instance for this run is still present
         except Exception:
             clear = False  # couldn't list -> can't prove clear -> don't race
+    # An instance provider that WAS available at submit (so it could have taken the lost create) but is
+    # NOT configurable now and owns the standing-instance capability can't be enumerated -> can't prove
+    # clear -> fail closed. Already-configured providers were handled above; non-capability ones (Lambda)
+    # have no standing label to leak.
+    with contextlib.suppress(Exception):
+        recorded = getattr(get_status(spec.run_id), "submitted_instance_providers", None) or []
+        for name in recorded:
+            if name in configured or name not in INSTANCE_PROVIDERS:
+                continue
+            if getattr(get_provider(name), "run_instances_remaining", None) is not None:
+                clear = False
     return clear
 
 

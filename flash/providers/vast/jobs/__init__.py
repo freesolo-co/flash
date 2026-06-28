@@ -260,7 +260,14 @@ def deploy_and_submit(
             )
         except vast_api.VastApiError as e:
             last_err = e
-            say(f"offer {offer.offer_id} ({offer.gpu} ${offer.dph_total:.2f}/hr) rejected: {e}")
+            # This PRE-RECONCILE log must NOT throw: the create just failed AMBIGUOUSLY (timeout / 5xx /
+            # unreadable response on the NON-IDEMPOTENT PUT /asks may have left a billed contract). A
+            # raising ``say`` (closed log stream / disk error) here would abort BEFORE
+            # create_error_is_ambiguous() and the whole adopt/destroy/terminal path below ever run, so
+            # the phantom would never be reconciled and the runner would see a generic deploy error and
+            # retry/rent another offer while it keeps billing + writing this run's artifacts (Codex).
+            with contextlib.suppress(Exception):
+                say(f"offer {offer.offer_id} ({offer.gpu} ${offer.dph_total:.2f}/hr) rejected: {e}")
             # An AMBIGUOUS create failure (5xx / network-timeout on the NON-IDEMPOTENT PUT /asks) may
             # have created a billed contract that never surfaced in the response. Renting the next
             # offer would leave that one untracked and billing until the orphan sweep. Reconcile by our
