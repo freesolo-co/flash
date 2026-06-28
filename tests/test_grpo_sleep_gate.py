@@ -195,3 +195,39 @@ def test_sleep_gate_resolves_unset_max_length_against_real_rollout_length():
     assert grpo_sleep_mode(model, max_length=0, max_tokens=64, card_vram_gb=80) is False
     # unknown card VRAM -> fall back to the size/context gate, which now sees the real long rollout
     assert grpo_sleep_mode(model, max_length=0, max_tokens=64, card_vram_gb=0) is True
+
+
+def test_finalize_alloc_conf_passes_fp8_kv_in_parity_with_run_rl():
+    # finalize_alloc_conf_for_sleep documents that it resolves the sleep decision "EXACTLY as run_rl
+    # does". run_rl threads fp8_kv (device capability >= (8, 9)) into grpo_sleep_mode so the
+    # resident-fit gate admits the longer context fp8 KV unlocks; finalize MUST pass it too, or a
+    # long-context MoE that fits resident ONLY with fp8 KV resolves sleep ON at boot (keeping the
+    # non-expandable alloc conf) while training runs sleep OFF -- the very divergence this guards.
+    # AST-based (the called keyword is the invariant) so it survives reformatting.
+    import ast
+    import inspect
+
+    import flash.engine.worker as w
+    from flash.engine.worker import gpu_setup
+
+    def _sleep_call_keywords(fn) -> set[str] | None:
+        tree = ast.parse(inspect.getsource(fn))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+            if name == "grpo_sleep_mode":
+                return {kw.arg for kw in node.keywords}
+        return None
+
+    rl_kws = _sleep_call_keywords(w.run_rl)
+    assert rl_kws is not None, "run_rl no longer calls grpo_sleep_mode"
+    assert "fp8_kv" in rl_kws, "run_rl must pass fp8_kv to grpo_sleep_mode"
+    fin_kws = _sleep_call_keywords(gpu_setup.finalize_alloc_conf_for_sleep)
+    assert fin_kws is not None, "finalize_alloc_conf_for_sleep no longer calls grpo_sleep_mode"
+    assert "fp8_kv" in fin_kws, (
+        "finalize_alloc_conf_for_sleep must thread fp8_kv into grpo_sleep_mode (parity with run_rl) -- "
+        "else the boot-time alloc-conf sleep decision diverges from the trainer's for an fp8-KV-only "
+        "resident fit"
+    )

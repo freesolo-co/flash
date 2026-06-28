@@ -93,6 +93,12 @@ def finalize_alloc_conf_for_sleep() -> None:
         except Exception:
             ctx = 0
         card_gb = 0.0
+        # fp8 KV (cc>=8.9) halves the resident KV bytes, so grpo_sleep_mode's resident-fit gate admits
+        # a LONGER context as fitting. Derive it EXACTLY as run_rl does (device capability >= (8, 9))
+        # and feed it to the SAME gate below -- else a long-context MoE that fits resident ONLY with
+        # fp8 KV resolves sleep ON here (keeping the non-expandable conf) while run_rl runs sleep OFF,
+        # diverging from this function's documented "exactly run_rl's gate" contract.
+        fp8_kv = False
         try:
             import torch as _torch_card
 
@@ -101,6 +107,7 @@ def finalize_alloc_conf_for_sleep() -> None:
                 # estimate_vram_gb is decimal, so the card size fed to the same sleep gate must be
                 # decimal too or this alloc-conf decision would diverge from the trainer's.
                 card_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+                fp8_kv = _torch_card.cuda.get_device_capability() >= (8, 9)
         except Exception:
             card_gb = 0.0
         # Resolve group_size EXACTLY as run_rl does (gcfg override, else the recipe default), not a
@@ -119,6 +126,7 @@ def finalize_alloc_conf_for_sleep() -> None:
             lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
             thinking=_w.THINKING,
             card_vram_gb=card_gb,
+            fp8_kv=fp8_kv,
         )
         if not sleep_on:  # sleep resolves OFF -> expandable is safe + better
             conf = "expandable_segments:True"
