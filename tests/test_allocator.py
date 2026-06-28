@@ -182,17 +182,17 @@ def test_required_vram_policy_floors_and_downrouting():
 
 def test_required_vram_sizes_weights_from_curated_params_b_not_display_string():
     """Cursor Medium: model_required_vram_gb must size the resident WEIGHT term from the curated
-    ``ModelInfo.params_b`` (the single source of truth resolve_params_b / the cost model read),
-    falling back to the ``params`` display string only when params_b is unset. Re-parsing the
-    string is fragile for an MoE whose string lists BOTH counts ("35B total / ~3B active"): if the
-    first parsed token were the ~3B active count, the ~70 GB resident weights would be sized ~10x
-    too small and the card under-provisioned."""
+    ``ModelInfo.params_b`` (the single source of truth resolve_params_b / the cost model read).
+    params_b is now a required numeric field and the ``params`` display string is display-only
+    (params_b_from_str was removed): re-parsing the string was fragile for an MoE whose string lists
+    BOTH counts ("35B total / ~3B active") — the first parsed token could be the ~3B active count,
+    sizing the ~70 GB resident weights ~10x too small and under-provisioning the card."""
     from flash.catalog import MODELS, ModelInfo
-    from flash.engine.vram import model_required_vram_gb, params_b_from_str
+    from flash.engine.vram import model_required_vram_gb
 
     fake_id = "test/moe-active-first-string"
-    # A pathological display string that lists the ACTIVE count FIRST, so params_b_from_str() would
-    # parse 3.0 — the exact footgun the curated params_b avoids.
+    # A pathological display string that lists the ACTIVE count FIRST — the exact footgun the curated
+    # params_b avoids now that the string is never parsed.
     fake = ModelInfo(
         id=fake_id,
         display_name="fake MoE (active-first string)",
@@ -203,7 +203,6 @@ def test_required_vram_sizes_weights_from_curated_params_b_not_display_string():
         active_params_b=3.0,
         vocab_size=248_320,
     )
-    assert params_b_from_str(fake.params) == 3.0  # the string alone would mis-size to 3B
     MODELS[fake_id] = fake
     try:
         # Sized from the curated 35.0 -> the ~70 GB bf16 resident weights dominate, so the SFT need is
