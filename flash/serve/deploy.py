@@ -111,7 +111,9 @@ def servable_gpu(gpu_name: str) -> str:
     return cheapest_gpu(info.vram_gb)  # else the cheapest RunPod class that fits
 
 
-def validate_serving_lora_rank(model: str, lora_rank: int) -> None:
+def validate_serving_lora_rank(
+    model: str, lora_rank: int, *, rank_source: str = "adapter"
+) -> None:
     """Fail before registration when a trained adapter rank exceeds serving capacity."""
     from flash.catalog import get_model
 
@@ -124,8 +126,54 @@ def validate_serving_lora_rank(model: str, lora_rank: int) -> None:
     if int(lora_rank) > serving.max_lora_rank:
         raise ValueError(
             f"{model} serving supports max_lora_rank={serving.max_lora_rank}; "
-            f"adapter rank {int(lora_rank)} cannot be deployed"
+            f"{rank_source} rank {int(lora_rank)} cannot be deployed"
         )
+
+
+def _rank_from_adapter_config(config: dict, *, source: str) -> int:
+    ranks: list[int] = []
+    try:
+        if config.get("r") is not None:
+            ranks.append(int(config["r"]))
+        rank_pattern = config.get("rank_pattern") or {}
+        if rank_pattern:
+            if not isinstance(rank_pattern, dict):
+                raise TypeError("rank_pattern is not a mapping")
+            ranks.extend(int(v) for v in rank_pattern.values())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"could not verify adapter rank: {source} has invalid rank metadata") from exc
+    if not ranks:
+        raise ValueError(f"could not verify adapter rank: {source} has no LoRA rank metadata")
+    rank = max(ranks)
+    if rank <= 0:
+        raise ValueError(f"could not verify adapter rank: {source} has non-positive rank {rank}")
+    return rank
+
+
+def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
+    """Read the deployed adapter's actual rank from HF artifact metadata."""
+    filename = f"{subfolder.rstrip('/')}/adapter_config.json"
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
+        raise ValueError("could not verify adapter rank: huggingface_hub is not installed") from exc
+    try:
+        local = hf_hub_download(
+            repo_id=hf_repo,
+            filename=filename,
+            repo_type="dataset",
+            token=os.environ.get("HF_TOKEN"),
+        )
+    except Exception as exc:
+        raise ValueError(f"could not verify adapter rank: failed to read {hf_repo}:{filename}") from exc
+    try:
+        with open(local, encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as exc:
+        raise ValueError(f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object")
+    return _rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
 def deploy_adapter(
@@ -140,9 +188,15 @@ def deploy_adapter(
     org_id: str | None = None,
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app."""
-    validate_serving_lora_rank(model, lora_rank)
+    validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
     friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
+    if not dry_run:
+        validate_serving_lora_rank(
+            model,
+            adapter_artifact_lora_rank(hf_repo, subfolder),
+            rank_source="adapter artifact",
+        )
     dep = Deployment(
         run_id=run_id,
         model=model,
