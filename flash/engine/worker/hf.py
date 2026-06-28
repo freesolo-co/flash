@@ -332,10 +332,9 @@ _CHECKPOINT_TRAINER_STATE = (
     "zero_to_fp32.py",
 )
 
-# The PEFT adapter weights file a checkpoint must carry to be loadable/servable (safetensors is
-# the default; .bin is the legacy fallback). A step with adapter_config.json but no weights is
-# NOT deployable, so it's never published/listed.
-_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
+# The PEFT adapter weights file a checkpoint must carry to be loadable/servable. A step with
+# adapter_config.json but no weights is NOT deployable, so it's never published/listed.
+_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
 
 
 def _has_deployable_adapter(ckpt_dir: str) -> bool:

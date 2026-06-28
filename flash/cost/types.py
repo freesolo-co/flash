@@ -17,10 +17,6 @@ class RunConfig:
     method: str  # "sft" | "grpo"
     steps: int
 
-    # Cold-start setups the bill covers: a multi-seed run reprovisions (and re-pays boot) per
-    # seed, so this is the seed count.
-    setup_repeats: int = 1
-
     # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
     # GRPO default mirrors the worker's max(1024, max_prompt_len + completion); see normalized().
     seq_len: int | None = None
@@ -32,7 +28,7 @@ class RunConfig:
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
 
-    max_wall_seconds: int | None = None  # per-seed wall cap (spec gpu.max_wall_seconds); None = 24h
+    max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
     environment: str | None = None  # Freesolo environment id; descriptive only
 
@@ -46,14 +42,6 @@ class RunConfig:
         object.__setattr__(self, "provider", prov)
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
-        if self.setup_repeats < 1:
-            raise ValueError(f"setup_repeats must be >= 1, got {self.setup_repeats}")
-        # Steps are split evenly across seeds, so a non-divisible split would price fractional
-        # steps per seed (impossible in a real run).
-        if self.steps % self.setup_repeats != 0:
-            raise ValueError(
-                f"steps ({self.steps}) must be a multiple of setup_repeats ({self.setup_repeats})"
-            )
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
         # runner floors it to max(60, ...) and estimate_cost mirrors that, so a non-positive cap
         # is accepted (floored to 60s), not rejected.

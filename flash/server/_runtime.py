@@ -198,8 +198,8 @@ def _worker_artifacts(spec) -> dict[str, str]:
 
 def recover_runs() -> None:
     """Recover every in-flight run after a restart so a redeploy never loses a training session:
-    re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
-    ``queued``/``provisioning`` runs that never reached a worker."""
+    re-attach to ``running`` jobs, and resubmit ``queued``/``provisioning`` runs that never reached
+    a worker."""
     from flash.runner import (
         _gc_run_endpoints,
         _run_job_background,
