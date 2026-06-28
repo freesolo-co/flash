@@ -277,23 +277,26 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     if not isinstance(private, bool):
         raise HTTPException(status_code=400, detail="private must be a boolean")
 
-    status = owned_run(run_id, key)
-    spec = JobSpec.from_dict(status.spec)
-    # Legacy runs with no artifact repo (mirrors the /deploy guard): the adapter can't be located.
-    if not spec.train.hf_repo:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
-                "cannot be located, so it cannot be exported"
-            ),
-        )
-    # Hold the SAME per-run lock deploy/undeploy take, across the checkpoint resolution AND the
-    # download-then-upload below: both read the run's private artifact repo (``spec.train.hf_repo``),
-    # so without this the always-on repo GC could ``delete_repo`` that source mid-export. The GC takes
-    # this lock (non-blocking) before deleting, so an in-progress export is spared; a delete that
-    # started first holds the lock and an export arriving mid-delete waits for it.
+    # Hold the SAME per-run lock deploy/undeploy take BEFORE resolving the run, and keep it across the
+    # checkpoint resolution AND the download-then-upload below — mirroring /deploy, which takes the
+    # lock FIRST. owned_run, the legacy-repo guard, and the artifact-repo read all run UNDER the lock,
+    # so the always-on repo GC can't ``delete_repo`` the source mid-export: the GC acquires this same
+    # lock (non-blocking) before deleting, so an in-progress export is spared, and a delete that
+    # started first holds the lock until it finishes. Taking the lock AFTER owned_run/validation (as
+    # it did before) left a start-after-check window where the GC could delete the source between the
+    # local checks and the ``with`` block, failing the export against a just-removed repo.
     with _app._deploy_lock(run_id):
+        status = owned_run(run_id, key)
+        spec = JobSpec.from_dict(status.spec)
+        # Legacy runs with no artifact repo (mirrors the /deploy guard): the adapter can't be located.
+        if not spec.train.hf_repo:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
+                    "cannot be located, so it cannot be exported"
+                ),
+            )
         # Optional `step`: export a specific intermediate checkpoint instead of the final adapter,
         # validated against what's actually on HF (a missing step 404s with the available list).
         checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
