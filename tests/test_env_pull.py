@@ -7,6 +7,7 @@ import tarfile
 import urllib.error
 import urllib.request
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -199,6 +200,25 @@ def test_pull_environment_package_preserves_dest_when_staging_copy_fails(monkeyp
     assert (dest / "keep.txt").read_text() == "precious"
 
 
+def test_pull_environment_package_restores_dest_when_final_swap_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
+    dest = tmp_path / "stuff"
+    dest.mkdir()
+    (dest / "keep.txt").write_text("precious")
+    real_replace = env_pull.os.replace
+
+    def fail_final_replace(src, dst):
+        if Path(src).name == dest.name and Path(dst) == dest:
+            raise OSError("swap failed")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(env_pull.os, "replace", fail_final_replace)
+
+    with pytest.raises(OSError, match="swap failed"):
+        pull_environment_package("david-freesolo-co/stuff", dest, overwrite=True)
+    assert (dest / "keep.txt").read_text() == "precious"
+
+
 def test_pull_environment_package_replaces_symlink_without_touching_target(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
     real_target = tmp_path / "real"
@@ -279,7 +299,19 @@ def test_pull_environment_package_custom_entrypoint_ref(monkeypatch, tmp_path):
     assert (dest / "datasets" / "train.jsonl").is_file()
 
 
-def test_pull_into_cwd_replaces_child_symlink_not_target(monkeypatch, tmp_path):
+def test_pull_into_empty_cwd_populates_in_place(monkeypatch, tmp_path):
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+
+    pull_environment_package("david-freesolo-co/stuff", ".")
+
+    assert (work / "environment.py").is_file()
+    assert (work / "datasets" / "train.jsonl").is_file()
+
+
+def test_pull_into_occupied_cwd_is_refused_without_touching_children(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
     external = tmp_path / "external"
     external.mkdir()
@@ -288,11 +320,12 @@ def test_pull_into_cwd_replaces_child_symlink_not_target(monkeypatch, tmp_path):
     (work / "datasets").symlink_to(external)
     monkeypatch.chdir(work)
 
-    pull_environment_package("david-freesolo-co/stuff", ".", overwrite=True)
+    with pytest.raises(RuntimeError, match="current working directory"):
+        pull_environment_package("david-freesolo-co/stuff", ".", overwrite=True)
 
-    assert not (work / "datasets").is_symlink()
-    assert (work / "datasets" / "train.jsonl").is_file()
+    assert (work / "datasets").is_symlink()
     assert not (external / "train.jsonl").exists()
+    assert not (work / "environment.py").exists()
 
 
 def test_pull_environment_package_filters_hub_to_env_under_member_limit(monkeypatch, tmp_path):

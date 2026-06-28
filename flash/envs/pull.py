@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import tempfile
@@ -98,32 +99,61 @@ def _cwd_is_inside(path: Path) -> bool:
     return resolved == cwd or resolved in cwd.parents
 
 
-def _copy_contents(source: Path, dest: Path, *, overwrite: bool) -> None:
-    dest.mkdir(parents=True, exist_ok=True)
-    for child in sorted(source.iterdir()):
-        target = dest / child.name
-        if target.exists() or target.is_symlink():
-            if not overwrite:
+def _populate_empty_dir(source: Path, dest: Path) -> None:
+    staging_parent = Path(tempfile.mkdtemp(prefix=".flash-env-pull-", dir=dest.resolve().parent))
+    moved: list[Path] = []
+    try:
+        staging = staging_parent / "contents"
+        shutil.copytree(source, staging)
+        if any(dest.iterdir()):
+            raise FileExistsError(
+                f"destination {dest} already exists (pass overwrite=True to replace)"
+            )
+        for child in sorted(staging.iterdir()):
+            target = dest / child.name
+            if target.exists() or target.is_symlink():
                 raise FileExistsError(
                     f"destination {target} already exists (pass overwrite=True to replace)"
                 )
-            _remove_path(target)
-        if child.is_dir():
-            shutil.copytree(child, target)
-        else:
-            shutil.copy2(child, target)
+            os.replace(child, target)
+            moved.append(target)
+    except Exception:
+        for target in reversed(moved):
+            if target.exists() or target.is_symlink():
+                with contextlib.suppress(OSError):
+                    _remove_path(target)
+        raise
+    finally:
+        shutil.rmtree(staging_parent, ignore_errors=True)
 
 
 def _replace_with_tree(source: Path, dest: Path) -> None:
     staging_parent = Path(tempfile.mkdtemp(prefix=".flash-env-pull-", dir=dest.parent))
+    keep_staging = False
     try:
         staging = staging_parent / dest.name
+        backup = staging_parent / f"{dest.name}.old"
         shutil.copytree(source, staging)
         if dest.exists() or dest.is_symlink():
-            _remove_path(dest)
-        os.replace(staging, dest)
+            os.replace(dest, backup)
+            keep_staging = True
+            try:
+                os.replace(staging, dest)
+            except Exception:
+                try:
+                    os.replace(backup, dest)
+                    keep_staging = False
+                except OSError as restore_exc:
+                    raise RuntimeError(
+                        f"failed to replace {dest}; original retained at {backup}"
+                    ) from restore_exc
+                raise
+            keep_staging = False
+        else:
+            os.replace(staging, dest)
     finally:
-        shutil.rmtree(staging_parent, ignore_errors=True)
+        if not keep_staging:
+            shutil.rmtree(staging_parent, ignore_errors=True)
 
 
 def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool = False) -> Path:
@@ -169,9 +199,12 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
         if not dest_path.exists() and not dest_path.is_symlink():
             shutil.copytree(source, dest_path)
         elif dest_path.is_dir() and not dest_path.is_symlink() and not any(dest_path.iterdir()):
-            _copy_contents(source, dest_path, overwrite=False)
+            _populate_empty_dir(source, dest_path)
         elif dest_path.is_dir() and not dest_path.is_symlink() and _cwd_is_inside(dest_path):
-            _copy_contents(source, dest_path, overwrite=True)
+            raise RuntimeError(
+                f"refusing to overwrite {dest_path} because it contains the current working directory; "
+                "choose a separate output path"
+            )
         else:
             if not overwrite:
                 raise FileExistsError(
