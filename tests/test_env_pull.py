@@ -99,10 +99,16 @@ def test_download_environment_file_uses_raw_media_type(monkeypatch):
 def test_download_environment_file_sends_token(monkeypatch):
     captured: dict[str, object] = {}
 
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
     def fake_urlopen(req, timeout):
         captured["auth"] = req.headers.get("Authorization")
-        return io.BytesIO(b"ok")
-
+        return _Resp(b"ok")
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
 
