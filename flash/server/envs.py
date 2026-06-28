@@ -36,6 +36,12 @@ _REPO_CONTROL_TOP_LEVEL_PATHS = {
 # and publish writes `source/<name>` without objection — so the delete validator must reject only
 # `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
 _BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
+_TAR_METADATA_TYPES = {
+    tarfile.XHDTYPE,
+    tarfile.XGLTYPE,
+    tarfile.GNUTYPE_LONGNAME,
+    tarfile.GNUTYPE_LONGLINK,
+}
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
@@ -110,6 +116,8 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     raise EnvPublishError(
                         f"env package has too many members (limit {_MAX_MEMBERS})"
                     )
+                if member.type in _TAR_METADATA_TYPES:
+                    continue
                 segments: list[str] = []
                 for segment in member.name.replace("\\", "/").split("/"):
                     if not segment or segment == ".":
