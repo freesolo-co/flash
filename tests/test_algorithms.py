@@ -27,6 +27,7 @@ def test_grpo_capability_still_enforced():
         id="test/sft-only",
         display_name="sft only",
         params="1B",
+        params_b=1.0,
         algos=("sft",),
         min_vram_gb=12,
     )
