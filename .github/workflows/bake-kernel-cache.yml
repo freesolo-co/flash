@@ -11,8 +11,8 @@ name: flash worker kernel-cache (per-arch)
 # warmup runs INSIDE it so the cache matches the image's pinned torch/triton/fla/liger toolchain.
 #
 # Secrets: RUNPOD_API_KEY (the warmup GPU pod) + HF_TOKEN (the temp dataset that ferries code + the
-# cache artifact) are pulled from Infisical (/flash, prod) via the bootstrap INFISICAL_CLIENT_ID /
-# CLIENT_SECRET / PROJECT_ID repo secrets; the GHCR push uses the default GITHUB_TOKEN. Heavy + paid,
+# cache artifact) are native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the
+# github-ci-flash Secret Sync; the GHCR push uses the default GITHUB_TOKEN. Heavy + paid,
 # but UNGATED: the fingerprint detection in auto-rebake.yml decides WHEN this runs (only on a real
 # kernel-toolchain change), so there is no manual approval step. Invoked by hand (workflow_dispatch)
 # OR automatically by auto-rebake.yml (workflow_call) when the kernel toolchain changed.
@@ -179,38 +179,25 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: uv sync --extra server
 
-      - name: Install Infisical CLI
-        if: steps.gate.outputs.run == 'true'
-        run: |
-          curl -1sLf 'https://dl.cloudsmith.io/public/infisical/infisical-cli/setup.deb.sh' | sudo -E bash
-          sudo apt-get update && sudo apt-get install -y infisical
-
-      # RUNPOD_API_KEY + HF_TOKEN come from Infisical (/flash, prod) -- mirrors infisical-entrypoint.sh;
-      # the CLI takes the project UUID directly (the secrets-action wants a slug). `env -u
-      # FLASH_CHALK_SPEC` drops any chalk-spec override living in /flash so the bake always warms the
-      # repo-default chalk (the value the fingerprint hashed) -- otherwise the image could be warmed with
-      # one chalk and labeled with another. BASE_IMAGE is digest-pinned so the warm runs inside the EXACT
-      # base the per-arch tag will sit on.
+      # RUNPOD_API_KEY (the warmup GPU pod) + HF_TOKEN (the temp dataset that ferries code/cache) are
+      # native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the github-ci-flash
+      # Secret Sync. No Infisical CLI/login at job time -- Infisical stays the source of truth and
+      # rotations propagate via the sync. FLASH_CHALK_SPEC isn't synced, so bake_kernel_cache.py uses
+      # the repo-default DEFAULT_CHALK_SPEC (the value the fingerprint hashed) automatically. BASE_IMAGE
+      # is digest-pinned so the warm runs inside the EXACT base the per-arch tag will sit on.
       - name: Warm kernels on a RunPod ${{ matrix.sm }} GPU -> build/kernel_cache
         if: steps.gate.outputs.run == 'true'
         env:
-          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
-          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           BASE_IMAGE: ${{ steps.base.outputs.ref }}
         run: |
-          INFISICAL_TOKEN="$(infisical login --method=universal-auth \
-            --client-id="$INFISICAL_CLIENT_ID" --client-secret="$INFISICAL_CLIENT_SECRET" \
-            --silent --plain)"
-          export INFISICAL_TOKEN
-          infisical run --projectId "$INFISICAL_PROJECT_ID" --env prod --path /flash -- \
-            env -u FLASH_CHALK_SPEC \
-            uv run python docker/bake_kernel_cache.py \
-              --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
-              --gpu-type-id "${{ matrix.gpu_type_id }}" \
-              --allowed-cuda "${{ matrix.allowed_cuda }}" \
-              --image "$BASE_IMAGE" \
-              --out build/kernel_cache
+          uv run python docker/bake_kernel_cache.py \
+            --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
+            --gpu-type-id "${{ matrix.gpu_type_id }}" \
+            --allowed-cuda "${{ matrix.allowed_cuda }}" \
+            --image "$BASE_IMAGE" \
+            --out build/kernel_cache
 
       - name: Free disk space
         if: steps.gate.outputs.run == 'true'
