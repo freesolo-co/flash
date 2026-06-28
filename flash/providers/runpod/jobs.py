@@ -1061,13 +1061,10 @@ def worker_flagged_retriable(heartbeat_reader) -> bool:
     return bool(hb.get("retriable"))
 
 
-def surfaced_worker_flags(heartbeat_reader, last_hb_key, say) -> tuple:
-    """ONE forced heartbeat read, shared by progress-surfacing AND the structured failure flags.
-
-    Returns ``(last_hb_key, retriable, oom)``. On a worker-FAILED edge the runner needs both flags —
-    ``retriable`` (retry on a fresh same-size GPU) and ``oom`` (a CUDA OOM -> escalate to a LARGER
-    GPU) — and reading once avoids the redundant HF downloads that separate ``worker_flagged_*`` calls
-    would incur right at the failure point."""
+def surfaced_worker_flags(heartbeat_reader, last_hb_key, say) -> tuple[tuple | None, bool, bool]:
+    """ONE forced heartbeat read shared by progress-surfacing and the two structured failure flags,
+    returning ``(last_hb_key, retriable, oom)`` — ``retriable`` retries a fresh same-size GPU, ``oom``
+    escalates to a larger one. One read avoids redundant HF downloads at the failure edge."""
     hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
     last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
     if not isinstance(hb, dict):

@@ -410,12 +410,11 @@ def _submit_seed_supervised(
         # Retry only on a structured failure category the provider already classified; a real job
         # failure fails fast. No detail-string parsing. (USER cancels are caught below, not here.)
         infra_shaped = res.failure in ("stalled", "no_capacity", "poll_error", "job_preempted")
-        # A CUDA OOM retries too, but on a STRICTLY larger card: record the failed card's VRAM as the
-        # escalation floor for the next attempt's candidate filter. It is NOT infra (the host was
-        # fine), so it must NOT escape the provider (the record block below skips that for oom).
+        # A CUDA OOM retries on a STRICTLY larger card: record the failed VRAM as the escalation floor.
+        # Not infra (the host was fine), so it doesn't escape the provider (record block below).
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
-            oom_vram_floor = max(oom_vram_floor, int(chosen.vram_gb))
+            oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)
         retry_shaped = infra_shaped or oom_shaped
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
@@ -447,13 +446,12 @@ def _submit_seed_supervised(
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
         )
-        # OOM escalation is COST (each retry is a strictly bigger, pricier GPU), so it respects the
-        # user's RAW max_retries — NOT the INFRA_RETRY_FLOOR that lets infra bad-luck retries exceed it
-        # (so max_retries=1 grants ONE larger-GPU attempt, not five). Infra keeps the floored budget.
+        # OOM escalation is COST (a bigger, pricier GPU), so it respects the user's RAW max_retries
+        # (max_retries=1 -> ONE larger attempt), not the INFRA_RETRY_FLOOR that infra retries get.
         retry_budget = max_retries if oom_shaped else infra_budget
-        # "retrying" is true when the budget remains OR a cache-drop fallback will retry this even past
-        # it (first_cache_drop) — else the log would say "not retrying" while the loop actually
-        # continues with the reserved cache-less fallback attempt.
+        # Retry while the budget remains, plus the ONE reserved cache-drop fallback that runs past it
+        # (first_cache_drop): a cache-attached no_capacity/poll_error retries once cache-less on the
+        # wider all-DC pool before the budget applies. A non-retry-shaped failure never retries.
         will_retry = retry_shaped and (walk_attempt < retry_budget or first_cache_drop)
         action = (
             f"retrying on a larger GPU (> {oom_vram_floor} GB)"
@@ -468,13 +466,7 @@ def _submit_seed_supervised(
             file=log,
             flush=True,
         )
-        if not retry_shaped:
-            break
-        # Stop when the GPU-walk retry budget is exhausted — UNLESS a cache-drop fallback is still
-        # available. The bonus attempt granted above is reserved for exactly this transition; once the
-        # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
-        # and the loop cannot spin past its one extra cache-less attempt.
-        if walk_attempt >= retry_budget and not first_cache_drop:
+        if not will_retry:
             break
         if first_cache_drop:
             drop_weight_cache = True
@@ -485,9 +477,8 @@ def _submit_seed_supervised(
             # cheapest GPU without the volume on the wider all-DC pool first — the miss may have been
             # the cache's datacenter set, not the GPU class globally. Only walk if THAT also fails.
         elif chosen is not None:
-            # Record what THIS attempt burned so the next pick avoids it. An infra failure also escapes
-            # the PROVIDER cross-provider; an OOM does NOT (the host was fine — just grow the card,
-            # which the oom_vram_floor filter already enforces).
+            # Record what THIS attempt burned so the next pick avoids it. Infra also escapes the
+            # PROVIDER cross-provider; OOM does not (the host was fine — just grow the card).
             if not oom_shaped:
                 failed_providers.add(chosen.provider)
             tried_classes.add((chosen.provider, chosen.gpu))
