@@ -160,8 +160,14 @@ class JobHandle:
 
     @classmethod
     def from_dict(cls, d: dict) -> JobHandle:
+        # Coerce attempt via _attempt_int (not a bare int()) so a legacy/corrupt non-int value (""/
+        # junk) deserializes to the 0 default instead of crashing attach. The handle field is an int,
+        # so None -> 0; the poll() path separately maps legacy/corrupt to current_attempt=None.
         return cls(
-            d["endpoint_id"], d.get("endpoint_name", ""), d["job_id"], int(d.get("attempt", 0) or 0)
+            d["endpoint_id"],
+            d.get("endpoint_name", ""),
+            d["job_id"],
+            _attempt_int(d.get("attempt")) or 0,
         )
 
 
