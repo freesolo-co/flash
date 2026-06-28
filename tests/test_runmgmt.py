@@ -38,6 +38,37 @@ def test_list_and_cancel(monkeypatch):
         assert same.state in {"dry_run", "cancelled"}
 
 
+def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
+    # A status JSON written by an OLDER control plane can carry a since-removed field (e.g.
+    # `resume_seed_index` from the pre-#317 multi-seed era); `~/.flash/runs/*.json` is never GC'd,
+    # so those files persist across an upgrade. get_status/list_runs must drop unknown keys rather
+    # than 500 (a strict RunStatus(**d) would TypeError, and callers catch only FileNotFoundError).
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        stale = {
+            "run_id": "old",
+            "state": "done",
+            "spec": {},
+            "cost_usd": 2.0,
+            "resume_seed_index": 3,  # removed field
+            "totally_unknown_future_key": "x",  # forward-compat unknown field
+        }
+        os.makedirs(tmp, exist_ok=True)
+        with open(runner.runs_file_path("old", ".json"), "w") as f:
+            json.dump(stale, f)
+
+        s = runner.get_status("old")
+        assert s.run_id == "old" and s.state == "done" and s.cost_usd == 2.0
+        assert not hasattr(s, "resume_seed_index")
+        assert "old" in {r.run_id for r in runner.list_runs()}
+
+
 def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         import flash.runner as runner
