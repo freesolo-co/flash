@@ -425,9 +425,21 @@ def _submit_seed_supervised(
         # NOT infra (the host was fine, the card was just too small), so it must NOT escape the
         # provider (only grow the card); the record block below skips failed_providers for it.
         oom_shaped = res.failure == "oom"
+        oom_no_larger = False
         if oom_shaped and chosen is not None:
             oom_vram_floor = max(oom_vram_floor, int(chosen.vram_gb))
-        retry_shaped = infra_shaped or oom_shaped
+            # If THIS attempt's candidate set has no card strictly larger than the new floor, the run
+            # already OOM'd the biggest class that can run it — escalation is impossible (the catalog
+            # of runnable classes doesn't grow between attempts; only live capacity shifts). Fail
+            # terminally NOW instead of logging "retrying on a larger GPU" and spinning one more
+            # allocate/pass before the top-of-loop _oom_escalated check reaches the same verdict.
+            if alloc is not None and not _oom_escalated(alloc.candidates, oom_vram_floor):
+                oom_no_larger = True
+                last_detail = (
+                    f"oom: the run exceeded the largest available GPU class "
+                    f"({oom_vram_floor} GB) — no larger card to escalate to"
+                )
+        retry_shaped = (infra_shaped or oom_shaped) and not oom_no_larger
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
@@ -463,7 +475,9 @@ def _submit_seed_supervised(
         # continues with the reserved cache-less fallback attempt.
         will_retry = retry_shaped and (walk_attempt < infra_budget or first_cache_drop)
         action = (
-            "not retrying"
+            f"OOM on the largest GPU class ({oom_vram_floor} GB); not retrying"
+            if oom_no_larger
+            else "not retrying"
             if not will_retry
             else f"retrying on a larger GPU (> {oom_vram_floor} GB)"
             if oom_shaped

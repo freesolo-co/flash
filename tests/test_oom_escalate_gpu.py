@@ -25,6 +25,10 @@ def test_is_cuda_oom_matches_the_real_traceback_not_generic_errors():
     # genuine NON-oom training/config errors must NOT escalate (they'd waste a bigger GPU)
     assert is_cuda_oom(ValueError("bad config")) is False
     assert is_cuda_oom(RuntimeError("loss became nan")) is False
+    # an OOM with NO CUDA/Triton context is a host-RAM / other-library OOM — must NOT trigger GPU
+    # escalation just because the substring "out of memory" appears.
+    assert is_cuda_oom(RuntimeError("DataLoader worker (pid 1) killed: out of memory")) is False
+    assert is_cuda_oom(MemoryError("Unable to allocate array: out of memory")) is False
 
 
 def _card(gpu, vram, provider="runpod", price=1.0):
@@ -59,6 +63,42 @@ def test_worker_flagged_oom_reads_the_structured_flag():
     assert worker_flagged_oom(lambda force=False: {"retriable": True}) is False  # not an OOM
     assert worker_flagged_oom(lambda force=False: "not a dict") is False
     assert worker_flagged_oom(None) is False
+
+
+def test_once_forced_reads_underlying_heartbeat_only_once():
+    # A terminal path surfaces the heartbeat AND extracts retriable+oom from it; _once_forced makes
+    # those share ONE underlying force-read (fewer HF round-trips, no cross-snapshot race).
+    from flash.providers.runpod.jobs import (
+        _once_forced,
+        worker_flagged_oom,
+        worker_flagged_retriable,
+    )
+
+    calls = {"n": 0}
+
+    def underlying(force=False):
+        calls["n"] += 1
+        return {"oom": True, "retriable": False}
+
+    reader = _once_forced(underlying)
+    # three logical consumers (surface + 2 flags) -> still one underlying read
+    reader(force=True)
+    assert worker_flagged_oom(reader) is True
+    assert worker_flagged_retriable(reader) is False
+    assert calls["n"] == 1
+    assert _once_forced(None) is None
+
+
+def test_lambda_poller_escalates_oom_for_cross_provider_parity():
+    # The Lambda poller must also map a worker OOM flag to failure="oom" so a Lambda candidate's OOM
+    # escalates to a larger GPU instead of failing fast as job_failed (parity with RunPod's poll_job).
+    src, _ = _src("flash.providers.lambdalabs.jobs", "")
+    # the oom flag is read in BOTH Lambda worker-fail paths (marker + dead-host error_*.txt crash)
+    assert src.count("worker_flagged_oom(heartbeat_reader)") >= 2
+    # marker path: oom wins over the retriable/job_failed split
+    assert 'failure="oom" if oom else ("job_preempted" if retriable else "job_failed")' in src
+    # dead-host crash path: oom takes precedence before the crash/preempt split
+    assert '"job_failed" if worker_crashed else "job_preempted"' in src
 
 
 def _src(modfile_attr, name):
@@ -96,9 +136,12 @@ def test_runner_classifies_oom_as_retriable_and_escalates_vram():
     body = ast.get_source_segment(src, fn)
     # OOM is a retry category (NOT fail-fast) AND it grows the escalation floor
     assert 'oom_shaped = res.failure == "oom"' in body
-    assert "retry_shaped = infra_shaped or oom_shaped" in body
+    assert "infra_shaped or oom_shaped" in body  # OOM joins the retry-shaped categories
     assert "if not retry_shaped:" in body  # the fail-fast break now honors oom too
     assert "oom_vram_floor = max(oom_vram_floor, int(chosen.vram_gb))" in body
     # the next attempt restricts to strictly-larger cards, and an OOM does NOT escape the provider
     assert "_oom_escalated(alloc.candidates, oom_vram_floor)" in body
     assert "if not oom_shaped:" in body  # guards failed_providers.add
+    # an OOM on the largest class terminates immediately (no extra "retrying on a larger GPU" spin)
+    assert "oom_no_larger" in body
+    assert "retry_shaped = (infra_shaped or oom_shaped) and not oom_no_larger" in body

@@ -50,7 +50,14 @@ def is_cuda_oom(exc: BaseException | None, tb_text: str = "") -> bool:
     except Exception:
         pass
     blob = f"{type(exc).__name__ if exc is not None else ''}: {exc}\n{tb_text}".lower()
-    return any(m in blob for m in _CUDA_OOM_MARKERS)
+    if not any(m in blob for m in _CUDA_OOM_MARKERS):
+        return False
+    # An OOM substring alone is not enough: a HOST-RAM OOM or another library's OOM would otherwise
+    # trip the expensive GPU-tier escalation. Require CUDA/Triton context (the typed
+    # torch.cuda.OutOfMemoryError above is the unambiguous fast-path that skips this). The CUDA marker
+    # "cuda_error_out_of_memory" already carries "cuda"; "out of memory"/"outofmemoryerror" must be
+    # accompanied by it.
+    return "cuda" in blob or "triton" in blob
 
 
 def detect_mig_slice() -> str | None:

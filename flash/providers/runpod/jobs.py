@@ -713,10 +713,14 @@ def poll_job(
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:
                 # COMPLETED but the output decodes as an error (a handler exception). Consult the
-                # worker flag too: an infra failure can surface here and must still retry.
-                last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
-                retriable = worker_flagged_retriable(heartbeat_reader)
-                oom = worker_flagged_oom(heartbeat_reader)
+                # worker flag too: an infra failure can surface here and must still retry. Read the
+                # heartbeat ONCE and reuse it for surfacing AND both flag reads — three separate
+                # force-reads added avoidable HF IO and could race (flags from different snapshots if
+                # the heartbeat updated between reads).
+                hb_reader = _once_forced(heartbeat_reader)
+                last_hb_key, _ = surface_forced_heartbeat(hb_reader, last_hb_key, say)
+                retriable = worker_flagged_retriable(hb_reader)
+                oom = worker_flagged_oom(hb_reader)
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
                     False,
@@ -737,10 +741,12 @@ def poll_job(
             # heartbeat read entirely (no worker error there, and it may not even exist yet).
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
-            # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
-            last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
-            retriable = worker_flagged_retriable(heartbeat_reader)
-            oom = worker_flagged_oom(heartbeat_reader)
+            # A worker FAILED: consult the structured worker flag. Read the heartbeat ONCE and reuse
+            # it for surfacing AND both flag reads (avoids redundant HF IO + cross-snapshot races).
+            hb_reader = _once_forced(heartbeat_reader)
+            last_hb_key, _ = surface_forced_heartbeat(hb_reader, last_hb_key, say)
+            retriable = worker_flagged_retriable(hb_reader)
+            oom = worker_flagged_oom(hb_reader)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
                 False,
@@ -1052,6 +1058,24 @@ def make_hf_failure_detail_reader(
         return "\n".join(parts) if parts else None
 
     return read
+
+
+def _once_forced(heartbeat_reader):
+    """Wrap a heartbeat reader so the underlying ``force=True`` read happens AT MOST ONCE, then every
+    call (whatever its ``force`` arg) returns that one snapshot. A terminal path can then surface the
+    heartbeat AND extract the ``retriable``/``oom`` flags from a SINGLE read instead of three — fewer
+    HF round-trips, and no risk of the flags coming from different snapshots if the worker updates the
+    heartbeat mid-sequence. Returns ``None`` when the reader is ``None`` (callers already handle it)."""
+    if heartbeat_reader is None:
+        return None
+    cache: dict = {}
+
+    def reader(force: bool = False):
+        if "hb" not in cache:
+            cache["hb"] = heartbeat_reader(force=True)
+        return cache["hb"]
+
+    return reader
 
 
 def worker_flagged_retriable(heartbeat_reader) -> bool:
