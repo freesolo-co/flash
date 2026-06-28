@@ -38,6 +38,17 @@ def test_nb_buckets_tiny_run_is_single_bucket():
     assert kw.gdn_autotune_nb_buckets(16, kw._L2NORM_NB_GRANULARITY) == [256]
 
 
+def test_nb_buckets_no_overshoot_with_large_head_count():
+    # Each warmed seq must land in EXACTLY its target bucket. With a large num_key_heads the old
+    # max(256, ...) floor could push 256*h past the bucket boundary (e.g. NB=1 -> rows land in NB=2),
+    # silently skipping that [D, NB] key. Every returned seq must map to its 1-based bucket index.
+    for heads in (8, 16, 32, 256, 512):
+        max_rows = 8 * 4096 * heads
+        seqs = kw.gdn_autotune_nb_buckets(heads, max_rows)
+        nbs = [_nb(s, heads) for s in seqs]
+        assert nbs == list(range(1, len(seqs) + 1)), (heads, seqs, nbs)
+
+
 def test_nb_buckets_capped():
     # A pathological (huge) row count can't explode the sweep into dozens of warms.
     seqs = kw.gdn_autotune_nb_buckets(16, 8 * 65536 * 64)

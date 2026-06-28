@@ -325,8 +325,15 @@ def gdn_autotune_nb_buckets(num_key_heads: int, max_rows: int) -> list[int]:
     nb_max = min(nb_max, _MAX_NB_BUCKETS)
     seqs = []
     for nb in range(1, nb_max + 1):
-        # smallest seq with rows just inside bucket nb: rows just above (nb-1)*granularity
-        seq = max(256, (nb - 1) * _L2NORM_NB_GRANULARITY // h + 64)
+        lo = (nb - 1) * _L2NORM_NB_GRANULARITY  # rows must exceed this to land in bucket nb
+        # smallest seq whose flattened rows (seq*h) fall STRICTLY above lo -> exactly NB == nb
+        seq = max(1, -(-(lo + 1) // h))  # ceil((lo + 1) / h)
+        # Prefer a 256-token floor (cheap; avoids absurdly tiny warm shapes), but ONLY when it stays
+        # inside bucket nb: with a large num_key_heads, 256*h can overshoot into a LATER bucket, which
+        # would silently skip this [D, NB] key and leave it cold to benchmark at train time. Keep the
+        # exact smallest seq in that case so every bucket 1..nb_max is covered without gaps.
+        if seq < 256 and 256 * h <= nb * _L2NORM_NB_GRANULARITY:
+            seq = 256
         seqs.append(int(seq))
     return seqs
 
