@@ -1576,9 +1576,11 @@ def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
     def checking_validate(repository):
         # The payload validation runs BEFORE owned_run; assert it too is inside the lock, so the GC
         # cannot delete the source during the (cheap, local) body validation.
-        seen["locked_during_validation"] = (
-            app_mod._deploy_lock(run_id).acquire(blocking=False) is False
-        )
+        lk = app_mod._deploy_lock(run_id)
+        acquired = lk.acquire(blocking=False)
+        seen["locked_during_validation"] = not acquired
+        if acquired:
+            lk.release()
         return real_validate(repository)
 
     def checking_owned_run(rid, k):
