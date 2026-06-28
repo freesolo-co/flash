@@ -464,11 +464,9 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        # A CUDA OOM means this card was too small -> stamp a structured ``oom`` flag so the runner
-        # retries on a strictly larger GPU (not infra; not a re-roll of the same size). Classified off
-        # torch's typed OutOfMemoryError + its num_ooms counter, never the message. ``not retriable``
-        # FIRST (short-circuit): a RetriableInfraError (e.g. wait_for_gpu readiness, possibly because
-        # CUDA isn't healthy) retries same-size, so don't even probe torch/memory_stats for it.
+        # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Gate on ``not
+        # retriable`` first so an infra error (same-size retry) is never reclassified as oom — oom wins
+        # over retriable in the poller, which would otherwise escalate a same-size retry to a bigger card.
         oom = not retriable and is_cuda_oom(e)
         hb_flags = {"retriable": retriable, "oom": oom}
         try:
