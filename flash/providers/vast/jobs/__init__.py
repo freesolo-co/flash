@@ -20,6 +20,7 @@ this ``__init__`` so a ``monkeypatch.setattr(jobs, …)`` still takes effect.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import json
 import time
 from collections.abc import Callable
@@ -579,16 +580,24 @@ def poll_vast_job(
         try:
             inst = vast_api.get_instance(handle.instance_id)
             poll_errors.reset()
-        except (vast_api.VastApiError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        except (
+            vast_api.VastApiError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            http.client.HTTPException,
+        ) as e:
             # A transient MALFORMED 200 body from the instance-detail API (truncated / non-JSON /
-            # invalid-UTF8) makes ``RestClient.request`` raise JSONDecodeError/UnicodeDecodeError, NOT a
-            # VastApiError — the _http retry wrapper only catches the OSError-family transients, so a
-            # decode failure escapes get_instance's ``except VastApiError`` raw. Without catching it here
-            # it would ESCAPE the poll loop and a recoverable read blip would be misclassified (e.g. as a
-            # terminal/gone instance). A malformed status read is a TRANSIENT poll error: count it
-            # against the poll-error budget and keep polling, exactly like a VastApiError. (UnicodeDecode
-            # Error is a sibling of JSONDecodeError under ValueError that json.loads raises on invalid-UTF8
-            # bytes; the JSONDecodeError clause alone would miss it.) (Codex)
+            # invalid-UTF8) makes ``RestClient.request`` raise JSONDecodeError/UnicodeDecodeError/
+            # http.client.HTTPException, NOT a VastApiError — the _http retry wrapper only catches the
+            # OSError-family transients, so a decode/incomplete-read failure escapes get_instance's
+            # ``except VastApiError`` raw. Without catching it here it would ESCAPE the poll loop and a
+            # recoverable read blip would be misclassified (e.g. as a terminal/gone instance). A malformed
+            # status read is a TRANSIENT poll error: count it against the poll-error budget and keep
+            # polling, exactly like a VastApiError. (UnicodeDecodeError is a sibling of JSONDecodeError
+            # under ValueError that json.loads raises on invalid-UTF8 bytes; the JSONDecodeError clause
+            # alone would miss it. http.client.HTTPException covers IncompleteRead from a truncated
+            # ``resp.read()`` — also not an OSError, so the _http retry wrapper lets it through raw;
+            # the create/ambiguous-create paths in vast.api already treat it the same way.) (Codex/Cursor)
             if poll_errors.record(e):
                 return PollResult(False, failure="poll_error", detail=str(e))
             continue

@@ -9,6 +9,7 @@ API entirely, so no key is needed.
 from __future__ import annotations
 
 import base64
+import http.client
 import itertools
 import json
 
@@ -468,14 +469,18 @@ def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
     [
         json.JSONDecodeError("Expecting value", "<malformed>", 0),
         UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        # IncompleteRead (subclass of http.client.HTTPException) from a truncated ``resp.read()``: also
+        # not an OSError, so the _http retry wrapper lets it through raw, same as the decode errors.
+        http.client.IncompleteRead(b"partial"),
     ],
 )
 def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
-    # Codex: a transient MALFORMED 200 body from the instance-detail API makes RestClient.request raise
-    # JSONDecodeError/UnicodeDecodeError (NOT a VastApiError — the _http wrapper only catches the
-    # OSError-family transients). The poll loop must treat that as a TRANSIENT poll error (count + keep
-    # polling, give up only once the budget is spent), never let it escape and misclassify a recoverable
-    # read blip as a terminal/gone instance.
+    # Codex/Cursor: a transient MALFORMED 200 body from the instance-detail API makes RestClient.request
+    # raise JSONDecodeError/UnicodeDecodeError, or IncompleteRead/http.client.HTTPException on a truncated
+    # body read (NOT a VastApiError — the _http wrapper only catches the OSError-family transients). The
+    # poll loop must treat all of those as a TRANSIENT poll error (count + keep polling, give up only once
+    # the budget is spent), never let it escape and misclassify a recoverable read blip as a terminal/gone
+    # instance.
     from flash.providers import _poll
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
