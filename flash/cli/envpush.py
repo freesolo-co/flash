@@ -26,6 +26,53 @@ def _err(msg: str) -> int:
     return 1
 
 
+def cmd_env_delete(args) -> int:
+    import re
+
+    from flash.client import ClientError, client_from_config
+    from flash.envs.adapter import is_managed_environment_slug
+
+    # Delete only targets MANAGED hub ids ("namespace/name") — not github: refs or local paths, which
+    # don't live on the hub. And enforce the hub's canonical form (lowercase, no surrounding
+    # whitespace) BEFORE the network call: the server's slug validator is lowercase-only, so a
+    # mixed-case / padded id would otherwise make a pointless request and return a confusing 400.
+    env_id = (args.env_id or "").strip()
+    if not is_managed_environment_slug(env_id):
+        return _err(
+            f'env id must be a managed Freesolo hub id "namespace/name" (got {args.env_id!r}); '
+            "github refs and local paths can't be deleted from the hub"
+        )
+    if env_id != env_id.lower() or not all(
+        re.fullmatch(r"[a-z0-9._-]+", part) for part in env_id.split("/")
+    ):
+        return _err(
+            f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
+        )
+    if not getattr(args, "yes", False):
+        prompt = f"delete environment {env_id}? this removes it from the hub [y/N] "
+        try:
+            answer = input(render.warn(prompt) if render.styled() else prompt)
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("aborted; environment not deleted", file=sys.stderr)
+            return 1
+    try:
+        result = client_from_config().delete_env(env_id)
+    except ClientError as exc:
+        return _err(str(exc))
+    # A missing env deletes to `deleted: false` (idempotent); default True so an older server that
+    # omits the field still reads as success.
+    deleted = bool(result.get("deleted", True))
+    msg = (
+        f"deleted {env_id}"
+        if deleted
+        else f"{env_id} was not found on the hub (already deleted)"
+    )
+    print(render.ok(msg) if render.styled() else msg)
+    return 0
+
+
 _ENV_ENTRYPOINT = "environment.py"
 _ENV_PUSH_IGNORED_NAMES = frozenset(
     {
