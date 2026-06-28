@@ -161,7 +161,6 @@ def recover_runs() -> None:
         _run_job_background,
         _update,
         attach_run,
-        resume_run,
     )
 
     active: set[str] = set()
@@ -180,10 +179,6 @@ def recover_runs() -> None:
             # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
-        elif status.resume_seed_index is not None:
-            # Restarted between seeds: resume the remaining seeds, preserving the finished ones.
-            active.add(status.run_id)
-            threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
             # No handle yet: the restart hit the submit->provisioning window, so no worker exists.
             # A spec that won't parse can never be resubmitted -> mark it terminally failed

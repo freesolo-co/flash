@@ -42,7 +42,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k", "params": {"max_examples": 8}},
-    "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
+    "train": {"steps": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 

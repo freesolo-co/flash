@@ -130,7 +130,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"seeds": [0], **knobs},
+            "train": {**knobs},
         }
     )
     monkeypatch.setattr(w, "JOB_SPEC", spec)
@@ -141,7 +141,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py", "params": {"grpo_config": knobs}},
-            "train": {"seeds": [0]},
+            "train": {},
         }
     )
     monkeypatch.setattr(w, "JOB_SPEC", poisoned)
@@ -155,7 +155,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"seeds": [0], "group_size": 2},
+                "train": {"group_size": 2},
             }
         ),
     )
@@ -181,7 +181,6 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "steps": 10,
             "hf_repo": "owner/runs",
             "group_size": 4,
@@ -297,18 +296,17 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "steps": 10,
             "hf_repo": "owner/runs",
-            "init_from_adapter": "Freesolo-Co/flashrun-run-x:sft/run-x/seed0",
+            "init_from_adapter": "Freesolo-Co/flashrun-run-x:sft/run-x",
         },
     }
     spec = spec_from_dict(raw, run_id="grpo-x")
-    assert spec.train.init_from_adapter == "Freesolo-Co/flashrun-run-x:sft/run-x/seed0"
+    assert spec.train.init_from_adapter == "Freesolo-Co/flashrun-run-x:sft/run-x"
     # survives the JSON round-trip the worker reconstructs from
     assert (
         JobSpec.from_dict(spec.to_dict()).train.init_from_adapter
-        == "Freesolo-Co/flashrun-run-x:sft/run-x/seed0"
+        == "Freesolo-Co/flashrun-run-x:sft/run-x"
     )
     # absent -> empty string (train fresh from base)
     raw["train"].pop("init_from_adapter")
@@ -322,7 +320,6 @@ def test_init_from_adapter_rejects_repo_without_status_prefix() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "steps": 10,
             "init_from_adapter": "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff",
         },
@@ -344,7 +341,7 @@ def test_init_from_adapter_rejects_invalid_shape_or_path_traversal_ref(bad_adapt
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
-        "train": {"seeds": [0], "steps": 10, "init_from_adapter": bad_adapter_ref},
+        "train": {"steps": 10, "init_from_adapter": bad_adapter_ref},
     }
     with pytest.raises(ConfigError, match="full adapter_ref emitted by `flash status`"):
         spec_from_dict(raw, run_id="grpo-x")
@@ -365,7 +362,6 @@ def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "steps": 10,
             "init_from_adapter": bad_ref,
         },
@@ -382,7 +378,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "train": {"seeds": [0], "steps": 10},
+        "train": {"steps": 10},
     }
     # absent -> fine (no longer required); left blank for the control plane to assign
     spec = spec_from_dict(raw, run_id="hf-x")
@@ -390,7 +386,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == ""
     # user-supplied -> ignored (the control plane overrides it at submit)
     spec2 = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": "someone-else/their-repo"}},
+        {**raw, "train": {"steps": 10, "hf_repo": "someone-else/their-repo"}},
         run_id="hf-y",
     )
     assert spec2.train.hf_repo == ""
@@ -407,7 +403,6 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "seeds": [0],
             "hf_repo": "owner/runs",
             "learning_rate": 3e-5,
             "batch_size": 16,
@@ -427,26 +422,26 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         assert s.train.stop_sequences == ("</answer>", "\n\n")
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
     bare = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs"}}, run_id="grpo-w"
+        {**raw, "train": {"hf_repo": "owner/runs"}}, run_id="grpo-w"
     )
     assert bare.train.learning_rate is None
     assert bare.train.batch_size is None
     assert bare.train.stop_sequences == ()
     # a bare-string stop_sequences is ONE stop, never split into characters
     one = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": "</answer>"}},
+        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": "</answer>"}},
         run_id="grpo-s",
     )
     assert one.train.stop_sequences == ("</answer>",)
     assert JobSpec.from_dict(one.to_dict()).train.stop_sequences == ("</answer>",)
     # an empty string means "no stop configured" -> (), not ("",); empty list entries drop
     empty = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": ""}},
+        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": ""}},
         run_id="grpo-e",
     )
     assert empty.train.stop_sequences == ()
     dropped = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": ["x", ""]}},
+        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": ["x", ""]}},
         run_id="grpo-d",
     )
     assert dropped.train.stop_sequences == ("x",)
@@ -619,7 +614,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
     ]
     for bad in bad_cases:
         with pytest.raises(ConfigError):
-            spec_from_dict({**base, "train": {"seeds": [0], **bad}}, run_id="bad")
+            spec_from_dict({**base, "train": {**bad}}, run_id="bad")
 
 
 def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
@@ -637,11 +632,11 @@ def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
     }
     for bad in ({"steps": 1.5}, {"epochs": 2.5}, {"steps": 0}, {"epochs": -1}):
         with pytest.raises(ConfigError):
-            spec_from_dict({**base, "train": {"seeds": [0], "hf_repo": "o/r", **bad}}, run_id="bad")
+            spec_from_dict({**base, "train": {"hf_repo": "o/r", **bad}}, run_id="bad")
 
     # Genuine integers still parse and round-trip.
     spec = spec_from_dict(
-        {**base, "train": {"seeds": [0], "hf_repo": "o/r", "steps": 10, "epochs": 3}},
+        {**base, "train": {"hf_repo": "o/r", "steps": 10, "epochs": 3}},
         run_id="ok",
     )
     assert spec.train.steps == 10
@@ -693,7 +688,7 @@ def test_grpo_masks_truncated_completions_by_default() -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "owner/env"},
-            "train": {"seeds": [0]},
+            "train": {},
         }
     )
     assert w.grpo_mask_truncated_completions(spec.train) is True
@@ -712,7 +707,7 @@ def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "owner/env"},
-            "train": {"seeds": [0], "stop_sequences": ["</answer>"]},
+            "train": {"stop_sequences": ["</answer>"]},
         }
     )
     assert spec.train.stop_sequences == ("</answer>",)
