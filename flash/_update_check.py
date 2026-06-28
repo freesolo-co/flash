@@ -1,23 +1,4 @@
-"""Background "a new release is available" notice for the `flash` CLI.
-
-The client CLI is pure standard library (no extra deps), so this is too: it queries PyPI
-with ``urllib`` and compares the published version against the installed ``__version__``.
-
-Design constraints that keep it from ever getting in the way:
-
-- **Stays out of the way.** The PyPI lookup runs in a daemon thread (so it overlaps the
-  command) and every failure (offline, timeout, bad JSON) is swallowed. Only the once-a-day
-  refresh waits briefly for that thread; every other command builds the notice from cache with
-  zero network I/O.
-- **Cached once per day.** The latest version is stored in ``~/.flash/update_check.json``;
-  we only hit PyPI when that cache is older than :data:`_CHECK_INTERVAL_S`. The check time is
-  stamped synchronously before the lookup so the daily back-off holds even if the worker thread
-  is killed at process exit before it records a result.
-- **stderr only, TTY only.** The notice prints to stderr (never stdout), so it can't corrupt
-  JSON piped to ``jq`` or captured output, and it's suppressed entirely when stderr isn't a
-  terminal (pipes, redirects, CI, tests). Color is dropped when ``NO_COLOR`` is set.
-- **Opt-out.** Set ``FLASH_NO_UPDATE_CHECK=1`` to disable the check and notice completely.
-"""
+"""Background "a new release is available" notice for the `flash` CLI."""
 
 from __future__ import annotations
 
@@ -39,32 +20,23 @@ from flash.client.config import CONFIG_DIR
 
 logger = get_logger("flash.update_check")
 
-# The PyPI distribution name (== pyproject `name`) and the command that upgrades it. Follows the
-# installed channel (freesolo-flash, or freesolo-flash-dev for the dev build) — see flash/_channel.py.
 PACKAGE_NAME = DIST_NAME
 UPGRADE_COMMAND = f"uv tool upgrade {PACKAGE_NAME}"
 _PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
 
 CACHE_PATH = CONFIG_DIR / "update_check.json"
 
-# Re-check PyPI at most once a day; the notice itself is shown on every command from cache.
 _CHECK_INTERVAL_S = 24 * 60 * 60
-# How long the lookup may take, and how long the once-a-day refresh waits for it at the end of a
-# command. Keep the join >= the fetch timeout so the worker thread finishes (and records its
-# result) within the wait instead of being killed at process exit mid-write.
+# join >= fetch timeout so the worker finishes writing before process exit kills it.
 _FETCH_TIMEOUT_S = 1.5
 _JOIN_TIMEOUT_S = 2.0
 
 _OPT_OUT_ENV = "FLASH_NO_UPDATE_CHECK"
 
-# A PEP 440 version only uses this charset. We reject anything else (control chars, ANSI escape
-# sequences, newlines) before printing the value to a terminal, so a poisoned cache or a hostile
-# response can't inject escape codes into the notice. The length bound is just a sanity cap.
+# Reject anything outside the PEP 440 charset before printing — prevents escape-code injection.
 _SAFE_VERSION = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9.+!_-]{0,63}\Z")
 
-# A coarse subset of the PEP 440 grammar: the numeric release plus optional pre/post/dev markers.
-# Enough to order the simple versions this package ships and to spot pre-releases; this is not a
-# full PEP 440 implementation (the stdlib-only client can't depend on `packaging`).
+# Coarse PEP 440 subset; stdlib-only client can't depend on `packaging`.
 _VERSION_RE = re.compile(
     r"""\A\s*v?
         (?P<release>\d+(?:\.\d+)*)
@@ -77,14 +49,12 @@ _VERSION_RE = re.compile(
 
 
 def _enabled() -> bool:
-    """The whole feature is off unless stderr is a TTY and the user hasn't opted out."""
+    """Off unless stderr is a TTY and the user hasn't opted out."""
     if os.environ.get(_OPT_OUT_ENV):
         return False
     try:
         return bool(sys.stderr.isatty())
     except Exception:
-        # stderr may be detached/closed/replaced (e.g. some embedded contexts); any failure
-        # here is treated as "not a TTY" so the check can never crash a command.
         return False
 
 
@@ -97,13 +67,7 @@ def _normalize_release(release: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def _version_key(version: str) -> tuple[tuple[int, ...], int, int]:
-    """A coarse PEP 440 sort key ``(release, final_rank, post)`` where higher means newer.
-
-    The release segment is normalized (``1.0 == 1.0.0``). A pre-release/dev version ranks below
-    the final release of the same number (``final_rank`` 0 vs 1); a post-release ranks above it
-    via ``post``. Epochs and local versions are ignored — the catalog ships only simple versions.
-    Returns an empty release for unparseable input, which compares as "older than everything".
-    """
+    """Sort key ``(release, final_rank, post)`` where higher means newer."""
     match = _VERSION_RE.match(version or "")
     if not match:
         return ((), 1, 0)
@@ -127,19 +91,12 @@ def _is_newer(latest: str, current: str) -> bool:
 
 
 def _clean_version(value: object) -> str | None:
-    """Return ``value`` only if it's a safe, escape-free version string, else ``None``.
-
-    Guards both the PyPI response and the on-disk cache: ``_version_key`` parses just the
-    numeric/marker prefix, so without this an injected suffix (ANSI codes, newlines) could reach
-    the terminal. Non-strings (and anything outside the PEP 440 charset) are rejected.
-    """
+    """Return ``value`` if it's a safe version string, else ``None``."""
     return value if isinstance(value, str) and _SAFE_VERSION.match(value) else None
 
 
 def _read_cache() -> dict:
-    # read_json_or_empty returns whatever the file parses to; a non-object (e.g. ``[]``) would
-    # make the ``.get()`` callers raise, and _check_due runs before main()'s error handling — so
-    # coerce anything that isn't a dict back to an empty one.
+    # Coerce non-dict results (e.g. []) since _check_due runs before main()'s error handling.
     cache = read_json_or_empty(CACHE_PATH)
     return cache if isinstance(cache, dict) else {}
 
@@ -168,21 +125,13 @@ def _fetch_latest_version(timeout: float = _FETCH_TIMEOUT_S) -> str | None:
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         logger.debug("update check: PyPI lookup failed: %s", exc)
         return None
-    # Expected shape is {"info": {"version": ...}}; tolerate anything else (a proxy error page,
-    # ``[]``, ``{"info": null}``, ...) instead of letting a dereference raise into the caller.
     info = payload.get("info") if isinstance(payload, dict) else None
     version = info.get("version") if isinstance(info, dict) else None
     return _clean_version(version)
 
 
 def _stamp_check_time() -> None:
-    """Record "checked just now" (keeping any cached version), synchronously and best-effort.
-
-    Done before the background lookup starts so the daily back-off holds even if the daemon worker
-    is killed at process exit before it records its own result — otherwise a stale/missing cache
-    would make every command re-run (and wait on) the lookup. Never raises (runs before main()'s
-    error handling).
-    """
+    """Record "checked just now" synchronously so the daily back-off holds even if the daemon is killed."""
     with contextlib.suppress(Exception):
         cache = _read_cache()
         cache["checked_at"] = time.time()
@@ -190,11 +139,7 @@ def _stamp_check_time() -> None:
 
 
 def _refresh_cache() -> None:
-    """Fetch from PyPI and persist the version on success; runs in a daemon thread, never raises.
-
-    The attempt time is already stamped by :func:`_stamp_check_time`, so a failed lookup just
-    returns and lets the daily back-off (set there) stand.
-    """
+    """Fetch from PyPI and persist the version; runs in a daemon thread, never raises."""
     try:
         latest = _fetch_latest_version()
         if not latest:
@@ -203,7 +148,7 @@ def _refresh_cache() -> None:
         cache["checked_at"] = time.time()
         cache["pypi_version"] = latest
         secure_json_write(CACHE_PATH, cache)
-    except Exception as exc:  # truly never let a background thread escape
+    except Exception as exc:
         logger.debug("update check: refresh failed: %s", exc)
 
 
@@ -218,7 +163,6 @@ def _red(text: str) -> str:
 def _build_notice() -> str | None:
     """Build the upgrade notice from the cached PyPI version, or ``None`` if up to date."""
     latest = _clean_version(_read_cache().get("pypi_version"))
-    # Only nudge toward stable releases: never advertise a pre-release (rc/dev) as an upgrade.
     if not latest or _is_prerelease(latest) or not _is_newer(latest, __version__):
         return None
     return _red(
@@ -228,38 +172,26 @@ def _build_notice() -> str | None:
 
 
 def maybe_start_update_check() -> threading.Thread | None:
-    """Kick off a background PyPI refresh if one is due. Returns the thread (or ``None``).
-
-    Pass the return value to :func:`emit_update_notice`. No-ops (returns ``None``) when the
-    feature is disabled or the cached check is still fresh, so the common path is free.
-    """
+    """Kick off a background PyPI refresh if one is due; returns the thread (or ``None``)."""
     if not _enabled() or not _check_due(time.time()):
         return None
-    # Stamp the attempt synchronously before spawning the worker, so the daily back-off holds even
-    # if the daemon is killed at process exit before it writes (see _stamp_check_time).
     _stamp_check_time()
     thread = threading.Thread(target=_refresh_cache, name="flash-update-check", daemon=True)
     try:
         thread.start()
     except RuntimeError:
-        # can't spawn a thread (e.g. interpreter shutting down) — skip the check silently.
         return None
     return thread
 
 
 def emit_update_notice(notifier: threading.Thread | None = None) -> None:
-    """Print the upgrade notice (if any) to stderr at the end of a command.
-
-    Briefly waits for an in-flight refresh so a freshly fetched version can be shown the same
-    run; if it doesn't finish in time we just use whatever is already cached.
-    """
+    """Print the upgrade notice (if any) to stderr at the end of a command."""
     if not _enabled():
         return
     if notifier is not None:
         with contextlib.suppress(RuntimeError):
             notifier.join(timeout=_JOIN_TIMEOUT_S)
-    # This runs from main()'s finally block, so it must never raise: a broken pipe
-    # (`flash ... | head`), full disk, or closed stderr would otherwise crash the command.
+    # Must never raise: broken pipe or closed stderr would crash the command.
     with contextlib.suppress(Exception):
         notice = _build_notice()
         if notice:

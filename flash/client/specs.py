@@ -1,8 +1,4 @@
-"""Turn a locally validated JobSpec into the payload sent to the control plane.
-
-The client fills default pip requirements for Freesolo environments unless the
-config provided an explicit ``[environment] pip`` escape hatch.
-"""
+"""Turn a locally validated JobSpec into the payload sent to the control plane."""
 
 from __future__ import annotations
 

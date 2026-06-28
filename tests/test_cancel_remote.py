@@ -136,6 +136,41 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     assert out.deployment["state"] == "undeployed"
 
 
+def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path, monkeypatch):
+    # Race: cancel_run enters on a non-`deployed` snapshot (state="running"), but a deploy lands during
+    # teardown (running -> done -> deployed) before the terminal `cancelled` write. `deployed` is
+    # non-terminal so `cancelled` still wins, but the entry-gated undeploy never ran. cancel_run must
+    # re-read post-write and tear down the raced-in deployment so it is never orphaned.
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-racein"})
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+
+    undeployed: list[str] = []
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda rid, *a, **k: undeployed.append(rid) or ["x"]
+    )
+    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+
+    # Inject the deploy race at the last step before the terminal write (after the entry snapshot).
+    real_gc = orch._gc_run_endpoints
+
+    def gc_then_deploy(s):
+        real_gc(s)
+        orch.mark_deployed(spec.run_id, {"state": "ready", "gpu": "RTX 5090"})
+
+    monkeypatch.setattr(orch, "_gc_run_endpoints", gc_then_deploy)
+
+    out = orch.cancel_run(spec.run_id)
+    assert out.state == "cancelled"
+    assert undeployed == [spec.run_id], "the raced-in deployment must be torn down, not orphaned"
+    assert (out.deployment or {}).get("state") == "undeployed"
+
+
 def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, monkeypatch):
     # Regression: the deployed branch used a bare _save_status OUTSIDE _STATUS_LOCK, which
     # persisted a stale pre-teardown snapshot and bypassed serialization. It must instead
@@ -432,7 +467,13 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
         run_id=spec.run_id,
         state="running",
         spec=spec.to_dict(),
-        remote={"provider": "runpod", "endpoint_id": "ep-1", "job_id": "job-1"},
+        remote={
+            "provider": "runpod",
+            "endpoint_id": "ep-1",
+            "endpoint_name": "n",
+            "job_id": "job-1",
+            "attempt": 0,
+        },
     )
     orch._save_status(st)
 
@@ -476,7 +517,13 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
         run_id=spec.run_id,
         state="running",
         spec=spec.to_dict(),
-        remote={"provider": "runpod", "endpoint_id": "ep-1", "job_id": "job-1"},
+        remote={
+            "provider": "runpod",
+            "endpoint_id": "ep-1",
+            "endpoint_name": "n",
+            "job_id": "job-1",
+            "attempt": 0,
+        },
     )
     orch._save_status(st)
 
