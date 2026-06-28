@@ -537,6 +537,40 @@ def _submit_seed_supervised(
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
 
 
+def _touch_warmstart_source(spec: JobSpec) -> None:
+    """Refresh a managed warm-start SOURCE repo's ``last_modified`` so the repo GC's age gate spares
+    it while THIS run depends on it.
+
+    A run can ``init_from_adapter = "<owner>/<repo>:<phase>/<run_id>"`` from a prior managed run's
+    adapter, which the worker ``snapshot_download``s at boot. The GC deletes undeployed ``flashrun-*``
+    repos older than 30 days, and the source's ISSUING control plane may differ from this one
+    (multi-plane), so a purely-local protected set on this plane can't shield it. Writing a small
+    marker into the source repo bumps its HF ``last_modified`` — shared state that EVERY plane's GC
+    reads — age-resetting it for another GC window, long enough for this run to fetch it. Best-effort:
+    if the source is already gone the failure surfaces at worker boot (where it would anyway)."""
+    from flash.runner import _ARTIFACT_NAMESPACE
+
+    ref = (spec.train.init_from_adapter or "").strip()
+    if ":" not in ref:
+        return
+    source_repo = ref.split(":", 1)[0]
+    # Only managed per-run artifact repos are ever GC'd; a user/base ref needs no touch.
+    if not source_repo.startswith(f"{_ARTIFACT_NAMESPACE}/flashrun-"):
+        return
+    import io
+
+    from huggingface_hub import HfApi
+
+    with contextlib.suppress(Exception):
+        HfApi(token=os.environ.get("HF_TOKEN")).upload_file(
+            path_or_fileobj=io.BytesIO(spec.run_id.encode()),
+            path_in_repo=f"referenced_by/{spec.run_id}",
+            repo_id=source_repo,
+            repo_type="dataset",
+            commit_message=f"warm-start reference from {spec.run_id}",
+        )
+
+
 def _run_job_inner(
     spec: JobSpec,
     log_path: str,
@@ -546,6 +580,10 @@ def _run_job_inner(
     from flash.runner import _run_training, _RunCancelled, _update, get_status
 
     try:
+        # Keep a warm-start SOURCE repo alive against the repo GC's age gate while we depend on it
+        # (cross-plane-safe: bumps the source's shared HF last_modified). Before upload_code so the
+        # source is protected as early as possible.
+        _touch_warmstart_source(spec)
         # Ship the flash package to the run's HF repo (the per-run [train] hf_repo) so the GPU
         # worker — which fetches code/** from that same repo — can run it.
         upload_code(spec.train.hf_repo)

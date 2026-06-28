@@ -45,16 +45,14 @@ def is_cuda_oom(exc: BaseException | None) -> bool:
     torch's typed ``OutOfMemoryError`` or its ``num_ooms`` allocator counter having advanced. A host
     ``MemoryError`` is never a GPU OOM (a bigger card can't fix it). The worker calls this on its live
     exception and stamps an ``oom`` heartbeat flag so the runner retries on a larger GPU."""
-    # No exception object => nothing to classify. Never fall through to the ``num_ooms`` counter for a
-    # missing exception: a stray non-zero counter (e.g. an OOM the run already recovered from) must not
-    # classify "no error" as an OOM and trigger a spurious larger-GPU escalation.
-    if exc is None:
-        return False
-    if isinstance(exc, MemoryError):
+    # No exception object => nothing to classify; never fall through to the ``num_ooms`` counter for a
+    # missing exception (a stray non-zero counter, e.g. an OOM the run already recovered from, must not
+    # classify "no error" as an OOM and trigger a spurious larger-GPU escalation). A host ``MemoryError``
+    # is RAM, not VRAM — a bigger card can't fix it.
+    if exc is None or isinstance(exc, MemoryError):
         return False
     try:
         import torch
-
         if isinstance(exc, torch.cuda.OutOfMemoryError):
             return True
     except Exception:

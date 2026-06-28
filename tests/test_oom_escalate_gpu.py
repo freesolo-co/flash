@@ -60,16 +60,35 @@ def test_oom_escalated_keeps_only_strictly_larger_cards():
     assert _oom_escalated(cands, 180) == []  # OOM'd the biggest -> nowhere larger
 
 
-def test_worker_flagged_oom_reads_the_flag():
-    from flash.providers.runpod.jobs import _oom_from_hb, worker_flagged_oom
+def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
+    from flash.providers.runpod.jobs import surfaced_worker_flags
 
-    assert worker_flagged_oom(lambda force=False: {"oom": True}) is True
-    assert worker_flagged_oom(lambda force=False: {"oom": False}) is False
-    assert worker_flagged_oom(lambda force=False: {"retriable": True}) is False
-    assert worker_flagged_oom(None) is False
-    # Stale-heartbeat gate: the seed heartbeat path is SHARED across attempts, so a prior attempt's
-    # lingering {"oom": true} must NOT be honored for a DIFFERENT attempt — trust it only when the
-    # heartbeat's own worker-stamped `attempt` (a str env var) matches the attempt being polled.
+    say = lambda _m: None  # noqa: E731
+    reads = {"n": 0}
+
+    def reader(force=False):
+        reads["n"] += 1
+        return {"oom": True, "retriable": False, "stage": "rl_train"}
+
+    _key, retriable, oom = surfaced_worker_flags(reader, None, say)
+    assert (retriable, oom) == (False, True)
+    assert reads["n"] == 1  # surfacing + both flags share ONE forced read
+    assert surfaced_worker_flags(lambda force=False: {"retriable": True}, None, say)[1:] == (True, False)
+    assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
+    # A prior attempt's lingering {"oom": true} must NOT be honored for a DIFFERENT attempt: when the
+    # caller passes the attempt it is polling, trust the oom flag only when the heartbeat's own
+    # worker-stamped `attempt` matches (retriable is NOT attempt-gated — see surfaced_worker_flags).
+    stale = lambda force=False: {"oom": True, "attempt": "0", "retriable": False}  # noqa: E731
+    assert surfaced_worker_flags(stale, None, say, 0)[1:] == (False, True)  # this attempt's own flag
+    assert surfaced_worker_flags(stale, None, say, 1)[1:] == (False, False)  # STALE prior-attempt flag
+
+
+def test_oom_from_hb_attempt_gates_stale_flag():
+    from flash.providers.runpod.jobs import _oom_from_hb
+
+    # The seed heartbeat path is SHARED across attempts, so a prior attempt's lingering {"oom": true}
+    # must not escalate a fresh non-OOM failure — gate on the heartbeat's own worker-stamped `attempt`
+    # (a str env var) matching the attempt being polled.
     assert _oom_from_hb({"oom": True, "attempt": "0"}, 0) is True  # this attempt's own flag
     assert _oom_from_hb({"oom": True, "attempt": "0"}, 1) is False  # STALE prior-attempt flag
     assert _oom_from_hb({"oom": True, "attempt": "1"}, 1) is True
@@ -117,11 +136,23 @@ def test_worker_stamps_oom_flag():
 def test_poller_maps_oom_flag_to_oom_failure():
     src = _read("flash.providers.runpod.jobs")
     assert src.count('"oom" if oom else') == 2  # oom wins in both worker-fail paths
-    assert "def worker_flagged_oom" in src
-    # Both worker-fail paths attempt-GATE the oom flag (stale prior-attempt heartbeat can't escalate),
-    # and submit_run forwards the attempt being polled so the gate has something to match against.
-    assert src.count("_oom_from_hb(hb, current_attempt)") == 2
-    assert "current_attempt=int(attempt)" in src
+    assert "def surfaced_worker_flags" in src  # single-read helper feeds both paths
+    assert "def _oom_from_hb" in src  # the attempt-gating helper exists
+    assert "_oom_from_hb(hb, current_attempt)" in src  # surfaced_worker_flags gates the oom flag
+    assert "current_attempt=int(attempt)" in src  # submit_run forwards the polled attempt
+    # Both worker-fail poll paths thread the attempt being polled into the single-read helper so a
+    # stale prior-attempt heartbeat can't escalate (AST: surfaced_worker_flags is called twice and each
+    # call forwards a ``current_attempt`` positional arg — robust to formatting/reflow).
+    calls = [
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "surfaced_worker_flags"
+    ]
+    assert len(calls) == 2
+    for c in calls:
+        assert any(isinstance(a, ast.Name) and a.id == "current_attempt" for a in c.args)
 
 
 def test_runner_escalates_on_oom():
