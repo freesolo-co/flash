@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import os
 import time
+from dataclasses import dataclass
 
 from flash.spec import JobSpec
 
@@ -30,38 +31,36 @@ INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_p
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 
 
+@dataclass
 class _RetryBudget:
-    def __init__(self, infra_retries: int, oom_retries: int, cache_fallbacks: int):
-        self.infra_retries = int(infra_retries)
-        self.oom_retries = int(oom_retries)
-        self.cache_fallbacks = int(cache_fallbacks)
-        self.infra_used = 0
-        self.oom_used = 0
+    infra_retries: int
+    oom_retries: int
+    cache_fallbacks: int
+    infra_used: int = 0
+    oom_used: int = 0
 
     @property
     def max_attempts(self) -> int:
         return 1 + self.infra_retries + self.oom_retries + self.cache_fallbacks
 
-    def exhausted(self, *, oom_mode: bool, cache_fallback_available: bool) -> bool:
-        spent = self.oom_used if oom_mode else self.infra_used
-        budget = self.oom_retries if oom_mode else self.infra_retries
-        return spent >= budget and not cache_fallback_available
+    def infra_exhausted(self, *, cache_fallback_available: bool) -> bool:
+        return self.infra_used >= self.infra_retries and not cache_fallback_available
 
-    def can_retry(self, failure: str | None, *, oom_mode: bool, cache_drop: bool) -> bool:
+    def can_retry(self, failure: str | None, *, cache_drop: bool) -> bool:
         if failure not in RETRY_FAILURES:
             return False
         if cache_drop:
             return True
-        if oom_mode:
+        if failure == "oom":
             return self.oom_used < self.oom_retries
         return self.infra_used < self.infra_retries
 
-    def record_retry(self, *, oom_mode: bool, cache_drop: bool) -> None:
+    def record_retry(self, failure: str | None, *, cache_drop: bool) -> None:
         if cache_drop:
             return
-        if oom_mode:
+        if failure == "oom":
             self.oom_used += 1
-        else:
+        elif failure in INFRA_RETRY_FAILURES:
             self.infra_used += 1
 
 
@@ -362,12 +361,8 @@ def _submit_seed_supervised(
                 and chosen is not None
                 and chosen.provider == "runpod"
             )
-            oom_mode = oom_vram_floor > 0
             on_last_gpu = len(untried) <= 1 or (
-                retry_budget.exhausted(
-                    oom_mode=oom_mode,
-                    cache_fallback_available=cache_fallback_available,
-                )
+                retry_budget.infra_exhausted(cache_fallback_available=cache_fallback_available)
             )
             # Mirror into the closure cell so on_handle persists THIS attempt's value (see
             # current_on_last_gpu) for a recovery to reproduce the same stall tuning.
@@ -458,10 +453,9 @@ def _submit_seed_supervised(
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
         )
-        oom_mode = oom_shaped or oom_vram_floor > 0
+        oom_mode = oom_vram_floor > 0
         will_retry = retry_budget.can_retry(
             res.failure,
-            oom_mode=oom_mode,
             cache_drop=first_cache_drop,
         )
         action = (
@@ -481,9 +475,9 @@ def _submit_seed_supervised(
             break
         if first_cache_drop:
             drop_weight_cache = True
-            retry_budget.record_retry(oom_mode=oom_mode, cache_drop=True)
+            retry_budget.record_retry(res.failure, cache_drop=True)
         else:
-            retry_budget.record_retry(oom_mode=oom_mode, cache_drop=False)
+            retry_budget.record_retry(res.failure, cache_drop=False)
             if chosen is not None:
                 # Record what THIS attempt burned so the next pick avoids it. An infra failure also
                 # escapes the PROVIDER cross-provider; an OOM does NOT (the host was fine — just grow the
