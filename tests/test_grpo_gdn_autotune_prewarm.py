@@ -113,6 +113,58 @@ def test_prewarm_warms_every_bucket_at_real_dims(monkeypatch):
     assert all(c["varlen"] is False for c in calls[1:])
 
 
+def test_prewarm_sizes_rows_by_per_device_comps_above_group_size(monkeypatch):
+    # TRL GRPO's logp forward processes per_device_train_batch_size COMPLETIONS, which
+    # rl_per_device_comps can grow above group_size. The bucket sweep must size rows by the larger of
+    # the two, so the higher NB bucket the training forward reaches is pre-warmed (not benchmarked on
+    # the memory-tight resident step).
+    monkeypatch.setattr(kw, "_gdn_dims_from_config", lambda mid: (128, 16))
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(available=True))
+    small = []
+    monkeypatch.setattr(kw, "warm_fla_gdn", lambda torch, **k: small.append(k) or True)
+    kw.prewarm_gdn_autotune("x/gdn", max_length=3072, group_size=8, per_device_comps=8)
+    big = []
+    monkeypatch.setattr(kw, "warm_fla_gdn", lambda torch, **k: big.append(k) or True)
+    kw.prewarm_gdn_autotune("x/gdn", max_length=3072, group_size=8, per_device_comps=16)
+    # per_device 16 > group 8 doubles the row bound -> at least as many buckets, reaching a HIGHER NB
+    assert len(big) >= len(small)
+    assert _nb(big[-1]["seq_len"], 16) > _nb(small[-1]["seq_len"], 16)
+
+
+def test_prewarm_defaults_to_group_size_when_per_device_unset(monkeypatch):
+    # Default per_device_comps=0 must fall back to group_size (max(group_size, 0)) — unchanged sweep.
+    monkeypatch.setattr(kw, "_gdn_dims_from_config", lambda mid: (128, 16))
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(available=True))
+    a = []
+    monkeypatch.setattr(kw, "warm_fla_gdn", lambda torch, **k: a.append(k) or True)
+    kw.prewarm_gdn_autotune("x/gdn", max_length=3072, group_size=8)
+    b = []
+    monkeypatch.setattr(kw, "warm_fla_gdn", lambda torch, **k: b.append(k) or True)
+    kw.prewarm_gdn_autotune("x/gdn", max_length=3072, group_size=8, per_device_comps=8)
+    assert [_nb(c["seq_len"], 16) for c in a] == [_nb(c["seq_len"], 16) for c in b]
+
+
+def test_run_rl_prewarm_passes_per_device_ceiling():
+    # The call must bound rows by the per-device completion ceiling (_RL_PER_DEVICE_MAX), not just
+    # group_size — else a short non-thinking run whose per_device_train_batch_size exceeds group_size
+    # leaves the higher NB bucket cold to benchmark (and OOM) on the resident colocate step.
+    import ast
+    import pathlib
+
+    src = pathlib.Path(kw.__file__).with_name("rl.py").read_text()
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_rl")
+    call = next(
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) == "prewarm_gdn_autotune"
+    )
+    kwargs = {k.arg: k.value for k in call.keywords}
+    assert "per_device_comps" in kwargs, "prewarm call must pass the per-device completion bound"
+    assert "_RL_PER_DEVICE_MAX" in ast.dump(kwargs["per_device_comps"])
+
+
 def test_warm_fla_gdn_signature_keeps_build_time_default():
     # The build-time bake calls warm_fla_gdn(torch) with no dims; the head-dim/seq params must default
     # so that path is unchanged.

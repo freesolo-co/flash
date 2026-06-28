@@ -282,10 +282,14 @@ def warm_fla_gdn(
 # one warm shape covers only ONE NB bucket. Keep this in lockstep with the pinned fla SHA in
 # Dockerfile.worker (fla/modules/l2norm.py: NB = triton.cdiv(T, 2048 * 32)).
 _L2NORM_NB_GRANULARITY = 2048 * 32  # 65536
-# Cap the bucket sweep so a pathological (huge group x context x heads) config can't warm dozens of
-# shapes; the common GRPO range is NB 1-6. A run that legitimately exceeds this re-benchmarks only the
-# uncovered tail buckets (logged), not every step.
-_MAX_NB_BUCKETS = 6
+# Cap the bucket sweep so a pathological (huge B x context x heads) config can't warm dozens of shapes.
+# B is the per-device COMPLETION micro-batch (per_device_train_batch_size), which rl_per_device_comps
+# grows up to _RL_PER_DEVICE_MAX(=16) on short non-thinking runs — 2x the old group-size(8) assumption,
+# so the common range is NB 1-12 (not 1-6): at the per-device ceiling a short run reaches NB ~8, and a
+# divisor-shrunk batch x seq up to the engine context fills 9-12. Cap there so the prewarm actually
+# covers the realistic per-device range (else the higher buckets re-benchmark and OOM on the resident
+# step — the failure this prewarm prevents). A run beyond this re-benchmarks only the tail (logged).
+_MAX_NB_BUCKETS = 12
 # Above this head dim fla dispatches a NON-autotuned l2norm kernel (no benchmark -> no OOM to prevent),
 # so there is nothing to warm. Mirrors fla/modules/l2norm.py's BLOCK_N<=512 fast-path gate.
 _L2NORM_AUTOTUNE_MAX_D = 512
@@ -327,7 +331,9 @@ def gdn_autotune_nb_buckets(num_key_heads: int, max_rows: int) -> list[int]:
     return seqs
 
 
-def prewarm_gdn_autotune(model_id: str, *, max_length: int = 0, group_size: int = 8) -> bool:
+def prewarm_gdn_autotune(
+    model_id: str, *, max_length: int = 0, group_size: int = 8, per_device_comps: int = 0
+) -> bool:
     """Run the GatedDeltaNet ``l2norm`` (and chunk) fwd/bwd while VRAM is free, across every NB autotune
     bucket the run can reach — so TRL's GRPO training backward gets a cache HIT instead of benchmarking
     25 Triton configs on the memory-tight colocate step.
@@ -343,8 +349,13 @@ def prewarm_gdn_autotune(model_id: str, *, max_length: int = 0, group_size: int 
 
     NB depends on the ROW count (``B*seq*num_key_heads``), not just head_dim, so a single shape would
     cover only one bucket; we sweep ``seq`` across the buckets bounded by the run's
-    ``group_size x max_length x num_key_heads`` rows. Best-effort: a non-GDN model, head_dim above the
-    autotuned range, missing fla, or no CUDA is a silent no-op and NEVER blocks a paid run."""
+    ``max(group_size, per_device_comps) x max_length x num_key_heads`` rows. ``B`` is the per-device
+    COMPLETION micro-batch of TRL's logprob forward (``per_device_train_batch_size``), which
+    ``rl_per_device_comps`` can grow ABOVE ``group_size`` on short non-thinking runs — so the caller
+    passes that bound via ``per_device_comps`` and we sweep to whichever is larger (sizing by
+    ``group_size`` alone leaves the higher NB bucket cold, and it would then benchmark on the tight
+    resident step — the exact OOM this prewarm prevents). Best-effort: a non-GDN model, head_dim above
+    the autotuned range, missing fla, or no CUDA is a silent no-op and NEVER blocks a paid run."""
     dims = _gdn_dims_from_config(model_id)
     if not dims:
         return False
@@ -358,9 +369,12 @@ def prewarm_gdn_autotune(model_id: str, *, max_length: int = 0, group_size: int 
         return False
     if not (getattr(torch, "cuda", None) and torch.cuda.is_available()):
         return False
-    # Upper-bound the training l2norm rows: the per-device logp micro-batch is <= group_size, the seq is
-    # <= the run's engine context (max_length). Size the bucket sweep to that worst case.
-    max_rows = max(1, int(group_size)) * max(256, int(max_length or 1024)) * num_key_heads
+    # Upper-bound the training l2norm rows: the per-device logp micro-batch is the per-device
+    # COMPLETION count (per_device_train_batch_size), which rl_per_device_comps can grow above
+    # group_size — so take the larger of the two; the seq is <= the run's engine context (max_length).
+    # Size the bucket sweep to that worst case so every NB key the training forward reaches is warm.
+    rows_per_micro_batch = max(1, int(group_size), int(per_device_comps))
+    max_rows = rows_per_micro_batch * max(256, int(max_length or 1024)) * num_key_heads
     seqs = gdn_autotune_nb_buckets(num_key_heads, max_rows)
     _log(
         f"pre-warming GatedDeltaNet l2norm autotuner: head_dim={head_dim}, num_key_heads={num_key_heads}, "

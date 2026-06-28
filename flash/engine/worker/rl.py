@@ -150,13 +150,27 @@ def run_rl():
     # resident, since the sleep/wake cycle stalls large-model GRPO) that benchmark's transient OOMs the
     # ~full card (prod run flash-1782588906: 9B GRPO on an 80 GB A100 PCIe died in l2norm_bwd's do_bench,
     # not in steady-state training). Doing the benchmark here populates the in-process autotune cache so
-    # every training step hits cache. The autotune key buckets by token count, so prewarm_gdn_autotune
-    # sweeps the NB buckets bounded by this run's rollout length x group. Wrapped in liveness_heartbeat
-    # so the CUDA-busy sweep can't trip the stall watchdog (PR #273 class); best-effort and a no-op for
-    # non-GDN models (MiniCPM) / missing fla / no CUDA, so it can never block a paid run.
+    # every training step hits cache. The autotune key buckets by ROW count (B x seq x heads), so
+    # prewarm_gdn_autotune sweeps the NB buckets bounded by this run's rollout length x the per-device
+    # completion micro-batch. Wrapped in liveness_heartbeat so the CUDA-busy sweep can't trip the stall
+    # watchdog (PR #273 class); best-effort and a no-op for non-GDN models (MiniCPM) / missing fla / no
+    # CUDA, so it can never block a paid run.
     _warm_seq = grpo_rollout_seq_len(_grpo_ctx, gcfg.get("max_tokens"), _w.THINKING)
+    # B is the logp forward's per-device COMPLETION micro-batch (per_device_train_batch_size), which
+    # rl_per_device_comps can grow ABOVE group_size (up to _RL_PER_DEVICE_MAX on short non-thinking
+    # runs). It isn't resolved until after the VRAM-tight engine setup below, so pass that hard ceiling
+    # as the prewarm's worst-case row bound: over-covering NB buckets on the still-free card is
+    # harmless, whereas sizing by group_size alone leaves the higher bucket cold to benchmark (and OOM)
+    # on the resident step — the exact failure this prewarm exists to prevent.
+    from flash.engine.worker.grpo import _RL_PER_DEVICE_MAX
+
     with liveness_heartbeat("rl_prewarm_kernels"):
-        prewarm_gdn_autotune(model_id, max_length=_warm_seq, group_size=group_size)
+        prewarm_gdn_autotune(
+            model_id,
+            max_length=_warm_seq,
+            group_size=group_size,
+            per_device_comps=_RL_PER_DEVICE_MAX,
+        )
     # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
     # colocated vLLM; there is no transformers-generation fallback.
     use_vllm = True
