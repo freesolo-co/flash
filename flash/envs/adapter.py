@@ -9,8 +9,8 @@ low-level refs remain parseable for compatibility. The canonical generated envir
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
-import io
 import json
 import os
 import re
@@ -20,9 +20,10 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from flash.envs.base import BaseEnvironment
 
@@ -31,7 +32,10 @@ _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+_MAX_TARBALL_BYTES = 1024 * 1024 * 1024
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
+_MAX_ARCHIVE_SCAN_MEMBERS = 200_000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _TAR_METADATA_TYPES = {
@@ -253,8 +257,37 @@ def _resolve_ref_sha(
     return sha
 
 
+def _iter_capped_chunks(resp: object, max_bytes: int) -> Iterator[bytes]:
+    total = 0
+    while True:
+        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        if total + len(chunk) > max_bytes:
+            raise RuntimeError(
+                f"GitHub response body exceeded the maximum allowed size ({max_bytes} bytes); "
+                "download aborted"
+            )
+        total += len(chunk)
+        yield chunk
+
+
+def _read_capped(resp: object, max_bytes: int) -> bytes:
+    return b"".join(_iter_capped_chunks(resp, max_bytes))
+
+
+def _copy_capped(resp: object, max_bytes: int, out: BinaryIO) -> None:
+    for chunk in _iter_capped_chunks(resp, max_bytes):
+        out.write(chunk)
+
+
 def _urlopen(
-    req: urllib.request.Request, *, timeout: float = 60.0, max_rate_limit_retries: int = 5
+    req: urllib.request.Request,
+    *,
+    timeout: float = 60.0,
+    max_rate_limit_retries: int = 5,
+    max_bytes: int | None = None,
+    out: BinaryIO | None = None,
 ) -> bytes:
     """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
 
@@ -268,6 +301,9 @@ def _urlopen(
     ``max_rate_limit_retries=0`` makes it fail fast (one request, no sleeps): the control plane uses
     that for its best-effort resolve-once pin so a persistent limit can never block run creation —
     the long retry belongs on the worker, which can afford to wait.
+
+    When ``max_bytes`` is set, the body is streamed in chunks and rejected once it crosses
+    that ceiling.
     """
     import random
     import time
@@ -277,6 +313,14 @@ def _urlopen(
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if max_bytes is not None:
+                    if out is not None:
+                        _copy_capped(resp, max_bytes, out)
+                        return b""
+                    return _read_capped(resp, max_bytes)
+                if out is not None:
+                    shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
+                    return b""
                 return resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
@@ -288,7 +332,10 @@ def _urlopen(
                 exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
             )
             if is_rate_limit and attempt < max_rate_limit_retries:
-                delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
+                delay = max(
+                    _RATE_LIMIT_BASE_DELAY,
+                    min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
+                )
                 time.sleep(delay)
                 attempt += 1
                 continue
@@ -297,17 +344,14 @@ def _urlopen(
                 raise GitHubRateLimitError(
                     f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
                 ) from exc
-            raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+            raise RuntimeError(
+                f"GitHub environment request failed ({exc.code}): {body[:500]}"
+            ) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
-def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
-    # Callers download the tarball for the ALREADY-resolved commit sha (see
-    # _resolve_github_environment_file), which extracts it into the content-addressed disk cache
-    # under _CACHE_ROOT/<hash(repo@sha:path)> and never re-downloads on a hit. So reuse is handled
-    # on disk; we deliberately do NOT also retain the (up to _MAX_ARCHIVE_BYTES) archive bytes in a
-    # module-level cache for the worker's lifetime — that wasted hundreds of MiB of RAM per process.
+def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -316,43 +360,85 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
-    if len(data) > _MAX_ARCHIVE_BYTES:
-        raise RuntimeError(
-            f"environment archive is too large ({len(data)} bytes; "
-            f"limit {_MAX_ARCHIVE_BYTES} bytes)"
-        )
-    return data
+    tar_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="flash-env-tar-", suffix=".tar.gz", delete=False
+        ) as spill:
+            tar_path = Path(spill.name)
+            _urlopen(
+                urllib.request.Request(url, headers=headers),
+                timeout=120.0,
+                max_bytes=_MAX_TARBALL_BYTES,
+                out=spill,
+            )
+    except BaseException:
+        if tar_path is not None:
+            with contextlib.suppress(OSError):
+                tar_path.unlink()
+        raise
+    return tar_path
 
 
-def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
+def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path, subdir: str = "") -> Path:
+    tarball = _download_github_tarball(ref)
+    try:
+        return _safe_extract_archive(tarball, dest, subdir=subdir)
+    finally:
+        if isinstance(tarball, Path):
+            with contextlib.suppress(OSError):
+                tarball.unlink()
+
+
+def _safe_extract_archive(
+    tar_source: bytes | bytearray | Path, dest: Path, subdir: str = ""
+) -> Path:
+    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
+    if isinstance(tar_source, (bytes, bytearray)):
+        with tempfile.NamedTemporaryFile(prefix="flash-env-tar-", suffix=".tar.gz") as spill:
+            spill.write(tar_source)
+            spill.seek(0)
+            return _safe_extract_archive_file(spill, dest, subdir)
+    with tar_source.open("rb") as spill:
+        return _safe_extract_archive_file(spill, dest, subdir)
+
+
+def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
+    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
     root = dest.resolve()
+    want = [p for p in subdir.split("/") if p] if subdir else []
     top_dirs: set[str] = set()
     total = 0
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-        for count, member in enumerate(tar, start=1):
-            if count > _MAX_ARCHIVE_MEMBERS:
+    extracted = 0
+    scanned = 0
+    with tarfile.open(fileobj=tar_file, mode="r:gz") as tar:
+        for member in tar:
+            scanned += 1
+            if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
                 raise RuntimeError(
-                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
+                    f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
                 )
             if member.type in _TAR_METADATA_TYPES:
                 continue
-            parts: list[str] = []
-            for part in member.name.replace("\\", "/").split("/"):
-                if not part or part == ".":
-                    continue
-                if part == "..":
-                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-                parts.append(part)
-            if not parts:
+            raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
+            if not raw:
                 continue
-            normalized_name = "/".join(parts)
+            top_dirs.add(raw[0])
+            if want and raw[1 : 1 + len(want)] != want:
+                continue
+            if ".." in raw:
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+            normalized_name = "/".join(raw)
             target = (dest / normalized_name).resolve()
             if target != root and root not in target.parents:
                 raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
-            top_dirs.add(parts[0])
+            extracted += 1
+            if extracted > _MAX_ARCHIVE_MEMBERS:
+                raise RuntimeError(
+                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
+                )
             total += max(0, member.size)
             if total > _MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
@@ -362,10 +448,15 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
             tar.extract(member, dest)
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")
-    extracted = dest / next(iter(top_dirs))
-    if not extracted.is_dir():
-        raise RuntimeError("environment archive did not extract to a directory")
-    return extracted
+    extracted_dir = dest / next(iter(top_dirs))
+    if extracted_dir.exists() and not extracted_dir.is_dir():
+        raise RuntimeError("environment archive had an unexpected layout")
+    if not extracted_dir.is_dir():
+        if want:
+            extracted_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            raise RuntimeError("environment archive did not extract to a directory")
+    return extracted_dir
 
 
 def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
@@ -394,7 +485,9 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
+        # Runtime loading keeps repo-level sidecars available to relative paths/imports.
+        # User-facing pulls filter to the requested env subtree in flash.envs.pull.
+        extracted = _extract_github_tarball(resolved, tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
@@ -639,7 +732,11 @@ class FreesoloEnvironment(BaseEnvironment):
         value = example.get(_CANONICAL_OUTPUT_KEY)
         if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
             return [dict(m) for m in value]
-        if isinstance(value, dict) and list(value) == ["messages"] and isinstance(value["messages"], list):
+        if (
+            isinstance(value, dict)
+            and list(value) == ["messages"]
+            and isinstance(value["messages"], list)
+        ):
             return [dict(m) for m in value["messages"]]
         return [{"role": "assistant", "content": "" if value is None else str(value)}]
 
@@ -697,7 +794,11 @@ class FreesoloEnvironment(BaseEnvironment):
                 key = json.dumps(ex, sort_keys=True, default=str)
                 grp = groups.get(key)
                 if grp is None:
-                    grp = groups[key] = {"task": self._task_example(ex), "idxs": [], "responses": []}
+                    grp = groups[key] = {
+                        "task": self._task_example(ex),
+                        "idxs": [],
+                        "responses": [],
+                    }
                     order.append(key)
                 grp["idxs"].append(i)
                 grp["responses"].append(str(st.get("response_text") or ""))
@@ -706,7 +807,9 @@ class FreesoloEnvironment(BaseEnvironment):
                 grp = groups[key]
                 rewards = self._env.score_responses(grp["task"], grp["responses"])
                 if len(rewards) != len(grp["responses"]):
-                    raise RuntimeError("Freesolo environment score_responses returned the wrong length")
+                    raise RuntimeError(
+                        "Freesolo environment score_responses returned the wrong length"
+                    )
                 for idx, rw in zip(grp["idxs"], rewards, strict=True):
                     out[idx] = float(rw.score)
             return out
