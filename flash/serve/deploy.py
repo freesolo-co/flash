@@ -111,6 +111,23 @@ def servable_gpu(gpu_name: str) -> str:
     return cheapest_gpu(info.vram_gb)  # else the cheapest RunPod class that fits
 
 
+def validate_serving_lora_rank(model: str, lora_rank: int) -> None:
+    """Fail before registration when a trained adapter rank exceeds serving capacity."""
+    from flash.catalog import get_model
+
+    try:
+        serving = get_model(model).serving
+    except ValueError:
+        return
+    if serving is None:
+        return
+    if int(lora_rank) > serving.max_lora_rank:
+        raise ValueError(
+            f"{model} serving supports max_lora_rank={serving.max_lora_rank}; "
+            f"adapter rank {int(lora_rank)} cannot be deployed"
+        )
+
+
 def deploy_adapter(
     run_id: str,
     model: str,
@@ -118,10 +135,12 @@ def deploy_adapter(
     adapter_prefix: str,
     gpu_name: str = "RTX 5090",
     dry_run: bool = False,
+    lora_rank: int = 32,
     thinking: bool = False,
     org_id: str | None = None,
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app."""
+    validate_serving_lora_rank(model, lora_rank)
     friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
     dep = Deployment(

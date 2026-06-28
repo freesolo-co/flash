@@ -108,6 +108,11 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     assert spec_from_dict(raw).train.hf_repo == ""
 
 
+def test_lora_rank_must_fit_serving_cap() -> None:
+    with pytest.raises(ConfigError, match="serving max_lora_rank=32"):
+        spec_from_dict(_raw(**{"train.lora_rank": 64}))
+
+
 def test_bare_environment_id_is_rejected() -> None:
     # A bare id like "gsm8k" passes the presence check but is not a Freesolo env slug;
     # reject it up front.
