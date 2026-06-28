@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 from flash.catalog import ModelInfo, resolve_model
 from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
@@ -115,6 +115,18 @@ class RunStatus:
             _adapter_ref_from_status_spec(self.spec) if self.state in {"done", "deployed"} else None
         )
         return data
+
+    @classmethod
+    def from_persisted(cls, data: dict) -> RunStatus:
+        """Build a RunStatus from persisted status JSON, ignoring unknown keys.
+
+        Run-status JSON is forward/backward compatible across control-plane upgrades: a release
+        that REMOVES a field (e.g. the old multi-seed ``resume_seed_index``) must still load runs
+        written by the prior version. A plain ``RunStatus(**data)`` would raise ``TypeError`` on
+        any extra key, breaking startup ``recover_runs`` / ``flash status`` / ``list_runs`` for
+        every in-flight run carried across the upgrade. Drop keys not on the current dataclass."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 class _RunCancelled(RuntimeError):
@@ -504,7 +516,7 @@ def get_status(run_id: str) -> RunStatus:
     if not os.path.exists(path):
         raise FileNotFoundError(f"unknown run_id: {run_id}")
     with open(path) as f:
-        return RunStatus(**json.load(f))
+        return RunStatus.from_persisted(json.load(f))
 
 
 def list_runs() -> list[RunStatus]:
@@ -513,7 +525,7 @@ def list_runs() -> list[RunStatus]:
     for name in sorted(os.listdir(RUNS_DIR)):
         if name.endswith(".json"):
             with open(os.path.join(RUNS_DIR, name)) as f:
-                runs.append(RunStatus(**json.load(f)))
+                runs.append(RunStatus.from_persisted(json.load(f)))
     return runs
 
 
