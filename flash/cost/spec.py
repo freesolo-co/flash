@@ -59,15 +59,16 @@ def spec_steps(spec) -> int:
 
 
 def runconfig_from_spec(spec) -> RunConfig:
-    """Map a parsed ``JobSpec`` to a cost ``RunConfig``."""
+    """Map a parsed ``JobSpec`` to a cost ``RunConfig``. A run trains exactly one adapter, so the
+    estimate covers a single job. The estimate doesn't pin a GPU -- it does its own cheapest-fit
+    (provider="auto")."""
     t, g = spec.train, spec.gpu
     is_grpo = spec.algorithm == "grpo"
-    seeds = max(1, len(t.seeds or (0,)))
     return RunConfig(
         model_id=spec.model,
         method=spec.algorithm,
-        steps=spec_steps(spec) * seeds,
-        setup_repeats=seeds,
+        steps=spec_steps(spec),
+        setup_repeats=1,
         seq_len=t.max_length,
         completion_len=t.max_tokens if is_grpo else None,
         batch_size=t.batch_size,

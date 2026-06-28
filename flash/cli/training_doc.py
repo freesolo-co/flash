@@ -80,11 +80,12 @@ A managed run references a **published** environment by id — so push your fold
 
 ```bash
 flash env push --name my-env .       # uploads this project; prints an env id like "your-org/my-env"
-flash env list                       # installed envs + local sources you can push
-flash env install your-org/their-env # record an env someone else published, to train against it
+flash env list                       # local env sources you can push
 ```
 
-Paste the returned id into `[environment] id` in **both** configs. Re-push after any
+To train against an env someone else published, just set its slug as `[environment] id` —
+no separate step is needed. Paste the returned id into `[environment] id` in **both** configs.
+Re-push after any
 edit to `environment.py` or `datasets/` so the managed run uses your change.
 
 ### 3. Configure the run (TOML)
@@ -104,7 +105,6 @@ id = "your-org/my-env"      # the id printed by `flash env push`
 steps = 150                 # GRPO is step-driven; SFT is epoch-driven (epochs = N)
 lora_rank = 32
 lora_alpha = 64
-seeds = [0]
 ```
 
 GPU and the HF artifact repo are **fully managed** — there is no GPU knob; the allocator
@@ -312,8 +312,8 @@ algorithm = "grpo"
 
 [train]
 # paste the full adapter_ref `flash status <sft-run-id>` prints, verbatim
-# (shape: <owner>/<repo>:sft/<run-id>/seed0 — the owner/repo prefix is required)
-init_from_adapter = "your-org/your-repo:sft/<sft-run-id>/seed0"
+# (shape: <owner>/<repo>:sft/<run-id> — the owner/repo prefix is required)
+init_from_adapter = "your-org/your-repo:sft/<sft-run-id>"
 lora_rank = 32     # must match the SFT run
 lora_alpha = 64    # must match the SFT run
 ```

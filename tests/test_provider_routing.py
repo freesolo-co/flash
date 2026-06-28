@@ -17,7 +17,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "hf_repo": "owner/runs"},
             "gpu": gpu,
         }
     )
@@ -110,7 +110,6 @@ def test_runpod_cost_projection_flows_into_run_status(orch, monkeypatch):
     _seed_status(orch, spec)
     cost = orch._persist_metrics(
         spec,
-        0,
         {"train_tokens": 4096, "wall_seconds": 1800, "allocated_gpu": "RTX A6000"},
     )
     assert cost == pytest.approx(0.245)  # 0.5 hr x $0.49/hr (RTX A6000)
@@ -482,7 +481,7 @@ def test_config_gpu_fields(monkeypatch):
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "hf_repo": "owner/runs"},
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
     spec = spec_from_dict(dict(base), run_id="x")
