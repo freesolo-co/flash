@@ -69,7 +69,8 @@ def cmd_env_pull(args) -> int:
         return 1
     try:
         if args.path:
-            out = Path(args.output) if args.output else Path(Path(args.path).name)
+            default_name = Path(args.path.replace("\\", "/")).name
+            out = Path(args.output) if args.output else Path(default_name)
             if out.is_dir() and not out.is_symlink():
                 # a single file can't replace a REAL directory; refuse instead of crashing on write.
                 # A symlink-to-a-dir is NOT rejected here — it's handled by the symlink/--force check
