@@ -67,11 +67,16 @@ async def _repo_cleanup_loop() -> None:
     interval = 24.0 * 3600.0
     while True:
         await asyncio.sleep(interval)
+        # The blocking sweep runs in a worker thread that task.cancel() can't interrupt; a stop Event
+        # lets the lifespan signal it to halt BETWEEN deletes at shutdown, so a large in-flight sweep
+        # can't keep deleting repos after the server was told to stop (see _charge_retry_loop).
+        stop = threading.Event()
         try:
-            deleted = await asyncio.to_thread(run_scheduled_cleanup)
+            deleted = await asyncio.to_thread(run_scheduled_cleanup, should_stop=stop.is_set)
             if deleted:
                 _log.info("repo GC: deleted %d undeployed run repo(s) older than the GC age", deleted)
         except asyncio.CancelledError:
+            stop.set()  # signal the worker thread to stop deleting between targets (see _charge_retry_loop)
             raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
         except CleanupAborted as exc:
             # Serving live set unconfirmed -> the sweep deleted NOTHING by design. Expected during a

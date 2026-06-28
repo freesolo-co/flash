@@ -288,46 +288,52 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 "cannot be located, so it cannot be exported"
             ),
         )
-    # Optional `step`: export a specific intermediate checkpoint instead of the final adapter,
-    # validated against what's actually on HF (a missing step 404s with the available list).
-    checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
-    is_checkpoint = checkpoint_step is not None
-    # Same state gate as deploy: a final adapter exists only once a run finished; a per-step
-    # checkpoint also survives a run that stopped mid-RL (cancelled/failed).
-    allowed_states = (
-        _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
-    )
-    if status.state not in allowed_states:
-        detail = (
-            f"run {run_id} is {status.state!r}; export a checkpoint only once the run "
-            "has finished, been cancelled, or failed"
+    # Hold the SAME per-run lock deploy/undeploy take, across the checkpoint resolution AND the
+    # download-then-upload below: both read the run's private artifact repo (``spec.train.hf_repo``),
+    # so without this the always-on repo GC could ``delete_repo`` that source mid-export. The GC takes
+    # this lock (non-blocking) before deleting, so an in-progress export is spared; a delete that
+    # started first holds the lock and an export arriving mid-delete waits for it.
+    with _app._deploy_lock(run_id):
+        # Optional `step`: export a specific intermediate checkpoint instead of the final adapter,
+        # validated against what's actually on HF (a missing step 404s with the available list).
+        checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
+        is_checkpoint = checkpoint_step is not None
+        # Same state gate as deploy: a final adapter exists only once a run finished; a per-step
+        # checkpoint also survives a run that stopped mid-RL (cancelled/failed).
+        allowed_states = (
+            _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
+        )
+        if status.state not in allowed_states:
+            detail = (
+                f"run {run_id} is {status.state!r}; export a checkpoint only once the run "
+                "has finished, been cancelled, or failed"
+                if is_checkpoint
+                else f"run {run_id} is {status.state!r}; only finished runs with "
+                "trained adapter artifacts can be exported"
+            )
+            raise HTTPException(status_code=409, detail=detail)
+        # The per-step adapter folder for a checkpoint, otherwise the run's final adapter folder.
+        prefix = (
+            checkpoint_adapter_prefix(spec, checkpoint_step)
             if is_checkpoint
-            else f"run {run_id} is {status.state!r}; only finished runs with "
-            "trained adapter artifacts can be exported"
+            else adapter_prefix(spec)
         )
-        raise HTTPException(status_code=409, detail=detail)
-    # The per-step adapter folder for a checkpoint, otherwise the run's final adapter folder.
-    prefix = (
-        checkpoint_adapter_prefix(spec, checkpoint_step)
-        if is_checkpoint
-        else adapter_prefix(spec)
-    )
-    subfolder = f"{prefix}/adapter"
-    try:
-        url = _app.export_adapter(
-            source_repo=spec.train.hf_repo,
-            source_subfolder=subfolder,
-            dest_repo=repository,
-            dest_token=hf_token,
-            private=private,
-        )
-    except ValueError as exc:
-        # The source has no adapter artifacts at that path — nothing to export.
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ServingError as exc:
-        # An HF transport/permission failure (download or upload) — an upstream problem, not a
-        # flash bug, so surface a clean 502 with the real reason (mirrors deploy/undeploy).
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        subfolder = f"{prefix}/adapter"
+        try:
+            url = _app.export_adapter(
+                source_repo=spec.train.hf_repo,
+                source_subfolder=subfolder,
+                dest_repo=repository,
+                dest_token=hf_token,
+                private=private,
+            )
+        except ValueError as exc:
+            # The source has no adapter artifacts at that path — nothing to export.
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ServingError as exc:
+            # An HF transport/permission failure (download or upload) — an upstream problem, not a
+            # flash bug, so surface a clean 502 with the real reason (mirrors deploy/undeploy).
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
     result = {
         "run_id": run_id,
         "adapter_id": run_id,
