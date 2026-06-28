@@ -56,7 +56,11 @@ def delete_env(env_id: str, key: Annotated[dict, Depends(require_key)]):
     # ``delete_package`` so it can't be bypassed.
     from flash.server import envs
 
+    # Normalize/validate ONCE here so the id used for deletion, the metadata-mirror drop, and the
+    # response are the SAME canonical ``namespace/name`` — never a non-canonical variant (trailing
+    # slash, padding from URL-decoding) that could delete one slug while recording/returning another.
     try:
+        env_id = envs.canonical_env_id(env_id)
         deleted = envs.delete_package(slug=env_id, key=key)
     except envs.EnvPublishError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc

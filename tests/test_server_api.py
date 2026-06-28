@@ -1309,6 +1309,24 @@ def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
     assert resp.json()["deleted"] is True
 
 
+def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
+    """A non-canonical id (uppercase / trailing slash) is rejected 400 before any storage call."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(
+        envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_k: pytest.fail("mirror must not be touched"),
+    )
+    for bad in ("Dev-Clado-Ai/My-Env", "dev-clado-ai/my-env/"):
+        resp = api.delete(f"/v1/envs/{bad}", headers=_bearer(_login()))
+        assert resp.status_code == 400, resp.text
+
+
 # --------------------------------------------------------------------------------------------
 # Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
 # --------------------------------------------------------------------------------------------

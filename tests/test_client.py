@@ -194,6 +194,17 @@ def test_delete_env_sends_delete_to_slug_path(stub):
     assert seen["auth"] == "Bearer fslo-user-test"
 
 
+def test_delete_env_percent_encodes_reserved_chars(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    # A programmatic caller passing reserved characters must NOT be able to truncate the request
+    # target: `?` becomes %3F (not a query string), `#` becomes %23 (not a dropped fragment), while
+    # the namespace/name separator `/` is preserved so the server still routes the :path param.
+    client.delete_env("team/env?x=1#frag")
+    assert seen["method"] == "DELETE"
+    assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag"
+
+
 def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
     import flash.client.http as http_mod
 
