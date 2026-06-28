@@ -113,15 +113,25 @@ def cancel_run(run_id: str) -> RunStatus:
     # terminal override to runs that were `deployed` at entry — there a racing `done` is always
     # an undeploy artifact (cancel wins); elsewhere a racing `done` is a genuine completion that
     # _update's CAS correctly protects (cancel loses to a real finish).
-    _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
-    # A run cancelled mid-RL keeps whatever per-step adapters the worker already streamed to
-    # HF; mirror them to the backend store now so the cancelled run is immediately listable +
-    # deployable (`flash checkpoints` / `flash deploy --step N`). Best-effort: never let
-    # checkpoint bookkeeping fail a cancel.
-    with contextlib.suppress(Exception):
-        from flash.server.checkpoints import register_checkpoints_best_effort
+    # Hold the per-run deploy/export lock across the terminal `cancelled` write AND the checkpoint
+    # mirror below: once `cancelled` is persisted the run leaves _RECOVERABLE, so the repo GC would
+    # consider its (possibly >30-day-old) artifact repo deletable. The GC acquires this SAME lock
+    # (non-blocking, _try_hold_deploy_lock) before deleting, so holding it here keeps the repo alive
+    # until checkpoint registration has finished mirroring the per-step adapters the cancel path
+    # explicitly preserves — closing the window where the GC could delete the repo mid-finalization.
+    # The /cancel route does not hold this lock, so there is no re-entrant double-acquire.
+    from flash.server._locks import _deploy_lock
 
-        register_checkpoints_best_effort(get_status(run_id))
+    with _deploy_lock(run_id):
+        _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
+        # A run cancelled mid-RL keeps whatever per-step adapters the worker already streamed to
+        # HF; mirror them to the backend store now so the cancelled run is immediately listable +
+        # deployable (`flash checkpoints` / `flash deploy --step N`). Best-effort: never let
+        # checkpoint bookkeeping fail a cancel.
+        with contextlib.suppress(Exception):
+            from flash.server.checkpoints import register_checkpoints_best_effort
+
+            register_checkpoints_best_effort(get_status(run_id))
     return get_status(run_id)
 
 

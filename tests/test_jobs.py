@@ -14,6 +14,42 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def test_touch_warmstart_source_bumps_only_managed_source(monkeypatch):
+    # The repo GC's age gate is age-reset for a warm-start SOURCE repo by writing a reference marker
+    # into it (cross-plane-safe). Only managed Freesolo-Co/flashrun-* sources are touched.
+    import huggingface_hub
+
+    from flash.runner import lifecycle
+    from flash.spec import JobSpec
+
+    calls = []
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def upload_file(self, **kw):
+            calls.append(kw)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    def _spec(run_id, ref):
+        return JobSpec.from_dict(
+            {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": run_id, "train": {"init_from_adapter": ref}}
+        )
+
+    lifecycle._touch_warmstart_source(_spec("flash-grpo-1", "Freesolo-Co/flashrun-sft0:sft/sft0"))
+    assert len(calls) == 1
+    assert calls[0]["repo_id"] == "Freesolo-Co/flashrun-sft0"
+    assert calls[0]["path_in_repo"] == "referenced_by/flash-grpo-1"
+    assert calls[0]["repo_type"] == "dataset"
+
+    calls.clear()
+    lifecycle._touch_warmstart_source(_spec("flash-grpo-2", "someuser/somerepo:sft/x"))  # user ref
+    lifecycle._touch_warmstart_source(_spec("flash-grpo-3", ""))  # no warm-start
+    assert calls == []
+
+
 def test_job_handle_roundtrip():
     from flash.providers.runpod.jobs import JobHandle
 
