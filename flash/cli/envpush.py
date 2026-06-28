@@ -46,13 +46,26 @@ def cmd_env_install(args) -> int:
 
 
 def cmd_env_delete(args) -> int:
-    from flash.client import ClientError, client_from_config
-    from flash.envs.adapter import is_freesolo_environment_id
+    import re
 
-    env_id = args.env_id
-    if not is_freesolo_environment_id(env_id):
+    from flash.client import ClientError, client_from_config
+    from flash.envs.adapter import is_managed_environment_slug
+
+    # Delete only targets MANAGED hub ids ("namespace/name") — not github: refs or local paths, which
+    # don't live on the hub. And enforce the hub's canonical form (lowercase, no surrounding
+    # whitespace) BEFORE the network call: the server's slug validator is lowercase-only, so a
+    # mixed-case / padded id would otherwise make a pointless request and return a confusing 400.
+    env_id = (args.env_id or "").strip()
+    if not is_managed_environment_slug(env_id):
         return _err(
-            f'env id must be a Freesolo environment id, e.g. "your-name/your-env" (got {env_id!r})'
+            f'env id must be a managed Freesolo hub id "namespace/name" (got {args.env_id!r}); '
+            "github refs and local paths can't be deleted from the hub"
+        )
+    if env_id != env_id.lower() or not all(
+        re.fullmatch(r"[a-z0-9._-]+", part) for part in env_id.split("/")
+    ):
+        return _err(
+            f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
         )
     if not getattr(args, "yes", False):
         prompt = f"delete environment {env_id}? this removes it from the hub [y/N] "
