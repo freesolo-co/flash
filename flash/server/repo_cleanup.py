@@ -272,6 +272,18 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
             if repo_id in fresh:
                 logger.warning("repo GC: %s became deployed mid-sweep; skipping", repo_id)
                 continue
+            # Re-confirm the repo is STILL past the age right before deleting: its last_modified may
+            # have been refreshed since enumeration (e.g. a warm-start run on ANOTHER plane wrote a
+            # reference marker to keep this source alive — see runner.lifecycle._touch_warmstart_source).
+            # The enumeration sample can be minutes stale, so a single fresh stat closes that window.
+            try:
+                fresh_lm = api.repo_info(repo_id, repo_type="dataset").last_modified
+            except Exception as exc:
+                logger.warning("repo GC: re-stat of %s failed; skipping to stay safe (%s)", repo_id, exc)
+                continue
+            if fresh_lm is None or (now - fresh_lm).total_seconds() < max_age_s:
+                logger.warning("repo GC: %s was refreshed since enumeration (now within age); skipping", repo_id)
+                continue
             try:
                 api.delete_repo(repo_id=repo_id, repo_type="dataset", missing_ok=True)
                 deleted += 1
