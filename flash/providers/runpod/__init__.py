@@ -70,6 +70,7 @@ class RunpodProvider:
         return submit_run(spec, seed, **kwargs)
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
+        from flash.providers._poll import _attempt_int
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
@@ -88,8 +89,8 @@ class RunpodProvider:
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         handle_dict = handle.to_dict()
-        on_last_gpu = bool(handle_dict["on_last_gpu"])
-        current_attempt = int(handle_dict["attempt"])
+        on_last_gpu = bool(handle_dict.get("on_last_gpu", False))
+        current_attempt = _attempt_int(handle_dict.get("attempt"))
         return poll_job(
             rh,
             log=log,
