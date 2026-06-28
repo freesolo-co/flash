@@ -106,14 +106,18 @@ def _confirm_live_set() -> set[str]:
 
 
 def _inflight_repo_ids() -> set[str]:
-    """Repos of runs still IN FLIGHT (queued/provisioning/running) — protected regardless of age.
+    """Repos PROTECTED regardless of age because an IN-FLIGHT (queued/provisioning/running) run still
+    needs them: the run's OWN artifact repo AND any warm-start SOURCE repo it will download.
 
     The deployed-set + age gates alone cannot shield an in-flight run: its repo is created at submit
     (``upload_code`` -> ``create_repo``) BEFORE any GPU worker, so during a long provisioning/capacity
     wait nothing commits and ``last_modified`` stays frozen at upload time — and an in-flight run is
     never in serving's ``/adapters`` set. So an aged-out-but-still-running repo would be deletable.
-    This mirrors how the sibling reapers shield ``_RECOVERABLE`` runs. Raises (the sweep fails closed,
-    deleting nothing) if run state can't be enumerated."""
+    A run can ALSO ``init_from_adapter`` from another run's adapter (e.g. GRPO continuing an old SFT
+    run); the worker ``snapshot_download``s that SOURCE repo at boot (``engine.worker.adapter``), so an
+    old undeployed source must survive until the dependent run has fetched it. This mirrors how the
+    sibling reapers shield ``_RECOVERABLE`` runs. Raises (the sweep fails closed, deleting nothing) if
+    run state can't be enumerated."""
     from flash.runner import get_status
     from flash.server import db
     from flash.server._runtime import _RECOVERABLE
@@ -124,9 +128,16 @@ def _inflight_repo_ids() -> set[str]:
             status = get_status(row["run_id"])
         except FileNotFoundError:
             continue
-        if status.state in _RECOVERABLE:
-            repo = ((status.spec or {}).get("train") or {}).get("hf_repo")
-            ids.add(repo or f"{_ARTIFACT_NAMESPACE}/{RUN_REPO_PREFIX}{row['run_id']}")
+        if status.state not in _RECOVERABLE:
+            continue
+        train = (status.spec or {}).get("train") or {}
+        ids.add(train.get("hf_repo") or f"{_ARTIFACT_NAMESPACE}/{RUN_REPO_PREFIX}{row['run_id']}")
+        # The warm-start source the worker will pull: init_from_adapter is "<owner>/<repo>:<phase>/
+        # <run_id>", so the repo is everything before the first ":". Protect it so the GC can't delete
+        # the old SFT repo a still-queued GRPO run depends on.
+        src_ref = train.get("init_from_adapter") or ""
+        if ":" in src_ref:
+            ids.add(src_ref.split(":", 1)[0])
     return ids
 
 

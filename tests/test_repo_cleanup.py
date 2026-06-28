@@ -14,6 +14,7 @@ from flash.server import repo_cleanup as rc
 # tests below can exercise the genuine functions.
 _REAL_KNOWN_RUN_REPO_IDS = rc._known_run_repo_ids
 _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
+_REAL_INFLIGHT_REPO_IDS = rc._inflight_repo_ids
 # The global offline conftest stubs run_scheduled_cleanup to a no-op (so the always-on GC sweep
 # never reaches serving/HF in offline TestClient startups). Capture the genuine function so this
 # file's fixture can restore it — these unit tests exercise the real sweep.
@@ -283,6 +284,33 @@ def test_known_run_repo_ids_built_from_local_runs(monkeypatch):
 
     monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": "r1"}, {"run_id": "r2"}])
     assert _REAL_KNOWN_RUN_REPO_IDS() == {f"{NS}/flashrun-r1", f"{NS}/flashrun-r2"}
+
+
+def test_inflight_repo_ids_protects_warmstart_source(monkeypatch):
+    # An in-flight GRPO run warm-starting (init_from_adapter) off an OLD SFT run must protect BOTH
+    # its own repo AND that SFT source repo — the worker snapshot_downloads the source at boot, so
+    # the GC must not delete it out from under the still-queued/running dependent run.
+    from flash.server import db
+
+    class _St:
+        def __init__(self, state, spec):
+            self.state = state
+            self.spec = spec
+
+    statuses = {
+        "grpo1": _St("running", {"train": {
+            "hf_repo": f"{NS}/flashrun-grpo1",
+            "init_from_adapter": f"{NS}/flashrun-sft0:sft/sft0",
+        }}),
+        "done1": _St("done", {"train": {"hf_repo": f"{NS}/flashrun-done1"}}),
+    }
+    monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": "grpo1"}, {"run_id": "done1"}])
+    monkeypatch.setattr("flash.runner.get_status", lambda rid: statuses[rid])
+
+    ids = _REAL_INFLIGHT_REPO_IDS()
+    assert f"{NS}/flashrun-grpo1" in ids   # the in-flight run's own repo
+    assert f"{NS}/flashrun-sft0" in ids    # its warm-start SOURCE repo (the fix)
+    assert f"{NS}/flashrun-done1" not in ids  # a terminal run is not protected
 
 
 def test_sweep_skips_repos_for_runs_this_plane_doesnt_know(monkeypatch):
