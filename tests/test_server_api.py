@@ -1252,6 +1252,81 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     assert "must be a base64 string" in r2.text.lower()
 
 
+def test_delete_env_endpoint_removes_package(api, monkeypatch):
+    """DELETE /v1/envs/{id} removes the package and reports it deleted."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    seen: dict = {}
+
+    def fake_delete_package(*, slug, key):
+        seen.update(slug=slug, key=key)
+        return True
+
+    monkeypatch.setattr(envs_mod, "delete_package", fake_delete_package)
+    recorded: dict = {}
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda *, slug, key: recorded.update(slug=slug) or True,
+    )
+
+    resp = api.delete("/v1/envs/dev-clado-ai/my-env", headers=_bearer(_login()))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"id": "dev-clado-ai/my-env", "deleted": True}
+    assert seen["slug"] == "dev-clado-ai/my-env"
+    assert recorded["slug"] == "dev-clado-ai/my-env"
+
+    # Unauthenticated requests are rejected.
+    assert api.delete("/v1/envs/dev-clado-ai/my-env").status_code in (401, 403)
+
+
+def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
+    """A namespace-authorization EnvPublishError surfaces as its HTTP status (403)."""
+    import flash.server.envs as envs_mod
+
+    def fake_delete_package(*, slug, key):
+        raise envs_mod.EnvPublishError("not your namespace", status=403)
+
+    monkeypatch.setattr(envs_mod, "delete_package", fake_delete_package)
+    resp = api.delete("/v1/envs/someone-else/env", headers=_bearer(_login()))
+    assert resp.status_code == 403, resp.text
+
+
+def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
+    """A failing metadata-mirror delete must not turn a successful delete into a 500."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(envs_mod, "delete_package", lambda *, slug, key: True)
+
+    def boom(*, slug, key):
+        raise RuntimeError("backend down")
+
+    monkeypatch.setattr(environment_registry, "record_deleted_environment", boom)
+    resp = api.delete("/v1/envs/dev-clado-ai/my-env", headers=_bearer(_login()))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] is True
+
+
+def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
+    """A non-canonical id (uppercase / trailing slash) is rejected 400 before any storage call."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(
+        envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_k: pytest.fail("mirror must not be touched"),
+    )
+    for bad in ("Dev-Clado-Ai/My-Env", "dev-clado-ai/my-env/"):
+        resp = api.delete(f"/v1/envs/{bad}", headers=_bearer(_login()))
+        assert resp.status_code == 400, resp.text
+
+
 # --------------------------------------------------------------------------------------------
 # Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
 # --------------------------------------------------------------------------------------------
