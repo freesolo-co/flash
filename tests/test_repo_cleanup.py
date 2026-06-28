@@ -10,6 +10,11 @@ import pytest
 
 from flash.server import repo_cleanup as rc
 
+# Real implementations, captured before the autouse fixture swaps in test defaults, so the unit
+# tests below can exercise the genuine functions.
+_REAL_KNOWN_RUN_REPO_IDS = rc._known_run_repo_ids
+_REAL_REPO_DEPLOY_IN_PROGRESS = rc._repo_deploy_in_progress
+
 NS = rc._ARTIFACT_NAMESPACE
 NOW = datetime(2026, 6, 28, 12, 0, 0, tzinfo=UTC)
 
@@ -27,8 +32,21 @@ def _fast_and_frozen(monkeypatch):
     # Default: no in-flight runs (isolate the sweep tests from the local run registry / db). The
     # in-flight guard is exercised explicitly below.
     monkeypatch.setattr(rc, "_inflight_repo_ids", lambda: set())
+    # Default: this plane "knows" every repo (single-plane) — so the known-runs scope never filters
+    # anything. The multi-plane scope is exercised explicitly below.
+    monkeypatch.setattr(rc, "_known_run_repo_ids", lambda: _Everything())
+    # Default: no deploy is in progress for any repo. The deploy-window guard is exercised below.
+    monkeypatch.setattr(rc, "_repo_deploy_in_progress", lambda repo_id: False)
     # Clear HF_TOKEN so the enablement check is deterministic (the policy itself has no env knobs).
     monkeypatch.delenv("HF_TOKEN", raising=False)
+
+
+class _Everything:
+    """A set-like that contains everything — the test default for the 'runs this plane knows' scope
+    (single-plane: every repo belongs to a run this plane issued)."""
+
+    def __contains__(self, item: object) -> bool:
+        return True
 
 
 def _days_ago(d: float) -> datetime:
@@ -205,3 +223,92 @@ def test_per_delete_recheck_spares_repo_deployed_midsweep(monkeypatch):
     monkeypatch.setattr(rc, "deployed_repo_ids", _live)
     rc.run_scheduled_cleanup(dry_run=False, api=api)
     assert api.deleted == [f"{NS}/flashrun-2"]  # 1 was spared by the mid-sweep re-check
+
+
+def test_midsweep_unconfirmable_live_set_aborts_whole_sweep(monkeypatch):
+    # If the live set becomes unconfirmable BETWEEN deletes (serving blip, or a live adapter with no
+    # repo id), the WHOLE sweep must abort — never press on to delete later repos while an
+    # unidentified live adapter may be backed by one of them.
+    api = FakeApi([
+        _DS(f"{NS}/flashrun-1", _days_ago(45)),
+        _DS(f"{NS}/flashrun-2", _days_ago(45)),
+    ])
+    calls = {"n": 0}
+
+    def _live():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return (set(), True)   # enumeration + pre-delete re-check for flashrun-1: OK -> delete
+        return (set(), False)      # pre-delete re-check for flashrun-2: incomplete -> abort sweep
+
+    monkeypatch.setattr(rc, "deployed_repo_ids", _live)
+    with pytest.raises(rc.CleanupAborted):
+        rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert api.deleted == [f"{NS}/flashrun-1"]  # 1 deleted before the abort; 2 was NOT deleted
+
+
+# ---- multi-plane scope (only delete repos this plane issued) -----------------------------------
+
+def test_known_run_repo_ids_built_from_local_runs(monkeypatch):
+    from flash.server import db
+
+    monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": "r1"}, {"run_id": "r2"}])
+    assert _REAL_KNOWN_RUN_REPO_IDS() == {f"{NS}/flashrun-r1", f"{NS}/flashrun-r2"}
+
+
+def test_sweep_skips_repos_for_runs_this_plane_doesnt_know(monkeypatch):
+    # A repo for a run this plane has no record of (e.g. launched by a sibling control plane) must
+    # NOT be deleted even when old + undeployed — only repos this plane issued are reapable.
+    ours = f"{NS}/flashrun-ours"
+    theirs = f"{NS}/flashrun-theirs"
+    api = FakeApi([_DS(ours, _days_ago(45)), _DS(theirs, _days_ago(45))])
+    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
+    monkeypatch.setattr(rc, "_known_run_repo_ids", lambda: {ours})
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 1
+    assert api.deleted == [ours]  # the sibling plane's repo was spared
+
+
+# ---- in-progress-deploy guard -----------------------------------------------------------------
+
+def test_sweep_skips_repo_with_deploy_in_progress(monkeypatch):
+    # A repo whose run is mid-deploy (holding the deploy lock, before serving reports it live) must
+    # be spared — deleting its HF source would break the in-flight registration.
+    deploying = f"{NS}/flashrun-deploying"
+    other = f"{NS}/flashrun-other"
+    api = FakeApi([_DS(deploying, _days_ago(45)), _DS(other, _days_ago(45))])
+    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
+    monkeypatch.setattr(rc, "_repo_deploy_in_progress", lambda repo_id: repo_id == deploying)
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 1
+    assert api.deleted == [other]
+
+
+def test_repo_deploy_in_progress_reads_held_lock():
+    # The wrapper parses the run id from the repo id and reports the per-run deploy lock's held state.
+    from flash.server import _locks
+
+    rid = f"{NS}/flashrun-deploy-lock"
+    assert _REAL_REPO_DEPLOY_IN_PROGRESS(rid) is False  # no lock taken yet
+    with _locks._deploy_lock("deploy-lock"):            # a deploy holds the run's lock
+        assert _REAL_REPO_DEPLOY_IN_PROGRESS(rid) is True
+    assert _REAL_REPO_DEPLOY_IN_PROGRESS(rid) is False  # released
+
+
+# ---- malformed live-record fail-closed (deployed_repo_ids) -------------------------------------
+
+def test_deployed_repo_ids_fail_closed_on_blank_or_nonstr(monkeypatch):
+    from flash.serve import deploy
+
+    monkeypatch.setattr(
+        deploy,
+        "list_deployed_adapters",
+        lambda: [
+            {"repoId": f"{NS}/flashrun-good"},
+            {"repoId": "   "},   # whitespace-only -> incomplete, not coerced
+            {"repoId": 12345},   # non-str -> incomplete, not coerced into a bogus id
+        ],
+    )
+    ids, complete = rc.deployed_repo_ids()
+    assert ids == {f"{NS}/flashrun-good"}
+    assert complete is False  # a live repo couldn't be identified -> caller fails closed

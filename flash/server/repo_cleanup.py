@@ -69,10 +69,14 @@ def deployed_repo_ids() -> tuple[set[str], bool]:
     complete = True
     for rec in deploy.list_deployed_adapters():
         repo = rec.get("repoId") or rec.get("repo_id")
-        if not repo:
-            complete = False  # an unidentifiable live repo — caller fails closed
+        # A live record's repo id must be a real, non-blank string. A missing, whitespace-only, or
+        # non-str (schema-drift) value is NOT coerced with str() — that would mint a bogus id that
+        # matches no real repo and silently drop a live repo from the protected set. Treat it as an
+        # unidentifiable live repo and fail closed (the caller deletes nothing this cycle).
+        if not isinstance(repo, str) or not repo.strip():
+            complete = False
             continue
-        ids.add(str(repo))
+        ids.add(repo.strip())
     return ids, complete
 
 
@@ -111,6 +115,37 @@ def _inflight_repo_ids() -> set[str]:
             repo = ((status.spec or {}).get("train") or {}).get("hf_repo")
             ids.add(repo or f"{_ARTIFACT_NAMESPACE}/{RUN_REPO_PREFIX}{row['run_id']}")
     return ids
+
+
+def _known_run_repo_ids() -> set[str]:
+    """The default ``flashrun-<run_id>`` repo id for every run THIS control plane has a record of, in
+    ANY state — the only repos the GC is allowed to delete.
+
+    Mirrors the instance reaper's ``known_labels`` multi-plane guard
+    (``flash.server.app._known_run_ids``): two control planes sharing one HF org carry DISJOINT
+    server-assigned run ids, so a queued/running run launched by ANOTHER plane is absent from this
+    SQLite db and not yet in serving. Its repo is created at submit and frozen during provisioning,
+    so the age gate alone would make it a delete target — this plane would reap a sibling's live run.
+    Restricting deletes to repos this plane issued shields it (the deployed/in-flight sets can't, as
+    they only see this plane's serving + db). Deliberate trade-off, same as the reaper: a repo whose
+    local run record was lost is no longer auto-GC'd — reclaim such strays out of band. Raises if the
+    run registry can't be enumerated, so the sweep fails closed (deleting nothing)."""
+    from flash.server import db
+
+    return {f"{_ARTIFACT_NAMESPACE}/{RUN_REPO_PREFIX}{row['run_id']}" for row in db.all_runs()}
+
+
+def _repo_deploy_in_progress(repo_id: str) -> bool:
+    """True if a deploy/undeploy is currently registering ``repo_id``'s run with serving.
+
+    A deploy holds the per-run deploy lock for its whole duration — INCLUDING the window before the
+    repo shows up in serving's live ``/adapters`` set, which the per-delete re-check can't see. Skip
+    such a repo so the GC never deletes the HF source out from under an in-flight registration.
+    Best-effort, in-process; never raises."""
+    from flash.server._locks import _deploy_in_progress
+
+    run_id = repo_id.split("/", 1)[-1].removeprefix(RUN_REPO_PREFIX)
+    return _deploy_in_progress(run_id)
 
 
 def list_run_repos(api, namespace: str) -> list[tuple[str, datetime | None]]:
@@ -156,11 +191,14 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None) -> int:
     # deployed set). Snapshotted once per sweep like the sibling reapers; a run that goes in-flight
     # AFTER this has a brand-new repo (young -> not a target anyway). Raises -> sweep fails closed.
     protected = deployed | _inflight_repo_ids()
+    # Multi-plane guard: only delete repos for runs THIS plane issued, so a sibling plane's
+    # queued/running run (absent from our db + serving) is never reaped. Raises -> fails closed.
+    known = _known_run_repo_ids()
     now = datetime.now(UTC)
     targets = [
         repo_id
         for repo_id, last_modified in list_run_repos(api, _ARTIFACT_NAMESPACE)
-        if _deletable(repo_id, last_modified, protected, now, max_age_s)
+        if repo_id in known and _deletable(repo_id, last_modified, protected, now, max_age_s)
     ]
     if dry_run:
         logger.info("repo GC (dry-run): %d undeployed repo(s) past the GC age would be deleted", len(targets))
@@ -168,16 +206,19 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None) -> int:
 
     deleted = 0
     for repo_id in targets:
-        # Re-confirm the live set immediately before EACH delete: a repo deployed since enumeration
-        # must be spared, and if serving is momentarily unconfirmable we skip this repo rather than
-        # risk a blind delete (it'll be reconsidered next cycle).
-        try:
-            fresh = _confirm_live_set()
-        except CleanupAborted as exc:
-            logger.warning("repo GC: live set unconfirmable before deleting %s; skipping (%s)", repo_id, exc)
-            continue
+        # Re-confirm the live set immediately before EACH delete. If it can't be confirmed now —
+        # serving unreachable, OR a live adapter whose repo id couldn't be mapped — abort the WHOLE
+        # sweep (re-raise, exactly like the up-front confirm) rather than press on deleting other
+        # repos while an unidentified live adapter may be backed by one of them. Reconsidered next
+        # cycle once serving is confirmable again.
+        fresh = _confirm_live_set()  # raises CleanupAborted -> whole sweep fails closed
         if repo_id in fresh:
             logger.warning("repo GC: %s became deployed mid-sweep; skipping", repo_id)
+            continue
+        # A deploy registering this run holds the per-run deploy lock for the whole window before the
+        # repo shows up in the live set above — skip it so we never delete the source mid-deploy.
+        if _repo_deploy_in_progress(repo_id):
+            logger.warning("repo GC: %s has a deploy in progress; skipping", repo_id)
             continue
         try:
             api.delete_repo(repo_id=repo_id, repo_type="dataset", missing_ok=True)
