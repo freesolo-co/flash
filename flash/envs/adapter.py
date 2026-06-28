@@ -428,17 +428,21 @@ def _safe_extract_archive(tar_bytes: bytes | bytearray, dest: Path, subdir: str 
                     continue
                 if ".." in raw:
                     raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-                extracted += 1
-                if extracted > _MAX_ARCHIVE_MEMBERS:
-                    raise RuntimeError(
-                        f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
-                    )
                 normalized_name = "/".join(raw)
                 target = (dest / normalized_name).resolve()
                 if target != root and root not in target.parents:
                     raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
                 if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                     continue
+                # Count toward the member limit ONLY entries that are actually extracted: skipped
+                # symlinks/hardlinks/unsupported types (just above) and out-of-subtree members must
+                # not count, per the docstring ("only its members count"). The TOTAL headers walked
+                # are bounded separately by _MAX_ARCHIVE_SCAN_MEMBERS, so this stays DoS-safe.
+                extracted += 1
+                if extracted > _MAX_ARCHIVE_MEMBERS:
+                    raise RuntimeError(
+                        f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
+                    )
                 total += max(0, member.size)
                 if total > _MAX_ARCHIVE_BYTES:
                     raise RuntimeError(
