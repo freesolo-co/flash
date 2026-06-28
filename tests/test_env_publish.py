@@ -456,6 +456,26 @@ def test_safe_extract_skips_tar_metadata_entries(tmp_path):
     assert (tmp_path / "pkg" / "environment.py").read_bytes() == b"ok"
 
 
+def test_safe_extract_metadata_entries_do_not_count_toward_member_cap(monkeypatch, tmp_path):
+    metadata_type = b"Z"
+    monkeypatch.setattr(envs, "_MAX_MEMBERS", 2)
+    monkeypatch.setattr(envs, "_TAR_METADATA_TYPES", envs._TAR_METADATA_TYPES | {metadata_type})
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for idx in range(3):
+            pax = tarfile.TarInfo(f"metadata-{idx}")
+            pax.type = metadata_type
+            tar.addfile(pax)
+        data = b"ok"
+        info = tarfile.TarInfo("pkg/environment.py")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    envs._safe_extract(buf.getvalue(), tmp_path)
+
+    assert (tmp_path / "pkg" / "environment.py").read_bytes() == b"ok"
+
+
 def test_safe_extract_rejects_special_members(tmp_path):
     for typeflag, label in ((tarfile.FIFOTYPE, "fifo"), (tarfile.CHRTYPE, "char-device")):
         buf = io.BytesIO()
