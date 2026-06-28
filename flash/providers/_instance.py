@@ -221,7 +221,7 @@ def build_payload(
         # chalk spec ride along here to reach default runs (mirrors runpod/jobs.submit_run).
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
-        "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
+        "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
         "attempt": int(attempt),
     }

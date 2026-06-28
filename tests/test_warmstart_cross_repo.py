@@ -30,15 +30,15 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
 
 
 def test_status_adapter_ref_downloads_from_other_repo(monkeypatch):
-    calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX/seed0")
+    calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX")
     assert calls["repo_id"] == "Freesolo-Co/flashrun-sftX"
-    assert calls["allow_patterns"] == ["sft/flash-sftX/seed0/adapter/*"]
+    assert calls["allow_patterns"] == ["sft/flash-sftX/adapter/*"]
     assert out is not None
-    assert out.endswith("sft/flash-sftX/seed0/adapter")
+    assert out.endswith("sft/flash-sftX/adapter")
 
 
 def test_bare_prefix_is_not_a_public_init_adapter_ref(monkeypatch):
-    calls, out = _capture(monkeypatch, "sft/flash-self/seed0")
+    calls, out = _capture(monkeypatch, "sft/flash-self")
     assert calls == {}
     assert out is None
 

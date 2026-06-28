@@ -127,10 +127,10 @@ def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, mon
     streams = [u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoint/checkpoint-60")]
     assert len(streams) == 1, "the resumable full-state checkpoint must be streamed exactly once"
     up = streams[0]
-    assert up["path_in_repo"] == "rl/flash-resume-1/seed0/checkpoint/checkpoint-60"
+    assert up["path_in_repo"] == "rl/flash-resume-1/checkpoint/checkpoint-60"
     assert up["repo_type"] == "dataset"
     # Latest-only: the prior checkpoint is pruned in the SAME commit so resume sees just one.
-    assert up["delete_patterns"] == ["rl/flash-resume-1/seed0/checkpoint/**"]
+    assert up["delete_patterns"] == ["rl/flash-resume-1/checkpoint/**"]
     # FULL state: this upload must NOT strip optimizer/RNG — that's what makes the resume true
     # (Adam moments + LR schedule + RNG continue) rather than re-initializing the optimizer.
     assert "ignore_patterns" not in up
@@ -276,7 +276,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "hf_repo": "owner/runs"},
             "gpu": gpu,
         }
     )
