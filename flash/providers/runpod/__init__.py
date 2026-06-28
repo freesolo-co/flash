@@ -70,6 +70,7 @@ class RunpodProvider:
         return submit_run(spec, seed, **kwargs)
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
+        from flash.providers._poll import _attempt_int
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
@@ -93,11 +94,18 @@ class RunpodProvider:
         # shorter non-last window. Absent (a pre-persist / non-runpod handle) => False, the
         # historical default.
         on_last_gpu = bool(handle.to_dict().get("on_last_gpu", False))
+        # This endpoint's attempt (persisted by on_handle, same field path as on_last_gpu). Forwarded
+        # so worker_flagged_oom gates on it and a PRIOR attempt's lingering {"oom": true} on the
+        # shared-prefix heartbeat can't misclassify an unrelated failure as an OOM and trigger a
+        # needless GPU escalation across a control-plane restart. Absent (pre-persist handle) => None,
+        # the historical trust-the-flag behavior.
+        current_attempt = _attempt_int(handle.to_dict().get("attempt"))
         return poll_job(
             rh,
             log=log,
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
+            current_attempt=current_attempt,
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

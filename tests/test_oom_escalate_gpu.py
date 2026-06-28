@@ -283,3 +283,19 @@ def test_oom_escalation_floor_survives_a_control_plane_restart():
     assert 'allocated_vram_gb = int(remote.pop("allocated_vram_gb", 0) or 0)' in deploy
     assert "resumed_floor = max(resumed_floor, allocated_vram_gb)" in deploy
     assert "resume_oom_vram_floor=resumed_floor" in deploy
+
+
+def test_runpod_reattach_poll_gates_oom_on_the_persisted_attempt():
+    # -CF/-CH/-t5: the reattach poll (RunpodProvider.poll) must ALSO gate worker_flagged_oom, else a
+    # control-plane restart trusts a PRIOR attempt's lingering OOM heartbeat and needlessly escalates
+    # (and, via 5W1, raises resume_oom_vram_floor). The attempt is persisted into the run handle by
+    # on_handle and read back here (same field path as on_last_gpu), then forwarded as current_attempt.
+    life = pathlib.Path(
+        __import__("flash.runner.lifecycle", fromlist=["x"]).__file__
+    ).read_text()
+    rp = pathlib.Path(
+        __import__("flash.providers.runpod", fromlist=["x"]).__file__
+    ).read_text()
+    assert '"attempt": int(attempt)' in life  # persisted on every submit
+    assert 'current_attempt = _attempt_int(handle.to_dict().get("attempt"))' in rp
+    assert "current_attempt=current_attempt" in rp

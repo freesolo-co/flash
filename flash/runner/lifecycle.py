@@ -193,6 +193,10 @@ def _submit_seed_supervised(
                 # here predates this attempt's card; recovery bumps it by allocated_vram_gb on an OOM).
                 "allocated_vram_gb": current_gpu.get("vram_gb"),
                 "oom_vram_floor": int(oom_vram_floor),
+                # This endpoint's attempt number (matches the worker-stamped heartbeat ``attempt``), so
+                # the reattach poll can gate worker_flagged_oom on it and NOT trust a PRIOR attempt's
+                # lingering {"oom": true} on the shared-prefix heartbeat (RunpodProvider.poll).
+                "attempt": int(attempt),
                 "on_last_gpu": bool(current_on_last_gpu["value"]),
             },
         )
