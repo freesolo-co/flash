@@ -181,7 +181,7 @@ from flash.spec import load_job_spec_from_env
 # ------------------------------------------------------------------------------------------------
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
-SEED = int(os.environ.get("SEED", "0"))
+SEED = int(os.environ.get("SEED", "42"))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = os.environ.get("ATTEMPT", "")
 JOB_SPEC = load_job_spec_from_env()

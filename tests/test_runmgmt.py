@@ -175,9 +175,9 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
             "cost_usd": 0.0,
             "wall_seconds": 1.0,
         }
-        out = runner._persist_metrics(spec, 0, metrics)
+        out = runner._persist_metrics(spec, metrics)
         assert out == 1.0
-        with open(os.path.join(runner.artifacts_dir(spec), "seed0", "metrics.json")) as f:
+        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["cost_usd"] == 1.0
         assert on_disk["notes"]["provider"] == "runpod"
@@ -197,8 +197,8 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
 
         spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-4B", algorithm="grpo")
         # No cost_usd stamped (RunPod path): fall back to wall * rate and attribute runpod.
-        out = runner._persist_metrics(spec, 0, {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090"})
+        out = runner._persist_metrics(spec, {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090"})
         assert out == 1.0  # 1s / 3600 * 3600/hr
-        with open(os.path.join(runner.artifacts_dir(spec), "seed0", "metrics.json")) as f:
+        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["notes"]["provider"] == "runpod"

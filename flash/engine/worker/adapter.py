@@ -248,25 +248,25 @@ def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     """Resolve init_from_adapter into (repo, prefix).
 
     The only public form is the exact adapter_ref emitted by ``flash status``:
-    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
+    ``<owner>/<repo>:<phase>/<run_id>``.
     """
     adapter_ref = adapter_ref.strip()
     match = re.fullmatch(
         r"(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*):"
-        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})/seed(?P<seed>\d+)",
+        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})",
         adapter_ref,
     )
     if not match:
         return None
-    repo, phase, run_id, seed = match.groups()
-    return repo, f"{phase}/{run_id}/seed{seed}"
+    repo, phase, run_id = match.groups()
+    return repo, f"{phase}/{run_id}"
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
     """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
 
     ``adapter_prefix`` must be the full ``adapter_ref`` string emitted by ``flash status``:
-    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
+    ``<owner>/<repo>:<phase>/<run_id>``.
     """
     if not adapter_prefix:
         return None
