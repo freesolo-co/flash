@@ -9,7 +9,11 @@ and `--dry-run` stay fully local.
 from __future__ import annotations
 
 import argparse
+import difflib
+import re
+import shlex
 import sys
+from typing import NoReturn
 
 from flash import __version__
 from flash._channel import CLI_NAME
@@ -47,7 +51,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.envpush import cmd_env_push
+from flash.cli.envpush import cmd_env_delete, cmd_env_push
 
 logger = get_logger("flash.cli")
 
@@ -107,13 +111,54 @@ _HELP_OPTIONS: list[tuple[str, str]] = [
 ]
 
 
-class _FlashParser(argparse.ArgumentParser):
+def _friendly_message(message: str) -> str:
+    """Shorten argparse's verbose ``invalid choice: 'x' (choose from a, b, c, ...)`` into a concise
+    ``unknown command 'x' (did you mean 'y'?)`` — the single closest match instead of dumping the
+    whole list. Other messages pass through untouched. Styled path only; the machine path keeps
+    argparse's exact text (scripts and the error tests match on the literal `invalid choice`)."""
+    m = re.search(r"invalid choice: '([^']*)'(?: \(choose from (.*)\))?", message)
+    if not m:
+        return message
+    bad, raw_choices = m.group(1), m.group(2) or ""
+    choices = [c.strip().strip("'\"") for c in raw_choices.split(",") if c.strip()]
+    near = difflib.get_close_matches(bad, choices, n=1)
+    return f"unknown command '{bad}'" + (f" (did you mean '{near[0]}'?)" if near else "")
+
+
+class _ThemedParser(argparse.ArgumentParser):
+    """Base parser whose usage errors match the rest of the themed CLI.
+
+    argparse handles usage errors itself inside `parse_args()` — a missing required argument, an
+    unknown flag, a bad subcommand choice, a bad `type=` conversion — by calling `error()`, which
+    prints a raw `usage: ...` block plus `prog: error: msg` and exits 2, long before main()'s
+    catch-all handler ever runs. So those errors never picked up the red ✗ idiom the rest of the
+    CLI uses (this is the unstyled blob you get from a bare `flash` or a typo'd flag). We override
+    `error()` to emit `render.error()` + a dimmed `--help` pointer on a styled terminal, while the
+    machine path keeps argparse's exact text and exit code 2 that scripts, the agent contract, and
+    the error tests match on.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        if not render.styled():
+            super().error(message)  # argparse's raw usage + `prog: error: msg`, then exit 2
+        # themed twin: the red ✗ error line (same idiom as main()'s catch-all and `flash login`),
+        # then a dimmed pointer at this parser's own --help instead of the raw usage block. An
+        # "invalid choice" becomes a short "did you mean" suggestion (see _friendly_message).
+        print(render.error(_friendly_message(message)), file=sys.stderr)
+        # dimmed pointer at THIS parser's own --help (argparse sets prog per parser: `flash --help`
+        # for the root, `flash <cmd> --help` for a subcommand) instead of the raw usage block.
+        print(render.arrow(f"run `{self.prog} --help` for usage"), file=sys.stderr)
+        self.exit(2)  # keep argparse's usage-error exit code
+
+
+class _FlashParser(_ThemedParser):
     """Root parser that renders the themed help page on a styled stdout.
 
-    Only the top-level parser is a `_FlashParser`; the subparsers are plain argparse (see the
-    `parser_class=` below), so `flash <cmd> --help` keeps argparse's standard layout. Piped or
-    scripted `flash --help` also falls back to argparse, so existing greps stay byte-for-byte.
-    Overriding `format_help` (not the help action) preserves argparse's `--help` exit-0 flow.
+    Every parser (root + subcommands) inherits `_ThemedParser`'s themed `error()`, so a usage
+    error on any command gets the red ✗ idiom on a TTY. Only the root parser overrides
+    `format_help`, so `flash <cmd> --help` keeps argparse's standard layout. Piped or scripted
+    `flash --help` also falls back to argparse, so existing greps stay byte-for-byte. Overriding
+    `format_help` (not the help action) preserves argparse's `--help` exit-0 flow.
     """
 
     def format_help(self) -> str:
@@ -147,9 +192,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help="increase log verbosity (-v for info, -vv for debug)",
     )
-    # subparsers stay vanilla argparse so `flash <cmd> --help` keeps the standard layout; only
-    # the root parser themes its help (see _FlashParser).
-    sub = parser.add_subparsers(dest="cmd", required=True, parser_class=argparse.ArgumentParser)
+    # subparsers theme their usage errors (parser_class=_ThemedParser) but not their help, so
+    # `flash <cmd> --help` keeps the standard layout; only the root parser themes its help (see
+    # _FlashParser). Nested `env` subcommands inherit _ThemedParser automatically (the env parser
+    # is itself a _ThemedParser, so its add_subparsers defaults to the same class).
+    sub = parser.add_subparsers(dest="cmd", required=True, parser_class=_ThemedParser)
 
     version = sub.add_parser("version", help="print the Flash version")
     version.set_defaults(func=cmd_version)
@@ -198,6 +245,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
+
+    env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")
+    env_delete.add_argument("env_id", help="the Freesolo environment id to delete, e.g. you/your-env")
+    env_delete.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt",
+    )
+    env_delete.set_defaults(func=cmd_env_delete)
 
     train = sub.add_parser("train", help="submit a managed training run from a TOML config")
     train.add_argument("config")
@@ -322,6 +379,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
@@ -344,5 +402,20 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print(render.note("aborted") if render.styled() else "aborted", file=sys.stderr)
         return 130
+    except Exception as exc:
+        # anything outside _USER_ERRORS — e.g. a read-only ~/.flash when `flash login` saves the
+        # key, or a non-writable cwd on `flash env setup` — would otherwise dump a raw Python
+        # traceback, the least themed output there is. On a styled terminal show the red ✗ idiom
+        # + a `--debug` pointer instead; the machine path (and --debug) keep the full traceback,
+        # which is the bug signal CI and `--debug` bug reports rely on.
+        if debug or not render.styled():
+            raise
+        # point at the exact command to re-run, copy-pasteable. --debug is a root-level flag, so it
+        # must come BEFORE the subcommand (argparse rejects `flash runs --debug`); place it right
+        # after the program name. raw_args never contains --debug here — that path re-raises above.
+        cmd = " ".join([CLI_NAME, "--debug", *(shlex.quote(a) for a in raw_args)])
+        print(render.error(str(exc) or exc.__class__.__name__), file=sys.stderr)
+        print(render.arrow(f"run `{cmd}` for the full traceback"), file=sys.stderr)
+        return 1
     finally:
         emit_update_notice(update_check)

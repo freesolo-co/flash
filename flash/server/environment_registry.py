@@ -69,6 +69,45 @@ def record_published_environment(*, slug: str, name: str, key: dict) -> bool:
     return False
 
 
+def record_deleted_environment(*, slug: str, key: dict) -> bool:
+    """Remove the platform-backend metadata mirror for a deleted environment.
+
+    Symmetric to :func:`record_published_environment`: the package store (GitHub) is the source
+    of truth and is already updated by the time this runs, so dropping the row the web UI lists
+    is deliberately best-effort and never blocks ``flash env delete``.
+    """
+    internal_key = os.environ.get(INTERNAL_KEY_ENV)
+    org_id = str(key.get("org_id") or "").strip()
+    if not internal_key or not org_id:
+        return False
+
+    req = urllib.request.Request(
+        f"{freesolo_base_url()}{_PATH}",
+        data=json.dumps({"orgId": org_id, "slug": slug}).encode("utf-8"),
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {internal_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = exc.read().decode("utf-8", "replace")[:500]
+        _LOG.warning(
+            "failed to record deleted environment %s: HTTP %s %s",
+            slug,
+            exc.code,
+            detail,
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        _LOG.warning("failed to record deleted environment %s: %s", slug, exc)
+    return False
+
+
 def record_environment_use(*, slug: str, run_id: str, key: dict) -> bool:
     internal_key = os.environ.get(INTERNAL_KEY_ENV)
     org_id = str(key.get("org_id") or "").strip()

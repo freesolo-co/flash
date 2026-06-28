@@ -11,10 +11,9 @@ lifespan), never blocks request handling, and any failure is swallowed and retri
 Realized cost is reported with the operator INTERNAL key (this is COGS, not a customer charge),
 which also gates the whole feature -- with no FREESOLO_INTERNAL_KEY set, reconciliation is off.
 
-Scope note (v1): cost is attributed from the run's last persisted handle (RunStatus.remote),
-which is exact for the common single-seed run. A multi-seed run keeps only its final seed's
-handle, so its realized cost is currently under-counted -- a known limitation to extend by
-persisting every seed's resource id.
+Scope note (v1): cost is attributed from the run's last persisted handle (RunStatus.remote).
+This is exact for the common single-attempt run; runs that retried across multiple resources may be
+under-counted until every attempt's resource id is persisted.
 """
 
 from __future__ import annotations
