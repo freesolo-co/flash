@@ -45,7 +45,6 @@ def _representative_config() -> dict:
             "steps": 120,
             "lora_rank": 32,
             "lora_alpha": 64,
-            "seeds": [0, 1],
             "learning_rate": 1e-5,
             "group_size": 8,
             "temperature": 0.9,
@@ -68,7 +67,6 @@ def test_backend_run_config_parses_into_valid_jobspec() -> None:
     # control plane to assign per run at submit), so it must NOT survive parsing.
     assert spec.train.hf_repo == ""
     assert spec.train.steps == 120
-    assert tuple(spec.train.seeds) == (0, 1)
     assert spec.train.group_size == 8
     assert spec.run_id == "flash-test-1"
 

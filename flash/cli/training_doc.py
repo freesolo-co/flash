@@ -114,7 +114,6 @@ id = "your-org/my-env"      # the id printed by `flash env push`
 steps = 150                 # GRPO is step-driven; SFT is epoch-driven (epochs = N)
 lora_rank = 32
 lora_alpha = 64
-seeds = [0]
 ```
 
 GPU and the HF artifact repo are **fully managed** — there is no GPU knob; the allocator
@@ -322,8 +321,8 @@ algorithm = "grpo"
 
 [train]
 # paste the full adapter_ref `flash status <sft-run-id>` prints, verbatim
-# (shape: <owner>/<repo>:sft/<run-id>/seed0 — the owner/repo prefix is required)
-init_from_adapter = "your-org/your-repo:sft/<sft-run-id>/seed0"
+# (shape: <owner>/<repo>:sft/<run-id> — the owner/repo prefix is required)
+init_from_adapter = "your-org/your-repo:sft/<sft-run-id>"
 lora_rank = 32     # must match the SFT run
 lora_alpha = 64    # must match the SFT run
 ```
