@@ -727,7 +727,7 @@ def test_poll_heartbeat_stall(monkeypatch):
     # A FRESH training heartbeat (ts >= launch 10_000) that then FROZE: it proves liveness (so the
     # fast first-liveness failover is satisfied) AND arms the tight training stall window, so the
     # subsequent no-progress gap past stall_after_s is the stall actually under test here.
-    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0}
+    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0, "attempt": "0"}
     res = jobs.poll_lambda_job(
         _handle(),
         _spec(),
@@ -873,7 +873,7 @@ def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
         seed=0,
         interval_s=0,
         first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0, "attempt": "0"},
     )
     assert res.failure == "job_preempted"
     assert "no worker liveness" not in (res.detail or "")
@@ -890,7 +890,7 @@ def test_poll_active_stale_heartbeat_does_not_satisfy_liveness(monkeypatch):
         seed=0,
         interval_s=0,
         first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 1.0},  # < launch
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 1.0, "attempt": "0"},
     )
     assert res.failure == "stalled"
     assert "no worker liveness" in res.detail
@@ -1005,7 +1005,7 @@ def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     import re
 
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
-    hb = {"stage": "rl", "step": 7, "ts": 8500.0}
+    hb = {"stage": "rl", "step": 7, "ts": 8500.0, "attempt": "0"}
     res = jobs.poll_lambda_job(
         _handle(started_ts=8_000.0),
         _spec(),
