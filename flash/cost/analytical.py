@@ -130,9 +130,8 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
         )
     notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; static GPU $/hr")
     if wall_capped:
-        per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
-            f"training clamped to fit the {_fmt_duration(cap_s)} {per_seed}wall cap "
+            f"training clamped to fit the {_fmt_duration(cap_s)} wall cap "
             f"(after setup; uncapped: {_fmt_duration(raw_train_s)})"
         )
     return tuple(notes)
@@ -145,18 +144,14 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
 
-    # Each seed is its own job (own cold start + own wall cap): price one seed, clamp, x seeds.
-    seeds = config.setup_repeats
-    setup_per_seed = setup_seconds(config)
+    setup = setup_seconds(config)
     sps = seconds_per_step(config, gpu)
-    raw_train_per_seed = (config.steps / seeds) * sps
+    raw_train = config.steps * sps
 
-    # The cap is on total per-seed wall; setup is billed too, so clamp training to fit it.
-    wall_capped = (setup_per_seed + raw_train_per_seed) > cap_s
-    setup_per_seed = min(setup_per_seed, cap_s)
-    train_per_seed = max(0.0, cap_s - setup_per_seed) if wall_capped else raw_train_per_seed
-
-    setup, train = setup_per_seed * seeds, train_per_seed * seeds
+    # The cap is on total wall; setup is billed too, so clamp training to fit it.
+    wall_capped = (setup + raw_train) > cap_s
+    setup = min(setup, cap_s)
+    train = max(0.0, cap_s - setup) if wall_capped else raw_train
     wall = setup + train
 
     return CostEstimate(
@@ -174,5 +169,5 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
         total_usd=wall / 3600.0 * hourly,
-        notes=_notes(config, raw_train_per_seed, wall_capped, cap_s),
+        notes=_notes(config, raw_train, wall_capped, cap_s),
     )
