@@ -202,3 +202,65 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["notes"]["provider"] == "runpod"
+
+
+def test_get_status_tolerates_legacy_unknown_fields(monkeypatch):
+    """A status JSON written by the pre-multi-seed-removal control plane still carries the dropped
+    ``resume_seed_index`` key. Loading it must ignore the unknown field, not raise TypeError, so a
+    control-plane upgrade can recover/list in-flight runs (get_status + list_runs)."""
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        legacy = {
+            "run_id": "legacy",
+            "state": "running",
+            "spec": {"model": "Qwen/Qwen3.5-4B"},
+            "resume_seed_index": 1,  # removed field still present on disk
+            "some_future_field": "x",  # any other unknown key is also dropped
+        }
+        with open(os.path.join(tmp, "legacy.json"), "w") as f:
+            json.dump(legacy, f)
+
+        status = runner.get_status("legacy")
+        assert status.run_id == "legacy"
+        assert status.state == "running"
+        assert not hasattr(status, "resume_seed_index")
+        # list_runs uses the same tolerant loader.
+        assert {r.run_id for r in runner.list_runs()} == {"legacy"}
+
+
+def test_run_training_bails_when_running_cas_rejects(monkeypatch):
+    """If a run flips terminal in the race window between the pre-check and the ``running`` CAS,
+    _run_training must raise _RunCancelled and never reach the PAID supervised submit. The gate is
+    _update's return value (False == rejected by terminal-stickiness)."""
+    import pytest
+
+    import flash.runner as runner
+    from flash.runner import lifecycle
+    from flash.spec import JobSpec
+
+    importlib.reload(runner)
+    spec = JobSpec(run_id="cas", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+    # Pre-check sees a live run...
+    monkeypatch.setattr(
+        runner,
+        "get_status",
+        lambda rid: runner.RunStatus(run_id=rid, state="running", spec={}),
+    )
+    # ...but the CAS rejects because the run went terminal concurrently.
+    monkeypatch.setattr(runner, "_update", lambda *a, **k: False)
+    submitted: list[bool] = []
+    monkeypatch.setattr(
+        runner,
+        "_submit_seed_supervised",
+        lambda *a, **k: submitted.append(True) or {},
+    )
+
+    with pytest.raises(runner._RunCancelled):
+        lifecycle._run_training(spec, None, prior_cost=0.0)
+    assert submitted == []  # never charged a GPU for an already-terminal run
