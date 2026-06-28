@@ -33,7 +33,6 @@ from flash.providers._poll import (
     _attempt_int,
     is_training_heartbeat,
     make_say,
-    surface_forced_heartbeat,
     surface_heartbeat,
 )
 from flash.providers.base import PollResult, canonical_gpu
@@ -715,7 +714,7 @@ def poll_job(
                 # COMPLETED but the output decodes as an error (a handler exception). Consult the
                 # worker flag too: an infra failure can surface here and must still retry.
                 hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
-                last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
+                last_hb_key, _ = surface_heartbeat(lambda hb=hb: hb, last_hb_key, say)
                 retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
                 oom = bool(hb.get("oom")) if isinstance(hb, dict) else False
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
@@ -740,7 +739,7 @@ def poll_job(
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
             # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
             hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
-            last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
+            last_hb_key, _ = surface_heartbeat(lambda hb=hb: hb, last_hb_key, say)
             retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
             oom = bool(hb.get("oom")) if isinstance(hb, dict) else False
             detail = _append_failure_artifacts(detail, failure_detail_reader)

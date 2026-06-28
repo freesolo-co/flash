@@ -465,9 +465,10 @@ def main():
             print("error-upload warn:", up_err)
         # A CUDA OOM means this card was too small -> stamp a structured ``oom`` flag so the runner
         # retries on a strictly larger GPU (not infra; not a re-roll of the same size). Classified off
-        # torch's typed OutOfMemoryError + its num_ooms counter, never the message. ``and not
-        # retriable``: a RetriableInfraError (e.g. wait_for_gpu readiness) retries same-size, not oom.
-        oom = is_cuda_oom(e) and not retriable
+        # torch's typed OutOfMemoryError + its num_ooms counter, never the message. ``not retriable``
+        # FIRST (short-circuit): a RetriableInfraError (e.g. wait_for_gpu readiness, possibly because
+        # CUDA isn't healthy) retries same-size, so don't even probe torch/memory_stats for it.
+        oom = not retriable and is_cuda_oom(e)
         hb_flags = {"retriable": retriable, "oom": oom}
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
