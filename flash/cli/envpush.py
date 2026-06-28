@@ -1,6 +1,5 @@
-"""Environment publish/install machinery for the `flash env` subcommands.
+"""Environment publish machinery for the `flash env` subcommands.
 
-`flash env install` records a Freesolo environment id locally;
 `flash env push` packages a local Freesolo environment and uploads it through the
 managed Flash control plane.
 """
@@ -25,24 +24,6 @@ def _err(msg: str) -> int:
     text untouched for scripts and the env tests."""
     print(render.error(msg) if render.styled() else msg, file=sys.stderr)
     return 1
-
-
-def cmd_env_install(args) -> int:
-    from flash.envs.adapter import is_freesolo_environment_id
-    from flash.envs.registry import INSTALLED_MANIFEST, record_installed_env
-
-    env_id = args.env_id
-    if not is_freesolo_environment_id(env_id):
-        return _err(
-            f'env id must be a Freesolo environment id, e.g. "your-name/your-env" (got {env_id!r})'
-        )
-    record_installed_env(env_id, package="freesolo")
-    if render.styled():
-        print(render.env_installed(env_id, str(INSTALLED_MANIFEST)))
-    else:
-        print(f"installed {env_id}; recorded in {INSTALLED_MANIFEST}")
-        print(f'use it via:  [environment]\\nid = "{env_id}"')
-    return 0
 
 
 def cmd_env_delete(args) -> int:

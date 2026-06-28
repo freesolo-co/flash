@@ -300,20 +300,16 @@ def build_cases(tmp: Path):
     cost_cfg.write_text(
         'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
         '[environment]\nid = "acme/math-grader"\n'
-        '[train]\nsteps = 150\nseeds = [0]\n'
+        "[train]\nsteps = 150\nseeds = [0]\n"
         '[gpu]\ntype = "RTX 5090"\n'
     )
     dry_cfg = tmp / "sft.toml"
     dry_cfg.write_text(
         'model = "Qwen/Qwen3.5-4B"\nalgorithm = "sft"\n'
         '[environment]\nid = "acme/math-grader"\n'
-        '[train]\nepochs = 1\nseeds = [0]\n'
+        "[train]\nepochs = 1\nseeds = [0]\n"
     )
 
-    install_plain = (
-        "installed acme/math-grader; recorded in /Users/you/.flash/environments.json\n"
-        'use it via:  [environment]\\nid = "acme/math-grader"'
-    )
     push_plain = (
         "published acme/math-grader\nreference it in your config:\n\n"
         '  [environment]\n  id = "acme/math-grader"'
@@ -355,13 +351,7 @@ def build_cases(tmp: Path):
     add_argv("flash models", "supported base models", ["models"])
     add_argv("flash gpus", "managed GPU classes + $/hr", ["gpus"])
     add_argv("flash env setup", "scaffold a starter environment", ["env", "setup"], cwd=setup_dir)
-    add_argv("flash env list", "installed + local environments", ["env", "list"], cwd=list_dir)
-    add_text(
-        "flash env install acme/math-grader",
-        "record a published environment",
-        lambda: render.env_installed("acme/math-grader", "/Users/you/.flash/environments.json"),
-        install_plain,
-    )
+    add_argv("flash env list", "local environment sources", ["env", "list"], cwd=list_dir)
     add_text(
         "flash env push --name math-grader .",
         "package + upload a local environment",
@@ -478,9 +468,6 @@ def main():
     # committed gallery doesn't churn on every regeneration.
     sys.modules["flash.cli.commands"].new_run_id = lambda: "flash-1718900000-d0cf00ed"
     with tempfile.TemporaryDirectory() as td:
-        # Point the installed-env registry at an empty temp manifest so `flash env list` never
-        # leaks a developer's real installed env slugs (~/.flash/envs.json) into the preview.
-        os.environ["FLASH_ENVS_MANIFEST"] = str(Path(td) / "empty-envs.json")
         cases = build_cases(Path(td))
     blocks = [HEAD]
     for title, sub, plain, dark, light in cases:
