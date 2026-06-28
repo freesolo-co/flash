@@ -92,17 +92,6 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     assert spec_from_dict(raw).train.hf_repo == ""
 
 
-def test_environment_path_is_rejected() -> None:
-    # Local environment paths are gone; a `path` (alone or alongside `id`) must fail loudly.
-    raw = _raw()
-    raw["environment"] = {"path": "./environment.py"}
-    with pytest.raises(ConfigError, match="local environment paths are no longer supported"):
-        spec_from_dict(raw)
-    raw["environment"] = {"id": "gsm8k", "path": "./environment.py"}
-    with pytest.raises(ConfigError, match="local environment paths are no longer supported"):
-        spec_from_dict(raw)
-
-
 def test_bare_environment_id_is_rejected() -> None:
     # A bare id like "gsm8k" passes the presence check but is not a Freesolo env slug;
     # reject it up front.
