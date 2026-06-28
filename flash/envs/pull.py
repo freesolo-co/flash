@@ -170,7 +170,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             shutil.copytree(source, dest_path)
         elif dest_path.is_dir() and not dest_path.is_symlink() and not any(dest_path.iterdir()):
             _copy_contents(source, dest_path, overwrite=False)
-        elif _cwd_is_inside(dest_path):
+        elif dest_path.is_dir() and not dest_path.is_symlink() and _cwd_is_inside(dest_path):
             _copy_contents(source, dest_path, overwrite=True)
         else:
             if not overwrite:
