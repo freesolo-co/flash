@@ -43,8 +43,9 @@ class ModelInfo:
     # DIRECTLY (no parsing of the ``params`` display string). Drives the memory/size terms (VRAM, disk,
     # download), which always size the FULL checkpoint. REQUIRED: every ModelInfo must state it — a
     # curated catalog model sets its true count, and the open-model policy passes the HF/estimated count
-    # (or 0.0 when the size is genuinely "unknown size"). ``test_catalog`` asserts every curated MODELS
-    # entry sets it > 0, so a new entry can never silently fall back to a parsed string again.
+    # (or 0.0 when the size is genuinely "unknown size"). ``test_every_catalog_entry_sets_params_b``
+    # asserts every curated MODELS entry sets it > 0, so a new entry can never silently fall back to a
+    # parsed string again.
     params_b: float
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
