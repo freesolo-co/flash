@@ -133,11 +133,11 @@ def cmd_login(args) -> int:
     # default plane also drops a stale custom url from a previous custom-URL login.
     _ = save_credentials(api_key, api_url=api_url)
     if args.api_key and env_api_key and env_api_key != args.api_key:
-        print(
-            "warning: FREESOLO_API_KEY is set and will override this saved login for future "
-            "commands; unset FREESOLO_API_KEY to use the saved key.",
-            file=sys.stderr,
+        msg = (
+            "FREESOLO_API_KEY is set and will override this saved login for future "
+            "commands; unset FREESOLO_API_KEY to use the saved key."
         )
+        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
     # Show who they are right away (the same identity `flash whoami` prints) so they don't
     # have to run a second command. Never echo the key itself. The identity lookup is
     # best-effort: the key is already verified and stored, so a momentary control-plane
@@ -256,7 +256,6 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n"
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
@@ -269,7 +268,6 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "epochs = 1\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n"
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
@@ -334,9 +332,6 @@ def cmd_gpus(args) -> int:
 
 
 def cmd_env_list(args) -> int:
-    from flash.envs.registry import list_installed_environments
-
-    installed = list_installed_environments()
     paths: list[str] = []
     if Path("environment.py").is_file():
         paths.append(".")
@@ -354,18 +349,15 @@ def cmd_env_list(args) -> int:
                     paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
-    # Decide the rendering up front so the themed panel and the legacy lines never both print.
     if render.styled():
-        print(render.env_list(list(installed), sorted(paths)))
+        print(render.env_list(sorted(paths)))
         return 0
-    if installed:
-        print("installed environments:")
-        for env_id in installed:
-            print(f"  {env_id}")
     if paths:
         print("local env sources (publish with `flash env push --name <name> <path>`):")
         for path in sorted(paths):
             print(f"  {path}")
+    else:
+        print("no environments yet - scaffold one with `flash env setup`")
     return 0
 
 
@@ -417,12 +409,11 @@ def cmd_train(args) -> int:
     )
     run_id = status["run_id"]
     logger.info(
-        "submitted run %s: model=%s algorithm=%s gpu=%s seeds=%s",
+        "submitted run %s: model=%s algorithm=%s gpu=%s",
         run_id,
         spec.model,
         spec.algorithm,
         spec.gpu.type,
-        list(spec.train.seeds),
     )
     if args.background:
         if render.styled():
@@ -491,7 +482,10 @@ def cmd_status(args) -> int:
             # Separate sections with a blank line, but NOT before the first thing printed (an empty
             # orchestrator log would otherwise leave a leading blank line above the first section).
             sep = "\n" if printed_any else ""
-            print(f"{sep}----- {name} -----")
+            if render.styled():
+                print(f"{sep}{render.log_section(name)}")
+            else:
+                print(f"{sep}----- {name} -----")
             print(text, end="" if text.endswith("\n") else "\n")
             printed_any = True
     status = client.get_run(args.run_id)
@@ -536,7 +530,7 @@ def cmd_cancel(args) -> int:
     status = client_from_config().cancel_run(args.run_id)
     payload = {"run_id": args.run_id, "state": status["state"]}
     if render.styled():
-        print(render.object_panel("cancel", payload))
+        print(render.cancelled(payload))
     else:
         print(json.dumps(payload, indent=2))
     return 0
@@ -545,11 +539,17 @@ def cmd_cancel(args) -> int:
 def cmd_checkpoints(args) -> int:
     checkpoints = client_from_config().checkpoints(args.run_id)
     if not checkpoints:
-        print(
+        message = (
             f"no deployable checkpoints for {args.run_id} yet "
-            "(RL streams one per save interval; SFT-only runs have none).",
-            file=sys.stderr,
+            "(RL streams one per save interval; SFT-only runs have none)."
         )
+        if render.styled():
+            print(render.empty("checkpoints", "0 deployable", message))
+        else:
+            print(message, file=sys.stderr)
+        return 0
+    if render.styled():
+        print(render.checkpoints_table(args.run_id, checkpoints))
         return 0
     for c in checkpoints:
         print(f"step {c['step']:>6}  {c['repo_id']}:{c['subfolder']}")
@@ -567,14 +567,16 @@ def cmd_deploy(args) -> int:
         step=getattr(args, "step", None),
     )
     if render.styled():
-        print(render.object_panel("deploy", dep))
+        print(render.deployed(dep))
     else:
         print(json.dumps(dep, indent=2))
-    print(
-        "note: serving is billed per token only; use "
-        f"`flash undeploy {args.run_id}` to deregister the adapter.",
-        file=sys.stderr,
-    )
+    # a dry run creates no deployment, so the billing / undeploy hint would be misleading.
+    if dep.get("state") != "dry_run":
+        note = (
+            f"serving is billed per token only; use `flash undeploy {args.run_id}` "
+            "to deregister the adapter."
+        )
+        print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
     return 0
 
 
@@ -589,11 +591,11 @@ def cmd_export(args) -> int:
         )
     client = client_from_config()
     where = f" (step {args.step})" if args.step is not None else ""
-    print(
+    progress = (
         f"exporting adapter {args.adapter_id}{where} to {args.repository} — "
-        "downloading then re-uploading; this can take a minute...",
-        file=sys.stderr,
+        "downloading then re-uploading; this can take a minute..."
     )
+    print(render.note(progress) if render.styled() else progress, file=sys.stderr)
     result = client.export(
         args.adapter_id,
         repository=args.repository,
@@ -602,17 +604,23 @@ def cmd_export(args) -> int:
         private=not args.public,
     )
     if render.styled():
-        print(render.object_panel("export", result))
+        # the control-plane result carries no `private` key, so reflect the privacy we requested
+        # (the server applies exactly this) rather than mislabeling a private export as public.
+        print(render.exported({**result, "private": not args.public}))
     else:
         print(json.dumps(result, indent=2))
-    print(f"exported to {result.get('url', args.repository)}", file=sys.stderr)
+    url = result.get("url", args.repository)
+    print(
+        render.arrow(f"exported to {url}") if render.styled() else f"exported to {url}",
+        file=sys.stderr,
+    )
     return 0
 
 
 def cmd_undeploy(args) -> int:
     result = client_from_config().undeploy(args.run_id)
     if render.styled():
-        print(render.object_panel("undeploy", result))
+        print(render.undeployed(result))
     else:
         print(json.dumps(result, indent=2))
     return 0

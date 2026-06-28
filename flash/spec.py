@@ -138,15 +138,20 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
+# The single RNG seed every training job uses. Flash trains exactly one adapter per run (no
+# multi-seed); the value is fixed so runs are reproducible and the artifact path carries no seed
+# segment. It still reaches the worker via the ``SEED`` env (data shuffling / init in sft.py/rl.py).
+FIXED_SEED = 42
+
+
 @dataclass(frozen=True)
 class TrainSpec:
     steps: int | None = None
     epochs: int | None = None
     lora_rank: int = 32
     lora_alpha: int = 64
-    seeds: tuple[int, ...] = (0,)
     # Artifact-store adapter ref output by `flash status`:
-    # ``<hf_repo>:<phase>/<run_id>/seed<N>``.
+    # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = ""
     # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
     # code storage AND serving. PLATFORM-MANAGED, not a user field: the control plane assigns
@@ -278,7 +283,6 @@ class JobSpec:
                 epochs=_opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),
-                seeds=tuple(int(s) for s in train.get("seeds", (0,))),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),

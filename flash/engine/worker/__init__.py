@@ -172,7 +172,7 @@ from flash.engine.worker.wandb_log import (
 )
 from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
-from flash.spec import load_job_spec_from_env
+from flash.spec import FIXED_SEED, load_job_spec_from_env
 
 # ------------------------------------------------------------------------------------------------
 # Run-scoped STATE (module globals). Set once at import from the launch env / JobSpec; tests patch
@@ -181,7 +181,7 @@ from flash.spec import load_job_spec_from_env
 # ------------------------------------------------------------------------------------------------
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
-SEED = int(os.environ.get("SEED", "0"))
+SEED = int(os.environ.get("SEED", str(FIXED_SEED)))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = os.environ.get("ATTEMPT", "")
 JOB_SPEC = load_job_spec_from_env()

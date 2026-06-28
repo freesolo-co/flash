@@ -47,7 +47,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.envpush import cmd_env_install, cmd_env_push
+from flash.cli.envpush import cmd_env_push
 
 logger = get_logger("flash.cli")
 
@@ -187,12 +187,8 @@ def _build_parser() -> argparse.ArgumentParser:
     setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
     setup.set_defaults(func=cmd_env_setup)
 
-    env_list = env_sub.add_parser("list", help="list installed + local environments")
+    env_list = env_sub.add_parser("list", help="list local environment sources")
     env_list.set_defaults(func=cmd_env_list)
-
-    env_install = env_sub.add_parser("install", help="record a Freesolo environment")
-    env_install.add_argument("env_id", help="the Freesolo environment id to record")
-    env_install.set_defaults(func=cmd_env_install)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument(
@@ -338,10 +334,15 @@ def main(argv: list[str] | None = None) -> int:
     except _USER_ERRORS as exc:
         if debug:
             raise
-        print(f"error: {exc}", file=sys.stderr)
+        # themed red ✗ on a styled terminal (same idiom as `flash login` failures); the machine
+        # path keeps the plain `error: {exc}` prefix that scripts and tests match on.
+        if render.styled():
+            print(render.error(str(exc)), file=sys.stderr)
+        else:
+            print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("aborted", file=sys.stderr)
+        print(render.note("aborted") if render.styled() else "aborted", file=sys.stderr)
         return 130
     finally:
         emit_update_notice(update_check)
