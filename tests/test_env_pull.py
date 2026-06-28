@@ -370,6 +370,41 @@ def test_cmd_env_pull_refuses_overwrite_of_existing_file(monkeypatch, tmp_path):
     assert calls["n"] == 0  # refused before any download
 
 
+def test_cmd_env_pull_single_file_replaces_symlink_to_dir_with_force(monkeypatch, tmp_path):
+    # `out.is_dir()` follows symlinks, so a symlink-to-a-dir must NOT be rejected as a real directory:
+    # with --force the file replaces the LINK itself (_atomic_write_bytes -> os.replace), and the
+    # target dir is left untouched.
+    monkeypatch.setattr(adapter, "download_environment_file", lambda env, path: b"data\n")
+    realdir = tmp_path / "realdir"
+    realdir.mkdir()
+    (realdir / "keep").write_text("x")
+    out = tmp_path / "train.jsonl"
+    out.symlink_to(realdir, target_is_directory=True)
+
+    rc = cmd_env_pull(_args(path="datasets/train.jsonl", output=str(out), force=True))
+    assert rc == 0
+    assert not out.is_symlink()  # link replaced by a real file
+    assert out.read_bytes() == b"data\n"
+    assert (realdir / "keep").read_text() == "x"  # target dir untouched
+
+
+def test_cmd_env_pull_single_file_refuses_real_dir(monkeypatch, tmp_path):
+    # A REAL directory output is still refused (a single file can't replace it), even with --force.
+    calls = {"n": 0}
+
+    def fake_download(env, path):
+        calls["n"] += 1
+        return b"x"
+
+    monkeypatch.setattr(adapter, "download_environment_file", fake_download)
+    out = tmp_path / "adir"
+    out.mkdir()
+    rc = cmd_env_pull(_args(path="datasets/train.jsonl", output=str(out), force=True))
+    assert rc == 1
+    assert out.is_dir()
+    assert calls["n"] == 0  # refused before any download
+
+
 def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _make_hub_tarball())
     dest = tmp_path / "stuff"
