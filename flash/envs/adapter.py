@@ -619,6 +619,30 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
+    def _grouped_score(self, items, *, task_of, payload_of, scorer, method: str) -> list[float]:
+        """Group rollouts that share an example (input order preserved), score each group with ONE
+        concurrent ``scorer(task, payloads)`` call, then scatter rewards back to per-item order.
+        ``task_of(ex, st)`` builds a group's task; ``payload_of(st)`` its per-rollout payload."""
+        groups: dict[str, dict] = {}
+        order: list[str] = []
+        for i, (ex, st) in enumerate(items):
+            key = json.dumps(ex, sort_keys=True, default=str)
+            grp = groups.get(key)
+            if grp is None:
+                grp = groups[key] = {"task": task_of(ex, st), "idxs": [], "payloads": []}
+                order.append(key)
+            grp["idxs"].append(i)
+            grp["payloads"].append(payload_of(st))
+        out: list[float] = [0.0] * len(items)
+        for key in order:
+            grp = groups[key]
+            rewards = scorer(grp["task"], grp["payloads"])
+            if len(rewards) != len(grp["payloads"]):
+                raise RuntimeError(f"Freesolo environment {method} returned the wrong length")
+            for idx, rw in zip(grp["idxs"], rewards, strict=True):
+                out[idx] = float(rw.score)
+        return out
+
     def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
         """Reward for many ``(example, state)`` rollouts at once, in input order.
 
@@ -647,53 +671,24 @@ class FreesoloEnvironment(BaseEnvironment):
             return [self.reward(str(st.get("response_text") or ""), ex, st) for ex, st in items]
         if not self.multi_turn:
             # Single-turn: group rollouts of the same example so their completions go through ONE
-            # score_responses() call (env-concurrent), mirroring the multi-turn score_episodes()
-            # batching below. Without this, a GRPO step's whole completion batch was scored by
-            # serial per-rollout reward() calls — one blocking judge/API round-trip at a time, with
-            # the GPU idle throughout. Scoring grades the rollout's actual response (stored on the
-            # state), not "" (which would score every item empty).
-            groups: dict[str, dict] = {}
-            order: list[str] = []
-            for i, (ex, st) in enumerate(items):
-                key = json.dumps(ex, sort_keys=True, default=str)
-                grp = groups.get(key)
-                if grp is None:
-                    grp = groups[key] = {"task": self._task_example(ex), "idxs": [], "responses": []}
-                    order.append(key)
-                grp["idxs"].append(i)
-                grp["responses"].append(str(st.get("response_text") or ""))
-            out: list[float] = [0.0] * len(items)
-            for key in order:
-                grp = groups[key]
-                rewards = self._env.score_responses(grp["task"], grp["responses"])
-                if len(rewards) != len(grp["responses"]):
-                    raise RuntimeError("Freesolo environment score_responses returned the wrong length")
-                for idx, rw in zip(grp["idxs"], rewards, strict=True):
-                    out[idx] = float(rw.score)
-            return out
-        groups: dict[str, dict] = {}
-        order: list[str] = []
-        for i, (ex, st) in enumerate(items):
-            key = json.dumps(ex, sort_keys=True, default=str)
-            grp = groups.get(key)
-            if grp is None:
-                grp = groups[key] = {
-                    "task": st.get("task") or self._task_example(ex),
-                    "idxs": [],
-                    "episodes": [],
-                }
-                order.append(key)
-            grp["idxs"].append(i)
-            grp["episodes"].append(self._episode_from_state(st))
-        out: list[float] = [0.0] * len(items)
-        for key in order:
-            grp = groups[key]
-            rewards = self._env.score_episodes(grp["task"], grp["episodes"])
-            if len(rewards) != len(grp["episodes"]):
-                raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
-            for idx, rw in zip(grp["idxs"], rewards, strict=True):
-                out[idx] = float(rw.score)
-        return out
+            # score_responses() call (env-concurrent), replacing serial per-rollout reward() calls
+            # (one blocking judge/API round-trip each, GPU idle). Scoring grades the rollout's actual
+            # response (stored on the state), not "" (which would score every item empty).
+            return self._grouped_score(
+                items,
+                task_of=lambda ex, st: self._task_example(ex),
+                payload_of=lambda st: str(st.get("response_text") or ""),
+                scorer=self._env.score_responses,
+                method="score_responses",
+            )
+        # Multi-turn: same grouping, but score whole episodes via score_episodes().
+        return self._grouped_score(
+            items,
+            task_of=lambda ex, st: st.get("task") or self._task_example(ex),
+            payload_of=self._episode_from_state,
+            scorer=self._env.score_episodes,
+            method="score_episodes",
+        )
 
     @property
     def reward_thread_safe(self) -> bool:
