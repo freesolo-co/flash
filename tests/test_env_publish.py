@@ -564,6 +564,20 @@ def test_delete_package_internal_key_can_delete_any_namespace(monkeypatch):
     assert seen["slug"] == "dev-clado-ai/paper-foo"
 
 
+def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch):
+    # The internal key bypasses the namespace-ownership check, so _validate_slug is the ONLY barrier
+    # before `git rm -r -- <namespace>/<name>`. A reserved repo-control top-level path (the same set
+    # publish blocks via _safe_extract) must be rejected so e.g. DELETE /v1/envs/.github/workflows
+    # can't remove tracked repo infrastructure.
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setattr(
+        envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
+    )
+    for blocked in envs._BLOCKED_TOP_LEVEL_PATHS:
+        with pytest.raises(envs.EnvPublishError, match="invalid env id segment"):
+            envs.delete_package(slug=f"{blocked}/workflows", key={"auth_kind": "internal"})
+
+
 def test_delete_package_validates_slug(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(

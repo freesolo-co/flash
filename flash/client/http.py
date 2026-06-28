@@ -229,8 +229,14 @@ class ApiClient:
 
         The id carries a slash, which the server route matches with a ``:path`` converter, so it
         goes straight into the URL. The server removes the hub package and best-effort drops the
-        platform metadata mirror; deleting an already-absent env is a no-op (``deleted: false``)."""
-        return self._request("DELETE", f"/v1/envs/{env_id}", timeout=600.0)
+        platform metadata mirror; deleting an already-absent env is a no-op (``deleted: false``).
+
+        The timeout matches publish's (1800s): the server-side delete is a git push loop that can
+        retry up to 3 times, each attempt running clone + pull --rebase + push with a 180s per-git
+        budget (~1620s worst case). A shorter client timeout could expire mid-delete and report a
+        timeout even though the server still completes the (destructive) removal — keep the client
+        budget above the server's so the CLI result is unambiguous."""
+        return self._request("DELETE", f"/v1/envs/{env_id}", timeout=1800.0)
 
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
