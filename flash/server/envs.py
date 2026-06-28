@@ -348,3 +348,126 @@ def publish_package(*, package_b64: str, name: str, key: dict) -> str:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
         return _github_publish(dest, name=name, key=key)
+
+
+_SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9._-]+$")
+
+
+def _validate_slug(slug: str) -> tuple[str, str]:
+    """Validate a ``namespace/name`` environment id and return its two segments.
+
+    Rejects anything that isn't exactly two non-empty path-safe segments — in particular
+    ``..`` and stray separators — so the slug can be used directly as a git pathspec / on-disk
+    publish root without traversal risk (mirrors the guarantees `_sanitize_name` gives publish).
+    """
+    if not isinstance(slug, str):
+        raise EnvPublishError("env id must be a string")
+    cleaned = slug.strip().strip("/")
+    parts = cleaned.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise EnvPublishError("env id must be 'namespace/name'")
+    for segment in parts:
+        if segment in {".", ".."} or not _SLUG_SEGMENT_RE.match(segment):
+            raise EnvPublishError(f"invalid env id segment: {segment!r}")
+    return parts[0], parts[1]
+
+
+def _staged_has_changes(checkout: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EnvPublishError(
+            f"Freesolo environment delete git command timed out after {_GIT_TIMEOUT_S}s",
+            status=504,
+        ) from exc
+    # `--quiet` => exit 0 when nothing is staged, 1 when there are staged changes.
+    return proc.returncode != 0
+
+
+def _github_delete_once(*, repo: str, token: str, publish_root: str, message: str) -> bool:
+    with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
+        tmp_path = Path(tmp)
+        checkout = tmp_path / "environment-hub"
+        _run_git(
+            tmp_path,
+            [
+                "clone",
+                "--branch",
+                _GITHUB_BRANCH,
+                "--single-branch",
+                _credentialed_repo_url(repo, token),
+                str(checkout),
+            ],
+            token=token,
+        )
+        target = checkout / publish_root
+        checkout_root = checkout.resolve()
+        target_root = target.resolve()
+        if target_root != checkout_root and checkout_root not in target_root.parents:
+            raise EnvPublishError("unsafe environment delete path")
+        if not target.exists():
+            # Idempotent: nothing published under this slug, so there is nothing to remove.
+            return False
+        _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token)
+        _run_git(checkout, ["config", "user.email", "bot@freesolo.co"], token=token)
+        _run_git(
+            checkout, ["rm", "-r", "--quiet", "--ignore-unmatch", "--", publish_root], token=token
+        )
+        if not _staged_has_changes(checkout):
+            # The directory was present on disk but untracked (never committed) — nothing to push.
+            return False
+        _run_git(checkout, ["commit", "-m", message], token=token)
+        _push_environment_commit(checkout=checkout, token=token)
+        return True
+
+
+def _github_delete(slug: str, *, token: str) -> bool:
+    repo = _DEFAULT_GITHUB_REPO
+    message = f"Delete Flash environment {slug}"
+    last_error: EnvPublishError | None = None
+    max_attempts = len(_GIT_PUSH_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(max_attempts):
+        if attempt:
+            time.sleep(_GIT_PUSH_RETRY_DELAYS_SECONDS[attempt - 1])
+        try:
+            return _github_delete_once(
+                repo=repo, token=token, publish_root=slug, message=message
+            )
+        except EnvPublishError as exc:
+            last_error = exc
+            if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
+                raise
+    assert last_error is not None
+    raise last_error
+
+
+def delete_package(*, slug: str, key: dict) -> bool:
+    """Remove a published environment from the hub.
+
+    Returns ``True`` when a package was removed and ``False`` when it was already absent
+    (idempotent). Authorization mirrors publish's namespace isolation: a user key may delete
+    only environments in its own ``namespace_for(key)`` namespace, while the internal service
+    key (``auth_kind == "internal"``) may delete any environment.
+    """
+    namespace, name = _validate_slug(slug)
+    canonical = f"{namespace}/{name}"
+    caller_namespace = namespace_for(key)
+    if key.get("auth_kind") != "internal" and namespace != caller_namespace:
+        raise EnvPublishError(
+            "you can only delete environments in your own namespace "
+            f"({caller_namespace}/…); got {canonical!r}",
+            status=403,
+        )
+    token = _github_token()
+    if not token:
+        raise EnvPublishError(
+            "GITHUB_TOKEN is required to delete environments from Freesolo",
+            status=503,
+        )
+    return _github_delete(canonical, token=token)
