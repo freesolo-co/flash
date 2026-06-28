@@ -13,10 +13,17 @@ from flash.server import repo_cleanup as rc
 # Real implementations, captured before the autouse fixture swaps in test defaults, so the unit
 # tests below can exercise the genuine functions.
 _REAL_KNOWN_RUN_REPO_IDS = rc._known_run_repo_ids
-_REAL_REPO_DEPLOY_IN_PROGRESS = rc._repo_deploy_in_progress
+_REAL_HOLD_RUN_LOCK = rc._hold_run_lock
 
 NS = rc._ARTIFACT_NAMESPACE
 NOW = datetime(2026, 6, 28, 12, 0, 0, tzinfo=UTC)
+
+
+class _DummyHeld:
+    """Stand-in for a held per-run lock: the sweep only ever calls ``release()`` on it."""
+
+    def release(self) -> None:
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -35,8 +42,9 @@ def _fast_and_frozen(monkeypatch):
     # Default: this plane "knows" every repo (single-plane) — so the known-runs scope never filters
     # anything. The multi-plane scope is exercised explicitly below.
     monkeypatch.setattr(rc, "_known_run_repo_ids", lambda: _Everything())
-    # Default: no deploy is in progress for any repo. The deploy-window guard is exercised below.
-    monkeypatch.setattr(rc, "_repo_deploy_in_progress", lambda repo_id: False)
+    # Default: the per-run deploy/export lock is always free (nothing in progress) — the sweep
+    # acquires-and-holds a dummy. The acquire-and-hold guard is exercised explicitly below.
+    monkeypatch.setattr(rc, "_hold_run_lock", lambda repo_id: _DummyHeld())
     # Clear HF_TOKEN so the enablement check is deterministic (the policy itself has no env knobs).
     monkeypatch.delenv("HF_TOKEN", raising=False)
 
@@ -269,30 +277,121 @@ def test_sweep_skips_repos_for_runs_this_plane_doesnt_know(monkeypatch):
     assert api.deleted == [ours]  # the sibling plane's repo was spared
 
 
-# ---- in-progress-deploy guard -----------------------------------------------------------------
+# ---- in-progress deploy/export guard (acquire-and-hold the per-run lock) -----------------------
 
-def test_sweep_skips_repo_with_deploy_in_progress(monkeypatch):
-    # A repo whose run is mid-deploy (holding the deploy lock, before serving reports it live) must
-    # be spared — deleting its HF source would break the in-flight registration.
-    deploying = f"{NS}/flashrun-deploying"
+def test_sweep_skips_repo_with_deploy_or_export_in_progress(monkeypatch):
+    # A repo whose run is mid-deploy/mid-export (holding the per-run lock, before serving reports it
+    # live) must be spared — deleting its HF source would break the in-flight registration/download.
+    # The GC's non-blocking acquire fails for such a repo, so _hold_run_lock returns None -> skip.
+    busy = f"{NS}/flashrun-busy"
     other = f"{NS}/flashrun-other"
-    api = FakeApi([_DS(deploying, _days_ago(45)), _DS(other, _days_ago(45))])
+    api = FakeApi([_DS(busy, _days_ago(45)), _DS(other, _days_ago(45))])
     monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
-    monkeypatch.setattr(rc, "_repo_deploy_in_progress", lambda repo_id: repo_id == deploying)
+    monkeypatch.setattr(
+        rc, "_hold_run_lock", lambda repo_id: None if repo_id == busy else _DummyHeld()
+    )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
     assert n == 1
     assert api.deleted == [other]
 
 
-def test_repo_deploy_in_progress_reads_held_lock():
-    # The wrapper parses the run id from the repo id and reports the per-run deploy lock's held state.
+def test_hold_run_lock_blocked_by_held_deploy_lock():
+    # The real helper parses the run id from the repo id and does a NON-BLOCKING acquire of the same
+    # per-run lock deploy/undeploy/export take: free -> returns a held lock; already held -> None.
     from flash.server import _locks
 
     rid = f"{NS}/flashrun-deploy-lock"
-    assert _REAL_REPO_DEPLOY_IN_PROGRESS(rid) is False  # no lock taken yet
-    with _locks._deploy_lock("deploy-lock"):            # a deploy holds the run's lock
-        assert _REAL_REPO_DEPLOY_IN_PROGRESS(rid) is True
-    assert _REAL_REPO_DEPLOY_IN_PROGRESS(rid) is False  # released
+    held = _REAL_HOLD_RUN_LOCK(rid)  # lock free -> acquired and returned
+    assert held is not None
+    held.release()
+    with _locks._deploy_lock("deploy-lock"):            # a deploy/export holds the run's lock
+        assert _REAL_HOLD_RUN_LOCK(rid) is None         # GC can't acquire -> spare the repo
+    again = _REAL_HOLD_RUN_LOCK(rid)                     # released -> acquirable again
+    assert again is not None
+    again.release()
+
+
+def test_sweep_holds_deploy_lock_across_delete(monkeypatch):
+    # The destructive delete must run WHILE the per-run lock is held, so a deploy/export is mutually
+    # excluded from the delete window (not merely observed). Assert the lock is un-acquirable from
+    # the outside exactly at delete time, using the REAL acquire-and-hold helper.
+    from flash.server import _locks
+
+    rid = f"{NS}/flashrun-held"
+    seen: dict[str, bool] = {}
+
+    class _CheckApi(FakeApi):
+        def delete_repo(self, repo_id=None, repo_type=None, missing_ok=None):
+            # A non-blocking acquire from outside must FAIL (return False) while the GC holds it.
+            seen["held_during_delete"] = _locks._deploy_lock("held").acquire(blocking=False) is False
+            super().delete_repo(repo_id=repo_id, repo_type=repo_type, missing_ok=missing_ok)
+
+    api = _CheckApi([_DS(rid, _days_ago(45))])
+    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
+    monkeypatch.setattr(rc, "_hold_run_lock", _REAL_HOLD_RUN_LOCK)  # undo the fixture's dummy default
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 1
+    assert seen["held_during_delete"] is True
+    # The lock is released after the sweep, so a later deploy can take it. Keep a strong ref across
+    # acquire+release (the WeakValueDictionary would otherwise hand back a different object).
+    lk = _locks._deploy_lock("held")
+    assert lk.acquire(blocking=False) is True
+    lk.release()
+
+
+# ---- cooperative shutdown stop --------------------------------------------------------------
+
+def test_sweep_stops_between_deletes_when_should_stop_set(monkeypatch):
+    # The sweep checks should_stop BETWEEN targets and bails promptly (so a shutdown can't keep it
+    # churning destructive deletes). Stop AFTER the first delete: first check False, second True.
+    api = FakeApi([
+        _DS(f"{NS}/flashrun-1", _days_ago(45)),
+        _DS(f"{NS}/flashrun-2", _days_ago(45)),
+    ])
+    monkeypatch.setattr(rc, "deployed_repo_ids", lambda: (set(), True))
+    calls = {"n": 0}
+
+    def _stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api, should_stop=_stop)
+    assert n == 1
+    assert api.deleted == [f"{NS}/flashrun-1"]  # flashrun-2 never reached after the stop
+
+
+def test_cleanup_loop_signals_worker_stop_on_cancel(monkeypatch):
+    # On shutdown the lifespan cancels the loop task; that only cancels the await on to_thread, so the
+    # loop must SET a stop Event the in-flight worker sweep observes. Verify the loop threads a real
+    # stop callback into the sweep and sets it once the cancel propagates.
+    import asyncio
+
+    from flash.server import _runtime
+
+    seen: dict[str, object] = {}
+
+    def fake_sweep(*, should_stop=None, **_kw):
+        seen["should_stop"] = should_stop
+        seen["stopped_while_running"] = should_stop()  # not yet set during the sweep
+        raise asyncio.CancelledError  # emulate shutdown arriving mid-sweep
+
+    # The loop imports run_scheduled_cleanup from flash.server.repo_cleanup at call time, so patch it
+    # on that source module (rc), not on _runtime.
+    monkeypatch.setattr(rc, "run_scheduled_cleanup", fake_sweep)
+
+    calls = {"sleep": 0}
+
+    async def fake_sleep(_interval):
+        calls["sleep"] += 1  # 1st sleep enters the body; the sweep then cancels
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_runtime._repo_cleanup_loop())
+
+    assert callable(seen["should_stop"])
+    assert seen["stopped_while_running"] is False  # the worker saw a live (un-set) stop flag
+    assert seen["should_stop"]() is True           # the loop set it on cancel -> worker will halt
 
 
 # ---- malformed live-record fail-closed (deployed_repo_ids) -------------------------------------
