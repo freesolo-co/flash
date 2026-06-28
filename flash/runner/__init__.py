@@ -1,4 +1,4 @@
-"""Platform runner: drives managed RunPod GPUs, one allocation per seed."""
+"""Platform runner: drives managed RunPod GPUs, one allocation per run."""
 
 from __future__ import annotations
 

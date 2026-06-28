@@ -120,9 +120,8 @@ class EnvironmentSpec:
     # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    # Pip requirements the GPU worker needs for this environment.
-    # Filled in client-side from the local install manifest so the managed control
-    # plane never depends on client-local state; empty means "derive on the server".
+    # Pip requirements the GPU worker needs for this environment; empty means "derive on the server"
+    # (spec_payload defaults to the freesolo SDK). An explicit [environment] pip is the escape hatch.
     pip: tuple[str, ...] = ()
     # Secret env var names the environment requires on the worker. Values are never stored in the
     # spec; the client reads matching local env/.env values and sends them out-of-band via
