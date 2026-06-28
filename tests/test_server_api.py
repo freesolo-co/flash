@@ -1584,9 +1584,11 @@ def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
     def checking_owned_run(rid, k):
         # A non-blocking acquire from outside must FAIL (lock already held by the handler) — proving
         # the handler is INSIDE the `with _deploy_lock(...)` block by the time owned_run runs.
-        seen["locked_during_owned_run"] = (
-            app_mod._deploy_lock(rid).acquire(blocking=False) is False
-        )
+        lk = app_mod._deploy_lock(rid)
+        acquired = lk.acquire(blocking=False)
+        seen["locked_during_owned_run"] = not acquired
+        if acquired:
+            lk.release()
         return real_owned_run(rid, k)
 
     monkeypatch.setattr(serving_routes, "_validate_hf_repo_id", checking_validate)
