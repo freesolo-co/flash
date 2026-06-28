@@ -72,6 +72,7 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
             id="test/big-disk",
             display_name="x",
             params="4B",
+            params_b=4.0,
             algos=("sft",),
             min_vram_gb=32,
             min_disk_gb=160,

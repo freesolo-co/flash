@@ -286,6 +286,82 @@ def test_error_path_themed_on_tty_plain_on_machine(monkeypatch, capsys) -> None:
     assert capsys.readouterr().err.startswith("error:")  # machine path unchanged
 
 
+def test_argparse_usage_error_themed_on_tty_plain_on_machine(monkeypatch, capsys) -> None:
+    """argparse handles usage errors (a missing arg, a bad subcommand) itself inside parse_args,
+    before main()'s catch-all runs. On a styled terminal those now get the same red ✗ idiom + a
+    dimmed `--help` pointer; the machine path keeps argparse's raw `usage: ... / prog: error:`
+    block. Either way the exit code stays 2 (the agent contract and scripts match on it)."""
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([])  # no subcommand -> argparse's "the following arguments are required" error
+    assert excinfo.value.code == 2  # argparse's usage-error exit code is preserved
+    err = capsys.readouterr().err
+    assert err.startswith("✗")  # ✗ leads the themed line, like main()'s catch-all
+    assert "error:" in err
+    assert "--help" in err  # the dimmed next-step pointer replaces the raw usage block
+    assert "usage:" not in err  # argparse's unstyled usage block is gone on a TTY
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("usage:")  # machine path keeps argparse's raw usage block
+    assert "error:" in err
+    assert "✗" not in err
+
+
+def test_unexpected_error_themed_on_tty_traceback_on_machine(monkeypatch, capsys) -> None:
+    """An error outside _USER_ERRORS (e.g. a read-only ~/.flash, a full disk) used to dump a raw
+    Python traceback. On a styled terminal it now gets the red ✗ idiom + a `--debug` pointer; the
+    machine path (and --debug) keep the full traceback as the bug signal CI and bug reports rely
+    on, so the byte-for-byte machine contract for unexpected errors is unchanged."""
+
+    def _boom(*a, **k):
+        raise OSError("disk full")  # not in _USER_ERRORS (a plain OSError, not FileNotFoundError)
+
+    monkeypatch.setattr(cli.commands, "client_from_config", _boom)
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert cli.main(["runs"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("✗")  # red ✗ idiom, not a raw traceback
+    assert "disk full" in err
+    assert "--debug runs" in err  # names the exact command, with --debug BEFORE the subcommand
+    assert "Traceback (most recent call last)" not in err
+
+    # machine path: the raw exception propagates (a traceback), exactly as before this handler
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    with pytest.raises(OSError, match="disk full"):
+        cli.main(["runs"])
+
+
+def test_invalid_command_suggests_closest_match(monkeypatch, capsys) -> None:
+    """An unknown command gets a short themed `did you mean '<closest>'?` suggestion instead of
+    argparse's full `(choose from ...)` dump; the machine path keeps argparse's exact text."""
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["deploly"])  # a typo of `deploy`
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "did you mean 'deploy'?" in err
+    assert "choose from" not in err  # the full choice list is gone on a TTY
+    assert "--help" in err
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["deploly"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice" in err  # machine path unchanged
+    assert "choose from" in err  # the full argparse list stays on the machine path
+
+
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("COLORTERM", "truecolor")
