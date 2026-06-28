@@ -123,7 +123,8 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                     "cannot be located, so it cannot be deployed"
                 ),
             )
-        # CAS guard: /cancel is NOT serialized by the deploy lock, so capture state before deploy.
+        # CAS guard: /cancel's worker + provider teardown runs outside this lock (only its status
+        # write is lock-serialized), so capture state before deploy and re-verify it on the write.
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = (
