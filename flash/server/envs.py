@@ -480,6 +480,17 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
             raise EnvPublishError("unsafe environment delete path")
         if not target.exists():
             # Idempotent: nothing published under this slug, so there is nothing to remove.
+            #
+            # The `git clone --single-branch` above already fetched the branch tip, so `target`
+            # reflects the latest published state as of that fetch and this check runs microseconds
+            # later with no intervening network round-trip. A `git pull` here would not meaningfully
+            # close the publish/delete race: it can only shrink the (sub-second, clone-unpack) window
+            # between a fetch and this check, never eliminate it — a publish landing one instant after
+            # *any* fetch is still unseen. Reporting `deleted: false` for a slug absent in the freshly
+            # cloned tip is the correct answer for the state we observed; a publish racing in
+            # afterwards is a genuinely concurrent, unordered event. We therefore accept this race
+            # rather than pay an extra round-trip on every delete. (The inverse race — a concurrent
+            # publish landing while the slug *does* exist — is handled in `_push_environment_delete`.)
             return False
         _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token, operation="delete")
         _run_git(
