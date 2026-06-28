@@ -51,7 +51,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.envpush import cmd_env_pull, cmd_env_push, cmd_env_delete, cmd_env_push
+from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
 
 logger = get_logger("flash.cli")
 
@@ -264,7 +264,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_pull.add_argument("-f", "--force", action="store_true", help="overwrite existing output")
     env_pull.set_defaults(func=cmd_env_pull)
-    
+
     env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")
     env_delete.add_argument("env_id", help="the Freesolo environment id to delete, e.g. you/your-env")
     env_delete.add_argument(
