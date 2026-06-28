@@ -216,6 +216,25 @@ def test_pull_environment_package_replaces_symlink_without_touching_target(monke
     assert (real_target / "precious.txt").read_text() == "keep me"
 
 
+def test_pull_environment_package_replaces_symlink_to_cwd_without_touching_target(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
+    real_target = tmp_path / "real"
+    real_target.mkdir()
+    (real_target / "precious.txt").write_text("keep me")
+    dest = tmp_path / "stuff"
+    dest.symlink_to(real_target, target_is_directory=True)
+    monkeypatch.chdir(real_target)
+
+    pull_environment_package("david-freesolo-co/stuff", dest, overwrite=True)
+
+    assert not dest.is_symlink()
+    assert (dest / "environment.py").is_file()
+    assert (real_target / "precious.txt").read_text() == "keep me"
+    assert not (real_target / "environment.py").exists()
+
+
 def test_pull_environment_package_refuses_whole_hub_root(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
     with pytest.raises(ValueError, match="whole shared environment hub"):
@@ -288,6 +307,14 @@ def test_pull_environment_package_filters_hub_to_env_under_member_limit(monkeypa
     pull_environment_package("david-freesolo-co/stuff", tmp_path / "out")
 
     assert (tmp_path / "out" / "datasets" / "train.jsonl").read_text() == "data\n"
+
+
+def test_safe_extract_archive_bounds_total_members_scanned(monkeypatch, tmp_path):
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_SCAN_MEMBERS", 4)
+    entries = {f"unrelated/f{i}.txt": b"x" for i in range(20)}
+
+    with pytest.raises(RuntimeError, match="too many entries to scan"):
+        adapter._safe_extract_archive(_tarball(entries), tmp_path, subdir="wanted")
 
 
 def test_pull_rechecks_destination_after_download(monkeypatch, tmp_path):
