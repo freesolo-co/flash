@@ -51,10 +51,12 @@ async def _reconcile_cost_loop() -> None:
 
 
 async def _repo_cleanup_loop() -> None:
-    """Background loop: periodically delete per-run HF artifact repos (``Freesolo-Co/flashrun-*``)
-    that are NOT currently deployed and older than a fixed 30-day age, reclaiming the org's
-    private-storage quota. Currently-deployed repos are the only thing spared. The age and the daily
-    cadence are hardcoded constants (no env knobs) — see ``flash.server.repo_cleanup``.
+    """Background loop: sweep ONCE on startup, then periodically delete per-run HF artifact repos
+    (``Freesolo-Co/flashrun-*``) that are NOT currently deployed and older than a fixed 30-day age,
+    reclaiming the org's private-storage quota. Currently-deployed repos are the only thing spared.
+    The age and the daily cadence are hardcoded constants (no env knobs) — see
+    ``flash.server.repo_cleanup``. Sweeping on startup (rather than after a full interval) keeps the
+    GC making progress even on a plane that restarts more often than the 24h cadence.
 
     Fails CLOSED: each sweep aborts (deleting nothing) if the serving live set can't be confirmed, so
     a serving blip never risks deleting a live adapter — it just retries next cycle. The HF + serving
@@ -65,8 +67,12 @@ async def _repo_cleanup_loop() -> None:
     # Daily sweep (fixed). The 30-day delete age makes the exact cadence non-critical — a repo a few
     # hours past 30d is no different from one a few hours under.
     interval = 24.0 * 3600.0
+    # Sweep IMMEDIATELY on startup, THEN sleep between subsequent sweeps (sleep is at the END of the
+    # loop). Sleeping first would let a control plane restarted — or crash-looping — more often than
+    # the 24h interval never reclaim anything: the GC would always be cancelled before its first
+    # sweep. The startup sweep is still off the critical path — this loop is a background task and the
+    # sweep itself runs in a worker thread (see app.lifespan), so it never delays accepting traffic.
     while True:
-        await asyncio.sleep(interval)
         # The blocking sweep runs in a worker thread that task.cancel() can't interrupt; a stop Event
         # lets the lifespan signal it to halt BETWEEN deletes at shutdown, so a large in-flight sweep
         # can't keep deleting repos after the server was told to stop (see _charge_retry_loop).
@@ -84,6 +90,8 @@ async def _repo_cleanup_loop() -> None:
             _log.warning("repo GC sweep skipped (serving live set unconfirmed); retrying next cycle: %s", exc)
         except Exception:
             _log.debug("repo GC sweep failed; retrying next cycle", exc_info=True)
+        # Sleep AFTER the sweep, so the first sweep runs at startup rather than a full interval later.
+        await asyncio.sleep(interval)
 
 
 async def _charge_retry_startup() -> None:
