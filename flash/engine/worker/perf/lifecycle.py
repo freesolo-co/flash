@@ -23,6 +23,36 @@ class RetriableInfraError(RuntimeError):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
 
 
+# Substrings that identify a CUDA out-of-memory crash in an exception message / traceback. The worker
+# stamps a structured ``oom`` heartbeat flag off ``is_cuda_oom`` (NOT the runner parsing detail
+# strings), so the runner can ESCALATE the retry to a strictly LARGER GPU instead of failing fast or
+# re-rolling the same too-small card.
+_CUDA_OOM_MARKERS = (
+    "out of memory",  # "CUDA out of memory" AND fla/Triton's "Triton Error [CUDA]: out of memory"
+    "cuda_error_out_of_memory",
+    "outofmemoryerror",
+)
+
+
+def is_cuda_oom(exc: BaseException | None, tb_text: str = "") -> bool:
+    """True when ``exc`` (or its traceback) is a CUDA out-of-memory crash.
+
+    Catches torch's typed ``OutOfMemoryError`` AND a plain ``RuntimeError`` whose message names OOM
+    (e.g. the ``Triton Error [CUDA]: out of memory`` that fla's backward kernels raise — the 9B-GRPO
+    autotune crash). The worker calls this on its LIVE exception (the one place the real cause is in
+    hand) and stamps a structured ``oom`` flag the poller reads, so classification never relies on
+    runner-side detail-string parsing. Best-effort and torch-import-safe."""
+    try:
+        import torch
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    blob = f"{type(exc).__name__ if exc is not None else ''}: {exc}\n{tb_text}".lower()
+    return any(m in blob for m in _CUDA_OOM_MARKERS)
+
+
 def detect_mig_slice() -> str | None:
     """Return a reason string if this worker was handed a MIG slice (a partitioned GPU), else None.
 

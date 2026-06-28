@@ -123,6 +123,16 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     )
 
 
+def _oom_escalated(candidates, oom_vram_floor: int):
+    """Candidates strictly LARGER than the VRAM that just OOM'd — the cards a bigger-card retry may
+    pick. ``oom_vram_floor == 0`` (no prior OOM) returns the list unchanged; otherwise an OOM on an
+    80GB card leaves only the >80GB classes. An EMPTY result means the run already OOM'd the largest
+    available class, so there is nowhere bigger to escalate to (the caller fails terminally)."""
+    if not oom_vram_floor:
+        return list(candidates)
+    return [c for c in candidates if c.vram_gb > oom_vram_floor]
+
+
 def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
@@ -218,6 +228,10 @@ def _submit_seed_supervised(
     # retry before walking classes within it.
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
+    # The largest GPU VRAM (GB) that has OOM'd this run. A CUDA-OOM retry must land on a STRICTLY
+    # larger card (a same-size walk would just OOM again), so the next attempt filters its candidates
+    # to ``vram_gb > oom_vram_floor`` (see _oom_escalated). 0 until the first OOM.
+    oom_vram_floor = 0
     # Attempts spent on the cache-drop fallback, EXCLUDED from the GPU-walk budget. The bonus slot
     # ``cache_fallback_attempts`` widens the loop range, but the budget checks below use the raw attempt
     # counter; without this offset the cache-drop attempt would still tick the budget, so a run that
@@ -303,11 +317,26 @@ def _submit_seed_supervised(
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
+            # On a CUDA-OOM retry, restrict the candidate list to cards STRICTLY larger than the one
+            # that OOM'd (a same-size walk would just OOM again). When nothing larger is left, the run
+            # already OOM'd the biggest class we have -> fail terminally rather than re-roll the size.
+            cands = _oom_escalated(alloc.candidates, oom_vram_floor)
+            if not cands:
+                last_detail = (
+                    f"oom: the run exceeded the largest available GPU class "
+                    f"({oom_vram_floor} GB) — no larger card to escalate to"
+                )
+                print(
+                    f"seed={seed} OOM on the largest GPU class ({oom_vram_floor} GB); not retrying",
+                    file=log,
+                    flush=True,
+                )
+                break
             # Pick this attempt's (provider, class) from the cross-provider ranked list: the first
             # attempt takes the cheapest; each retry that provisioned a class and lost it to an infra
             # failure ESCAPES that provider before walking classes within it (see _select_candidate),
             # so a congested/sick provider can't burn the whole budget.
-            chosen = _select_candidate(alloc.candidates, failed_providers, tried_classes)
+            chosen = _select_candidate(cands, failed_providers, tried_classes)
             # ``on_last_gpu`` == NO further GPU attempt will be made after this one — either the
             # candidate list is exhausted (``len(untried) <= 1``) OR the retry budget is exhausted
             # (``attempt >= max_retries``, including the single-attempt ``max_retries == 0`` case).
@@ -316,7 +345,7 @@ def _submit_seed_supervised(
             # Tell the provider so its no-capacity backstops wait longer before giving up rather than
             # failing fast into a retry that will never happen. A pinned/single-candidate run is
             # "last" from attempt 0, which is what we want.
-            untried = [c for c in alloc.candidates if (c.provider, c.gpu) not in tried_classes]
+            untried = [c for c in cands if (c.provider, c.gpu) not in tried_classes]
             # The cache-drop fallback (cache_fallback_attempts) is a reserved attempt PAST the retry
             # budget, so when it's still available a cache-attached RunPod attempt is not "last" by
             # BUDGET — don't let ``attempt >= max_retries`` mark it last-GPU (long no-capacity grace),
@@ -391,6 +420,14 @@ def _submit_seed_supervised(
         # Retry only on a structured failure category the provider already classified; a real job
         # failure fails fast. No detail-string parsing. (USER cancels are caught below, not here.)
         infra_shaped = res.failure in ("stalled", "no_capacity", "poll_error", "job_preempted")
+        # A CUDA OOM is its own retry category: retry, but on a STRICTLY larger card — record the
+        # failed card's VRAM as the escalation floor the next attempt's candidate filter reads. It is
+        # NOT infra (the host was fine, the card was just too small), so it must NOT escape the
+        # provider (only grow the card); the record block below skips failed_providers for it.
+        oom_shaped = res.failure == "oom"
+        if oom_shaped and chosen is not None:
+            oom_vram_floor = max(oom_vram_floor, int(chosen.vram_gb))
+        retry_shaped = infra_shaped or oom_shaped
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
@@ -424,14 +461,21 @@ def _submit_seed_supervised(
         # "retrying" is true when the GPU-walk budget remains OR a cache-drop fallback will retry this
         # even past it (first_cache_drop) — else the log would say "not retrying" while the loop actually
         # continues with the reserved cache-less fallback attempt.
+        will_retry = retry_shaped and (walk_attempt < infra_budget or first_cache_drop)
+        action = (
+            "not retrying"
+            if not will_retry
+            else f"retrying on a larger GPU (> {oom_vram_floor} GB)"
+            if oom_shaped
+            else "retrying (resume from last checkpoint)"
+        )
         print(
-            f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < infra_budget or first_cache_drop) else 'not retrying'}"
+            f"seed={seed} attempt={attempt} failed ({res.failure}); {action}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
         )
-        if not infra_shaped:
+        if not retry_shaped:
             break
         # Stop when the GPU-walk retry budget is exhausted — UNLESS a cache-drop fallback is still
         # available. The bonus attempt granted above is reserved for exactly this transition; once the
@@ -448,10 +492,12 @@ def _submit_seed_supervised(
             # cheapest GPU without the volume on the wider all-DC pool first — the miss may have been
             # the cache's datacenter set, not the GPU class globally. Only walk if THAT also fails.
         elif chosen is not None:
-            # Record what THIS attempt burned so the next pick escapes it cross-provider — only when
-            # an attempt actually provisioned a class and lost it infra-shaped. An allocation/pricing
-            # failure (chosen is None) never tried a card, so it must not poison the next pick.
-            failed_providers.add(chosen.provider)
+            # Record what THIS attempt burned so the next pick avoids it — only when an attempt
+            # actually provisioned a class and lost it (chosen is None never tried a card). An infra
+            # failure also escapes the PROVIDER cross-provider; an OOM does NOT (the host was fine —
+            # just grow the card, which the oom_vram_floor filter already enforces).
+            if not oom_shaped:
+                failed_providers.add(chosen.provider)
             tried_classes.add((chosen.provider, chosen.gpu))
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones

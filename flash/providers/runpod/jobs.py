@@ -716,10 +716,11 @@ def poll_job(
                 # worker flag too: an infra failure can surface here and must still retry.
                 last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
                 retriable = worker_flagged_retriable(heartbeat_reader)
+                oom = worker_flagged_oom(heartbeat_reader)
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
                     False,
-                    failure="job_preempted" if retriable else "job_failed",
+                    failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
                     detail=detail,
                 )
         if status in TERMINAL_FAIL:
@@ -739,10 +740,11 @@ def poll_job(
             # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
             last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
             retriable = worker_flagged_retriable(heartbeat_reader)
+            oom = worker_flagged_oom(heartbeat_reader)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
                 False,
-                failure="job_preempted" if retriable else "job_failed",
+                failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
                 detail=f"[{status}] {detail}",
             )
         # Capacity backstop: bound how long the job may sit IN_QUEUE (no worker has accepted it).
@@ -1062,3 +1064,15 @@ def worker_flagged_retriable(heartbeat_reader) -> bool:
     if not isinstance(hb, dict):
         return False
     return bool(hb.get("retriable"))
+
+
+def worker_flagged_oom(heartbeat_reader) -> bool:
+    """True if the worker stamped ``oom`` (a CUDA out-of-memory crash) in its last heartbeat — the
+    structured signal that lets the runner ESCALATE the retry to a strictly larger GPU instead of
+    failing fast on a too-small card. Same fresh-read contract as ``worker_flagged_retriable``."""
+    if heartbeat_reader is None:
+        return False
+    hb = heartbeat_reader(force=True)
+    if not isinstance(hb, dict):
+        return False
+    return bool(hb.get("oom"))

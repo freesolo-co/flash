@@ -156,6 +156,7 @@ from flash.engine.worker.perf import (
     gpu_diagnostics,
     grad_checkpointing_on,
     grpo_sleep_mode,
+    is_cuda_oom,
     liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
@@ -456,6 +457,12 @@ def main():
         retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
         tb = traceback.format_exc()
         traceback.print_exc()
+        # A CUDA out-of-memory crash means THIS card was too small for the run's peak. Stamp a
+        # structured ``oom`` flag (off the LIVE exception + traceback, the one place the real cause is
+        # in hand) so the runner ESCALATES the retry to a strictly larger GPU instead of failing fast
+        # (it's NOT infra) or re-rolling the same too-small card. Checked on str(e)+tb so the
+        # fla/Triton "[CUDA]: out of memory" RuntimeError counts, not just torch's typed error.
+        oom = is_cuda_oom(e, tb)
         try:
             err_name = error_artifact_name(RUN_MODE)
             err_path = f"/tmp/{err_name}"
@@ -464,7 +471,7 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        hb_flags = {"retriable": retriable}
+        hb_flags = {"retriable": retriable, "oom": oom}
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:
