@@ -443,6 +443,25 @@ def test_deployed_repo_ids_flags_record_without_repo_id_as_incomplete(monkeypatc
     assert complete is False
 
 
+def test_deployed_repo_ids_flags_malformed_truthy_repo_id_as_incomplete(monkeypatch):
+    from flash.serve import deploy
+
+    # Schema drift: a truthy but non-string repoId (here a dict) must NOT be str()-ified into the
+    # keep-set — that token can't match the real Freesolo-Co/flashrun-* id, so the live repo would
+    # look un-deployed and become delete-eligible. Fail closed (complete=False) like a missing key.
+    monkeypatch.setattr(
+        deploy, "list_deployed_adapters",
+        lambda: [
+            {"repoId": "Freesolo-Co/flashrun-a"},
+            {"repoId": {"name": "flashrun-b"}},  # truthy non-string
+            {"repoId": "   "},  # blank
+        ],
+    )
+    ids, complete = rc.deployed_repo_ids()
+    assert ids == {"Freesolo-Co/flashrun-a"}  # only the well-formed id, no "{'name': ...}" token
+    assert complete is False
+
+
 def test_deployed_repo_ids_collects_repo_ids(monkeypatch):
     from flash.serve import deploy
 
