@@ -139,6 +139,7 @@ def _submit_seed_supervised(
     log,
     runtime_secrets: dict[str, str] | None = None,
     oom_vram_floor_start: int = 0,
+    resume_oom_attempts: int = 0,
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
@@ -215,6 +216,18 @@ def _submit_seed_supervised(
     # of broken/busy GPUs is walked past to a healthy host, but only when the user left retries enabled
     # (max_retries==0 stays 0 — a deliberate single-shot run is never forced to retry).
     infra_budget = max(max_retries, INFRA_RETRY_FLOOR) if max_retries else 0
+    # OOM-recovery budget guard: ``resume_oom_attempts`` is the count of attempts a control-plane
+    # restart already spent on THIS seed before it reattached to an OOM (see attach_run). OOM
+    # escalation walks onto strictly larger (pricier) cards, so its total must honor the user's
+    # ``max_retries``. If the pre-restart attempts already used the whole escalation budget, fail NOW
+    # instead of submitting another (costly) larger-GPU attempt — notably max_retries=0 (single-shot).
+    # The loop's own budget check below adds ``resume_oom_attempts`` to the OOM count so any remaining
+    # escalations are also capped globally, not re-granted fresh.
+    if resume_oom_attempts and oom_vram_floor_start and resume_oom_attempts > max_retries:
+        raise RuntimeError(
+            f"seed {seed} CUDA-OOM exhausted the retry budget before recovery "
+            f"(attempts={resume_oom_attempts}, max_retries={max_retries}); not escalating again"
+        )
     last_detail = None
     # Sticky: once a no-capacity failure shows the weight-cache datacenter set is starved, drop the
     # cache (volume) for every remaining attempt so they run on the unrestricted all-DC pool.
@@ -490,10 +503,16 @@ def _submit_seed_supervised(
         # ``max_retries=1``) caps OOM escalation sooner, so a CUDA OOM can't quietly walk through five
         # ever-pricier GPUs against the user's wishes.
         retry_budget = max_retries if oom_shaped else infra_budget
+        # For an OOM, count the attempts a pre-restart process already spent on this seed
+        # (``resume_oom_attempts``) against the escalation budget so a control-plane restart can't
+        # re-grant a fresh full set of larger-GPU escalations beyond ``max_retries`` (the entry guard
+        # above already rejects an outright-exhausted budget; this caps any REMAINING escalations).
+        # Infra retries are unaffected — a restart legitimately re-leases the infra budget.
+        budget_spent = walk_attempt + (resume_oom_attempts if oom_shaped else 0)
         # "retrying" is true when the GPU-walk budget remains OR a cache-drop fallback will retry this
         # even past it (first_cache_drop) — else the log would say "not retrying" while the loop actually
         # continues with the reserved cache-less fallback attempt.
-        will_retry = retry_shaped and (walk_attempt < retry_budget or first_cache_drop)
+        will_retry = retry_shaped and (budget_spent < retry_budget or first_cache_drop)
         action = (
             f"OOM on the largest GPU class ({oom_vram_floor} GB); not retrying"
             if oom_no_larger
@@ -515,7 +534,7 @@ def _submit_seed_supervised(
         # available. The bonus attempt granted above is reserved for exactly this transition; once the
         # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
         # and the loop cannot spin past its one extra cache-less attempt.
-        if walk_attempt >= retry_budget and not first_cache_drop:
+        if budget_spent >= retry_budget and not first_cache_drop:
             break
         if first_cache_drop:
             drop_weight_cache = True
@@ -576,6 +595,7 @@ def _run_seed_loop(
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
     resume_oom_vram_floor: int = 0,
+    resume_oom_attempts: int = 0,
 ) -> None:
     """Run spec.train.seeds[start_index:] under supervision; finalize the run.
 
@@ -616,11 +636,17 @@ def _run_seed_loop(
             file=log,
             flush=True,
         )
-        # The resumed escalation floor applies ONLY to the in-flight seed (the first iteration after a
-        # restart); subsequent seeds rebuild their own floor from scratch (see the docstring).
+        # The resumed escalation floor + consumed-OOM-attempt count apply ONLY to the in-flight seed
+        # (the first iteration after a restart); subsequent seeds rebuild their own from scratch.
         seed_oom_floor = resume_oom_vram_floor if i == start_index else 0
+        seed_oom_attempts = resume_oom_attempts if i == start_index else 0
         metrics = _submit_seed_supervised(
-            spec, seed, log, runtime_secrets=runtime_secrets, oom_vram_floor_start=seed_oom_floor
+            spec,
+            seed,
+            log,
+            runtime_secrets=runtime_secrets,
+            oom_vram_floor_start=seed_oom_floor,
+            resume_oom_attempts=seed_oom_attempts,
         )
         total_cost += _persist_metrics(spec, seed, metrics)
         # A cancel can land while this thread writes metrics — after the supervised

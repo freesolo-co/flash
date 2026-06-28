@@ -160,6 +160,12 @@ def build_worker_env(payload: dict) -> dict:
         env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
+    # The retry attempt, stamped into every heartbeat (engine.worker reads ATTEMPT). The shared RunPod
+    # env builder does NOT set it (RunPod's submit_run adds ATTEMPT to the worker env itself), so an
+    # instance worker would otherwise heartbeat attempt="" — and the poller's attempt-gated
+    # worker_flagged_oom would then reject a real CUDA OOM. Carry the payload's attempt so instance
+    # OOMs are attributed to THIS attempt and escalate correctly.
+    env["ATTEMPT"] = str(int(payload.get("attempt", 0)))
     # Compute substrate for the RunMetrics record (engine.worker reads FLASH_ARM). The payload env
     # was built by the shared runpod env builder, which stamps "runpod"; this bootstrap runs on the
     # rented instance, so override it to the real backend carried in the payload.
@@ -264,19 +270,46 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     return proc.returncode
 
 
-def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bool = False) -> None:
+def _console_flags_cuda_oom(mode: str | None) -> bool:
+    """True if THIS attempt's training console (``/tmp/console_<mode>.txt``) names a CUDA OOM — a
+    subprocess OOM (e.g. a vLLM EngineCore child) the worker's own exception classifier missed
+    because the parent exception is just a wrapper. Attempt-safe: the console is local to this
+    instance, which ran only this attempt (unlike the shared per-seed HF artifacts). Runs the SAME
+    CUDA-specific predicate as the worker (``is_cuda_oom``), so a host/library OOM does not escalate.
+    Best-effort: never raises (absent console / odd encoding -> not an OOM)."""
+    try:
+        from flash.engine.worker.perf.lifecycle import is_cuda_oom
+
+        path = f"/tmp/console_{mode}.txt"
+        if not mode or not os.path.exists(path):
+            return False
+        with open(path, errors="replace") as f:
+            tail = f.read()[-8000:]
+        return is_cuda_oom(None, tail)
+    except Exception:
+        return False
+
+
+def write_attempt_marker(
+    payload: dict, ok: bool, error: str = "", retriable: bool = False, oom: bool = False
+) -> None:
     """Attempt-scoped terminal marker (``<arm>_attempt<N>.json``): how the control plane
     distinguishes THIS attempt's failure from a prior attempt's leftovers under the same prefix.
 
     ``retriable`` stamps the same flag the host failmark and the worker heartbeat use: the pollers
     read ``marker.get("retriable")`` and classify a flagged failure as ``job_preempted`` (retried on
     a fresh host within the HF infra budget) instead of ``job_failed`` (fails fast). Set it for
-    infra-shaped bootstrap failures (HF fetch/upload) so an HF outage doesn't burn the run."""
+    infra-shaped bootstrap failures (HF fetch/upload) so an HF outage doesn't burn the run.
+
+    ``oom`` stamps the structured CUDA-OOM flag the pollers escalate on (a larger GPU). It is set
+    when THIS attempt's training console named a CUDA OOM that the worker's own exception classifier
+    missed (a subprocess OOM, e.g. a vLLM EngineCore child). Marker-scoped, so it is attempt-safe."""
     marker = {
         "ok": bool(ok),
         "ts": time.time(),
         "attempt": int(payload.get("attempt") or 0),
         "retriable": bool(retriable),
+        "oom": bool(oom),
         "error": error[:2000],
     }
     p = "/tmp/attempt_marker.json"
@@ -407,6 +440,7 @@ def main() -> int:
     ok = False
     error = ""
     retriable = False
+    oom = False
     try:
         # hf_transfer is baked into the worker image; enable it so model pulls saturate the NIC.
         try:
@@ -505,9 +539,15 @@ def main() -> int:
         # artifact that never uploaded) is raised as RetriableBootstrapError so the marker carries
         # retriable=True and the poller retries on a fresh host instead of failing the run fast.
         retriable = isinstance(exc, RetriableBootstrapError)
+        # A CUDA OOM can surface ONLY in the training subprocess console (a vLLM EngineCore child),
+        # not in this bootstrap-level wrapper exception. Classify THIS attempt's local console so the
+        # attempt-scoped marker carries a structured oom flag the poller escalates on. Skip when
+        # retriable (retriable wins, mirroring the worker's classifier).
+        if not retriable:
+            oom = _console_flags_cuda_oom(payload.get("phase"))
         print(f"bootstrap failed: {error}", flush=True)
     finally:
-        write_attempt_marker(payload, ok, error, retriable=retriable)
+        write_attempt_marker(payload, ok, error, retriable=retriable, oom=oom)
     return 0 if ok else 1
 
 

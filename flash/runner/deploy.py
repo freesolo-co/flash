@@ -166,6 +166,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     # sees only the transport fields.
     persisted_oom_floor = int(remote.pop("oom_vram_floor", 0) or 0)
     allocated_vram_gb = int(remote.pop("allocated_vram_gb", 0) or 0)
+    # The in-flight attempt's index (NOT popped — RunpodProvider.poll also reads it from the handle to
+    # attempt-gate the OOM flag). Used below to count attempts the pre-restart process already spent so
+    # an OOM-recovery can't re-grant a fresh larger-GPU escalation budget past the user's max_retries.
+    persisted_attempt = int(remote.get("attempt", 0) or 0)
     log = log_stream or sys.stderr
     # Dispatch the poll generically via the handle's provider (the provider owns its
     # heartbeat reader + poll loop); the orchestrator stays provider-agnostic.
@@ -206,14 +210,20 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             # OOM'd, its card joins the floor (the persisted floor predates this attempt's card), so
             # the resumed seed escalates to a STRICTLY larger class rather than re-OOMing on the same.
             resumed_floor = persisted_oom_floor
+            resumed_oom_attempts = 0
             if res.failure == "oom":
                 resumed_floor = max(resumed_floor, allocated_vram_gb)
+                # Attempts 0..persisted_attempt were already spent on this seed (the reattached one
+                # OOM'd), so the resumed loop must count them against the escalation budget — else a
+                # restart would hand out a fresh full set of larger-GPU escalations past max_retries.
+                resumed_oom_attempts = persisted_attempt + 1
             _run_seed_loop(
                 spec,
                 log,
                 start_index=seed_index,
                 prior_cost=float(status.cost_usd or 0.0),
                 resume_oom_vram_floor=resumed_floor,
+                resume_oom_attempts=resumed_oom_attempts,
             )
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the

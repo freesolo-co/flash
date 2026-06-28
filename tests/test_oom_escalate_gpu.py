@@ -310,3 +310,53 @@ def test_runpod_reattach_poll_gates_oom_on_the_persisted_attempt():
     assert '"attempt": int(attempt)' in life  # persisted on every submit
     assert 'current_attempt = _attempt_int(handle.to_dict().get("attempt"))' in rp
     assert "current_attempt=current_attempt" in rp
+
+
+def test_instance_worker_env_stamps_attempt_for_heartbeat_gating():
+    # BRZ: the shared RunPod env builder does NOT set ATTEMPT (RunPod's submit adds it), so an instance
+    # (Lambda) worker would heartbeat attempt="" and the poller's attempt-gated worker_flagged_oom
+    # would then REJECT a real CUDA OOM. The instance bootstrap must stamp ATTEMPT from the payload.
+    boot = pathlib.Path(
+        __import__("flash.providers._instance_bootstrap", fromlist=["x"]).__file__
+    ).read_text()
+    assert 'env["ATTEMPT"] = str(int(payload.get("attempt", 0)))' in boot
+
+
+def test_instance_marker_carries_console_classified_oom():
+    # BRc: a CUDA OOM can surface ONLY in the training subprocess console (a vLLM EngineCore child),
+    # which the worker's own exception classifier misses. The instance bootstrap classifies THIS
+    # attempt's LOCAL console (attempt-safe) into the attempt-scoped marker's oom field. (Scanning the
+    # SHARED console_<phase>.txt from the poller would reintroduce the cross-attempt staleness AVE
+    # flagged, so it's done at the source instead.)
+    boot = pathlib.Path(
+        __import__("flash.providers._instance_bootstrap", fromlist=["x"]).__file__
+    ).read_text()
+    assert "def _console_flags_cuda_oom" in boot
+    assert '"oom": bool(oom)' in boot  # marker carries the structured flag
+    assert "oom = _console_flags_cuda_oom(payload.get(\"phase\"))" in boot
+    assert "if not retriable:" in boot  # retriable wins (don't escalate an infra crash)
+    assert "write_attempt_marker(payload, ok, error, retriable=retriable, oom=oom)" in boot
+
+
+def test_oom_recovery_respects_the_user_retry_budget():
+    # BRa: a control-plane restart that reattaches to an in-flight OOM must NOT re-grant a fresh
+    # larger-GPU escalation budget past max_retries. The consumed attempt count rides into the resumed
+    # in-flight seed: an entry guard fails fast when the budget is already spent (notably
+    # max_retries=0), and the loop's budget check adds it so any remaining escalations are capped.
+    life = pathlib.Path(
+        __import__("flash.runner.lifecycle", fromlist=["x"]).__file__
+    ).read_text()
+    deploy = pathlib.Path(
+        __import__("flash.runner.deploy", fromlist=["x"]).__file__
+    ).read_text()
+    # the supervisor takes the consumed-attempt count and enforces it
+    assert "resume_oom_attempts: int = 0" in life
+    assert "resume_oom_attempts > max_retries" in life  # entry guard (fail-fast when exhausted)
+    assert "budget_spent = walk_attempt + (resume_oom_attempts if oom_shaped else 0)" in life
+    assert "budget_spent < retry_budget" in life
+    assert "if budget_spent >= retry_budget and not first_cache_drop:" in life
+    # infra retries are unaffected (the offset only applies when oom_shaped)
+    # recovery computes the consumed count from the persisted handle attempt and threads it in
+    assert 'persisted_attempt = int(remote.get("attempt", 0) or 0)' in deploy
+    assert "resumed_oom_attempts = persisted_attempt + 1" in deploy
+    assert "resume_oom_attempts=resumed_oom_attempts" in deploy

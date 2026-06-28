@@ -157,7 +157,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     monkeypatch.setattr(
         lb,
         "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
+        lambda p, ok, error="", retriable=False, oom=False: markers.append((ok, error, retriable)),
     )
     monkeypatch.setattr(lb.os.path, "exists", lambda p: metrics if "metrics.json" in p else False)
     return lb, calls, markers
@@ -1591,7 +1591,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503")))
     monkeypatch.setattr(
         lb, "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
+        lambda p, ok, error="", retriable=False, oom=False: markers.append((ok, error, retriable)),
     )
     assert lb.main() == 1
     ok, error, retriable = markers[0]
