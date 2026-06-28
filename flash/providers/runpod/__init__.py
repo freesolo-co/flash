@@ -70,6 +70,7 @@ class RunpodProvider:
         return submit_run(spec, seed, **kwargs)
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
+        from flash.providers._poll import _attempt_int
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
@@ -87,17 +88,15 @@ class RunpodProvider:
         rh = RunpodJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
-        # Same stall tuning as the submit path so a reattached run isn't judged differently:
-        # the original submit's ``on_last_gpu`` is persisted in the handle (by the runner's
-        # on_handle), so reproduce its no-capacity grace here instead of defaulting to the
-        # shorter non-last window. Absent (a pre-persist / non-runpod handle) => False, the
-        # historical default.
-        on_last_gpu = bool(handle.to_dict().get("on_last_gpu", False))
+        handle_dict = handle.to_dict()
+        on_last_gpu = bool(handle_dict.get("on_last_gpu", False))
+        current_attempt = _attempt_int(handle_dict.get("attempt"))
         return poll_job(
             rh,
             log=log,
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
+            current_attempt=current_attempt,
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 

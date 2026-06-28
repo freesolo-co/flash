@@ -381,6 +381,12 @@ def _attempt_int(value: Any) -> int | None:
         return None
 
 
+def heartbeat_oom_for_attempt(hb: Any, current_attempt: int | None) -> bool:
+    if not isinstance(hb, dict) or not hb.get("oom"):
+        return False
+    return current_attempt is not None and _attempt_int(hb.get("attempt")) == current_attempt
+
+
 def heartbeat_progress_ts(
     hb_key: tuple | None, launch_ts: float | None, current_attempt: int | None = None
 ) -> tuple[float, bool]:
