@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import urllib.error
 import urllib.request
 
 from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key, org_id_of
+from .auth import freesolo_base_url
 
 _LOG = logging.getLogger("flash.server.environments")
 _PATH = "/api/flash/environments/internal"
@@ -53,6 +55,45 @@ def record_published_environment(*, slug: str, name: str, key: dict) -> bool:
         "metadata": {"source": "flash.env.push"},
     }
     return _post(_PATH, body, subject=f"record published environment {slug}")
+
+
+def record_deleted_environment(*, slug: str, key: dict) -> bool:
+    """Remove the platform-backend metadata mirror for a deleted environment.
+
+    Symmetric to :func:`record_published_environment`: the package store (GitHub) is the source
+    of truth and is already updated by the time this runs, so dropping the row the web UI lists
+    is deliberately best-effort and never blocks ``flash env delete``.
+    """
+    token = internal_key()
+    org_id = org_id_of(key)
+    if not token or not org_id:
+        return False
+
+    req = urllib.request.Request(
+        f"{freesolo_base_url()}{_PATH}",
+        data=json.dumps({"orgId": org_id, "slug": slug}).encode("utf-8"),
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = exc.read().decode("utf-8", "replace")[:500]
+        _LOG.warning(
+            "failed to record deleted environment %s: HTTP %s %s",
+            slug,
+            exc.code,
+            detail,
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        _LOG.warning("failed to record deleted environment %s: %s", slug, exc)
+    return False
 
 
 def record_environment_use(*, slug: str, run_id: str, key: dict) -> bool:
