@@ -145,7 +145,9 @@ class _ThemedParser(argparse.ArgumentParser):
         # then a dimmed pointer at this parser's own --help instead of the raw usage block. An
         # "invalid choice" becomes a short "did you mean" suggestion (see _friendly_message).
         print(render.error(_friendly_message(message)), file=sys.stderr)
-        print(render.usage_hint(self.prog), file=sys.stderr)
+        # dimmed pointer at THIS parser's own --help (argparse sets prog per parser: `flash --help`
+        # for the root, `flash <cmd> --help` for a subcommand) instead of the raw usage block.
+        print(render.arrow(f"run `{self.prog} --help` for usage"), file=sys.stderr)
         self.exit(2)  # keep argparse's usage-error exit code
 
 
