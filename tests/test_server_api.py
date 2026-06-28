@@ -345,7 +345,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # Negative (401) -> cached with the SHORT negative TTL.
     now = time.time()
     assert auth_mod._freesolo_verify("neg") is False
-    neg_exp = auth_mod._verify_cache["neg"][1]
+    neg_exp = auth_mod._verify_cache["neg"][2]
     assert neg_exp <= now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
     # ...and definitely shorter than the long TTL.
     assert neg_exp < now + auth_mod._VERIFY_CACHE_TTL_S
@@ -355,7 +355,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     state["code"] = 200
     now = time.time()
     assert auth_mod._freesolo_verify("pos") is True
-    pos_exp = auth_mod._verify_cache["pos"][1]
+    pos_exp = auth_mod._verify_cache["pos"][2]
     assert pos_exp > now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
     assert pos_exp <= now + auth_mod._VERIFY_CACHE_TTL_S + 1
 
@@ -364,11 +364,11 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # expired while a same-age positive would still be live.
     auth_mod._verify_cache.clear()
     base = time.time()
-    auth_mod._verify_cache["neg"] = (False, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
-    auth_mod._verify_cache["pos"] = (True, base + auth_mod._VERIFY_CACHE_TTL_S)
+    auth_mod._verify_cache["neg"] = (False, {}, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
+    auth_mod._verify_cache["pos"] = (True, {}, base + auth_mod._VERIFY_CACHE_TTL_S)
     later = base + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1.0  # past neg TTL, well under pos TTL
-    assert auth_mod._verify_cache["neg"][1] <= later  # negative entry has expired
-    assert auth_mod._verify_cache["pos"][1] > later  # positive entry is still live
+    assert auth_mod._verify_cache["neg"][2] <= later  # negative entry has expired
+    assert auth_mod._verify_cache["pos"][2] > later  # positive entry is still live
 
 
 def test_freesolo_verify_rejects_oversized_token(monkeypatch):
@@ -466,7 +466,7 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
 
     # An already-expired entry must be removed on the next write (no longer reachable).
-    auth_mod._verify_cache["stale"] = (True, time.time() - 1)
+    auth_mod._verify_cache["stale"] = (True, {}, time.time() - 1)
     auth_mod._freesolo_verify("fresh-token")
     assert "stale" not in auth_mod._verify_cache
     assert "fresh-token" in auth_mod._verify_cache
@@ -620,6 +620,95 @@ def test_worker_output_route(api, monkeypatch):
     # Another user can't read it (same ownership gate as /logs).
     other = _login()
     assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
+
+
+def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
+    """The logs fetcher resolves the newest attempt-scoped error file, so a retried-then-failed run
+    surfaces the FINAL attempt's traceback, not attempt0's stale one."""
+    import huggingface_hub
+
+    from flash.server._runtime import _latest_error_artifact_name
+
+    prefix = "sft/run-1/seed0"
+    listed = [
+        f"{prefix}/console_sft.txt",
+        f"{prefix}/error_sft_attempt0.txt",
+        f"{prefix}/error_sft_attempt2.txt",
+        f"{prefix}/error_sft_attempt1.txt",
+        f"{prefix}/heartbeat.json",
+        "other/run/error_sft_attempt9.txt",  # different prefix -> ignored
+    ]
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return listed
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    assert _latest_error_artifact_name("org/repo", prefix, "sft") == "error_sft_attempt2.txt"
+
+
+def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
+    """If the repo can't be listed, fall back to attempt0 rather than failing the logs fetch."""
+    import huggingface_hub
+
+    from flash.server._runtime import _latest_error_artifact_name
+
+    class _BoomApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            raise RuntimeError("HF down")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _BoomApi)
+    assert _latest_error_artifact_name("org/repo", "rl/r/seed0", "rl") == "error_rl_attempt0.txt"
+
+
+def test_worker_artifacts_fetches_console_and_latest_attempt_error(monkeypatch, tmp_path):
+    """The fetcher pulls the worker console plus the NEWEST attempt-scoped error file
+    (error_<phase>_attempt<N>.txt) — on a retried run only the highest attempt is the real crash."""
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "rl/r1/console_rl.txt": "worker console\n",
+        "rl/r1/error_rl_attempt0.txt": "stale first-attempt traceback\n",
+        "rl/r1/error_rl_attempt1.txt": "TRACEBACK latest\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert out["console_rl.txt"] == "worker console\n"
+    # The newest attempt's traceback surfaces; the superseded attempt0 is not fetched.
+    assert out["error_rl_attempt1.txt"] == "TRACEBACK latest\n"
+    assert "error_rl_attempt0.txt" not in out
 
 
 def test_local_env_path_rejected(api):
@@ -824,6 +913,80 @@ def test_chat_streams_deployed_run(api, monkeypatch):
     assert text == "hi there"
     assert seen["run_id"] == run_id
     assert seen["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkeypatch):
+    """A run cancelled mid-RL can deploy a per-step checkpoint (stays `cancelled`, listed active by
+    /v1/deployments). The chat route must SERVE that live adapter, not 409 on the cancelled state."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "cancelled"  # cancelled, but with a live checkpoint deployment
+    status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+    runner._save_status(status)
+
+    monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi", " there"]))
+    with api.stream(
+        "POST",
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    ) as resp:
+        text = resp.read().decode()
+    assert resp.status_code == 200, text
+    assert text == "hi there"
+
+
+def test_chat_cancelled_run_without_deployment_is_409(api):
+    """A cancelled run with no active deployment still 409s, pointing the user at `flash deploy`."""
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "cancelled"
+    runner._save_status(status)
+
+    r = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers=_bearer(key),
+    )
+    assert r.status_code == 409
+    assert "deploy a checkpoint" in r.json()["detail"]
+
+
+def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
+    """JSON `1e400`/`Infinity` parses to float('inf'); `int(inf)` raises OverflowError (an
+    ArithmeticError, NOT TypeError/ValueError) which used to escape the guard -> 500. A non-finite
+    max_tokens or temperature must be a clean 400, per the route's own bad-values-are-400 contract."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+    monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi"]))
+
+    headers = {**_bearer(key), "content-type": "application/json"}
+    for body in (
+        b'{"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1e400}',
+        b'{"messages": [{"role": "user", "content": "hi"}], "temperature": 1e400}',
+    ):
+        r = api.post(f"/v1/runs/{run_id}/chat", content=body, headers=headers)
+        assert r.status_code == 400, (body, r.status_code, r.text)
 
 
 def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
@@ -1438,13 +1601,14 @@ def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
 
 
 def test_deploy_rejects_non_integer_step(api, monkeypatch):
-    """A bool (True->1) or non-integer step must be rejected, not silently coerced."""
+    """A bool (True->1) or non-integer step must be rejected, not silently coerced. An all-digit string
+    over Python's 4300-digit int()-conversion limit must also be a clean 400, not int()->uncaught 500."""
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
     run_id = _make_run(api, key, "done")
-    for bad in (True, 40.9, "40.9"):
+    for bad in (True, 40.9, "40.9", "1" * 5000):
         r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": bad}, headers=_bearer(key))
         assert r.status_code == 400, f"{bad!r} -> {r.status_code} {r.text}"
 
