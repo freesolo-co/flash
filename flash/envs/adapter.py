@@ -10,6 +10,7 @@ low-level refs remain parseable for compatibility. The canonical generated envir
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -269,25 +270,26 @@ def _resolve_ref_sha(
     return sha
 
 
-def _read_capped(resp: object, max_bytes: int) -> bytes:
-    """Read ``resp`` in ``_DOWNLOAD_CHUNK_BYTES`` chunks, aborting once the accumulated size exceeds
-    ``max_bytes``. This bounds peak memory at ``max_bytes`` (+ one chunk) instead of the single huge
-    allocation a bare ``resp.read()`` would make for a near-``_MAX_TARBALL_BYTES`` body, and it lets
-    an oversize download bail out early rather than fetching the whole thing only to reject it."""
-    chunks: list[bytes] = []
-    total = 0
+def _read_capped(resp: object, max_bytes: int) -> bytearray:
+    """Read ``resp`` in ``_DOWNLOAD_CHUNK_BYTES`` chunks into one growing buffer, aborting once the
+    accumulated size exceeds ``max_bytes``. Returning the ``bytearray`` directly — rather than
+    retaining a list of chunks and ``b"".join``-ing them — keeps peak memory at ~``max_bytes`` + one
+    chunk, NOT 2x: a near-``_MAX_TARBALL_BYTES`` body never needs a second contiguous copy. It also
+    bails out early on an oversize download instead of fetching the whole thing only to reject it.
+    Callers treat the result as a read-only bytes buffer (``len`` / ``io.BytesIO`` / file write all
+    accept a ``bytearray``)."""
+    buf = bytearray()
     while True:
         chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
         if not chunk:
             break
-        total += len(chunk)
-        if total > max_bytes:
+        if len(buf) + len(chunk) > max_bytes:
             raise RuntimeError(
                 f"GitHub response body exceeded the maximum allowed size ({max_bytes} bytes); "
                 "download aborted"
             )
-        chunks.append(chunk)
-    return b"".join(chunks)
+        buf.extend(chunk)
+    return buf
 
 
 def _urlopen(
@@ -296,7 +298,7 @@ def _urlopen(
     timeout: float = 60.0,
     max_rate_limit_retries: int = 5,
     max_bytes: int | None = None,
-) -> bytes:
+) -> bytes | bytearray:
     """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
 
     On a 429 or a 403 whose body says "rate limit" (a cold spawn wave of workers all hitting the
@@ -352,7 +354,7 @@ def _urlopen(
             raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
-def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
+def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes | bytearray:
     # Callers download the tarball for the ALREADY-resolved commit sha (see
     # _resolve_github_environment_file), which extracts it into the content-addressed disk cache
     # under _CACHE_ROOT/<hash(repo@sha:path)> and never re-downloads on a hit. So reuse is handled
@@ -381,7 +383,7 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     return data
 
 
-def _safe_extract_archive(tar_bytes: bytes, dest: Path, subdir: str = "") -> Path:
+def _safe_extract_archive(tar_bytes: bytes | bytearray, dest: Path, subdir: str = "") -> Path:
     """Extract the GitHub repo tarball under ``dest`` and return its single top-level directory.
 
     When ``subdir`` is given (the environment's path within the repo, e.g. ``ns/name``), ONLY that
@@ -473,9 +475,12 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        extracted = _safe_extract_archive(
-            _download_github_tarball(resolved), tmp_parent, subdir=_environment_dir(parsed.path)
-        )
+        # Full-repo extraction here (NO subdir filter): this resolver feeds env EXECUTION/training,
+        # where an env can reference repo-level sidecars via relative params/imports (e.g.
+        # ``dataset_path = "../datasets/train.jsonl"`` -> a sibling outside its own subtree). Filtering
+        # to just the env dir would drop those, so the env loads but fails at run time. The subtree
+        # filter is for ``pull_environment_package`` only (the user pulling ONE env to local disk).
+        extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
@@ -569,7 +574,7 @@ def environment_local_dirname(env_ref: str) -> str:
     return env_dir.rsplit("/", 1)[-1] if env_dir else ref.repo
 
 
-def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 120.0) -> bytes:
+def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 120.0) -> bytes | bytearray:
     """Download a single file from a published environment as raw bytes.
 
     Uses GitHub's ``application/vnd.github.raw`` media type, which streams the file's bytes
@@ -619,13 +624,43 @@ def _atomic_copy2(src: Path, dst: Path) -> None:
         raise
 
 
+def _rm_path(p: Path) -> None:
+    """Remove ``p`` whether it is a symlink, file, or directory (symlink dirs are unlinked, not
+    recursed)."""
+    if p.is_symlink() or not p.is_dir():
+        p.unlink()
+    else:
+        shutil.rmtree(p)
+
+
+def _replace_opposite_type(target: Path, build) -> None:
+    """Replace an existing ``target`` of the OPPOSITE type (file<->dir) without destroying it until the
+    replacement is ready: move it aside, run ``build()`` to create the new ``target``, drop the backup
+    on success, and RESTORE the original if ``build`` raises (a mid-copy disk/quota/read error). The
+    naive ``unlink()``/``rmtree()``-then-copy would leave the user with nothing if the copy failed."""
+    backup = target.with_name(f".{target.name}.flash-old")
+    if backup.is_symlink() or backup.exists():
+        _rm_path(backup)
+    os.replace(target, backup)  # atomic move-aside (file, dir, or symlink)
+    try:
+        build()
+    except BaseException:
+        if target.is_symlink() or target.exists():
+            _rm_path(target)  # drop any partial replacement
+        os.replace(backup, target)  # restore the original intact
+        raise
+    _rm_path(backup)  # success: the saved original is no longer needed
+
+
 def _merge_into_dir(source: Path, dest: Path) -> None:
     """Recursively copy ``source``'s contents into existing ``dest``, overwriting same-named
     children. Unlike ``shutil.copytree(dirs_exist_ok=True)``, a child of ``dest`` that is a SYMLINK
     is removed before writing, never followed — so a pre-existing ``datasets -> /elsewhere`` link in
     the destination (e.g. the cwd, when merging in place with ``--force``) can't redirect writes
     outside the requested output tree. Each file is replaced atomically (stage + ``os.replace``) so a
-    failed merge never leaves an existing file truncated."""
+    failed merge never leaves an existing file truncated. A child being replaced by one of the
+    OPPOSITE type (existing file vs incoming dir, or vice versa) is swapped via move-aside/restore so a
+    mid-copy failure can't destroy the user's existing child."""
     dest.mkdir(parents=True, exist_ok=True)
     for child in source.iterdir():
         target = dest / child.name
@@ -633,12 +668,16 @@ def _merge_into_dir(source: Path, dest: Path) -> None:
             target.unlink()  # replace the link itself; do not write through it
         if child.is_dir():
             if target.exists() and not target.is_dir():
-                target.unlink()
-            _merge_into_dir(child, target)
+                # incoming dir over an existing file: keep the file until the subtree is fully built.
+                _replace_opposite_type(target, functools.partial(_merge_into_dir, child, target))
+            else:
+                _merge_into_dir(child, target)
         else:
             if target.is_dir():
-                shutil.rmtree(target)
-            _atomic_copy2(child, target)
+                # incoming file over an existing dir: keep the dir until the file copy succeeds.
+                _replace_opposite_type(target, functools.partial(_atomic_copy2, child, target))
+            else:
+                _atomic_copy2(child, target)
 
 
 def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool = False) -> Path:
@@ -695,10 +734,6 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
         # Create any missing parent dirs (mirrors the single-file download) so a nested output path
         # works.
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        # A symlink at the destination (even a broken one) is unlinked, never rmtree'd (shutil
-        # refuses) or followed — we write a real directory and leave any symlink target untouched.
-        if dest_path.is_symlink():
-            dest_path.unlink()
         # When the destination IS the current working directory (or an ancestor of it) — e.g.
         # ``-o .`` — we must never rmtree/rename it (``shutil.rmtree('.')`` deletes its contents
         # before raising, and you can't rename over a live dir). Merge the env's files in place,
@@ -706,24 +741,31 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
         cwd = Path.cwd().resolve()
         dest_resolved = dest_path.resolve()
         in_place = dest_resolved == cwd or dest_resolved in cwd.parents
-        if not dest_path.exists():
+        # A symlink destination (even a dangling one) is NOT unlinked up front: doing so before the
+        # copy would lose the user's link if the copy then failed. It goes through the staged swap
+        # below (which replaces the link itself, never writing through it / touching its target) so the
+        # link survives until the replacement is ready and is restored on failure.
+        dest_is_symlink = dest_path.is_symlink()
+        if not dest_is_symlink and not dest_path.exists():
             shutil.copytree(source, dest_path)
-        elif in_place or (dest_path.is_dir() and not any(dest_path.iterdir())):
+        elif not dest_is_symlink and (in_place or (dest_path.is_dir() and not any(dest_path.iterdir()))):
             # An existing empty dir, or the cwd/an ancestor: populate in place (preserve the dir and
             # its perms; overwrite only same-named children). `occupied` already gated on overwrite.
             # Use the symlink-safe merge so a child symlink in the destination can't redirect writes
             # outside the output tree.
             _merge_into_dir(source, dest_path)
         else:
-            # Overwriting an OCCUPIED destination: build the new tree in a sibling staging dir, move
-            # the live tree ASIDE, swap the new one in, and only then drop the old — so the previous
-            # package is never partially removed. If the swap fails, the old tree is restored intact.
+            # Overwriting an OCCUPIED destination (file / non-empty dir) OR replacing a SYMLINK: build
+            # the new tree in a sibling staging dir, move the live path ASIDE (``os.replace`` handles a
+            # file, dir, OR symlink), swap the new one in, and only then drop the old — so the previous
+            # package or link is never removed until the replacement is ready, and is restored intact if
+            # the swap fails.
             staging_parent = Path(tempfile.mkdtemp(prefix=".flash-env-pull-", dir=dest_path.parent))
             try:
                 staging = staging_parent / dest_path.name
                 shutil.copytree(source, staging)
                 backup = staging_parent / (dest_path.name + ".old")
-                os.replace(dest_path, backup)  # atomic move-aside (works for a file or a dir)
+                os.replace(dest_path, backup)  # atomic move-aside (works for a file, dir, or symlink)
                 try:
                     os.replace(staging, dest_path)
                 except BaseException:
