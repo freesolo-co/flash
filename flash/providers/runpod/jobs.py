@@ -309,13 +309,13 @@ def _sweep_idle_flash_endpoints(
       ``None`` keeps the legacy unscoped behavior. Unlike ``protected`` this guards a second plane's
       *idle/between-jobs* endpoint — a busy one is already safe (it never reads as idle).
     - ``protected`` — endpoint names tied to a LIVE run (both the bare ``flash-...`` and the SDK's
-      ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between seeds).
+      ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between jobs).
     - ``reap_warm`` — when True (the run-aware periodic reaper, which protects EVERY live run),
       a merely *warm* ``idle``/``ready`` worker left over after a job counts as doing nothing and
       is reclaimable; that warm-idle state is the dominant leak, since RunPod keeps a worker warm
       after each job. When False (the deploy-time reactive sweep, which only protects the current
       run), a warm worker is treated as busy so the sweep reaps only endpoints that have FULLY
-      scaled to zero — it must not delete another live run's between-seeds warm endpoint.
+      scaled to zero — it must not delete another live run's between-jobs warm endpoint.
     - ``min_idle_s`` requires the idle reading to PERSIST across sweeps, so a single transient
       zero (cold start / between jobs) never triggers a delete.
 
@@ -514,7 +514,7 @@ def deploy_train_endpoint(
                 # Under acute quota pressure, sweep idle orphaned flash training endpoints on THIS
                 # account NOW (min_idle_s=0) to free a slot. This only protects THIS run's endpoint,
                 # so it stays conservative (reap_warm=False): it reaps only endpoints fully scaled
-                # to zero, never another live run's between-seeds WARM endpoint. The control-plane
+                # to zero, never another live run's between-jobs WARM endpoint. The control-plane
                 # periodic reaper does the run-aware, graced warm-idle sweep across all live runs.
                 swept = _sweep_idle_flash_endpoints(
                     protected={canonical_endpoint_name(name)}, min_idle_s=0.0, reap_warm=False
