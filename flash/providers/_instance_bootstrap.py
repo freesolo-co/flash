@@ -53,19 +53,42 @@ def _arm(payload: dict) -> str:
     return str(payload.get("flash_arm") or "instance")
 
 
-def hf_upload(payload: dict, local_path: str, repo_subpath: str) -> None:
-    """Upload one artifact under the run's HF prefix; never raises."""
-    try:
-        from huggingface_hub import HfApi
+def hf_upload(payload: dict, local_path: str, repo_subpath: str, retries: int = 0) -> None:
+    """Upload one artifact under the run's HF prefix; never raises.
 
-        HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=f"{payload['hf_prefix']}/{repo_subpath}",
-            repo_id=payload["hf_repo"],
-            repo_type="dataset",
+    ``retries`` (>0) re-attempts a lost upload a few times with a short backoff before giving up, and
+    on FINAL failure logs LOUDLY — for the few artifacts whose loss MISCLASSIFIES the run rather than
+    just dropping a log line. The attempt marker is the one such artifact: it is the only attempt-safe
+    structured signal the poller reads for a console-only Lambda OOM (the dead-host path intentionally
+    does not scan the shared console), so a silently-lost single-shot upload turns a real OOM into a
+    fail/preempt. Default 0 keeps the best-effort single-shot behavior for ordinary console/log
+    artifacts. Self-contained (no flash import) so it stays usable from the bootstrap."""
+    total = max(1, retries + 1)
+    last_exc: Exception | None = None
+    for i in range(total):
+        try:
+            from huggingface_hub import HfApi
+
+            HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
+                path_or_fileobj=local_path,
+                path_in_repo=f"{payload['hf_prefix']}/{repo_subpath}",
+                repo_id=payload["hf_repo"],
+                repo_type="dataset",
+            )
+            return
+        except Exception as exc:
+            last_exc = exc
+            print(f"hf upload warn ({repo_subpath}): {exc}", flush=True)
+            if i + 1 < total:
+                time.sleep(min(2**i, 10))
+    if retries:
+        # Loud, not silent: a lost retried artifact (the attempt marker) misclassifies the run, so
+        # surface the final failure rather than burying it under the per-try warn above.
+        print(
+            f"FLASH: hf upload FAILED after {total} attempts ({repo_subpath}): {last_exc} "
+            "— a lost attempt marker can misclassify this run",
+            flush=True,
         )
-    except Exception as exc:
-        print(f"hf upload warn ({repo_subpath}): {exc}", flush=True)
 
 
 def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
@@ -292,6 +315,23 @@ def _text_flags_cuda_oom(text: str) -> bool:
     return "cuda" in blob or "triton" in blob
 
 
+def _any_line_flags_cuda_oom(text: str) -> bool:
+    """True iff a SINGLE un-indented (exception-type) line names BOTH an out-of-memory marker AND
+    CUDA/Triton context — a real ``CUDA out of memory`` / ``Triton Error [CUDA]: out of memory`` /
+    ``torch.cuda.OutOfMemoryError`` crash line. Same-line co-location, so it can NEVER borrow a 'cuda'
+    from one line and an 'out of memory' from an UNRELATED line (the cross-line false-escalation the
+    terminal-block scan guards against); a host-RAM/DataLoader OOM whose only 'cuda' is on a separate
+    line (or in an indented torch/cuda frame PATH, filtered out here) stays False. Used ONLY as the
+    no-traceback-framing backstop below, where there is no terminal block to scope the scan to."""
+    for ln in text.splitlines():
+        if ln[:1] in (" ", "\t"):
+            continue  # indented frame line — a torch/cuda file PATH is not GPU context
+        low = ln.lower()
+        if any(m in low for m in _CUDA_OOM_MARKERS) and ("cuda" in low or "triton" in low):
+            return True
+    return False
+
+
 def _terminal_exception_block(text: str) -> str:
     """The LAST traceback in a multi-line console tail — i.e. the terminal exception. Mirrors
     ``flash.providers.runpod.jobs._terminal_exception_block`` (INLINED — the bootstrap stays
@@ -329,10 +369,18 @@ def _console_flags_cuda_oom(mode: str | None) -> bool:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - tail_bytes))
             tail = f.read().decode(errors="replace")
-        # Scan only the TERMINAL exception block (last traceback), not the whole tail — mirrors the
-        # worker's runpod.jobs.detail_flags_cuda_oom narrowing so an early 'cuda' init line plus a
-        # later host-RAM 'out of memory' can't be combined into a false GPU-escalating OOM marker.
-        return _text_flags_cuda_oom(_terminal_exception_block(tail))
+        # Scan the TERMINAL exception block (last traceback), not the whole tail — mirrors the worker's
+        # runpod.jobs.detail_flags_cuda_oom narrowing so an early 'cuda' init line plus a later host-RAM
+        # 'out of memory' can't be combined into a false GPU-escalating OOM marker.
+        if _text_flags_cuda_oom(_terminal_exception_block(tail)):
+            return True
+        # Backstop the no-traceback-framing case: when the 8000-byte slice has NO "Traceback" header,
+        # _terminal_exception_block falls back to the LAST 15 lines, so a bare subprocess CUDA OOM (a
+        # vLLM EngineCore child) dumped earlier in the slice — then buried under >15 lines of teardown
+        # noise — would be missed. Re-scan the whole slice per-LINE, requiring cuda+oom CO-LOCATED on
+        # one un-indented line, which catches that buried OOM WITHOUT re-opening the cross-line borrow
+        # (gated to the no-traceback case so the terminal-block scan still scopes any framed failure).
+        return "Traceback (most recent call last):" not in tail and _any_line_flags_cuda_oom(tail)
     except Exception:
         return False
 
@@ -362,7 +410,9 @@ def write_attempt_marker(
     p = "/tmp/attempt_marker.json"
     with open(p, "w") as f:
         json.dump(marker, f)
-    hf_upload(payload, p, f"{_arm(payload)}_attempt{marker['attempt']}.json")
+    # Retried (not best-effort single-shot): the marker is the only attempt-safe structured OOM/retriable
+    # signal the poller can read for a console-only failure, so a lost upload misclassifies the run.
+    hf_upload(payload, p, f"{_arm(payload)}_attempt{marker['attempt']}.json", retries=3)
 
 
 def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Event] | None:

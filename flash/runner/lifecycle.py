@@ -202,6 +202,14 @@ def _submit_seed_supervised(
                 # an OOM-recovery resume), so a recovered larger attempt's id can never collide with a
                 # prior physical attempt's heartbeat (RunpodProvider.poll / worker_flagged_oom).
                 "attempt": int(submit_attempt),
+                # Cache-drop bonus attempts (the free cache-less no_capacity/poll_error fallback the
+                # shared weight cache grants) are EXCLUDED from the GPU-walk/OOM budget here in the live
+                # loop (walk_attempt = attempt - cache_drop_consumed). Persist the count alongside the
+                # PHYSICAL attempt so an OOM-aware resume (attach_run) subtracts it too — else a restart
+                # would seed the OOM budget off the physical attempt id and over-count the free bonus,
+                # failing a run's allowed escalation (notably max_retries=1: cache attempt 0 -> cacheless
+                # OOM attempt 1 would resume as 2 spent and trip the entry guard).
+                "cache_drop_consumed": int(cache_drop_consumed),
                 "on_last_gpu": bool(current_on_last_gpu["value"]),
             },
         )

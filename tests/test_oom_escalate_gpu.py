@@ -299,7 +299,7 @@ def test_instance_bootstrap_oom_scanner_is_self_contained():
     # whole tail — mirrors runpod.jobs.detail_flags_cuda_oom so an early 'cuda' init line + a later
     # host-RAM OOM can't be combined into a false escalating marker (and stays self-contained).
     assert "def _terminal_exception_block" in boot  # inlined narrower
-    assert "return _text_flags_cuda_oom(_terminal_exception_block(tail))" in boot
+    assert "if _text_flags_cuda_oom(_terminal_exception_block(tail)):" in boot
     # the inlined predicate matches the worker's CUDA-OOM behavior (string branch of is_cuda_oom)
     import importlib
 
@@ -453,6 +453,94 @@ def test_instance_marker_carries_console_classified_oom():
     assert "write_attempt_marker(payload, ok, error, retriable=retriable, oom=oom)" in boot
 
 
+def test_attempt_marker_upload_is_retried(monkeypatch):
+    # Mxb8a: the attempt marker is the ONLY attempt-safe structured signal the poller reads for a
+    # console-only Lambda OOM (the dead-host path intentionally does NOT scan the shared console), so a
+    # silently-lost single-shot best-effort upload would misclassify a real OOM as fail/preempt. The
+    # marker upload retries a few times (and logs loudly on final failure) instead of one best-effort shot.
+    import importlib
+
+    boot = importlib.import_module("flash.providers._instance_bootstrap")
+    # the marker write asks hf_upload to retry; ordinary console/log artifacts keep the single shot
+    src = pathlib.Path(boot.__file__).read_text()
+    assert (
+        "hf_upload(payload, p, f\"{_arm(payload)}_attempt{marker['attempt']}.json\", retries=3)" in src
+    )
+    assert "def hf_upload(payload: dict, local_path: str, repo_subpath: str, retries: int = 0)" in src
+
+    # behavioral: a transient upload error is retried, not dropped on the first failure
+    monkeypatch.setattr(boot.time, "sleep", lambda *_a, **_k: None)  # don't actually back off
+    calls = {"n": 0}
+
+    class _FlakyApi:
+        def __init__(self, *a, **k):
+            pass
+
+        def upload_file(self, **k):
+            calls["n"] += 1
+            if calls["n"] < 3:  # fail twice, then succeed
+                raise RuntimeError("transient HF 503")
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FlakyApi)
+    payload = {"hf_prefix": "p/r", "hf_repo": "o/d", "env": {"HF_TOKEN": "t"}, "attempt": 1}
+    p = "/tmp/_test_marker_retry.txt"
+    pathlib.Path(p).write_text("x")
+    boot.hf_upload(payload, p, "instance_attempt1.json", retries=3)
+    assert calls["n"] == 3  # retried past the two transient failures to a landed upload
+    # default (retries=0) stays a single best-effort shot — one call, never raises
+    calls["n"] = 0
+
+    class _DeadApi(_FlakyApi):
+        def upload_file(self, **k):
+            calls["n"] += 1
+            raise RuntimeError("down")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _DeadApi)
+    boot.hf_upload(payload, p, "console_rl.txt")  # default retries=0
+    assert calls["n"] == 1
+
+
+def test_console_oom_scan_catches_a_buried_subprocess_oom(tmp_path, monkeypatch):
+    # MxaQ4: when the 8000-byte console slice has NO "Traceback" header, the terminal-block fallback
+    # only sees the last 15 lines, so a bare subprocess CUDA OOM dumped earlier in the slice (then
+    # buried under teardown noise) was missed. A per-LINE backstop scans the whole slice but requires
+    # cuda+oom CO-LOCATED on one un-indented line, catching the buried OOM WITHOUT re-opening the
+    # cross-line borrow the terminal-block scan guards against.
+    import importlib
+
+    boot = importlib.import_module("flash.providers._instance_bootstrap")
+    teardown = "\n".join(f"INFO shutdown step {i}" for i in range(40))  # > the 15-line fallback
+    # real single-line CUDA OOM with no traceback framing, buried above the teardown noise
+    buried = "ERROR EngineCore: torch.cuda.OutOfMemoryError: CUDA out of memory\n" + teardown
+    assert boot._any_line_flags_cuda_oom(buried) is True
+    # cross-line borrow still rejected: an early 'cuda' init line + a later UNRELATED host-RAM OOM on
+    # separate lines must NOT combine into a false escalation
+    cross = "INFO: CUDA initialized on device 0\n" + teardown + "\nDataLoader worker killed: out of memory\n"
+    assert boot._any_line_flags_cuda_oom(cross) is False
+
+    # end-to-end through _console_flags_cuda_oom (reads /tmp/console_<mode>.txt)
+    monkeypatch.setattr(boot.os.path, "exists", lambda _p: True)
+    console = tmp_path / "console.txt"
+
+    def _read(mode_text):
+        console.write_text(mode_text)
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            return real_open(console, *a, **k) if path == "/tmp/console_buried.txt" else real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        try:
+            return boot._console_flags_cuda_oom("buried")
+        finally:
+            monkeypatch.setattr("builtins.open", real_open)
+
+    assert _read(buried) is True  # buried in-slice OOM now caught
+    assert _read(cross) is False  # cross-line host OOM still not escalated
+
+
 def test_oom_recovery_respects_the_user_retry_budget():
     # BRa: a control-plane restart that reattaches to an in-flight OOM must NOT re-grant a fresh
     # larger-GPU escalation budget past max_retries. The consumed attempt count rides into the resumed
@@ -473,12 +561,20 @@ def test_oom_recovery_respects_the_user_retry_budget():
     # infra retries are unaffected (the offset only applies when oom_shaped)
     # recovery computes the consumed count from the persisted handle attempt and threads it in
     assert 'persisted_attempt = int(remote.get("attempt", 0) or 0)' in deploy
-    assert "resumed_oom_attempts = persisted_attempt + 1" in deploy  # oom-shaped reattach
     assert "resume_oom_attempts=resumed_oom_attempts" in deploy
+    # cache-drop bonus attempts (the free cache-less no_capacity/poll_error fallback the shared weight
+    # cache grants) are EXCLUDED from the live walk budget (walk_attempt = attempt - cache_drop_consumed).
+    # The same count is persisted into the handle and SUBTRACTED on an OOM-aware resume, else a restart
+    # would seed the OOM budget off the PHYSICAL attempt id (which counts the bonus) and over-count past
+    # max_retries — a max_retries=1 run doing cache attempt 0 -> cacheless OOM attempt 1 would resume as
+    # 2 spent and trip the entry guard instead of taking its one allowed escalation.
+    assert '"cache_drop_consumed": int(cache_drop_consumed)' in life  # persisted on every submit
+    assert 'persisted_cache_drops = int(remote.pop("cache_drop_consumed", 0) or 0)' in deploy
+    assert "resumed_oom_attempts = persisted_attempt + 1 - persisted_cache_drops" in deploy  # oom reattach
     # an INFRA-shaped reattach must STILL remember a spent OOM budget when a prior OOM created the
     # floor (else a subsequent OOM after a preempted larger attempt re-escalates past max_retries).
     assert "elif persisted_oom_floor > 0:" in deploy
-    assert "resumed_oom_attempts = persisted_attempt" in deploy
+    assert "resumed_oom_attempts = persisted_attempt - persisted_cache_drops" in deploy
     # the resumed attempts get a MONOTONIC physical-id base so a recovered attempt's heartbeat can't
     # collide with a prior physical attempt's lingering OOM flag (independent of the budget accounting)
     assert "resume_attempt_base=persisted_attempt + 1" in deploy

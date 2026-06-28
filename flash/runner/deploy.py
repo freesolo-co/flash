@@ -171,6 +171,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     # attempt-gate the OOM flag). Used below to count attempts the pre-restart process already spent so
     # an OOM-recovery can't re-grant a fresh larger-GPU escalation budget past the user's max_retries.
     persisted_attempt = int(remote.get("attempt", 0) or 0)
+    # The cache-drop bonus attempt(s) the live loop EXCLUDES from the budget (walk_attempt = attempt -
+    # cache_drop_consumed): a no_capacity/poll_error cache-less fallback the shared weight cache grants
+    # for free. The persisted ``attempt`` above is the PHYSICAL id (it counts the bonus), so seeding the
+    # OOM budget off it alone over-counts; subtract the persisted bonus count to mirror the live walk
+    # accounting. Popped (like the other budget/meta fields) so JobHandle.from_dict sees only transport.
+    persisted_cache_drops = int(remote.pop("cache_drop_consumed", 0) or 0)
     log = log_stream or sys.stderr
     # Dispatch the poll generically via the handle's provider (the provider owns its
     # heartbeat reader + poll loop); the orchestrator stays provider-agnostic.
@@ -212,7 +218,13 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 # Attempts 0..persisted_attempt were already spent on this run (the reattached one
                 # OOM'd), so the resumed submit must count them against the escalation budget — else a
                 # restart would hand out a fresh full set of larger-GPU escalations past max_retries.
-                resumed_oom_attempts = persisted_attempt + 1
+                # Subtract the cache-drop bonus attempt(s): the live loop excludes them from the budget
+                # (walk_attempt = attempt - cache_drop_consumed), so an OOM-aware resume must too, or a
+                # max_retries=1 run that did cache attempt 0 -> cacheless OOM attempt 1 would resume with
+                # 2 spent and FAIL the entry guard instead of taking its one allowed escalation. The
+                # persistence invariant keeps this non-negative (a cache drop is always one attempt, and
+                # the in-flight OOM attempt itself is never a cache drop, so drops <= persisted_attempt).
+                resumed_oom_attempts = persisted_attempt + 1 - persisted_cache_drops
             elif persisted_oom_floor > 0:
                 # The reattached attempt ended infra-shaped (preempt/stall), but an EARLIER OOM created
                 # the persisted floor and ALREADY spent escalation budget. Without seeding it here, a
@@ -221,7 +233,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 # preempted, recovery resumes, and a fresh 96GB OOM would walk to 141GB past the cap.
                 # Count the attempts already spent (the in-flight INFRA attempt itself does NOT add to
                 # the OOM count, unlike the oom branch) so any remaining escalation honors max_retries.
-                resumed_oom_attempts = persisted_attempt
+                # Subtract the cache-drop bonus here too (mirrors the live walk accounting); drops <=
+                # persisted_attempt (the in-flight infra attempt is not a cache drop), so non-negative.
+                resumed_oom_attempts = persisted_attempt - persisted_cache_drops
             _run_training(
                 spec,
                 log,
