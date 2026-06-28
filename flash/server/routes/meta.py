@@ -28,6 +28,8 @@ def me(key: Annotated[dict, Depends(require_key)]):
         "email",
         "user_id",
         "org_id",
+        "org_slug",
+        "org_name",
         "api_key_id",
         "training_agent_job_id",
         "project_id",

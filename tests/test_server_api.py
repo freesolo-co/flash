@@ -55,6 +55,7 @@ def _identity_for_token(token: str) -> dict[str, str]:
         "email": f"user-{suffix}@example.com",
         "key_prefix": "fslo_test",
         "org_id": f"org-{suffix}",
+        "org_slug": f"org-{suffix}",
     }
 
 
@@ -121,6 +122,7 @@ def test_me(api):
     # A verified freesolo user key resolves to the Freesolo identity returned by verify.
     assert me.json()["email"] == f"user-{key.removeprefix(_USER_PREFIX)}@example.com"
     assert me.json()["key_prefix"] == "fslo_test"
+    assert me.json()["org_slug"] == f"org-{key.removeprefix(_USER_PREFIX)}"
 
 
 def test_requests_without_key_are_rejected(api):
@@ -178,7 +180,7 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
         auth_mod,
         "_cached_identity",
         lambda token: (
-            {"email": "user-good@example.com", "key_prefix": "fslo_good"}
+            {"email": "user-good@example.com", "key_prefix": "fslo_good", "org_slug": "acme"}
             if token == "fslo-user-good"
             else {}
         ),
@@ -194,16 +196,37 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
     assert again["id"] == row["id"]
 
 
-def test_freesolo_user_key_without_email_is_rejected(api, monkeypatch):
-    # A verified external key must include an email identity. Do not fall back to
+def test_freesolo_user_key_without_org_slug_is_rejected(api, monkeypatch):
+    # A verified external key must include an org slug. Do not fall back to email or
     # token-derived namespaces for env publishing.
     import flash.server.auth as auth_mod
 
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
-    monkeypatch.setattr(auth_mod, "_cached_identity", lambda token: {"key_prefix": "fslo_noemail"})
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {"email": "user@example.com", "key_prefix": "fslo_noorg"},
+    )
 
-    assert auth_mod.authenticate("Bearer fslo-no-email") is None
+    assert auth_mod.authenticate("Bearer fslo-no-org") is None
+
+
+def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkeypatch):
+    import flash.server.auth as auth_mod
+
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {"key_prefix": "fslo_noemail", "org_slug": "acme", "org_id": "org-acme"},
+    )
+
+    row = auth_mod.authenticate("Bearer fslo-no-email")
+    assert row is not None
+    assert row["org_slug"] == "acme"
+    assert not row.get("email")
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
@@ -219,7 +242,11 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     monkeypatch.setattr(
         auth_mod,
         "_cached_identity",
-        lambda token: {"email": "revoked@example.com", "key_prefix": "fslo_revoked"},
+        lambda token: {
+            "email": "revoked@example.com",
+            "key_prefix": "fslo_revoked",
+            "org_slug": "acme",
+        },
     )
 
     assert auth_mod.authenticate("Bearer fslo-revoked") is not None  # provisioned on first use
@@ -425,7 +452,10 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
             status = 200
 
             def read(self):
-                return b'{"email":"cached@example.com","key_prefix":"fslo_cached"}'
+                return (
+                    b'{"email":"cached@example.com","key_prefix":"fslo_cached",'
+                    b'"org_slug":"acme"}'
+                )
 
             def __enter__(self):
                 return self
@@ -1349,15 +1379,17 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
             tar.addfile(info, io.BytesIO(content))
     pkg = base64.b64encode(buf.getvalue()).decode()
 
+    key = _login()
+    expected_root = f"org-{key.removeprefix(_USER_PREFIX)}/myenv"
     resp = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(key),
         json={"name": "MyEnv", "package_b64": pkg},
     )
     assert resp.status_code == 200
     ref = resp.json()["id"]
-    assert ref.endswith("/myenv")
-    assert any(root.endswith("/myenv") for root in published_roots)
+    assert ref == expected_root
+    assert expected_root in published_roots
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
@@ -1398,6 +1430,7 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert seen["name"] == "e"
     assert seen["package_b64"] == pkg
+    assert seen["key"]["org_slug"].startswith("org-")
     assert "is_new" not in seen
 
 
@@ -1434,14 +1467,14 @@ def test_delete_env_endpoint_removes_package(api, monkeypatch):
         lambda *, slug, key: recorded.update(slug=slug) or True,
     )
 
-    resp = api.delete("/v1/envs/dev-clado-ai/my-env", headers=_bearer(_login()))
+    resp = api.delete("/v1/envs/acme/my-env", headers=_bearer(_login()))
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"id": "dev-clado-ai/my-env", "deleted": True}
-    assert seen["slug"] == "dev-clado-ai/my-env"
-    assert recorded["slug"] == "dev-clado-ai/my-env"
+    assert resp.json() == {"id": "acme/my-env", "deleted": True}
+    assert seen["slug"] == "acme/my-env"
+    assert recorded["slug"] == "acme/my-env"
 
     # Unauthenticated requests are rejected.
-    assert api.delete("/v1/envs/dev-clado-ai/my-env").status_code in (401, 403)
+    assert api.delete("/v1/envs/acme/my-env").status_code in (401, 403)
 
 
 def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
@@ -1467,7 +1500,7 @@ def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
         raise RuntimeError("backend down")
 
     monkeypatch.setattr(environment_registry, "record_deleted_environment", boom)
-    resp = api.delete("/v1/envs/dev-clado-ai/my-env", headers=_bearer(_login()))
+    resp = api.delete("/v1/envs/acme/my-env", headers=_bearer(_login()))
     assert resp.status_code == 200, resp.text
     assert resp.json()["deleted"] is True
 
@@ -1485,7 +1518,7 @@ def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
         "record_deleted_environment",
         lambda **_k: pytest.fail("mirror must not be touched"),
     )
-    for bad in ("Dev-Clado-Ai/My-Env", "dev-clado-ai/my-env/"):
+    for bad in ("Acme/My-Env", "acme/my-env/"):
         resp = api.delete(f"/v1/envs/{bad}", headers=_bearer(_login()))
         assert resp.status_code == 400, resp.text
 
@@ -1622,7 +1655,7 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
         "record_environment_use",
         lambda **kwargs: calls.append(kwargs) or True,
     )
-    spec = {**SPEC, "environment": {"id": "dev-clado-ai/my-env"}}
+    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
     key = _login()
 
     resp = api.post(
@@ -1633,7 +1666,7 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
 
     assert resp.status_code == 200, resp.text
     assert calls
-    assert calls[0]["slug"] == "dev-clado-ai/my-env"
+    assert calls[0]["slug"] == "acme/my-env"
     assert calls[0]["run_id"] == resp.json()["run_id"]
     assert calls[0]["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
 
