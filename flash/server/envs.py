@@ -18,6 +18,7 @@ from pathlib import Path
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_MEMBERS = 5000
+_MAX_SCAN_MEMBERS = 200_000
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
@@ -111,10 +112,13 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
         reader = _LimitedReader(gzip.GzipFile(fileobj=io.BytesIO(tar_bytes)), stream_cap)
         with tarfile.open(fileobj=reader, mode="r|") as tar:
             total = 0
-            for count, member in enumerate(tar, start=1):
-                if count > _MAX_MEMBERS:
+            scanned = 0
+            extracted = 0
+            for member in tar:
+                scanned += 1
+                if scanned > _MAX_SCAN_MEMBERS:
                     raise EnvPublishError(
-                        f"env package has too many members (limit {_MAX_MEMBERS})"
+                        f"env package has too many entries to scan (limit {_MAX_SCAN_MEMBERS})"
                     )
                 if member.type in _TAR_METADATA_TYPES:
                     continue
@@ -141,6 +145,11 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     raise EnvPublishError(
                         f"only regular files and directories are allowed in env packages, "
                         f"but {member.name!r} is a special file"
+                    )
+                extracted += 1
+                if extracted > _MAX_MEMBERS:
+                    raise EnvPublishError(
+                        f"env package has too many members (limit {_MAX_MEMBERS})"
                     )
                 total += max(0, member.size)
                 if total > _MAX_UNCOMPRESSED_BYTES:
