@@ -283,8 +283,13 @@ def _console_flags_cuda_oom(mode: str | None) -> bool:
         path = f"/tmp/console_{mode}.txt"
         if not mode or not os.path.exists(path):
             return False
-        with open(path, errors="replace") as f:
-            tail = f.read()[-8000:]
+        # Seek to the tail instead of reading the whole console: a long-running job's console can be
+        # large, and this runs on the failure path where the OOM (if any) is in the last lines.
+        tail_bytes = 8000
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail_bytes))
+            tail = f.read().decode(errors="replace")
         return is_cuda_oom(None, tail)
     except Exception:
         return False
