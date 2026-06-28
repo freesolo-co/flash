@@ -49,14 +49,21 @@ def is_cuda_oom(exc: BaseException | None, tb_text: str = "") -> bool:
             return True
     except Exception:
         pass
-    blob = f"{type(exc).__name__ if exc is not None else ''}: {exc}\n{tb_text}".lower()
+    # Build the signal from the exception MESSAGE text only: the exception's own str() plus the
+    # UN-INDENTED exception-type lines of the traceback (e.g. "RuntimeError: Triton Error [CUDA]: out
+    # of memory"). The INDENTED frame lines (``  File ".../torch/cuda/x.py" ...`` and their source/
+    # caret continuations) are dropped — a HOST-RAM OOM (a MemoryError, a DataLoader "out of memory")
+    # whose stack merely traverses torch/cuda/* file PATHS must not borrow that "cuda" as GPU context
+    # and trip the expensive larger-GPU escalation (more VRAM can't fix a host/library OOM).
+    exc_lines = "\n".join(ln for ln in tb_text.splitlines() if ln[:1] not in (" ", "\t"))
+    blob = f"{type(exc).__name__ if exc is not None else ''}: {exc}\n{exc_lines}".lower()
     if not any(m in blob for m in _CUDA_OOM_MARKERS):
         return False
     # An OOM substring alone is not enough: a HOST-RAM OOM or another library's OOM would otherwise
     # trip the expensive GPU-tier escalation. Require CUDA/Triton context (the typed
     # torch.cuda.OutOfMemoryError above is the unambiguous fast-path that skips this). The CUDA marker
     # "cuda_error_out_of_memory" already carries "cuda"; "out of memory"/"outofmemoryerror" must be
-    # accompanied by it.
+    # accompanied by it — and only from the exception message now, never a stack file path.
     return "cuda" in blob or "triton" in blob
 
 

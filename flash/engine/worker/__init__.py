@@ -462,7 +462,12 @@ def main():
         # in hand) so the runner ESCALATES the retry to a strictly larger GPU instead of failing fast
         # (it's NOT infra) or re-rolling the same too-small card. Checked on str(e)+tb so the
         # fla/Triton "[CUDA]: out of memory" RuntimeError counts, not just torch's typed error.
-        oom = is_cuda_oom(e, tb)
+        # ``and not retriable``: a RetriableInfraError raised by wait_for_gpu carries the LAST CUDA
+        # readiness error in its message, which can be "CUDA out of memory" — but that's a host/GPU
+        # READINESS failure that should retry on a fresh SAME-size GPU, not a workload OOM. Since the
+        # pollers give oom precedence over retriable, retriable must win HERE (don't stamp oom) so an
+        # infra readiness flake doesn't escalate onto a larger, costlier card.
+        oom = is_cuda_oom(e, tb) and not retriable
         try:
             err_name = error_artifact_name(RUN_MODE)
             err_path = f"/tmp/{err_name}"

@@ -95,16 +95,94 @@ def test_lambda_poller_escalates_oom_for_cross_provider_parity():
     import re
 
     src, _ = _src("flash.providers.lambdalabs.jobs", "")
-    compact = re.sub(r"\s+", "", src)  # drop all whitespace (one call site wraps across lines)
+    compact = re.sub(r"\s+", "", src)  # drop all whitespace (call sites wrap across lines)
     # the oom flag is read in BOTH Lambda worker-fail paths (marker + dead-host error_*.txt crash),
-    # and BOTH gate on handle.attempt so a prior attempt's lingering {"oom": true} can't misclassify
-    # an unrelated startup/platform failure as an OOM (5Wy parity with the RunPod current_attempt gate)
-    assert compact.count("worker_flagged_oom(heartbeat_reader,handle.attempt)") == 2
-    assert "worker_flagged_oom(heartbeat_reader)" not in compact  # no ungated read survives
+    # BOTH gate on handle.attempt (5Wy: a prior attempt's lingering {"oom": true} can't misclassify),
+    # and BOTH read off a single shared _once_forced snapshot hb_once (8bS: two separate forced reads
+    # could disagree, the first missing a not-yet-visible heartbeat the second would see).
+    assert compact.count("worker_flagged_oom(hb_once,handle.attempt)") == 2
+    assert "worker_flagged_oom(heartbeat_reader" not in compact  # no direct-reader read survives
+    assert "worker_flagged_retriable(hb_once)" in compact  # retriable shares the same snapshot
+    assert "worker_flagged_retriable(heartbeat_reader)" not in compact
     # marker path: oom wins over the retriable/job_failed split
     assert 'failure="oom" if oom else ("job_preempted" if retriable else "job_failed")' in src
     # dead-host crash path: oom takes precedence before the crash/preempt split
     assert '"job_failed" if worker_crashed else "job_preempted"' in src
+
+
+def test_is_cuda_oom_ignores_cuda_only_in_traceback_file_paths():
+    # 8bM: the CUDA-context signal must come from the exception MESSAGE, not stack frame file paths.
+    # A host-RAM OOM whose traceback merely traverses torch/cuda/* must NOT be treated as a GPU OOM
+    # (more VRAM can't fix it), even though "cuda" appears in a `File ".../torch/cuda/..."` frame.
+    from flash.engine.worker.perf.lifecycle import is_cuda_oom
+
+    host_oom_tb = (
+        "Traceback (most recent call last):\n"
+        '  File "/usr/lib/python3.11/site-packages/torch/cuda/memory.py", line 1, in alloc\n'
+        "    return _do()\n"
+        "MemoryError: Unable to allocate 8.00 GiB: out of memory\n"
+    )
+    assert is_cuda_oom(MemoryError("Unable to allocate 8.00 GiB: out of memory"), host_oom_tb) is False
+    # a DataLoader host OOM whose stack also passes through torch/cuda frames — still NOT a CUDA OOM
+    dl_tb = (
+        "Traceback (most recent call last):\n"
+        '  File "/x/torch/cuda/streams.py", line 9, in run\n'
+        "    loss.backward()\n"
+        "RuntimeError: DataLoader worker (pid 7) is killed by signal: out of memory\n"
+    )
+    assert is_cuda_oom(RuntimeError("DataLoader worker (pid 7) is killed by signal: out of memory"), dl_tb) is False
+    # a REAL CUDA OOM whose root cause is on the (un-indented) exception line of a wrapper traceback
+    # is still detected (the message, not a file path, supplies the context).
+    real_tb = (
+        "Traceback (most recent call last):\n"
+        '  File "/x/fla/modules/l2norm.py", line 3, in bwd\n'
+        "    k()\n"
+        "RuntimeError: Triton Error [CUDA]: out of memory\n"
+    )
+    assert is_cuda_oom(RuntimeError("boom"), real_tb) is True
+
+
+def test_worker_does_not_stamp_oom_for_a_retriable_infra_exception():
+    # 81I: wait_for_gpu raises RetriableInfraError carrying the last CUDA readiness error, which can
+    # be "CUDA out of memory". The pollers give oom precedence over retriable, so the worker must NOT
+    # stamp oom when the exception is already retriable — else a host-readiness flake escalates onto a
+    # larger, costlier card instead of retrying on a fresh same-size GPU.
+    src, _ = _src("flash.engine.worker", "")
+    assert "oom = is_cuda_oom(e, tb) and not retriable" in src
+
+
+def test_detail_flags_cuda_oom_is_a_gated_fallback():
+    # 81K/81L: when the structured heartbeat oom flag is absent (best-effort upload lost) OR the OOM
+    # is in a subprocess the worker didn't classify (vLLM EngineCore child, root cause only in the
+    # appended stdout tail), the poller falls back to the SAME CUDA predicate on the assembled detail.
+    from flash.providers.runpod.jobs import detail_flags_cuda_oom
+
+    # a CUDA OOM surfaced only in a worker/subprocess stdout tail is caught
+    assert detail_flags_cuda_oom("... vLLM EngineCore died: CUDA out of memory. Tried to allocate") is True
+    # a host/library OOM in the text does NOT escalate (no CUDA/Triton context)
+    assert detail_flags_cuda_oom("DataLoader worker killed: out of memory") is False
+    # a RetriableInfraError that merely names a CUDA OOM must NOT escalate (retriable wins) — the
+    # marker in the text suppresses the fallback so it retries on a fresh same-size GPU.
+    assert detail_flags_cuda_oom("RETRIABLE_INFRA_GPU: cuda readiness: CUDA out of memory") is False
+    assert detail_flags_cuda_oom(None) is False
+    assert detail_flags_cuda_oom("") is False
+
+
+def test_pollers_fall_back_to_detail_only_when_unflagged_and_not_retriable():
+    # The fallback is gated: it runs ONLY when the structured flag said neither oom nor retriable, so
+    # the primary path stays structured and an infra preemption can't be relabeled as oom.
+    import re
+
+    runpod = re.sub(
+        r"\s+", " ", pathlib.Path(__import__("flash.providers.runpod.jobs", fromlist=["x"]).__file__).read_text()
+    )
+    lam = re.sub(
+        r"\s+", " ", pathlib.Path(__import__("flash.providers.lambdalabs.jobs", fromlist=["x"]).__file__).read_text()
+    )
+    # RunPod: both terminal worker-fail paths add the gated fallback on the assembled detail
+    assert runpod.count("if not oom and not retriable: oom = detail_flags_cuda_oom(detail)") == 2
+    # Lambda dead-host crash path runs the same fallback on the error artifact
+    assert "if not oom and not retriable: oom = detail_flags_cuda_oom(err)" in lam
 
 
 def test_worker_flagged_oom_ignores_a_prior_attempts_stale_flag():

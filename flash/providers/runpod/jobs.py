@@ -728,6 +728,11 @@ def poll_job(
                 retriable = worker_flagged_retriable(hb_reader)
                 oom = worker_flagged_oom(hb_reader, current_attempt)
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
+                # Fallback when the structured flag is absent (heartbeat upload failed) or the OOM was
+                # in a subprocess the worker didn't classify: scan the assembled detail. Gated on
+                # ``not retriable`` so an infra retry that names a CUDA OOM still wins as preempt.
+                if not oom and not retriable:
+                    oom = detail_flags_cuda_oom(detail)
                 return PollResult(
                     False,
                     failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
@@ -754,6 +759,11 @@ def poll_job(
             retriable = worker_flagged_retriable(hb_reader)
             oom = worker_flagged_oom(hb_reader, current_attempt)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
+            # Fallback OOM detection (heartbeat-flag absent, or a child-process OOM whose root cause
+            # is only in the appended worker stdout tail — e.g. vLLM EngineCore). Gated on
+            # ``not retriable`` so an infra preemption that names a CUDA OOM still wins as preempt.
+            if not oom and not retriable:
+                oom = detail_flags_cuda_oom(detail)
             return PollResult(
                 False,
                 failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
@@ -1124,3 +1134,27 @@ def worker_flagged_oom(heartbeat_reader, current_attempt: int | None = None) -> 
     # heartbeat was stamped by the attempt we're polling (current_attempt None = caller has no
     # expected attempt, e.g. the reattach poll → keep the historical trust-the-flag behavior).
     return current_attempt is None or _attempt_int(hb.get("attempt")) == current_attempt
+
+
+def detail_flags_cuda_oom(detail: str | None) -> bool:
+    """Fallback OOM classifier for the assembled failure ``detail``, for the two cases the structured
+    heartbeat ``oom`` flag misses:
+
+    * the terminal error heartbeat upload FAILED (best-effort) while the error artifact made it, so
+      no ``oom`` flag is visible even though the traceback names a CUDA OOM; and
+    * the OOM happened in a SUBPROCESS the worker didn't classify on its own exception (a vLLM
+      EngineCore child whose CUDA OOM only reaches the parent via stdout, which the poller appends to
+      ``detail``).
+
+    Runs the SAME CUDA-specific predicate the worker uses (``is_cuda_oom``), so a host/library OOM in
+    the text does NOT escalate. Skips any detail carrying the retriable-infra marker so a host-
+    readiness RetriableInfraError that merely names a CUDA OOM still retries on a fresh same-size GPU
+    (mirrors the worker's retriable-wins rule). This is a fallback ONLY — callers gate it on the
+    structured flag being absent, so the primary path stays structured (no routine string parsing)."""
+    if not detail:
+        return False
+    from flash.engine.worker.perf.lifecycle import RETRIABLE_INFRA_MARKER, is_cuda_oom
+
+    if RETRIABLE_INFRA_MARKER.lower() in detail.lower():
+        return False
+    return is_cuda_oom(None, detail)

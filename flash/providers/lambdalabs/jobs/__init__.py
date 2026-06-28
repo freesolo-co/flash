@@ -442,16 +442,21 @@ def poll_lambda_job(
         # its OWN category the runner escalates to a STRICTLY larger GPU — parity with RunPod's
         # poll_job, else a Lambda candidate's OOM would fail fast and never escalate. A
         # RetriableInfraError retries on a fresh host like a platform termination.
-        from flash.providers.runpod.jobs import worker_flagged_oom, worker_flagged_retriable
-
-        # The attempt-scoped marker (lambda_attempt{N}.json) is already this-attempt-safe; the
-        # heartbeat fallback reads the shared-prefix file, so gate its OOM flag on handle.attempt
-        # (a prior attempt's lingering {"oom": true} must not escalate this attempt — see
-        # worker_flagged_oom).
-        oom = bool(marker and marker.get("oom")) or worker_flagged_oom(
-            heartbeat_reader, handle.attempt
+        from flash.providers.runpod.jobs import (
+            _once_forced,
+            worker_flagged_oom,
+            worker_flagged_retriable,
         )
-        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(heartbeat_reader)
+
+        # One forced heartbeat snapshot shared by both flag reads (parity with RunPod's poll_job):
+        # two separate forced reads could see different states — the first missing a not-yet-visible
+        # heartbeat while a later read shows oom, leaving classification stuck on job_failed. The
+        # attempt-scoped marker (lambda_attempt{N}.json) is already this-attempt-safe; the heartbeat
+        # fallback reads the shared-prefix file, so gate its OOM flag on handle.attempt (a prior
+        # attempt's lingering {"oom": true} must not escalate this attempt — see worker_flagged_oom).
+        hb_once = _once_forced(heartbeat_reader)
+        oom = bool(marker and marker.get("oom")) or worker_flagged_oom(hb_once, handle.attempt)
+        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(hb_once)
         return PollResult(
             False,
             failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
@@ -566,13 +571,26 @@ def poll_lambda_job(
             # attempt-scoped, but this can't flip a genuine preemption to job_failed: a prior
             # attempt's NON-retriable crash already ended the run via this same branch, and a prior
             # retriable crash leaves a retriable heartbeat that keeps this path on job_preempted.
-            from flash.providers.runpod.jobs import worker_flagged_oom, worker_flagged_retriable
+            from flash.providers.runpod.jobs import (
+                _once_forced,
+                detail_flags_cuda_oom,
+                worker_flagged_oom,
+                worker_flagged_retriable,
+            )
 
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
             # A CUDA OOM here is its own escalation category (grow the GPU), not a fail-fast crash —
             # parity with fail_from_marker / RunPod. It takes precedence over the crash/preempt split.
-            oom = worker_flagged_oom(heartbeat_reader, handle.attempt)
-            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
+            # One shared heartbeat snapshot for both flag reads (see fail_from_marker).
+            hb_once = _once_forced(heartbeat_reader)
+            oom = worker_flagged_oom(hb_once, handle.attempt)
+            retriable = worker_flagged_retriable(hb_once)
+            worker_crashed = bool(err and err.strip()) and not retriable
+            # Fallback when the heartbeat flag is absent (best-effort upload lost): the error
+            # artifact's traceback may name the CUDA OOM. Gated on not-retriable so an infra crash
+            # that mentions a CUDA OOM still retries on a fresh same-size host.
+            if not oom and not retriable:
+                oom = detail_flags_cuda_oom(err)
             return PollResult(
                 False,
                 failure="oom"
