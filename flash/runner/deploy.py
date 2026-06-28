@@ -1,6 +1,10 @@
 """Deploy / cancel / recover state transitions for a run.
 
-Uses function-local imports to avoid import cycles and keep test monkeypatches reachable.
+Store helpers and the lifecycle functions (``_run_training`` / ``_gc_run_endpoints``) are
+pulled in via FUNCTION-LOCAL lazy ``from flash.runner import ...`` imports — never at module
+level — for the same two reasons as ``lifecycle.py``: avoid a partially-initialized-package
+import cycle, and keep the test monkeypatches (e.g. ``flash.runner._gc_run_endpoints``)
+reachable through the package global rather than a statically-bound copy.
 """
 
 from __future__ import annotations
@@ -80,10 +84,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     import sys
 
     from flash.runner import (
+        FIXED_SEED,
         TERMINAL_STATES,
         _gc_run_endpoints,
         _persist_metrics,
-        _run_seed_loop,
+        _run_training,
         _RunCancelled,
         _update,
         artifacts_dir,
@@ -98,7 +103,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
 
     spec = JobSpec.from_dict(status.spec)
     remote = dict(status.remote)
-    seed = int(remote.pop("seed", spec.train.seeds[0]))
+    seed = int(remote.pop("seed", FIXED_SEED))
+    # The class the run actually provisioned (a policy retry may have walked past the
+    # provisional spec.gpu.type). The in-process success path stamps this into metrics;
+    # on recovery the worker output carries no such field, so recover it from the handle
+    # to cost the right card.
     allocated_gpu = remote.pop("allocated_gpu", None)
     log = log_stream or sys.stderr
     from flash.providers import get_provider
@@ -111,92 +120,35 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
-            try:
-                seed_index = list(spec.train.seeds).index(seed)
-            except ValueError:
-                seed_index = 0
+            # Job ended not-ok — usually because it was abandoned during the redeploy. Resume from
+            # the last HF checkpoint (fresh allocation, worker resumes mid-training) instead of
+            # failing; _run_training still terminates a genuinely broken run when it re-fails.
             print(
-                f"attach: {run_id} seed {seed} ended ({res.failure}); resuming from checkpoint",
+                f"attach: {run_id} ended ({res.failure}); resuming from checkpoint",
                 file=log,
             )
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
-            if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
+            # Bail if the run was raced to terminal during the long poll above: _update's CAS
+            # returns False, and resuming would submit paid work for a dead run.
+            if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
-            _run_seed_loop(
-                spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
-            )
+            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0))
             return get_status(run_id)
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
-        total = float(status.cost_usd or 0.0) + _persist_metrics(spec, seed, res.metrics)
+        # Add the recovered run's cost to any already booked before the restart so recovery
+        # doesn't underreport spend.
+        total = float(status.cost_usd or 0.0) + _persist_metrics(spec, res.metrics)
+        # A cancel can land while this thread persists the recovered metrics (after the late-cancel
+        # check above). Re-read before the terminal "done" so a late worker success can't resurrect
+        # a user-cancelled run. _RunCancelled is caught below, leaving the cancellation intact.
         if get_status(run_id).state == "cancelled":
             raise _RunCancelled(f"run {run_id} was cancelled")
-        try:
-            resumed_index = list(spec.train.seeds).index(seed) + 1
-        except ValueError:
-            resumed_index = len(spec.train.seeds)
-        more_seeds = resumed_index < len(spec.train.seeds)
-        # Clear stale handle before resuming so a restart in the inter-seed gap picks the right seed.
-        applied = _update(
-            run_id,
-            "running",
-            cost_usd=total,
-            artifacts_dir=artifacts_dir(spec),
-            **({"remote": None, "resume_seed_index": resumed_index} if more_seeds else {}),
-        )
-        if more_seeds:
-            if not applied:
-                print(
-                    f"attach: {run_id} went terminal during recovery; "
-                    "not resuming the remaining seeds",
-                    file=log,
-                )
-                return get_status(run_id)
-            _run_seed_loop(spec, log, start_index=resumed_index, prior_cost=total)
-        else:
-            _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
+        _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
     except _RunCancelled:
         pass  # cancel_run already wrote terminal `cancelled`
-    except Exception as exc:
-        if get_status(run_id).state != "cancelled":
-            _update(run_id, "failed", error=str(exc))
-    finally:
-        _gc_run_endpoints(spec)
-    return get_status(run_id)
-
-
-def resume_run(run_id: str, log_stream=None) -> RunStatus:
-    """Resume remaining seeds of a multi-seed run after a restart in the inter-seed gap."""
-    import sys
-
-    from flash.runner import (
-        TERMINAL_STATES,
-        _gc_run_endpoints,
-        _run_seed_loop,
-        _RunCancelled,
-        _update,
-        get_status,
-    )
-
-    status = get_status(run_id)
-    if status.state in TERMINAL_STATES:
-        return status
-    if status.resume_seed_index is None:
-        raise ValueError(f"run {run_id} has no resume_seed_index; cannot resume")
-    spec = JobSpec.from_dict(status.spec)
-    log = log_stream or sys.stderr
-    print(f"resuming {run_id}: remaining seeds from index {status.resume_seed_index}", file=log)
-    try:
-        _run_seed_loop(
-            spec,
-            log,
-            start_index=status.resume_seed_index,
-            prior_cost=float(status.cost_usd or 0.0),
-        )
-    except _RunCancelled:
-        pass  # cancel_run already set the terminal state
     except Exception as exc:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))

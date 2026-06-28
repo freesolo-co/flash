@@ -150,7 +150,7 @@ def build_payload(
         # Per-run env wheel + opt-in chalk spec; the bootstrap pip-installs extra_pip for every job.
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
-        "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
+        "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
         "attempt": int(attempt),
     }

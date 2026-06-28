@@ -109,8 +109,10 @@ def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
 def _worker_artifacts(spec) -> dict[str, str]:
     """Fetch worker console/error logs from the private HF artifact repo using the operator token.
 
-    Each seed uploads under its own seed{N} prefix; a multi-seed run that fails on a LATER seed keeps
-    its traceback there, not under seed0, so scan every seed (key entries by seed when there's >1).
+    The worker streams ``console_<phase>.txt`` and the attempt-scoped
+    ``error_<phase>_attempt<N>.txt`` to the run's PRIVATE HF repo; read them with the OPERATOR
+    ``HF_TOKEN`` so ``flash status --logs`` shows the real worker output regardless of run state
+    and without the user needing repo access. Best-effort: a missing file / no repo yields {}.
     """
     repo = getattr(getattr(spec, "train", None), "hf_repo", None)
     if not repo:
@@ -119,28 +121,25 @@ def _worker_artifacts(spec) -> dict[str, str]:
         from huggingface_hub import hf_hub_download
     except Exception:
         return {}
-    seeds = list(getattr(getattr(spec, "train", None), "seeds", None) or [0])
+    prefix = adapter_prefix(spec)
     out: dict[str, str] = {}
-    for seed in seeds:
-        prefix = adapter_prefix(spec, seed=seed)
-        key_prefix = f"seed{seed}/" if len(seeds) > 1 else ""
-        for name in (
-            f"console_{spec.phase}.txt",
-            _latest_error_artifact_name(repo, prefix, spec.phase),
-        ):
-            try:
-                path = hf_hub_download(
-                    repo_id=repo,
-                    repo_type="dataset",
-                    filename=f"{prefix}/{name}",
-                    token=os.environ.get("HF_TOKEN"),
-                    force_download=True,  # worker appends across run; cached copy goes stale
-                )
-                # errors="replace": worker stdout can carry non-UTF-8 bytes from tracebacks/progress bars
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    out[f"{key_prefix}{name}"] = f.read()
-            except Exception:
-                continue
+    for name in (
+        f"console_{spec.phase}.txt",
+        _latest_error_artifact_name(repo, prefix, spec.phase),
+    ):
+        try:
+            path = hf_hub_download(
+                repo_id=repo,
+                repo_type="dataset",
+                filename=f"{prefix}/{name}",
+                token=os.environ.get("HF_TOKEN"),
+                force_download=True,  # worker appends across run; cached copy goes stale
+            )
+            # errors="replace": worker stdout can carry non-UTF-8 bytes from tracebacks/progress bars
+            with open(path, encoding="utf-8", errors="replace") as f:
+                out[name] = f.read()
+        except Exception:
+            continue
     return out
 
 
@@ -151,7 +150,6 @@ def recover_runs() -> None:
         _run_job_background,
         _update,
         attach_run,
-        resume_run,
     )
 
     active: set[str] = set()
@@ -166,9 +164,6 @@ def recover_runs() -> None:
         if status.remote:
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
-        elif status.resume_seed_index is not None:
-            active.add(status.run_id)
-            threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
             # No handle: restart hit the submit→provisioning window; GC any half-made endpoint and resubmit.
             try:

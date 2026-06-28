@@ -28,7 +28,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
+    "train": {"steps": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 
@@ -667,9 +667,10 @@ def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
     assert _latest_error_artifact_name("org/repo", "rl/r/seed0", "rl") == "error_rl_attempt0.txt"
 
 
-def test_worker_artifacts_scans_all_seeds(monkeypatch, tmp_path):
-    """A multi-seed run that fails on a LATER seed keeps its traceback under that seed's prefix, not
-    seed0 — the fetcher must scan every seed and key entries by seed so the real crash surfaces."""
+def test_worker_artifacts_reads_console_and_latest_attempt_error(monkeypatch, tmp_path):
+    """A run streams its console + attempt-scoped error under the single ``<phase>/<run_id>`` prefix;
+    the fetcher reads the console and the LATEST ``error_<phase>_attempt<N>.txt`` so the real crash
+    (highest attempt) surfaces, fetched with the operator token."""
     import types
 
     import huggingface_hub
@@ -679,12 +680,12 @@ def test_worker_artifacts_scans_all_seeds(monkeypatch, tmp_path):
     spec = types.SimpleNamespace(
         phase="rl",
         run_id="r1",
-        train=types.SimpleNamespace(hf_repo="org/repo", seeds=[0, 1]),
+        train=types.SimpleNamespace(hf_repo="org/repo"),
     )
     content = {
-        "rl/r1/seed0/console_rl.txt": "seed0 console\n",
-        "rl/r1/seed1/console_rl.txt": "seed1 console\n",
-        "rl/r1/seed1/error_rl_attempt0.txt": "TRACEBACK seed1\n",
+        "rl/r1/console_rl.txt": "console\n",
+        "rl/r1/error_rl_attempt0.txt": "stale first attempt\n",
+        "rl/r1/error_rl_attempt1.txt": "TRACEBACK final\n",
     }
 
     def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
@@ -705,10 +706,9 @@ def test_worker_artifacts_scans_all_seeds(monkeypatch, tmp_path):
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
     out = _worker_artifacts(spec)
-    assert out["seed0/console_rl.txt"] == "seed0 console\n"
-    assert out["seed1/console_rl.txt"] == "seed1 console\n"
-    assert out["seed1/error_rl_attempt0.txt"] == "TRACEBACK seed1\n"  # the actual crash surfaces
-    assert "seed0/error_rl_attempt0.txt" not in out  # seed0 had no error -> not fabricated
+    assert out["console_rl.txt"] == "console\n"
+    assert out["error_rl_attempt1.txt"] == "TRACEBACK final\n"  # latest attempt = the real crash
+    assert "error_rl_attempt0.txt" not in out  # the stale earlier attempt is not surfaced
 
 
 def test_local_env_path_rejected(api):
@@ -1176,7 +1176,7 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "nohandle-1",
     }
@@ -1233,7 +1233,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "bad-1",
     }
@@ -1241,7 +1241,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     good_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"steps": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "good-2",
     }
@@ -1419,11 +1419,11 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
 # Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
 # --------------------------------------------------------------------------------------------
 _FAKE_CKPTS = [
-    {"step": 40, "adapter_prefix": "rl/X/seed0/checkpoints/step-40",
-     "subfolder": "rl/X/seed0/checkpoints/step-40/adapter",
+    {"step": 40, "adapter_prefix": "rl/X/checkpoints/step-40",
+     "subfolder": "rl/X/checkpoints/step-40/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
-    {"step": 80, "adapter_prefix": "rl/X/seed0/checkpoints/step-80",
-     "subfolder": "rl/X/seed0/checkpoints/step-80/adapter",
+    {"step": 80, "adapter_prefix": "rl/X/checkpoints/step-80",
+     "subfolder": "rl/X/checkpoints/step-80/adapter",
      "repo_id": "org/test-runs", "repo_type": "dataset"},
 ]
 
@@ -1634,11 +1634,11 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     body = resp.json()
     assert body["repository"] == "me/adapters"
     assert body["url"] == "https://huggingface.co/me/adapters"
-    assert body["source"] == f"{src_repo}:rl/{run_id}/seed0/adapter"
+    assert body["source"] == f"{src_repo}:rl/{run_id}/adapter"
     assert "step" not in body
     # Source = the run's private dataset repo + final-adapter subfolder; dest = the user's repo.
     assert seen["source_repo"] == src_repo
-    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/adapter"
+    assert seen["source_subfolder"] == f"rl/{run_id}/adapter"
     assert seen["dest_repo"] == "me/adapters"
     assert seen["dest_token"] == "hf_user"
     assert seen["private"] is True  # private by default
@@ -1789,7 +1789,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
         lambda spec: [
             {
                 "step": 40,
-                "subfolder": f"rl/{run_id}/seed0/checkpoints/step-40/adapter",
+                "subfolder": f"rl/{run_id}/checkpoints/step-40/adapter",
                 "repo_id": "org/test-runs",
                 "repo_type": "dataset",
             }
@@ -1808,7 +1808,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     )
     assert ok.status_code == 200, ok.text
     assert ok.json()["step"] == 40
-    assert seen["source_subfolder"] == f"rl/{run_id}/seed0/checkpoints/step-40/adapter"
+    assert seen["source_subfolder"] == f"rl/{run_id}/checkpoints/step-40/adapter"
 
     bad = api.post(
         f"/v1/runs/{run_id}/export",

@@ -11,9 +11,13 @@ from flash.spec import JobSpec
 _ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors", "adapter_model.bin"})
 
 
-def checkpoint_adapter_prefix(spec: JobSpec, step: int, seed: int | None = None) -> str:
-    """Return the per-step adapter prefix; deploy_adapter appends /adapter to this."""
-    return f"{adapter_prefix(spec, seed)}/checkpoints/step-{step}"
+def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:
+    """The ``adapter_prefix`` that serves checkpoint ``step``.
+
+    ``deploy_adapter`` appends ``/adapter`` to whatever prefix it's given, so this returns the
+    per-step root (``<run prefix>/checkpoints/step-<N>``) — matching the worker's upload path —
+    and the existing deploy path needs no special-casing for checkpoints."""
+    return f"{adapter_prefix(spec)}/checkpoints/step-{step}"
 
 
 def _adapter_file_re(base: str) -> re.Pattern[str]:
@@ -21,12 +25,19 @@ def _adapter_file_re(base: str) -> re.Pattern[str]:
     return re.compile(re.escape(base) + r"/checkpoints/step-(\d+)/adapter/([^/]+)$")
 
 
-def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
-    """Deployable per-step adapter snapshots for ``spec``, ascending by step."""
+def list_checkpoints(spec: JobSpec) -> list[dict]:
+    """Deployable per-step adapter snapshots for ``spec``, ascending by step.
+
+    A step is included only if its adapter folder carries BOTH ``adapter_config.json`` AND a
+    weights file (so ``/deploy --step`` can never target a half-uploaded, unloadable step). Each
+    entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
+    ``adapter_prefix`` is the value to hand ``deploy_adapter`` to serve that exact step and
+    ``subfolder`` is the full path of the adapter folder in the repo. Returns ``[]`` when the
+    run has no HF repo or no published snapshots (older runs, or none saved yet)."""
     repo = spec.train.hf_repo
     if not repo:
         return []
-    base = adapter_prefix(spec, seed)
+    base = adapter_prefix(spec)
     pattern = _adapter_file_re(base)
     try:
         from huggingface_hub import HfApi
@@ -47,7 +58,7 @@ def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
         names = by_step[step]
         if "adapter_config.json" not in names or names.isdisjoint(_ADAPTER_WEIGHT_FILES):
             continue
-        prefix = checkpoint_adapter_prefix(spec, step, seed)
+        prefix = checkpoint_adapter_prefix(spec, step)
         out.append(
             {
                 "step": step,
