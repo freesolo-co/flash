@@ -13,7 +13,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 
 from flash.catalog import ModelInfo, resolve_model
-from flash.spec import JobSpec
+from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
 
 # Fixed local storage roots (not operator-configurable): run-state JSON + result artifacts,
 # both under the ~/.flash state dir (same root as server/db.py's DB_PATH) so a single
@@ -37,17 +37,16 @@ def artifacts_dir(spec: JobSpec) -> str:
     return os.path.join(RESULTS_DIR, "runpod", spec.phase, spec.run_id)
 
 
-def adapter_prefix(spec: JobSpec, seed: int | None = None) -> str:
-    """A run's adapter location on the HF artifact store."""
-    chosen = spec.train.seeds[0] if seed is None else seed
-    return f"{spec.phase}/{spec.run_id}/seed{chosen}"
+def adapter_prefix(spec: JobSpec) -> str:
+    """A run's adapter location on the HF artifact store: ``<phase>/<run_id>``."""
+    return f"{spec.phase}/{spec.run_id}"
 
 
-def adapter_ref(spec: JobSpec, seed: int | None = None) -> str | None:
+def adapter_ref(spec: JobSpec) -> str | None:
     """Full init_from_adapter reference for a run's trained adapter."""
     if not spec.train.hf_repo:
         return None
-    return f"{spec.train.hf_repo}:{adapter_prefix(spec, seed=seed)}"
+    return f"{spec.train.hf_repo}:{adapter_prefix(spec)}"
 
 
 def _adapter_ref_from_status_spec(raw: dict) -> str | None:
@@ -83,10 +82,6 @@ class RunStatus:
     # Durable job handle {endpoint_id, endpoint_name, job_id} — lets any process
     # reattach to / cancel the remote job (see `flash status --follow`).
     remote: dict | None = None
-    # Index of the next seed to run for a multi-seed job, set while the remote handle
-    # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
-    # after an inter-seed restart instead of failing the run (losing completed work).
-    resume_seed_index: int | None = None
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
     # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
     # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the wall x $/hr
@@ -582,12 +577,12 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
     _report_status(status)
 
 
-def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
-    """Write metrics to results/runpod/<phase>/<run_id>/seedN and return the cost.
+def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
+    """Write metrics to results/runpod/<phase>/<run_id> and return the cost.
 
-    The run id keeps concurrent/sequential runs of the same phase+seed from
+    The run id keeps concurrent/sequential runs of the same phase from
     overwriting each other's artifacts."""
-    dest = os.path.join(artifacts_dir(spec), f"seed{seed}")
+    dest = artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Rate the actually-allocated class, not the parse-time provisional spec.gpu.type:
     # a policy GPU can be re-allocated to a different RunPod class at submit time, so
@@ -611,7 +606,7 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     with contextlib.suppress(Exception):
         from flash.server.run_registry import record_training_checkpoint
 
-        record_training_checkpoint(spec=spec, seed=seed, metrics=metrics, artifact_path=dest)
+        record_training_checkpoint(spec=spec, metrics=metrics, artifact_path=dest)
     return float(cost)
 
 
@@ -620,7 +615,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
 
     Returns ``True`` if the transition was applied, ``False`` if it was rejected because
     the run was already in a terminal state (the sticky compare-and-set below). Callers
-    that gate PAID work on a transition (e.g. the recovery path resuming ``_run_seed_loop``)
+    that gate PAID work on a transition (e.g. the recovery path resuming ``_run_training``)
     must check this return so a run concurrently flipped terminal does not get resumed.
     """
     # The read-check-write below must be atomic: a concurrent `flash cancel` (also via
@@ -799,13 +794,12 @@ from flash.runner.deploy import (  # noqa: E402,F401
     mark_deployed,
     mark_deployment_undeployed,
     mark_undeployed,
-    resume_run,
 )
 from flash.runner.lifecycle import (  # noqa: E402,F401
     _gc_run_endpoints,
     _run_job,
     _run_job_inner,
-    _run_seed_loop,
+    _run_training,
     _spec_with_gpu,
     _submit_seed_supervised,
 )
