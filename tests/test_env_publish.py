@@ -440,6 +440,22 @@ def test_safe_extract_extracts_regular_files_and_dirs(tmp_path):
     assert (tmp_path / "pkg" / "pyproject.toml").read_text() == "[project]\nname='e'\n"
 
 
+def test_safe_extract_skips_tar_metadata_entries(tmp_path):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        pax = tarfile.TarInfo("pax_global_header")
+        pax.type = tarfile.XGLTYPE
+        tar.addfile(pax)
+        data = b"ok"
+        info = tarfile.TarInfo("pkg/environment.py")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    envs._safe_extract(buf.getvalue(), tmp_path)
+
+    assert (tmp_path / "pkg" / "environment.py").read_bytes() == b"ok"
+
+
 def test_safe_extract_rejects_special_members(tmp_path):
     for typeflag, label in ((tarfile.FIFOTYPE, "fifo"), (tarfile.CHRTYPE, "char-device")):
         buf = io.BytesIO()
