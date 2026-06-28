@@ -91,6 +91,37 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     return [t for t, _ in kept], [r for _, r in kept], len(pretok) - len(kept)
 
 
+def _model_arch_dims(model_id: str) -> tuple[int, int]:
+    """``(hidden_size, num_hidden_layers)`` used to size the GC-off activation estimate.
+
+    Prefer the CURATED catalog geometry (deterministic, no network/parse risk) for known models — a
+    live B200 SFT showed the runtime ``AutoConfig`` probe returning (0, 0) on the 35B-A3B's
+    multimodal-nested config, which silently kept GC on. For open-model-policy ids (no catalog dims)
+    fall back to the HF config, handling the ``text_config`` nesting (config.json is already cached by
+    the tokenizer load). Best-effort: ``(0, 0)`` if neither is available -> the GC-off gate
+    conservatively keeps gradient checkpointing on."""
+    from flash.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    c_hidden = int(getattr(info, "hidden_size", 0) or 0) if info else 0
+    c_layers = int(getattr(info, "num_layers", 0) or 0) if info else 0
+    if c_hidden and c_layers:
+        return c_hidden, c_layers
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        tc = getattr(cfg, "text_config", None) or cfg
+        hidden = c_hidden or int(getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0)
+        layers = c_layers or int(
+            getattr(tc, "num_hidden_layers", 0) or getattr(cfg, "num_hidden_layers", 0) or 0
+        )
+        return hidden, layers
+    except Exception as e:
+        print(f"[sft] arch-dims probe failed ({e}); GC decision stays conservative (keep GC on)")
+        return c_hidden, c_layers
+
+
 def run_sft():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -179,7 +210,7 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     # SDK [train] knobs override the recipe default.
-    from flash.catalog import vocab_size_for
+    from flash.catalog import MODELS, vocab_size_for
     from flash.engine.vram import resolve_params_b, sft_grad_accum, sft_logits_fused
 
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
@@ -251,6 +282,44 @@ def run_sft():
     out_dir = f"/tmp/sft_seed{_w.SEED}"
     resume_ckpt = _w.hf_resume_checkpoint()
 
+    # Gradient-checkpointing decision. For a big MoE with a cheap ~3B active backbone (35B-A3B) on a
+    # big datacenter card (141 GB H200 / 180 GB B200) with fused CE removing the [B,T,vocab] logit
+    # spike, the no-recompute activations fit with margin -> GC's ~+33% recompute is pure tax. Gather
+    # the GPU + architecture signals the gate needs; all best-effort (any failure -> signals stay
+    # 0/None -> the gate keeps GC ON, the old behavior). allow_disable=True opts THIS (SFT) path into
+    # the GC-off win; the colocated GRPO trainer never passes it (it has no room to drop GC).
+    _gc_card_gb, _gc_cap = 0.0, None
+    try:
+        import torch as _torch_gc
+
+        if _torch_gc.cuda.is_available():
+            _gc_card_gb = _torch_gc.cuda.get_device_properties(0).total_memory / 1e9
+            _gc_cap = _torch_gc.cuda.get_device_capability(0)
+    except Exception:
+        _gc_card_gb, _gc_cap = 0.0, None
+    _gc_hidden, _gc_layers = _model_arch_dims(model_id)
+    # MODELS.get (not get_model, which RAISES on an uncataloged id) so an open-model SFT run
+    # (model_policy="allow") doesn't crash here -> None active_params_b -> treated as dense, the
+    # correct default for a model whose MoE active count we don't know. Mirrors rl.py's _info read.
+    _gc_active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0) or None
+    # The GC-off fit check must use the SAME LoRA rank the adapter is actually built with (make_lora:
+    # JOB_SPEC.train.lora_rank else RECIPE.lora.rank) — a high-rank run grows the LoRA optimizer/adapter
+    # memory, so estimating GC-off fit at the default rank could disable checkpointing and then OOM.
+    _gc_lora_rank = int(_t.lora_rank if _t and _t.lora_rank else RECIPE.lora.rank)
+    _grad_ckpt = grad_checkpointing_on(
+        model_id,
+        sft_max_len,
+        allow_disable=True,
+        card_vram_gb=_gc_card_gb,
+        capability=_gc_cap,
+        active_params_b=_gc_active_b,
+        hidden=_gc_hidden,
+        num_layers=_gc_layers,
+        fused_ce=_sft_fused,
+        per_device_bs=per_device_bs,
+        lora_rank=_gc_lora_rank,
+    )
+
     # [train].max_steps>0 caps optimizer steps (used by the cheap pre-flight smoke).
     max_steps = int(_t.max_steps or 0 if _t and _t.max_steps is not None else 0)
     cfg_kwargs = {
@@ -284,7 +353,7 @@ def run_sft():
         "dataloader_pin_memory": True,
         "dataloader_persistent_workers": True,
         "seed": _w.SEED,
-        "gradient_checkpointing": grad_checkpointing_on(model_id, sft_max_len),
+        "gradient_checkpointing": _grad_ckpt,
         # Non-reentrant checkpointing: composes cleanly with autograd hooks (verl #3629) and is
         # required by TRL for correct grad flow through the LoRA adapters.
         "gradient_checkpointing_kwargs": {"use_reentrant": False},
@@ -651,6 +720,10 @@ def run_sft():
             "download_seconds": download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "thinking": _w.THINKING,
+            # Gradient-checkpointing decision (the activation-fit GC-off SFT speed lever): record it
+            # so the GC-off-vs-on A/B is unambiguous on a SUCCESSFUL run (the console is only uploaded
+            # on failure). False == GC OFF (the speed win); True == kept on.
+            "gradient_checkpointing": _grad_ckpt,
             # Persist the loss curve so a CONVERGENCE A/B (PiSSA / LoRA+ init, etc.) is measurable
             # without a checkpoint: trainer_state.json is only written on a save_step, and the
             # console is only uploaded on failure, so a short successful run otherwise drops its
