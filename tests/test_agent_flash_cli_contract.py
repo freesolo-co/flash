@@ -206,7 +206,6 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
             "model": "Qwen/Qwen3.5-2B",
             "train": {
                 "epochs": 1,
-                "seeds": [0],
                 "hf_repo": f"Freesolo-Co/flashrun-{rid}",
             },
         }
@@ -217,5 +216,5 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     runner._save_status(RunStatus(run_id=rid, state="done", spec=spec.to_dict()))
     assert (
         get_status(rid).to_dict()["adapter_ref"]
-        == f"Freesolo-Co/flashrun-{rid}:sft/{rid}/seed0"
+        == f"Freesolo-Co/flashrun-{rid}:sft/{rid}"
     )
