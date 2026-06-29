@@ -477,7 +477,79 @@ def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
     return is_vl_checkpoint(model_id)
 
 
-def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
+def adapter_lora_rank(adapter_dir: str) -> int:
+    """Read a saved PEFT LoRA adapter's uniform rank from adapter_config.json."""
+    import json
+    import os
+
+    cfg_path = os.path.join(adapter_dir, "adapter_config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        rank = int(cfg["r"])
+    except FileNotFoundError as exc:
+        raise ValueError(f"adapter rank preflight: missing {cfg_path!r}") from exc
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"adapter rank preflight: {cfg_path!r} must contain a positive integer `r`"
+        ) from exc
+    if rank <= 0:
+        raise ValueError(
+            f"adapter rank preflight: {cfg_path!r} has non-positive rank r={rank}"
+        )
+    for key in ("rank_pattern", "alpha_pattern"):
+        if cfg.get(key):
+            raise ValueError(
+                f"adapter rank preflight: {cfg_path!r} has non-empty {key}={cfg[key]!r}; "
+                "VL warm-start recombine requires a uniform LoRA rank/alpha"
+            )
+    return rank
+
+
+def validate_recombined_lora_rank(
+    sft_dir: str,
+    grpo_rank: int,
+    *,
+    max_rank: int | None,
+) -> tuple[int, int, int]:
+    """Fail before training when a VL SFT+GRPO recombine would exceed serving's rank cap."""
+    try:
+        grpo_rank = int(grpo_rank)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("VL warm-start rank preflight: GRPO train.lora_rank must be an integer") from exc
+    if grpo_rank <= 0:
+        raise ValueError(
+            f"VL warm-start rank preflight: GRPO train.lora_rank must be positive, got {grpo_rank}"
+        )
+
+    sft_rank = adapter_lora_rank(sft_dir)
+    recombined_rank = sft_rank + grpo_rank
+    if max_rank is None:
+        return sft_rank, grpo_rank, recombined_rank
+    max_rank = int(max_rank)
+    if recombined_rank <= max_rank:
+        return sft_rank, grpo_rank, recombined_rank
+
+    allowed_grpo_rank = max_rank - sft_rank
+    if allowed_grpo_rank >= 1:
+        guidance = f"set GRPO train.lora_rank <= {allowed_grpo_rank}"
+    else:
+        allowed_sft_rank = max_rank - grpo_rank
+        if allowed_sft_rank >= 1:
+            guidance = f"retrain the SFT adapter at rank <= {allowed_sft_rank}"
+        else:
+            guidance = f"lower both SFT and GRPO ranks so their sum is <= {max_rank}"
+    raise ValueError(
+        "VL warm-start rank preflight failed: recombined SFT+GRPO adapter would be "
+        f"rank {recombined_rank} (SFT rank {sft_rank} + GRPO rank {grpo_rank}), "
+        f"exceeding the serving LoRA rank cap {max_rank}. Because this warm-start path "
+        f"rank-stacks the adapters for deploy, {guidance}."
+    )
+
+
+def recombine_lora_adapters(
+    sft_dir: str, grpo_dir: str, out_dir: str, *, model_id: str | None = None
+) -> int:
     """Stack two LoRA adapters (SFT ⊕ GRPO) into ONE rank-(r_sft+r_grpo) adapter in ``out_dir``.
 
     The VL warm-start path (#296) MERGES the SFT into the base and trains a FRESH LoRA on the merged
@@ -492,7 +564,9 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
 
     Both adapters must target the SAME modules (true for managed flash: target_modules is
     model-derived, not user-set) and be plain LoRA — DoRA / ``modules_to_save`` / non-LoRA tensors
-    raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead).
+    raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead). ``model_id`` is the
+    selected GRPO job model when known; passing it keeps this finalize guard on the same serving cap
+    the init-time preflight used, even if the SFT adapter config lacks base metadata.
     """
     import json
     import math
@@ -530,10 +604,12 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     # fresh GRPO LoRA is saved by the text-only ``AutoModelForCausalLM`` trainer with no infix
     # (``base_model.model.model.layers...`` — see _remap_vl_sync_weights / the warm-start remap note).
     # Without this, the equivalent LM modules compare as DIFFERENT targets and the recombine wrongly
-    # aborts for the default Qwen3.5 warm-start path. Stripping is idempotent (a no-op for an already
-    # text-only adapter) and emits the text-only key form serving deploys on the catalog base.
+    # aborts for the default Qwen3.5 warm-start path. The normalized form is only an INTERNAL math key:
+    # if either source adapter used the VL ``language_model`` namespace for a tensor, the recombined
+    # output uses that same serving-compatible key instead of the stripped text-only key.
     def _normalize_infix(sd, which):
         norm: dict = {}
+        infixed_keys: dict[str, str] = {}
         for k, v in sd.items():
             nk = strip_language_model_infix(k)
             # Fail closed on ANY post-normalization collision. A malformed adapter carrying BOTH the
@@ -546,10 +622,15 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
                     "the '.language_model.' infix — cannot normalize a mixed VL adapter"
                 )
             norm[nk] = v
-        return norm
+            if _LANGUAGE_MODEL_INFIX in k:
+                infixed_keys[nk] = k
+        return norm, infixed_keys
 
-    sft_sd = _normalize_infix(sft_sd, "SFT")
-    grpo_sd = _normalize_infix(grpo_sd, "GRPO")
+    sft_sd, sft_infixed_keys = _normalize_infix(sft_sd, "SFT")
+    grpo_sd, grpo_infixed_keys = _normalize_infix(grpo_sd, "GRPO")
+
+    def _output_key(k: str) -> str:
+        return sft_infixed_keys.get(k) or grpo_infixed_keys.get(k) or k
 
     for name, cfg in (("SFT", sft_cfg), ("GRPO", grpo_cfg)):
         # peft_type defaults to LORA for older configs that omit it; anything else (e.g. ADALORA)
@@ -623,6 +704,15 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     s_sft, s_grpo = _scale(sft_cfg), _scale(grpo_cfg)
     r_sft, r_grpo = int(sft_cfg["r"]), int(grpo_cfg["r"])
     r_out = r_sft + r_grpo
+    from flash.catalog import serving_lora_rank_cap
+
+    max_rank = serving_lora_rank_cap(model_id or sft_cfg.get("base_model_name_or_path"))
+    if max_rank is not None and r_out > max_rank:
+        raise ValueError(
+            "recombine: rank-stacked SFT+GRPO adapter would be "
+            f"rank {r_out} (SFT rank {r_sft} + GRPO rank {r_grpo}), exceeding the serving "
+            f"LoRA rank cap {max_rank}"
+        )
 
     out: dict[str, torch.Tensor] = {}
     # Sorted so ``out``'s insertion order — and thus the serialized safetensors byte layout — is
@@ -640,8 +730,15 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
                 f"recombine: lora_A key {ak!r} has no matching lora_B key {bk!r} — the adapter is "
                 "malformed (unpaired LoRA tensors)"
             )
+        out_ak = _output_key(ak)
+        out_bk = _output_key(bk)
+        if out_ak in out or out_bk in out:
+            raise ValueError(
+                "recombine: output key collision while restoring the '.language_model.' infix "
+                f"(A={out_ak!r}, B={out_bk!r})"
+            )
         # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
-        out[ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
+        out[out_ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
         # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
         # combined adapter carries unit scale, so the per-component scales survive intact.
         # Promote to the higher of the two input dtypes (don't force the SFT's, which would downcast a
@@ -649,7 +746,16 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
         dt = torch.promote_types(sft_sd[bk].dtype, grpo_sd[bk].dtype)
         b_sft = sft_sd[bk].to(torch.float32) * s_sft
         b_grpo = grpo_sd[bk].to(torch.float32) * s_grpo
-        out[bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
+        out[out_bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
+
+    if sft_infixed_keys or grpo_infixed_keys:
+        plain_layer_keys = sorted(k for k in out if k.startswith("base_model.model.model.layers."))
+        if plain_layer_keys:
+            raise ValueError(
+                "recombine: VL warm-start output would use plain model.layers LoRA keys "
+                f"(e.g. {plain_layer_keys[:3]}). Serving expects the language_model namespace; "
+                "refusing to write a known-bad GRPO artifact."
+            )
 
     out_cfg = dict(grpo_cfg)
     out_cfg["r"] = r_out

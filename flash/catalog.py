@@ -259,6 +259,24 @@ def get_model(model_id: str) -> ModelInfo:
         ) from exc
 
 
+def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
+    """Return the model's serving LoRA rank cap, or None when Flash has no local cap.
+
+    Serving capacity is model-specific: small serving models currently allow rank 64, while larger
+    serving paths can cap at rank 32. Unknown/open-policy models intentionally return None instead
+    of inheriting a global fallback.
+    """
+    if isinstance(model, ModelInfo):
+        info = model
+    elif isinstance(model, str) and model.strip():
+        info = MODELS.get(model.strip())
+    else:
+        info = None
+    if info is None or info.serving is None:
+        return None
+    return int(info.serving.max_lora_rank)
+
+
 def vocab_size_for(model_id: str) -> int:
     """Curated vocab_size for a model, or the safe default for open-model-policy entries."""
     info = MODELS.get(model_id)
