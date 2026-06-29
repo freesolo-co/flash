@@ -113,6 +113,41 @@ def test_config_cheapest_policy_validated_pool(monkeypatch):
         assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 4090"
 
 
+def test_retired_gpu_resolves_for_teardown_but_is_not_selectable():
+    # RTX A6000 was dropped from the managed catalog, but an in-flight run can still reference it
+    # during a rollout. Its metadata must stay resolvable so teardown (terminate_endpoint, the idle
+    # reaper) can reconstruct the endpoint name; otherwise the endpoint silently leaks quota/billing.
+    from flash.providers.base import KNOWN, VALIDATED, canonical_gpu, get_gpu_info, gpu_short
+    from flash.providers.runpod.train import _run_suffix, endpoint_name
+
+    # Aliases resolve (raw spec gpu.type spellings) instead of raising UnsupportedGpuError.
+    for alias in ("RTX A6000", "rtx a6000", "a6000", "NVIDIA RTX A6000"):
+        assert canonical_gpu(alias) == "RTX A6000"
+    assert gpu_short("RTX A6000") == "a6000"
+    assert get_gpu_info("RTX A6000").vram_gb == 48
+    # The exact teardown reconstruction works end to end.
+    rebuilt = endpoint_name(canonical_gpu("RTX A6000"), _run_suffix("run-123"))
+    assert rebuilt.startswith("flash-a6000-")
+    # ...but it stays out of the managed catalog: never allocated, validated, or listed.
+    assert "RTX A6000" not in KNOWN
+    assert "RTX A6000" not in VALIDATED
+    from flash.providers.lambdalabs.gpus import gpu_classes as lambda_classes
+    from flash.providers.runpod.gpus import gpu_classes as runpod_classes
+
+    assert "RTX A6000" not in {g.name for g in runpod_classes()}
+    assert "RTX A6000" not in {g.name for g in lambda_classes()}
+
+
+def test_retired_gpu_priceable_for_billing():
+    # Codex asked for a legacy cleanup/pricing path: a retired class must still price so an in-flight
+    # run's billing/teardown doesn't KeyError.
+    from flash.providers.lambdalabs.pricing import _static_rate
+    from flash.providers.runpod.pricing import hourly_rate
+
+    assert hourly_rate("RTX A6000") == 0.49  # RunPod static snapshot from the retained metadata
+    assert _static_rate("RTX A6000") == 0.49  # Lambda static fallback (no live key -> metadata rate)
+
+
 def test_flash_gpu_enum_members():
     from flash.providers.runpod.gpus import flash_gpu
 
