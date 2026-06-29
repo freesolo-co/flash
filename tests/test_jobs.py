@@ -1323,7 +1323,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     # A policy ("cheapest") request that keeps hitting infra-shaped failures must walk
     # down the ranked candidate list, not burn every retry on the same (capacity-starved)
     # class. With static rates the validated >=24 GB pool for a 0.8B GRPO run ranks
-    # RTX A6000 < RTX 4090 < RTX 5090 < ... by $/hr, so successive attempts step through them.
+    # RTX 4090 < RTX 5090 < A100 PCIe < ... by $/hr, so successive attempts step through them.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
@@ -1362,7 +1362,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         rates = [hourly_rate(g) for g in gpus_seen]
         assert rates == sorted(rates)
         # cheapest validated class with >= 24 GB
-        assert gpus_seen[0] == "RTX A6000"
+        assert gpus_seen[0] == "RTX 4090"
 
 
 def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
@@ -1559,8 +1559,8 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         assert orch.get_status("alloc-blip").state == "done"
         # First allocation failed (no provision); the retry provisioned the cheapest class
-        # (RTX A6000, the cheapest validated RunPod class that fits 24 GB).
-        assert gpus_seen == ["RTX A6000"]
+        # (RTX 4090, the cheapest validated RunPod class that fits 24 GB).
+        assert gpus_seen == ["RTX 4090"]
 
 
 def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
