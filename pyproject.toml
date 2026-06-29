@@ -65,6 +65,7 @@ server = [
     "huggingface-hub>=0.34",
     "datasets>=2.19",
     "freesolo>=0.2.49",
+    "transformers>=5.6,<5.11",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
@@ -78,6 +79,7 @@ dev = [
     "huggingface-hub>=0.34",
     "datasets>=2.19",
     "freesolo>=0.2.49",
+    "transformers>=5.6,<5.11",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.

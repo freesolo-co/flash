@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import tempfile
 
+import pytest
+
 
 def test_list_and_cancel(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
@@ -235,6 +237,33 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["notes"]["provider"] == "runpod"
+
+
+def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu: 3600.0)
+        from flash.spec import JobSpec
+
+        spec = JobSpec(run_id="r-train-only", model="Qwen/Qwen3.5-4B", algorithm="sft")
+        metrics = {
+            "wall_seconds": 10.0,  # worker training loop only
+            "setup_seconds": 590.0,  # reported for observability, not customer cost
+            "train_tokens": 190_679,
+            "allocated_gpu": "RTX 5090",
+        }
+        out = runner._persist_metrics(spec, metrics)
+        assert out == pytest.approx(10.0)  # 10s / 3600 * $3600/hr
+        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
+            on_disk = json.load(f)
+        assert on_disk["cost_usd"] == pytest.approx(10.0)
+        assert on_disk["setup_seconds"] == pytest.approx(590.0)
 
 
 def test_run_training_bails_when_running_cas_rejects(monkeypatch):
