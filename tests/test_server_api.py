@@ -1656,6 +1656,74 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
     assert any(d["run_id"] == run_id for d in deployments)
 
 
+@pytest.mark.parametrize("state", ["queued", "provisioning", "running", "failed"])
+def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, state):
+    """A resolved checkpoint step proves the adapter exists, so run state does not gate serving it."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(
+        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
+    )
+
+    key = _login()
+    run_id = _make_run(api, key, state)
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert r.json()["checkpoint_step"] == 40
+    status = runner.get_status(run_id)
+    assert status.state == state
+    assert status.deployment["checkpoint_step"] == 40
+    deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
+    assert any(d["run_id"] == run_id and d["state"] == state for d in deployments)
+
+
+def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "running")
+
+    def fake_deploy(**kwargs):
+        status = runner.get_status(run_id)
+        status.state = "done"
+        runner._save_status(status)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    status = runner.get_status(run_id)
+    assert status.state == "deployed"
+    assert status.deployment["checkpoint_step"] == 40
+
+
+def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(
+        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
+    )
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: [run_id])
+
+    key = _login()
+    run_id = _make_run(api, key, "running")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+
+    r = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    status = runner.get_status(run_id)
+    assert status.state == "running"
+    assert status.deployment["state"] == "undeployed"
+
+
 def test_deploy_cancelled_run_without_step_is_409(api):
     """Without a step, a cancelled run is still undeployable (no final adapter)."""
     key = _login()
