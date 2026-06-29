@@ -530,10 +530,12 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     # fresh GRPO LoRA is saved by the text-only ``AutoModelForCausalLM`` trainer with no infix
     # (``base_model.model.model.layers...`` — see _remap_vl_sync_weights / the warm-start remap note).
     # Without this, the equivalent LM modules compare as DIFFERENT targets and the recombine wrongly
-    # aborts for the default Qwen3.5 warm-start path. Stripping is idempotent (a no-op for an already
-    # text-only adapter) and emits the text-only key form serving deploys on the catalog base.
+    # aborts for the default Qwen3.5 warm-start path. The normalized form is only an INTERNAL math key:
+    # if either source adapter used the VL ``language_model`` namespace for a tensor, the recombined
+    # output uses that same serving-compatible key instead of the stripped text-only key.
     def _normalize_infix(sd, which):
         norm: dict = {}
+        infixed_keys: dict[str, str] = {}
         for k, v in sd.items():
             nk = strip_language_model_infix(k)
             # Fail closed on ANY post-normalization collision. A malformed adapter carrying BOTH the
@@ -546,10 +548,15 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
                     "the '.language_model.' infix — cannot normalize a mixed VL adapter"
                 )
             norm[nk] = v
-        return norm
+            if _LANGUAGE_MODEL_INFIX in k:
+                infixed_keys[nk] = k
+        return norm, infixed_keys
 
-    sft_sd = _normalize_infix(sft_sd, "SFT")
-    grpo_sd = _normalize_infix(grpo_sd, "GRPO")
+    sft_sd, sft_infixed_keys = _normalize_infix(sft_sd, "SFT")
+    grpo_sd, grpo_infixed_keys = _normalize_infix(grpo_sd, "GRPO")
+
+    def _output_key(k: str) -> str:
+        return sft_infixed_keys.get(k) or grpo_infixed_keys.get(k) or k
 
     for name, cfg in (("SFT", sft_cfg), ("GRPO", grpo_cfg)):
         # peft_type defaults to LORA for older configs that omit it; anything else (e.g. ADALORA)
@@ -640,8 +647,15 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
                 f"recombine: lora_A key {ak!r} has no matching lora_B key {bk!r} — the adapter is "
                 "malformed (unpaired LoRA tensors)"
             )
+        out_ak = _output_key(ak)
+        out_bk = _output_key(bk)
+        if out_ak in out or out_bk in out:
+            raise ValueError(
+                "recombine: output key collision while restoring the '.language_model.' infix "
+                f"(A={out_ak!r}, B={out_bk!r})"
+            )
         # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
-        out[ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
+        out[out_ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
         # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
         # combined adapter carries unit scale, so the per-component scales survive intact.
         # Promote to the higher of the two input dtypes (don't force the SFT's, which would downcast a
@@ -649,7 +663,16 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
         dt = torch.promote_types(sft_sd[bk].dtype, grpo_sd[bk].dtype)
         b_sft = sft_sd[bk].to(torch.float32) * s_sft
         b_grpo = grpo_sd[bk].to(torch.float32) * s_grpo
-        out[bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
+        out[out_bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
+
+    if sft_infixed_keys or grpo_infixed_keys:
+        plain_layer_keys = sorted(k for k in out if k.startswith("base_model.model.model.layers."))
+        if plain_layer_keys:
+            raise ValueError(
+                "recombine: VL warm-start output would use plain model.layers LoRA keys "
+                f"(e.g. {plain_layer_keys[:3]}). Serving expects the language_model namespace; "
+                "refusing to write a known-bad GRPO artifact."
+            )
 
     out_cfg = dict(grpo_cfg)
     out_cfg["r"] = r_out
