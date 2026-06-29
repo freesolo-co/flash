@@ -386,6 +386,25 @@ def test_pull_environment_package_filters_hub_to_env_under_member_limit(monkeypa
     assert (tmp_path / "out" / "datasets" / "train.jsonl").read_text() == "data\n"
 
 
+def test_safe_extract_archive_filters_hub_to_env_under_uncompressed_limit(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 32)
+    entries = {
+        "david-freesolo-co/stuff/environment.py": b"# env\n",
+        "other-org/large/data.bin": b"x" * (8 * 1024 * 1024),
+    }
+
+    extracted = adapter._safe_extract_archive(
+        _tarball(entries),
+        tmp_path,
+        subdir="david-freesolo-co/stuff",
+    )
+
+    assert (extracted / "david-freesolo-co" / "stuff" / "environment.py").is_file()
+    assert not (extracted / "other-org").exists()
+
+
 def test_safe_extract_archive_bounds_total_members_scanned(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_MAX_ARCHIVE_SCAN_MEMBERS", 4)
     entries = {f"unrelated/f{i}.txt": b"x" for i in range(20)}

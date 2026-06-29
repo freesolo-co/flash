@@ -26,6 +26,10 @@ _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+# A managed hub tarball can contain many unrelated environments. When extracting
+# a requested subdirectory, cap the archive scan separately from the extracted
+# package size so unrelated hub contents do not trip the per-env package limit.
+_MAX_FILTERED_ARCHIVE_STREAM_BYTES = 1024 * 1024 * 1024
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
@@ -341,6 +345,7 @@ class _LimitedReader:
 
     def __init__(self, raw, limit: int):
         self._raw = raw
+        self._limit = limit
         self._remaining = limit
 
     def read(self, size: int = -1) -> bytes:
@@ -349,7 +354,7 @@ class _LimitedReader:
         self._remaining -= len(chunk)
         if self._remaining < 0:
             raise RuntimeError(
-                f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
+                f"environment archive is too large uncompressed (limit {self._limit} bytes)"
             )
         return chunk
 
@@ -385,7 +390,13 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     total = 0
     extracted = 0
     scanned = 0
-    stream_cap = _MAX_ARCHIVE_BYTES + _MAX_ARCHIVE_MEMBERS * 1024 + (1 << 20)
+    stream_payload_cap = (
+        _MAX_FILTERED_ARCHIVE_STREAM_BYTES if want else _MAX_ARCHIVE_BYTES
+    )
+    stream_member_overhead = (
+        _MAX_ARCHIVE_SCAN_MEMBERS if want else _MAX_ARCHIVE_MEMBERS
+    ) * 1024
+    stream_cap = stream_payload_cap + stream_member_overhead + (1 << 20)
     reader = _LimitedReader(gzip.GzipFile(fileobj=tar_file), stream_cap)
     with tarfile.open(fileobj=reader, mode="r|") as tar:
         for member in tar:
@@ -435,16 +446,42 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     return extracted_dir
 
 
+def _managed_hub_extract_subdir(ref: GitHubEnvironmentRef) -> str:
+    if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
+        return ""
+    parts = [part for part in ref.path.split("/") if part]
+    # Published managed env packages live under namespace/name. Do not special-case a
+    # repo-root ref; it remains the caller's explicit full-repo GitHub ref.
+    return "/".join(parts[:2]) if len(parts) >= 2 else ""
+
+
+def _path_relative_to_subdir(path: str, subdir: str) -> str:
+    if not subdir:
+        return path
+    prefix = f"{subdir.rstrip('/')}/"
+    if path == subdir:
+        return _DEFAULT_ENVIRONMENT_PATH
+    if path.startswith(prefix):
+        rel = path[len(prefix) :]
+        return rel or _DEFAULT_ENVIRONMENT_PATH
+    raise ValueError(f"environment path {path!r} is outside requested subdir {subdir!r}")
+
+
 def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
     resolved_ref = _resolve_ref_sha(parsed, pinned_sha=pinned_sha)
+    extract_subdir = _managed_hub_extract_subdir(parsed)
+    local_path = _path_relative_to_subdir(parsed.path, extract_subdir)
     cache_key = hashlib.sha256(
-        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
+        (
+            f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}"
+            f":subdir={extract_subdir}"
+        ).encode()
     ).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
-    env_file = cache_dir / parsed.path
+    env_file = cache_dir / local_path
     if env_file.is_dir():
         env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
     if env_file.is_file():
@@ -457,21 +494,31 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        # Runtime loading keeps repo-level sidecars available to relative paths/imports.
-        # User-facing pulls filter to the requested env subtree in flash.envs.pull.
-        extracted = _extract_github_tarball(resolved, tmp_parent)
-        candidate = extracted / parsed.path
+        # Runtime loading keeps repo-level sidecars available for arbitrary GitHub refs.
+        # Managed hub refs are isolated to namespace/name so unrelated environments in the
+        # shared hub do not count against the requested package's extraction limit.
+        extracted = _extract_github_tarball(
+            resolved,
+            tmp_parent,
+            subdir=extract_subdir,
+        )
+        source_root = extracted / extract_subdir if extract_subdir else extracted
+        if not source_root.is_dir():
+            raise FileNotFoundError(
+                f"environment archive did not contain directory {extract_subdir!r}"
+            )
+        candidate = source_root / local_path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
-        required_entrypoint = candidate.relative_to(extracted).as_posix()
+        required_entrypoint = candidate.relative_to(source_root).as_posix()
         if not candidate.is_file():
             raise FileNotFoundError(
                 f"environment archive did not contain required entrypoint {required_entrypoint!r}"
             )
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
-        shutil.copytree(extracted, cache_dir)
-        return cache_dir / candidate.relative_to(extracted)
+        shutil.copytree(source_root, cache_dir)
+        return cache_dir / candidate.relative_to(source_root)
     finally:
         shutil.rmtree(tmp_parent, ignore_errors=True)
 

@@ -11,6 +11,7 @@ import tarfile
 import tracemalloc
 import types
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -609,6 +610,38 @@ def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, mon
 
     with pytest.raises(FileNotFoundError, match=r"envs/e/environment\.py"):
         adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
+
+
+def test_managed_environment_runtime_extracts_only_requested_hub_env(
+    tmp_path, monkeypatch
+):
+    import flash.envs.adapter as adapter
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        entries = {
+            "hub-sha/acme/small/environment.py": b"# env\n",
+            "hub-sha/acme/small/datasets/train.jsonl": b'{"a":1}\n',
+            "hub-sha/other/large/data.bin": b"x" * (8 * 1024 * 1024),
+        }
+        for name, data in entries.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 64)
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "c" * 40)
+    monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: buf.getvalue())
+
+    resolved = adapter._resolve_environment_reference("acme/small")
+    env_file = Path(resolved)
+
+    assert env_file.name == "environment.py"
+    assert env_file.read_text(encoding="utf-8") == "# env\n"
+    assert (env_file.parent / "datasets" / "train.jsonl").is_file()
+    assert not list((tmp_path / "cache").rglob("large"))
+    assert not list((tmp_path / "cache").rglob("data.bin"))
 
 
 def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
