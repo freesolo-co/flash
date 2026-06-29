@@ -338,7 +338,11 @@ def cmd_env_list(args) -> int:
 
 
 def _cmd_train_cost(args) -> int:
-    """Print the pre-flight USD cost for the config and exit without submitting."""
+    """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
+
+    Catalog-only and deterministic; SFT uses the actual local training-token count when the env
+    and tokenizer are importable. An uncapped SFT run must be able to count the env's train split,
+    otherwise it errors instead of guessing a dataset size."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(
