@@ -145,7 +145,8 @@ def test_retired_gpu_priceable_for_billing():
     from flash.providers.runpod.pricing import hourly_rate
 
     assert hourly_rate("RTX A6000") == 0.49  # RunPod static snapshot from the retained metadata
-    assert _static_rate("RTX A6000") == 0.49  # Lambda static fallback (no live key -> metadata rate)
+    # Lambda bills at the Lambda list price, NOT the RunPod snapshot (0.49) from GpuClass.hourly_usd.
+    assert _static_rate("RTX A6000") == 1.09
 
 
 def test_flash_gpu_enum_members():
