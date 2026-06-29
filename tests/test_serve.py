@@ -119,6 +119,23 @@ def test_deploy_rejects_adapter_config_without_rank_metadata(monkeypatch, tmp_pa
         )
 
 
+def test_deploy_rejects_falsey_invalid_rank_pattern(monkeypatch, tmp_path):
+    from flash.serve.deploy import deploy_adapter
+
+    _stub_adapter_config(monkeypatch, tmp_path, config={"r": 32, "rank_pattern": []})
+
+    with pytest.raises(ValueError, match="invalid rank metadata"):
+        deploy_adapter(
+            run_id="r-bad-pattern",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-bad-pattern/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
+
+
 def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
     import flash.serve.deploy as d
 
@@ -139,6 +156,13 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
             dry_run=False,
             lora_rank=32,
         )
+
+
+def test_deploy_adapter_options_after_gpu_are_keyword_only():
+    from flash.serve.deploy import deploy_adapter
+
+    with pytest.raises(TypeError):
+        deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", "RTX 4090", True)
 
 
 def test_deploy_rejects_unsupported_gpu():
