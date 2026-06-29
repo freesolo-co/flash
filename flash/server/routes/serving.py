@@ -231,6 +231,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 dest_repo=repository,
                 dest_token=hf_token,
                 private=private,
+                base_model=spec.model,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
