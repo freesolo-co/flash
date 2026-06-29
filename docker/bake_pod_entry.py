@@ -28,6 +28,20 @@ def main() -> int:
     arch = os.environ.get("BAKE_ARCH", "")
     api = HfApi(token=token)
 
+    # Upload a STARTED marker FIRST -- before the code download / chalk install / warmup -- so a CI-side
+    # timeout can tell whether this entrypoint even ran. Present on a timeout = the warmup started (so it
+    # hung or was slow); absent = the pod ran the wrong entrypoint and never reached the warmup.
+    try:
+        api.upload_file(
+            path_or_fileobj=io.BytesIO(f"started arch={arch}\n".encode()),
+            path_in_repo="out/STARTED",
+            repo_id=repo,
+            repo_type="dataset",
+        )
+        print("[bake] uploaded out/STARTED", flush=True)
+    except Exception as e:
+        print(f"[bake] STARTED upload failed: {e}", flush=True)
+
     # the flash code the helper uploaded (upload_code -> code/flash); run the warmup from it.
     snapshot_download(
         repo_id=repo,
