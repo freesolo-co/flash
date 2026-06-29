@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
+import types
 
 import pytest
 
@@ -22,7 +24,11 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("safetensors")
 from safetensors.torch import load_file, save_file
 
-from flash.engine.worker.lora import recombine_lora_adapters
+from flash.engine.worker.lora import (
+    SERVING_MAX_LORA_RANK,
+    recombine_lora_adapters,
+    validate_recombined_lora_rank,
+)
 
 # Realistic Qwen3.5 VL adapter key stems. The SFT adapter is trained against the FULL multimodal
 # model, so its LM modules live under ``language_model.`` (MODULES). The fresh GRPO LoRA is saved by
@@ -134,6 +140,59 @@ def test_recombine_normalizes_language_model_infix(tmp_path):
     out_modules = {k.rsplit(".lora_", 1)[0] for k in out_sd}
     assert out_modules == set(TEXT_MODULES), "recombined modules must be the normalized text-only set"
     assert all(".language_model." not in k for k in out_sd)
+
+
+def test_recombined_rank_preflight_allows_sum_at_serving_cap(tmp_path):
+    sft = str(tmp_path / "sft")
+    _write_adapter(sft, modules=MODULES, r=16, alpha=32, seed=1)
+
+    assert validate_recombined_lora_rank(sft, 16) == (16, 16, SERVING_MAX_LORA_RANK)
+
+
+def test_recombined_rank_preflight_rejects_undeployable_sum(tmp_path):
+    sft = str(tmp_path / "sft")
+    _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
+
+    with pytest.raises(ValueError, match=r"SFT rank 24 \+ GRPO rank 16"):
+        validate_recombined_lora_rank(sft, 16)
+
+
+def test_recombine_rejects_rank_above_serving_cap(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
+    _write_adapter(grpo, modules=MODULES, r=16, alpha=32, seed=2)
+
+    with pytest.raises(ValueError, match=r"rank-stacked SFT\+GRPO adapter would be rank 40"):
+        recombine_lora_adapters(sft, grpo, out)
+
+
+def test_init_adapter_model_preflights_vl_recombined_rank_before_model_load(tmp_path, monkeypatch):
+    import flash.engine.worker.adapter as worker_adapter
+
+    sft = str(tmp_path / "sft")
+    _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
+    peft = types.ModuleType("peft")
+    peft.PeftModel = object
+    monkeypatch.setitem(sys.modules, "peft", peft)
+    monkeypatch.setattr(worker_adapter, "_download_adapter", lambda _prefix: sft)
+    monkeypatch.setattr(worker_adapter, "adapter_is_vl_warmstart", lambda _adir, _model_id: True)
+    monkeypatch.setattr(worker_adapter, "optimal_attn_impl", lambda: None)
+    monkeypatch.setattr(
+        W,
+        "JOB_SPEC",
+        types.SimpleNamespace(
+            train=types.SimpleNamespace(
+                init_from_adapter="owner/runs:sft/sft-run/seed0",
+                lora_rank=16,
+            )
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match=r"SFT rank 24 \+ GRPO rank 16"):
+        worker_adapter._init_adapter_model("Qwen/Qwen3.5-2B")
 
 
 def test_recombine_rejects_mismatched_target_modules(tmp_path):

@@ -14,6 +14,7 @@ from __future__ import annotations
 # DO touch them cannot be loaded by vLLM in text-only (language_model_only) serving —
 # its LoRA loader rejects "unexpected modules" (observed with Qwen3.5-2B).
 _VL_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "multi_modal_projector", "mtp")
+SERVING_MAX_LORA_RANK = 32
 
 
 def lora_exclude_modules(model_id: str) -> str | None:
@@ -477,6 +478,67 @@ def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
     return is_vl_checkpoint(model_id)
 
 
+def adapter_lora_rank(adapter_dir: str) -> int:
+    """Read a saved PEFT LoRA adapter's scalar rank from adapter_config.json."""
+    import json
+    import os
+
+    cfg_path = os.path.join(adapter_dir, "adapter_config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        rank = int(cfg["r"])
+    except FileNotFoundError as exc:
+        raise ValueError(f"adapter rank preflight: missing {cfg_path!r}") from exc
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"adapter rank preflight: {cfg_path!r} must contain a positive integer `r`"
+        ) from exc
+    if rank <= 0:
+        raise ValueError(
+            f"adapter rank preflight: {cfg_path!r} has non-positive rank r={rank}"
+        )
+    return rank
+
+
+def validate_recombined_lora_rank(
+    sft_dir: str,
+    grpo_rank: int,
+    *,
+    max_rank: int = SERVING_MAX_LORA_RANK,
+) -> tuple[int, int, int]:
+    """Fail before training when a VL SFT+GRPO recombine would exceed serving's rank cap."""
+    try:
+        grpo_rank = int(grpo_rank)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("VL warm-start rank preflight: GRPO train.lora_rank must be an integer") from exc
+    if grpo_rank <= 0:
+        raise ValueError(
+            f"VL warm-start rank preflight: GRPO train.lora_rank must be positive, got {grpo_rank}"
+        )
+
+    sft_rank = adapter_lora_rank(sft_dir)
+    recombined_rank = sft_rank + grpo_rank
+    if recombined_rank <= max_rank:
+        return sft_rank, grpo_rank, recombined_rank
+
+    allowed_grpo_rank = max_rank - sft_rank
+    if allowed_grpo_rank >= 1:
+        guidance = f"set GRPO [train].lora_rank <= {allowed_grpo_rank}"
+    else:
+        allowed_sft_rank = max_rank - grpo_rank
+        if allowed_sft_rank >= 1:
+            guidance = f"retrain the SFT adapter at rank <= {allowed_sft_rank}"
+        else:
+            guidance = f"lower both SFT and GRPO ranks so their sum is <= {max_rank}"
+    raise ValueError(
+        "VL warm-start rank preflight failed: recombined SFT+GRPO adapter would be "
+        f"rank {recombined_rank} (SFT rank {sft_rank} + GRPO rank {grpo_rank}), "
+        f"exceeding the serving LoRA rank cap {max_rank}. Because this warm-start path "
+        f"rank-stacks the adapters for deploy, {guidance}."
+    )
+
+
 def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     """Stack two LoRA adapters (SFT ⊕ GRPO) into ONE rank-(r_sft+r_grpo) adapter in ``out_dir``.
 
@@ -623,6 +685,12 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     s_sft, s_grpo = _scale(sft_cfg), _scale(grpo_cfg)
     r_sft, r_grpo = int(sft_cfg["r"]), int(grpo_cfg["r"])
     r_out = r_sft + r_grpo
+    if r_out > SERVING_MAX_LORA_RANK:
+        raise ValueError(
+            "recombine: rank-stacked SFT+GRPO adapter would be "
+            f"rank {r_out} (SFT rank {r_sft} + GRPO rank {r_grpo}), exceeding the serving "
+            f"LoRA rank cap {SERVING_MAX_LORA_RANK}"
+        )
 
     out: dict[str, torch.Tensor] = {}
     # Sorted so ``out``'s insertion order — and thus the serialized safetensors byte layout — is
