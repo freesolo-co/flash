@@ -1,4 +1,8 @@
-"""Cost accounting and run-metrics record for Flash runs."""
+"""Cost accounting + the standard run-metrics record for Flash runs.
+
+Customer GPU cost = training-loop GPU hours * hourly_rate; setup/cold-start time is reported
+separately for observability.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ class RunMetrics:
     phase: str = ""  # "sft" | "rl"
     seed: int = 0
     model_id: str = ""
-    wall_seconds: float = 0.0
+    wall_seconds: float = 0.0  # training-loop wall time used for customer cost
     setup_seconds: float = 0.0  # cold start / provisioning + model load
     train_throughput_toks_per_s: float = 0.0
     train_tokens: int = 0
