@@ -12,8 +12,11 @@ from flash._logging import get_logger
 logger = get_logger(__name__)
 
 # Lambda list prices (snapshot 2026-06-25, from /instance-types). Live rates override these.
+# RTX A6000 is retired from the catalog but kept here so an in-flight Lambda A6000 run still bills at
+# the Lambda list price ($1.09), NOT the RunPod snapshot from GpuClass.hourly_usd ($0.49).
 _STATIC_RATES: dict[str, float] = {
     "A10": 1.29,
+    "RTX A6000": 1.09,
     "A100 SXM 40GB": 1.99,
     "H100": 3.29,
     "B200": 6.99,
@@ -23,7 +26,9 @@ _STATIC_RATES: dict[str, float] = {
 def _static_rate(name: str) -> float:
     from flash.providers.base import get_gpu_info
 
-    # get_gpu_info (not GPU_INFO[name]) so a retired class still resolves for in-flight teardown.
+    # get_gpu_info (not GPU_INFO[name]) so a retired class still resolves; its Lambda rate lives in
+    # _STATIC_RATES above, so the RunPod-snapshot fallback is only a last resort for a class with no
+    # Lambda static entry at all.
     return _STATIC_RATES.get(name) or get_gpu_info(name).hourly_usd
 
 
