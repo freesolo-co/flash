@@ -21,9 +21,10 @@ _STATIC_RATES: dict[str, float] = {
 
 
 def _static_rate(name: str) -> float:
-    from flash.providers.base import GPU_INFO
+    from flash.providers.base import get_gpu_info
 
-    return _STATIC_RATES.get(name) or GPU_INFO[name].hourly_usd
+    # get_gpu_info (not GPU_INFO[name]) so a retired class still resolves for in-flight teardown.
+    return _STATIC_RATES.get(name) or get_gpu_info(name).hourly_usd
 
 
 def hourly_rate(gpu_name: str) -> float:
