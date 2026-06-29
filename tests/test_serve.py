@@ -16,7 +16,7 @@ import pytest
 
 def _stub_adapter_config(monkeypatch, tmp_path, *, rank: int = 32, config: dict | None = None):
     cfg = tmp_path / "adapter_config.json"
-    cfg.write_text(json.dumps(config or {"r": rank}), encoding="utf-8")
+    cfg.write_text(json.dumps({"r": rank} if config is None else config), encoding="utf-8")
     seen = {}
 
     def fake_hf_hub_download(**kwargs):
@@ -100,6 +100,23 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
     assert seen["repo_id"] == "org/repo"
     assert seen["filename"] == "grpo/r-recombined/seed0/adapter/adapter_config.json"
     assert seen["repo_type"] == "dataset"
+
+
+def test_deploy_rejects_adapter_config_without_rank_metadata(monkeypatch, tmp_path):
+    from flash.serve.deploy import deploy_adapter
+
+    _stub_adapter_config(monkeypatch, tmp_path, config={})
+
+    with pytest.raises(ValueError, match="no LoRA rank metadata"):
+        deploy_adapter(
+            run_id="r-missing-rank",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-missing-rank/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
 
 
 def test_deploy_rejects_unsupported_gpu():
