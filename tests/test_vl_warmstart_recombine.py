@@ -24,9 +24,9 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("safetensors")
 from safetensors.torch import load_file, save_file
 
+from flash.catalog import serving_lora_rank_cap
 from flash.engine.worker.lora import (
     recombine_lora_adapters,
-    serving_max_lora_rank,
     validate_recombined_lora_rank,
 )
 
@@ -147,7 +147,7 @@ def test_recombine_normalizes_language_model_infix(tmp_path):
 def test_recombined_rank_preflight_allows_sum_at_serving_cap(tmp_path):
     sft = str(tmp_path / "sft")
     _write_adapter(sft, modules=MODULES, r=16, alpha=32, seed=1)
-    max_rank = serving_max_lora_rank("Qwen/Qwen3.5-4B")
+    max_rank = serving_lora_rank_cap("Qwen/Qwen3.5-4B")
 
     assert validate_recombined_lora_rank(sft, 16, max_rank=max_rank) == (16, 16, max_rank)
 
@@ -155,16 +155,24 @@ def test_recombined_rank_preflight_allows_sum_at_serving_cap(tmp_path):
 def test_recombined_rank_preflight_allows_model_specific_rank64_cap(tmp_path):
     sft = str(tmp_path / "sft")
     _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
-    max_rank = serving_max_lora_rank("Qwen/Qwen3.5-2B")
+    max_rank = serving_lora_rank_cap("Qwen/Qwen3.5-2B")
 
     assert max_rank == 64
     assert validate_recombined_lora_rank(sft, 32, max_rank=max_rank) == (32, 32, 64)
 
 
+def test_recombined_rank_preflight_does_not_apply_rank32_fallback_without_serving_cap(tmp_path):
+    sft = str(tmp_path / "sft")
+    _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
+
+    assert serving_lora_rank_cap("unknown/model") is None
+    assert validate_recombined_lora_rank(sft, 32, max_rank=None) == (32, 32, 64)
+
+
 def test_recombined_rank_preflight_rejects_undeployable_sum(tmp_path):
     sft = str(tmp_path / "sft")
     _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
-    max_rank = serving_max_lora_rank("Qwen/Qwen3.5-4B")
+    max_rank = serving_lora_rank_cap("Qwen/Qwen3.5-4B")
 
     with pytest.raises(ValueError, match=r"set GRPO train\.lora_rank <= 8"):
         validate_recombined_lora_rank(sft, 16, max_rank=max_rank)

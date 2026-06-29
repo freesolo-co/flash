@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 
+from flash.catalog import serving_lora_rank_cap
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.lora import (
@@ -13,7 +14,6 @@ from flash.engine.worker.lora import (
     assert_adapter_load_clean,
     assert_lora_applied,
     recombine_lora_adapters,
-    serving_max_lora_rank,
     validate_recombined_lora_rank,
 )
 from flash.engine.worker.perf import optimal_attn_impl
@@ -137,14 +137,15 @@ def _init_adapter_model(model_id: str):
 
     if adapter_is_vl_warmstart(adir, model_id):
         grpo_rank = _w.JOB_SPEC.train.lora_rank if _w.JOB_SPEC else RECIPE.lora.rank
-        max_rank = serving_max_lora_rank(model_id)
+        max_rank = serving_lora_rank_cap(model_id)
         sft_rank, grpo_rank, recombined_rank = validate_recombined_lora_rank(
             adir, grpo_rank, max_rank=max_rank
         )
+        cap_note = f"serving cap {max_rank}" if max_rank is not None else "no catalog serving cap"
         print(
             "[init-adapter] VL warm-start rank preflight: "
             f"SFT rank {sft_rank} + GRPO rank {grpo_rank} = deploy rank {recombined_rank} "
-            f"(serving cap {max_rank})"
+            f"({cap_note})"
         )
         merged_dir = _merge_vl_warmstart_adapter(adir, model_id, attn_kw)
         print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")

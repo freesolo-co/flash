@@ -14,28 +14,6 @@ from __future__ import annotations
 # DO touch them cannot be loaded by vLLM in text-only (language_model_only) serving —
 # its LoRA loader rejects "unexpected modules" (observed with Qwen3.5-2B).
 _VL_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "multi_modal_projector", "mtp")
-DEFAULT_SERVING_MAX_LORA_RANK = 32
-
-
-def serving_max_lora_rank(model_id: str | None) -> int:
-    """Return the catalog serving LoRA rank cap for ``model_id``.
-
-    Unknown/open-policy models do not have catalog serving capacity locally, so keep the historical
-    rank-32 fallback for the VL recombine guard.
-    """
-    if isinstance(model_id, str) and model_id:
-        try:
-            from flash.catalog import get_model
-
-            serving = get_model(model_id).serving
-        except (ValueError, TypeError):
-            serving = None
-        if serving is not None:
-            try:
-                return int(serving.max_lora_rank)
-            except (TypeError, ValueError):
-                pass
-    return DEFAULT_SERVING_MAX_LORA_RANK
 
 
 def lora_exclude_modules(model_id: str) -> str | None:
@@ -532,7 +510,7 @@ def validate_recombined_lora_rank(
     sft_dir: str,
     grpo_rank: int,
     *,
-    max_rank: int = DEFAULT_SERVING_MAX_LORA_RANK,
+    max_rank: int | None,
 ) -> tuple[int, int, int]:
     """Fail before training when a VL SFT+GRPO recombine would exceed serving's rank cap."""
     try:
@@ -546,6 +524,9 @@ def validate_recombined_lora_rank(
 
     sft_rank = adapter_lora_rank(sft_dir)
     recombined_rank = sft_rank + grpo_rank
+    if max_rank is None:
+        return sft_rank, grpo_rank, recombined_rank
+    max_rank = int(max_rank)
     if recombined_rank <= max_rank:
         return sft_rank, grpo_rank, recombined_rank
 
@@ -723,8 +704,10 @@ def recombine_lora_adapters(
     s_sft, s_grpo = _scale(sft_cfg), _scale(grpo_cfg)
     r_sft, r_grpo = int(sft_cfg["r"]), int(grpo_cfg["r"])
     r_out = r_sft + r_grpo
-    max_rank = serving_max_lora_rank(model_id or sft_cfg.get("base_model_name_or_path"))
-    if r_out > max_rank:
+    from flash.catalog import serving_lora_rank_cap
+
+    max_rank = serving_lora_rank_cap(model_id or sft_cfg.get("base_model_name_or_path"))
+    if max_rank is not None and r_out > max_rank:
         raise ValueError(
             "recombine: rank-stacked SFT+GRPO adapter would be "
             f"rank {r_out} (SFT rank {r_sft} + GRPO rank {r_grpo}), exceeding the serving "
