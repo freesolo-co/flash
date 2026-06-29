@@ -119,6 +119,28 @@ def test_deploy_rejects_adapter_config_without_rank_metadata(monkeypatch, tmp_pa
         )
 
 
+def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
+    import flash.serve.deploy as d
+
+    def fake_hf_hub_download(**_kwargs):
+        raise RuntimeError("hub timeout")
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+    )
+
+    with pytest.raises(d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter"):
+        d.deploy_adapter(
+            run_id="r-hf-down",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-hf-down/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
+
+
 def test_deploy_rejects_unsupported_gpu():
     from flash.providers.base import UnsupportedGpuError
     from flash.serve.deploy import deploy_adapter
