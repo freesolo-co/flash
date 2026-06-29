@@ -164,7 +164,7 @@ def test_recombined_rank_preflight_rejects_undeployable_sum(tmp_path):
     _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
     max_rank = serving_max_lora_rank("Qwen/Qwen3.5-4B")
 
-    with pytest.raises(ValueError, match=r"SFT rank 24 \+ GRPO rank 16"):
+    with pytest.raises(ValueError, match=r"set GRPO train\.lora_rank <= 8"):
         validate_recombined_lora_rank(sft, 16, max_rank=max_rank)
 
 

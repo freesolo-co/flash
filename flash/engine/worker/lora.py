@@ -548,7 +548,7 @@ def validate_recombined_lora_rank(
 
     allowed_grpo_rank = max_rank - sft_rank
     if allowed_grpo_rank >= 1:
-        guidance = f"set GRPO [train].lora_rank <= {allowed_grpo_rank}"
+        guidance = f"set GRPO train.lora_rank <= {allowed_grpo_rank}"
     else:
         allowed_sft_rank = max_rank - grpo_rank
         if allowed_sft_rank >= 1:
