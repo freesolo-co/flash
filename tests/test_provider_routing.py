@@ -10,7 +10,7 @@ from flash.spec import JobSpec
 
 
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
-    gpu = {"type": "RTX A6000", "max_retries": 2}
+    gpu = {"type": "RTX 4090", "max_retries": 2}
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
         {
@@ -23,11 +23,11 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     )
 
 
-def _alloc(gpu="RTX A6000", rate=0.49, candidates=None):
+def _alloc(gpu="RTX 4090", rate=0.69, candidates=None):
     from flash.providers.base import Allocation, Candidate
 
     if candidates is None:
-        candidates = (Candidate("runpod", gpu, rate, 48),)
+        candidates = (Candidate("runpod", gpu, rate, 24),)
     return Allocation(
         provider=candidates[0].provider,
         gpu=candidates[0].gpu,
@@ -98,11 +98,11 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
         runtime_secrets={"WANDB_API_KEY": "user-wb"},
     )
     assert metrics["train_tokens"] == 4096
-    assert captured["gpu_type"] == "RTX A6000"
+    assert captured["gpu_type"] == "RTX 4090"
     assert captured["runtime_secrets"] == {"WANDB_API_KEY": "user-wb"}
     remote = orch.get_status(spec.run_id).remote
     assert remote["provider"] == "runpod"
-    assert remote["allocated_gpu"] == "RTX A6000"
+    assert remote["allocated_gpu"] == "RTX 4090"
 
 
 def test_runpod_cost_projection_flows_into_run_status(orch, monkeypatch):
@@ -110,9 +110,9 @@ def test_runpod_cost_projection_flows_into_run_status(orch, monkeypatch):
     _seed_status(orch, spec)
     cost = orch._persist_metrics(
         spec,
-        {"train_tokens": 4096, "wall_seconds": 1800, "allocated_gpu": "RTX A6000"},
+        {"train_tokens": 4096, "wall_seconds": 1800, "allocated_gpu": "RTX 4090"},
     )
-    assert cost == pytest.approx(0.245)  # 0.5 hr x $0.49/hr (RTX A6000)
+    assert cost == pytest.approx(0.345)  # 0.5 hr x $0.69/hr (RTX 4090)
 
 
 def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monkeypatch):
@@ -123,7 +123,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
 
     candidates = (
         Candidate("runpod", "L4", 0.39, 24),
-        Candidate("runpod", "RTX A6000", 0.49, 48),
+        Candidate("runpod", "H100", 0.49, 48),
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     cancelled, deleted, submitted_gpus = [], [], []
@@ -144,7 +144,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, 0, log)
     assert metrics["train_tokens"] == 4096
-    assert submitted_gpus == ["L4", "RTX A6000"]
+    assert submitted_gpus == ["L4", "H100"]
     assert cancelled == [("ep1", "j1")]
     assert "ep1" in deleted
     assert "walking past the cheapest class" in log.getvalue()
@@ -238,20 +238,20 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
     from flash.runner.lifecycle import _select_candidate
 
     cands = (
-        Candidate("runpod", "RTX A6000", 0.49, 48),
+        Candidate("runpod", "H100", 0.49, 48),
         Candidate("runpod", "RTX 6000 Ada", 0.50, 48),
-        Candidate("lambda", "RTX A6000", 0.50, 48),
+        Candidate("lambda", "H100", 0.50, 48),
     )
     # Attempt 0 (nothing failed): cheapest overall.
     assert _select_candidate(cands, set(), set()) is cands[0]
     # RunPod burned an infra attempt -> escape to the OTHER provider, not the next RunPod class.
-    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "RTX A6000")})
-    assert (chosen.provider, chosen.gpu) == ("lambda", "RTX A6000")
+    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "H100")})
+    assert (chosen.provider, chosen.gpu) == ("lambda", "H100")
     # Both providers burned -> fall back to the cheapest class NOT yet tried (within-provider walk).
     chosen = _select_candidate(
         cands,
         {"runpod", "lambda"},
-        {("runpod", "RTX A6000"), ("lambda", "RTX A6000")},
+        {("runpod", "H100"), ("lambda", "H100")},
     )
     assert (chosen.provider, chosen.gpu) == ("runpod", "RTX 6000 Ada")
 
@@ -261,8 +261,8 @@ def test_select_candidate_single_provider_walks_classes():
     from flash.providers.base import Candidate
     from flash.runner.lifecycle import _select_candidate
 
-    cands = (Candidate("runpod", "L4", 0.39, 24), Candidate("runpod", "RTX A6000", 0.49, 48))
-    assert _select_candidate(cands, {"runpod"}, {("runpod", "L4")}).gpu == "RTX A6000"
+    cands = (Candidate("runpod", "L4", 0.39, 24), Candidate("runpod", "H100", 0.49, 48))
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "L4")}).gpu == "H100"
 
 
 def test_select_candidate_single_fitting_gpu_never_breaks():
@@ -292,9 +292,9 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     from flash.providers.runpod import jobs as rp_jobs
 
     candidates = (
-        Candidate("runpod", "RTX A6000", 0.49, 48),  # cheapest -> attempt 0
+        Candidate("runpod", "H100", 0.49, 48),  # cheapest -> attempt 0
         Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # next RunPod class (the WRONG retry target)
-        Candidate("lambda", "RTX A6000", 0.50, 48),  # the right cross-provider escape
+        Candidate("lambda", "H100", 0.50, 48),  # the right cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
@@ -322,8 +322,8 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, 0, log)
     assert metrics["train_tokens"] == 4096
-    assert rp_gpus == ["RTX A6000"]  # RunPod tried exactly once...
-    assert lam_gpus == ["RTX A6000"]  # ...then the retry escaped cross-provider to Lambda
+    assert rp_gpus == ["H100"]  # RunPod tried exactly once...
+    assert lam_gpus == ["H100"]  # ...then the retry escaped cross-provider to Lambda
     assert orch.get_status(spec.run_id).remote["provider"] == "lambda"
     assert "walking past the cheapest class" in log.getvalue()
 
@@ -343,7 +343,7 @@ def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatc
     monkeypatch.setattr(
         allocator,
         "allocate",
-        lambda *a, **k: _alloc(candidates=(Candidate("runpod", "RTX A6000", 0.49, 48),)),
+        lambda *a, **k: _alloc(candidates=(Candidate("runpod", "H100", 0.49, 48),)),
     )
     monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
@@ -383,7 +383,7 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     candidates = (
-        Candidate("runpod", "RTX A6000", 0.49, 48),  # cheapest -> cache attempt, then cache-less same class
+        Candidate("runpod", "H100", 0.49, 48),  # cheapest -> cache attempt, then cache-less same class
         Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # the GPU-walk target the real retry must reach
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -410,8 +410,8 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     assert metrics["train_tokens"] == 4096
     # cache attempt -> cache-less SAME class (free fallback) -> GPU-walk to the OTHER class (real retry).
     assert seen == [
-        ("RTX A6000", WEIGHT_CACHE_VOLUME_NAME),
-        ("RTX A6000", None),
+        ("H100", WEIGHT_CACHE_VOLUME_NAME),
+        ("H100", None),
         ("RTX 6000 Ada", None),
     ]
 
@@ -429,8 +429,8 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
 
     candidates = (
         Candidate("lambda", "A10", 0.40, 24),  # cheapest -> attempt 0 (lands on broken instance)
-        Candidate("lambda", "RTX A6000", 0.45, 48),  # next class on the SAME (sick) provider
-        Candidate("runpod", "RTX A6000", 0.49, 48),  # the right cross-provider escape
+        Candidate("lambda", "H100", 0.45, 48),  # next class on the SAME (sick) provider
+        Candidate("runpod", "H100", 0.49, 48),  # the right cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     terminated = []
@@ -464,7 +464,7 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     metrics = orch._submit_seed_supervised(spec, 0, log)
     assert metrics["train_tokens"] == 4096
     assert lam_gpus == ["A10"]  # broken Lambda instance tried once...
-    assert rp_gpus == ["RTX A6000"]  # ...then escaped cross-provider to RunPod
+    assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
     assert "i-broken" in terminated  # sick instance torn down before the retry
     assert orch.get_status(spec.run_id).remote["provider"] == "runpod"
 
@@ -482,8 +482,8 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     from flash.providers.runpod import jobs as rp_jobs
 
     candidates = (
-        Candidate("lambda", "RTX A6000", 0.45, 48),  # cheapest -> attempt 0 (sick region)
-        Candidate("runpod", "RTX A6000", 0.49, 48),  # the cross-provider escape
+        Candidate("lambda", "H100", 0.45, 48),  # cheapest -> attempt 0 (sick region)
+        Candidate("runpod", "H100", 0.49, 48),  # the cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
@@ -512,8 +512,8 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
     assert metrics["train_tokens"] == 4096
-    assert lam_gpus == ["RTX A6000"]  # sick region tried once...
-    assert rp_gpus == ["RTX A6000"]  # ...then escaped cross-provider to RunPod
+    assert lam_gpus == ["H100"]  # sick region tried once...
+    assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
     assert orch.get_status(spec.run_id).remote["provider"] == "runpod"
 
 
@@ -566,8 +566,8 @@ def test_config_gpu_fields(monkeypatch):
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
     spec = spec_from_dict(dict(base), run_id="x")
-    assert spec.gpu.type == "RTX A6000"
+    assert spec.gpu.type == "RTX 4090"
     again = JobSpec.from_dict(spec.to_dict())
-    assert again.gpu.type == "RTX A6000"
+    assert again.gpu.type == "RTX 4090"
     spec = spec_from_dict({**base, "gpu": {"type": "A100 SXM"}}, run_id="x")
-    assert spec.gpu.type == "RTX A6000"
+    assert spec.gpu.type == "RTX 4090"
