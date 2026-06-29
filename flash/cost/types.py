@@ -17,10 +17,6 @@ class RunConfig:
     method: str  # "sft" | "grpo"
     steps: int
 
-    # SFT only: actual training tokens across all epochs. When present, SFT dollars are priced
-    # from this token count instead of the padded batch_size * seq_len slot estimate.
-    train_tokens: int | None = None
-
     # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
     # GRPO default mirrors the worker's max(1024, max_prompt_len + completion); see normalized().
     seq_len: int | None = None
@@ -35,6 +31,9 @@ class RunConfig:
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
     environment: str | None = None  # Freesolo environment id; descriptive only
+    # SFT only: actual training tokens across all epochs. When present, SFT dollars are priced
+    # from this token count instead of the padded batch_size * seq_len slot estimate.
+    train_tokens: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
