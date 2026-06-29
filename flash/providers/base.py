@@ -51,11 +51,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     # Lambda-only; RunPod has no A10. Allocator reaches it only after cheaper RunPod classes exhaust.
     GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
-    GpuClass(
-        "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
-        validated=True,
-        lambda_name="gpu_1x_a6000",
-    ),
     # Lambda-only 40 GB A100; fills the 32->80 GB gap on Lambda.
     GpuClass(
         "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99,
@@ -107,7 +102,22 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
 )
 
+# Retired classes: dropped from the managed catalog (never allocated, priced, or listed) but kept
+# resolvable so an in-flight run still referencing one can be torn down. During a rollout that removes
+# a class, an old endpoint may still be provisioning before its handle is persisted; teardown paths
+# (terminate_endpoint, the idle reaper's _train_endpoint_names) reconstruct its name from the raw spec
+# via canonical_gpu/gpu_short, so losing the metadata would silently skip it and leak quota/billing.
+LEGACY_GPU_CLASSES: tuple[GpuClass, ...] = (
+    GpuClass(
+        "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
+        lambda_name="gpu_1x_a6000",
+    ),
+)
+
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
+# Name -> class for RESOLUTION ONLY (catalog + retired classes). Never iterate this for selection,
+# pricing tables, or display; those use GPU_INFO/KNOWN/VALIDATED so retired classes stay excluded.
+_GPU_INFO_ALL: dict[str, GpuClass] = {**GPU_INFO, **{g.name: g for g in LEGACY_GPU_CLASSES}}
 
 KNOWN = tuple(GPU_INFO)
 VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
@@ -124,8 +134,9 @@ def _alias_keys(name: str) -> set[str]:
     return keys
 
 
+# Built from catalog + retired classes so a retired class stays resolvable for teardown/pricing.
 _ALIASES: dict[str, str] = {}
-for _info in GPU_INFO.values():
+for _info in _GPU_INFO_ALL.values():
     for _k in _alias_keys(_info.name):
         _ALIASES[_k] = _info.name
 # Full marketing names (nvidia-smi / RunPod API) and historical aliases not covered by generic rules.
@@ -156,7 +167,11 @@ class UnsupportedGpuError(ValueError):
 
 
 def canonical_gpu(name: str) -> str:
-    """Normalize a friendly GPU name to one of ``KNOWN``; raise otherwise."""
+    """Normalize a friendly GPU name to a managed (``KNOWN``) or retired class; raise otherwise.
+
+    Retired classes resolve too so teardown of an in-flight run can still reconstruct its endpoint
+    name; they are excluded from allocation/display by being absent from ``KNOWN``/``VALIDATED``.
+    """
     key = (name or "").strip().lower()
     if key in _ALIASES:
         return _ALIASES[key]
@@ -166,7 +181,7 @@ def canonical_gpu(name: str) -> str:
 
 
 def get_gpu_info(name: str) -> GpuClass:
-    return GPU_INFO[canonical_gpu(name)]
+    return _GPU_INFO_ALL[canonical_gpu(name)]
 
 
 def providers_for(name: str) -> tuple[str, ...]:
