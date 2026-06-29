@@ -76,16 +76,23 @@ jobs:
               gpu_type_id: "NVIDIA RTX A6000",
               allowed_cuda: "",
             }
+          # sm89 (Ada): warm on the L40S -- a DATACENTER Ada card with reliable secure-cloud capacity --
+          # instead of the consumer RTX 4090 (scarce/cold on secure cloud, where the bake pod often never
+          # finished pulling the ~20GB image before the deadline). The cache is sm-keyed, so an L40S-warmed
+          # sm89 cache is valid on every sm89 card (4090/L40/L4). NB: verify the exact RunPod gpuTypeId.
           - {
               sm: sm89,
               arch: "8.9",
-              gpu_type_id: "NVIDIA GeForce RTX 4090",
+              gpu_type_id: "NVIDIA L40S",
               allowed_cuda: "",
             }
+          # sm90 (Hopper): warm on the H200 (141GB, sm90) -- better secure-cloud capacity than the
+          # heavily-contended H100 80GB HBM3 (which cold-pull-stalled the bake). Same sm90, so the cache
+          # is valid on every H100/H200. H200 is in flash's validated GPU catalog (providers/base.py).
           - {
               sm: sm90,
               arch: "9.0",
-              gpu_type_id: "NVIDIA H100 80GB HBM3",
+              gpu_type_id: "NVIDIA H200",
               allowed_cuda: "",
             }
           # Blackwell needs CUDA-13 hosts to JIT its PTX (matches min_cuda_for in the provider). Bake
