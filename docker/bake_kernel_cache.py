@@ -66,15 +66,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="offload the kernel-cache warmup to a RunPod GPU")
     ap.add_argument("--arch", required=True, help="TORCH_CUDA_ARCH_LIST target, e.g. 9.0")
     ap.add_argument("--sm", required=True, help="sm tag, e.g. sm90 (must match the produced cache)")
-    ap.add_argument("--gpu-type-id", required=True, help="RunPod gpuTypeId, e.g. 'NVIDIA H100 80GB HBM3'")
+    ap.add_argument(
+        "--gpu-type-id", required=True, help="RunPod gpuTypeId, e.g. 'NVIDIA H100 80GB HBM3'"
+    )
     ap.add_argument("--image", default="ghcr.io/freesolo-co/flash-worker:cu128")
     ap.add_argument("--out", default="build/kernel_cache")
     # the warm pod only pulls the ~20GB image + writes the cache (no model download), so keep this
     # modest -- an over-large ask shrinks the eligible host pool and trips "machine does not have the
     # resources" on scarce classes (e.g. Blackwell sm120 on secure cloud).
     ap.add_argument("--container-disk-gb", type=int, default=60)
-    ap.add_argument("--deadline-min", type=int, default=45)
-    ap.add_argument("--run-id", default="", help="unique suffix for the temp repo (default: time+uuid)")
+    ap.add_argument("--deadline-min", type=int, default=90)
+    ap.add_argument(
+        "--run-id", default="", help="unique suffix for the temp repo (default: time+uuid)"
+    )
     ap.add_argument(
         "--allowed-cuda",
         default="",
@@ -189,6 +193,48 @@ def main() -> int:
                 shutil.move(s, d)
             shutil.rmtree(tmp, ignore_errors=True)
             rc = _verify(args.out, args.sm)
+        else:
+            # Non-success (timeout / pod_died): the pod-side out/ (STARTED marker, warmup.log) lives in
+            # the temp dataset the `finally` below deletes, so pull + print it FIRST. out/STARTED present
+            # = the warmup entrypoint ran (a timeout then means it hung / was slow); STARTED absent = the
+            # pod ran the wrong entrypoint and the warmup never started. warmup.log is only uploaded
+            # AFTER the warmup process returns, so it's present only if the warmup finished/was killed,
+            # not on a pure mid-run hang.
+            log(f"outcome={outcome}: pulling pod-side out/ for diagnostics before cleanup")
+            try:
+                dbg = os.path.join(args.out, ".dbg")
+                snapshot_download(
+                    repo_id=repo,
+                    repo_type="dataset",
+                    allow_patterns=["out/**"],
+                    local_dir=dbg,
+                    token=token,
+                )
+                src = os.path.join(dbg, "out")
+                if os.path.isdir(src) and os.listdir(src):
+                    started = os.path.isfile(os.path.join(src, "STARTED"))
+                    log(f"warmup entrypoint ran (out/STARTED present): {started}")
+                    for root, _, files in os.walk(src):
+                        for f in sorted(files):
+                            p = os.path.join(root, f)
+                            log(f"   out/{os.path.relpath(p, src)} ({os.path.getsize(p)} b)")
+                    wl = os.path.join(src, "warmup.log")
+                    if os.path.isfile(wl):
+                        log("--- warmup.log tail (last 60 lines) ---")
+                        with open(wl, errors="replace") as wlf:
+                            for line in wlf.read().splitlines()[-60:]:
+                                log(f"   | {line}")
+                    else:
+                        log(
+                            "no warmup.log (warmup never returned -> mid-run hang or still running at deadline)"
+                        )
+                else:
+                    log(
+                        "pod produced NO out/ -> the warmup entrypoint never ran (wrong CMD / docker_args)"
+                    )
+                shutil.rmtree(dbg, ignore_errors=True)
+            except Exception as e:
+                log(f"diagnostic fetch failed (ignore): {str(e)[:160]}")
     finally:
         if pod_id:
             try:
