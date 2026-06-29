@@ -138,6 +138,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 adapter_prefix=deploy_prefix,
                 gpu_name=spec.gpu.type,
                 dry_run=dry_run,
+                lora_rank=spec.train.lora_rank,
                 # a run trained with thinking serves with thinking (per-run parity)
                 thinking=spec.thinking,
                 org_id=deploy_org_id,

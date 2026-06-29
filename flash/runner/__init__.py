@@ -377,10 +377,11 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
 
 
 def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
-    """Write metrics to results/runpod/<phase>/<run_id> and return the cost.
+    """Write metrics to results/runpod/<phase>/<run_id> and return the customer training cost.
 
     The run id keeps concurrent/sequential runs of the same phase from
-    overwriting each other's artifacts."""
+    overwriting each other's artifacts. ``metrics["wall_seconds"]`` is the worker's training-loop
+    wall time; setup/cold-start is reported separately and is not included here."""
     dest = artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.

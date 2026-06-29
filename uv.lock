@@ -1024,7 +1024,7 @@ wheels = [
 
 [[package]]
 name = "freesolo-flash"
-version = "0.2.29"
+version = "0.2.30"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1038,6 +1038,7 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "runpod-flash" },
+    { name = "transformers" },
     { name = "uvicorn" },
 ]
 gpu = [
@@ -1059,6 +1060,7 @@ server = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "runpod-flash" },
+    { name = "transformers" },
     { name = "uvicorn" },
 ]
 
@@ -1095,7 +1097,9 @@ requires-dist = [
     { name = "runpod-flash", marker = "extra == 'dev'" },
     { name = "runpod-flash", marker = "extra == 'server'" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
+    { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.6,<5.11" },
     { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.11" },
+    { name = "transformers", marker = "extra == 'server'", specifier = ">=5.6,<5.11" },
     { name = "trl", marker = "extra == 'gpu'", specifier = ">=1.6,<1.7" },
     { name = "uvicorn", marker = "extra == 'dev'" },
     { name = "uvicorn", marker = "extra == 'server'" },

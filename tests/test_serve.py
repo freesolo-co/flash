@@ -7,7 +7,26 @@ dry-run Deployment shaping — there is no flash-owned vLLM endpoint to provisio
 
 from __future__ import annotations
 
+import json
+import sys
+import types
+
 import pytest
+
+
+def _stub_adapter_config(monkeypatch, tmp_path, *, rank: int = 32, config: dict | None = None):
+    cfg = tmp_path / "adapter_config.json"
+    cfg.write_text(json.dumps({"r": rank} if config is None else config), encoding="utf-8")
+    seen = {}
+
+    def fake_hf_hub_download(**kwargs):
+        seen.update(kwargs)
+        return str(cfg)
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+    )
+    return seen
 
 
 def test_deploy_dry_run():
@@ -47,6 +66,105 @@ def test_deploy_9b_dry_run_is_not_rejected():
     assert dep.to_dict()["state"] == "dry_run"
 
 
+def test_deploy_rejects_lora_rank_above_serving_cap():
+    from flash.serve.deploy import deploy_adapter
+
+    with pytest.raises(ValueError, match="max_lora_rank=32"):
+        deploy_adapter(
+            run_id="r64",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r64/seed0",
+            gpu_name="RTX 5090",
+            dry_run=True,
+            lora_rank=64,
+        )
+
+
+def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, tmp_path):
+    """Deploy validates the effective artifact rank, not only spec.train.lora_rank."""
+    from flash.serve.deploy import deploy_adapter
+
+    seen = _stub_adapter_config(monkeypatch, tmp_path, rank=64)
+
+    with pytest.raises(ValueError, match="adapter artifact has rank 64"):
+        deploy_adapter(
+            run_id="r-recombined",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="grpo/r-recombined/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
+    assert seen["repo_id"] == "org/repo"
+    assert seen["filename"] == "grpo/r-recombined/seed0/adapter/adapter_config.json"
+    assert seen["repo_type"] == "dataset"
+
+
+def test_deploy_rejects_adapter_config_without_rank_metadata(monkeypatch, tmp_path):
+    from flash.serve.deploy import deploy_adapter
+
+    _stub_adapter_config(monkeypatch, tmp_path, config={})
+
+    with pytest.raises(ValueError, match="no LoRA rank metadata"):
+        deploy_adapter(
+            run_id="r-missing-rank",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-missing-rank/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
+
+
+def test_deploy_rejects_falsey_invalid_rank_pattern(monkeypatch, tmp_path):
+    from flash.serve.deploy import deploy_adapter
+
+    _stub_adapter_config(monkeypatch, tmp_path, config={"r": 32, "rank_pattern": []})
+
+    with pytest.raises(ValueError, match="invalid rank metadata"):
+        deploy_adapter(
+            run_id="r-bad-pattern",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-bad-pattern/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
+
+
+def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
+    import flash.serve.deploy as d
+
+    def fake_hf_hub_download(**_kwargs):
+        raise RuntimeError("hub timeout")
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+    )
+
+    with pytest.raises(d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter"):
+        d.deploy_adapter(
+            run_id="r-hf-down",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-hf-down/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
+
+
+def test_deploy_adapter_options_after_gpu_are_keyword_only():
+    from flash.serve.deploy import deploy_adapter
+
+    with pytest.raises(TypeError):
+        deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", "RTX 4090", True)
+
+
 def test_deploy_rejects_unsupported_gpu():
     from flash.providers.base import UnsupportedGpuError
     from flash.serve.deploy import deploy_adapter
@@ -81,13 +199,14 @@ def test_deploy_retired_gpu_maps_to_current_class():
     assert dep.to_dict()["gpu"] == "A100 PCIe"
 
 
-def test_deploy_registers_with_freesolo_serving(monkeypatch):
+def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path):
     """A non-dry-run deploy POSTs the adapter to {FREESOLO_SERVING_URL}/adapters with the
     right body and the internal-key auth header."""
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
 
     seen = {}
 
@@ -135,13 +254,14 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch):
     assert dep.state == "ready"
 
 
-def test_deploy_includes_org_id_when_provided(monkeypatch):
+def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path):
     """When the deploying org is known, registration carries `orgId` so serving can persist
     hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
 
     seen = {}
 
@@ -178,7 +298,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch):
     assert "orgId" not in seen["json"]
 
 
-def test_deploy_sends_thinking_default(monkeypatch):
+def test_deploy_sends_thinking_default(monkeypatch, tmp_path):
     """Registration carries the run's training `thinking` flag so serving can default
     enable_thinking to it for raw chat callers (those that omit chat_template_kwargs). A
     thinking=true run registers thinking=true; a thinking=false run registers thinking=false."""
@@ -186,6 +306,7 @@ def test_deploy_sends_thinking_default(monkeypatch):
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
 
     seen = {}
 
@@ -224,10 +345,12 @@ def test_deploy_sends_thinking_default(monkeypatch):
     assert seen["json"]["thinking"] is False
 
 
-def test_deploy_propagates_serving_error(monkeypatch):
+def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
     """A non-2xx from the serving app surfaces as a ServingError (the server maps it to a 502)
     instead of swallowing it or letting a raw httpx error escape as an unhandled 500."""
     import flash.serve.deploy as d
+
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
 
     class _Resp:
         status_code = 500

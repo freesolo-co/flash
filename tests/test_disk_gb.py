@@ -59,8 +59,7 @@ def test_default_catalog_models_need_no_disk_bump():
 
 
 def test_submit_raises_disk_to_model_min(monkeypatch):
-    """submit_job (dry-run) bumps gpu.disk_gb to a catalog model's min_disk_gb. No shipping model
-    needs a bump now, so inject a synthetic big-checkpoint entry to exercise the mechanism."""
+    """submit_job (dry-run) bumps gpu.disk_gb to a catalog model's min_disk_gb."""
     from flash import runner
     from flash.catalog import MODELS, ModelInfo
     from flash.spec import JobSpec
