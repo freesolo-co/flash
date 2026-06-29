@@ -117,17 +117,14 @@ def validate_serving_lora_rank(
     model: str, lora_rank: int, *, rank_source: str = "adapter"
 ) -> None:
     """Fail before registration when a trained adapter rank exceeds serving capacity."""
-    from flash.catalog import get_model
+    from flash.catalog import serving_lora_rank_cap
 
-    try:
-        serving = get_model(model).serving
-    except ValueError:
+    max_lora_rank = serving_lora_rank_cap(model)
+    if max_lora_rank is None:
         return
-    if serving is None:
-        return
-    if int(lora_rank) > serving.max_lora_rank:
+    if int(lora_rank) > max_lora_rank:
         raise ValueError(
-            f"{model} serving supports max_lora_rank={serving.max_lora_rank}; "
+            f"{model} serving supports max_lora_rank={max_lora_rank}; "
             f"{rank_source} has rank {int(lora_rank)} and cannot be deployed"
         )
 
