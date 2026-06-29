@@ -285,7 +285,7 @@ def test_hf_resume_checkpoint_swallows_download_error(monkeypatch, resume_run_id
 # 3. CONTROL PLANE — _submit_seed_supervised relaunches the same run on infra-shaped failure
 # ============================================================================================
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
-    gpu = {"type": "RTX A6000", "max_retries": 2}
+    gpu = {"type": "RTX 4090", "max_retries": 2}
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
         {
@@ -301,11 +301,11 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
 def _alloc():
     from flash.providers.base import Allocation, Candidate
 
-    candidates = (Candidate("runpod", "RTX A6000", 0.49, 48),)
+    candidates = (Candidate("runpod", "RTX 4090", 0.69, 24),)
     return Allocation(
         provider="runpod",
-        gpu="RTX A6000",
-        hourly_usd=0.49,
+        gpu="RTX 4090",
+        hourly_usd=0.69,
         min_vram_gb=12,
         candidates=candidates,
     )

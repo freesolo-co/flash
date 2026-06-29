@@ -1,8 +1,8 @@
 """Lambda Cloud $/hr: live ``/instance-types`` rate per class, static fallback.
 
 NB: the static fallback is a Lambda-specific map, NOT ``GpuClass.hourly_usd`` — that field is the
-RunPod secure-cloud snapshot, which differs from Lambda's list price (e.g. RTX A6000 is $0.49 on
-RunPod but $1.09 on Lambda).
+RunPod secure-cloud snapshot, which differs from Lambda's list price (e.g. B200 is $5.89 on
+RunPod but $6.99 on Lambda).
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ logger = get_logger(__name__)
 # Lambda list prices (snapshot 2026-06-25, from /instance-types). Live rates override these.
 _STATIC_RATES: dict[str, float] = {
     "A10": 1.29,
-    "RTX A6000": 1.09,
     "A100 SXM 40GB": 1.99,
     "H100": 3.29,
     "B200": 6.99,

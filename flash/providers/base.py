@@ -51,11 +51,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     # Lambda-only; RunPod has no A10. Allocator reaches it only after cheaper RunPod classes exhaust.
     GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
-    GpuClass(
-        "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
-        validated=True,
-        lambda_name="gpu_1x_a6000",
-    ),
     # Lambda-only 40 GB A100; fills the 32->80 GB gap on Lambda.
     GpuClass(
         "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99,
