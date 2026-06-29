@@ -25,8 +25,8 @@ pytest.importorskip("safetensors")
 from safetensors.torch import load_file, save_file
 
 from flash.engine.worker.lora import (
-    SERVING_MAX_LORA_RANK,
     recombine_lora_adapters,
+    serving_max_lora_rank,
     validate_recombined_lora_rank,
 )
 
@@ -145,16 +145,27 @@ def test_recombine_normalizes_language_model_infix(tmp_path):
 def test_recombined_rank_preflight_allows_sum_at_serving_cap(tmp_path):
     sft = str(tmp_path / "sft")
     _write_adapter(sft, modules=MODULES, r=16, alpha=32, seed=1)
+    max_rank = serving_max_lora_rank("Qwen/Qwen3.5-4B")
 
-    assert validate_recombined_lora_rank(sft, 16) == (16, 16, SERVING_MAX_LORA_RANK)
+    assert validate_recombined_lora_rank(sft, 16, max_rank=max_rank) == (16, 16, max_rank)
+
+
+def test_recombined_rank_preflight_allows_model_specific_rank64_cap(tmp_path):
+    sft = str(tmp_path / "sft")
+    _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
+    max_rank = serving_max_lora_rank("Qwen/Qwen3.5-2B")
+
+    assert max_rank == 64
+    assert validate_recombined_lora_rank(sft, 32, max_rank=max_rank) == (32, 32, 64)
 
 
 def test_recombined_rank_preflight_rejects_undeployable_sum(tmp_path):
     sft = str(tmp_path / "sft")
     _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
+    max_rank = serving_max_lora_rank("Qwen/Qwen3.5-4B")
 
     with pytest.raises(ValueError, match=r"SFT rank 24 \+ GRPO rank 16"):
-        validate_recombined_lora_rank(sft, 16)
+        validate_recombined_lora_rank(sft, 16, max_rank=max_rank)
 
 
 def test_recombine_rejects_rank_above_serving_cap(tmp_path):
@@ -163,9 +174,21 @@ def test_recombine_rejects_rank_above_serving_cap(tmp_path):
     out = str(tmp_path / "out")
     _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
     _write_adapter(grpo, modules=MODULES, r=16, alpha=32, seed=2)
+    _set_base(sft, "Qwen/Qwen3.5-4B")
 
     with pytest.raises(ValueError, match=r"rank-stacked SFT\+GRPO adapter would be rank 40"):
         recombine_lora_adapters(sft, grpo, out)
+
+
+def test_recombine_allows_rank64_for_model_with_serving_cap64(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=32, alpha=64, seed=2)
+
+    assert recombine_lora_adapters(sft, grpo, out) == 64
+    assert _read_cfg(out)["r"] == 64
 
 
 def test_init_adapter_model_preflights_vl_recombined_rank_before_model_load(tmp_path, monkeypatch):
@@ -192,7 +215,40 @@ def test_init_adapter_model_preflights_vl_recombined_rank_before_model_load(tmp_
     )
 
     with pytest.raises(ValueError, match=r"SFT rank 24 \+ GRPO rank 16"):
-        worker_adapter._init_adapter_model("Qwen/Qwen3.5-2B")
+        worker_adapter._init_adapter_model("Qwen/Qwen3.5-4B")
+
+
+def test_init_adapter_model_uses_model_specific_serving_cap(tmp_path, monkeypatch):
+    import flash.engine.worker.adapter as worker_adapter
+
+    sft = str(tmp_path / "sft")
+    merged = str(tmp_path / "merged")
+    _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
+    monkeypatch.setattr(worker_adapter, "_download_adapter", lambda _prefix: sft)
+    monkeypatch.setattr(worker_adapter, "adapter_is_vl_warmstart", lambda _adir, _model_id: True)
+    monkeypatch.setattr(worker_adapter, "optimal_attn_impl", lambda: None)
+    monkeypatch.setattr(
+        worker_adapter,
+        "_merge_vl_warmstart_adapter",
+        lambda _adir, _model_id, _attn_kw: merged,
+    )
+    monkeypatch.setattr(worker_adapter, "make_lora", lambda model_id: {"model_id": model_id})
+    monkeypatch.setattr(
+        W,
+        "JOB_SPEC",
+        types.SimpleNamespace(
+            train=types.SimpleNamespace(
+                init_from_adapter="owner/runs:sft/sft-run/seed0",
+                lora_rank=32,
+            )
+        ),
+        raising=False,
+    )
+
+    assert worker_adapter._init_adapter_model("Qwen/Qwen3.5-2B") == (
+        merged,
+        {"model_id": merged},
+    )
 
 
 def test_recombine_rejects_mismatched_target_modules(tmp_path):
@@ -234,6 +290,15 @@ def _patch_cfg(adir: str, **extra) -> None:
     cfg.update(extra)
     with open(p, "w") as f:
         json.dump(cfg, f)
+
+
+def test_recombined_rank_preflight_rejects_per_module_rank_pattern(tmp_path):
+    sft = str(tmp_path / "sft")
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
+    _patch_cfg(sft, rank_pattern={"q_proj": 8})
+
+    with pytest.raises(ValueError, match=r"rank_pattern"):
+        validate_recombined_lora_rank(sft, 4, max_rank=32)
 
 
 def test_recombine_rejects_non_lora_peft_type(tmp_path):
