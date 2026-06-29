@@ -40,6 +40,7 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(500, text="no base-model engines loaded", request=req)
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
@@ -59,6 +60,7 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(401, text="invalid internal key", request=req)
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
@@ -82,6 +84,7 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
     def fake_post(url, *a, **k):
         raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
 
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")

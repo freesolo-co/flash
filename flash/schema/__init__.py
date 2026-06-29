@@ -241,6 +241,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true",
             file=sys.stderr,
         )
+    lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
+    if info.serving is not None and lora_rank > info.serving.max_lora_rank:
+        raise ConfigError(
+            f"train.lora_rank={lora_rank} exceeds {model}'s serving max_lora_rank="
+            f"{info.serving.max_lora_rank}; lower train.lora_rank or raise the serving cap "
+            "after real-GPU validation"
+        )
 
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
@@ -257,7 +264,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         train=TrainSpec(
             steps=_train_int(train_raw, "steps", minimum=1),
             epochs=_train_int(train_raw, "epochs", minimum=1),
-            lora_rank=_train_int(train_raw, "lora_rank", minimum=1) or 32,
+            lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
             init_from_adapter=_init_from_adapter_ref(train_raw),
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
