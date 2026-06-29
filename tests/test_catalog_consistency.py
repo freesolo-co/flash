@@ -46,6 +46,24 @@ def test_thinking_capability_values_are_valid():
 
 def test_serving_capacity_matches_validated_matrix():
     expected = {
+        "openbmb/MiniCPM5-1B": {
+            "gpu": "L4",
+            "max_loras": 16,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+        },
+        "Qwen/Qwen3.5-0.8B": {
+            "gpu": "L4",
+            "max_loras": 16,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+        },
+        "Qwen/Qwen3.5-2B": {
+            "gpu": "L4",
+            "max_loras": 16,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+        },
         "Qwen/Qwen3.5-4B": {
             "gpu": "L40S",
             "serve_model_id": "lovedheart/Qwen3.5-4B-FP8",
@@ -94,7 +112,7 @@ def test_public_rows_prune_unset_serving_capacity_fields():
     assert row["serving"] == {
         "gpu": "L4",
         "max_loras": 16,
-        "max_lora_rank": 32,
+        "max_lora_rank": 64,
         "max_model_len": 32768,
     }
 
