@@ -17,8 +17,9 @@ def test_estimate_is_positive_and_self_consistent():
     e = estimate_cost(RunConfig(MID, "sft", 200))
     assert e.total_usd > 0
     assert e.wall_clock_seconds == pytest.approx(e.setup_seconds + e.train_seconds)
-    # total = wall-clock hours x hourly rate
-    assert e.total_usd == pytest.approx(e.wall_clock_hours * e.gpu_hourly_usd)
+    # total = billable training hours x hourly rate; setup is elapsed time only.
+    assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
+    assert e.billable_hours == pytest.approx(e.train_seconds / 3600.0)
     # chosen card actually fits the run's requirement
     assert e.gpu_vram_gb >= e.required_vram_gb
 
@@ -26,6 +27,16 @@ def test_estimate_is_positive_and_self_consistent():
 def test_cost_increases_with_steps():
     costs = [estimate_cost(RunConfig(SMALL, "sft", s)).total_usd for s in (100, 500, 1000)]
     assert costs[0] < costs[1] < costs[2]
+
+
+def test_sft_train_tokens_price_actual_tokens_instead_of_padded_slots():
+    padded = estimate_cost(RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048))
+    actual = estimate_cost(
+        RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048, train_tokens=50_000)
+    )
+    assert actual.train_seconds < padded.train_seconds
+    assert actual.total_usd < padded.total_usd
+    assert any("50,000 actual train tokens" in n for n in actual.notes)
 
 
 def test_grpo_costs_more_than_sft():
@@ -99,14 +110,15 @@ def test_cold_start_calibrated_to_real_short_sft_run():
     e = estimate_cost(RunConfig(SMALL, "sft", 26))
     assert e.gpu == "RTX 4090"
     assert e.gpu_hourly_usd == pytest.approx(0.69, abs=1e-3)
-    assert e.total_usd == pytest.approx(0.1075, rel=0.10)
+    assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
+    assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
     # Model load (not boot/deps) is the dominant cold-start term for a short job.
     assert e.setup_seconds > e.train_seconds  # cold start dominates this short run
 
 
 def test_cold_start_negligible_for_long_runs():
     # The bigger cold start must NOT regress long runs: when training wall dominates, setup is a
-    # small single-digit fraction of the bill.
+    # small single-digit fraction of elapsed wall time.
     e = estimate_cost(RunConfig(SMALL, "sft", 5000))
     assert e.setup_seconds / e.wall_clock_seconds < 0.05
 
@@ -115,8 +127,10 @@ def test_wall_clock_cap_bounds_runaway_runs():
     e = estimate_cost(RunConfig(BIG, "grpo", 100_000))
     assert e.wall_capped is True
     assert e.wall_clock_seconds == pytest.approx(DEFAULT_WALL_CAP_S)
-    # The cap shows up in the notes and bounds the bill.
+    # The cap shows up in the notes and bounds billable training time.
     assert any("cap" in n.lower() for n in e.notes)
+    assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
+    assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
     uncapped_like = estimate_cost(RunConfig(BIG, "grpo", 100_000), wall_cap_s=10**9)
     assert uncapped_like.total_usd > e.total_usd
 
@@ -138,7 +152,8 @@ def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
     e30 = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=30))
     assert e10.wall_clock_seconds == pytest.approx(60.0)
     assert e30.wall_clock_seconds == pytest.approx(60.0)
-    assert e10.total_usd > 0.0
+    assert e10.train_seconds == pytest.approx(0.0)
+    assert e10.total_usd == pytest.approx(0.0)
 
 
 def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
@@ -149,7 +164,8 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
         assert cfg.max_wall_seconds == cap
         e = estimate_cost(cfg)
         assert e.wall_clock_seconds == pytest.approx(60.0)
-        assert e.total_usd > 0.0
+        assert e.train_seconds == pytest.approx(0.0)
+        assert e.total_usd == pytest.approx(0.0)
     capped = RunConfig(BIG, "grpo", 100_000, max_wall_seconds=3600)
     assert estimate_cost(capped).wall_clock_seconds == pytest.approx(3600.0)
 

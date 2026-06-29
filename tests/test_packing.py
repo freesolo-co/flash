@@ -165,6 +165,7 @@ def test_gdn_forward_probe_resolves_actual_arch():
     # it stays correct for a future qwen3_6 module. With no model_id it falls back to qwen3_5, whose
     # installed forward threads both reset kwargs -> True; a bogus arch -> safe-False.
     pytest.importorskip("transformers")
+    pytest.importorskip("torch")
     from flash.engine.worker.packing import _gdn_forward_threads_reset_kwargs
 
     assert _gdn_forward_threads_reset_kwargs(None) is True

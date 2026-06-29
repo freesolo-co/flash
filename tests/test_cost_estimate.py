@@ -24,10 +24,15 @@ def test_wall_clock_hours_derivation(est):
     assert est.wall_clock_hours == pytest.approx(est.wall_clock_seconds / 3600.0)
 
 
+def test_billable_hours_derivation(est):
+    assert est.billable_hours == pytest.approx(est.train_seconds / 3600.0)
+
+
 def test_breakdown_lists_every_term(est):
     b = est.breakdown()
-    for needle in ("GPU", "Setup", "Per step", "Train", "Wall clock", "TOTAL"):
+    for needle in ("GPU", "Setup", "Per step", "Train", "Wall clock", "Billable", "TOTAL"):
         assert needle in b
+    assert "not billed" in b
     # GRPO estimate carries explanatory notes.
     assert "Notes" in b
 

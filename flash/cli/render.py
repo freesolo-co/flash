@@ -592,7 +592,8 @@ def cost_panel(est) -> str:
         ),
         (
             "setup",
-            f"{est.setup_seconds / 60:.1f} min  {_dim(f'(cold start: boot + deps + model load{setup_extra})')}",
+            f"{est.setup_seconds / 60:.1f} min  "
+            f"{_dim(f'(cold start: boot + deps + model load{setup_extra}; not billed)')}",
         ),
         ("per step", f"{est.seconds_per_step:.2f} s"),
         (
@@ -601,6 +602,7 @@ def cost_panel(est) -> str:
             + (_paint("  [capped at wall-clock limit]", _RED) if est.wall_capped else ""),
         ),
         ("wall clock", f"{est.wall_clock_hours:.2f} h"),
+        ("billable", f"{est.billable_hours:.2f} h  {_dim('(training only)')}"),
     ]
     panel = _kv(pairs)
     total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(f'${est.total_usd:.2f}', _TEAL, '1')}"
