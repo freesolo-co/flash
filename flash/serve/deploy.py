@@ -156,7 +156,7 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
-        raise ValueError("could not verify adapter rank: huggingface_hub is not installed") from exc
+        raise ServingError("could not verify adapter rank: huggingface_hub is not installed") from exc
     try:
         local = hf_hub_download(
             repo_id=hf_repo,
@@ -165,7 +165,7 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
             token=os.environ.get("HF_TOKEN"),
         )
     except Exception as exc:
-        raise ValueError(f"could not verify adapter rank: failed to read {hf_repo}:{filename}") from exc
+        raise ServingError(f"could not verify adapter rank: failed to read {hf_repo}:{filename}") from exc
     try:
         with open(local, encoding="utf-8") as f:
             config = json.load(f)
