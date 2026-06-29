@@ -76,9 +76,9 @@ def test_resident_peak_is_at_least_sleep_peak():
 
 
 def test_4b_grpo_fits_resident_on_roomy_cards_not_tight_ones():
-    # The 4B GRPO run (1024 ctx, group 8) fits resident on the cards the allocator sends it to
-    # (A6000 48 GB / A100-H100 80 GB) -> sleep mode can be skipped; it does NOT fit a 24/32 GB
-    # card -> sleep stays on there.
+    # The 4B GRPO run (1024 ctx, group 8) fits resident on a roomy card (>=48 GB; the allocator
+    # now sends it to the 80 GB A100-H100 tier) -> sleep mode can be skipped; it does NOT fit a
+    # 24/32 GB card -> sleep stays on there.
     kw = {"seq_len": 1024, "max_tokens": 64, "group_size": 8, "lora_rank": 32}
     assert grpo_fits_resident("Qwen/Qwen3.5-4B", card_vram_gb=80, **kw) is True
     assert grpo_fits_resident("Qwen/Qwen3.5-4B", card_vram_gb=48, **kw) is True

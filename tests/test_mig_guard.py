@@ -71,9 +71,9 @@ def test_mismatch_reason_flags_generational_downgrade():
 
 
 def test_mismatch_reason_does_not_penalize_higher_minor():
-    # Minor is NOT capability-ordered: an A100 (sm80, major 8) substituted for an A6000 (sm86) must
-    # NOT be flagged on capability (major 8 >= 8); the bigger A100 also clears the A6000 VRAM bar.
-    assert _gpu_mismatch_reason("RTX A6000", (8, 0), 79.0, 12.8) is None
+    # Minor is NOT capability-ordered: an A100 (sm80, major 8) substituted for an A10 (sm86) must
+    # NOT be flagged on capability (major 8 >= 8); the bigger A100 also clears the A10 VRAM bar.
+    assert _gpu_mismatch_reason("A10", (8, 0), 79.0, 12.8) is None
 
 
 def test_mismatch_reason_best_effort_on_unknowns():

@@ -35,6 +35,16 @@ def test_gpu_tflops_known_and_default():
     assert gpu_tflops("totally-unknown-gpu") == 100.0  # documented default
 
 
+def test_lambda_a100_40gb_band_has_real_tflops():
+    # Removing A6000 exposes the Lambda-only `A100 SXM 40GB` as the cheapest fit for the 33-40 GB
+    # band on the Lambda path; it must carry a real TFLOPS figure rather than fall back to
+    # _DEFAULT_TFLOPS, or Lambda cost quotes overstate runtime ~3x for that band.
+    pick = pick_gpu(35, provider="lambda")
+    assert pick == "A100 SXM 40GB"
+    assert gpu_tflops(pick) == GPU_COMPUTE_TFLOPS["A100 SXM 40GB"]
+    assert gpu_tflops(pick) > 100.0  # not the _DEFAULT_TFLOPS fallback
+
+
 def test_pricing_and_vram_track_the_registry():
     for name, g in GPU_INFO.items():
         assert gpu_hourly_usd(name) == g.hourly_usd
@@ -50,11 +60,11 @@ def test_unknown_gpu_lookup_raises():
 
 def test_pick_gpu_cheapest_fit_no_validation_gate():
     # No validation gate: every fitting class is eligible, ranked by static rate. The cheapest
-    # managed card is the 48 GB RTX A6000 ($0.49), so anything that fits <=48 GB lands on it.
-    assert pick_gpu(12) == "RTX A6000"
-    assert pick_gpu(24) == "RTX A6000"
-    # 40-48 GB still fits the RTX A6000 (48 GB, $0.49 — the cheapest static rate).
-    assert pick_gpu(40) == "RTX A6000"
+    # managed card is the 24 GB RTX 4090 ($0.69), so anything that fits <=24 GB lands on it.
+    assert pick_gpu(12) == "RTX 4090"
+    assert pick_gpu(24) == "RTX 4090"
+    # 40 GB has no card between the 32 GB RTX 5090 and the 80 GB A100 PCIe ($1.39, the cheapest fit).
+    assert pick_gpu(40) == "A100 PCIe"
 
 
 def test_pick_gpu_result_actually_fits_and_is_cheapest():
@@ -89,4 +99,4 @@ def test_pick_gpu_impossible_raises():
 
 def test_pick_gpu_auto_matches_default():
     assert pick_gpu(24, provider="auto") == pick_gpu(24)
-    assert pick_gpu(12) == "RTX A6000"
+    assert pick_gpu(12) == "RTX 4090"
