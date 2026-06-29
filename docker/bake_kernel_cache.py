@@ -196,10 +196,11 @@ def main() -> int:
         else:
             # Non-success (timeout / pod_died): the pod-side out/ (STARTED marker, warmup.log) lives in
             # the temp dataset the `finally` below deletes, so pull + print it FIRST. out/STARTED present
-            # = the warmup entrypoint ran (a timeout then means it hung / was slow); STARTED absent = the
-            # pod ran the wrong entrypoint and the warmup never started. warmup.log is only uploaded
-            # AFTER the warmup process returns, so it's present only if the warmup finished/was killed,
-            # not on a pure mid-run hang.
+            # = the warmup entrypoint ran (a timeout then means it hung / was slow); STARTED absent is
+            # AMBIGUOUS -- either the pod ran the wrong entrypoint, or the best-effort STARTED upload
+            # failed while the warmup is still running (the pod log disambiguates). warmup.log is only
+            # uploaded AFTER the warmup process returns, so it's present only if the warmup
+            # finished/was killed, not on a pure mid-run hang.
             log(f"outcome={outcome}: pulling pod-side out/ for diagnostics before cleanup")
             try:
                 dbg = os.path.join(args.out, ".dbg")
@@ -229,8 +230,18 @@ def main() -> int:
                             "no warmup.log (warmup never returned -> mid-run hang or still running at deadline)"
                         )
                 else:
+                    # Ambiguous: out/STARTED is uploaded best-effort BEFORE warmup, and the cache tree
+                    # only lands AFTER warmup returns. So an empty out/ means EITHER the entrypoint
+                    # never ran (wrong CMD / docker_args) OR the STARTED upload failed while warmup is
+                    # still mid-run. The pod retries that upload 3x, so a dropped marker is unlikely and
+                    # wrong-entrypoint is the probable cause -- but don't assert it. The only proof is
+                    # the pod's OWN console (its "[bake] uploaded out/STARTED" / WARNING lines), which
+                    # this helper can't fetch (pod terminated below) -> read it in the RunPod dashboard.
                     log(
-                        "pod produced NO out/ -> the warmup entrypoint never ran (wrong CMD / docker_args)"
+                        "pod produced NO out/ -> warmup entrypoint probably never ran "
+                        "(wrong CMD / docker_args); the only other cause is a failed out/STARTED "
+                        "upload mid-run (unlikely, it retries 3x) -- confirm via the pod console "
+                        "in the RunPod dashboard (this CI log does not capture pod stdout)"
                     )
                 shutil.rmtree(dbg, ignore_errors=True)
             except Exception as e:
