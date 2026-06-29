@@ -474,12 +474,10 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     resolved_ref = _resolve_ref_sha(parsed, pinned_sha=pinned_sha)
     extract_subdir = _managed_hub_extract_subdir(parsed)
     local_path = _path_relative_to_subdir(parsed.path, extract_subdir)
-    cache_key = hashlib.sha256(
-        (
-            f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}"
-            f":subdir={extract_subdir}"
-        ).encode()
-    ).hexdigest()[:24]
+    cache_identity = f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}"
+    if extract_subdir:
+        cache_identity = f"{cache_identity}:subdir={extract_subdir}"
+    cache_key = hashlib.sha256(cache_identity.encode()).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
     env_file = cache_dir / local_path
     if env_file.is_dir():

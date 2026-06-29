@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import tarfile
 import urllib.request
@@ -642,3 +643,7 @@ def test_resolve_github_env_extracts_repo_level_siblings(monkeypatch, tmp_path):
 
     assert env_file.is_file()
     assert (env_file.parents[1] / "datasets" / "train.jsonl").is_file()
+    expected_cache_key = hashlib.sha256(
+        f"github:owner/repo@{'a' * 40}:envs/e/environment.py".encode()
+    ).hexdigest()[:24]
+    assert env_file == tmp_path / "cache" / expected_cache_key / "envs/e/environment.py"
