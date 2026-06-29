@@ -23,15 +23,18 @@ def serving_max_lora_rank(model_id: str | None) -> int:
     Unknown/open-policy models do not have catalog serving capacity locally, so keep the historical
     rank-32 fallback for the VL recombine guard.
     """
-    if model_id:
+    if isinstance(model_id, str) and model_id:
         try:
             from flash.catalog import get_model
 
             serving = get_model(model_id).serving
-        except ValueError:
+        except (ValueError, TypeError):
             serving = None
         if serving is not None:
-            return int(serving.max_lora_rank)
+            try:
+                return int(serving.max_lora_rank)
+            except (TypeError, ValueError):
+                pass
     return DEFAULT_SERVING_MAX_LORA_RANK
 
 
