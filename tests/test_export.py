@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+BASE_MODEL = "Qwen/Qwen3.5-0.8B"
+
 
 def _install_fake_hub(monkeypatch, *, download, hf_api):
     """Inject a fake ``huggingface_hub`` module exposing HfApi + snapshot_download."""
@@ -91,6 +93,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
         source_token="hf_operator",
         private=True,
     )
@@ -134,7 +137,6 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
     """
     uploaded: dict = {}
     temp_base = "/tmp/flash_sft_merged_abcd1234"
-    real_base = "Qwen/Qwen3.5-0.8B"
 
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
@@ -182,11 +184,11 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
         dest_repo="me/adapters",
         dest_token="hf_user",
         source_token="hf_operator",
-        base_model=real_base,
+        base_model=BASE_MODEL,
     )
 
-    assert uploaded["adapter_config"]["base_model_name_or_path"] == real_base
-    assert f"base_model: {real_base}" in uploaded["readme"]
+    assert uploaded["adapter_config"]["base_model_name_or_path"] == BASE_MODEL
+    assert BASE_MODEL in uploaded["readme"]
     assert temp_base not in uploaded["readme"]
 
 
@@ -235,6 +237,7 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
         source_token="hf_operator",
     )
     # Static, adapter-scoped delete patterns: ``adapter_model*`` clears a stale ``.bin`` (and sharded /
@@ -283,6 +286,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
         source_token="hf_operator",
         private=False,
     )
@@ -327,6 +331,7 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
         source_token="hf_operator",
         private=True,
     )
@@ -370,6 +375,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
     )
     assert seen["token"] == "hf_from_env"  # no source_token -> HF_TOKEN
 
@@ -392,6 +398,7 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
             source_subfolder="rl/run-x/seed0/adapter",
             dest_repo="me/adapters",
             dest_token="hf_user",
+            base_model=BASE_MODEL,
             source_token="hf_operator",
         )
 
@@ -428,6 +435,7 @@ def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
             source_subfolder="rl/run-x/seed0/adapter",
             dest_repo="me/adapters",
             dest_token="hf_user",
+            base_model=BASE_MODEL,
             source_token="hf_operator",
         )
     assert not uploaded["called"], "must reject before touching the destination repo"
@@ -452,6 +460,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
             source_subfolder="rl/run-x/seed0/adapter",
             dest_repo="me/adapters",
             dest_token="hf_user",
+            base_model=BASE_MODEL,
             source_token="hf_operator",
         )
 
@@ -525,6 +534,7 @@ def test_export_missing_operator_token_raises_runtime_error_not_serving_error(mo
             source_subfolder="runs/r/adapter",
             dest_repo="me/out",
             dest_token="hf_dest",
+            base_model=BASE_MODEL,
             source_token=None,
         )
     assert not isinstance(ei.value, ServingError)  # NOT the 502 path

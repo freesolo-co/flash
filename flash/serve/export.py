@@ -20,11 +20,15 @@ logger = get_logger(__name__)
 # Delete stale adapter artifacts on re-export so old weights can't linger beside new ones.
 # Scoped to PEFT filenames only — never touch the user's unrelated repo files.
 _STALE_ADAPTER_DELETE_PATTERNS = ["adapter_model*", "adapter_config.json"]
+_TEMP_MERGED_BASE_MODEL_RE = re.compile(
+    r"(?:/[^\s\"'`,\]\){}]+)*/flash_sft_merged_[^\s\"'`,\]\){}]+"
+)
 
 
-def _normalize_base_model(base_model: str | None) -> str | None:
-    base_model = (base_model or "").strip()
-    return base_model or None
+def _clean_base_model(base_model: str) -> str:
+    if not isinstance(base_model, str) or not base_model.strip():
+        raise RuntimeError("base_model is required to export adapter metadata")
+    return base_model.strip()
 
 
 def _rewrite_adapter_config_base_model(adapter_dir: Path, base_model: str) -> bool:
@@ -46,59 +50,23 @@ def _rewrite_adapter_config_base_model(adapter_dir: Path, base_model: str) -> bo
     return changed
 
 
-def _rewrite_readme_base_model(adapter_dir: Path, base_model: str) -> bool:
+def _rewrite_readme_temp_base_model(adapter_dir: Path, base_model: str) -> bool:
     path = adapter_dir / "README.md"
     try:
         text = path.read_text()
     except OSError:
         return False
-    lines = text.splitlines(keepends=True)
-    if not lines or lines[0].strip() != "---":
+    repaired = _TEMP_MERGED_BASE_MODEL_RE.sub(base_model, text)
+    if repaired == text:
         return False
-    end = None
-    for i, line in enumerate(lines[1:], start=1):
-        if line.strip() == "---":
-            end = i
-            break
-    if end is None:
-        return False
-
-    metadata = lines[1:end]
-    rewritten: list[str] = []
-    found = False
-    changed = False
-    j = 0
-    top_level_key = re.compile(r"^[A-Za-z0-9_-]+:\s*")
-    while j < len(metadata):
-        line = metadata[j]
-        if line.startswith("base_model:"):
-            found = True
-            replacement = f"base_model: {base_model}\n"
-            rewritten.append(replacement)
-            changed = changed or line != replacement
-            j += 1
-            while j < len(metadata) and not top_level_key.match(metadata[j]):
-                changed = True
-                j += 1
-            continue
-        rewritten.append(line)
-        j += 1
-
-    if not found:
-        rewritten.insert(0, f"base_model: {base_model}\n")
-        changed = True
-    if changed:
-        path.write_text("".join([lines[0], *rewritten, *lines[end:]]))
-    return changed
+    path.write_text(repaired)
+    return True
 
 
-def _repair_export_metadata(adapter_dir: Path, base_model: str | None) -> None:
-    base_model = _normalize_base_model(base_model)
-    if not base_model:
-        return
+def _repair_export_metadata(adapter_dir: Path, base_model: str) -> None:
     changed = 0
     changed += int(_rewrite_adapter_config_base_model(adapter_dir, base_model))
-    changed += int(_rewrite_readme_base_model(adapter_dir, base_model))
+    changed += int(_rewrite_readme_temp_base_model(adapter_dir, base_model))
     if changed:
         logger.info("repaired exported adapter metadata base_model=%s", base_model)
 
@@ -121,11 +89,12 @@ def export_adapter(
     source_subfolder: str,
     dest_repo: str,
     dest_token: str,
+    base_model: str,
     source_token: str | None = None,
     private: bool = True,
-    base_model: str | None = None,
 ) -> str:
     """Copy adapter ``source_repo:{source_subfolder}`` into ``dest_repo`` and return its URL."""
+    base_model = _clean_base_model(base_model)
     HfApi, snapshot_download = _hf_api()
     read_token = source_token or os.environ.get("HF_TOKEN")
     if not read_token:
