@@ -17,6 +17,10 @@ class RunConfig:
     method: str  # "sft" | "grpo"
     steps: int
 
+    # SFT only: actual training tokens across all epochs. When present, SFT dollars are priced
+    # from this token count instead of the padded batch_size * seq_len slot estimate.
+    train_tokens: int | None = None
+
     # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
     # GRPO default mirrors the worker's max(1024, max_prompt_len + completion); see normalized().
     seq_len: int | None = None
@@ -49,6 +53,8 @@ class RunConfig:
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")
+        if self.train_tokens is not None and self.train_tokens < 1:
+            raise ValueError(f"train_tokens must be >= 1, got {self.train_tokens}")
 
     @property
     def is_grpo(self) -> bool:
@@ -102,7 +108,11 @@ class RunConfig:
 
 @dataclass(frozen=True)
 class CostEstimate:
-    """A pre-flight estimate. ``total_usd`` = ``wall_clock_hours * gpu_hourly_usd``, no multiplier."""
+    """A pre-flight estimate.
+
+    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is
+    reported as elapsed wall time but is not billed to the user estimate.
+    """
 
     model_id: str
     method: str
@@ -124,6 +134,10 @@ class CostEstimate:
     def wall_clock_hours(self) -> float:
         return self.wall_clock_seconds / 3600.0
 
+    @property
+    def billable_hours(self) -> float:
+        return self.train_seconds / 3600.0
+
     def breakdown(self) -> str:
         """Multi-line itemized breakdown for CLI output."""
         lines = [
@@ -133,11 +147,12 @@ class CostEstimate:
             f"@ ${self.gpu_hourly_usd:.2f}/hr",
             f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + model load"
             + (" + vLLM init" if self.method == "grpo" else "")
-            + ")",
+            + "; not billed)",
             f"Per step   : {self.seconds_per_step:.2f} s",
             f"Train      : {self.train_seconds / 60:.1f} min"
             + ("  [CAPPED at the wall-clock limit]" if self.wall_capped else ""),
             f"Wall clock : {self.wall_clock_hours:.2f} h",
+            f"Billable   : {self.billable_hours:.2f} h (training only)",
             f"TOTAL      : ${self.total_usd:.2f}",
         ]
         if self.notes:
