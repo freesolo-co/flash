@@ -102,13 +102,15 @@ class Deployment:
 
 def servable_gpu(gpu_name: str) -> str:
     """Resolve a canonical RunPod GPU class for the deployment record (informational)."""
-    from flash.providers.base import GPU_INFO, cheapest_gpu
+    from flash.providers.base import GPU_INFO, cheapest_gpu, get_gpu_info
 
     friendly = canonical_gpu(gpu_name)
-    info = GPU_INFO[friendly]
-    if info.enum_member:  # a RunPod class — serve it directly
+    info = get_gpu_info(friendly)  # resolves retired classes too (canonical_gpu now accepts them)
+    # A current RunPod class serves directly; a Lambda-only OR retired class (the latter is not in
+    # GPU_INFO and is no longer provisionable) maps to the cheapest current RunPod class that fits.
+    if friendly in GPU_INFO and info.enum_member:
         return friendly
-    return cheapest_gpu(info.vram_gb)  # else the cheapest RunPod class that fits
+    return cheapest_gpu(info.vram_gb)
 
 
 def deploy_adapter(
