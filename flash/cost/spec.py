@@ -6,6 +6,7 @@ from their final recorded ``cost_usd`` instead of charging this estimate at subm
 from __future__ import annotations
 
 import math
+import random
 
 from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
@@ -30,7 +31,13 @@ def _env_rows(env_id: str, params: dict | None = None) -> list | None:
         rows = env.dataset()
     except Exception:
         return None
-    return list(rows) if rows is not None else None
+    if rows is None:
+        return None
+    try:
+        len(rows)
+        return rows
+    except Exception:
+        return list(rows)
 
 
 def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
@@ -102,6 +109,33 @@ def _sft_steps_from_examples(spec, examples: int, *, apply_cap: bool) -> int:
     return min(n, cap) if apply_cap and cap > 0 else n
 
 
+def _indexable_dataset_rows(env) -> object | None:
+    try:
+        rows = env.dataset()
+    except Exception:
+        return None
+    if rows is None:
+        return None
+    try:
+        n = len(rows)
+        if n:
+            rows[0]
+        return rows
+    except Exception:
+        try:
+            return list(rows)
+        except Exception:
+            return None
+
+
+def _sft_selected_row_indexes(rows, max_examples: int) -> list[int]:
+    from flash.spec import FIXED_SEED
+
+    order = list(range(len(rows)))
+    random.Random(FIXED_SEED).shuffle(order)
+    return order[:max_examples] if max_examples > 0 else order
+
+
 def count_sft_train_tokens(spec) -> int | None:
     """Actual SFT training tokens across epochs, or ``None`` if local token counting is unavailable.
 
@@ -115,45 +149,55 @@ def count_sft_train_tokens(spec) -> int | None:
     env = _load_env(spec.environment.id, spec.environment.params)
     if env is None:
         return None
-    try:
-        rows = list(env.dataset() or [])
-    except Exception:
+    rows = _indexable_dataset_rows(env)
+    if rows is None:
         return None
     max_examples = int(spec.train.max_examples) if spec.train.max_examples else 0
-    if max_examples > 0:
-        rows = rows[:max_examples]
-    if not rows:
+    row_indexes = _sft_selected_row_indexes(rows, max_examples)
+    if not row_indexes:
         return None
 
     try:
         from transformers import AutoTokenizer
 
-        from flash.engine.worker.packing import tokenize_for_packing
+        from flash.engine.worker.sft import _pretokenize_completion_only
 
         tok = AutoTokenizer.from_pretrained(spec.model, trust_remote_code=True)
         if getattr(tok, "pad_token", None) is None:
             tok.pad_token = tok.eos_token
-        texts: list[str] = []
-        for ex in rows:
+        texts: list[dict[str, str]] = []
+        for idx in row_indexes:
+            ex = rows[idx]
             prompt_messages = list(env.prompt_messages(ex) or [])
             completion = list(env.sft_completion(ex) or [])
             msgs = [*prompt_messages, *completion]
             texts.append(
-                tok.apply_chat_template(
-                    msgs,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    enable_thinking=bool(spec.thinking),
-                )
+                {
+                    "text": tok.apply_chat_template(
+                        msgs,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        enable_thinking=bool(spec.thinking),
+                    ),
+                    "prompt_text": tok.apply_chat_template(
+                        prompt_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=bool(spec.thinking),
+                    ),
+                }
             )
-        token_rows = tokenize_for_packing(texts, tok, _sft_seq_len(spec))
-        tokens = sum(len(ids) for ids in token_rows)
+        _, token_rows, _ = _pretokenize_completion_only(texts, tok, _sft_seq_len(spec))
+        tokens = sum(len(row["input_ids"]) for row in token_rows)
     except Exception:
+        return None
+    if not token_rows:
         return None
 
     total = max(1, tokens * _sft_epochs(spec))
-    uncapped_steps = _sft_steps_from_examples(spec, len(rows), apply_cap=False)
-    capped_steps = _sft_steps_from_examples(spec, len(rows), apply_cap=True)
+    trainable_examples = len(token_rows)
+    uncapped_steps = _sft_steps_from_examples(spec, trainable_examples, apply_cap=False)
+    capped_steps = _sft_steps_from_examples(spec, trainable_examples, apply_cap=True)
     if capped_steps < uncapped_steps:
         total = max(1, math.ceil(total * capped_steps / uncapped_steps))
     return total
