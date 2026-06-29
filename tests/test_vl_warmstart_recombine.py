@@ -227,10 +227,16 @@ def test_init_adapter_model_uses_model_specific_serving_cap(tmp_path, monkeypatc
     monkeypatch.setattr(worker_adapter, "_download_adapter", lambda _prefix: sft)
     monkeypatch.setattr(worker_adapter, "adapter_is_vl_warmstart", lambda _adir, _model_id: True)
     monkeypatch.setattr(worker_adapter, "optimal_attn_impl", lambda: None)
+
+    def fake_merge(_adir, _model_id, _attn_kw):
+        W._VL_WARMSTART_SFT_DIR = _adir
+        W._VL_WARMSTART_MODEL_ID = _model_id
+        return merged
+
     monkeypatch.setattr(
         worker_adapter,
         "_merge_vl_warmstart_adapter",
-        lambda _adir, _model_id, _attn_kw: merged,
+        fake_merge,
     )
     monkeypatch.setattr(worker_adapter, "make_lora", lambda model_id: {"model_id": model_id})
     monkeypatch.setattr(W, "_VL_WARMSTART_MODEL_ID", None, raising=False)
@@ -251,6 +257,27 @@ def test_init_adapter_model_uses_model_specific_serving_cap(tmp_path, monkeypatc
         {"model_id": merged},
     )
     assert W._VL_WARMSTART_MODEL_ID == "Qwen/Qwen3.5-2B"
+
+
+def test_init_adapter_model_clears_stale_vl_warmstart_state(monkeypatch):
+    import flash.engine.worker.adapter as worker_adapter
+
+    monkeypatch.setattr(worker_adapter, "make_lora", lambda model_id: {"model_id": model_id})
+    monkeypatch.setattr(W, "_VL_WARMSTART_SFT_DIR", "/tmp/stale-sft", raising=False)
+    monkeypatch.setattr(W, "_VL_WARMSTART_MODEL_ID", "Qwen/Qwen3.5-2B", raising=False)
+    monkeypatch.setattr(
+        W,
+        "JOB_SPEC",
+        types.SimpleNamespace(train=types.SimpleNamespace(init_from_adapter="")),
+        raising=False,
+    )
+
+    assert worker_adapter._init_adapter_model("Qwen/Qwen3.5-4B") == (
+        "Qwen/Qwen3.5-4B",
+        {"model_id": "Qwen/Qwen3.5-4B"},
+    )
+    assert W._VL_WARMSTART_SFT_DIR is None
+    assert W._VL_WARMSTART_MODEL_ID is None
 
 
 def test_recombine_rejects_mismatched_target_modules(tmp_path):

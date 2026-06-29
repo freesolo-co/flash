@@ -175,6 +175,10 @@ ACTIVE_ENV = None
 # so the saved adapter is SFT-less and MUST be recombined with this SFT before deploy. Stays None for
 # fresh-LoRA and continued-adapter (non-VL) runs, whose saved adapter is already deployable as-is.
 _VL_WARMSTART_SFT_DIR: str | None = None
+# The selected catalog model for the same VL warm-start path. Finalize uses it to enforce the same
+# model-specific serving rank cap that init-time preflight used, even if the SFT adapter config lacks
+# base_model_name_or_path.
+_VL_WARMSTART_MODEL_ID: str | None = None
 
 
 def require_active_env():

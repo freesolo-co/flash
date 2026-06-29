@@ -112,11 +112,14 @@ def _merge_vl_warmstart_adapter(adir: str, model_id: str, attn_kw: dict) -> str:
     # The saved GRPO LoRA will be SFT-less (trained on the merged base), so finalize MUST recombine it
     # with this SFT before deploy (recombined_warmstart_adapter_dir).
     _w._VL_WARMSTART_SFT_DIR = adir
+    _w._VL_WARMSTART_MODEL_ID = model_id
     return merged_dir
 
 
 def _init_adapter_model(model_id: str):
     """Load init_from_adapter as a trainable PeftModel, or return model_id + fresh LoRA."""
+    _w._VL_WARMSTART_SFT_DIR = None
+    _w._VL_WARMSTART_MODEL_ID = None
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     if not prefix:
         return model_id, make_lora(model_id)
@@ -143,7 +146,6 @@ def _init_adapter_model(model_id: str):
             f"SFT rank {sft_rank} + GRPO rank {grpo_rank} = deploy rank {recombined_rank} "
             f"(serving cap {max_rank})"
         )
-        _w._VL_WARMSTART_MODEL_ID = model_id
         merged_dir = _merge_vl_warmstart_adapter(adir, model_id, attn_kw)
         print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
         return merged_dir, make_lora(merged_dir)
