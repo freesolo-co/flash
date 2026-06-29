@@ -563,7 +563,9 @@ def validate_recombined_lora_rank(
     )
 
 
-def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
+def recombine_lora_adapters(
+    sft_dir: str, grpo_dir: str, out_dir: str, *, model_id: str | None = None
+) -> int:
     """Stack two LoRA adapters (SFT ⊕ GRPO) into ONE rank-(r_sft+r_grpo) adapter in ``out_dir``.
 
     The VL warm-start path (#296) MERGES the SFT into the base and trains a FRESH LoRA on the merged
@@ -578,7 +580,9 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
 
     Both adapters must target the SAME modules (true for managed flash: target_modules is
     model-derived, not user-set) and be plain LoRA — DoRA / ``modules_to_save`` / non-LoRA tensors
-    raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead).
+    raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead). ``model_id`` is the
+    selected GRPO job model when known; passing it keeps this finalize guard on the same serving cap
+    the init-time preflight used, even if the SFT adapter config lacks base metadata.
     """
     import json
     import math
@@ -709,7 +713,7 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
     s_sft, s_grpo = _scale(sft_cfg), _scale(grpo_cfg)
     r_sft, r_grpo = int(sft_cfg["r"]), int(grpo_cfg["r"])
     r_out = r_sft + r_grpo
-    max_rank = serving_max_lora_rank(sft_cfg.get("base_model_name_or_path"))
+    max_rank = serving_max_lora_rank(model_id or sft_cfg.get("base_model_name_or_path"))
     if r_out > max_rank:
         raise ValueError(
             "recombine: rank-stacked SFT+GRPO adapter would be "

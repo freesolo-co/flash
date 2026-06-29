@@ -143,6 +143,7 @@ def _init_adapter_model(model_id: str):
             f"SFT rank {sft_rank} + GRPO rank {grpo_rank} = deploy rank {recombined_rank} "
             f"(serving cap {max_rank})"
         )
+        _w._VL_WARMSTART_MODEL_ID = model_id
         merged_dir = _merge_vl_warmstart_adapter(adir, model_id, attn_kw)
         print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
         return merged_dir, make_lora(merged_dir)
@@ -198,7 +199,12 @@ def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
 
     out_dir = tempfile.mkdtemp(prefix="flash_recomb_adapter_")
     try:
-        rank = recombine_lora_adapters(sft_adir, src_adapter_dir, out_dir)
+        rank = recombine_lora_adapters(
+            sft_adir,
+            src_adapter_dir,
+            out_dir,
+            model_id=getattr(_w, "_VL_WARMSTART_MODEL_ID", None),
+        )
         # Carry tokenizer/aux files from the raw save (serving uses the base tokenizer, but keep the
         # deployed dir at parity with the un-recombined save); the recombined config+weights stay.
         # Skip trainer state — for the per-step path src is a `checkpoint-<n>` dir carrying optimizer/

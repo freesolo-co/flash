@@ -233,6 +233,7 @@ def test_init_adapter_model_uses_model_specific_serving_cap(tmp_path, monkeypatc
         lambda _adir, _model_id, _attn_kw: merged,
     )
     monkeypatch.setattr(worker_adapter, "make_lora", lambda model_id: {"model_id": model_id})
+    monkeypatch.setattr(W, "_VL_WARMSTART_MODEL_ID", None, raising=False)
     monkeypatch.setattr(
         W,
         "JOB_SPEC",
@@ -249,6 +250,7 @@ def test_init_adapter_model_uses_model_specific_serving_cap(tmp_path, monkeypatc
         merged,
         {"model_id": merged},
     )
+    assert W._VL_WARMSTART_MODEL_ID == "Qwen/Qwen3.5-2B"
 
 
 def test_recombine_rejects_mismatched_target_modules(tmp_path):
@@ -468,6 +470,23 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
         assert torch.allclose(
             _delta(out, m_text), _delta(sft, m_sft) + _delta(grpo, m_text), atol=1e-6, rtol=1e-5
         )
+
+
+def test_orchestrator_recombine_uses_recorded_model_cap(tmp_path, monkeypatch):
+    # Regression: init preflight uses the selected model's serving cap, so finalize must use the
+    # same cap instead of falling back to rank 32 when the SFT adapter lacks base_model_name_or_path.
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=32, alpha=64, seed=2)
+    _set_base(sft, None)
+    monkeypatch.setattr(W, "_VL_WARMSTART_SFT_DIR", sft, raising=False)
+    monkeypatch.setattr(W, "_VL_WARMSTART_MODEL_ID", "Qwen/Qwen3.5-2B", raising=False)
+
+    out = W.recombined_warmstart_adapter_dir(grpo)
+
+    assert out is not None
+    assert _read_cfg(out)["r"] == 64
 
 
 def test_orchestrator_cleans_temp_dir_when_recombine_fails(tmp_path, monkeypatch):
