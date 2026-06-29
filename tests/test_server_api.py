@@ -1792,6 +1792,7 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     assert seen["dest_repo"] == "me/adapters"
     assert seen["dest_token"] == "hf_user"
     assert seen["private"] is True  # private by default
+    assert seen["base_model"] == SPEC["model"]
 
 
 def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
@@ -2011,6 +2012,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     assert ok.status_code == 200, ok.text
     assert ok.json()["step"] == 40
     assert seen["source_subfolder"] == f"rl/{run_id}/checkpoints/step-40/adapter"
+    assert seen["base_model"] == SPEC["model"]
 
     bad = api.post(
         f"/v1/runs/{run_id}/export",
