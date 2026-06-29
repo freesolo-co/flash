@@ -33,7 +33,8 @@ from flash.engine.worker.lora import (
 # Realistic Qwen3.5 VL adapter key stems. The SFT adapter is trained against the FULL multimodal
 # model, so its LM modules live under ``language_model.`` (MODULES). The fresh GRPO LoRA is saved by
 # the text-only AutoModelForCausalLM trainer, so the SAME modules have no infix (TEXT_MODULES). The
-# recombine must line these equivalent modules up (normalize the infix) and emit the text-only form.
+# recombine must line these equivalent modules up for math, then emit the serving-compatible
+# language_model form.
 MODULES = [
     "base_model.model.model.language_model.layers.0.self_attn.q_proj",
     "base_model.model.model.language_model.layers.0.self_attn.v_proj",
@@ -109,24 +110,24 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
     assert out_cfg["lora_alpha"] == r_sft + r_grpo
     assert out_cfg["use_rslora"] is False
 
-    # Output is emitted in the text-only key form (the form serving deploys on the catalog base);
-    # no `.language_model.` infix survives.
+    # Output is emitted in the VL SFT key namespace; serving expects the language_model wrapper.
     out_sd = load_file(os.path.join(out, "adapter_model.safetensors"))
-    assert all(".language_model." not in k for k in out_sd), "recombined keys must be text-only"
+    assert all(".language_model." in k for k in out_sd), "recombined keys must target language_model"
+    assert not any(k.startswith("base_model.model.model.layers.") for k in out_sd)
 
-    # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base. SFT's
-    # infixed module maps to the text-only module the GRPO and output adapters use.
+    # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base. GRPO's
+    # text-only module maps back to the language_model module the SFT and output adapters use.
     for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True):
         want = _delta(sft, m_sft) + _delta(grpo, m_text)
-        got = _delta(out, m_text)
-        assert torch.allclose(got, want, atol=1e-6, rtol=1e-5), f"{m_text}: recombine delta mismatch"
+        got = _delta(out, m_sft)
+        assert torch.allclose(got, want, atol=1e-6, rtol=1e-5), f"{m_sft}: recombine delta mismatch"
 
 
 def test_recombine_normalizes_language_model_infix(tmp_path):
     # Regression: the default Qwen3.5 VL warm-start saves an infixed SFT adapter and a text-only
     # GRPO LoRA. The recombine must treat the equivalent LM modules as the SAME target (not raise
-    # "DIFFERENT modules") and emit text-only keys — otherwise it never publishes the recombined
-    # adapter for the main path.
+    # "DIFFERENT modules") and emit language_model keys — otherwise the artifact does not load under
+    # the serving wrapper.
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
@@ -138,8 +139,9 @@ def test_recombine_normalizes_language_model_infix(tmp_path):
 
     out_sd = load_file(os.path.join(out, "adapter_model.safetensors"))
     out_modules = {k.rsplit(".lora_", 1)[0] for k in out_sd}
-    assert out_modules == set(TEXT_MODULES), "recombined modules must be the normalized text-only set"
-    assert all(".language_model." not in k for k in out_sd)
+    assert out_modules == set(MODULES), "recombined modules must use the serving language_model set"
+    assert all(".language_model." in k for k in out_sd)
+    assert not any(k.startswith("base_model.model.model.layers.") for k in out_sd)
 
 
 def test_recombined_rank_preflight_allows_sum_at_serving_cap(tmp_path):
@@ -491,11 +493,11 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
     assert _read_cfg(out)["r"] == 8  # r_sft + r_grpo
     assert os.path.isfile(os.path.join(out, "special_tokens_map.json"))  # aux carried over
     assert not os.path.exists(os.path.join(out, "optimizer.pt"))  # trainer state skipped
-    # exactness: recombined delta == SFT_delta + GRPO_delta. Output is text-only, so the infixed
-    # SFT module maps to the text-only module the GRPO and recombined output use.
+    # exactness: recombined delta == SFT_delta + GRPO_delta. Output uses the serving language_model
+    # namespace, so the text-only GRPO module maps back to the SFT/output module.
     for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True):
         assert torch.allclose(
-            _delta(out, m_text), _delta(sft, m_sft) + _delta(grpo, m_text), atol=1e-6, rtol=1e-5
+            _delta(out, m_sft), _delta(sft, m_sft) + _delta(grpo, m_text), atol=1e-6, rtol=1e-5
         )
 
 
