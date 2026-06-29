@@ -10,6 +10,7 @@ import pytest
 from flash.cli.commands import cmd_train
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
+from flash.cost.types import RunConfig
 from flash.engine.recipe import RECIPE
 from flash.schema import spec_from_dict
 
@@ -149,21 +150,13 @@ def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
     assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
 
 
-def test_sft_steps_unpinned_falls_back_when_env_cannot_be_counted(monkeypatch, capsys):
-    # A managed Freesolo env may not be importable in the local cost path, so counting returns None.
-    # Pricing must NOT hard-fail: it falls back to a representative default example count so
-    # `flash train --cost` still produces a quote.
-    from flash.cost.spec import DEFAULT_UNCOUNTED_SFT_EXAMPLES
-
+def test_sft_steps_unpinned_requires_countable_env(monkeypatch):
+    # No max_examples means the worker trains the full dataset. If the local cost path cannot
+    # count that dataset, it must fail clearly instead of guessing a magic example count.
     monkeypatch.setattr("flash.cost.spec.count_env_examples", lambda env_id, params=None: None)
     spec = _sft_spec(batch_size=16, epochs=2)
-    steps = _spec_steps(spec)
-    # epochs(2) x ceil(default / 16), using the same realized batch the worker uses.
-    assert steps == _worker_sft_steps(
-        examples=DEFAULT_UNCOUNTED_SFT_EXAMPLES, requested_batch=16, epochs=2
-    )
-    assert steps > 0
-    assert capsys.readouterr().err == ""
+    with pytest.raises(ValueError, match="environment dataset could not be counted"):
+        _spec_steps(spec)
 
 
 def test_sft_steps_pinned_examples_skips_the_uncounted_fallback(monkeypatch, capsys):
@@ -176,6 +169,130 @@ def test_sft_steps_pinned_examples_skips_the_uncounted_fallback(monkeypatch, cap
     spec = _sft_spec(max_examples=320, batch_size=16, epochs=2)
     assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
     assert "could not count" not in capsys.readouterr().err
+
+
+def test_sft_runconfig_carries_actual_train_tokens(monkeypatch):
+    monkeypatch.setattr("flash.cost.spec.count_sft_train_tokens", lambda spec: 190_679)
+    spec = _sft_spec(max_examples=320, batch_size=16, epochs=2)
+    cfg = _runconfig_from_spec(spec)
+    assert cfg.steps == 40
+    assert cfg.train_tokens == 190_679
+
+
+def test_runconfig_preserves_positional_seq_len_compatibility():
+    cfg = RunConfig("Qwen/Qwen3.5-4B", "sft", 10, 2048)
+    assert cfg.seq_len == 2048
+    assert cfg.train_tokens is None
+
+
+def test_sft_train_token_count_renders_and_tokenizes_dataset(monkeypatch):
+    transformers = pytest.importorskip("transformers")
+    from flash.cost.spec import count_sft_train_tokens
+
+    class FakeEnv:
+        def dataset(self):
+            return [{"prompt": "aa", "answer": "bbb"}, {"prompt": "c", "answer": "dddd"}]
+
+        def prompt_messages(self, ex):
+            return [{"role": "user", "content": ex["prompt"]}]
+
+        def sft_completion(self, ex):
+            return [{"role": "assistant", "content": ex["answer"]}]
+
+    class FakeTokenizer:
+        eos_token = "<eos>"
+        pad_token = None
+
+        def apply_chat_template(self, msgs, **kwargs):
+            return "|".join(m["content"] for m in msgs)
+
+        def __call__(self, rows, truncation=False, max_length=None):
+            cap = max_length if truncation and max_length else 10**9
+            return {"input_ids": [list(range(min(len(row), cap))) for row in rows]}
+
+    monkeypatch.setattr("flash.cost.spec._load_env", lambda env_id, params=None: FakeEnv())
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: FakeTokenizer()
+    )
+
+    spec = _sft_spec(max_examples=2, batch_size=16, epochs=3, max_length=100)
+    # Rendered rows: "aa|bbb" and "c|dddd"; tokenize_for_packing appends "<eos>" to each.
+    assert count_sft_train_tokens(spec) == (len("aa|bbb<eos>") + len("c|dddd<eos>")) * 3
+
+
+def test_sft_train_token_count_shuffles_before_max_examples(monkeypatch):
+    transformers = pytest.importorskip("transformers")
+    from flash.cost.spec import count_sft_train_tokens
+
+    class FakeEnv:
+        def dataset(self):
+            return [
+                {"prompt": "a", "answer": "bb"},
+                {"prompt": "ccc", "answer": "dddd"},
+                {"prompt": "eeeee", "answer": "ffffff"},
+            ]
+
+        def prompt_messages(self, ex):
+            return [{"role": "user", "content": ex["prompt"]}]
+
+        def sft_completion(self, ex):
+            return [{"role": "assistant", "content": ex["answer"]}]
+
+    class FakeTokenizer:
+        eos_token = ""
+        pad_token = None
+        all_special_ids = ()
+
+        def apply_chat_template(self, msgs, **kwargs):
+            return "".join(m["content"] for m in msgs)
+
+        def __call__(self, rows, truncation=False, max_length=None):
+            cap = max_length if truncation and max_length else 10**9
+            return {"input_ids": [[ord(ch) for ch in row[:cap]] for row in rows]}
+
+    monkeypatch.setattr("flash.cost.spec._load_env", lambda env_id, params=None: FakeEnv())
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: FakeTokenizer()
+    )
+
+    spec = _sft_spec(max_examples=1, batch_size=16, epochs=1, max_length=100)
+    # random.Random(FIXED_SEED=42).shuffle([0, 1, 2]) selects row 1 first, not row 0.
+    assert count_sft_train_tokens(spec) == len("cccdddd")
+
+
+def test_sft_train_token_count_drops_completion_free_rows(monkeypatch):
+    transformers = pytest.importorskip("transformers")
+    from flash.cost.spec import count_sft_train_tokens
+
+    class FakeEnv:
+        def dataset(self):
+            return [{"prompt": "p", "answer": "xy"}, {"prompt": "drop", "answer": ""}]
+
+        def prompt_messages(self, ex):
+            return [{"role": "user", "content": ex["prompt"]}]
+
+        def sft_completion(self, ex):
+            return [{"role": "assistant", "content": ex["answer"]}]
+
+    class FakeTokenizer:
+        eos_token = ""
+        pad_token = None
+        all_special_ids = ()
+
+        def apply_chat_template(self, msgs, **kwargs):
+            return "".join(m["content"] for m in msgs)
+
+        def __call__(self, rows, truncation=False, max_length=None):
+            cap = max_length if truncation and max_length else 10**9
+            return {"input_ids": [[ord(ch) for ch in row[:cap]] for row in rows]}
+
+    monkeypatch.setattr("flash.cost.spec._load_env", lambda env_id, params=None: FakeEnv())
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: FakeTokenizer()
+    )
+
+    spec = _sft_spec(max_examples=2, batch_size=16, epochs=2, max_length=100)
+    assert count_sft_train_tokens(spec) == len("pxy") * 2
 
 
 def test_sft_max_steps_caps_the_derived_count():
