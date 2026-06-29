@@ -86,6 +86,11 @@ def _resolve_deployable_target(
     is_checkpoint = checkpoint_step is not None
     # A resolved checkpoint step has already proven a servable adapter exists; only final-adapter
     # deploy/export needs the run-state gate because the final adapter exists only after completion.
+    if enforce_state and is_checkpoint and status.state == "dry_run":
+        raise HTTPException(
+            status_code=409,
+            detail=f"run {run_id} is 'dry_run'; dry-run runs cannot be {action}ed",
+        )
     if enforce_state and not is_checkpoint and status.state not in _app._DEPLOYABLE_STATES:
         detail = (
             f"run {run_id} is {status.state!r}; only finished runs with "
@@ -148,18 +153,22 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
         if not dry_run:
+            state_guard = prev_state
             if is_checkpoint:
-                mark_checkpoint_deployed(run_id, dep_dict)
+                state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
+                marked = mark_checkpoint_deployed(
+                    run_id, dep_dict, expect_state=state_guard
+                )
             else:
-                # CAS: if /cancel raced us, the adapter is orphaned — deregister and 409.
                 marked = mark_deployed(run_id, dep_dict, expect_state=prev_state)
-                if marked.state != "deployed":
-                    with contextlib.suppress(Exception):
-                        _app.undeploy_adapter(run_id)
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
-                    )
+            # CAS: if /cancel or /undeploy raced us, the adapter is orphaned — deregister and 409.
+            if state_guard is not None and marked.state != "deployed":
+                with contextlib.suppress(Exception):
+                    _app.undeploy_adapter(run_id)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
+                )
         return dep_dict
 
 

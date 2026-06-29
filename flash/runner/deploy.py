@@ -179,7 +179,9 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
         return status
 
 
-def mark_checkpoint_deployed(run_id: str, deployment: dict) -> RunStatus:
+def mark_checkpoint_deployed(
+    run_id: str, deployment: dict, expect_state: str | None = None
+) -> RunStatus:
     """Record a checkpoint deployment using the run's current lifecycle state.
 
     If training has finished by the time serving registration completes, the run behaves like any
@@ -189,6 +191,10 @@ def mark_checkpoint_deployed(run_id: str, deployment: dict) -> RunStatus:
 
     with _STATUS_LOCK:
         status = get_status(run_id)
+        if status.state == "dry_run":
+            return status
+        if expect_state is not None and status.state != expect_state:
+            return status
         if status.state in _FINAL_DEPLOYMENT_STATES:
             _promote_final_deployment(status, deployment)
         else:
