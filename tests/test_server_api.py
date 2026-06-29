@@ -741,6 +741,48 @@ def test_worker_artifacts_fetches_console_and_latest_attempt_error(monkeypatch, 
     assert "error_rl_attempt0.txt" not in out
 
 
+def test_worker_artifacts_prefers_latest_attempt_console(monkeypatch, tmp_path):
+    """When console output is attempt-scoped, /worker should show the current attempt's tail."""
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "rl/r1/console_rl_attempt0.txt": "stale console\n",
+        "rl/r1/console_rl_attempt2.txt": "current console\n",
+        "rl/r1/error_rl_attempt2.txt": "current traceback\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert out["console_rl_attempt2.txt"] == "current console\n"
+    assert out["error_rl_attempt2.txt"] == "current traceback\n"
+    assert "console_rl_attempt0.txt" not in out
+
+
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()
