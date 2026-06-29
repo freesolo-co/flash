@@ -1,8 +1,8 @@
 """Lambda Cloud $/hr: live ``/instance-types`` rate per class, static fallback.
 
 NB: the static fallback is a Lambda-specific map, NOT ``GpuClass.hourly_usd`` — that field is the
-RunPod secure-cloud snapshot, which differs from Lambda's list price (e.g. RTX A6000 is $0.49 on
-RunPod but $1.09 on Lambda).
+RunPod secure-cloud snapshot, which differs from Lambda's list price (e.g. B200 is $5.89 on
+RunPod but $6.99 on Lambda).
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ from flash._logging import get_logger
 logger = get_logger(__name__)
 
 # Lambda list prices (snapshot 2026-06-25, from /instance-types). Live rates override these.
+# RTX A6000 is retired from the catalog but kept here so an in-flight Lambda A6000 run still bills at
+# the Lambda list price ($1.09), NOT the RunPod snapshot from GpuClass.hourly_usd ($0.49).
 _STATIC_RATES: dict[str, float] = {
     "A10": 1.29,
     "RTX A6000": 1.09,
@@ -22,9 +24,12 @@ _STATIC_RATES: dict[str, float] = {
 
 
 def _static_rate(name: str) -> float:
-    from flash.providers.base import GPU_INFO
+    from flash.providers.base import get_gpu_info
 
-    return _STATIC_RATES.get(name) or GPU_INFO[name].hourly_usd
+    # get_gpu_info (not GPU_INFO[name]) so a retired class still resolves; its Lambda rate lives in
+    # _STATIC_RATES above, so the RunPod-snapshot fallback is only a last resort for a class with no
+    # Lambda static entry at all.
+    return _STATIC_RATES.get(name) or get_gpu_info(name).hourly_usd
 
 
 def hourly_rate(gpu_name: str) -> float:
