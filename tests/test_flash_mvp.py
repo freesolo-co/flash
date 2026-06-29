@@ -19,7 +19,7 @@ def test_catalog_validation():
     assert "grpo" in info.algos
     # 9B is the bf16 GRPO tier (needs an 80 GB-class card; QLoRA was dropped).
     assert validate_model_for_algorithm("Qwen/Qwen3.5-9B", "grpo").id == "Qwen/Qwen3.5-9B"
-    # An sft-only model still rejects grpo (inject one — no catalog entry is sft-only now).
+    # An sft-only model still rejects grpo.
     from flash.catalog import MODELS, ModelInfo
 
     MODELS["test/sft-only"] = ModelInfo(
