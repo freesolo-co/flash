@@ -665,6 +665,15 @@ def recombine_lora_adapters(sft_dir: str, grpo_dir: str, out_dir: str) -> int:
         b_grpo = grpo_sd[bk].to(torch.float32) * s_grpo
         out[out_bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
 
+    if sft_infixed_keys or grpo_infixed_keys:
+        plain_layer_keys = sorted(k for k in out if k.startswith("base_model.model.model.layers."))
+        if plain_layer_keys:
+            raise ValueError(
+                "recombine: VL warm-start output would use plain model.layers LoRA keys "
+                f"(e.g. {plain_layer_keys[:3]}). Serving expects the language_model namespace; "
+                "refusing to write a known-bad GRPO artifact."
+            )
+
     out_cfg = dict(grpo_cfg)
     out_cfg["r"] = r_out
     out_cfg["lora_alpha"] = r_out  # alpha/r == 1.0 (scales already baked into each B block)
