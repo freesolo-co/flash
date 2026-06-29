@@ -6,7 +6,9 @@ the destination model repo, so the user never needs access to internal artifact 
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -18,6 +20,87 @@ logger = get_logger(__name__)
 # Delete stale adapter artifacts on re-export so old weights can't linger beside new ones.
 # Scoped to PEFT filenames only — never touch the user's unrelated repo files.
 _STALE_ADAPTER_DELETE_PATTERNS = ["adapter_model*", "adapter_config.json"]
+
+
+def _normalize_base_model(base_model: str | None) -> str | None:
+    base_model = (base_model or "").strip()
+    return base_model or None
+
+
+def _rewrite_adapter_config_base_model(adapter_dir: Path, base_model: str) -> bool:
+    path = adapter_dir / "adapter_config.json"
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+
+    changed = config.get("base_model_name_or_path") != base_model
+    config["base_model_name_or_path"] = base_model
+    if "base_model" in config and config.get("base_model") != base_model:
+        config["base_model"] = base_model
+        changed = True
+    if changed:
+        path.write_text(json.dumps(config, indent=2) + "\n")
+    return changed
+
+
+def _rewrite_readme_base_model(adapter_dir: Path, base_model: str) -> bool:
+    path = adapter_dir / "README.md"
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return False
+    end = None
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end = i
+            break
+    if end is None:
+        return False
+
+    metadata = lines[1:end]
+    rewritten: list[str] = []
+    found = False
+    changed = False
+    j = 0
+    top_level_key = re.compile(r"^[A-Za-z0-9_-]+:\s*")
+    while j < len(metadata):
+        line = metadata[j]
+        if line.startswith("base_model:"):
+            found = True
+            replacement = f"base_model: {base_model}\n"
+            rewritten.append(replacement)
+            changed = changed or line != replacement
+            j += 1
+            while j < len(metadata) and not top_level_key.match(metadata[j]):
+                changed = True
+                j += 1
+            continue
+        rewritten.append(line)
+        j += 1
+
+    if not found:
+        rewritten.insert(0, f"base_model: {base_model}\n")
+        changed = True
+    if changed:
+        path.write_text("".join([lines[0], *rewritten, *lines[end:]]))
+    return changed
+
+
+def _repair_export_metadata(adapter_dir: Path, base_model: str | None) -> None:
+    base_model = _normalize_base_model(base_model)
+    if not base_model:
+        return
+    changed = 0
+    changed += int(_rewrite_adapter_config_base_model(adapter_dir, base_model))
+    changed += int(_rewrite_readme_base_model(adapter_dir, base_model))
+    if changed:
+        logger.info("repaired exported adapter metadata base_model=%s", base_model)
 
 
 def _hf_api():
@@ -40,6 +123,7 @@ def export_adapter(
     dest_token: str,
     source_token: str | None = None,
     private: bool = True,
+    base_model: str | None = None,
 ) -> str:
     """Copy adapter ``source_repo:{source_subfolder}`` into ``dest_repo`` and return its URL."""
     HfApi, snapshot_download = _hf_api()
@@ -77,6 +161,7 @@ def export_adapter(
                 f"no loadable LoRA adapter at {source_repo}:{source_subfolder} "
                 "(need adapter_config.json + an adapter_model* weight; nothing to export)"
             )
+        _repair_export_metadata(adapter_dir, base_model)
         api = HfApi(token=dest_token)
         try:
             # Always create private first so the repo is never transiently exposed empty/partial.

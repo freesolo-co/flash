@@ -6,6 +6,7 @@ the calls instead of touching the Hub).
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -123,6 +124,70 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     assert calls["upload"]["delete_patterns"] == ["adapter_model*", "adapter_config.json"]
     # The commit is pinned to the repo's current head (concurrent-export guard).
     assert calls["upload"]["parent_commit"] == "parent-sha"
+
+
+def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
+    """Warm-start GRPO can save PEFT/HF metadata pointing at a temporary merged SFT path.
+
+    Export must publish the real catalog base model from the run spec so downstream Hub loaders and
+    model cards do not point at a deleted `/tmp/flash_sft_merged_*` directory.
+    """
+    uploaded: dict = {}
+    temp_base = "/tmp/flash_sft_merged_abcd1234"
+    real_base = "Qwen/Qwen3.5-0.8B"
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text(
+            json.dumps(
+                {
+                    "base_model_name_or_path": temp_base,
+                    "r": 32,
+                    "target_modules": "all-linear",
+                }
+            )
+            + "\n"
+        )
+        (adapter / "README.md").write_text(
+            f"---\nbase_model:\n- {temp_base}\nlibrary_name: peft\n---\n# Adapter\n"
+        )
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, folder_path, **kw):
+            folder = Path(folder_path)
+            uploaded["adapter_config"] = json.loads((folder / "adapter_config.json").read_text())
+            uploaded["readme"] = (folder / "README.md").read_text()
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        source_token="hf_operator",
+        base_model=real_base,
+    )
+
+    assert uploaded["adapter_config"]["base_model_name_or_path"] == real_base
+    assert f"base_model: {real_base}" in uploaded["readme"]
+    assert temp_base not in uploaded["readme"]
 
 
 def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeypatch):
