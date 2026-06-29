@@ -156,15 +156,16 @@ def _append_run_log(run_id: str, message: str) -> None:
         f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
 
 
-def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
-    """Newest attempt-scoped worker error file under prefix (error_<phase>_attempt<N>.txt).
+def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) -> str:
+    """Newest worker artifact file under prefix.
 
-    The worker writes error_<phase>_attempt<N>.txt (see error_artifact_name); on a retried run only the
-    highest attempt is the real final crash. Falls back to attempt0 when the repo can't be listed.
+    Workers historically wrote stable files (``console_rl.txt``), and newer workers may write
+    attempt-scoped files (e.g. ``console_rl_attempt2.txt`` / ``error_rl_attempt2.txt``). On a retried run only the highest attempt is
+    the real current evidence. Falls back to the legacy/default name when the repo can't be listed.
     """
     import re
 
-    default = f"error_{phase}_attempt0.txt"
+    default = f"{kind}_{phase}.txt" if kind == "console" else f"{kind}_{phase}_attempt0.txt"
     try:
         from huggingface_hub import HfApi
 
@@ -173,13 +174,25 @@ def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
         )
     except Exception:
         return default
-    pat = re.compile(rf"^{re.escape(prefix)}/error_{re.escape(phase)}_attempt(\d+)\.txt$")
+    pat = re.compile(
+        rf"^{re.escape(prefix)}/{kind}_{re.escape(phase)}(?:_attempt(\d+))?\.txt$"
+    )
     best: int | None = None
+    best_name: str | None = None
     for f in files:
         m = pat.match(f)
-        if m and (best is None or int(m.group(1)) > best):
-            best = int(m.group(1))
-    return default if best is None else f"error_{phase}_attempt{best}.txt"
+        if not m:
+            continue
+        attempt = int(m.group(1)) if m.group(1) is not None else -1
+        if best is None or attempt > best:
+            best = attempt
+            best_name = os.path.basename(f)
+    return default if best_name is None else best_name
+
+
+def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
+    """Newest worker error file under prefix."""
+    return _latest_worker_artifact_name(repo, prefix, phase, "error")
 
 
 def _worker_artifacts(spec) -> dict[str, str]:
@@ -201,7 +214,10 @@ def _worker_artifacts(spec) -> dict[str, str]:
         return {}
     prefix = adapter_prefix(spec)
     out: dict[str, str] = {}
-    for name in (f"console_{spec.phase}.txt", _latest_error_artifact_name(repo, prefix, spec.phase)):
+    for name in (
+        _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
+        _latest_error_artifact_name(repo, prefix, spec.phase),
+    ):
         try:
             path = hf_hub_download(
                 repo_id=repo,
