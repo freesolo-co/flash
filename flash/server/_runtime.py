@@ -160,7 +160,7 @@ def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) 
     """Newest worker artifact file under prefix.
 
     Workers historically wrote stable files (``console_rl.txt``), and newer workers may write
-    attempt-scoped files (``error_rl_attempt2.txt``). On a retried run only the highest attempt is
+    attempt-scoped files (e.g. ``console_rl_attempt2.txt`` / ``error_rl_attempt2.txt``). On a retried run only the highest attempt is
     the real current evidence. Falls back to the legacy/default name when the repo can't be listed.
     """
     import re
