@@ -137,8 +137,8 @@ def _rank_from_adapter_config(config: dict, *, source: str) -> int:
     try:
         if config.get("r") is not None:
             ranks.append(int(config["r"]))
-        rank_pattern = config.get("rank_pattern") or {}
-        if rank_pattern:
+        if "rank_pattern" in config and config["rank_pattern"] is not None:
+            rank_pattern = config["rank_pattern"]
             if not isinstance(rank_pattern, dict):
                 raise TypeError("rank_pattern is not a mapping")
             ranks.extend(int(v) for v in rank_pattern.values())
@@ -184,6 +184,7 @@ def deploy_adapter(
     hf_repo: str,
     adapter_prefix: str,
     gpu_name: str = "RTX 5090",
+    *,
     dry_run: bool = False,
     lora_rank: int = 32,
     thinking: bool = False,
