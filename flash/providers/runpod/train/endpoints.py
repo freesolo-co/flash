@@ -28,6 +28,7 @@ FLASH_SDK_LOCK = threading.Lock()
 RUNPOD_ENDPOINT_SLOT_CAP = 28
 _SLOT_QUEUE_WAIT_S = 10.0
 _SLOT_STORE_MAX_ERRORS = 6
+_CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 
 _LOCAL_SLOTS = threading.Semaphore(RUNPOD_ENDPOINT_SLOT_CAP)
 # name -> "shared"|"local": tracks how this process acquired each slot so release routes correctly.
@@ -176,6 +177,9 @@ def _train_body(input_data: dict) -> dict:
     import subprocess
     import sys
     import threading
+    import time
+    from datetime import UTC, datetime
+    from email.utils import parsedate_to_datetime
 
     from huggingface_hub import snapshot_download
 
@@ -190,13 +194,17 @@ def _train_body(input_data: dict) -> dict:
         # gets persisted to the volume (phantom warm).
         if not hf_home or not hf_home.startswith("/runpod-volume"):
             return {
-                "preloaded": [], "already_cached": [], "failed": {},
+                "preloaded": [],
+                "already_cached": [],
+                "failed": {},
                 "error": f"preload requires HF_HOME rooted at /runpod-volume (got HF_HOME={hf_home!r})",
                 "hf_home": hf_home,
             }
         if not os.path.isdir("/runpod-volume"):
             return {
-                "preloaded": [], "already_cached": [], "failed": {},
+                "preloaded": [],
+                "already_cached": [],
+                "failed": {},
                 "error": f"weight-cache volume not mounted at /runpod-volume (HF_HOME={hf_home})",
                 "hf_home": hf_home,
             }
@@ -208,8 +216,11 @@ def _train_body(input_data: dict) -> dict:
             try:
                 try:
                     snapshot_download(
-                        repo_id=repo_id, token=tok, cache_dir=cache_dir,
-                        ignore_patterns=ignore_patterns, local_files_only=True,
+                        repo_id=repo_id,
+                        token=tok,
+                        cache_dir=cache_dir,
+                        ignore_patterns=ignore_patterns,
+                        local_files_only=True,
                     )
                     already.append(repo_id)
                     continue
@@ -233,14 +244,112 @@ def _train_body(input_data: dict) -> dict:
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
 
     overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
-    snapshot_download(
-        repo_id=input_data["hf_repo"],
-        repo_type="dataset",
-        allow_patterns=["code/**"],
-        local_dir="/runcode",
-        token=overrides.get("HF_TOKEN"),
-    )
-    code_dir = "/runcode/code"
+
+    def _code_prefix() -> str:
+        raw = input_data.get("code_prefix")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("missing code_prefix")
+        prefix = raw.strip().strip("/")
+        parts = prefix.split("/")
+        digest = parts[1] if len(parts) == 3 else ""
+        if (
+            len(parts) != 3
+            or parts[0] != "code"
+            or parts[2] != "flash"
+            or len(digest) != 32
+            or any(c not in "0123456789abcdef" for c in digest)
+        ):
+            raise ValueError(f"invalid code_prefix: {prefix!r}")
+        return prefix
+
+    def _hf_status_code(exc: BaseException) -> int | None:
+        response = getattr(exc, "response", None)
+        code = getattr(response, "status_code", None)
+        try:
+            return int(code)
+        except (TypeError, ValueError):
+            return None
+
+    def _hf_retry_after(exc: BaseException) -> float | None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) or {}
+        value = headers.get("retry-after") if hasattr(headers, "get") else None
+        if not value and hasattr(headers, "items"):
+            for key, candidate in headers.items():
+                if str(key).lower() == "retry-after":
+                    value = candidate
+                    break
+        if not value:
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(value))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                seconds = (retry_at - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError):
+                return None
+        return min(60.0, max(0.0, seconds))
+
+    def _hf_call(call, label: str):
+        retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
+        transient_status_codes = {429, 500, 502, 503, 504}
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                return call()
+            except Exception as exc:
+                if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
+                    retry_delays
+                ):
+                    raise
+                retry_after = _hf_retry_after(exc)
+                delay = retry_after if retry_after is not None else retry_delays[attempt]
+                print(
+                    f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {exc}",
+                    flush=True,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable")
+
+    def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        api = HfApi(token=token)
+        files = [
+            entry.path
+            for entry in _hf_call(
+                lambda: list(
+                    api.list_repo_tree(
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                        path_in_repo=prefix,
+                        recursive=True,
+                        token=token,
+                    )
+                ),
+                f"list flash code under {repo_id}:{prefix}",
+            )
+            if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
+        ]
+        if not files:
+            raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
+        for filename in files:
+            _hf_call(
+                lambda filename=filename: hf_hub_download(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    filename=filename,
+                    local_dir="/runcode",
+                    token=token,
+                ),
+                f"download flash code file {repo_id}:{filename}",
+            )
+
+    code_prefix = _code_prefix()
+    _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
+    code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
 
     env = dict(os.environ)
     env.update(overrides)
@@ -295,7 +404,7 @@ def _train_body(input_data: dict) -> dict:
     def run_mode(mode: str, check: bool) -> int:
         """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
         console = f"/tmp/console_{mode}.txt"
-        interval = 30.0
+        interval = 3600.0
         stop_upload = threading.Event()
 
         def _upload_loop() -> None:

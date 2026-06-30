@@ -27,6 +27,7 @@ _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
+_MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
 _MAX_ARCHIVE_SCAN_MEMBERS = 200_000
@@ -291,7 +292,9 @@ def _urlopen(
                 raise GitHubRateLimitError(
                     f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
                 ) from exc
-            raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+            raise RuntimeError(
+                f"GitHub environment request failed ({exc.code}): {body[:500]}"
+            ) from exc
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             if attempt < max_rate_limit_retries:
                 delay = max(
@@ -334,6 +337,202 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
                 tar_path.unlink()
         raise
     return tar_path
+
+
+def _managed_hub_package_root(ref: GitHubEnvironmentRef) -> str:
+    if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
+        return ""
+    parts = [part for part in ref.path.split("/") if part]
+    if len(parts) < 2 or not _is_safe_github_path_parts(tuple(parts[:2])):
+        return ""
+    return "/".join(parts[:2])
+
+
+def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
+    quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/") if part)
+    return (
+        f"https://api.github.com/repos/{ref.repo_full_name}/contents/{quoted_path}"
+        f"?ref={urllib.parse.quote(ref.ref, safe='')}"
+    )
+
+
+def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool = False) -> str:
+    url = (
+        f"https://api.github.com/repos/{ref.repo_full_name}/git/trees/"
+        f"{urllib.parse.quote(treeish, safe='')}"
+    )
+    if recursive:
+        url = f"{url}?recursive=1"
+    return url
+
+
+def _github_headers(accept: str) -> dict[str, str]:
+    headers = {"Accept": accept, "User-Agent": "freesolo-flash"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _safe_contents_path(path: object, root_parts: list[str]) -> str:
+    if not isinstance(path, str):
+        raise RuntimeError("GitHub contents response did not include a path")
+    try:
+        normalized = _normalize_env_path(path)
+    except ValueError as exc:
+        raise RuntimeError(f"unsafe path in environment contents: {path!r}") from exc
+    parts = normalized.split("/")
+    if parts[: len(root_parts)] != root_parts:
+        raise RuntimeError(f"unexpected path in environment contents: {path!r}")
+    return normalized
+
+
+def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> Any:
+    data = _urlopen(
+        urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
+        timeout=120.0,
+        max_bytes=_MAX_CONTENTS_JSON_BYTES,
+    )
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "GitHub environment request failed for "
+            f"{ref.repo_full_name}@{ref.ref}:{context}: invalid response"
+        ) from exc
+
+
+def _github_response_message(payload: object) -> str:
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            return f" ({message})"
+    return ""
+
+
+def _github_tree_entries(ref: GitHubEnvironmentRef, treeish: str, context: str) -> list[dict]:
+    payload = _download_github_json(ref, _github_tree_url(ref, treeish), context)
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        raise RuntimeError(
+            f"GitHub path {context!r} is not an environment directory"
+            f"{_github_response_message(payload)}"
+        )
+    if payload.get("truncated"):
+        raise RuntimeError(
+            f"GitHub tree response for environment directory {context!r} was truncated"
+        )
+    entries = payload["tree"]
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise RuntimeError("GitHub tree response included an invalid entry")
+    return entries
+
+
+def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
+    treeish = ref.ref
+    current = ""
+    for part in [part for part in repo_dir.split("/") if part]:
+        entries = _github_tree_entries(ref, treeish, current or ref.ref)
+        match = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("path") == part
+                and entry.get("type") == "tree"
+                and isinstance(entry.get("sha"), str)
+            ),
+            None,
+        )
+        current = f"{current}/{part}" if current else part
+        if match is None:
+            raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
+        treeish = match["sha"]
+    return treeish
+
+
+def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
+    """Download one GitHub directory into a repo-shaped tree under ``dest``."""
+    repo_root = dest / "repo"
+    root_parts = [part for part in repo_dir.split("/") if part]
+    state = {"members": 0, "bytes": 0}
+
+    def record_member(path: str) -> None:
+        state["members"] += 1
+        if state["members"] > _MAX_ARCHIVE_MEMBERS:
+            raise RuntimeError(f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})")
+        target = (repo_root / path).resolve()
+        root = repo_root.resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError(f"unsafe path in environment contents: {path!r}")
+
+    def download_file(path: str, declared_size: object, mode: object = None) -> None:
+        record_member(path)
+        if (
+            isinstance(declared_size, int)
+            and declared_size >= 0
+            and state["bytes"] + declared_size > _MAX_ARCHIVE_BYTES
+        ):
+            raise RuntimeError(
+                "environment archive is too large uncompressed "
+                f"({state['bytes'] + declared_size} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+            )
+        remaining = _MAX_ARCHIVE_BYTES - state["bytes"]
+        target = repo_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as out:
+            _urlopen(
+                urllib.request.Request(
+                    _github_contents_url(ref, path),
+                    headers=_github_headers("application/vnd.github.raw"),
+                ),
+                timeout=120.0,
+                max_bytes=remaining,
+                out=out,
+            )
+        state["bytes"] += target.stat().st_size
+        if state["bytes"] > _MAX_ARCHIVE_BYTES:
+            raise RuntimeError(
+                "environment archive is too large uncompressed "
+                f"({state['bytes']} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+            )
+        if isinstance(mode, str):
+            with contextlib.suppress(ValueError):
+                target.chmod(int(mode, 8) & 0o777)
+
+    def create_dir(path: str) -> None:
+        record_member(path)
+        (repo_root / path).mkdir(parents=True, exist_ok=True)
+
+    create_dir(repo_dir)
+    package_tree_sha = _resolve_github_directory_tree_sha(ref, repo_dir)
+    payload = _download_github_json(
+        ref,
+        _github_tree_url(ref, package_tree_sha, recursive=True),
+        repo_dir,
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        raise RuntimeError(
+            f"GitHub path {repo_dir!r} is not an environment directory"
+            f"{_github_response_message(payload)}"
+        )
+    if payload.get("truncated"):
+        raise RuntimeError(
+            f"GitHub tree response for environment directory {repo_dir!r} was truncated"
+        )
+    for entry in payload["tree"]:
+        if not isinstance(entry, dict):
+            raise RuntimeError("GitHub tree response included an invalid entry")
+        rel_path = entry.get("path")
+        if not isinstance(rel_path, str):
+            raise RuntimeError("GitHub tree response included an entry without a path")
+        child_path = _safe_contents_path(f"{repo_dir}/{rel_path}", root_parts)
+        kind = entry.get("type")
+        if kind == "tree":
+            create_dir(child_path)
+        elif kind == "blob" and entry.get("mode") != "120000":
+            download_file(child_path, entry.get("size"), entry.get("mode"))
+        else:
+            raise RuntimeError(f"unsupported entry in environment contents: {child_path!r}")
+    return repo_root
 
 
 class _LimitedReader:
@@ -440,8 +639,14 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
     resolved_ref = _resolve_ref_sha(parsed, pinned_sha=pinned_sha)
+    package_root = _managed_hub_package_root(parsed)
+    if parsed.repo_full_name.lower() == _DEFAULT_MANAGED_ENV_REPO.lower() and not package_root:
+        raise ValueError(
+            "managed environment hub refs must include a namespace/name environment path"
+        )
+    cache_scope = "managed-hub" if package_root else "github"
     cache_key = hashlib.sha256(
-        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
+        f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
     env_file = cache_dir / parsed.path
@@ -457,9 +662,14 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        # Runtime loading keeps repo-level sidecars available to relative paths/imports.
-        # User-facing pulls filter to the requested env subtree in flash.envs.pull.
-        extracted = _extract_github_tarball(resolved, tmp_parent)
+        if package_root:
+            # The shared managed hub can be much larger than one environment. Download only the
+            # requested package so worker cache/extraction limits apply to that env, not the hub.
+            extracted = _download_github_directory(resolved, package_root, tmp_parent)
+        else:
+            # Generic GitHub refs keep repo-level sidecars available to relative paths/imports.
+            # User-facing pulls filter to the requested env subtree in flash.envs.pull.
+            extracted = _extract_github_tarball(resolved, tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
@@ -546,6 +756,40 @@ def _json_safe(value: Any) -> Any:
         return value
     except TypeError:
         return str(value)
+
+
+class _ScoredResponseText(str):
+    """String-compatible response passed to SDK scorers.
+
+    The string value is the answer-only completion so existing graders keep their old behavior.
+    Thinking-aware scorers can opt into the structured views.
+    """
+
+    completion: str
+    thinking: str | None
+    raw: str
+
+    def __new__(cls, completion: str, *, raw: str, thinking: str | None):
+        obj = str.__new__(cls, completion)
+        obj.completion = completion
+        obj.thinking = thinking
+        obj.raw = raw
+        return obj
+
+
+def _completion_for_scoring(completion: str, state: dict | None) -> str:
+    if state:
+        raw = state.get("raw")
+        if not isinstance(raw, str):
+            return completion
+        answer = state.get("completion")
+        thinking = state.get("thinking")
+        return _ScoredResponseText(
+            answer if isinstance(answer, str) else completion,
+            raw=raw,
+            thinking=thinking if isinstance(thinking, str) else None,
+        )
+    return completion
 
 
 class FreesoloEnvironment(BaseEnvironment):
@@ -689,7 +933,9 @@ class FreesoloEnvironment(BaseEnvironment):
     def _score_one(self, completion: str, example: dict, state: dict | None):
         if state and self.multi_turn:
             return self._score_episode(example, state)
-        rewards = self._env.score_responses(self._task_example(example), [completion])
+        rewards = self._env.score_responses(
+            self._task_example(example), [_completion_for_scoring(completion, state)]
+        )
         return self._single(rewards, "score_responses")
 
     def scores_breakdown(
@@ -754,7 +1000,9 @@ class FreesoloEnvironment(BaseEnvironment):
             return self._grouped_score(
                 items,
                 task_of=lambda ex, st: self._task_example(ex),
-                payload_of=lambda st: str(st.get("response_text") or ""),
+                payload_of=lambda st: _completion_for_scoring(
+                    str(st.get("response_text") or ""), st
+                ),
                 scorer=self._env.score_responses,
                 method="score_responses",
             )

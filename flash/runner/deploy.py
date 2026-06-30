@@ -18,6 +18,8 @@ from flash.spec import JobSpec
 if TYPE_CHECKING:
     from flash.runner import RunStatus
 
+_FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
+
 
 def cancel_run(run_id: str) -> RunStatus:
     """Cancel a run: stop the remote worker and mark it cancelled."""
@@ -100,6 +102,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     spec = JobSpec.from_dict(status.spec)
     remote = dict(status.remote)
     seed = int(remote.pop("seed", FIXED_SEED))
+    code_prefix = remote.pop("code_prefix", None)
     # The class the run actually provisioned (a policy retry may have walked past the
     # provisional spec.gpu.type). The in-process success path stamps this into metrics;
     # on recovery the worker output carries no such field, so recover it from the handle
@@ -130,7 +133,13 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
-            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0))
+            if code_prefix is None:
+                from flash.providers.runpod.train import upload_code
+                from flash.runner import flash_code_prefix
+
+                code_prefix = flash_code_prefix()
+                upload_code(spec.train.hf_repo, code_prefix=code_prefix)
+            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0), code_prefix=code_prefix)
             return get_status(run_id)
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
@@ -153,6 +162,15 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     return get_status(run_id)
 
 
+def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
+    """Apply the lifecycle state for a final-adapter deployment."""
+    # Preserve teardown time for legacy `done` runs (finished_at=None) before deploy bumps updated_at.
+    if status.state == "done" and status.finished_at is None and not status.reconciled_at:
+        status.finished_at = status.updated_at
+    status.deployment = deployment
+    status.state = "deployed"
+
+
 def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None) -> RunStatus:
     from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
 
@@ -162,41 +180,46 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
             return status
         if expect_state is not None and status.state != expect_state:
             return status
-        # Preserve teardown time for legacy `done` runs (finished_at=None) before deploy bumps updated_at.
-        if status.state == "done" and status.finished_at is None and not status.reconciled_at:
-            status.finished_at = status.updated_at
-        status.deployment = deployment
-        status.state = "deployed"
+        _promote_final_deployment(status, deployment)
         status.updated_at = time.time()
         _save_status(status)
         return status
 
 
-def attach_checkpoint_deployment(run_id: str, deployment: dict) -> RunStatus:
-    """Attach a serving deployment to a run WITHOUT changing its training state.
+def mark_checkpoint_deployed(
+    run_id: str, deployment: dict, expect_state: str | None = None
+) -> RunStatus:
+    """Record a checkpoint deployment using the run's current lifecycle state.
 
-    Used for cancelled/failed runs serving a mid-RL checkpoint — preserves terminal state
-    while still tracking the deployment so /v1/deployments lists it and undeploy clears it.
+    If training has finished by the time serving registration completes, the run behaves like any
+    finished deployed run. Otherwise, keep the training state and only attach the deployment record.
     """
     from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
-        status.deployment = deployment
+        if status.state == "dry_run":
+            return status
+        if expect_state is not None and status.state != expect_state:
+            return status
+        if status.state in _FINAL_DEPLOYMENT_STATES:
+            _promote_final_deployment(status, deployment)
+        else:
+            status.deployment = deployment
         status.updated_at = time.time()
         _save_status(status)
         return status
 
 
 def mark_undeployed(run_id: str) -> RunStatus:
-    """Record an explicit undeploy; live `deployed` runs return to `done`."""
-    from flash.runner import _STATUS_LOCK, TERMINAL_STATES, _save_status, get_status
+    """Record an explicit undeploy; live final-adapter deployments return to `done`."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}
-        if status.state not in TERMINAL_STATES:
+        if status.state == "deployed":
             status.state = "done"
         status.updated_at = time.time()
         _save_status(status)

@@ -302,9 +302,12 @@ Pick SFT when you already have good answers and want the model to imitate them.
   more.
 - **SFT is a great warm start for GRPO.** SFT first to teach the format and a competent
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
-  model and the same `lora_rank` / `lora_alpha`** — `init_from_adapter` loads a LoRA
-  adapter specific to one base model and one adapter shape, so mixing sizes is an
-  invalid shape mismatch.
+  model**. For text-only continued adapters, keep the same adapter shape. For VL
+  warm-starts, Flash trains a fresh GRPO LoRA and rank-stacks it with the SFT LoRA
+  for deployment, so `SFT rank + GRPO rank` must stay within the selected model's
+  effective serving `max_lora_rank`. That cap comes from the serving/model policy:
+  some small serving models allow rank 64, while larger serving paths can cap at rank
+  32. Flash preflights the rank-stacked deploy rank against that model-specific cap.
 
 ```toml
 # configs/rl.toml — warm-start GRPO from the SFT run's adapter
@@ -314,8 +317,8 @@ algorithm = "grpo"
 # paste the full adapter_ref `flash status <sft-run-id>` prints, verbatim
 # (shape: <owner>/<repo>:sft/<run-id> — the owner/repo prefix is required)
 init_from_adapter = "your-org/your-repo:sft/<sft-run-id>"
-lora_rank = 32     # must match the SFT run
-lora_alpha = 64    # must match the SFT run
+lora_rank = 16     # for VL warm-starts, SFT rank + GRPO rank must fit the effective serving cap
+lora_alpha = 32
 ```
 
 SFT is **epoch-driven** (`epochs`); GRPO is **step-driven** (`steps`).

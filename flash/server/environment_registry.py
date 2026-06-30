@@ -57,21 +57,26 @@ def record_published_environment(*, slug: str, name: str, key: dict) -> bool:
     return _post(_PATH, body, subject=f"record published environment {slug}")
 
 
-def record_deleted_environment(*, slug: str, key: dict) -> bool:
+def record_deleted_environment(*, slug: str, key: dict, org_id: str | None = None) -> bool:
     """Remove the platform-backend metadata mirror for a deleted environment.
 
     Symmetric to :func:`record_published_environment`: the package store (GitHub) is the source
     of truth and is already updated by the time this runs, so dropping the row the web UI lists
     is deliberately best-effort and never blocks ``flash env delete``.
+
+    ``key`` supplies the org for a user-key delete (``flash env delete``). The internal key is
+    org-agnostic, so for the web UI delete the caller passes the authenticated user's ``org_id``
+    explicitly. We prefer the key's own org and only fall back to the supplied one — so a user
+    key never honors a caller-supplied override and can't drop another org's row.
     """
     token = internal_key()
-    org_id = org_id_of(key)
-    if not token or not org_id:
+    resolved_org_id = org_id_of(key) or str(org_id or "").strip()
+    if not token or not resolved_org_id:
         return False
 
     req = urllib.request.Request(
         f"{freesolo_base_url()}{_PATH}",
-        data=json.dumps({"orgId": org_id, "slug": slug}).encode("utf-8"),
+        data=json.dumps({"orgId": resolved_org_id, "slug": slug}).encode("utf-8"),
         method="DELETE",
         headers={
             "Authorization": f"Bearer {token}",

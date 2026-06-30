@@ -7,7 +7,7 @@ import sys
 import tomllib
 from typing import Any
 
-from flash.catalog import normalize_algorithm, resolve_model
+from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -242,10 +242,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             file=sys.stderr,
         )
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
-    if info.serving is not None and lora_rank > info.serving.max_lora_rank:
+    max_lora_rank = serving_lora_rank_cap(info)
+    if max_lora_rank is not None and lora_rank > max_lora_rank:
         raise ConfigError(
             f"train.lora_rank={lora_rank} exceeds {model}'s serving max_lora_rank="
-            f"{info.serving.max_lora_rank}; lower train.lora_rank or raise the serving cap "
+            f"{max_lora_rank}; lower train.lora_rank or raise the serving cap "
             "after real-GPU validation"
         )
 

@@ -646,10 +646,12 @@ def submit_run(
     attempt: int = 0,
     runtime_secrets: dict[str, str] | None = None,
     on_last_gpu: bool = False,
+    code_prefix: str | None = None,
 ) -> PollResult:
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
     from flash.envs.registry import worker_pip_for_env
     from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
+    from flash.runner import flash_code_prefix
 
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     # Per-attempt suffix so a retry lands on a fresh endpoint, not the same throttled/sick host.
@@ -675,6 +677,7 @@ def submit_run(
         "seed": int(seed),
         "env": worker_env,
         "extra_pip": extra_pip,
+        "code_prefix": code_prefix or flash_code_prefix(),
     }
     try:
         job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
