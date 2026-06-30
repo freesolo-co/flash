@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from flash.envs.base import BaseEnvironment
-from flash.envs.training_params import apply_training_max_examples
 
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
@@ -1094,7 +1093,7 @@ def load_freesolo_environment(
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 
-    params = apply_training_max_examples(reference, dict(kwargs))
+    params = dict(kwargs)
     source = params.pop("records", None)
     dataset_path = params.get("dataset_path")
     if source is None and dataset_path:

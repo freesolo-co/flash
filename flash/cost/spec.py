@@ -73,9 +73,7 @@ def _sft_example_count(spec) -> int:
     pinned_examples = int(t.max_examples) if t.max_examples else 0
     if pinned_examples > 0:
         return pinned_examples
-    from flash.envs.training_params import training_env_params
-
-    examples = count_env_examples(spec.environment.id, training_env_params(spec))
+    examples = count_env_examples(spec.environment.id, spec.environment.params)
     if examples is None:
         raise ValueError(
             "cannot estimate uncapped SFT cost because the environment dataset could not be "
@@ -148,9 +146,7 @@ def count_sft_train_tokens(spec) -> int | None:
     """
     if spec.algorithm != "sft":
         return None
-    from flash.envs.training_params import training_env_params
-
-    env = _load_env(spec.environment.id, training_env_params(spec))
+    env = _load_env(spec.environment.id, spec.environment.params)
     if env is None:
         return None
     rows = _indexable_dataset_rows(env)

@@ -8,12 +8,10 @@ import types
 import pytest
 
 from flash.cli.commands import cmd_train
-from flash.cost.spec import count_sft_train_tokens
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
 from flash.engine.recipe import RECIPE
-from flash.envs.training_params import _FLASH_TRAIN_MAX_EXAMPLES, training_env_params
 from flash.schema import spec_from_dict
 
 GRPO_RAW = {
@@ -150,51 +148,6 @@ def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
     spec = _sft_spec(max_examples=0, batch_size=16, epochs=2)
     assert spec.train.max_examples == 0
     assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
-
-
-def test_sft_uncapped_count_forwards_loader_no_cap(monkeypatch):
-    captured = []
-
-    def fake_count(env_id, params=None):
-        captured.append(dict(params or {}))
-        return 10_178
-
-    monkeypatch.setattr("flash.cost.spec.count_env_examples", fake_count)
-
-    specs = (
-        _sft_spec(batch_size=32, epochs=2),
-        _sft_spec(max_examples=0, batch_size=32, epochs=2),
-    )
-    for spec in specs:
-        assert (
-            _spec_steps(spec)
-            == _worker_sft_steps(examples=10_178, requested_batch=32, epochs=2)
-            == 638
-        )
-
-    assert captured == [
-        {_FLASH_TRAIN_MAX_EXAMPLES: None},
-        {_FLASH_TRAIN_MAX_EXAMPLES: None},
-    ]
-
-
-def test_grpo_train_max_examples_does_not_forward_loader_cap():
-    spec = _spec(**{"train.max_examples": 10_178})
-
-    assert training_env_params(spec) == {}
-
-
-def test_sft_train_token_count_forwards_loader_no_cap(monkeypatch):
-    captured = []
-
-    def fake_load_env(env_id, params=None):
-        captured.append(dict(params or {}))
-
-    monkeypatch.setattr("flash.cost.spec._load_env", fake_load_env)
-    spec = _sft_spec(max_examples=10_178, batch_size=32, epochs=2)
-
-    assert count_sft_train_tokens(spec) is None
-    assert captured == [{_FLASH_TRAIN_MAX_EXAMPLES: None}]
 
 
 def test_sft_steps_unpinned_requires_countable_env(monkeypatch):
@@ -364,10 +317,7 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
         "train": {
             "hf_repo": "owner/runs",
-            "max_examples": 320,
-            "batch_size": 6,
-            "epochs": 2,
-            "max_length": 1024,
+            "max_examples": 320, "batch_size": 6, "epochs": 2, "max_length": 1024,
         },
         "gpu": {"type": "RTX 4090"},
     }
