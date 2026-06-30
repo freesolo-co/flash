@@ -41,7 +41,9 @@ class RunConfig:
         # substrate up front (else it filters out every candidate -> confusing "no GPU fits").
         prov = (self.provider or "auto").strip().lower() or "auto"
         if prov not in ("auto", *PROVIDER_NAMES):
-            raise ValueError(f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})")
+            raise ValueError(
+                f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
+            )
         object.__setattr__(self, "provider", prov)
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
@@ -86,7 +88,14 @@ class RunConfig:
             comp = None
             batch = self.batch_size if self.batch_size is not None else RECIPE.sft.effective_batch
             group = None
-        return replace(self, seq_len=seq, completion_len=comp, batch_size=batch, group_size=group, lora_rank=lora)
+        return replace(
+            self,
+            seq_len=seq,
+            completion_len=comp,
+            batch_size=batch,
+            group_size=group,
+            lora_rank=lora,
+        )
 
     def train_knobs(self) -> dict[str, int]:
         """The knob dict ``model_required_vram_gb`` consumes. Only an EXPLICIT batch_size is
@@ -141,7 +150,7 @@ class CostEstimate:
         """Multi-line itemized breakdown for CLI output."""
         lines = [
             f"Run        : {self.model_id}  [{self.method.upper()}, {self.steps} steps]",
-            f"GPU        : {self.gpu} on {self.provider} "
+            f"GPU        : {self.gpu} "
             f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
             f"@ ${self.gpu_hourly_usd:.2f}/hr",
             f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + model load"
