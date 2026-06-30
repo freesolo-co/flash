@@ -1,0 +1,35 @@
+name: Notify tests repo
+
+# Flash's cross-repo integration seams (flash<->backend auth, allocator, CLI flow)
+# live in the freesolo-co/tests repo, which carries flash as a pinned submodule.
+# On every push to dev/main, dispatch to that repo so its CI bumps the flash
+# submodule pin and runs the affected suites against the new sha. Mirrors the
+# freesolo-side notify-tests-repo.yml; the tests repo listens for `flash-merged`.
+
+on:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch to freesolo-co/tests
+        env:
+          PAT: ${{ secrets.FREESOLO_GITHUB_PAT }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "No FREESOLO_GITHUB_PAT (likely a fork) — skipping dispatch."
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/freesolo-co/tests/dispatches \
+            -d "{\"event_type\":\"flash-merged\",\"client_payload\":{\"sha\":\"${SHA}\",\"ref\":\"${REF}\"}}"
