@@ -825,12 +825,14 @@ def test_run_rl_wires_mask_truncated_completions_to_the_gating_helper() -> None:
 
 
 def test_run_rl_threads_prompt_opened_thinking_to_grading_and_penalty() -> None:
-    """run_rl must forward the computed _prompt_opens_thinking flag to BOTH graded_text and
-    think_token_count. The leaf-helper tests above cover the flag's True/False logic, but nothing
-    else guarantees run_rl actually PASSES it: drop either keyword and the helper tests stay green
-    while production silently reverts to the pre-fix no-op (the thinking-length penalty does nothing
-    and a tag-less reasoning ramble is graded as the answer — PR #281). Assert on run_rl's AST so it
-    survives reformatting — mirrors test_run_rl_wires_mask_truncated_completions_* above."""
+    """run_rl must forward the computed _prompt_opens_thinking flag to thinking helpers.
+
+    The leaf-helper tests above cover the flag's True/False logic, but nothing else guarantees
+    run_rl actually PASSES it: drop a keyword and the helper tests stay green while production
+    silently reverts to the pre-fix no-op (the thinking-length penalty and extracted scorer fields
+    are wrong, and a tag-less reasoning ramble is graded as the answer — PR #281). Assert on run_rl's
+    AST so it survives reformatting — mirrors test_run_rl_wires_mask_truncated_completions_* above.
+    """
     import ast
     import inspect
 
@@ -859,7 +861,7 @@ def test_run_rl_threads_prompt_opened_thinking_to_grading_and_penalty() -> None:
         )
 
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
-    for fname in ("graded_text", "think_token_count"):
+    for fname in ("graded_text", "thinking_text", "think_token_count"):
         assert any(_forwards_flag(c, fname) for c in calls), (
             f"run_rl must call {fname}(..., prompt_opened_thinking=_prompt_opens_thinking); without "
             "it the prompt-opened-<think> fix silently no-ops (the length penalty and <think> strip "

@@ -313,6 +313,13 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat_stream"
 
 
+@pytest.mark.parametrize("flag", ["--enable-thinking", "--disable-thinking"])
+def test_chat_does_not_expose_thinking_override_flags(fake_client, flag) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        _run(["chat", "flash-1", "-m", "What is 6*7?", flag])
+    assert excinfo.value.code == 2
+
+
 def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
 
