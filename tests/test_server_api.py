@@ -1518,6 +1518,66 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
     assert resubmitted == ["novast-1"]
 
 
+def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, tmp_path):
+    # A provider enabled after submit cannot have owned that run's pre-handle create. Its listing outage
+    # must not strand recovery when submitted_instance_providers explicitly says it was not available.
+    import threading
+
+    import flash.runner as runner
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+
+    spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "newvast-1",
+    }
+    runner._save_status(
+        runner.RunStatus(
+            run_id="newvast-1",
+            state="provisioning",
+            spec=spec,
+            remote=None,
+            submitted_instance_providers=[],
+        )
+    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "newvast-1"}])
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    resubmitted = []
+    done = threading.Event()
+    monkeypatch.setattr(runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set()))
+
+    class _NewVast:
+        name = "vast"
+
+        def gc(self, s):
+            raise AssertionError("newly configured unrecorded provider must not be reaped")
+
+        def run_instances_remaining(self, run_id):
+            raise AssertionError("newly configured unrecorded provider must not block recovery")
+
+        def sweep_orphans(self, **k):
+            return []
+
+    import flash.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_NewVast()])
+
+    app_mod.recover_runs()
+
+    assert done.wait(timeout=5), "newly configured unrecorded Vast must not block recovery"
+    assert resubmitted == ["newvast-1"]
+
+
 def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_path):
     # Codex: a deferred handle-less resubmit must not be stranded until the next control-plane restart —
     # a bounded background retry re-confirms the reap and resubmits once it becomes safe (the phantom is

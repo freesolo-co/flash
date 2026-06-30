@@ -388,6 +388,10 @@ def _wire_poll(
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
             if "/error_" in path:
+                if isinstance(error, dict):
+                    return error.get(path.rsplit("/", 1)[-1]) or error.get(path)
+                if not path.rsplit("/", 1)[-1].endswith("_attempt0.txt"):
+                    return None
                 return error() if callable(error) else error
             return None
 
@@ -552,8 +556,8 @@ def test_poll_dead_host_without_marker_is_preempted(monkeypatch):
 
 
 def test_poll_dead_host_with_error_file_is_job_failed(monkeypatch):
-    """A worker that RAN and crashed early (left error_<phase>.txt) but died before the marker is a
-    DETERMINISTIC worker error -> fail fast (job_failed), not burn fresh GPUs retrying a repeat crash."""
+    """A worker that RAN and crashed early (left error_<phase>_attempt<N>.txt) but died before the
+    marker is a DETERMINISTIC worker error -> fail fast, not burn fresh GPUs retrying a repeat crash."""
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}, {"actual_status": "exited"}],
@@ -568,14 +572,15 @@ def test_poll_dead_host_with_error_file_is_job_failed(monkeypatch):
 
 
 def test_poll_dead_host_stale_prior_attempt_error_is_preempted(monkeypatch):
-    """Codex MtbAD: ``error_<phase>.txt`` is seed-scoped (shared across this seed's retries). When the
-    latest heartbeat provably belongs to a PRIOR attempt (here attempt=0 while we poll attempt=1), the
-    co-located error file is a LEFTOVER — a fresh host LOSS on attempt 1, not a deterministic crash.
-    Without this guard, gating only the retriable flag (1a28224) would fail-fast a genuine retry."""
+    """A prior attempt's error artifact must not be read for this attempt. When attempt=1 dies before
+    writing a marker and only attempt0's error exists, this is a host loss, not a deterministic crash."""
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}, {"actual_status": "exited"}],
-        error="Traceback (most recent call last):\nRuntimeError: stale crash from a prior attempt ...",
+        error={
+            "error_sft_attempt0.txt": "Traceback (most recent call last):\n"
+            "RuntimeError: stale crash from a prior attempt ..."
+        },
     )
     # ts AFTER this attempt's launch (10_000) yet attempt=0 != the polled attempt=1 — the subtle
     # "fresh by timestamp but belongs to a different attempt" leftover.
@@ -598,7 +603,10 @@ def test_poll_dead_host_current_attempt_error_is_job_failed(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}, {"actual_status": "exited"}],
-        error="Traceback (most recent call last):\nValueError: bad config on this very attempt ...",
+        error={
+            "error_sft_attempt1.txt": "Traceback (most recent call last):\n"
+            "ValueError: bad config on this very attempt ..."
+        },
     )
     cur_hb = {"stage": "sft_train", "step": 5, "ts": 10_500.0, "attempt": 1}
     res = vast.poll_vast_job(

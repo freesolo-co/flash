@@ -388,7 +388,12 @@ _make_hf_file_reader = make_hf_text_reader
 
 
 def _failure_detail(
-    hf_repo: str, prefix: str, phase: str, marker: dict | None, instance_id: int | None = None
+    hf_repo: str,
+    prefix: str,
+    phase: str,
+    marker: dict | None,
+    instance_id: int | None = None,
+    attempt: int = 0,
 ) -> str:
     """Best root-cause detail we can assemble from the HF artifacts + the Vast console.
 
@@ -398,9 +403,10 @@ def _failure_detail(
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
-    content = _make_hf_file_reader(hf_repo, f"{prefix}/error_{phase}.txt")(force=True)
+    err_name = f"error_{phase}_attempt{int(attempt or 0)}.txt"
+    content = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
     if content:
-        parts.append(f"--- error_{phase}.txt ---\n{content[-2000:]}")
+        parts.append(f"--- {err_name} ---\n{content[-2000:]}")
     if instance_id:
         logs = vast_api.instance_logs(int(instance_id))
         if logs:
@@ -535,7 +541,9 @@ def poll_vast_job(
         return PollResult(
             False,
             failure="job_preempted" if retriable else "job_failed",
-            detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.instance_id),
+            detail=_failure_detail(
+                hf_repo, prefix, spec.phase, marker, handle.instance_id, attempt=handle.attempt
+            ),
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -666,18 +674,13 @@ def poll_vast_job(
                 return terminal
             # Dead host with no ok-marker/DONE. Distinguish a genuine host LOSS (retry on a fresh host)
             # from a worker that RAN and CRASHED early — before it could write the attempt marker — but
-            # left error_{phase}.txt (a bad env id, a config/code error, an OOM): that is DETERMINISTIC,
-            # so fail FAST. A crash the worker flagged retriable still retries.
-            err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
-            # ``error_{phase}.txt`` and the heartbeat are BOTH run-scoped (shared across this run's
-            # retries), so a prior attempt can leave either behind. The worker's crash handler uploads
-            # the error file AND a heartbeat stamped with THIS attempt + ts together (and error-stage
-            # heartbeats are force-uploaded, never throttled), so a genuine current-attempt crash always
-            # leaves a fresh attempt-matching heartbeat next to the error. We therefore use heartbeat
-            # provenance to attribute the error: treat it as a CURRENT deterministic crash only when
-            #  - the latest heartbeat is NOT a leftover from a PRIOR attempt (else the co-located error
-            #    is presumed leftover too -> a host LOSS, retry on a fresh host); AND
-            #  - the worker did not flag the failure retriable for THIS attempt.
+            # left error_{phase}_attempt<N>.txt (a bad env id, a config/code error, an OOM): that is
+            # DETERMINISTIC, so fail FAST. A crash the worker flagged retriable still retries.
+            err_name = f"error_{spec.phase}_attempt{int(handle.attempt or 0)}.txt"
+            err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
+            # Error files are attempt-scoped, but the heartbeat path is still run-scoped. Use heartbeat
+            # provenance to avoid attributing a current attempt's host loss to a stale prior heartbeat,
+            # and keep honoring the retriable flag for infra-shaped worker crashes.
             # Without the first guard, gating only the retriable flag (the 1a28224 fix) flips a genuine
             # retry-after-host-loss into a fail-fast job_failed once the stale flag is ignored. Dating
             # uses _dating_launch (the TRUE launch, 0.0 == unknown) so a now()-fallback can't misjudge a
@@ -695,7 +698,9 @@ def poll_vast_job(
             return PollResult(
                 False,
                 failure="job_failed" if worker_crashed else "job_preempted",
-                detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.instance_id),
+                detail=_failure_detail(
+                    hf_repo, prefix, spec.phase, None, handle.instance_id, attempt=handle.attempt
+                ),
             )
 
         raw_marker = marker_reader()

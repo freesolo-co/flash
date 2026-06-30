@@ -148,10 +148,19 @@ def _confirm_run_clear(spec) -> bool:
     can't have left a Vast phantom)."""
     from flash.providers import INSTANCE_PROVIDERS, configured_providers, get_provider
 
+    try:
+        recorded_raw = getattr(get_status(spec.run_id), "submitted_instance_providers", None)
+    except Exception:
+        # Can't read the durable record of providers available at submit -> can't rule out a recorded
+        # Vast phantom that this restart can no longer enumerate -> fail CLOSED.
+        return False
+    recorded = {str(name) for name in recorded_raw} if recorded_raw is not None else None
     configured = {getattr(p, "name", None): p for p in configured_providers()}
     clear = True
     for name, prov in configured.items():
         if name not in INSTANCE_PROVIDERS:
+            continue
+        if recorded is not None and name not in recorded:
             continue
         with contextlib.suppress(Exception):
             prov.gc(spec)
@@ -170,13 +179,7 @@ def _confirm_run_clear(spec) -> bool:
     # error loading the status, resolving a recorded provider, or reading the capability would otherwise
     # be swallowed and leave ``clear`` True, defeating the fail-closed intent (cursor). Every failure
     # inspecting the recorded set must instead make the guard CONSERVATIVE (block/defer the resubmit).
-    try:
-        recorded = getattr(get_status(spec.run_id), "submitted_instance_providers", None) or []
-    except Exception:
-        # Can't read the durable record of providers available at submit -> can't rule out a recorded
-        # Vast phantom that this restart can no longer enumerate -> fail CLOSED.
-        return False
-    for name in recorded:
+    for name in recorded or []:
         if name in configured or name not in INSTANCE_PROVIDERS:
             continue
         try:
