@@ -132,6 +132,7 @@ def _submit_seed_supervised(
     seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
+    code_prefix: str | None = None,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures.
 
@@ -140,8 +141,16 @@ def _submit_seed_supervised(
     from flash.providers import get_provider
     from flash.providers.allocator import allocate, allocation_summary
     from flash.providers.base import PollResult
-    from flash.runner import TERMINAL_STATES, _RunCancelled, _spec_with_gpu, _update, get_status
+    from flash.runner import (
+        TERMINAL_STATES,
+        _RunCancelled,
+        _spec_with_gpu,
+        _update,
+        flash_code_prefix,
+        get_status,
+    )
 
+    code_prefix = code_prefix or flash_code_prefix()
     last_handle: dict = {}
     current_gpu: dict = {}
     # Persisted into the run handle so attach_run recovery polls with the same stall tuning.
@@ -164,6 +173,7 @@ def _submit_seed_supervised(
                 "allocated_gpu": current_gpu.get("name"),
                 "on_last_gpu": bool(current_on_last_gpu["value"]),
                 "attempt": int(current_attempt["value"]),
+                "code_prefix": code_prefix,
             },
         )
 
@@ -303,6 +313,7 @@ def _submit_seed_supervised(
                     "on_handle": on_handle,
                     "attempt": attempt,
                     "on_last_gpu": on_last_gpu,
+                    "code_prefix": code_prefix,
                 }
                 if runtime_secrets:
                     submit_kwargs["runtime_secrets"] = runtime_secrets
@@ -375,53 +386,25 @@ def _submit_seed_supervised(
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
 
 
-def _touch_warmstart_source(spec: JobSpec) -> None:
-    """Refresh a managed warm-start SOURCE repo's ``last_modified`` so the repo GC's age gate spares
-    it while THIS run depends on it.
-
-    A run can ``init_from_adapter = "<owner>/<repo>:<phase>/<run_id>"`` from a prior managed run's
-    adapter, which the worker ``snapshot_download``s at boot. The GC deletes undeployed ``flashrun-*``
-    repos older than 30 days, and the source's ISSUING control plane may differ from this one
-    (multi-plane), so a purely-local protected set on this plane can't shield it. Writing a small
-    marker into the source repo bumps its HF ``last_modified`` — shared state that EVERY plane's GC
-    reads — age-resetting it for another GC window, long enough for this run to fetch it. Best-effort:
-    if the source is already gone the failure surfaces at worker boot (where it would anyway)."""
-    from flash.runner import _ARTIFACT_NAMESPACE
-
-    ref = (spec.train.init_from_adapter or "").strip()
-    if ":" not in ref:
-        return
-    source_repo = ref.split(":", 1)[0]
-    # Only managed per-run artifact repos are ever GC'd; a user/base ref needs no touch.
-    if not source_repo.startswith(f"{_ARTIFACT_NAMESPACE}/flashrun-"):
-        return
-    import io
-
-    from huggingface_hub import HfApi
-
-    with contextlib.suppress(Exception):
-        HfApi(token=os.environ.get("HF_TOKEN")).upload_file(
-            path_or_fileobj=io.BytesIO(spec.run_id.encode()),
-            path_in_repo=f"referenced_by/{spec.run_id}",
-            repo_id=source_repo,
-            repo_type="dataset",
-            commit_message=f"warm-start reference from {spec.run_id}",
-        )
-
-
 def _run_job_inner(
     spec: JobSpec,
     log_path: str,
     upload_code,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
-    from flash.runner import _run_training, _RunCancelled, _update, get_status
+    from flash.runner import _run_training, _RunCancelled, _update, flash_code_prefix, get_status
 
     try:
-        _touch_warmstart_source(spec)
-        upload_code(spec.train.hf_repo)
+        code_prefix = flash_code_prefix()
+        upload_code(spec.train.hf_repo, code_prefix=code_prefix)
         with open(log_path, "a") as log:
-            _run_training(spec, log, prior_cost=0.0, runtime_secrets=runtime_secrets)
+            _run_training(
+                spec,
+                log,
+                prior_cost=0.0,
+                runtime_secrets=runtime_secrets,
+                code_prefix=code_prefix,
+            )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
@@ -436,6 +419,7 @@ def _run_training(
     *,
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
+    code_prefix: str | None = None,
 ) -> None:
     """Train the run's single adapter under supervision; finalize the run.
 
@@ -470,7 +454,9 @@ def _run_training(
         file=log,
         flush=True,
     )
-    metrics = _submit_seed_supervised(spec, FIXED_SEED, log, runtime_secrets=runtime_secrets)
+    metrics = _submit_seed_supervised(
+        spec, FIXED_SEED, log, runtime_secrets=runtime_secrets, code_prefix=code_prefix
+    )
     total_cost = prior_cost + _persist_metrics(spec, metrics)
     # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
     # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.

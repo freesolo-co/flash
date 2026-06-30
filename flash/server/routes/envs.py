@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from flash._logging import get_logger
 from flash.server._deps import require_key
@@ -39,7 +39,15 @@ def publish_env(payload: dict, key: Annotated[dict, Depends(require_key)]):
 
 
 @router.delete("/v1/envs/{env_id:path}")
-def delete_env(env_id: str, key: Annotated[dict, Depends(require_key)]):
+def delete_env(
+    env_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    # The org a metadata-mirror drop targets. User keys carry their own org, so this is only
+    # consulted for the internal key (which is org-agnostic): the web UI delete authenticates
+    # the user, resolves their org, and passes it here. A user key never honors this header
+    # (see record_deleted_environment), so a forged value can't delete another org's row.
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+):
     # Delete a published Freesolo environment package from the managed hub. ``env_id`` is the
     # ``namespace/name`` slug and carries a slash, so the route uses the ``:path`` converter.
     # Authorization (own-namespace for user keys, any for the internal key) lives in
@@ -61,7 +69,7 @@ def delete_env(env_id: str, key: Annotated[dict, Depends(require_key)]):
     from flash.server.environment_registry import record_deleted_environment
 
     try:
-        record_deleted_environment(slug=env_id, key=key)
+        record_deleted_environment(slug=env_id, key=key, org_id=x_freesolo_org_id)
     except Exception as exc:
         logger.warning("record_deleted_environment failed (non-fatal): %s", exc, exc_info=True)
     return {"id": env_id, "deleted": deleted}

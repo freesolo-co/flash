@@ -30,6 +30,7 @@ from flash.engine.worker.decoding import (
     render_prompt,
     strip_think,
     think_token_count,
+    thinking_text,
 )
 from flash.engine.worker.finalize import write_train_meta
 from flash.engine.worker.gpu_setup import (
@@ -144,8 +145,9 @@ PHASE = os.environ.get(
 
 _HB_LAST_UPLOAD = 0.0
 _HB_LAST_PROGRESS_TS = 0.0
-# 60s throttle keeps GRPO under HF's 128 commits/hour-per-repo limit.
-_HB_MIN_INTERVAL_S = 60.0
+# Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
+# per-repo commit cap while staying under the provider poller's 1200s training stall window.
+_HB_MIN_INTERVAL_S = 900.0
 _HB_TERMINAL_ONLY = False
 
 _WANDB_FINISH_WAIT_S = 120.0
@@ -175,6 +177,10 @@ ACTIVE_ENV = None
 # so the saved adapter is SFT-less and MUST be recombined with this SFT before deploy. Stays None for
 # fresh-LoRA and continued-adapter (non-VL) runs, whose saved adapter is already deployable as-is.
 _VL_WARMSTART_SFT_DIR: str | None = None
+# The selected catalog model for the same VL warm-start path. Finalize uses it to enforce the same
+# model-specific serving rank cap that init-time preflight used, even if the SFT adapter config lacks
+# base_model_name_or_path.
+_VL_WARMSTART_MODEL_ID: str | None = None
 
 
 def require_active_env():
@@ -402,6 +408,7 @@ __all__ = [
     "strip_language_model_infix",
     "strip_think",
     "think_token_count",
+    "thinking_text",
     "upload_debug_jsonl",
     "vllm_language_model_only_kwargs",
     "wait_for_gpu",
