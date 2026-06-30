@@ -6,6 +6,7 @@ import os
 
 from flash._logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+from flash.envs.registry import FREESOLO_WORKER_SPEC
 from flash.providers.base import get_gpu_info
 from flash.spec import JobSpec
 
@@ -30,7 +31,7 @@ WORKER_DEPS = [
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
     # >=0.2.52: includes robust JSONL loading and corrected package metadata.
-    "freesolo>=0.2.52",
+    FREESOLO_WORKER_SPEC,
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
     # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
