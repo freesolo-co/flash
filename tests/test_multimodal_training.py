@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import inspect
+import io
 from typing import ClassVar
 
 import pytest
@@ -25,6 +26,14 @@ _RED_DOT = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAFgwJ/lR50uwAAAABJRU5ErkJggg=="
 )
+
+
+def _png_data_uri(rgb: tuple[int, int, int]) -> str:
+    Image = pytest.importorskip("PIL.Image")
+    image = Image.new("RGB", (1, 1), rgb)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def _prompt():
@@ -137,6 +146,31 @@ def test_multimodal_token_estimate_reserves_image_tokens(monkeypatch):
     monkeypatch.setenv("FLASH_IMAGE_TOKEN_RESERVE", "7")
     assert multimodal_token_estimate("hello", Tokenizer(), image_count=2) == 17
     assert image_input_count(_prompt(), _example()) == 1
+
+
+def test_remote_image_urls_are_opt_in_by_default():
+    with pytest.raises(ValueError, match="FLASH_ALLOW_REMOTE_IMAGES=1"):
+        _load_image("https://example.invalid/image.png")
+
+
+def test_empty_and_explicit_image_placeholders_keep_order():
+    blue_dot = _png_data_uri((0, 0, 255))
+    red_dot = _png_data_uri((255, 0, 0))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "image_url", "image_url": {"url": blue_dot}},
+                {"type": "text", "text": "Which image is red?"},
+            ],
+        }
+    ]
+
+    row = multimodal_grpo_prompt_row(messages, {"input": "x", "images": [red_dot]})
+
+    assert row["images"][0].getpixel((0, 0)) == (255, 0, 0)
+    assert row["images"][1].getpixel((0, 0)) == (0, 0, 255)
 
 
 def test_every_catalog_multimodal_model_accepts_image_rows():

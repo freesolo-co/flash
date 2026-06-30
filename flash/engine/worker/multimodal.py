@@ -24,6 +24,7 @@ _TEXT_BLOCK_TYPES = {"text", "input_text"}
 _DEFAULT_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 _DEFAULT_IMAGE_MAX_PIXELS = 64_000_000
 _DEFAULT_IMAGE_TOKEN_RESERVE = 1024
+_MISSING_IMAGE = object()
 
 
 def model_supports_images(model_id: str) -> bool:
@@ -104,6 +105,15 @@ def _configure_image_limits(Image) -> None:
     )
 
 
+def _allow_remote_images() -> bool:
+    return os.environ.get("FLASH_ALLOW_REMOTE_IMAGES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _open_rgb_image(Image, source):
+    with Image.open(source) as img:
+        return img.convert("RGB")
+
+
 def _check_image_size(size: int | None, *, label: str) -> None:
     if size is not None and size > _image_max_bytes():
         raise ValueError(f"{label} exceeds FLASH_IMAGE_MAX_BYTES={_image_max_bytes()}")
@@ -172,9 +182,9 @@ def _load_image(value: Any, *, base_dirs: tuple[Path, ...] | None = None):
         return value.convert("RGB")
     if isinstance(value, (bytes, bytearray)):
         _check_image_size(len(value), label="image bytes")
-        return Image.open(io.BytesIO(bytes(value))).convert("RGB")
+        return _open_rgb_image(Image, io.BytesIO(bytes(value)))
     if hasattr(value, "read"):
-        return Image.open(value).convert("RGB")
+        return _open_rgb_image(Image, value)
     if not isinstance(value, str):
         raise TypeError(f"unsupported image value {type(value).__name__}; expected path, URL, bytes, or PIL.Image")
 
@@ -187,12 +197,17 @@ def _load_image(value: Any, *, base_dirs: tuple[Path, ...] | None = None):
             raise ValueError("invalid data URI image reference")
         data = base64.b64decode(payload)
         _check_image_size(len(data), label="data URI image")
-        return Image.open(io.BytesIO(data)).convert("RGB")
+        return _open_rgb_image(Image, io.BytesIO(data))
 
     parsed = urllib.parse.urlparse(text)
     if parsed.scheme in {"http", "https"}:
+        if not _allow_remote_images():
+            raise ValueError(
+                "remote image URLs are disabled by default; set FLASH_ALLOW_REMOTE_IMAGES=1 "
+                "to allow http(s) image references in training data"
+            )
         with urllib.request.urlopen(text, timeout=60.0) as resp:
-            return Image.open(io.BytesIO(_read_limited_response(resp))).convert("RGB")
+            return _open_rgb_image(Image, io.BytesIO(_read_limited_response(resp)))
     if parsed.scheme and parsed.scheme != "file":
         raise ValueError(f"unsupported image URL scheme {parsed.scheme!r}")
 
@@ -200,7 +215,7 @@ def _load_image(value: Any, *, base_dirs: tuple[Path, ...] | None = None):
     for path in paths:
         if path.is_file():
             _check_image_size(path.stat().st_size, label=f"image file {path}")
-            return Image.open(path).convert("RGB")
+            return _open_rgb_image(Image, path)
     searched = ", ".join(str(p) for p in paths)
     allowed = ", ".join(str(p) for p in _allowed_base_dirs(base_dirs))
     raise FileNotFoundError(
@@ -229,7 +244,7 @@ def image_input_count(messages: list[dict] | None = None, example: dict | None =
     return block_count or top_level
 
 
-def _normalize_content(content: Any, *, block_payloads: list[Any], empty_image_blocks: list[int]) -> Any:
+def _normalize_content(content: Any, *, placeholder_values: list[Any]) -> Any:
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     if content is None:
@@ -244,10 +259,7 @@ def _normalize_content(content: Any, *, block_payloads: list[Any], empty_image_b
         kind = str(block.get("type") or "").lower()
         if kind in _IMAGE_BLOCK_TYPES:
             payload = _block_image_payload(block)
-            if payload is None:
-                empty_image_blocks.append(len(out))
-            else:
-                block_payloads.append(payload)
+            placeholder_values.append(_MISSING_IMAGE if payload is None else payload)
             out.append({"type": "image"})
             continue
         if kind in _TEXT_BLOCK_TYPES and "text" in block:
@@ -270,27 +282,31 @@ def normalize_messages_with_images(
     text environments compatible with image JSONL rows.
     """
     top_values = _image_values_from_example(example)
-    block_values: list[Any] = []
-    empty_image_blocks: list[int] = []
+    placeholder_values: list[Any] = []
     normalized: list[dict] = []
     for message in messages:
         m = dict(message)
-        m["content"] = _normalize_content(
-            m.get("content"), block_payloads=block_values, empty_image_blocks=empty_image_blocks
-        )
+        m["content"] = _normalize_content(m.get("content"), placeholder_values=placeholder_values)
         normalized.append(m)
 
-    placeholder_count = len(block_values) + len(empty_image_blocks)
     values: list[Any]
-    if placeholder_count:
-        values = list(block_values)
-        missing = placeholder_count - len(values)
+    if placeholder_values:
+        values = []
+        top_index = 0
+        missing = 0
+        for payload in placeholder_values:
+            if payload is _MISSING_IMAGE:
+                if top_index >= len(top_values):
+                    missing += 1
+                    continue
+                values.append(top_values[top_index])
+                top_index += 1
+            else:
+                values.append(payload)
         if missing:
-            if len(top_values) < missing:
-                raise ValueError(
-                    f"message has {missing} image placeholder(s) without matching top-level image data"
-                )
-            values.extend(top_values[:missing])
+            raise ValueError(
+                f"message has {missing} image placeholder(s) without matching top-level image data"
+            )
     else:
         values = list(top_values)
         if values:
