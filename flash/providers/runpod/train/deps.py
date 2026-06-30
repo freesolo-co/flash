@@ -29,8 +29,8 @@ WORKER_DEPS = [
     "flashinfer-python==0.6.6",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
-    # >=0.2.49: first version with Environment.sft_completion + datasets.target_messages (multi-turn SFT).
-    "freesolo>=0.2.49",
+    # >=0.2.50: includes robust JSONL loading for literal Unicode line separators.
+    "freesolo>=0.2.50",
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
     # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
