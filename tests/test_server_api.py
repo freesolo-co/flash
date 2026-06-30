@@ -1943,9 +1943,8 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
 def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
     """The /export handler must take the per-run deploy lock FROM THE VERY TOP — before even the
     payload-shape validation — and keep it across owned_run/the artifact read (mirroring /deploy,
-    which locks first). The always-on repo GC only spares a repo when it CAN'T acquire that same lock,
-    so taking the lock after the body validation left a window where the GC could delete the source
-    while the request was still validating its payload. Assert the lock is already held both during
+    which locks first). Taking the lock after body validation leaves a window for another deploy,
+    undeploy, or export operation to interleave with the request. Assert the lock is already held during
     the payload validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run
     runs."""
     import flash.server.app as app_mod
@@ -1959,8 +1958,7 @@ def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
     seen: dict = {}
 
     def checking_validate(repository):
-        # The payload validation runs BEFORE owned_run; assert it too is inside the lock, so the GC
-        # cannot delete the source during the (cheap, local) body validation.
+        # The payload validation runs BEFORE owned_run; assert it too is inside the lock.
         lk = app_mod._deploy_lock(run_id)
         acquired = lk.acquire(blocking=False)
         seen["locked_during_validation"] = not acquired

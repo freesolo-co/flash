@@ -109,6 +109,7 @@ def launch_and_submit(
     runtime_secrets: dict | None = None,
     mode: str | None = None,
     models: list | None = None,
+    code_prefix: str | None = None,
 ) -> LambdaJobHandle:
     """Launch the first region that accepts the job; walk regions on a capacity rejection."""
     say = make_say(log)
@@ -118,7 +119,8 @@ def launch_and_submit(
         )
     cache_name = getattr(spec.gpu, "network_volume", None)
     cold_user_data = build_user_data(
-        build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets), gpu=spec.gpu.type
+        build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets, code_prefix=code_prefix),
+        gpu=spec.gpu.type,
     )
 
     def _cache_user_data_for(mount_point: str) -> str:
@@ -126,7 +128,7 @@ def launch_and_submit(
         return build_user_data(
             build_payload(
                 spec, seed, attempt, runtime_secrets=runtime_secrets,
-                cache_host_mount=mount_point, mode=mode, models=models,
+                cache_host_mount=mount_point, mode=mode, models=models, code_prefix=code_prefix,
             ),
             gpu=spec.gpu.type,
         )
@@ -511,6 +513,7 @@ def submit_run_lambda(
     on_handle=None,
     attempt: int = 0,
     runtime_secrets: dict | None = None,
+    code_prefix: str | None = None,
 ) -> PollResult:
     """Launch, poll, and always terminate the instance (finally is the cost-safety primary)."""
     if spec.gpu.type not in GPU_INFO:
@@ -519,7 +522,13 @@ def submit_run_lambda(
         )
     instances = usable_instances(spec.gpu.type)
     handle = launch_and_submit(
-        spec, seed, instances, attempt=attempt, log=log, runtime_secrets=runtime_secrets
+        spec,
+        seed,
+        instances,
+        attempt=attempt,
+        log=log,
+        runtime_secrets=runtime_secrets,
+        code_prefix=code_prefix,
     )
     try:
         if on_handle is not None:
