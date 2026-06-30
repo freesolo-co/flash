@@ -509,9 +509,9 @@ def _save_status(status: RunStatus) -> None:
 
 
 from flash.runner.deploy import (  # noqa: E402,F401
-    attach_checkpoint_deployment,
     attach_run,
     cancel_run,
+    mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_undeployed,
     mark_undeployed,
