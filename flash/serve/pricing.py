@@ -28,12 +28,12 @@ class ServingPrice:
 
 
 SERVING_PRICES: dict[str, ServingPrice] = {
-    "openbmb/MiniCPM5-1B": ServingPrice("openbmb/MiniCPM5-1B", 0.01, 0.05, 0.002),
-    "Qwen/Qwen3.5-0.8B": ServingPrice("Qwen/Qwen3.5-0.8B", 0.01, 0.05, 0.002),
-    "Qwen/Qwen3.5-2B": ServingPrice("Qwen/Qwen3.5-2B", 0.02, 0.10, 0.004),
-    "Qwen/Qwen3.5-4B": ServingPrice("Qwen/Qwen3.5-4B", 0.03, 0.15, 0.006),
-    "Qwen/Qwen3.5-9B": ServingPrice("Qwen/Qwen3.5-9B", 0.10, 0.15, 0.020),
-    "Qwen/Qwen3.6-35B-A3B": ServingPrice("Qwen/Qwen3.6-35B-A3B", 0.15, 1.00, 0.050),
+    "openbmb/MiniCPM5-1B": ServingPrice(model_id="openbmb/MiniCPM5-1B", input_usd_per_mtok=0.01, output_usd_per_mtok=0.05, cached_input_usd_per_mtok=0.002),
+    "Qwen/Qwen3.5-0.8B": ServingPrice(model_id="Qwen/Qwen3.5-0.8B", input_usd_per_mtok=0.01, output_usd_per_mtok=0.05, cached_input_usd_per_mtok=0.002),
+    "Qwen/Qwen3.5-2B": ServingPrice(model_id="Qwen/Qwen3.5-2B", input_usd_per_mtok=0.02, output_usd_per_mtok=0.10, cached_input_usd_per_mtok=0.004),
+    "Qwen/Qwen3.5-4B": ServingPrice(model_id="Qwen/Qwen3.5-4B", input_usd_per_mtok=0.03, output_usd_per_mtok=0.15, cached_input_usd_per_mtok=0.006),
+    "Qwen/Qwen3.5-9B": ServingPrice(model_id="Qwen/Qwen3.5-9B", input_usd_per_mtok=0.10, output_usd_per_mtok=0.15, cached_input_usd_per_mtok=0.020),
+    "Qwen/Qwen3.6-35B-A3B": ServingPrice(model_id="Qwen/Qwen3.6-35B-A3B", input_usd_per_mtok=0.15, output_usd_per_mtok=1.00, cached_input_usd_per_mtok=0.050),
 }
 
 
