@@ -489,6 +489,26 @@ def test_training_max_examples_follows_reexported_loader(monkeypatch, tmp_path):
     assert seen["kwargs"]["max_examples"] is None
 
 
+def test_training_max_examples_uses_local_loader_after_uncapped_reexport(monkeypatch, tmp_path):
+    seen = _install_fake_freesolo(monkeypatch)
+    env_file = tmp_path / "environment.py"
+    helper_file = tmp_path / "helper.py"
+    env_file.write_text(
+        "from helper import load_environment\n\n"
+        "def load_environment(limit=1024):\n"
+        "    return None\n"
+    )
+    helper_file.write_text("def load_environment():\n    return None\n")
+
+    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES
+
+    load_freesolo_environment(str(env_file), **{_FLASH_TRAIN_MAX_EXAMPLES: None})
+
+    assert seen["kwargs"]["limit"] is None
+    assert "max_examples" not in seen["kwargs"]
+
+
 def test_training_max_examples_keeps_flash_cap_out_of_loader(monkeypatch, tmp_path):
     seen = _install_fake_freesolo(monkeypatch)
     env_file = tmp_path / "environment.py"
@@ -524,6 +544,20 @@ def test_training_max_examples_clears_all_declared_loader_caps(monkeypatch, tmp_
     env_file.write_text(
         "def load_environment(max_examples=None, limit=1024):\n    return None\n"
     )
+
+    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES
+
+    load_freesolo_environment(str(env_file), **{_FLASH_TRAIN_MAX_EXAMPLES: None})
+
+    assert seen["kwargs"]["max_examples"] is None
+    assert seen["kwargs"]["limit"] is None
+
+
+def test_training_max_examples_clears_kwargs_only_loader_caps(monkeypatch, tmp_path):
+    seen = _install_fake_freesolo(monkeypatch)
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**kwargs):\n    return None\n")
 
     from flash.envs.adapter import load_freesolo_environment
     from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES

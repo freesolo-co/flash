@@ -70,7 +70,8 @@ def _resolved_import_path(base: Path, module: str | None, level: int) -> Path | 
 def _load_environment_params(
     path: Path, target_name: str = "load_environment", seen: set[Path] | None = None
 ) -> tuple[set[str], bool]:
-    seen = seen or set()
+    if seen is None:
+        seen = set()
     resolved_path = path.resolve()
     if resolved_path in seen or len(seen) >= 8:
         return set(), False
@@ -80,6 +81,9 @@ def _load_environment_params(
             tree = ast.parse(source.read(), filename=os.fspath(path))
     except Exception:
         return set(), False
+
+    found = False
+    result: tuple[set[str], bool] = (set(), False)
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == target_name:
             args = node.args
@@ -91,7 +95,8 @@ def _load_environment_params(
                     *args.kwonlyargs,
                 )
             }
-            return names, args.kwarg is not None
+            result = names, args.kwarg is not None
+            found = True
         if isinstance(node, ast.ImportFrom):
             for alias in node.names:
                 if (alias.asname or alias.name) != target_name:
@@ -99,8 +104,10 @@ def _load_environment_params(
                 import_path = _resolved_import_path(path, node.module, node.level)
                 if import_path is None:
                     continue
-                return _load_environment_params(import_path, alias.name, seen)
-    return set(), False
+                result = _load_environment_params(import_path, alias.name, seen)
+                found = True
+                break
+    return result if found else (set(), False)
 
 
 def _apply_training_max_examples(reference: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -121,6 +128,7 @@ def _apply_training_max_examples(reference: str, params: dict[str, Any]) -> dict
         params["limit"] = None
     if not names.intersection({"max_examples", "limit"}) and accepts_kwargs:
         params["max_examples"] = None
+        params["limit"] = None
     return params
 
 
