@@ -52,10 +52,8 @@ def test_kernel_warmup_writes_arch_metadata(tmp_path):
 
 
 def test_worker_skips_baked_cache_when_arch_mismatches(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-
-    cache = tmp_path / "mega_cache.bin"
-    meta = tmp_path / "mega_cache.json"
+    cache = tmp_path / kernel_warmup.MEGA_CACHE_FILENAME
+    meta = tmp_path / kernel_warmup.MEGA_CACHE_META_FILENAME
     cache.write_bytes(b"cache")
     meta.write_text(json.dumps({"sm": "sm90"}))
     loaded = {"called": False}
@@ -67,18 +65,15 @@ def test_worker_skips_baked_cache_when_arch_mismatches(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setattr(worker, "_KERNEL_CACHE_FILE", str(cache))
-    monkeypatch.setattr(worker, "_KERNEL_CACHE_META_FILE", str(meta))
+    monkeypatch.setattr(kernel_warmup, "DEFAULT_CACHE_DIR", str(tmp_path))
 
-    assert worker._load_kernel_cache_if_present() is False
+    assert kernel_warmup.load_mega_cache() is False
     assert loaded["called"] is False
 
 
 def test_worker_skips_baked_cache_when_arch_undetermined(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-
-    cache = tmp_path / "mega_cache.bin"
-    meta = tmp_path / "mega_cache.json"
+    cache = tmp_path / kernel_warmup.MEGA_CACHE_FILENAME
+    meta = tmp_path / kernel_warmup.MEGA_CACHE_META_FILENAME
     cache.write_bytes(b"cache")
     # metadata arch would match a real sm89 worker, but this worker can't determine its own arch
     # (no CUDA) -> we must NOT load a blob we cannot verify; fall back to JIT.
@@ -105,8 +100,7 @@ def test_worker_skips_baked_cache_when_arch_undetermined(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setattr(worker, "_KERNEL_CACHE_FILE", str(cache))
-    monkeypatch.setattr(worker, "_KERNEL_CACHE_META_FILE", str(meta))
+    monkeypatch.setattr(kernel_warmup, "DEFAULT_CACHE_DIR", str(tmp_path))
 
-    assert worker._load_kernel_cache_if_present() is False
+    assert kernel_warmup.load_mega_cache() is False
     assert loaded["called"] is False

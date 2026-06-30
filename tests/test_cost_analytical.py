@@ -17,8 +17,9 @@ def test_estimate_is_positive_and_self_consistent():
     e = estimate_cost(RunConfig(MID, "sft", 200))
     assert e.total_usd > 0
     assert e.wall_clock_seconds == pytest.approx(e.setup_seconds + e.train_seconds)
-    # total = wall-clock hours x hourly rate
-    assert e.total_usd == pytest.approx(e.wall_clock_hours * e.gpu_hourly_usd)
+    # total = billable training hours x hourly rate; setup is elapsed time only.
+    assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
+    assert e.billable_hours == pytest.approx(e.train_seconds / 3600.0)
     # chosen card actually fits the run's requirement
     assert e.gpu_vram_gb >= e.required_vram_gb
 
@@ -26,6 +27,16 @@ def test_estimate_is_positive_and_self_consistent():
 def test_cost_increases_with_steps():
     costs = [estimate_cost(RunConfig(SMALL, "sft", s)).total_usd for s in (100, 500, 1000)]
     assert costs[0] < costs[1] < costs[2]
+
+
+def test_sft_train_tokens_price_actual_tokens_instead_of_padded_slots():
+    padded = estimate_cost(RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048))
+    actual = estimate_cost(
+        RunConfig(MID, "sft", 10, batch_size=16, seq_len=2048, train_tokens=50_000)
+    )
+    assert actual.train_seconds < padded.train_seconds
+    assert actual.total_usd < padded.total_usd
+    assert any("50,000 actual train tokens" in n for n in actual.notes)
 
 
 def test_grpo_costs_more_than_sft():
@@ -94,19 +105,20 @@ def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
 def test_cold_start_calibrated_to_real_short_sft_run():
     # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
     # the recipe batch) was cold-start-dominated (a fresh worker spent ~12.5 min in model load).
-    # Static pricing picks the cheapest fitting class; the cheapest managed card is the 48 GB
-    # RTX A6000 ($0.49). 26 = ceil(391 / 32) * 2 epochs.
+    # Static pricing picks the cheapest fitting class; the cheapest managed card is the 24 GB
+    # RTX 4090 ($0.69). 26 = ceil(391 / 32) * 2 epochs.
     e = estimate_cost(RunConfig(SMALL, "sft", 26))
-    assert e.gpu == "RTX A6000"
-    assert e.gpu_hourly_usd == pytest.approx(0.49, abs=1e-3)
-    assert e.total_usd == pytest.approx(0.0773, rel=0.10)
+    assert e.gpu == "RTX 4090"
+    assert e.gpu_hourly_usd == pytest.approx(0.69, abs=1e-3)
+    assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
+    assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
     # Model load (not boot/deps) is the dominant cold-start term for a short job.
     assert e.setup_seconds > e.train_seconds  # cold start dominates this short run
 
 
 def test_cold_start_negligible_for_long_runs():
     # The bigger cold start must NOT regress long runs: when training wall dominates, setup is a
-    # small single-digit fraction of the bill.
+    # small single-digit fraction of elapsed wall time.
     e = estimate_cost(RunConfig(SMALL, "sft", 5000))
     assert e.setup_seconds / e.wall_clock_seconds < 0.05
 
@@ -115,8 +127,10 @@ def test_wall_clock_cap_bounds_runaway_runs():
     e = estimate_cost(RunConfig(BIG, "grpo", 100_000))
     assert e.wall_capped is True
     assert e.wall_clock_seconds == pytest.approx(DEFAULT_WALL_CAP_S)
-    # The cap shows up in the notes and bounds the bill.
+    # The cap shows up in the notes and bounds billable training time.
     assert any("cap" in n.lower() for n in e.notes)
+    assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
+    assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
     uncapped_like = estimate_cost(RunConfig(BIG, "grpo", 100_000), wall_cap_s=10**9)
     assert uncapped_like.total_usd > e.total_usd
 
@@ -138,7 +152,8 @@ def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
     e30 = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=30))
     assert e10.wall_clock_seconds == pytest.approx(60.0)
     assert e30.wall_clock_seconds == pytest.approx(60.0)
-    assert e10.total_usd > 0.0
+    assert e10.train_seconds == pytest.approx(0.0)
+    assert e10.total_usd == pytest.approx(0.0)
 
 
 def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
@@ -149,9 +164,10 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
         assert cfg.max_wall_seconds == cap
         e = estimate_cost(cfg)
         assert e.wall_clock_seconds == pytest.approx(60.0)
-        assert e.total_usd > 0.0
-    one = RunConfig(BIG, "grpo", 100_000, setup_repeats=1, max_wall_seconds=3600)
-    assert estimate_cost(one).wall_clock_seconds == pytest.approx(3600.0)
+        assert e.train_seconds == pytest.approx(0.0)
+        assert e.total_usd == pytest.approx(0.0)
+    capped = RunConfig(BIG, "grpo", 100_000, max_wall_seconds=3600)
+    assert estimate_cost(capped).wall_clock_seconds == pytest.approx(3600.0)
 
 
 def test_select_gpu_picks_cheapest_including_unvalidated():
@@ -178,17 +194,19 @@ def test_9b_bf16_grpo_needs_an_80gb_class():
 
 
 def test_35b_moe_long_context_grpo_sized_past_the_b200():
-    # The 35B MoE colocated GRPO holds two ~70 GB weight copies + a KV pool on ONE 180 GB B200, so a
-    # long rollout context overflows it. The grpo_min_vram_gb floor engages the seq escalation, keyed
-    # on the ~3B ACTIVE params (not the 35B total): default/moderate GRPO stays on the B200, but a
-    # 32k-token run is sized PAST 180 GB so it's rejected at parse time rather than booted-then-OOM'd.
+    # The 35B MoE is RESIDENT-ONLY for GRPO (sleep_unsupported: vLLM sleep HANGS its wake), so it's
+    # sized on the RESIDENT peak (two ~70 GB weight copies + KV pool, fp8 KV). Default/moderate context
+    # fits the single 180 GB B200, but anything past the resident wall (~4-5k tok at group 8) is sized
+    # PAST 180 GB -> REJECTED at parse time, rather than admitted-then-HUNG in the broken sleep path
+    # (the old sleep estimate wrongly admitted up to ~16k, then the worker stalled).
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     moe = "Qwen/Qwen3.6-35B-A3B"
     # default + moderate context fit the single B200 (<= 180 GB).
     assert alloc_required_vram_gb(moe, "grpo", train={}, thinking=False) <= 180
-    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 8192}, thinking=False) <= 180
-    # a 32k-token rollout is sized ABOVE the 180 GB B200 (the biggest single card) -> nothing fits.
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 4096}, thinking=False) <= 180
+    # past the resident wall -> sized ABOVE the 180 GB B200 -> rejected (NOT routed to broken sleep).
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 8192}, thinking=False) > 180
     assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 32768}, thinking=False) > 180
     # The GRPO escalation is GRPO-only: default SFT stays at its 180 GB floor (fits the B200). (Long-
     # context SFT has its OWN large-vocab fp32-logits growth, independent of this grpo escalation.)

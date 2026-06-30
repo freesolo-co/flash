@@ -123,13 +123,26 @@ def vast_image(gpu: str | None = None) -> str:
     return worker_image_for_gpu(gpu) or WORKER_IMAGE
 
 
-def build_payload(spec, seed: int, attempt: int, runtime_secrets: dict | None = None) -> dict:
+def build_payload(
+    spec,
+    seed: int,
+    attempt: int,
+    runtime_secrets: dict | None = None,
+    code_prefix: str | None = None,
+) -> dict:
     """The Vast bootstrap payload (shared builder, arm='vast').
 
     Vast has no per-region weight-cache filesystem (that is Lambda's NFS feature), so it never
     passes ``cache_host_mount``/``mode`` — a plain cold worker payload every time.
     """
-    return _shared_build_payload(spec, seed, attempt, arm="vast", runtime_secrets=runtime_secrets)
+    return _shared_build_payload(
+        spec,
+        seed,
+        attempt,
+        arm="vast",
+        runtime_secrets=runtime_secrets,
+        code_prefix=code_prefix,
+    )
 
 
 def build_onstart(payload: dict) -> str:

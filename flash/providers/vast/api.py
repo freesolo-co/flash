@@ -154,6 +154,13 @@ def create_instance(
     # detail, destroy — keep their retries.)
     try:
         out = request_with_retries(f"/v0/asks/{int(offer_id)}/", method="PUT", body=body, retries=0)
+    except VastApiError as e:
+        cause = getattr(e, "__cause__", None)
+        if isinstance(cause, (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException)):
+            raise VastApiError(
+                f"create_instance({offer_id}) response unreadable (possible billed contract): {cause}"
+            ) from cause
+        raise
     except (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException) as e:
         # A 200 whose body is truncated / non-JSON / invalid-UTF8 on this NON-IDEMPOTENT create: Vast
         # may have already accepted the PUT and billed a contract while the RESPONSE leg failed, so we

@@ -1,10 +1,4 @@
-"""Worker dependency stack + per-run env / chalk-kernel selection (leaf module).
-
-The substrate-neutral training dependency list (``WORKER_DEPS``), the prebuilt worker
-image, the per-run worker env builder, and the chalk-kernel install-selection helpers.
-This is the leaf of the ``train`` package: it imports nothing else from the package and
-defines the shared ``logger`` the other submodules import.
-"""
+"""Worker dependency stack + per-run env / chalk-kernel selection (leaf module)."""
 
 from __future__ import annotations
 
@@ -12,111 +6,55 @@ import os
 
 from flash._logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+from flash.envs.registry import FREESOLO_WORKER_SPEC
 from flash.providers.base import get_gpu_info
 from flash.spec import JobSpec
 
-# Literal name (NOT __name__) so the logger stays "flash.providers.runpod.train" after the
-# module split into a package — callers/tests assert that exact name.
+# Literal name so the logger stays "flash.providers.runpod.train" after the package split — tests assert this.
 logger = get_logger("flash.providers.runpod.train")
 
 
-# Worker stack: trl 1.6 (colocate default; adds the GRPO `tools=` / `rollout_func`
-# multi-turn hooks used for Freesolo EnvironmentMultiTurn training), vllm 0.19.1
-# (Qwen3.5/3.6 archs, native RL APIs, transformers-5
-# compatible metadata), transformers 5.x (qwen3_5/qwen3_5_moe model types),
-# bitsandbytes (the 8-bit paged AdamW optimizer state — LoRA+ coexists with it).
-# trl 1.6 requires transformers>=4.56,
-# satisfied by the 5.6+ pin; GRPOConfig is field-compatible with the 1.5 usage here.
-# Resolver/driver notes: vllm 0.17/0.18 hard-pin transformers<5 (uv refuses the
-# combo), so the first transformers-5-compatible vllm line is 0.19.1. vllm >=0.20
-# pins torch 2.11 whose default pypi wheels are CUDA-13 builds — RunPod 4090/5090
-# hosts filtered at min_cuda 12.8 often run 12.8/12.9 drivers where cu13 torch sees
-# NO GPU (observed: "cuda not available" + vLLM "cumem allocator not supported").
-# vllm 0.19.1 pins torch 2.10 (cu128 default) which matches those drivers.
-# trl's *optional* [vllm] extra caps at 0.18, but we install plain trl, so the only
-# constraint that matters is runtime API compat — validated per-model on real
-# RTX 4090/5090 workers before promotion to default (see bench/results/phase1).
+# vllm 0.19.1: first vllm compatible with transformers 5.x; vllm>=0.20 pins torch 2.11
+# (CUDA-13 wheels) which reports no GPU on 12.8/12.9 drivers common on 4090/5090 hosts.
 WORKER_DEPS = [
     "torch==2.10.0",
     "transformers>=5.6,<5.13",
     "trl>=1.6,<1.7",
     "peft>=0.19",
     "vllm==0.19.1",
+    # FlashInfer: vLLM's Blackwell-native attention backend. vllm 0.19.1 pins flashinfer-python==0.6.6
+    # but treats it as an OPTIONAL extra (the plain `vllm` install does not pull it), so a consumer-
+    # Blackwell (sm120) / B200 rollout would silently fall back to a PTX-fragile default attention
+    # without it. Pin the matching 0.6.6 so the worker image carries the FLASHINFER attention backend
+    # (force_vllm_backend_for_sm120). No-op on non-Blackwell archs.
+    "flashinfer-python==0.6.6",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
-    # >=0.2.49: first version exposing Environment.sft_completion + datasets.target_messages,
-    # which the worker's SFT/multi-turn path now calls (flash #162 multi-turn SFT).
-    "freesolo>=0.2.49",
+    # >=0.2.52: includes robust JSONL loading and corrected package metadata.
+    FREESOLO_WORKER_SPEC,
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
-    # NB: the HF `kernels` Hub package is intentionally NOT pinned here — the versions
-    # compatible with torch2.10 break transformers 5.6-5.10's hub_kernels integration at IMPORT
-    # (LayerRepository now requires a version; transformers passes none -> ValueError on every
-    # `import transformers`). FlashAttention via the Hub is therefore disabled; attention uses
-    # SDPA (already a flash/efficient backend on Ampere/Ada) + the Liger fused kernels below,
-    # which are the dominant LoRA speedup anyway. (FA via a pinned flash-attn wheel is a future
-    # per-arch experiment, kept out of the default deps to avoid a fragile cold-start install.)
-    # Liger fused Triton kernels (pure Triton -> JITs on every arch incl. Blackwell): fused
-    # linear cross-entropy for SFT (use_liger_kernel) and the chunked GRPO loss
-    # (use_liger_loss) — the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
+    # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
     "wandb>=0.17",
     "liger-kernel>=0.5",
-    # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this, transformers
-    # falls back to a pure-PyTorch delta rule that is dramatically slower + memory-heavier (measured
-    # A/B, H100 SXM, Qwen3.5 hidden-2560 LoRA: seq4096 435->105 ms/step & 9.9->6.1 GB = 4.2x/1.6x;
-    # seq16384 3106->247 ms & 32->17 GB = 12.6x/1.9x; forward loss matches to 1.8e-4). Installed
-    # from git: the PyPI ``flash-linear-attention`` wheel is a broken stub missing ``fla.modules``.
-    # PINNED to a specific commit (not the moving default branch) so cold-start installs are
-    # reproducible and a breaking upstream change can't silently land on a run; bump intentionally
-    # after validating. Keep this SHA in lockstep with Dockerfile.worker's fla install.
+    # fla from git: PyPI wheel is a broken stub missing fla.modules. SHA-pinned for reproducibility;
+    # keep in lockstep with Dockerfile.worker. fla kept on ALL arches — worker ensures tilelang
+    # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper).
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
-    # fla's gated chunk_bwd is INCORRECT on Hopper (H100) with Triton>=3.4 (fla #640); its
-    # ``tilelang`` backend is the correct path there, so we KEEP fla on every arch (the worker's
-    # _ensure_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import).
-    # PINNED (like the fla SHA) so cold-start installs / image rebuilds are reproducible and a
-    # breaking upstream tilelang can't silently land on the Hopper correctness path. Keep this
-    # version in lockstep with Dockerfile.worker + perf.py's runtime reinstall.
+    # tilelang version-pinned in lockstep with Dockerfile.worker + perf.py runtime reinstall.
     "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
-    # NB: ``causal_conv1d`` (the conv kernel that, with fla's cu_seqlens, lets GatedDeltaNet hybrids
-    # PACK boundary-correctly — engine.worker.packing) is NOT pip-listed here: it's a CUDA-extension
-    # build, so Dockerfile.worker compiles it best-effort with TORCH_CUDA_ARCH_LIST set (a plain pip
-    # entry would try to compile at the no-GPU image-build step for the wrong/native arch). If it's
-    # absent the GDN packing path stays off (gdn_packing_available) and Qwen3.5/3.6 train unpacked.
-    # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
-    # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
-    # (chalk_extra_pip) appends the version-pinned ``freesolo-chalk`` (DEFAULT_CHALK_SPEC) from PyPI
-    # to the worker's `extra_pip` for EVERY job by default — installed + applied automatically, like
-    # Liger. Override the install SOURCE with FLASH_CHALK_SPEC (an exact version / git URL / wheel).
-    # The worker pip-installs extra_pip for EVERY job through the baked-image RunPod _train_body.
+    # causal_conv1d NOT pip-listed: CUDA extension compiled in Dockerfile.worker with TORCH_CUDA_ARCH_LIST.
+    # freesolo-chalk NOT in base deps: chalk_extra_pip() appends DEFAULT_CHALK_SPEC to extra_pip per job.
 ]
-# NOTE on download speed: Flash's runtime already ships hf_transfer and exports
-# HF_HUB_ENABLE_HF_TRANSFER=1 on workers (measured: Qwen3-4B's ~8 GB pulled in 6.3 s,
-# NIC-saturated — bench/results/phase6). Adding hf_transfer here is redundant; don't.
 WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
-# The prebuilt worker image (full training stack baked in; built by Dockerfile.worker /
-# .github/workflows/worker-image.yml). PUBLIC under the org namespace, so no registry login is
-# ever needed. Must be published to GHCR + made public before the paths that use it can pull it.
-#   * RunPod baked-image submit (jobs.deploy_train_endpoint / build_function_input): the default —
-#     a self-contained serverless worker whose rp_handler runs _train_body. FLASH_WORKER_IMAGE
-#     overrides the tag (e.g. a hotfix); the boot-install fallback is only reachable if BOTH are
-#     cleared (not a normal configuration).
-#   * RunPod Flash live-endpoint (train.endpoints.get_train_endpoint): does NOT use this baked image
-#     by default — RunPod Flash needs its serverless runtime baked in, which WORKER_IMAGE lacks, so
-#     it boot-installs resolve_worker_deps() on Flash's default template instead. It uses an image
-#     only when the operator sets FLASH_WORKER_IMAGE to a RunPod-serverless-compatible one.
-# So FLASH_WORKER_IMAGE IS an operator override (consulted by every RunPod path).
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 WORKER_IMAGE_TEMPLATE_ENV = "FLASH_WORKER_IMAGE_TEMPLATE"
 WORKER_IMAGE_PER_SM_ENV = "FLASH_WORKER_IMAGE_PER_SM"
 
-# SM arches for which a per-SM kernel-cache image is actually published. MUST mirror the bake
-# matrix default in .github/workflows/bake-kernel-cache.yml. ``worker_image_for_gpu`` only appends a
-# ``-smXX`` suffix for an arch in this set; an arch with no baked image (e.g. B200 / sm100 today)
-# falls back to the base ``WORKER_IMAGE`` so an allocation can't fail at ``docker pull`` on a tag
-# that was never built (it cold-JITs kernels instead — slower first run, but it runs). Add an arch
-# here in lockstep with adding it to the bake workflow.
+# MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
+# back to WORKER_IMAGE (no -smXX tag built) rather than failing at docker pull.
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120"})
 
 
@@ -133,20 +71,10 @@ def _append_tag_suffix(image: str, suffix: str) -> str:
 
 
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
-    """Return the RunPod worker image for a GPU class.
-
-    ``FLASH_WORKER_IMAGE`` remains the absolute override. Per-SM warmed images are opt-in through
-    either ``FLASH_WORKER_IMAGE_TEMPLATE`` (for custom tag layouts) or ``FLASH_WORKER_IMAGE_PER_SM``
-    (which appends ``-smXX`` to ``WORKER_IMAGE``'s tag). Without either opt-in, the current base
-    image is returned for durable jobs and ``None`` is returned for live endpoints that request no
-    default image.
-    """
+    """Return the RunPod worker image for a GPU class, respecting FLASH_WORKER_IMAGE override."""
     override = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
     if override:
         return override
-    # per-sm / template images are durable RunPod queue-worker images (CMD runs rp_handler.py), NOT
-    # RunPod Flash live-function images, so they must never leak into the live path. only the
-    # absolute FLASH_WORKER_IMAGE override (handled above) is treated as live-compatible.
     if friendly_gpu and allow_default:
         info = get_gpu_info(friendly_gpu)
         template = os.environ.get(WORKER_IMAGE_TEMPLATE_ENV, "").strip()
@@ -160,101 +88,43 @@ def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True
             )
         if _truthy(os.environ.get(WORKER_IMAGE_PER_SM_ENV)) and info.sm in BAKED_PER_SM_ARCHES:
             return _append_tag_suffix(WORKER_IMAGE, info.sm)
-        # else (PER_SM set but this arch has no baked per-SM image, e.g. B200/sm100): fall through to
-        # the base WORKER_IMAGE rather than selecting a `-smXX` tag `docker pull` would 404 on.
+        # arch not in BAKED_PER_SM_ARCHES: fall through to base image to avoid a 404 docker pull
     return WORKER_IMAGE if allow_default else None
 
 
 def resolve_worker_deps() -> list[str]:
-    """The dependency list Flash installs on the GPU worker for this run.
-
-    The pinned ``WORKER_DEPS`` is authoritative — flash is fully managed, no per-run override.
-
-    fla is kept on ALL arches (including Hopper): the worker's _ensure_fla_fastpath_on_hopper
-    ensures fla's correct ``tilelang`` backend is live on sm90 before any model import (fla #640's
-    Triton>=3.4 miscompute is a tilelang-backend fix, not a reason to drop fla). This makes Hopper
-    GDN training ~4-13x faster + ~2x less memory than the pure-PyTorch delta fallback.
-    """
+    """Return the pinned worker dependency list."""
     return list(WORKER_DEPS)
 
 
 def _effective_worker_env(spec=None) -> dict[str, str]:
-    """The env the WORKER process will actually see, for chalk-selection decisions.
-
-    chalk install-on-call is selected by ``FLASH_*`` flags read on the worker from its own process
-    env, which ``build_worker_env`` builds as the control-plane ``os.environ`` allowlist with the
-    run's ``[worker_env]`` overrides merged ON TOP (per-run ``spec.worker_env`` wins). A run that
-    opts into chalk via its ``[worker_env]`` block therefore sets the flag the worker reads — so the
-    SAME merge must decide whether chalk is selected and whether its spec is added to ``extra_pip``;
-    reading bare ``os.environ`` here would miss a per-run ``[worker_env]`` opt-in and the kernels
-    would never install for that run.
-
-    Returns ``os.environ`` overlaid with ``spec.worker_env`` (string-coerced). ``spec=None`` (no
-    per-run env) collapses to plain ``os.environ``.
-    """
+    """os.environ overlaid with spec.worker_env — mirrors what build_worker_env sends the worker."""
     eff: dict[str, str] = dict(os.environ)
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         eff[str(k)] = str(v)
     return eff
 
 
-# Default chalk install spec when FLASH_CHALK_SPEC is unset. VERSION-PINNED (bounded range, like the
-# rest of WORKER_DEPS) so a default run is reproducible and a breaking freesolo-chalk release can't
-# silently land on production jobs — 0.1.x patches are allowed, 0.2 is not. Bump intentionally after
-# validating a new line; an operator can pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
 DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.1.0,<0.2.0"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
-    """Chalk pip spec(s) to ADD to the worker's ``extra_pip`` when a chalk kernel is selected.
-
-    This is the install hook that runs for DEFAULT remote jobs: the baked-image RunPod path
-    (``_train_body`` -> ``pip install *extra_pip``) consumes the payload's ``extra_pip``
-    regardless of ``WORKER_IMAGE`` — unlike ``resolve_worker_deps``, which the durable
-    ``build_function_input`` baked-image path skips.
-
-    Selection (and the ``FLASH_CHALK_SPEC`` lookup) is resolved against the EFFECTIVE worker env —
-    the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
-    process will see (``build_worker_env``) and a per-run ``[worker_env]`` opt-in installs chalk.
-
-    Chalk's gap-fillers are default-on, so chalk is selected for a normal run even with no FLASH_*
-    flags set. freesolo-chalk is published on PyPI, so it auto-installs by DEFAULT (just like Liger):
-    when chalk is selected and ``FLASH_CHALK_SPEC`` is unset we add the version-pinned
-    :data:`DEFAULT_CHALK_SPEC`. Set ``FLASH_CHALK_SPEC`` to override the source (an exact version, a
-    git URL, or a wheel/path), or disable every kernel (``FLASH_<K>=0``) to skip the install.
-    """
-    # PyPI default (version-pinned for reproducibility) — chalk is published, so a normal run
-    # installs + applies it automatically. An explicit FLASH_CHALK_SPEC overrides the source.
+    """Return chalk pip spec(s) for the worker's extra_pip; resolved against the effective worker env."""
     spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
     import shlex
 
     return [d for d in shlex.split(spec_str) if d.strip()]
 
 
-DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
+DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap
 
 
 _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
 
-# Optimization-toggle env knobs REMOVED in PR #175 (deterministic behavior). flash is fully
-# managed: these used to let a run override alloc conf / attention backend / torch.compile / the
-# FlashAttention selection / chalk-kernel selection / the whole worker dep stack. They were dropped
-# from forwarding to make every run behave identically — but the per-run ``spec.worker_env`` block
-# is still merged into the worker env below, so without filtering, a recipe could RE-INJECT any of
-# them and silently re-enable the non-deterministic (and sometimes crash-prone) behavior:
-#   * PYTORCH_(CUDA_)ALLOC_CONF — overrides the sleep-SAFE alloc conf build_worker_env computes for
-#     RL; expandable_segments:True crashes GRPO vLLM sleep mode (CuMemAllocator assert at init).
-#   * RL_VLLM_SLEEP / FLASH_ALLOC_AUTO — the worker resolves sleep + alloc-conf deterministically.
-#   * VLLM_ATTENTION_BACKEND / VLLM_FLASH_ATTN_VERSION / FLASH_DISABLE_FA2 / FLASH_DISABLE_FA3 /
-#     TORCHDYNAMO_DISABLE — attention / compile escape hatches; FA is used whenever importable.
-#   * FLASH_*_KERNEL / FLASH_FP8_BASE / FLASH_TRITON_LORA — chalk kernel SELECTION is now fixed in
-#     engine.chalk_kernels._KERNELS (reads no env); a per-run flag is dead but still stripped.
-#   * FLASH_WORKER_DEPS / FLASH_WORKER_EXTRA_DEPS — the pinned WORKER_DEPS stack is authoritative.
-# Matched case-INSENSITIVELY (build_worker_env upper-cases each [worker_env] key ONLY for this
-# membership check — `ku = str(k).upper()`; the merge itself preserves the key's original casing).
-# FLASH_CHALK_SPEC is deliberately NOT here — it is a still-supported install-SOURCE override (see
-# build_worker_env's forward list).
+# Optimization toggles dropped in PR #175 (deterministic behavior). Filtered from [worker_env]
+# to prevent recipes re-injecting e.g. expandable_segments (crashes GRPO vLLM sleep mode).
+# FLASH_CHALK_SPEC is deliberately absent — it's still a supported install-source override.
 _REMOVED_OPTIMIZATION_ENV = frozenset(
     {
         "PYTORCH_ALLOC_CONF",
@@ -278,54 +148,21 @@ _REMOVED_OPTIMIZATION_ENV = frozenset(
 )
 
 
-# RunPod serverless mounts a network volume at this FIXED path (can't mount over ~/.cache), so the
-# redirect is conditional per-run env, not a static image ENV.
 _WEIGHT_CACHE_MOUNT = "/runpod-volume"
 
 
 def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
-    """Worker env pointing the BASE-MODEL prefetch at the persistent volume mount.
+    """Env pointing the base-model prefetch at the persistent volume mount.
 
-    Only used when a weight-cache volume is attached (jobs.weight_cache_endpoint_kwargs). This is the
-    whole feature — the base-model download becomes a one-time cost per region instead of per run
-    (hf_transfer already saturates the NIC; this just makes it land somewhere persistent).
-
-    BASE-MODEL-SCOPED, not a global HF_HOME redirect. We export ``FLASH_WEIGHT_CACHE_DIR`` (the HF hub
-    layout under the mount) and leave HF_HOME unset, so the worker's DEFAULT (per-worker, ephemeral)
-    HF cache stays the global cache. The worker (engine.worker.hf.prefetch_model) downloads ONLY the
-    trusted public base model onto the shared mount via an explicit ``cache_dir`` and symlinks it into
-    the ephemeral cache for the trainer/vLLM. Every OTHER HF download a run makes at execution time —
-    its environment/reward code fetching datasets/models with the forwarded platform HF_TOKEN — lands
-    in the ephemeral cache, never the SHARED multi-tenant mount where a later tenant in the region
-    could read it. (Previously this set HF_HOME onto the mount process-globally, so those env/reward
-    downloads leaked onto the shared volume — issue #252.)
-
-    DELIBERATELY does NOT redirect the executable kernel-JIT caches (Triton/Inductor/tilelang/
-    torch-extensions): those are compiled artifacts the worker *executes*, so sharing them across
-    tenants on one volume would let a buggy/hostile run's environment code poison a later unrelated
-    run in the same region. JIT caches stay per-worker/ephemeral (the ~10-15 min first-use compile is
-    paid per cold worker, as before).
-
-    Concurrent writes: two cold runs landing in the same region before it is warm both
-    snapshot_download the base model onto this shared mount. huggingface_hub guards this with a
-    per-blob file lock + atomic rename (content-addressed blobs), so the worst case is duplicated
-    download work, not a corrupt snapshot. The preload step (flash/providers/runpod/preload.py)
-    pre-warms each region precisely so real runs hit a populated cache and the cold-concurrent case is
-    rare.
+    Sets FLASH_WEIGHT_CACHE_DIR (not HF_HOME) so only the trusted public base model lands on the
+    shared multi-tenant mount; reward/env HF downloads stay in the ephemeral per-worker cache.
+    JIT caches are never redirected — sharing compiled artifacts across tenants is unsafe.
     """
     return {"FLASH_WEIGHT_CACHE_DIR": f"{mount}/hf-cache/hub"}
 
 
 def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
-    """Strip any ``mount``-rooted cache vars when the volume isn't actually mounted (mutates+returns).
-
-    Defense-in-depth for the cold/no-volume fallback: if the cache attach degraded to ``{}`` (an SDK
-    error) or the worker simply has no volume, ``FLASH_WEIGHT_CACHE_DIR`` would otherwise point at a
-    non-existent ``/runpod-volume`` path. Dropping it lets the base-model prefetch fall back to the
-    default ephemeral cache (a correct cold run) instead of writing under a missing/ephemeral mount.
-    Reads the real filesystem (``os.path.isdir``) but takes the env as an argument, so tests drive it
-    by monkeypatching isdir.
-    """
+    """Strip mount-rooted cache vars if the volume isn't actually mounted (mutates+returns)."""
     if os.path.isdir(mount):
         return env
     for k in [k for k, v in env.items() if str(v).startswith(mount)]:
@@ -334,16 +171,7 @@ def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dic
 
 
 def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
-    """Remove the RunPod weight-cache redirect from an env bound for a NON-RunPod worker (mutates).
-
-    Instance providers (e.g. Lambda) reuse this module's shared ``build_worker_env``, which
-    points ``FLASH_WEIGHT_CACHE_DIR`` at the RunPod network-volume mount (``/runpod-volume``) whenever
-    the run carries a weight-cache volume. That mount exists ONLY on RunPod serverless — on a rented
-    instance it is a nonexistent path with no cross-run persistence — so the instance submit path
-    strips any ``/runpod-volume``-rooted cache var here (unconditionally: instance providers never
-    mount it). A user ``[worker_env]`` ``HF_HOME`` override is not ``/runpod-volume``-rooted, so it is
-    preserved.
-    """
+    """Remove the RunPod weight-cache redirect from an env bound for a non-RunPod worker (mutates)."""
     for k in [k for k, v in env.items() if str(v).startswith(mount)]:
         env.pop(k, None)
     return env
@@ -354,21 +182,9 @@ def build_worker_env(
     seed: int,
     runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
-    """Per-run env passed to the worker (platform creds + recipe overrides).
-
-    Provider and artifact credentials still come from the control-plane process environment.
-    User runtime secrets (W&B plus [environment].secrets) are injected from ``runtime_secrets``
-    below so the control plane never stores user-owned secret values in the spec.
-    """
-    # CUDA allocator conf. Colocate (TRL trainer + vLLM on one GPU) fragments over a long run, so
-    # expandable_segments (which reclaims fragmentation) is the right default — EXCEPT under GRPO
-    # vLLM sleep mode, whose CuMemAllocator memory pool is incompatible with expandable_segments
-    # (vLLM asserts and the run crashes at engine init). RL is fully managed — no sleep/alloc knob:
-    # we set the sleep-SAFE non-expandable conf for RL here (the launcher can't yet know the model's
-    # resolved sleep decision), and the worker upgrades RL runs to expandable_segments when it
-    # resolves sleep OFF for the model/context (engine.worker.finalize_alloc_conf_for_sleep, same
-    # deterministic _memory_mode gate run_rl uses). SFT has no vLLM engine, so expandable is safe.
-    # torch >= 2.10 renamed the env to PYTORCH_ALLOC_CONF — set BOTH names for either stack.
+    """Per-run env passed to the worker (platform creds + recipe overrides)."""
+    # RL uses a non-expandable alloc conf: expandable_segments crashes GRPO vLLM sleep mode.
+    # Worker upgrades to expandable when it resolves sleep=OFF (finalize_alloc_conf_for_sleep).
     _is_rl = str(getattr(spec, "algorithm", "")).lower() not in ("sft",)
     _alloc_conf = (
         "garbage_collection_threshold:0.8,max_split_size_mb:256"
@@ -377,76 +193,39 @@ def build_worker_env(
     )
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
-        # Compute substrate, read back by engine.worker for the RunMetrics record.
         "FLASH_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }
-    # Platform creds only: HF artifact creds (HF_TOKEN) + managed environment hub creds
-    # (GITHUB_TOKEN). flash is fully managed — there are no per-run env knobs and no hardcoded
-    # reward-judge creds. A Freesolo environment whose reward calls an LLM judge declares the
-    # provider key it needs (e.g. OPENROUTER_API_KEY / OPENAI_API_KEY) as an [environment].secrets
-    # entry, which is forwarded via runtime_secrets at submit time to the worker where the reward
-    # runs; the judge model id is the env's own default. Forward any platform cred below that the
-    # operator has set; absent ones are simply not passed.
     for key in (
         "HF_TOKEN",
         "GITHUB_TOKEN",
     ):
         if os.environ.get(key):
             env[key] = os.environ[key]
-    # Seed the worker's own HF_REPO env from the run's [train] hf_repo (adapter/checkpoint/
-    # code storage + heartbeats). The worker reads HF_REPO from its own process env; that env
-    # is now sourced from the spec, not the operator's HF_REPO.
     env["HF_REPO"] = spec.train.hf_repo
-    # When the shared weight-cache volume is attached, point the BASE-MODEL prefetch at the mount so
-    # the public base-model weights persist across runs (HF blobs only — NOT the executable kernel-JIT
-    # caches; see weight_cache_env). Gated on a volume being assigned: without one the mount doesn't
-    # exist, so pointing the cache dir there would just break the worker (the worker also self-corrects
-    # at runtime if /runpod-volume isn't mounted — see _train_body / hf.prefetch_model). A per-run
-    # [worker_env] override still wins (merged last, below).
-    # CONFIDENTIALITY (issue #252, closed): this is FLASH_WEIGHT_CACHE_DIR, NOT a process-global HF_HOME.
-    # The worker downloads ONLY the trusted public base model onto the shared mount (explicit cache_dir)
-    # and symlinks it into the per-worker EPHEMERAL cache for the trainer/vLLM; the run's environment/
-    # reward code's runtime HF downloads (fetched with the forwarded HF_TOKEN) land in that ephemeral
-    # cache, never the shared multi-tenant mount. See the TRUST MODEL note in flash/runner/__init__.py.
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
     if spec.train.steps is not None:
         env["RL_STEPS"] = str(spec.train.steps)
     if spec.train.epochs is not None:
         env["SFT_EPOCHS"] = str(spec.train.epochs)
-    # Forward the worker-side knobs the worker / vLLM actually read. flash is fully
-    # managed: there are no per-run env tuning knobs — the only per-run config is the spec's
-    # structured fields, and the worker hardcodes the vLLM-util / quant / heartbeat defaults.
     for k in (
         "SFT_PER_DEVICE_BS",
         "VLLM_USE_V1",
-        # The chalk install SOURCE (an exact version / git URL / wheel). Kernel SELECTION is fixed
-        # in engine.chalk_kernels (no env flags); this only points install_chalk_kernels at a
-        # specific chalk build, and is also consumed at submit time to add chalk to extra_pip.
-        "FLASH_CHALK_SPEC",
+        "FLASH_CHALK_SPEC",  # install-source override; kernel selection is fixed in chalk_kernels
     ):
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
-    # Per-run worker_env overrides win over the global os.environ allowlist: this is what lets
-    # ONE run differ (e.g. a per-run optimizer or LoRA-init A/B) while every other concurrent run
-    # keeps the global default. Run-IDENTITY keys are control-plane-owned and excluded: the poller,
-    # deploy, and artifact paths all key off spec.run_id / spec.train.hf_repo, so letting a
-    # [worker_env] override RUN_ID/HF_REPO would make the worker upload under a different repo/prefix
-    # and orphan the artifacts (the poller would never find DONE/metrics, deploy can't locate the
-    # adapter). FLASH_ARM identifies the substrate.
+    # RUN_ID/HF_REPO/FLASH_ARM are control-plane-owned: overriding them would orphan artifacts.
     _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         ku = str(k).upper()
         if ku in _RESERVED_WORKER_ENV:
-            continue  # control plane owns run identity; a per-run override would orphan artifacts
+            continue
         if ku in _REMOVED_OPTIMIZATION_ENV:
-            # A removed optimization toggle (PR #175). flash is deterministic + fully managed: drop
-            # it so a recipe can't re-inject e.g. an unsafe PYTORCH_ALLOC_CONF that crashes GRPO
-            # sleep mode, or a stale chalk/FA selection flag. See _REMOVED_OPTIMIZATION_ENV.
             logger.warning(
                 "ignoring removed optimization toggle %s in [worker_env] (flash is fully "
                 "managed; behavior is deterministic)",

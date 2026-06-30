@@ -227,6 +227,7 @@ def deploy_and_submit(
     attempt: int = 0,
     log=None,
     runtime_secrets: dict | None = None,
+    code_prefix: str | None = None,
 ) -> VastJobHandle:
     """Rent the cheapest offer that will actually take the job; walk on rejection.
 
@@ -238,7 +239,13 @@ def deploy_and_submit(
 
     if not offers:
         raise vast_api.VastApiError("no usable vast offers (verified datacenter pool empty)")
-    payload = build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets)
+    payload = build_payload(
+        spec,
+        seed,
+        attempt,
+        runtime_secrets=runtime_secrets,
+        code_prefix=code_prefix,
+    )
     label = instance_label(spec.run_id, seed, attempt)
     onstart = build_onstart(payload)
 
@@ -787,6 +794,7 @@ def submit_run_vast(
     on_handle=None,
     attempt: int = 0,
     runtime_secrets: dict | None = None,
+    code_prefix: str | None = None,
 ) -> PollResult:
     """Vast equivalent of ``lambdalabs.jobs.submit_run_lambda``: rent, persist, poll, destroy.
 
@@ -810,9 +818,14 @@ def submit_run_vast(
         )
         if o.gpu == spec.gpu.type
     ]
-    handle = deploy_and_submit(
-        spec, seed, offers, attempt=attempt, log=log, runtime_secrets=runtime_secrets
-    )
+    deploy_kwargs = {
+        "attempt": attempt,
+        "log": log,
+        "runtime_secrets": runtime_secrets,
+    }
+    if code_prefix is not None:
+        deploy_kwargs["code_prefix"] = code_prefix
+    handle = deploy_and_submit(spec, seed, offers, **deploy_kwargs)
     # The instance is billing the MOMENT deploy_and_submit returns; the teardown ``finally`` must guard
     # EVERYTHING after that point — including ``on_handle`` (persisting the handle can itself raise).
     try:

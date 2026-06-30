@@ -59,6 +59,7 @@ class VastProvider:
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
+        code_prefix: str | None = None,
     ) -> PollResult:
         # ``on_last_gpu`` is accepted for the shared Provider interface (RunPod stretches its grace on
         # the last GPU); the instance providers use a UNIFORM per-GPU wait, so it is intentionally unused.
@@ -71,6 +72,7 @@ class VastProvider:
             on_handle=on_handle,
             attempt=attempt,
             runtime_secrets=runtime_secrets,
+            code_prefix=code_prefix,
         )
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:

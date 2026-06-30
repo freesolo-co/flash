@@ -31,8 +31,7 @@ INSTANCE_PROVIDERS: tuple[str, ...] = ("lambda", "vast")
 
 
 def get_provider(name: str) -> Provider:
-    """The ``Provider`` singleton for a registered name (raises on unknown)."""
-    # Normalize BEFORE the cache so "RunPod"/"runpod"/" runpod " share one cache entry.
+    """Return the ``Provider`` singleton for a registered name (raises on unknown)."""
     return _get_provider((name or "").strip().lower())
 
 
@@ -54,9 +53,7 @@ def _get_provider(key: str) -> Provider:
 
 
 def available_providers() -> tuple[str, ...]:
-    """Provider NAMES usable from this control plane right now: a provider is available when it
-    ``is_configured()`` (creds present). RunPod is always on; Lambda joins only when
-    its operator key is present."""
+    """Provider names whose credentials are present on this control plane."""
     return tuple(n for n in PROVIDER_NAMES if get_provider(n).is_configured())
 
 

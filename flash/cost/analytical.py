@@ -1,6 +1,9 @@
-"""The analytical cost model: total = wall-clock hours x GPU $/hr, where wall = cold-start
-setup + steps x per-step time (a FLOPs/MFU estimate). GRPO splits each step into a vLLM
-rollout + reward grading + policy/reference update."""
+"""The analytical cost model: total = training-only GPU hours x GPU $/hr.
+
+Elapsed wall clock still includes cold-start setup + steps x per-step time, but setup/cold-start
+is reported as non-billable. GRPO splits each step into a vLLM rollout + reward grading +
+policy/reference update.
+"""
 
 from __future__ import annotations
 
@@ -38,11 +41,11 @@ REWARD_CONCURRENCY = 16.0
 
 # Cold-start overhead (seconds): container boot + deps + model load (+ vLLM init for GRPO).
 #
-# Calibrated against a real fresh-worker run (0.8B SFT, RTX 3090 @ $0.239/hr) whose billed wall
+# Calibrated against a real fresh-worker run (0.8B SFT, RTX 3090 @ $0.239/hr) whose elapsed wall
 # was ~708s for only ~26 priced steps -- i.e. cold start, not training, dominated. A fresh worker
 # spent ~12.5 min in `sft_model_load` alone (download + checkpoint deserialize + GPU placement +
-# framework/CUDA init), so the MODEL-LOAD term -- not boot/deps -- is the dominant cost of a short
-# job. MODEL_LOAD_BASE_S is the fixed (size-independent) load/init overhead; the download term on
+# framework/CUDA init), so the MODEL-LOAD term -- not boot/deps -- dominates a short job's elapsed
+# time. MODEL_LOAD_BASE_S is the fixed (size-independent) load/init overhead; the download term on
 # top of it scales with checkpoint size, so bigger models pay a longer cold start.
 WORKER_BOOT_S = 120.0  # container pull + start
 DEPS_INSTALL_S = 90.0  # pip/uv resolve + install
@@ -64,9 +67,9 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def setup_seconds(config: RunConfig) -> float:
-    """Cold-start wall time billed before the first optimizer step: container boot + deps + model
-    load (a fixed deserialize/placement/init base + a size-scaled download), plus vLLM init for
-    GRPO. The model-load term dominates a short job's bill (see the constants above)."""
+    """Cold-start wall time before the first optimizer step: container boot + deps + model load
+    (a fixed deserialize/placement/init base + a size-scaled download), plus vLLM init for GRPO.
+    This elapsed setup time is reported but not included in customer-facing cost."""
     model_load = MODEL_LOAD_BASE_S + download_weight_gb(config.model_id) / DOWNLOAD_RATE_GBPS
     s = WORKER_BOOT_S + DEPS_INSTALL_S + model_load
     if config.is_grpo:
@@ -94,6 +97,14 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
     reward_s = math.ceil(completions / REWARD_CONCURRENCY) * latency  # ceil: a partial wave still costs one latency
     return gen_s + reward_s + update_s
+
+def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> float:
+    """SFT steady-state wall time for an actual token count on ``gpu``."""
+    n = config.normalized()
+    params = active_params_b(n.model_id) * 1e9
+    peak = gpu_tflops(gpu) * 1e12
+    flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * train_tokens
+    return flops / (peak * MFU_SFT_TRAIN)
 
 
 def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str, int]:
@@ -128,11 +139,12 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
             + (f", env {n.environment}" if n.environment else "")
             + ") + policy+reference update"
         )
+    elif n.train_tokens is not None:
+        notes.append(f"SFT priced on {n.train_tokens:,} actual train tokens")
     notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; static GPU $/hr")
     if wall_capped:
-        per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
-            f"training clamped to fit the {_fmt_duration(cap_s)} {per_seed}wall cap "
+            f"training clamped to fit the {_fmt_duration(cap_s)} wall cap "
             f"(after setup; uncapped: {_fmt_duration(raw_train_s)})"
         )
     return tuple(notes)
@@ -160,18 +172,18 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
     hourly = gpu_hourly_usd(gpu, provider=config.provider, max_wall_seconds=market_wall_s)
 
-    # Each seed is its own job (own cold start + own wall cap): price one seed, clamp, x seeds.
-    seeds = config.setup_repeats
-    setup_per_seed = setup_seconds(config)
+    setup = setup_seconds(config)
     sps = seconds_per_step(config, gpu)
-    raw_train_per_seed = (config.steps / seeds) * sps
+    raw_train = config.steps * sps
+    if not config.is_grpo and config.train_tokens is not None:
+        raw_train = sft_seconds_for_tokens(config, gpu, config.train_tokens)
+        sps = raw_train / config.steps
 
-    # The cap is on total per-seed wall; setup is billed too, so clamp training to fit it.
-    wall_capped = (setup_per_seed + raw_train_per_seed) > cap_s
-    setup_per_seed = min(setup_per_seed, cap_s)
-    train_per_seed = max(0.0, cap_s - setup_per_seed) if wall_capped else raw_train_per_seed
-
-    setup, train = setup_per_seed * seeds, train_per_seed * seeds
+    # The cap is on total elapsed wall; setup is reported but not billed, so only training
+    # contributes to total_usd.
+    wall_capped = (setup + raw_train) > cap_s
+    setup = min(setup, cap_s)
+    train = max(0.0, cap_s - setup) if wall_capped else raw_train
     wall = setup + train
 
     return CostEstimate(
@@ -188,6 +200,6 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         train_seconds=train,
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
-        total_usd=wall / 3600.0 * hourly,
-        notes=_notes(config, raw_train_per_seed, wall_capped, cap_s),
+        total_usd=train / 3600.0 * hourly,
+        notes=_notes(config, raw_train, wall_capped, cap_s),
     )

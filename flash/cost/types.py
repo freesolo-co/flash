@@ -17,10 +17,6 @@ class RunConfig:
     method: str  # "sft" | "grpo"
     steps: int
 
-    # Cold-start setups the bill covers: a multi-seed run reprovisions (and re-pays boot) per
-    # seed, so this is the seed count.
-    setup_repeats: int = 1
-
     # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
     # GRPO default mirrors the worker's max(1024, max_prompt_len + completion); see normalized().
     seq_len: int | None = None
@@ -32,9 +28,12 @@ class RunConfig:
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
 
-    max_wall_seconds: int | None = None  # per-seed wall cap (spec gpu.max_wall_seconds); None = 24h
+    max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
     environment: str | None = None  # Freesolo environment id; descriptive only
+    # SFT only: actual training tokens across all epochs. When present, SFT dollars are priced
+    # from this token count instead of the padded batch_size * seq_len slot estimate.
+    train_tokens: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -42,18 +41,12 @@ class RunConfig:
         # substrate up front (else it filters out every candidate -> confusing "no GPU fits").
         prov = (self.provider or "auto").strip().lower() or "auto"
         if prov not in ("auto", *PROVIDER_NAMES):
-            raise ValueError(f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})")
+            raise ValueError(
+                f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
+            )
         object.__setattr__(self, "provider", prov)
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
-        if self.setup_repeats < 1:
-            raise ValueError(f"setup_repeats must be >= 1, got {self.setup_repeats}")
-        # Steps are split evenly across seeds, so a non-divisible split would price fractional
-        # steps per seed (impossible in a real run).
-        if self.steps % self.setup_repeats != 0:
-            raise ValueError(
-                f"steps ({self.steps}) must be a multiple of setup_repeats ({self.setup_repeats})"
-            )
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
         # runner floors it to max(60, ...) and estimate_cost mirrors that, so a non-positive cap
         # is accepted (floored to 60s), not rejected.
@@ -61,6 +54,8 @@ class RunConfig:
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")
+        if self.train_tokens is not None and self.train_tokens < 1:
+            raise ValueError(f"train_tokens must be >= 1, got {self.train_tokens}")
 
     @property
     def is_grpo(self) -> bool:
@@ -93,7 +88,14 @@ class RunConfig:
             comp = None
             batch = self.batch_size if self.batch_size is not None else RECIPE.sft.effective_batch
             group = None
-        return replace(self, seq_len=seq, completion_len=comp, batch_size=batch, group_size=group, lora_rank=lora)
+        return replace(
+            self,
+            seq_len=seq,
+            completion_len=comp,
+            batch_size=batch,
+            group_size=group,
+            lora_rank=lora,
+        )
 
     def train_knobs(self) -> dict[str, int]:
         """The knob dict ``model_required_vram_gb`` consumes. Only an EXPLICIT batch_size is
@@ -114,7 +116,11 @@ class RunConfig:
 
 @dataclass(frozen=True)
 class CostEstimate:
-    """A pre-flight estimate. ``total_usd`` = ``wall_clock_hours * gpu_hourly_usd``, no multiplier."""
+    """A pre-flight estimate.
+
+    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is
+    reported as elapsed wall time but is not billed to the user estimate.
+    """
 
     model_id: str
     method: str
@@ -136,20 +142,25 @@ class CostEstimate:
     def wall_clock_hours(self) -> float:
         return self.wall_clock_seconds / 3600.0
 
+    @property
+    def billable_hours(self) -> float:
+        return self.train_seconds / 3600.0
+
     def breakdown(self) -> str:
         """Multi-line itemized breakdown for CLI output."""
         lines = [
             f"Run        : {self.model_id}  [{self.method.upper()}, {self.steps} steps]",
-            f"GPU        : {self.gpu} on {self.provider} "
+            f"GPU        : {self.gpu} "
             f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
             f"@ ${self.gpu_hourly_usd:.2f}/hr",
             f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + model load"
             + (" + vLLM init" if self.method == "grpo" else "")
-            + ")",
+            + "; not billed)",
             f"Per step   : {self.seconds_per_step:.2f} s",
             f"Train      : {self.train_seconds / 60:.1f} min"
             + ("  [CAPPED at the wall-clock limit]" if self.wall_capped else ""),
             f"Wall clock : {self.wall_clock_hours:.2f} h",
+            f"Billable   : {self.billable_hours:.2f} h (training only)",
             f"TOTAL      : ${self.total_usd:.2f}",
         ]
         if self.notes:

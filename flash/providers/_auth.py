@@ -1,10 +1,4 @@
-"""Shared operator-credential helpers for the GPU providers.
-
-Every provider authenticates the same way: a single API key read ONLY from an
-environment variable on the control-plane host (never config files, never shipped to
-workers). The per-provider ``auth.py`` modules wrap these with their own env-var name
-and error message.
-"""
+"""Shared operator-credential helpers for the GPU providers."""
 
 from __future__ import annotations
 

@@ -1,11 +1,4 @@
-"""RunPod Flash endpoint lifecycle: provision/cache/teardown + the worker handler.
-
-The live ("ad-hoc") endpoint deploy/cache (``get_train_endpoint``), the worker-side
-training handler it registers (``_train_body``), the per-run endpoint naming/suffix,
-the runpod_flash SDK state-isolation + backoff patches, and cross-process teardown
-(``terminate_endpoint``). Imports the dependency stack + worker env builder from
-``.deps`` (the leaf).
-"""
+"""RunPod Flash endpoint lifecycle: provision/cache/teardown + the worker handler."""
 
 from __future__ import annotations
 
@@ -26,39 +19,19 @@ from flash.providers.runpod.train.deps import (
     worker_image_for_gpu,
 )
 
-# The control plane runs each training run in its own thread. All runpod_flash deploy/
-# undeploy work goes through a shared asyncio singleton whose Lock binds to the first event
-# loop that touches it; two threads each calling asyncio.run() get distinct loops and the
-# second fails with "Lock ... is bound to a different event loop". Serialize every Flash SDK
-# async section (deploy AND undeploy) behind this one process-wide lock. Deploys/teardowns
-# are infrequent vs training, so the serialization cost is negligible.
+# runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
-# Quota: cap in-flight endpoints under RunPod's account-wide max-workers quota (30; the cap of
-# 28 leaves a 2-slot buffer for endpoints deployed by other tools/the CLI). Every endpoint this
-# process creates claims one slot; terminate_endpoint releases it once the remote endpoint is
-# provably torn down. Runs that find the quota full QUEUE (block) here instead of failing with
-# RunPod's "Max workers across all endpoints must not exceed your workers quota (30)" error.
-#
-# The store is CROSS-PROCESS when an operator internal key is configured: the claim is an
-# advisory-locked atomic op in Postgres (via the freesolo backend), so >1 control-plane replica
-# can never together exceed the cap, and a startup reconcile recovers the true in-use count after
-# a crash. Without an internal key (local/dev single process) we fall back to an in-process
-# semaphore. Releases route by how the slot was acquired (recorded in ``_ACQUIRED``), so a slot
-# claimed against the shared store is always released there.
+# 28 leaves a 2-slot buffer under RunPod's 30-worker account quota. Shared via Postgres when an
+# internal key is set; falls back to in-process semaphore otherwise. Releases only after the
+# remote endpoint is provably gone.
 RUNPOD_ENDPOINT_SLOT_CAP = 28
-# How long to wait before re-checking a full shared quota (queue-don't-crash), and how many
-# consecutive store errors to tolerate before falling back to the local semaphore so a single
-# process stays capped rather than deadlocking on a persistently-unreachable backend.
 _SLOT_QUEUE_WAIT_S = 10.0
 _SLOT_STORE_MAX_ERRORS = 6
+_CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 
-# Local (single-process) fallback, used when no internal key is configured or the shared store is
-# persistently unreachable. Resets on restart — fine, because a fresh process holds no slots.
 _LOCAL_SLOTS = threading.Semaphore(RUNPOD_ENDPOINT_SLOT_CAP)
-# name -> "shared" | "local": how this process acquired each held slot, so release routes to the
-# same store. Makes release idempotent — terminate_endpoint may run more than once for a name
-# (e.g. a retry after a failed undeploy), and only the call that still finds the name releases.
+# name -> "shared"|"local": tracks how this process acquired each slot so release routes correctly.
 _ACQUIRED: dict[str, str] = {}
 _ACQUIRED_LOCK = threading.Lock()
 
@@ -66,7 +39,7 @@ _ENDPOINT_CACHE: dict[str, Any] = {}
 
 
 def _acquire_local_slot(name: str) -> None:
-    """Claim an in-process semaphore slot (no internal key / store-unreachable fallback)."""
+    """Claim an in-process semaphore slot."""
     if not _LOCAL_SLOTS.acquire(blocking=False):
         logger.info(
             "Quota full (%d/%d slots) — waiting for a free slot...",
@@ -79,15 +52,10 @@ def _acquire_local_slot(name: str) -> None:
 
 
 def _acquire_endpoint_slot(name: str) -> None:
-    """Claim a quota slot for ``name``, QUEUEING (blocking) until one is free. Idempotent per name.
-
-    Uses the shared cross-process store when an internal key is set, else the in-process
-    semaphore. On persistent store errors it falls back to the local semaphore so a single
-    process stays capped instead of deadlocking or oversubscribing.
-    """
+    """Claim a quota slot for ``name``, blocking until one is free. Idempotent per name."""
     with _ACQUIRED_LOCK:
         if name in _ACQUIRED:
-            return  # already hold a slot for this name (e.g. _ENDPOINT_CACHE re-entry)
+            return
     from flash.providers.runpod import slots
 
     if slots.internal_key() is None:
@@ -143,17 +111,7 @@ def _acquire_endpoint_slot(name: str) -> None:
 def _release_endpoint_slot(name: str) -> bool:
     """Release the quota slot for ``name``, routed to the store it was claimed from.
 
-    The ``_ACQUIRED`` map records how this process claimed the slot (``"local"`` | ``"shared"``)
-    and makes the common path idempotent — only the first call for a name this process claimed
-    releases. When a shared store is configured, a teardown running on a DIFFERENT replica than
-    the one that claimed the slot (e.g. a ``flash cancel`` routed to another control-plane
-    replica) has no ``_ACQUIRED`` entry but must STILL drop the shared row, or the slot leaks
-    until the next reconcile and the queue is throttled even though the endpoint is gone. The
-    callers only invoke this once the remote endpoint is provably gone, and server-side release
-    is idempotent, so the best-effort cross-replica release is safe.
-
-    Returns ``True`` if a slot was (or, on the shared path, may have been) released; ``False`` for
-    a no-op (nothing tracked locally and no shared store to release against).
+    Returns True if a slot was released, False for a no-op.
     """
     with _ACQUIRED_LOCK:
         mode = _ACQUIRED.pop(name, None)
@@ -162,8 +120,6 @@ def _release_endpoint_slot(name: str) -> bool:
         return True
     from flash.providers.runpod import slots
 
-    # mode == "shared": this process holds the row. mode is None: either a cross-replica teardown
-    # (release the shared row anyway) or — with no shared store at all — genuinely nothing to do.
     cross_replica = mode is None
     if cross_replica and slots.internal_key() is None:
         return False
@@ -171,8 +127,7 @@ def _release_endpoint_slot(name: str) -> bool:
     try:
         released = slots.release(name)
     except slots.SlotStoreError as exc:
-        # A transient release failure can't leak the slot permanently: the endpoint is gone, so
-        # the next startup reconcile reclaims its row against the live endpoint list.
+        # Transient failure: reconcile on next startup will reclaim stale rows.
         logger.warning(
             "slot-store release failed for %s (%s); reconcile will reclaim it on restart",
             name,
@@ -183,22 +138,13 @@ def _release_endpoint_slot(name: str) -> bool:
 
 
 def reconcile_endpoint_slots() -> None:
-    """Reconcile the shared slot store against the live RunPod endpoint list (control-plane
-    startup), so a crash can't leak slots: rows for endpoints that no longer exist are reclaimed
-    and the in-use count recovers to the truth. No-op without an internal key (the local
-    semaphore needs no reconciliation — a fresh process starts empty). Best-effort: never raises.
-    """
+    """Reconcile the shared slot store against live RunPod endpoints on startup. Best-effort."""
     from flash.providers.runpod import slots
 
     if slots.internal_key() is None:
         return
     try:
         from flash.providers.runpod import api as runpod_api
-
-        # Match BOTH registered forms: the bare ``flash-<gpu>-<run>`` AND RunPod Flash's
-        # ``live-flash-...`` (live-provisioned) name. Reconciling only the bare prefix omitted
-        # every live endpoint, leaving their slot rows unreclaimed after a crash. Use the
-        # canonical sweep predicate (``jobs._is_flash_endpoint``) so the two stay in lockstep.
         from flash.providers.runpod.jobs import _is_flash_endpoint
 
         live = [
@@ -206,7 +152,7 @@ def reconcile_endpoint_slots() -> None:
             for e in runpod_api.list_endpoints()
             if _is_flash_endpoint(name := (e.get("name") or ""))
         ]
-    except Exception as exc:  # listing failed: do NOT reconcile against a partial/empty list
+    except Exception as exc:
         logger.warning("slot reconcile skipped: could not list RunPod endpoints (%s)", exc)
         return
     try:
@@ -221,10 +167,9 @@ def reconcile_endpoint_slots() -> None:
 
 
 def _train_body(input_data: dict) -> dict:
-    """Runs ON the RunPod GPU worker: fetch code, train (phase), return metrics.
+    """Runs ON the RunPod GPU worker: fetch code, train, return metrics.
 
-    NOTE: Flash serializes this handler and runs it standalone, so every name it uses
-    must be imported INSIDE the function body (module-level imports are not in scope).
+    All imports must be inside the function body — this handler is serialized standalone.
     """
     import contextlib
     import json
@@ -232,64 +177,50 @@ def _train_body(input_data: dict) -> dict:
     import subprocess
     import sys
     import threading
+    import time
+    from datetime import UTC, datetime
+    from email.utils import parsedate_to_datetime
 
     from huggingface_hub import snapshot_download
 
-    # Weight-cache PRELOAD mode: download-only, no code repo / no training subprocess. Runs on a
-    # worker whose `flash-weights` volume for ONE datacenter is mounted at /runpod-volume; with
-    # HF_HOME pointed there (passed in env), each snapshot_download warms that region's cache so the
-    # first real run in that region is a cache hit. Returns the repos it cached. Kept here (in the
-    # baked handler) so preload reuses the existing image/handler — no separate worker image.
     if input_data.get("mode") == "preload":
         overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
         os.environ.update(overrides)
-        # NB: HF_HUB_ENABLE_HF_TRANSFER is NOT set here — the worker image already exports it
-        # (Dockerfile.worker ENV), same as the training path relies on (see deps.py).
         tok = overrides.get("HF_TOKEN")
-        # CRITICAL: huggingface_hub froze HF_HUB_CACHE from HF_HOME at IMPORT time (the
-        # `from huggingface_hub import snapshot_download` above, before this branch), so the
-        # HF_HOME we just set in os.environ is ignored by snapshot_download. Pass cache_dir
-        # EXPLICITLY = <HF_HOME>/hub (HF's own layout) so the download lands on the mounted volume
-        # instead of the worker's ephemeral default cache. (The training path is immune: it spawns a
-        # subprocess that imports huggingface_hub fresh with HF_HOME already in its env.)
+        # CRITICAL: huggingface_hub froze HF_HUB_CACHE at import time, so pass cache_dir
+        # explicitly; os.environ update above is ignored by snapshot_download.
         hf_home = overrides.get("HF_HOME")
-        # The whole point of preload is to write onto the per-region network volume mounted at
-        # /runpod-volume. If HF_HOME is MISSING or not rooted there, cache_dir would fall back to the
-        # worker's EPHEMERAL default cache: snapshot_download would "succeed" and report repos
-        # preloaded while persisting NOTHING to the volume — a phantom warm the driver would count as a
-        # warmed region. Refuse a misconfigured preload instead (the flash driver always passes a
-        # volume-rooted HF_HOME, so this only fires on a handler-shape/env bug).
+        # Refuse a preload not rooted at /runpod-volume — HF_HOME elsewhere means nothing
+        # gets persisted to the volume (phantom warm).
         if not hf_home or not hf_home.startswith("/runpod-volume"):
             return {
-                "preloaded": [], "already_cached": [], "failed": {},
+                "preloaded": [],
+                "already_cached": [],
+                "failed": {},
                 "error": f"preload requires HF_HOME rooted at /runpod-volume (got HF_HOME={hf_home!r})",
                 "hf_home": hf_home,
             }
-        # Rooted at the volume but the mount is absent (endpoint deployed without the volume / RunPod
-        # didn't mount it) — same phantom-warm risk; fail loudly so the driver records this region failed.
         if not os.path.isdir("/runpod-volume"):
             return {
-                "preloaded": [], "already_cached": [], "failed": {},
+                "preloaded": [],
+                "already_cached": [],
+                "failed": {},
                 "error": f"weight-cache volume not mounted at /runpod-volume (HF_HOME={hf_home})",
                 "hf_home": hf_home,
             }
-        cache_dir = os.path.join(hf_home, "hub")  # hf_home is now guaranteed non-empty + volume-rooted
-        # Same exclusions as the worker prefetch (engine/worker.prefetch_model), the image bake, and
-        # the instance-provider preload (_instance_bootstrap.run_preload): weights + tokenizer/config
-        # only, never the large unused artifacts. Inlined (this handler is baked self-contained, so it
-        # can't import a shared constant). Keeps the warmed cache byte-for-byte what workers fetch,
-        # so the 100GB sizing holds and the local_files_only `already_cached` probe stays consistent.
+        cache_dir = os.path.join(hf_home, "hub")
+        # Inlined (handler is baked standalone); keep in sync with worker prefetch exclusions.
         ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
         done, already, failed = [], [], {}
         for repo_id in input_data.get("models") or []:
             try:
-                # Idempotent: if the volume already has this snapshot, skip the download. The
-                # local_files_only probe is also the persistence signal the live test reads —
-                # ``already_cached`` proves the weights survived a previous, separate deployment.
                 try:
                     snapshot_download(
-                        repo_id=repo_id, token=tok, cache_dir=cache_dir,
-                        ignore_patterns=ignore_patterns, local_files_only=True,
+                        repo_id=repo_id,
+                        token=tok,
+                        cache_dir=cache_dir,
+                        ignore_patterns=ignore_patterns,
+                        local_files_only=True,
                     )
                     already.append(repo_id)
                     continue
@@ -299,7 +230,7 @@ def _train_body(input_data: dict) -> dict:
                     repo_id=repo_id, token=tok, cache_dir=cache_dir, ignore_patterns=ignore_patterns
                 )
                 done.append(repo_id)
-            except Exception as exc:  # one bad/gated repo must not abort warming the rest
+            except Exception as exc:
                 failed[repo_id] = str(exc)[:300]
         return {
             "preloaded": done,
@@ -308,45 +239,125 @@ def _train_body(input_data: dict) -> dict:
             "hf_home": os.environ.get("HF_HOME"),
         }
 
-    # NB: the Hopper fla fast-path setup lives in flash.engine.worker._ensure_fla_fastpath_on_hopper (runs
-    # in the worker process AFTER all installs, before any model import) — doing it here would be
-    # undone by a later extra_pip / `prime env install`, and depends on a handler redeploy.
-
-    # Extra pip deps for Freesolo environments (installed per-run).
     extra_pip = input_data.get("extra_pip") or []
     if extra_pip:
-        # check=True: a deterministic dependency failure should fail fast here,
-        # not after model download + worker startup with a less actionable error.
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
 
-    # NB: fla is kept on ALL arches. On Hopper (sm90) fla's GDN backward is miscomputed with
-    # Triton>=3.4 (#640); the fix is fla's tilelang backend, so flash.engine.worker._ensure_fla_fastpath_on_hopper
-    # makes fla+tilelang live at worker startup (instead of dropping fla) for ~4-13x faster + ~2x
-    # lighter Hopper GDN training than the pure-PyTorch delta fallback.
-
     overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
-    snapshot_download(
-        repo_id=input_data["hf_repo"],
-        repo_type="dataset",
-        allow_patterns=["code/**"],
-        local_dir="/runcode",
-        token=overrides.get("HF_TOKEN"),
-    )
-    code_dir = "/runcode/code"
+
+    def _code_prefix() -> str:
+        raw = input_data.get("code_prefix")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("missing code_prefix")
+        prefix = raw.strip().strip("/")
+        parts = prefix.split("/")
+        digest = parts[1] if len(parts) == 3 else ""
+        if (
+            len(parts) != 3
+            or parts[0] != "code"
+            or parts[2] != "flash"
+            or len(digest) != 32
+            or any(c not in "0123456789abcdef" for c in digest)
+        ):
+            raise ValueError(f"invalid code_prefix: {prefix!r}")
+        return prefix
+
+    def _hf_status_code(exc: BaseException) -> int | None:
+        response = getattr(exc, "response", None)
+        code = getattr(response, "status_code", None)
+        try:
+            return int(code)
+        except (TypeError, ValueError):
+            return None
+
+    def _hf_retry_after(exc: BaseException) -> float | None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) or {}
+        value = headers.get("retry-after") if hasattr(headers, "get") else None
+        if not value and hasattr(headers, "items"):
+            for key, candidate in headers.items():
+                if str(key).lower() == "retry-after":
+                    value = candidate
+                    break
+        if not value:
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(value))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                seconds = (retry_at - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError):
+                return None
+        return min(60.0, max(0.0, seconds))
+
+    def _hf_call(call, label: str):
+        retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
+        transient_status_codes = {429, 500, 502, 503, 504}
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                return call()
+            except Exception as exc:
+                if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
+                    retry_delays
+                ):
+                    raise
+                retry_after = _hf_retry_after(exc)
+                delay = retry_after if retry_after is not None else retry_delays[attempt]
+                print(
+                    f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {exc}",
+                    flush=True,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable")
+
+    def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        api = HfApi(token=token)
+        files = [
+            entry.path
+            for entry in _hf_call(
+                lambda: list(
+                    api.list_repo_tree(
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                        path_in_repo=prefix,
+                        recursive=True,
+                        token=token,
+                    )
+                ),
+                f"list flash code under {repo_id}:{prefix}",
+            )
+            if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
+        ]
+        if not files:
+            raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
+        for filename in files:
+            _hf_call(
+                lambda filename=filename: hf_hub_download(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    filename=filename,
+                    local_dir="/runcode",
+                    token=token,
+                ),
+                f"download flash code file {repo_id}:{filename}",
+            )
+
+    code_prefix = _code_prefix()
+    _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
+    code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
 
     env = dict(os.environ)
     env.update(overrides)
-    # If the weight-cache volume isn't actually mounted (cold/no-volume run, or the attach degraded
-    # to {}), don't leave FLASH_WEIGHT_CACHE_DIR pointing at a missing /runpod-volume path — fall back
-    # to the default ephemeral cache. INLINED (not a flash import): this handler is extracted standalone
-    # into the baked image's rp_handler (docker/make_rp_handler.py), where flash is NOT importable,
-    # so it must stay self-contained. Mirrors deps.drop_unmounted_cache_env (unit-tested there).
+    # INLINED: handler is baked standalone (flash not importable). Mirrors deps.drop_unmounted_cache_env.
     if not os.path.isdir("/runpod-volume"):
         for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
             env.pop(_k, None)
-    # Always pass the spec via a file (FLASH_JOB_SPEC_PATH): a large inline spec can blow past the
-    # ~128 KiB per-env-string exec limit ("Argument list too long"), and a file is ONE code path for
-    # every size (cheap write). load_job_spec_from_env reads it.
+    # Pass spec via file to avoid ~128 KiB per-env-string exec limit.
     spec_path = "/tmp/job_spec.json"
     with open(spec_path, "w") as sf:
         sf.write(input_data["job_spec_json"])
@@ -379,8 +390,6 @@ def _train_body(input_data: dict) -> dict:
                 f.seek(0, os.SEEK_END)
                 f.seek(max(0, f.tell() - tail_bytes))
                 tail = f.read().decode("utf-8", "replace")
-            # utf-8 + replace so a non-ASCII console tail can't raise UnicodeEncodeError under a
-            # minimal-container ASCII locale (LANG=C); the tail itself was decoded utf-8/replace.
             with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                 f.write(tail)
             HfApi(token=env.get("HF_TOKEN")).upload_file(
@@ -393,23 +402,16 @@ def _train_body(input_data: dict) -> dict:
             print("console upload warn:", up_err)
 
     def run_mode(mode: str, check: bool) -> int:
-        """Run one worker process, tee its console to a file, and ALWAYS upload the tail to HF as
-        console_<mode>.txt — periodically while the worker runs (so `flash status --logs` shows
-        live progress) and once more when it exits. Every worker print reaches the CLI, not just a
-        post-mortem tail on crash: the engine-core root cause of crashes like vLLM EngineDeadError
-        only ever appears on the subprocess console (never in the Python traceback), and on SUCCESS
-        the same stream shows which optimizations engaged (LoRA+/8-bit-AdamW/Liger/PiSSA/rsLoRA/fla/
-        chalk each log engagement or fallback)."""
+        """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
         console = f"/tmp/console_{mode}.txt"
-        interval = 30.0  # seconds between live console uploads (fixed; flash is fully managed)
+        interval = 3600.0
         stop_upload = threading.Event()
 
         def _upload_loop() -> None:
             while not stop_upload.wait(interval):
                 _upload_console(mode)  # best-effort; swallows its own errors
 
-        # buffering=1 (line-buffered) so the periodic uploader sees each line as it is written.
-        with open(console, "w", buffering=1) as cf:
+        with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
             proc = subprocess.Popen(
                 [sys.executable, "-m", "flash.engine.worker"],
                 cwd=code_dir,
@@ -422,43 +424,32 @@ def _train_body(input_data: dict) -> dict:
             uploader.start()
             try:
                 for line in proc.stdout:
-                    print(line, end="")  # keep streaming to the platform console
+                    print(line, end="")
                     cf.write(line)
                 proc.wait()
             finally:
                 stop_upload.set()
                 uploader.join(timeout=10)
-        # Always upload the final tail (success or failure) so the CLI has the complete console.
         _upload_console(mode)
         if proc.returncode != 0 and check:
             raise RuntimeError(
                 f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
-                f"and error_{mode}.txt in the HF dataset repo"
+                f"and error_{mode}_attempt*.txt in the HF dataset repo"
             )
         return proc.returncode
 
-    # A warm worker can carry a previous seed's metrics files; a stale metrics.json
-    # would let a crashed train phase report the previous run's numbers. Clear before
-    # training.
+    # Clear stale metrics from a previous seed so a crash can't report wrong numbers.
     for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
         with contextlib.suppress(FileNotFoundError):
             os.remove(stale)
-    # Train. check=False — RL's colocated vLLM can segfault at interpreter exit AFTER
-    # the adapter + metrics.json + DONE are saved; don't treat that as a failure.
+    # check=False: RL's colocated vLLM can segfault at interpreter exit after saving — not a failure.
     run_mode(input_data["phase"], check=False)
-    # The train phase writes metrics.json + the DONE sentinel itself (RunPod can also
-    # redeliver a completed job, whose worker restores metrics.json from DONE). If it
-    # is missing, the train phase crashed before finishing — fail fast with the real
-    # cause (full traceback in error_<phase>.txt / console_<phase>.txt in the HF repo).
     if not os.path.exists("/tmp/metrics.json"):
         phase = input_data["phase"]
-        # run_mode already uploaded the final console; re-upload once more in case a hard
-        # OOM/segfault kill raced its in-loop write — this "crashed before finishing" path (no
-        # metrics.json, often no error_<phase>.txt) is otherwise undebuggable.
         _upload_console(phase)
         raise RuntimeError(
             f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
-            f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF "
+            f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
             f"dataset repo for the full traceback"
         )
     with open("/tmp/metrics.json") as f:
@@ -466,15 +457,7 @@ def _train_body(input_data: dict) -> dict:
 
 
 def isolate_flash_state(scope: str | None = None) -> None:
-    """Point the Flash SDK's resource registry at a per-process/private directory.
-
-    The SDK persists its registry to ``./.flash/resources.pkl`` — shared, whole-dict,
-    last-writer-wins across every process in the CWD. Observed failure modes: stale
-    entries resurrecting long-dead endpoints on later syncs, and concurrent processes
-    clobbering each other's bookkeeping. Each Flash process gets its own registry
-    under ``~/.flash/flash-state/<scope>``; remote cleanup never relies on the
-    registry anyway (REST by id/name — see api.py).
-    """
+    """Point the Flash SDK's resource registry at a per-process directory under ~/.flash/flash-state/."""
     try:
         from pathlib import Path
 
@@ -485,20 +468,12 @@ def isolate_flash_state(scope: str | None = None) -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
         rm.FLASH_STATE_DIR = state_dir
         rm.RESOURCE_STATE_FILE = state_dir / "resources.pkl"
-    except Exception as exc:  # never block a run on this
+    except Exception as exc:
         logger.warning("flash state isolation skipped: %s", exc)
 
 
 def _patch_runpod_backoff() -> None:
-    """Work around a runpod_flash bug that aborts long-running jobs.
-
-    The SDK polls a synchronous job with exponential backoff computed as
-    ``base * (2 ** attempt)`` and only clamps to ``max_seconds`` afterwards. On a long
-    run the poll ``attempt`` grows without bound, so ``2 ** attempt`` becomes a huge int
-    and the float multiply raises ``OverflowError: int too large to convert to float``
-    (observed ~80 min in), killing an otherwise-healthy job mid-run. We patch the symbol
-    to cap the exponent before the power so the delay still saturates at ``max_seconds``.
-    """
+    """Cap the backoff exponent before the power to prevent OverflowError on long runs (~80 min+)."""
     try:
         import math
         import random
@@ -515,7 +490,7 @@ def _patch_runpod_backoff() -> None:
             jitter=0.2,
             strategy=_bo.BackoffStrategy.EXPONENTIAL,
         ):
-            a = min(int(attempt), 30)  # cap exponent: 2**30 is plenty; delay saturates anyway
+            a = min(int(attempt), 30)
             if strategy == _bo.BackoffStrategy.EXPONENTIAL:
                 delay = base * (2**a)
             elif strategy == _bo.BackoffStrategy.LINEAR:
@@ -529,45 +504,26 @@ def _patch_runpod_backoff() -> None:
 
         _bo.get_backoff_delay = _safe_get_backoff_delay
         _bo._flash_backoff_patched = True
-        # serverless.py did `from ..utils.backoff import get_backoff_delay`, so patch its ref too.
+        # serverless.py imported the symbol directly; patch its ref too.
         try:
             from runpod_flash.core.resources import serverless as _sl
 
             _sl.get_backoff_delay = _safe_get_backoff_delay
         except Exception:
-            # serverless.py may not import the symbol in this SDK version; the primary
-            # patch above still applies, so a missing alias is fine to ignore.
             pass
-    except Exception as exc:  # never let the patch break submission
+    except Exception as exc:
         logger.warning("runpod backoff patch skipped: %s", exc)
 
 
 def min_cuda_for(friendly_gpu: str) -> str:
-    """Minimum host CUDA (driver) version for this GPU class on the active stack.
-
-    Blackwell classes (consumer sm_120 — RTX 5090, RTX Pro 6000; datacenter sm_100 —
-    B200): pypi wheels for the modern stack (vllm 0.19) ship no Blackwell SASS, so every
-    custom CUDA kernel is PTX-JIT'd by the driver — and their PTX is built with a newer
-    toolchain than CUDA-12.8-era drivers can JIT (observed: "the provided PTX was compiled
-    with an unsupported toolchain" on driver 570.x). CUDA-13 drivers JIT it fine, so those
-    classes are pinned to >=13.0 on the modern stack (per-GPU ``min_cuda_modern`` in
-    providers.base.GPU_INFO). Ampere/Ada/Hopper have SASS in the wheels and run on 12.8.
-    Fully managed per-GPU (no override).
-    """
+    """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0)."""
     from flash.providers.base import min_cuda_modern
 
     return min_cuda_modern(friendly_gpu)
 
 
 def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
-    """Flash endpoint/template name for a GPU class, optionally made unique per run.
-
-    A fixed name (``flash-5090``) collides across back-to-back runs: runpod_flash's
-    ``get_or_deploy_resource`` finds the prior run's still-registered resource and tries to
-    *update* it, which fails with ``GraphQL errors: Template name must be unique`` (there is
-    no endpoint GC/reuse). A per-run ``suffix`` (the run id tail) gives each run its own
-    endpoint so it deploys fresh instead of colliding. RunPod scales each to zero when idle.
-    """
+    """Flash endpoint name for a GPU class, with a per-run suffix to avoid template name collisions."""
     base = f"flash-{gpu_short(friendly_gpu)}"
     if not suffix:
         return base
@@ -583,7 +539,6 @@ def get_train_endpoint(
     spec=None,
 ):
     """Build (and cache) the live Flash endpoint handler for a GPU class."""
-    # Live ("ad-hoc") provisioning: provision on call, no separate `flash deploy`.
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
 
@@ -596,11 +551,7 @@ def get_train_endpoint(
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
     if name in _ENDPOINT_CACHE:
-        # Slot was already acquired when the entry was first created; don't re-acquire.
         return _ENDPOINT_CACHE[name]
-    # Claim a quota slot before creating the endpoint. This QUEUES (blocks) when the quota is
-    # full, making new runs wait here instead of failing with RunPod's worker-quota error. The
-    # slot is released by terminate_endpoint once the remote endpoint is provably torn down.
     _acquire_endpoint_slot(name)
     try:
         kwargs = {
@@ -609,26 +560,20 @@ def get_train_endpoint(
             "gpu_count": 1,
             "min_cuda_version": min_cuda_for(friendly),
             "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-            "workers": (0, 1),  # one dedicated worker per run; scale to zero when idle
+            "workers": (0, 1),
         }
-        # live endpoints keep the boot-install path by default. an operator can still opt into a
-        # serverless-compatible image through FLASH_WORKER_IMAGE or the per-sm image template.
         image = worker_image_for_gpu(friendly, allow_default=False)
         if image:
             kwargs["image"] = image
         else:
             kwargs["dependencies"] = resolve_worker_deps()
             kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-        # Parity with the baked-image deploy_train_endpoint path: attach the multi-region weight
-        # cache (best-effort {} on no-cache/error). Local import avoids a jobs<->endpoints import
-        # cycle (jobs imports this module at load), same as apply_disk_gb below.
+        # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
         from flash.providers.runpod.jobs import weight_cache_endpoint_kwargs
 
         kwargs.update(weight_cache_endpoint_kwargs(spec))
         ep = Endpoint(**kwargs)
-        handler = ep(_train_body)  # register the queue-based handler; returns the callable
-        # The resource config is cached on the Endpoint, so raising the disk on it here
-        # carries through to the deploy that the first handler call triggers.
+        handler = ep(_train_body)
         from flash.providers.runpod.jobs import apply_disk_gb
 
         cfg = ep._build_resource_config()
@@ -636,20 +581,15 @@ def get_train_endpoint(
         _ENDPOINT_CACHE[name] = handler
         return handler
     except Exception:
-        # Endpoint creation failed — release the slot so other runs are not permanently blocked.
         _release_endpoint_slot(name)
         raise
 
 
 def _run_suffix(run_id: str | None) -> str | None:
-    """Short, COLLISION-FREE per-run endpoint suffix.
+    """Stable, collision-free per-run endpoint suffix: sha1(run_id)[:8] with a readable prefix.
 
-    Must be unique per run_id: the endpoint name is ``endpoint_name(friendly, suffix)`` and
-    RunPod reuses an endpoint by name -- two runs with the same suffix share one endpoint (and
-    its cached image/deps/registry-auth/template), so a later run silently reuses the earlier
-    one's config. The old ``run_id.split("-")[-1]`` only worked for hash-tailed default ids; a
-    descriptive run_id ending in e.g. the card name (``...-a100``) collided across every run.
-    Use a stable short hash of the WHOLE run_id, with a sanitized prefix for readability."""
+    Using only the last segment of run_id collides when run_ids end in a GPU name.
+    """
     if not run_id:
         return None
     import hashlib
@@ -661,15 +601,7 @@ def _run_suffix(run_id: str | None) -> str | None:
 
 
 def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
-    """Best-effort: scale cached endpoint(s) to zero / drop them.
-
-    With ``name`` only that run's cached endpoint is dropped; without it, every
-    cached endpoint of the GPU class is — so a per-run teardown passes ``name``
-    to avoid evicting a concurrent run's handler in the same process.
-
-    NOTE: this only touches THIS process's in-memory cache, so it does nothing in a fresh
-    ``flash cancel`` process. Use ``terminate_endpoint`` to actually delete the remote endpoint.
-    """
+    """Scale cached endpoint(s) to zero. Only touches in-process cache; use terminate_endpoint for cross-process teardown."""
     friendly = canonical_gpu(friendly_gpu)
     prefix = f"flash-{gpu_short(friendly)}"
     if name:
@@ -690,11 +622,7 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
 
 
 def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
-    """Resource ids whose resource ``.name`` contains ``target``.
-
-    The live-provisioned resource is named ``live-<endpoint_name>``, so we match by substring
-    to catch the prefix. ``target`` is the endpoint name (``flash-<gpu>[-<run>]``).
-    """
+    """Return resource ids whose name contains ``target`` (live resources are prefixed with ``live-``)."""
     if not target:
         return []
     out = []
@@ -706,23 +634,11 @@ def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
 
 
 def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dict]:
-    """Reliably tear down the remote Flash endpoint(s) for a run — cross-process.
-
-    Unlike ``stop_endpoint`` (which only touches this process's in-memory cache), this looks
-    the endpoint up by name in runpod_flash's *persisted* resource registry and deletes it via
-    the RunPod API (``ResourceManager.undeploy_resource`` -> ``delete_endpoint``), which stops
-    any running worker. Best-effort: never raises. Returns the per-resource undeploy results.
-
-    With ``run_id`` it targets exactly that run's uniquely-named endpoint; without it, the
-    bare ``flash-<gpu>`` prefix matches every endpoint of that GPU class.
-    """
+    """Delete the remote Flash endpoint(s) for a run via the RunPod API. Best-effort, never raises."""
     friendly = canonical_gpu(friendly_gpu)
     target = endpoint_name(friendly, _run_suffix(run_id))
-    # Hold FLASH_SDK_LOCK across the ENTIRE Flash critical section, not just the undeploy.
-    # isolate_flash_state() swaps runpod_flash's process-wide registry globals and
-    # ResourceManager shares the SDK's asyncio singleton, so a concurrent deploy/undeploy on
-    # another thread could swap the registry scope between our lookup and our undeploy and tear
-    # down the wrong run's resources. Serialize isolation + lookup + undeploy together.
+    # Serialize isolation + lookup + undeploy: isolate_flash_state swaps process-wide globals,
+    # and a concurrent call could swap the registry scope between our lookup and undeploy.
     with FLASH_SDK_LOCK:
         try:
             from flash.providers.runpod.auth import ensure_auth
@@ -730,7 +646,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             ensure_auth()
             isolate_flash_state(_run_suffix(run_id))
             from runpod_flash.core.resources.resource_manager import ResourceManager
-        except Exception as exc:  # SDK/auth unavailable
+        except Exception as exc:
             return [{"success": False, "name": target, "message": f"flash unavailable: {exc}"}]
 
         try:
@@ -757,11 +673,9 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                # No running event loop — asyncio.run() works directly.
                 results = asyncio.run(_undeploy_all())
             else:
-                # Running event loop (e.g. FastAPI lifespan) — asyncio.run() would raise;
-                # daemon=True so a hung undeploy cannot prevent process shutdown.
+                # Running event loop (FastAPI lifespan etc) — run in a daemon thread.
                 _out: list = []
                 _err: list = []
 
@@ -782,14 +696,8 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
         except Exception as exc:
             results = [{"success": False, "name": target, "message": str(exc)}]
 
-    # Registry-less fallback: isolate_flash_state() keeps the Flash SDK's resource
-    # registry per-process under ~/.flash, so a recreated container (or a crash before
-    # on_handle() persisted the endpoint id) leaves the live endpoint invisible to the
-    # lookup above. Delete it via the RunPod REST API by its reconstructed name so it
-    # can't keep a paid worker alive.  ``rest_confirmed_absent`` records that the REST
-    # lookup actually RAN and found no endpoint of this name — i.e. we positively verified
-    # there is nothing to tear down (distinct from the API being unreachable, where we
-    # cannot tell and must keep holding the slot).
+    # Registry-less fallback: per-process state means a fresh container can't see the endpoint.
+    # Delete by reconstructed name via REST so the worker doesn't stay live.
     rest_confirmed_absent = False
     if not uids:
         try:
@@ -803,28 +711,15 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                     results.append(
                         {"success": True, "name": target, "message": "deleted via REST API"}
                     )
-            # No endpoint of this name exists remotely — positively verified absent.
             rest_confirmed_absent = not matches
         except Exception as exc:
-            # REST API unreachable: we cannot prove the endpoint is gone, so do NOT treat this
-            # as "absent" — releasing on an unverified absence risks oversubscribing the quota.
+            # Can't prove endpoint is gone — do NOT treat as absent; slot stays held.
             logger.debug("REST endpoint lookup failed for %s: %s", target, exc)
 
-    # Release the quota slot for this run's endpoint.  Releases the slot this process acquired,
-    # or — when a shared store is configured — the row a different replica claimed (a ``flash
-    # cancel`` may run on another replica than the one that deployed).  Release ONLY when
-    # the remote endpoint is provably gone: (a) at least one undeploy/delete succeeded, or
-    # (b) we positively verified no remote endpoint exists (registry returned no uids AND the
-    # REST lookup confirmed none — e.g. the endpoint never finished deploying, so its slot
-    # would otherwise leak forever and deadlock the queue).  We deliberately do NOT release on
-    # an undeploy/delete *failure*: the endpoint may still be live and counting against the
-    # RunPod quota, so releasing would oversubscribe it — the slot stays held until a later
-    # teardown confirms the endpoint is gone.  (stop_endpoint no longer releases the slot.)
+    # Release only when the endpoint is provably gone; do NOT release on failure (may still be live).
     if any(r.get("success") for r in results) or (not uids and rest_confirmed_absent):
         _release_endpoint_slot(target)
 
-    # also drop the in-process cached handler for THIS run only (a class-wide
-    # drop would evict a concurrent run's endpoint on the same GPU class).
     with contextlib.suppress(Exception):
         stop_endpoint(friendly, name=target)
     return results

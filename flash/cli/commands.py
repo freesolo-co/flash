@@ -1,10 +1,4 @@
-"""CLI command handlers for the managed Flash service.
-
-Every run-lifecycle command is a thin HTTP call to the Flash control plane —
-users authenticate with their freesolo API key (`flash login` verifies it against
-the freesolo backend), never with provider credentials. Config parsing/validation
-and `--dry-run` stay fully local.
-"""
+"""CLI command handlers for the managed Flash service."""
 
 from __future__ import annotations
 
@@ -38,8 +32,6 @@ from .training_doc import TRAINING_MD
 logger = get_logger("flash.cli")
 
 
-# Exceptions that represent expected user/config errors: report them as a clean one-line
-# message instead of a Python traceback (use --debug to see the full trace).
 _USER_ERRORS = (
     ConfigError,
     ClientError,
@@ -47,7 +39,6 @@ _USER_ERRORS = (
     ValueError,
 )
 
-# Run states after which nothing more will happen (polling can stop).
 _CLI_DONE_STATES = TERMINAL_STATES | {"deployed"}
 _OK_STATES = {"done", "dry_run", "deployed"}
 _SPINNER_FRAMES = "|/-\\"
@@ -108,9 +99,6 @@ def cmd_version(args) -> int:
 
 
 def cmd_login(args) -> int:
-    # Login is handled by the freesolo backend (not the flash control plane): the user
-    # supplies the freesolo API key they created at freesolo.co/sign-in, and we verify it against
-    # freesolo before storing it. The same key authenticates flash's control plane.
     try:
         env_api_key = os.environ.get("FREESOLO_API_KEY")
         api_key = args.api_key or env_api_key
@@ -121,16 +109,11 @@ def cmd_login(args) -> int:
             )
         verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
     except ClientError as exc:
-        # Login failed (no key, a rejected key, or an unreachable backend): say so plainly
-        # and point the user back at `flash login` to try again. `--debug` still surfaces
-        # the full traceback via the top-level handler.
         if getattr(args, "debug", False):
             raise
         print(render.login_failed(str(exc)), file=sys.stderr)
         return 1
     api_url = args.api_url or load_credentials()[0]
-    # save_credentials clears the stored url when it's the default, so logging into the
-    # default plane also drops a stale custom url from a previous custom-URL login.
     _ = save_credentials(api_key, api_url=api_url)
     if args.api_key and env_api_key and env_api_key != args.api_key:
         msg = (
@@ -146,14 +129,11 @@ def cmd_login(args) -> int:
     return 0
 
 
-# A control-plane hiccup must not make a successful login appear to hang while we fetch a
-# nonessential card, so the best-effort identity lookup uses a short timeout.
 _IDENTITY_LOOKUP_TIMEOUT_S = 5.0
 
 
 def _identity_or_none(api_key: str, api_url: str) -> dict | None:
-    # Use the key/url we just verified and stored, not `client_from_config()`: an ambient
-    # FREESOLO_API_KEY would otherwise win over the file and render the wrong identity.
+    # Don't use client_from_config(): ambient FREESOLO_API_KEY would win and show wrong identity.
     try:
         return ApiClient(api_url, api_key, timeout=_IDENTITY_LOOKUP_TIMEOUT_S).me()
     except (ClientError, OSError, ValueError):
@@ -256,8 +236,8 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
-            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
-            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
     sft = Path("configs/sft.toml")
     if not sft.exists():
@@ -268,15 +248,12 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "epochs = 1\n"
             "lora_rank = 32\n"
-            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
-            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
-    # TRAINING.md is the playbook for the AI agent driving these runs: how to design the
-    # reward, what to read, and how to decide a run actually improved (not just finished).
     training = Path("TRAINING.md")
     if not training.exists():
-        # Explicit UTF-8: TRAINING_MD has non-ASCII (em dashes, ·, √, ≥, ≈), which would
-        # raise UnicodeEncodeError under a non-UTF-8 locale with write_text's default.
+        # Explicit UTF-8: TRAINING_MD has non-ASCII chars that raise UnicodeEncodeError under a non-UTF-8 locale.
         training.write_text(TRAINING_MD, encoding="utf-8")
     scaffolded = [
         "environment.py",
@@ -303,7 +280,7 @@ def cmd_models(args) -> int:
 
 
 def cmd_gpus(args) -> int:
-    """List RunPod GPU classes, VRAM, and $/hr."""
+    """List validated managed GPU classes, VRAM, and estimated $/hr."""
     from flash.providers.base import GPU_INFO
     from flash.providers.runpod.pricing import static_rates as runpod_static_rates
 
@@ -313,7 +290,7 @@ def cmd_gpus(args) -> int:
     )
     tip = (
         "Tip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest validated RunPod class that fits the model, so you don't pin a GPU type."
+        "cheapest validated managed class that fits the model, so you don't pin a GPU type."
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
@@ -323,7 +300,7 @@ def cmd_gpus(args) -> int:
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}")
+    print(f"{'gpu':<16}{'vram':>6}{'$/hr':>11}")
     for info in infos:
         runpod_rate = runpod_rates.get(info.name)
         print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}")
@@ -337,7 +314,6 @@ def cmd_env_list(args) -> int:
         paths.append(".")
     local = Path("environments")
     if local.is_dir():
-        # Prefer publishing folders. Single-file modules remain supported for small smoke tests.
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
@@ -364,9 +340,9 @@ def cmd_env_list(args) -> int:
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Catalog-only and deterministic; an uncapped SFT run tries to count the env's train split, and
-    falls back to a default example count (with a warning) when the environment isn't
-    importable here."""
+    Catalog-only and deterministic; SFT uses the actual local training-token count when the env
+    and tokenizer are importable. An uncapped SFT run must be able to count the env's train split,
+    otherwise it errors instead of guessing a dataset size."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(
@@ -393,7 +369,6 @@ def cmd_train(args) -> int:
         extra_configs=args.extra_configs,
     )
     if args.dry_run:
-        # Fully local: validate the id-based config without credentials, a server, or a GPU.
         payload = {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
         if render.styled():
             print(
@@ -474,13 +449,9 @@ def cmd_status(args) -> int:
             if not logs.endswith("\n"):
                 print()
             printed_any = True
-        # Always append the real train-subprocess output (the orchestrator log can't carry it);
-        # the server fetches console_/error_<phase>.txt from HF with the operator token.
         for name, text in (client.get_worker_output(args.run_id) or {}).items():
             if not text:
                 continue
-            # Separate sections with a blank line, but NOT before the first thing printed (an empty
-            # orchestrator log would otherwise leave a leading blank line above the first section).
             sep = "\n" if printed_any else ""
             if render.styled():
                 print(f"{sep}{render.log_section(name)}")
@@ -512,13 +483,7 @@ def cmd_runs(args) -> int:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        remote = r.get("remote") or {}
-        # the remote handle knows what actually ran; the spec is the parse-time pick
-        provider = remote.get("provider") or (
-            "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
-        )
-        gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
-        where = f"{gpu}@{provider}" if provider else gpu
+        where = render._run_gpu(spec, r.get("remote") or {})
         print(
             f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
             f"{r.get('cost_usd', 0.0):>8.4f}  {where:<22}  {model}"
@@ -647,8 +612,6 @@ def cmd_deployments(args) -> int:
 def cmd_chat(args) -> int:
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
-    # A faint speaker label on a TTY; the reply text itself stays plain so a piped transcript
-    # is byte-for-byte the model's words.
     if render.styled():
         print(render.chat_label())
     stream = getattr(client, "chat_stream", None)

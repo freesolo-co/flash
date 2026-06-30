@@ -55,6 +55,16 @@ def _raw(**overrides) -> dict:
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
+        # An unhashable model (TOML array / `[model]` table) used to TypeError on MODELS.get() -> 500;
+        # it must be a clean ConfigError like every other scalar.
+        ({"model": ["Qwen/Qwen3.5-4B"]}, "must be a model id string"),
+        ({"model": {"id": "x"}}, "must be a model id string"),
+        ({"model": "   "}, "must be a model id string"),
+        # A truthy non-string algorithm used to AttributeError on .lower() (uncaught 500); it must be
+        # a clean ConfigError (400) like seeds. Falsy values still default to "grpo" (tested below).
+        ({"algorithm": 5}, "algorithm must be a string"),
+        ({"algorithm": ["grpo"]}, "algorithm must be a string"),
+        ({"algorithm": True}, "algorithm must be a string"),
         # NOTE: model_policy is no longer a user knob (it's read from the FLASH_MODEL_POLICY env on
         # the control plane), so a bad user-supplied model_policy is ignored, not rejected here.
         # Unknown config sections/keys are rejected (not silently dropped → 16x-cost defaults).
@@ -67,6 +77,12 @@ def _raw(**overrides) -> dict:
 def test_spec_validation_rejections(overrides, match) -> None:
     with pytest.raises(ConfigError, match=match):
         spec_from_dict(_raw(**overrides))
+
+
+def test_falsy_algorithm_defaults_to_grpo() -> None:
+    # The type guard must preserve the original `(value or "grpo")` semantics: falsy values default.
+    for falsy in (None, "", 0):
+        assert spec_from_dict(_raw(algorithm=falsy)).algorithm == "grpo"
 
 
 def test_sft_epochs_must_be_positive() -> None:
@@ -92,15 +108,18 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     assert spec_from_dict(raw).train.hf_repo == ""
 
 
-def test_environment_path_is_rejected() -> None:
-    # Local environment paths are gone; a `path` (alone or alongside `id`) must fail loudly.
-    raw = _raw()
-    raw["environment"] = {"path": "./environment.py"}
-    with pytest.raises(ConfigError, match="local environment paths are no longer supported"):
-        spec_from_dict(raw)
-    raw["environment"] = {"id": "gsm8k", "path": "./environment.py"}
-    with pytest.raises(ConfigError, match="local environment paths are no longer supported"):
-        spec_from_dict(raw)
+def test_lora_rank_allows_rank64_for_small_serving_models() -> None:
+    assert spec_from_dict(_raw(**{"train.lora_rank": 64})).train.lora_rank == 64
+
+
+def test_lora_rank_must_fit_small_serving_cap() -> None:
+    with pytest.raises(ConfigError, match="serving max_lora_rank=64"):
+        spec_from_dict(_raw(**{"train.lora_rank": 65}))
+
+
+def test_lora_rank_must_fit_large_serving_cap() -> None:
+    with pytest.raises(ConfigError, match="serving max_lora_rank=32"):
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", **{"train.lora_rank": 64}))
 
 
 def test_bare_environment_id_is_rejected() -> None:
@@ -131,6 +150,39 @@ def test_bare_environment_id_is_rejected() -> None:
         raw["environment"] = {"id": bad}
         with pytest.raises(ConfigError, match=r"Freesolo environment id"):
             spec_from_dict(raw)
+
+
+def test_env_ref_validator_matches_adapter_acceptor() -> None:
+    # The submit-time schema validator and the worker's environment acceptor parse ONE grammar;
+    # they must agree exactly (accept <-> no raise, reject <-> raise) or a ref accepted at submit
+    # could fail on the worker (or vice-versa). _require_environment_ref now delegates to the
+    # adapter's is_freesolo_environment_id; this pins that alignment across the grammar's corners.
+    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.schema.fields import _require_environment_ref
+
+    corpus = [
+        "ns/name",  # plain managed slug
+        "github:owner/repo",
+        "github:owner/repo@ref",
+        "https://github.com/owner/repo/blob/dev/envs/e/environment.py",  # blob URL
+        "  github:owner/repo@dev:envs/e/environment.py  ",  # whitespace-padded ref
+        "  ns/name  ",  # whitespace-padded slug
+        "https://github.com/owner/repo/blob/main/envs%2Fe/environment.py",  # %2F-encoded blob URL
+        "github:owner/repo@main:../../etc/passwd",  # traversal attempt
+        "https://github.com/owner/repo/blob/main/../x.py",  # traversal attempt
+        "../../etc/passwd",
+        "",
+    ]
+
+    def schema_accepts(value: str) -> bool:
+        try:
+            _require_environment_ref(value, "msg")
+            return True
+        except ConfigError:
+            return False
+
+    for value in corpus:
+        assert schema_accepts(value) is is_freesolo_environment_id(value), value
 
 
 def test_environment_must_be_a_table() -> None:

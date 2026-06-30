@@ -28,7 +28,7 @@ FIXTURE = [
     _offer(
         id=2, gpu_ram=24564, dph_total=0.34
     ),  # KEEP: under-reported VRAM ok (board < class nominal)
-    _offer(id=3, gpu_name="RTX A6000", gpu_ram=49140, dph_total=0.80),  # KEEP: 48GB Ampere
+    _offer(id=3, gpu_name="RTX A6000", gpu_ram=49140, dph_total=0.80),  # DROP: retired class
     _offer(id=4, gpu_name="A100 SXM4", gpu_ram=40960, dph_total=0.87),  # KEEP: 40GB SXM4 variant
     _offer(id=5, gpu_name="A100 SXM4", gpu_ram=81920, dph_total=1.20),  # KEEP: 80GB SXM4 variant
     _offer(id=10, dph_total=0.08, hosting_type=0),  # DROP: community host (secrets ship to it)
@@ -73,14 +73,13 @@ def test_usable_offers_filters_and_order(monkeypatch):
     monkeypatch.setattr(vast_api, "search_offers", fake_search)
     out = vast.usable_offers(24, disk_gb=60)
     # community host (id=10) dropped — datacenter-only (run secrets ship to the box)
-    assert [o.offer_id for o in out] == [1, 2, 17, 3, 4, 5]  # dph ascending, junk gone
+    assert [o.offer_id for o in out] == [1, 2, 17, 4, 5]  # dph ascending, junk gone
     assert captured["min_disk_gb"] == 60
     # the server-side VRAM filter carries slack for under-reporting boards
     assert captured["min_vram_mb"] == int(24 * 1024 * 0.92)
     by_id = {o.offer_id: o for o in out}
     assert by_id[2].gpu == "RTX 4090"
     assert by_id[2].vram_gb == 24
-    assert by_id[3].gpu == "RTX A6000"
     assert by_id[4].gpu == "A100 SXM 40GB"
     assert by_id[5].gpu == "A100 SXM"
     assert by_id[17].gpu == "RTX 5090"
@@ -95,7 +94,7 @@ def test_usable_offers_always_datacenter_only(monkeypatch):
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
     out = vast.usable_offers(24, disk_gb=60)
     # the community host (id=10) is dropped; only verified datacenter hosts survive
-    assert [o.offer_id for o in out] == [1, 2, 17, 3, 4, 5]
+    assert [o.offer_id for o in out] == [1, 2, 17, 4, 5]
 
 
 def test_usable_offers_vram_gate(monkeypatch):
@@ -104,8 +103,8 @@ def test_usable_offers_vram_gate(monkeypatch):
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
     out = vast.usable_offers(32, disk_gb=60)
-    # every 24 GB class drops; only the 32/40/48/80 GB survivors remain (dph ascending)
-    assert [o.offer_id for o in out] == [17, 3, 4, 5]
+    # every 24 GB class drops; only the active 32/40/80 GB survivors remain (dph ascending)
+    assert [o.offer_id for o in out] == [17, 4, 5]
 
 
 def test_usable_offers_exclude_machines(monkeypatch):

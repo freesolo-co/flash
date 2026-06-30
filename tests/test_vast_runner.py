@@ -738,7 +738,7 @@ def test_poll_setup_grace_protects_long_cold_start(monkeypatch):
     cold-start window that used to kill it every ~30 min."""
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
     # a fresh SETUP-stage heartbeat (boot/model-load), then frozen
-    setup_hb = {"stage": "sft_model_load", "step": 0, "ts": 10_000.0}
+    setup_hb = {"stage": "sft_model_load", "step": 0, "ts": 10_000.0, "attempt": 0}
     res = vast.poll_vast_job(
         _handle(),
         _spec(),
@@ -759,7 +759,7 @@ def test_poll_training_heartbeat_tightens_to_stall_window(monkeypatch):
     """Once a TRAINING heartbeat (a non-setup stage) arrives, the poll tightens to the smaller
     stall_after_s — a hung training loop is caught quickly (not given the full setup grace)."""
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
-    training_hb = {"stage": "rl_step", "step": 3, "ts": 10_000.0}  # training stage, then frozen
+    training_hb = {"stage": "rl_step", "step": 3, "ts": 10_000.0, "attempt": 0}  # training stage, then frozen
     res = vast.poll_vast_job(
         _handle(),
         _spec(),
@@ -833,7 +833,7 @@ def test_poll_fresh_boot_heartbeat_satisfies_liveness(monkeypatch):
         seed=0,
         interval_s=0,
         first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0, "attempt": 0},
     )
     assert res.failure == "job_preempted"
     assert "no worker heartbeat" not in (res.detail or "")

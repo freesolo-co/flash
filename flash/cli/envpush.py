@@ -1,4 +1,4 @@
-"""Environment publish machinery for the `flash env` subcommands.
+"""Environment publish/pull machinery for the `flash env` subcommands.
 
 `flash env push` packages a local Freesolo environment and uploads it through the
 managed Flash control plane.
@@ -6,7 +6,10 @@ managed Flash control plane.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,6 +17,20 @@ from . import render
 
 if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
+
+
+def _atomic_write_bytes(out: Path, data: bytes | bytearray) -> None:
+    """Write data via a sibling temp file so existing files are not truncated on failure."""
+    fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=".flash-env-pull-")
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _err(msg: str) -> int:
@@ -24,6 +41,117 @@ def _err(msg: str) -> int:
     text untouched for scripts and the env tests."""
     print(render.error(msg) if render.styled() else msg, file=sys.stderr)
     return 1
+
+
+def cmd_env_pull(args) -> int:
+    """Download a published Freesolo environment (or a single file from it) to local disk.
+
+    Pulls via GitHub's tarball / raw media type rather than the JSON "contents" API, so files
+    larger than 1 MB (e.g. ``datasets/train.jsonl``) come back intact instead of empty.
+    """
+    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.envs.pull import (
+        download_environment_file,
+        environment_local_dirname,
+        pull_environment_package,
+    )
+
+    env_id = args.env_id
+    if not is_freesolo_environment_id(env_id):
+        print(
+            'env id must be a Freesolo environment id — a managed slug "your-name/your-env", '
+            f'a "github:owner/repo@ref:path" ref, or a github.com URL (got {env_id!r})',
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        if args.path:
+            default_name = Path(args.path.replace("\\", "/")).name
+            out = Path(args.output) if args.output else Path(default_name)
+            if out.is_dir() and not out.is_symlink():
+                print(
+                    f"refusing to overwrite directory {out} with a file "
+                    "(a single-file pull needs -o to be a FILE path, not a directory)",
+                    file=sys.stderr,
+                )
+                return 1
+            if (out.exists() or out.is_symlink()) and not args.force:
+                print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
+                return 1
+            data = download_environment_file(env_id, args.path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_bytes(out, data)
+            if render.styled():
+                print(render.env_pulled(str(out), f"{args.path} · {len(data):,} bytes"))
+            else:
+                print(f"pulled {args.path} from {env_id} -> {out} ({len(data):,} bytes)")
+        else:
+            out = Path(args.output) if args.output else Path(environment_local_dirname(env_id))
+            pull_environment_package(env_id, out, overwrite=args.force)
+            if render.styled():
+                print(render.env_pulled(f"{out}/", env_id))
+            else:
+                print(f"pulled {env_id} -> {out}/")
+        return 0
+    except FileExistsError:
+        print(
+            f"refusing to overwrite existing {args.output or environment_local_dirname(env_id)!r} "
+            "(pass --force)",
+            file=sys.stderr,
+        )
+        return 1
+    except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+        print(f"env pull failed: {exc}", file=sys.stderr)
+        if "GitHub environment request failed" in str(exc) and not os.environ.get("GITHUB_TOKEN"):
+            print(
+                "hint: private/internal environments need a GitHub token; set GITHUB_TOKEN "
+                "(e.g. `export GITHUB_TOKEN=$(gh auth token)`).",
+                file=sys.stderr,
+            )
+        return 1
+
+
+def cmd_env_delete(args) -> int:
+    import re
+
+    from flash.client import ClientError, client_from_config
+    from flash.envs.adapter import is_managed_environment_slug
+
+    # Delete only targets MANAGED hub ids ("namespace/name") — not github: refs or local paths, which
+    # don't live on the hub. And enforce the hub's canonical form (lowercase, no surrounding
+    # whitespace) BEFORE the network call: the server's slug validator is lowercase-only, so a
+    # mixed-case / padded id would otherwise make a pointless request and return a confusing 400.
+    env_id = (args.env_id or "").strip()
+    if not is_managed_environment_slug(env_id):
+        return _err(
+            f'env id must be a managed Freesolo hub id "namespace/name" (got {args.env_id!r}); '
+            "github refs and local paths can't be deleted from the hub"
+        )
+    if env_id != env_id.lower() or not all(
+        re.fullmatch(r"[a-z0-9._-]+", part) for part in env_id.split("/")
+    ):
+        return _err(
+            f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
+        )
+    if not getattr(args, "yes", False):
+        prompt = f"delete environment {env_id}? this removes it from the hub [y/N] "
+        try:
+            answer = input(render.warn(prompt) if render.styled() else prompt)
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("aborted; environment not deleted", file=sys.stderr)
+            return 1
+    try:
+        result = client_from_config().delete_env(env_id)
+    except ClientError as exc:
+        return _err(str(exc))
+    # A missing env deletes to `deleted: false` (idempotent); default True so an older server that
+    # omits the field still reads as success.
+    deleted = bool(result.get("deleted", True))
+    msg = f"deleted {env_id}" if deleted else f"{env_id} was not found on the hub (already deleted)"
+    print(render.ok(msg) if render.styled() else msg)
+    return 0
 
 
 _ENV_ENTRYPOINT = "environment.py"
@@ -151,23 +279,17 @@ def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
 
 
 def _human_bytes(n: int) -> str:
-    """A short human-readable byte count, e.g. ``13.4 MB`` (whole bytes for sub-KB sizes)."""
+    """Human-readable byte count."""
     size = float(n)
     for unit in ("B", "KB", "MB"):
         if size < 1024:
             return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
-    # anything >= 1024 MB falls through to GB (env packages never reach TB).
     return f"{size:.1f} GB"
 
 
 class _UploadProgress:
-    """A carriage-return upload progress bar on stderr; a no-op off a TTY.
-
-    Mirrors ``_LogFollowSpinner`` in commands.py: render only when stderr is interactive,
-    rewrite a single line with ``\\r``, and wipe it before normal output. Off a TTY (CI, pipes)
-    ``callback`` is None, so the client uploads in one shot exactly as before and nothing is
-    written to stderr."""
+    """Carriage-return upload progress bar on stderr; no-op off a TTY."""
 
     _BAR_WIDTH = 24
 
@@ -184,11 +306,9 @@ class _UploadProgress:
 
     @property
     def callback(self) -> ProgressCallback | None:
-        # None off a TTY so the client keeps the plain single-shot upload path.
         return self.update if self._enabled else None
 
     def status(self, message: str) -> None:
-        """Show a transient pre-upload line (e.g. ``packaging environment``)."""
         if self._enabled:
             self._write(message)
 
@@ -196,7 +316,7 @@ class _UploadProgress:
         if not self._enabled:
             return
         pct = 100 if total <= 0 else min(100, sent * 100 // total)
-        # redraw only when the whole-number percent changes (8 KB chunks => thousands of calls)
+        # avoid thousands of redraws: skip if percent unchanged mid-upload
         if pct == self._last_pct and sent < total:
             return
         self._last_pct = pct
@@ -238,9 +358,10 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | No
     bar.clear()
     slug = result.get("id")
     if not slug:
-        msg = "the env was uploaded but the server returned no id"
-        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
-        return 1
+        # a publish that can't report an id has not done its job (no `id = "..."` snippet to show),
+        # so this is a hard failure — route it through _err's red ✗ idiom, not the amber ⚠ warning
+        # idiom (which means "succeeded / still proceeding") it used to borrow.
+        return _err("the env was uploaded but the server returned no id")
     if render.styled():
         print(render.env_published(slug))
     else:

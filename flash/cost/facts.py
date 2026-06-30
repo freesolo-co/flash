@@ -9,21 +9,16 @@ from flash.providers.base import GPU_INFO, GpuClass, providers_for
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "RTX 4090": 165.0,
     "RTX 5090": 210.0,
-    "RTX A6000": 155.0,
     "A100 PCIe": 312.0,
     "A100 SXM": 312.0,
-    # A100 SXM4 40 GB: same SMs/tensor cores as the 80 GB SXM (just less HBM) -> identical bf16 dense
-    # TFLOPS. Without this exact-name entry gpu_tflops() falls to the 100-TFLOPS default and inflates
-    # this class's seconds_per_step / quoted cost ~3x (Codex) — reachable now that a Vast live-offer
-    # quote can select the 40 GB A100 when it is the only duration-valid offer for a 35-40 GB run.
+    # A100 SXM 40GB: same SMs/tensor cores as the 80GB A100 SXM, less HBM only.
+    # Without this, 33-40 GB Lambda/Vast quotes fall back to _DEFAULT_TFLOPS.
     "A100 SXM 40GB": 312.0,
     "H100": 990.0,
-    # H200 is a Hopper part (same SMs/tensor cores as H100, more HBM) -> same bf16 dense TFLOPS.
+    # H200: same SMs/tensor cores as H100, more HBM only.
     "H200": 990.0,
     "RTX Pro 6000": 250.0,
-    # B200 (Blackwell datacenter, sm100): NVIDIA spec 2.25 PFLOPS bf16 dense tensor (no sparsity),
-    # listed like H100's 990 dense number so the cost estimator doesn't fall back to the 100-TFLOPS
-    # default and wildly over-estimate the 35B's train time.
+    # B200: 2.25 PFLOPS bf16 dense (NVIDIA spec); prevents ~10x cost over-estimate vs _DEFAULT_TFLOPS.
     "B200": 2250.0,
 }
 _DEFAULT_TFLOPS = 100.0
@@ -37,10 +32,8 @@ def gpu_tflops(name: str) -> float:
 def gpu_hourly_usd(name: str, provider: str | None = None, max_wall_seconds: float = 0.0) -> float:
     """Representative $/hr for a class, on ``provider`` when given.
 
-    The nominal ``GpuClass.hourly_usd`` is the RunPod rate, which is WRONG for a provider-specific
-    quote (e.g. a Lambda RTX A6000 is $1.09/hr, not RunPod's $0.49). When ``provider`` is ``lambda``
-    or ``vast`` and the class is offered there, price it through that provider's pricing module (live
-    with a static fallback); otherwise (runpod/auto/None) use the nominal rate.
+    When ``provider`` is ``lambda`` or ``vast`` and the class is offered there, price it through that
+    provider's pricing module (live with a static fallback); otherwise use the RunPod static rate.
 
     ``max_wall_seconds`` (>0) is threaded into the Vast live market so a duration-bound quote prices
     against offers that outlast the run, not a short-lived one filtered out at launch (Codex MtzrI).
@@ -122,9 +115,8 @@ def pick_gpu(
     return best.name
 
 
-# Model-size facts (catalog-only; five dense text models, no MoE/open-model sizing)
 def total_params_b(model_id: str) -> float:
-    """Total parameter count (billions) for a catalog model -- the curated ``params_b`` stat."""
+    """Total parameter count (billions) for a catalog model."""
     info = MODELS.get(model_id)
     if info is None:
         raise ValueError(
@@ -135,12 +127,7 @@ def total_params_b(model_id: str) -> float:
 
 
 def active_params_b(model_id: str) -> float:
-    """Parameters ACTIVE per token (billions) — the per-token FLOPs/step-time size.
-
-    For an MoE this is the curated ``active_params_b`` (a token routes through only a subset of
-    experts); for a dense model (``active_params_b`` unset / 0) it falls back to the total
-    ``params_b``. Use this for compute (FLOPs) terms; use ``total_params_b`` for memory/size terms
-    (VRAM, disk, download), which always size the full checkpoint."""
+    """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM."""
     info = MODELS.get(model_id)
     if info is None:
         raise ValueError(
@@ -151,18 +138,17 @@ def active_params_b(model_id: str) -> float:
 
 
 def model_quant(model_id: str) -> str:
-    """Quantization of the catalog entry; ``"bf16"`` for the whole catalog today (bf16 default)."""
+    """Quantization of the catalog entry; defaults to 'bf16'."""
     info = MODELS.get(model_id)
     return (info.quant or "bf16") if info is not None else "bf16"
 
 
 def download_weight_gb(model_id: str) -> float:
-    """GB pulled from the HF hub at cold start (full bf16 checkpoint, 2 bytes/param)."""
+    """Full bf16 checkpoint size in GB (2 bytes/param)."""
     return total_params_b(model_id) * 2.0
 
 
-# A single average grader latency (s/completion) for every env. Graders span ~0.01s (regex/math)
-# to ~3s (LLM judge/code); ~1s is a middle-of-the-road default (a run can override it).
+# ~1s mid-range default across grader types (regex ~0.01s to LLM judge ~3s).
 AVG_REWARD_SECONDS_PER_COMPLETION = 1.0
 
 

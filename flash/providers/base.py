@@ -1,14 +1,4 @@
-"""Shared GPU-provider interface + GPU registry.
-
-RunPod is the managed GPU substrate. This module owns the parts that are not specific to the
-RunPod transport:
-
-  * ``GpuClass`` — one managed GPU class with its RunPod Flash identity.
-  * ``JobHandle`` / ``PollResult`` — the persisted-handle + poll-outcome shapes the
-    orchestrator round-trips through the provider.
-  * ``Candidate`` / ``Allocation`` — the allocation result.
-  * The canonicalization / alias / policy helpers every call site already used.
-"""
+"""Shared GPU-provider interface + GPU registry."""
 
 from __future__ import annotations
 
@@ -21,47 +11,26 @@ if TYPE_CHECKING:
     from flash.spec import JobSpec
 
 
-# GPU class registry (provider-agnostic identity)
 @dataclass(frozen=True)
 class GpuClass:
-    """One managed RunPod GPU class: a friendly name + RunPod Flash identity/metadata."""
+    """One managed GPU class with its provider identity/metadata."""
 
-    name: str  # canonical friendly name used in configs / the catalog
+    name: str
     enum_member: str | None  # runpod_flash GpuType member name; None -> not on RunPod
     vram_gb: int
-    short: str  # endpoint-name-safe token (e.g. "4090", "a5000")
-    sm: str  # CUDA arch (informational; sm80+ only)
-    hourly_usd: float  # static rate used by pricing, cost projection, and ranking
-    # Min host CUDA (driver) on the modern stack. None -> 12.8. Blackwell (sm120/sm100)
-    # needs CUDA-13 drivers to JIT the wheels' PTX (no SASS shipped).
+    short: str  # endpoint-name-safe token
+    sm: str
+    hourly_usd: float
+    # None -> 12.8. Blackwell (sm120/sm100) needs CUDA-13 to JIT PTX (no SASS shipped).
     min_cuda_modern: str | None = None
-    # Whether this class has passed Flash's LIVE validation smoke (a real train+eval run on the
-    # card). The deployed control plane REJECTS a submit for a non-validated class ("gpu type 'X'
-    # has not passed Flash's live validation smoke"), so client-side allocation restricts to the
-    # validated pool by default (see ``validated_classes`` / allocator) — otherwise a default
-    # `flash train` could pick the absolute-cheapest fitting class (e.g. a newly-added, not-yet-validated one) that the
-    # server then refuses, and the run never submits. Exactly the smoke-validated members below
-    # are marked True.
+    # Server REJECTS non-validated classes; client restricts to this pool by default.
     validated: bool = False
-    # Lambda Cloud instance-type name for this class (e.g. "gpu_1x_a10"); None -> not on Lambda.
-    # Lambda is the instance-based complement to RunPod's serverless substrate: a class with a
-    # ``lambda_name`` is provisionable on Lambda (capacity permitting), priced from Lambda's own
-    # live ``/instance-types`` rate (NOT the RunPod ``hourly_usd`` snapshot above).
-    lambda_name: str | None = None
-    # Vast.ai offer ``gpu_name`` for this class (e.g. "RTX 4090", "A100 SXM4"); None -> not on Vast.
-    # Vast is the verified-datacenter live-market instance complement: a class with a ``vast_name`` is
-    # provisionable on Vast (capacity permitting), priced from the cheapest live verified-DC offer
-    # (NOT the RunPod ``hourly_usd`` snapshot). Names are NOT unique across VRAM variants (40/80 GB SXM4
-    # both report "A100 SXM4"); ``vast_gpu_for_offer`` disambiguates by the offer's actual ``gpu_ram``.
-    vast_name: str | None = None
-    # Extra Vast offer ``gpu_name`` strings that ALSO map to this class — a board variant Vast lists
-    # separately but is the same managed class (e.g. "H100 PCIE" alongside the SXM ``vast_name``).
-    # ``vast_gpu_for_offer`` accepts these too, so the market's variant rows aren't dropped as unknown
-    # capacity (which would make the class look unavailable on Vast). Empty for classes with one name.
+    lambda_name: str | None = None  # None -> not on Lambda; priced from Lambda live rates
+    vast_name: str | None = None  # None -> not on Vast; priced from Vast live/static rates
     vast_aliases: tuple[str, ...] = ()
 
 
-# Static hourly rates are RunPod secure-cloud on-demand snapshots.
+# Hourly rates are RunPod secure-cloud on-demand snapshots.
 GPU_CLASSES: tuple[GpuClass, ...] = (
     GpuClass(
         "RTX 4090",
@@ -84,43 +53,21 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
         vast_name="RTX 5090",
     ),
-    # Ampere/Ada workstation + datacenter cards (cheap capacity pools)
-    # 24 GB is the floor: the sub-24 GB tiers (16 GB RTX A4000 / RTX 2000 Ada, 20 GB RTX A4500 /
-    # RTX 4000 Ada) were dropped — the 24 GB classes below are the smallest managed cards.
-    # (RTX 3090 was removed from the catalog — see git history.)
-    # Lambda-only 24 GB Ampere datacenter card (RunPod has no A10). Instance-based capacity
-    # complement: the price-sorted allocator only reaches it once every cheaper FITTING RunPod class is
-    # out of capacity — not just the 24 GB tiers but e.g. the $0.49 48 GB RTX A6000 — so it never
-    # undercuts RunPod on price.
-    # Live-validated 2026-06-27: Qwen3.5-0.8B SFT train smoke (Lambda gpu_1x_a10, us-east-1).
+    # Lambda-only; RunPod has no A10. Allocator reaches it only after cheaper RunPod classes exhaust.
     GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
-    # Live-validated 2026-06-22: Qwen3.5-0.8B/9B SFT+GRPO train smokes (RunPod). The 48 GB tier that
-    # fills the 32->80 GB gap (e.g. 4B GRPO @ 35 GB) ~55% cheaper than the A100.
+    # Lambda-only 40 GB A100; fills the 32->80 GB gap on Lambda.
     GpuClass(
-        "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
+        "A100 SXM 40GB",
+        None,
+        40,
+        "a100sxm40",
+        "sm80",
+        1.99,
+        lambda_name="gpu_1x_a100_sxm4",
         validated=True,
-        lambda_name="gpu_1x_a6000",
-        vast_name="RTX A6000",
-    ),
-    # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
-    # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
-    # Live-validated 2026-06-27: Qwen3.5-0.8B SFT train smoke (Lambda gpu_1x_a100_sxm4, us-east-1).
-    GpuClass(
-        "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99,
-        lambda_name="gpu_1x_a100_sxm4", validated=True,
-        # 40 and 80 GB SXM4 boards BOTH report Vast's "A100 SXM4"; vast_gpu_for_offer resolves an
-        # offer to the largest class its actual gpu_ram covers, so a 40 GB board lands here.
         vast_name="A100 SXM4",
-        # Vast also lists 40 GB A100 PCIe boards as "A100 PCIE" (the 80 GB ``A100 PCIe`` class carries
-        # that vast_name): a 40 GB "A100 PCIE" offer fails the 80 GB class's VRAM gate and, without this
-        # alias, matched no 40 GB class -> real A100 capacity dropped for 35-40 GB runs. The largest-
-        # fitting-class resolution keeps an 80 GB "A100 PCIE" board on the 80 GB class; only a 40 GB one
-        # lands here. SXM-vs-PCIe interconnect is irrelevant for single-GPU runs (same precedent as the
-        # H100 "H100 PCIE" alias); priced live off the actual offer (Codex).
         vast_aliases=("A100 PCIE",),
     ),
-    # big-VRAM tier (9B bf16 GRPO, future >9B bf16)
-    # Validated 2026-06-11: 0.6B SFT smoke (phase6).
     GpuClass(
         "A100 PCIe",
         "NVIDIA_A100_80GB_PCIe",
@@ -131,15 +78,23 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
         vast_name="A100 PCIE",
     ),
-    # Live-validated 2026-06-22: Qwen3.5 0.8B/MiniCPM/2B/9B SFT+GRPO train smokes (RunPod).
     GpuClass(
-        "A100 SXM", "NVIDIA_A100_SXM4_80GB", 80, "a100sxm", "sm80", 1.49,
+        "A100 SXM",
+        "NVIDIA_A100_SXM4_80GB",
+        80,
+        "a100sxm",
+        "sm80",
+        1.49,
         validated=True,
         vast_name="A100 SXM4",
     ),
-    # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod).
     GpuClass(
-        "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29,
+        "H100",
+        "NVIDIA_H100_80GB_HBM3",
+        80,
+        "h100",
+        "sm90",
+        3.29,
         validated=True,
         lambda_name="gpu_1x_h100_pcie",
         vast_name="H100 SXM",
@@ -148,16 +103,15 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         # the actual offer, so a cheaper PCIe board just makes the class more available.
         vast_aliases=("H100 PCIE",),
     ),
-    # H200 (Hopper, sm90, 141 GB HBM3e) — same compute as the H100 with ~1.76x the VRAM. The
-    # mid-tier for big checkpoints whose WEIGHTS dominate but whose compute is small: e.g. the
-    # 35B-A3B MoE SFT (~70 GB resident weights + tiny active-3B compute) fits here, no need for the
-    # 180 GB B200. RunPod-only: Lambda offers only the GH200 (96 GB Grace-Hopper, a different SKU),
-    # and the Hyperstack image isn't wired. Hopper has SASS in the wheels -> CUDA 12.8, FA3 path.
     GpuClass(
-        "H200", "NVIDIA_H200", 141, "h200", "sm90", 4.39,
+        "H200",
+        "NVIDIA_H200",
+        141,
+        "h200",
+        "sm90",
+        4.39,
         validated=True,
     ),
-    # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
         "RTX Pro 6000",
         "NVIDIA_RTX_PRO_6000_BLACKWELL_SERVER_EDITION",
@@ -168,14 +122,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         min_cuda_modern="13.0",
         validated=True,
     ),
-    # Datacenter Blackwell (sm100, 180 GB HBM3e usable per SXM6 board — NVIDIA advertises 192 GB,
-    # but RunPod and Lambda both list 180 GB usable, so we size to the SAFE 180). The only managed
-    # class big enough for the Qwen3.6 35B-A3B MoE (~70 GB bf16 weights): SFT fits one card and
-    # colocated GRPO (two bf16 copies + KV + 248k-vocab fp32 logits) needs the full 180 GB. Like the
-    # other Blackwell cards it needs a CUDA-13 host driver to JIT the wheels' PTX.
-    # Offered as a SINGLE B200 by RunPod (serverless ``NVIDIA_B200``) and Lambda
-    # (``gpu_1x_b200_sxm6``). NOT on Hyperstack: its only B200 flavor is the 8-GPU node
-    # ``n3-B200-SXM6x8`` (no 1x flavor), so it can't back a single-GPU class.
+    # 180 GB usable (NVIDIA advertises 192 GB; size to the safe 180 per RunPod/Lambda listings).
     GpuClass(
         "B200",
         "NVIDIA_B200",
@@ -190,15 +137,20 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
-
-# Canonical friendly names Flash exposes in configs / the catalog.
+LEGACY_GPU_CLASSES: tuple[GpuClass, ...] = (
+    GpuClass(
+        "RTX A6000",
+        "NVIDIA_RTX_A6000",
+        48,
+        "a6000",
+        "sm86",
+        0.49,
+        lambda_name="gpu_1x_a6000",
+        vast_name="RTX A6000",
+    ),
+)
+_GPU_INFO_ALL: dict[str, GpuClass] = {**GPU_INFO, **{g.name: g for g in LEGACY_GPU_CLASSES}}
 KNOWN = tuple(GPU_INFO)
-
-# The names that have passed Flash's live validation smoke. Client-side allocation restricts to
-# these by default because the deployed control plane REJECTS a submit for any class outside the
-# pool ("gpu type 'X' has not passed Flash's live validation smoke"); allocating an unvalidated
-# (e.g. absolute-cheapest) class would just make the server refuse the run. Kept in sync with the
-# ``validated=True`` flags above.
 VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
 
@@ -214,11 +166,10 @@ def _alias_keys(name: str) -> set[str]:
 
 
 _ALIASES: dict[str, str] = {}
-for _info in GPU_INFO.values():
+for _info in _GPU_INFO_ALL.values():
     for _k in _alias_keys(_info.name):
         _ALIASES[_k] = _info.name
-# Spellings that don't fall out of the generic rules: full marketing names (what
-# nvidia-smi / the RunPod API print) and historical Flash aliases.
+# Full marketing names (nvidia-smi / RunPod API) and historical aliases not covered by generic rules.
 _ALIASES.update(
     {
         "nvidia geforce rtx 4090": "RTX 4090",
@@ -257,17 +208,19 @@ class UnreconciledCreateError(RuntimeError):
 
 
 def canonical_gpu(name: str) -> str:
-    """Normalize a friendly GPU name to one of ``KNOWN``; raise otherwise."""
+    """Normalize a friendly GPU name to an active or retired class; raise otherwise.
+
+    Retired classes resolve for teardown/pricing compatibility but stay absent from ``GPU_INFO`` so
+    allocation, display, and provider offer matching do not select them.
+    """
     key = (name or "").strip().lower()
     if key in _ALIASES:
         return _ALIASES[key]
-    raise UnsupportedGpuError(
-        f'unsupported gpu {name!r}; Flash manages {", ".join(KNOWN)}'
-    )
+    raise UnsupportedGpuError(f"unsupported gpu {name!r}; Flash manages {', '.join(KNOWN)}")
 
 
 def get_gpu_info(name: str) -> GpuClass:
-    return GPU_INFO[canonical_gpu(name)]
+    return _GPU_INFO_ALL[canonical_gpu(name)]
 
 
 # Slack between a board's REPORTED VRAM and its class nominal (boards under-report: an A100 SXM4 40 GB
@@ -318,16 +271,9 @@ def min_cuda_modern(name: str) -> str:
 
 
 def cheapest_gpu(min_vram_gb: int) -> str:
-    """Cheapest validated RunPod GPU class with at least ``min_vram_gb`` VRAM.
-
-    RunPod-static by design so the result is always deployable via Flash, and offline resolution
-    stays deterministic. Restricted to the validated pool so the picked class matches what the
-    deployed control plane will actually accept — a non-validated class submits then gets rejected.
-    """
+    """Cheapest validated RunPod GPU class with at least ``min_vram_gb`` VRAM."""
     pool = [
-        g
-        for g in GPU_INFO.values()
-        if g.enum_member and g.vram_gb >= min_vram_gb and g.validated
+        g for g in GPU_INFO.values() if g.enum_member and g.vram_gb >= min_vram_gb and g.validated
     ]
     if not pool:
         raise UnsupportedGpuError(
@@ -345,18 +291,10 @@ def provisional_gpu(
     train=None,
     thinking: bool = False,
 ) -> str:
-    """The cheapest VALIDATED GPU class whose VRAM covers the model -- a parse-time provisional.
-
-    GPU pinning is gone: this picks the cheapest RunPod-provisionable class whose VRAM covers the
-    model, restricted to the validated pool (``cheapest_gpu``'s default) so the provisional
-    matches what the deployed control plane will accept. The submit-time allocator
-    (``flash.providers.allocator``) always re-resolves the cheapest fitting validated class; this
-    is the RunPod-static, offline-deterministic equivalent the schema uses for sizing/display.
-    """
+    """Cheapest validated GPU for this model: parse-time provisional used by the schema for sizing/display."""
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
-    # Use the shared vram_headroom() so parse-time sizing matches the submit-time allocator exactly.
     min_vram = model_required_vram_gb(
         model_id,
         algorithm,
@@ -367,14 +305,9 @@ def provisional_gpu(
     return cheapest_gpu(min_vram)
 
 
-# Handles + poll outcomes (round-tripped through any provider)
 @dataclass
 class JobHandle:
-    """Provider-tagged, persisted handle: enough to reattach/cancel from any process.
-
-    The provider owns the rest of its handle shape (RunPod: endpoint_id/job_id). ``provider`` is
-    the routing key the orchestrator uses to dispatch poll/cancel/destroy through the registry.
-    """
+    """Provider-tagged persisted handle: enough to reattach/cancel from any process."""
 
     provider: str
     data: dict = field(default_factory=dict)
@@ -393,14 +326,7 @@ class JobHandle:
 class PollResult:
     ok: bool
     metrics: dict | None = None
-    # "job_failed"    : genuine worker/job code error (NOT retried)
-    # "job_preempted" : provider killed the worker (platform termination) -> infra-shaped, retried
-    # "no_capacity"   : NEVER scheduled — no provider capacity for the pinned GPU class (job sat
-    #                   IN_QUEUE / the only worker stayed THROTTLED) -> infra-shaped, retried on the
-    #                   next-best GPU. Distinct from "stalled" (a worker WAS scheduled then stopped
-    #                   making progress) so the terminal message points at capacity, not worker health.
-    # "stalled"       : a scheduled worker made no progress within the budget -> infra-shaped, retried
-    # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
+    # failure: job_failed, oom, job_preempted, no_capacity, stalled, or poll_error.
     failure: str | None = None
     detail: str | None = None
 
@@ -419,13 +345,12 @@ class Allocation:
     gpu: str
     hourly_usd: float
     min_vram_gb: int
-    candidates: tuple[Candidate, ...]  # full ranked list (retry walks this)
+    candidates: tuple[Candidate, ...]  # full ranked list; retry walks this
 
 
-# The provider interface (FIXED method set both providers implement)
 @runtime_checkable
 class Provider(Protocol):
-    """The GPU-substrate interface implemented by ``providers/runpod``."""
+    """GPU-substrate interface implemented by each provider."""
 
     name: str
 
@@ -434,12 +359,11 @@ class Provider(Protocol):
         ...
 
     def preflight(self, require_hf: bool = True) -> list[str]:
-        """Missing-config problems (empty list == ready). The control plane aggregates
-        these into one fail-fast error at startup."""
+        """Missing-config problems; empty list == ready."""
         ...
 
     def gpu_classes(self) -> list[GpuClass]:
-        """The GPU classes this provider can provision (its rows of the shared table)."""
+        """GPU classes this provider can provision."""
         ...
 
     def hourly_rate(self, gpu: str) -> float:
@@ -456,12 +380,11 @@ class Provider(Protocol):
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
+        code_prefix: str | None = None,
     ) -> PollResult:
-        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll.
+        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll to terminal.
 
-        ``on_last_gpu`` is True when no further GPU attempt will be made after this one — either the
-        candidate list is exhausted or the retry budget is exhausted — so there is no next-best class to fall
-        to and capacity backstops should wait longer before giving up.
+        ``on_last_gpu``: no further GPU attempt follows, so capacity backstops may wait longer.
         """
         ...
 
@@ -496,25 +419,12 @@ class Provider(Protocol):
         active_labels: set[str] | Callable[[], set[str]] | None = None,
         known_labels: set[str] | Callable[[], set[str]] | None = None,
     ) -> list[int | str]:
-        """Destroy any billable resource this provider owns that no live run claims.
+        """Destroy billable resources this provider owns that no live run claims.
 
-        Crash recovery: run at server startup (and after runs). ``active_labels`` is the set of
-        RAW run ids still owned by live runs — each instance provider derives its own instance-label
-        prefix from them via ``run_label_prefix`` and reaps anything matching none of them. It may
-        instead be a CALLABLE returning that set, which the instance providers resolve AFTER listing
-        their resources (the periodic in-lifetime sweep passes one to close the launch race — see the
-        instance ``sweep_orphans``).
-
-        ``known_labels`` is the (optional) set of RAW run ids this control plane has ANY record of —
-        the universe of resources it may attribute to itself. When supplied, a resource is reaped
-        ONLY if it maps to a run in this set (and is not in ``active_labels``); a resource whose run
-        id is absent is left alone. This is the multi-plane safety guard: two control planes sharing
-        one provider account each only reap their OWN orphans, so neither executes the other's live
-        instances. ``None`` (the default) preserves the legacy unscoped behavior (reap every unowned
-        ``flash-`` resource), which is correct for the single-control-plane production setup. Like
-        ``active_labels`` it may be a CALLABLE, resolved after listing.
-
-        Returns the destroyed resource ids (RunPod uses int ids; the instance providers use opaque
-        string ids). Providers without a standing-billing substrate (RunPod's serverless endpoints
-        self-reap) implement this as a no-op."""
+        ``active_labels``: raw run ids of live runs (may be a callable resolved after listing, to
+        close the launch race). ``known_labels``: universe of run ids this plane may own — reap only
+        resources in this set and not in active_labels (multi-plane safety: two planes sharing one
+        account only reap their own orphans). ``None`` = unscoped single-plane behavior (correct for
+        single-plane prod). Returns destroyed resource ids.
+        """
         ...

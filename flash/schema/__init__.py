@@ -7,7 +7,7 @@ import sys
 import tomllib
 from typing import Any
 
-from flash.catalog import normalize_algorithm, resolve_model
+from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -46,10 +46,8 @@ def spec_from_file(
     extra_configs: list[str] | None = None,
 ) -> JobSpec:
     raw = load_toml(path)
-    # Composed configs: later files override earlier keys (deep merge).
     for extra in extra_configs or []:
         _deep_merge(raw, load_toml(extra))
-    # `--set key=value` dotted overrides (highest precedence).
     for item in overrides or []:
         _apply_override(raw, item)
     return spec_from_dict(raw, run_id=run_id)
@@ -77,10 +75,7 @@ def _apply_override(raw: dict, item: str) -> None:
     leaf = parts[-1]
     # support list values like pip=["a","b"]
     val = value.strip()
-    # [wandb] leaves are string-valued labels (project / run name); a numeric- or
-    # bool-looking value like `--set wandb.run_name=123` is still the string label the
-    # user intends. Preserve it as a string instead of coercing it to int/float/bool
-    # (which _wandb_spec's string validation would otherwise reject).
+    # wandb leaves are string labels — don't coerce to int/bool
     if parts[0] == "wandb":
         node[leaf] = val
     elif val.startswith("[") and val.endswith("]"):
@@ -107,15 +102,9 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     )
 
 
-# Recognized config keys. Anything else is a typo or a knob in the wrong place — reject it loudly
-# rather than silently ignoring it and training (expensively) against defaults. The classic trap:
-# putting GRPO knobs under a `[grpo]` table (they belong under `[train]`), which used to be dropped
-# without a peep — a run would then use the default rollout (16x more completions) at 16x the cost.
-#
-# Some of these are platform-MANAGED, not user knobs: `gpu`, `model_policy`, `run_id`, and
-# `train.hf_repo` are ignored if a user sets them (the control plane derives/assigns them). They
-# remain RECOGNIZED — not rejected — because a round-tripped JobSpec (spec.to_dict(), which the
-# control plane re-parses on submit) still carries them; rejecting would break that re-validation.
+# Unknown tables are rejected loudly: a stray [grpo] table silently dropped GRPO knobs and trained
+# at 16x-cost defaults. Platform-managed keys (gpu, run_id, hf_repo) remain recognized (not
+# rejected) so a round-tripped JobSpec.to_dict() doesn't fail re-validation on submit.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
@@ -154,10 +143,7 @@ _TRAIN_KEYS = frozenset(
     }
 )
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
-    # Reject unknown config SECTIONS (table-valued top-level keys) — the footgun is a `[grpo]`
-    # table holding rollout knobs that actually belong under `[train]`, silently dropped + run at
-    # 16x-cost defaults. We only flag tables, not scalars: callers (e.g. the CLI) pass
-    # through harmless scalar control flags like `dry_run`/`background` alongside the spec.
+    # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
     if unknown:
         hint = ""
@@ -174,35 +160,26 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         model = raw["model"]
     except KeyError as exc:
         raise ConfigError("config must set `model`") from exc
+    # An unhashable model (TOML array / `[model]` table) would TypeError on MODELS.get() downstream,
+    # escaping the callers' ConfigError/ValueError guards -> 500; type-check like the other scalars.
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
 
     try:
         algorithm = normalize_algorithm(raw.get("algorithm"))
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    # model_policy (curated "catalog" vs any-fitting-HF-model "allow") is NOT a user knob: managed
-    # runs always use the curated catalog, so a user-supplied model_policy is ignored. (The "allow"
-    # path still exists in resolve_model for internal use, but a submitted config can't select it.)
-    model_policy = "catalog"
-    thinking = raw.get("thinking", False)  # reasoning mode OFF by default (operator preference)
+    model_policy = "catalog"  # not a user knob; "allow" path exists for internal use only
+    thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
 
-    # ``is None`` (not ``or {}``): a missing section defaults to an empty table, but a present-
-    # but-non-dict value (e.g. ``environment = false``) must reach the "must be a table" check
-    # rather than being silently coerced to ``{}`` and bypassing validation.
+    # Use `is None` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
     env_raw = raw.get("environment")
     if env_raw is None:
         env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
-    # Local environment paths are gone: a run names a published Freesolo env by [environment] id.
-    # A stray `path` (alone or alongside `id`) is a stale config — reject it loudly instead of
-    # silently ignoring the key and training against the wrong/missing env.
-    if env_raw.get("path"):
-        raise ConfigError(
-            "local environment paths are no longer supported — remove `path` and reference a "
-            "Freesolo environment `id` returned by `flash env push --name <name>`"
-        )
     # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
     # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
     # value (false -> {}/()) but a present-but-wrong-typed value otherwise crashes opaquely or
@@ -237,13 +214,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
 
-    # GPU allocation is fully automatic: the submit-time allocator always picks the cheapest
-    # fitting active RunPod class — there is no GPU pin. A config's gpu.type is not a user knob.
-    # ``provisional_gpu`` computes the offline RunPod-static cheapest-validated-that-fits for
-    # sizing/display only; the allocator re-resolves it at submit time.
     try:
-        # No GPU pin: the cheapest fitting VALIDATED class (the pool the deployed control plane
-        # accepts). The submit-time allocator re-resolves it on RunPod.
+        # Offline sizing/display only; allocator re-resolves at submit time.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
@@ -263,18 +235,21 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"disabled; set thinking = true"
         )
     if thinking and info.thinking == "unknown":
-        # stderr, not stdout: keep stdout clean for callers that parse machine-readable
-        # output, so this advisory warning never corrupts a structured stream.
+        # stderr keeps stdout clean for machine-readable callers
         print(
             f"warning: open-model policy: cannot verify that {model}'s chat template "
             f"supports thinking mode; the run proceeds with enable_thinking=true",
             file=sys.stderr,
         )
+    lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
+    max_lora_rank = serving_lora_rank_cap(info)
+    if max_lora_rank is not None and lora_rank > max_lora_rank:
+        raise ConfigError(
+            f"train.lora_rank={lora_rank} exceeds {model}'s serving max_lora_rank="
+            f"{max_lora_rank}; lower train.lora_rank or raise the serving cap "
+            "after real-GPU validation"
+        )
 
-    # worker_env is the lower-level per-run escape hatch ([worker_env] table, string-valued,
-    # secret-guarded; the worker reads it for the per-run chalk/kernel opt-in). The optional
-    # [wandb] naming table is a separate, typed spec field (JobSpec.wandb) — NOT folded into
-    # worker_env env vars.
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
 
@@ -290,13 +265,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         train=TrainSpec(
             steps=_train_int(train_raw, "steps", minimum=1),
             epochs=_train_int(train_raw, "epochs", minimum=1),
-            lora_rank=_train_int(train_raw, "lora_rank", minimum=1) or 32,
+            lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
             init_from_adapter=_init_from_adapter_ref(train_raw),
-            # hf_repo is assigned by the control plane (a per-run private dataset under the
-            # operator's namespace, written by the operator HF_TOKEN); a user-supplied
-            # [train] hf_repo is ignored. See flash.runner.submit_job._assign_managed_hf_repo.
-            hf_repo="",
+            hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
             max_length=_train_int(train_raw, "max_length", minimum=1),
@@ -310,19 +282,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
             stop_sequences=_train_stops(train_raw),
-            # SFT caps: max_steps caps optimizer steps (cheap pre-flight smoke); max_examples
-            # truncates the SFT dataset. minimum=0 so an explicit 0 means "no cap" (matches the
-            # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].
+            # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
         ),
-        # GPU allocation, disk sizing, retry budget, and network volumes are all platform-managed:
-        # the submit-time allocator picks the cheapest fitting validated RunPod GPU, disk is raised
-        # to the model's minimum server-side, and the infra knobs are operator defaults. A user
-        # [gpu] table is ignored; gpu_type here is the offline sizing/display provisional,
-        # re-resolved at submit.
         gpu=GpuSpec(type=gpu_type),
-        run_id=run_id or "local",  # server-assigned (new_run_id at create_run); never user-set
+        run_id=run_id or "local",  # server-assigned at create_run; never user-set
         worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,
@@ -337,15 +302,10 @@ def _validate_spec(spec: JobSpec) -> None:
         canonical_gpu(spec.gpu.type)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
-    # GRPO is step-driven; SFT is epoch-driven. Reject a non-positive explicit count
-    # for whichever the algorithm consumes, so an invalid config fails here instead of
-    # provisioning a worker that silently falls back to a default count.
     if spec.algorithm == "grpo" and spec.train.steps is not None and spec.train.steps <= 0:
         raise ConfigError("train.steps must be positive for GRPO")
     if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
-    # Every run must name a Freesolo environment by [environment] id.
-    # There is no default environment and no local path mode.
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
@@ -358,14 +318,6 @@ def _validate_spec(spec: JobSpec) -> None:
     )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")
-    # NOTE: the per-run HF artifact repo (train.hf_repo) is NOT validated here — it is no longer a
-    # user field. The control plane assigns it server-side (a per-run private dataset under the
-    # operator's namespace) in flash.runner.submit_job; see _assign_managed_hf_repo.
-    # GRPO recipe knobs (group_size/temperature/max_tokens/kl_penalty_coef/advantage_clip/
-    # thinking_length_penalty_coef) are range-validated at parse time by the _train_int/
-    # _train_float coercers above (including the thinking_length_penalty_coef <= 1.0 upper
-    # bound), so no re-check is needed here.
-    # lora_alpha scales the adapter contribution; 0 (or negative) trains a paid run
-    # that produces a no-op adapter (zero scaling at serve). Reject up front.
+    # lora_alpha=0 produces a no-op adapter (zero scaling at serve) — reject up front.
     if spec.train.lora_alpha <= 0:
         raise ConfigError("train.lora_alpha must be positive")

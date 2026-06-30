@@ -1012,19 +1012,19 @@ wheels = [
 
 [[package]]
 name = "freesolo"
-version = "0.2.49"
+version = "0.2.52"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/0c/d5c4292a28aff7a585074dfc0f24d178fcc578d38400caddb627e972042f/freesolo-0.2.49.tar.gz", hash = "sha256:ebdfc0650d1824b418afcadd2db3f43b401520494e950f71ce9d6c95547a06ea", size = 317620, upload-time = "2026-06-24T04:31:37.635Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ef/9b/1872807de7721e7dfc5ff81c4ead69765689cbc88bc829fcdcffae9d6636/freesolo-0.2.52.tar.gz", hash = "sha256:90be0102ae16b8f86c3a314e599c48b1ea3af867877265b0ae99e1a90f16b9ac", size = 351424, upload-time = "2026-06-30T08:20:33.509Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b9/11/01bb5666876e35a8e9fe149019b2229efde3aa2cfd28f8dcc43a7fbf2974/freesolo-0.2.49-py3-none-any.whl", hash = "sha256:e5ae22644a7e705552751e2aa7ffab2b6e9fc2956ae390aac6369552621b3322", size = 16564, upload-time = "2026-06-24T04:31:36.45Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/a1/fe1a03f08f4a4301df0c98246e6c8db452dd3e2df9ace1dc391889335780/freesolo-0.2.52-py3-none-any.whl", hash = "sha256:69480413ad8f76965a8b53c821884364286f573701f98df5f45e327f75a125e4", size = 63062, upload-time = "2026-06-30T08:20:32.187Z" },
 ]
 
 [[package]]
 name = "freesolo-flash"
-version = "0.2.27"
+version = "0.2.33"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1038,6 +1038,7 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "runpod-flash" },
+    { name = "transformers" },
     { name = "uvicorn" },
 ]
 gpu = [
@@ -1059,6 +1060,7 @@ server = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "runpod-flash" },
+    { name = "transformers" },
     { name = "uvicorn" },
 ]
 
@@ -1080,9 +1082,9 @@ requires-dist = [
     { name = "datasets", marker = "extra == 'server'", specifier = ">=2.19" },
     { name = "fastapi", marker = "extra == 'dev'" },
     { name = "fastapi", marker = "extra == 'server'" },
-    { name = "freesolo", marker = "extra == 'dev'", specifier = ">=0.2.49" },
-    { name = "freesolo", marker = "extra == 'gpu'", specifier = ">=0.2.49" },
-    { name = "freesolo", marker = "extra == 'server'", specifier = ">=0.2.49" },
+    { name = "freesolo", marker = "extra == 'dev'", specifier = ">=0.2.52" },
+    { name = "freesolo", marker = "extra == 'gpu'", specifier = ">=0.2.52" },
+    { name = "freesolo", marker = "extra == 'server'", specifier = ">=0.2.52" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "huggingface-hub", marker = "extra == 'dev'", specifier = ">=0.34" },
@@ -1095,7 +1097,9 @@ requires-dist = [
     { name = "runpod-flash", marker = "extra == 'dev'" },
     { name = "runpod-flash", marker = "extra == 'server'" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
+    { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.6,<5.11" },
     { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.11" },
+    { name = "transformers", marker = "extra == 'server'", specifier = ">=5.6,<5.11" },
     { name = "trl", marker = "extra == 'gpu'", specifier = ">=1.6,<1.7" },
     { name = "uvicorn", marker = "extra == 'dev'" },
     { name = "uvicorn", marker = "extra == 'server'" },
@@ -1106,7 +1110,7 @@ provides-extras = ["gpu", "server", "dev"]
 [package.metadata.requires-dev]
 dev = [
     { name = "datasets", specifier = ">=2.19" },
-    { name = "freesolo", specifier = ">=0.2.49" },
+    { name = "freesolo", specifier = ">=0.2.52" },
     { name = "mypy", specifier = ">=1.13.0" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.6" },

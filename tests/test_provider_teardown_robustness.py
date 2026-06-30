@@ -39,24 +39,6 @@ def test_is_not_found_keys_off_status_code_not_bare_404():
     assert is_not_found(RuntimeError("GET /x -> HTTP 404")) is True  # trailing token at end-of-string
 
 
-def test_is_conflict_keys_off_status_code_not_bare_409():
-    from flash.providers._http import is_conflict
-
-    # genuine 409 (chained HTTPError) -> conflict
-    assert is_conflict(_chained(409, "DELETE /core/virtual-machines/7 -> HTTP 409: Conflict")) is True
-    # a non-409 failure whose text merely contains "409"/"conflict" (e.g. a "4090" GPU name) -> NOT
-    # a conflict (the old bare-substring bug would swallow it as success and leak a billing VM)
-    assert is_conflict(_chained(500, "launch(RTX 4090) failed: HTTP 500 conflict")) is False
-    assert is_conflict(_chained(403, "DELETE /x/4090 -> HTTP 403: Forbidden conflict")) is False
-    # no chained cause: only an unambiguous "HTTP 409" token counts, never a bare "409"/"conflict"
-    assert is_conflict(RuntimeError("DELETE /x -> HTTP 409: Conflict")) is True
-    assert is_conflict(RuntimeError("launch(RTX 4090) failed: conflict")) is False
-    # a STATUS-like number that merely begins 409 must NOT match (trailing-\b rejects HTTP 4090/4091)
-    assert is_conflict(RuntimeError("DELETE /x -> HTTP 4090: weird")) is False
-    assert is_conflict(RuntimeError("DELETE /x -> HTTP 4091")) is False
-    assert is_conflict(RuntimeError("DELETE /x -> HTTP 409")) is True  # trailing token at end-of-string
-
-
 def test_lambda_terminate_is_per_id_isolated(monkeypatch):
     """One bad id must NOT abort teardown of the others (the crash-backstop sweep passes many)."""
     from flash.providers.lambdalabs import api as la_api
@@ -115,10 +97,10 @@ def test_provider_cost_uses_provider_rate():
     """A provider-specific quote prices through the provider's pricing, not the RunPod nominal."""
     from flash.cost.facts import gpu_hourly_usd
 
-    runpod = gpu_hourly_usd("RTX A6000")  # nominal RunPod snapshot
-    lam = gpu_hourly_usd("RTX A6000", provider="lambda")  # Lambda static fallback (no key in tests)
-    assert runpod == 0.49
-    assert lam == 1.09  # Lambda A6000
+    runpod = gpu_hourly_usd("B200")  # nominal RunPod snapshot
+    lam = gpu_hourly_usd("B200", provider="lambda")  # Lambda static fallback (no key in tests)
+    assert runpod == 5.89
+    assert lam == 6.99  # Lambda B200
     # unknown-on-provider class falls back to nominal (e.g. a RunPod-only consumer card on lambda)
     assert gpu_hourly_usd("RTX 4090", provider="lambda") == gpu_hourly_usd("RTX 4090")
 

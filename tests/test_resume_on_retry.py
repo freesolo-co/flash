@@ -38,11 +38,19 @@ INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
 # 1. WORKER STREAM — make_checkpoint_upload_callback
 # ============================================================================================
 class _RecordingHfApi:
-    def __init__(self):
+    def __init__(self, files: list[str] | None = None):
         self.uploads: list[dict] = []
+        self.deleted: list[str] = []
+        self._files = files or []
 
     def upload_folder(self, **kwargs):
         self.uploads.append(kwargs)
+
+    def list_repo_files(self, repo_id, repo_type):
+        return self._files
+
+    def delete_folder(self, path_in_repo, repo_id, repo_type):
+        self.deleted.append(path_in_repo)
 
 
 class _SyncThread:
@@ -110,10 +118,16 @@ def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, mon
     """on_save streams the resume checkpoint to <prefix>/checkpoint/checkpoint-<N>, pruned latest-only.
 
     This is the upload a preempted run resumes FROM, so it must (a) keep the trainer state
-    (no ignore_patterns dropping optimizer.pt) and (b) prune older checkpoints in the same commit
-    (delete_patterns) so hf_resume_checkpoint never has to disambiguate stale state.
+    (no ignore_patterns dropping optimizer.pt) and (b) prune older checkpoint dirs AFTER the new one
+    lands so hf_resume_checkpoint never disambiguates (or re-downloads) stale state.
     """
-    rec = _RecordingHfApi()
+    prefix = "rl/flash-resume-1"
+    rec = _RecordingHfApi(
+        files=[
+            f"{prefix}/checkpoint/checkpoint-40/optimizer.pt",  # stale prior step
+            f"{prefix}/checkpoint/checkpoint-60/optimizer.pt",
+        ]
+    )
     worker = _prime_worker(monkeypatch, rec)
     _full_checkpoint(tmp_path, 60)
 
@@ -127,10 +141,12 @@ def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, mon
     streams = [u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoint/checkpoint-60")]
     assert len(streams) == 1, "the resumable full-state checkpoint must be streamed exactly once"
     up = streams[0]
-    assert up["path_in_repo"] == "rl/flash-resume-1/checkpoint/checkpoint-60"
+    assert up["path_in_repo"] == f"{prefix}/checkpoint/checkpoint-60"
     assert up["repo_type"] == "dataset"
-    # Latest-only: the prior checkpoint is pruned in the SAME commit so resume sees just one.
-    assert up["delete_patterns"] == ["rl/flash-resume-1/checkpoint/**"]
+    # delete_patterns is matched RELATIVE to path_in_repo (the step dir) so it can't reach sibling step
+    # dirs; the callback prunes them explicitly, AFTER the new one lands (latest-only).
+    assert "delete_patterns" not in up
+    assert rec.deleted == [f"{prefix}/checkpoint/checkpoint-40"]
     # FULL state: this upload must NOT strip optimizer/RNG — that's what makes the resume true
     # (Adam moments + LR schedule + RNG continue) rather than re-initializing the optimizer.
     assert "ignore_patterns" not in up
@@ -269,7 +285,7 @@ def test_hf_resume_checkpoint_swallows_download_error(monkeypatch, resume_run_id
 # 3. CONTROL PLANE — _submit_seed_supervised relaunches the same run on infra-shaped failure
 # ============================================================================================
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
-    gpu = {"type": "RTX A6000", "max_retries": 2}
+    gpu = {"type": "RTX 4090", "max_retries": 2}
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
         {
@@ -285,11 +301,11 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
 def _alloc():
     from flash.providers.base import Allocation, Candidate
 
-    candidates = (Candidate("runpod", "RTX A6000", 0.49, 48),)
+    candidates = (Candidate("runpod", "RTX 4090", 0.69, 24),)
     return Allocation(
         provider="runpod",
-        gpu="RTX A6000",
-        hourly_usd=0.49,
+        gpu="RTX 4090",
+        hourly_usd=0.69,
         min_vram_gb=12,
         candidates=candidates,
     )

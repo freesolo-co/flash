@@ -1,6 +1,7 @@
 """Cost accounting + the standard run-metrics record for Flash runs.
 
-GPU cost = gpu_hours * hourly_rate (per-second billing on RunPod; artifacts go via HF).
+Customer GPU cost = training-loop GPU hours * hourly_rate; setup/cold-start time is reported
+separately for observability.
 """
 
 from __future__ import annotations
@@ -13,17 +14,16 @@ from dataclasses import asdict, dataclass, field
 class RunMetrics:
     """Standard metrics record written per phase."""
 
-    arm: str = "runpod"  # compute substrate
+    arm: str = "runpod"
     phase: str = ""  # "sft" | "rl"
     seed: int = 0
     model_id: str = ""
-    wall_seconds: float = 0.0
+    wall_seconds: float = 0.0  # training-loop wall time used for customer cost
     setup_seconds: float = 0.0  # cold start / provisioning + model load
     train_throughput_toks_per_s: float = 0.0
     train_tokens: int = 0
     generated_tokens: int = 0  # RL: total sampled completion tokens
-    # Misc / friction. cost_usd is computed/stamped downstream by the runner from the
-    # provider's $/hr (see runner._persist_metrics), not by the worker.
+    # cost_usd is stamped by runner._persist_metrics, not the worker.
     notes: dict = field(default_factory=dict)
 
     def to_json(self) -> str:

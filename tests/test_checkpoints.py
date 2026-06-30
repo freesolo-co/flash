@@ -35,11 +35,19 @@ def _spec() -> JobSpec:
 # Worker: publish_deployable_checkpoint
 # --------------------------------------------------------------------------------------------
 class _RecordingHfApi:
-    def __init__(self):
+    def __init__(self, files: list[str] | None = None):
         self.uploads: list[dict] = []
+        self.deleted: list[str] = []
+        self._files = files or []
 
     def upload_folder(self, **kwargs):
         self.uploads.append(kwargs)
+
+    def list_repo_files(self, repo_id, repo_type):
+        return self._files
+
+    def delete_folder(self, path_in_repo, repo_id, repo_type):
+        self.deleted.append(path_in_repo)
 
 
 def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", phase="rl", run="flash-ckpt-1"):
@@ -284,6 +292,43 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
         "rl/flash-ckpt-1/checkpoints/step-4/adapter",  # deployable first
         "rl/flash-ckpt-1/checkpoint/checkpoint-4",  # resume second
     ]
+
+
+def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
+    """The streamed resume checkpoint is latest-only, but upload_folder's delete_patterns can't reach
+    sibling step dirs (they're matched relative to the per-step path_in_repo), so older checkpoint-N
+    dirs are pruned explicitly. The plural deployable tree (checkpoints/) must be left intact."""
+    import flash.engine.worker.hf as worker_hf
+
+    prefix = "rl/flash-ckpt-1"
+    files = [
+        f"{prefix}/checkpoint/checkpoint-20/optimizer.pt",
+        f"{prefix}/checkpoint/checkpoint-20/adapter_model.safetensors",
+        f"{prefix}/checkpoint/checkpoint-40/optimizer.pt",
+        f"{prefix}/checkpoint/checkpoint-60/optimizer.pt",
+        f"{prefix}/checkpoints/step-60/adapter/adapter_model.safetensors",  # deployable (plural) -> keep
+        f"{prefix}/metrics.json",
+    ]
+    rec = _RecordingHfApi(files)
+    _prime_worker(monkeypatch, rec)
+
+    worker_hf._prune_stale_resume_checkpoints(60)
+
+    assert sorted(rec.deleted) == [
+        f"{prefix}/checkpoint/checkpoint-20",
+        f"{prefix}/checkpoint/checkpoint-40",
+    ]
+    assert f"{prefix}/checkpoint/checkpoint-60" not in rec.deleted  # latest kept
+    assert all("checkpoints/" not in d for d in rec.deleted)  # deployable tree untouched
+
+
+def test_prune_stale_resume_checkpoints_no_repo_is_noop(monkeypatch):
+    import flash.engine.worker.hf as worker_hf
+
+    rec = _RecordingHfApi(["rl/r/checkpoint/checkpoint-1/optimizer.pt"])
+    _prime_worker(monkeypatch, rec, repo="")  # local run, no HF repo
+    worker_hf._prune_stale_resume_checkpoints(5)
+    assert rec.deleted == []
 
 
 def test_on_save_skips_deployable_when_vl_recombine_fails(tmp_path, monkeypatch, fake_trainer_callback):

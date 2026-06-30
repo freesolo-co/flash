@@ -161,23 +161,23 @@ def test_allocator_picks_runpod_candidate(monkeypatch):
 
     a = allocate("Qwen/Qwen3.5-0.8B", "sft")
     assert a.provider == "runpod"
-    assert a.gpu == "RTX A6000"
+    assert a.gpu == "RTX 4090"
 
 
 def test_allocation_summary_formats_runpod_choice(monkeypatch):
     from flash.providers.allocator import allocation_summary
     from flash.providers.base import Allocation, Candidate
 
-    cand = Candidate("runpod", "RTX A6000", 0.49, 48)
+    cand = Candidate("runpod", "RTX 4090", 0.69, 24)
     alloc = Allocation(
         provider="runpod",
-        gpu="RTX A6000",
-        hourly_usd=0.49,
-        min_vram_gb=48,
+        gpu="RTX 4090",
+        hourly_usd=0.69,
+        min_vram_gb=24,
         candidates=(cand,),
     )
     out = allocation_summary(alloc)
-    assert "RTX A6000 on runpod" in out
+    assert "RTX 4090 on runpod" in out
 
 
 def test_jobhandle_roundtrip_tags_provider():

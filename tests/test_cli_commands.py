@@ -209,6 +209,9 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert _run(["gpus"]) == 0
     out = capsys.readouterr().out
     assert "GPU class selection is fully automatic" in out
+    assert "cheapest validated managed class" in out
+    assert "runpod" not in out.lower()
+    assert "lambda" not in out.lower()
     assert "You can still tune" not in out
     assert "[gpu] config table" not in out
 
@@ -286,13 +289,6 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     assert err.endswith("\r")
 
 
-@pytest.mark.parametrize("removed", ["cost", "attach", "logs"])
-def test_legacy_run_commands_removed(fake_client, removed) -> None:
-    with pytest.raises(SystemExit) as excinfo:
-        _run([removed, "flash-1"])
-    assert excinfo.value.code == 2
-
-
 def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["cancel", "flash-1"]) == 0
     assert ("cancel", "flash-1") in fake_client.calls
@@ -313,6 +309,13 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat_stream"
 
 
+@pytest.mark.parametrize("flag", ["--enable-thinking", "--disable-thinking"])
+def test_chat_does_not_expose_thinking_override_flags(fake_client, flag) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        _run(["chat", "flash-1", "-m", "What is 6*7?", flag])
+    assert excinfo.value.code == 2
+
+
 def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
 
@@ -329,13 +332,28 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert not (tmp_path / "configs/endpoints.toml").exists()
     assert 'algorithm = "grpo"' in grpo.read_text()
     assert "steps = 150" in grpo.read_text()
+    assert "cheapest fitting managed class" in grpo.read_text()
+    assert "private environment-scoped repo" in grpo.read_text()
     assert 'algorithm = "sft"' in sft.read_text()
     assert "epochs = 1" in sft.read_text()
+    assert "cheapest fitting managed class" in sft.read_text()
+    assert "private environment-scoped repo" in sft.read_text()
     training = tmp_path / "TRAINING.md"
     assert training.is_file()
     training_text = training.read_text(encoding="utf-8")
     assert "how to actually improve a model with Flash" in training_text
     assert "## Using Flash" in training_text  # end-to-end library usage, not just conventions
+    assert "## Common Flash issues and mitigations" in training_text
+    assert "Trying to pin managed infrastructure" in training_text
+    assert "response_text.thinking" in training_text
+    assert "flash env pull your-org/my-env" in training_text
+    assert "private environment-scoped repo" in training_text
+    assert "flash checkpoints <run-id>" in training_text
+    assert "flash deployments" in training_text
+    assert "flash export --adapter-id <run-id> --repository <you>/<repo>" in training_text
+    assert "HF_TOKEN" in training_text
+    assert "runpod" not in training_text.lower()
+    assert "lambda" not in training_text.lower()
     out = capsys.readouterr().out
     assert "datasets/train.jsonl" in out
     assert "configs/rl.toml" in out
@@ -363,7 +381,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
         model="Qwen/Qwen3.5-0.8B",
         environment=EnvironmentSpec(id="owner/env"),
     )
-    assert spec_payload(spec)["environment"]["pip"] == ["freesolo"]
+    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.52"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(

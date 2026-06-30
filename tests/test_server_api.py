@@ -55,6 +55,7 @@ def _identity_for_token(token: str) -> dict[str, str]:
         "email": f"user-{suffix}@example.com",
         "key_prefix": "fslo_test",
         "org_id": f"org-{suffix}",
+        "org_slug": f"org-{suffix}",
     }
 
 
@@ -104,7 +105,9 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
     # ...and that same key makes create_app() startup run the RunPod slot-store reconcile
     # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
-    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
+    )
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
@@ -121,6 +124,7 @@ def test_me(api):
     # A verified freesolo user key resolves to the Freesolo identity returned by verify.
     assert me.json()["email"] == f"user-{key.removeprefix(_USER_PREFIX)}@example.com"
     assert me.json()["key_prefix"] == "fslo_test"
+    assert me.json()["org_slug"] == f"org-{key.removeprefix(_USER_PREFIX)}"
 
 
 def test_requests_without_key_are_rejected(api):
@@ -178,7 +182,7 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
         auth_mod,
         "_cached_identity",
         lambda token: (
-            {"email": "user-good@example.com", "key_prefix": "fslo_good"}
+            {"email": "user-good@example.com", "key_prefix": "fslo_good", "org_slug": "acme"}
             if token == "fslo-user-good"
             else {}
         ),
@@ -194,16 +198,37 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
     assert again["id"] == row["id"]
 
 
-def test_freesolo_user_key_without_email_is_rejected(api, monkeypatch):
-    # A verified external key must include an email identity. Do not fall back to
+def test_freesolo_user_key_without_org_slug_is_rejected(api, monkeypatch):
+    # A verified external key must include an org slug. Do not fall back to email or
     # token-derived namespaces for env publishing.
     import flash.server.auth as auth_mod
 
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
-    monkeypatch.setattr(auth_mod, "_cached_identity", lambda token: {"key_prefix": "fslo_noemail"})
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {"email": "user@example.com", "key_prefix": "fslo_noorg"},
+    )
 
-    assert auth_mod.authenticate("Bearer fslo-no-email") is None
+    assert auth_mod.authenticate("Bearer fslo-no-org") is None
+
+
+def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkeypatch):
+    import flash.server.auth as auth_mod
+
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {"key_prefix": "fslo_noemail", "org_slug": "acme", "org_id": "org-acme"},
+    )
+
+    row = auth_mod.authenticate("Bearer fslo-no-email")
+    assert row is not None
+    assert row["org_slug"] == "acme"
+    assert not row.get("email")
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
@@ -219,7 +244,11 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     monkeypatch.setattr(
         auth_mod,
         "_cached_identity",
-        lambda token: {"email": "revoked@example.com", "key_prefix": "fslo_revoked"},
+        lambda token: {
+            "email": "revoked@example.com",
+            "key_prefix": "fslo_revoked",
+            "org_slug": "acme",
+        },
     )
 
     assert auth_mod.authenticate("Bearer fslo-revoked") is not None  # provisioned on first use
@@ -345,7 +374,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # Negative (401) -> cached with the SHORT negative TTL.
     now = time.time()
     assert auth_mod._freesolo_verify("neg") is False
-    neg_exp = auth_mod._verify_cache["neg"][1]
+    neg_exp = auth_mod._verify_cache["neg"][2]
     assert neg_exp <= now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
     # ...and definitely shorter than the long TTL.
     assert neg_exp < now + auth_mod._VERIFY_CACHE_TTL_S
@@ -355,7 +384,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     state["code"] = 200
     now = time.time()
     assert auth_mod._freesolo_verify("pos") is True
-    pos_exp = auth_mod._verify_cache["pos"][1]
+    pos_exp = auth_mod._verify_cache["pos"][2]
     assert pos_exp > now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
     assert pos_exp <= now + auth_mod._VERIFY_CACHE_TTL_S + 1
 
@@ -364,11 +393,11 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # expired while a same-age positive would still be live.
     auth_mod._verify_cache.clear()
     base = time.time()
-    auth_mod._verify_cache["neg"] = (False, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
-    auth_mod._verify_cache["pos"] = (True, base + auth_mod._VERIFY_CACHE_TTL_S)
+    auth_mod._verify_cache["neg"] = (False, {}, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
+    auth_mod._verify_cache["pos"] = (True, {}, base + auth_mod._VERIFY_CACHE_TTL_S)
     later = base + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1.0  # past neg TTL, well under pos TTL
-    assert auth_mod._verify_cache["neg"][1] <= later  # negative entry has expired
-    assert auth_mod._verify_cache["pos"][1] > later  # positive entry is still live
+    assert auth_mod._verify_cache["neg"][2] <= later  # negative entry has expired
+    assert auth_mod._verify_cache["pos"][2] > later  # positive entry is still live
 
 
 def test_freesolo_verify_rejects_oversized_token(monkeypatch):
@@ -425,7 +454,9 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
             status = 200
 
             def read(self):
-                return b'{"email":"cached@example.com","key_prefix":"fslo_cached"}'
+                return (
+                    b'{"email":"cached@example.com","key_prefix":"fslo_cached","org_slug":"acme"}'
+                )
 
             def __enter__(self):
                 return self
@@ -466,7 +497,7 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
 
     # An already-expired entry must be removed on the next write (no longer reachable).
-    auth_mod._verify_cache["stale"] = (True, time.time() - 1)
+    auth_mod._verify_cache["stale"] = (True, {}, time.time() - 1)
     auth_mod._freesolo_verify("fresh-token")
     assert "stale" not in auth_mod._verify_cache
     assert "fresh-token" in auth_mod._verify_cache
@@ -620,6 +651,137 @@ def test_worker_output_route(api, monkeypatch):
     # Another user can't read it (same ownership gate as /logs).
     other = _login()
     assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
+
+
+def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
+    """The logs fetcher resolves the newest attempt-scoped error file, so a retried-then-failed run
+    surfaces the FINAL attempt's traceback, not attempt0's stale one."""
+    import huggingface_hub
+
+    from flash.server._runtime import _latest_error_artifact_name
+
+    prefix = "sft/run-1/seed0"
+    listed = [
+        f"{prefix}/console_sft.txt",
+        f"{prefix}/error_sft_attempt0.txt",
+        f"{prefix}/error_sft_attempt2.txt",
+        f"{prefix}/error_sft_attempt1.txt",
+        f"{prefix}/heartbeat.json",
+        "other/run/error_sft_attempt9.txt",  # different prefix -> ignored
+    ]
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return listed
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    assert _latest_error_artifact_name("org/repo", prefix, "sft") == "error_sft_attempt2.txt"
+
+
+def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
+    """If the repo can't be listed, fall back to attempt0 rather than failing the logs fetch."""
+    import huggingface_hub
+
+    from flash.server._runtime import _latest_error_artifact_name
+
+    class _BoomApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            raise RuntimeError("HF down")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _BoomApi)
+    assert _latest_error_artifact_name("org/repo", "rl/r/seed0", "rl") == "error_rl_attempt0.txt"
+
+
+def test_worker_artifacts_fetches_console_and_latest_attempt_error(monkeypatch, tmp_path):
+    """The fetcher pulls the worker console plus the NEWEST attempt-scoped error file
+    (error_<phase>_attempt<N>.txt) — on a retried run only the highest attempt is the real crash."""
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "rl/r1/console_rl.txt": "worker console\n",
+        "rl/r1/error_rl_attempt0.txt": "stale first-attempt traceback\n",
+        "rl/r1/error_rl_attempt1.txt": "TRACEBACK latest\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert out["console_rl.txt"] == "worker console\n"
+    # The newest attempt's traceback surfaces; the superseded attempt0 is not fetched.
+    assert out["error_rl_attempt1.txt"] == "TRACEBACK latest\n"
+    assert "error_rl_attempt0.txt" not in out
+
+
+def test_worker_artifacts_prefers_latest_attempt_console(monkeypatch, tmp_path):
+    """When console output is attempt-scoped, /worker should show the current attempt's tail."""
+    import types
+
+    import huggingface_hub
+
+    from flash.server._runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "rl/r1/console_rl_attempt0.txt": "stale console\n",
+        "rl/r1/console_rl_attempt2.txt": "current console\n",
+        "rl/r1/error_rl_attempt2.txt": "current traceback\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        p = tmp_path / filename.replace("/", "_")
+        p.write_text(content[filename])
+        return str(p)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    assert out["console_rl_attempt2.txt"] == "current console\n"
+    assert out["error_rl_attempt2.txt"] == "current traceback\n"
+    assert "console_rl_attempt0.txt" not in out
 
 
 def test_local_env_path_rejected(api):
@@ -826,6 +988,118 @@ def test_chat_streams_deployed_run(api, monkeypatch):
     assert seen["messages"] == [{"role": "user", "content": "hello"}]
 
 
+def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "thinking": True}, "dry_run": True},
+        headers=_bearer(key),
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "enable_thinking": False,
+        },
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["thinking"] is True
+    assert "enable_thinking" not in seen
+
+
+def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkeypatch):
+    """A run cancelled mid-RL can deploy a per-step checkpoint (stays `cancelled`, listed active by
+    /v1/deployments). The chat route must SERVE that live adapter, not 409 on the cancelled state."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "cancelled"  # cancelled, but with a live checkpoint deployment
+    status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+    runner._save_status(status)
+
+    monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi", " there"]))
+    with api.stream(
+        "POST",
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    ) as resp:
+        text = resp.read().decode()
+    assert resp.status_code == 200, text
+    assert text == "hi there"
+
+
+def test_chat_cancelled_run_without_deployment_is_409(api):
+    """A cancelled run with no active deployment still 409s, pointing the user at `flash deploy`."""
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "cancelled"
+    runner._save_status(status)
+
+    r = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers=_bearer(key),
+    )
+    assert r.status_code == 409
+    assert "deploy a checkpoint" in r.json()["detail"]
+
+
+def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
+    """JSON `1e400`/`Infinity` parses to float('inf'); `int(inf)` raises OverflowError (an
+    ArithmeticError, NOT TypeError/ValueError) which used to escape the guard -> 500. A non-finite
+    max_tokens or temperature must be a clean 400, per the route's own bad-values-are-400 contract."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+    monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi"]))
+
+    headers = {**_bearer(key), "content-type": "application/json"}
+    for body in (
+        b'{"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1e400}',
+        b'{"messages": [{"role": "user", "content": "hi"}], "temperature": 1e400}',
+    ):
+        r = api.post(f"/v1/runs/{run_id}/chat", content=body, headers=headers)
+        assert r.status_code == 400, (body, r.status_code, r.text)
+
+
 def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     """An undeploy that hits a serving-backend failure surfaces as a clean 502 (same as deploy),
     not an unhandled 500: ServingError from undeploy_adapter is translated to HTTPException(502)."""
@@ -902,6 +1176,20 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     out = runner.mark_deployed("dep-3", {"endpoint_name": "e2"}, expect_state="deployed")
     assert out.state == "done"
     assert out.deployment["state"] == "undeployed"  # not re-advertised
+
+
+def test_mark_checkpoint_deployed_refuses_dry_run(monkeypatch, tmp_path):
+    import flash.runner as runner
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-dry"}
+    runner._save_status(runner.RunStatus(run_id="dep-dry", state="dry_run", spec=spec, remote=None))
+    out = runner.mark_checkpoint_deployed("dep-dry", {"endpoint_name": "e"})
+    assert out.state == "dry_run"
+    assert out.deployment is None
 
 
 def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monkeypatch, tmp_path):
@@ -1498,15 +1786,17 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
             tar.addfile(info, io.BytesIO(content))
     pkg = base64.b64encode(buf.getvalue()).decode()
 
+    key = _login()
+    expected_root = f"org-{key.removeprefix(_USER_PREFIX)}/myenv"
     resp = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(key),
         json={"name": "MyEnv", "package_b64": pkg},
     )
     assert resp.status_code == 200
     ref = resp.json()["id"]
-    assert ref.endswith("/myenv")
-    assert any(root.endswith("/myenv") for root in published_roots)
+    assert ref == expected_root
+    assert expected_root in published_roots
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
@@ -1547,6 +1837,7 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert seen["name"] == "e"
     assert seen["package_b64"] == pkg
+    assert seen["key"]["org_slug"].startswith("org-")
     assert "is_new" not in seen
 
 
@@ -1564,16 +1855,104 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     assert "must be a base64 string" in r2.text.lower()
 
 
+def test_delete_env_endpoint_removes_package(api, monkeypatch):
+    """DELETE /v1/envs/{id} removes the package and reports it deleted."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    seen: dict = {}
+
+    def fake_delete_package(*, slug, key):
+        seen.update(slug=slug, key=key)
+        return True
+
+    monkeypatch.setattr(envs_mod, "delete_package", fake_delete_package)
+    recorded: dict = {}
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda *, slug, key, org_id=None: recorded.update(slug=slug, org_id=org_id) or True,
+    )
+
+    resp = api.delete(
+        "/v1/envs/acme/my-env",
+        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-acme"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"id": "acme/my-env", "deleted": True}
+    assert seen["slug"] == "acme/my-env"
+    assert recorded["slug"] == "acme/my-env"
+    # the caller-supplied org (web UI delete) reaches the metadata-mirror drop.
+    assert recorded["org_id"] == "org-acme"
+
+    # Unauthenticated requests are rejected.
+    assert api.delete("/v1/envs/acme/my-env").status_code in (401, 403)
+
+
+def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
+    """A namespace-authorization EnvPublishError surfaces as its HTTP status (403)."""
+    import flash.server.envs as envs_mod
+
+    def fake_delete_package(*, slug, key):
+        raise envs_mod.EnvPublishError("not your namespace", status=403)
+
+    monkeypatch.setattr(envs_mod, "delete_package", fake_delete_package)
+    resp = api.delete("/v1/envs/someone-else/env", headers=_bearer(_login()))
+    assert resp.status_code == 403, resp.text
+
+
+def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
+    """A failing metadata-mirror delete must not turn a successful delete into a 500."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(envs_mod, "delete_package", lambda *, slug, key: True)
+
+    def boom(*, slug, key, org_id=None):
+        raise RuntimeError("backend down")
+
+    monkeypatch.setattr(environment_registry, "record_deleted_environment", boom)
+    resp = api.delete("/v1/envs/acme/my-env", headers=_bearer(_login()))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] is True
+
+
+def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
+    """A non-canonical id (uppercase / trailing slash) is rejected 400 before any storage call."""
+    import flash.server.envs as envs_mod
+    from flash.server import environment_registry
+
+    monkeypatch.setattr(
+        envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
+    )
+    monkeypatch.setattr(
+        environment_registry,
+        "record_deleted_environment",
+        lambda **_k: pytest.fail("mirror must not be touched"),
+    )
+    for bad in ("Acme/My-Env", "acme/my-env/"):
+        resp = api.delete(f"/v1/envs/{bad}", headers=_bearer(_login()))
+        assert resp.status_code == 400, resp.text
+
+
 # --------------------------------------------------------------------------------------------
 # Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
 # --------------------------------------------------------------------------------------------
 _FAKE_CKPTS = [
-    {"step": 40, "adapter_prefix": "rl/X/checkpoints/step-40",
-     "subfolder": "rl/X/checkpoints/step-40/adapter",
-     "repo_id": "org/test-runs", "repo_type": "dataset"},
-    {"step": 80, "adapter_prefix": "rl/X/checkpoints/step-80",
-     "subfolder": "rl/X/checkpoints/step-80/adapter",
-     "repo_id": "org/test-runs", "repo_type": "dataset"},
+    {
+        "step": 40,
+        "adapter_prefix": "rl/X/checkpoints/step-40",
+        "subfolder": "rl/X/checkpoints/step-40/adapter",
+        "repo_id": "org/test-runs",
+        "repo_type": "dataset",
+    },
+    {
+        "step": 80,
+        "adapter_prefix": "rl/X/checkpoints/step-80",
+        "subfolder": "rl/X/checkpoints/step-80/adapter",
+        "repo_id": "org/test-runs",
+        "repo_type": "dataset",
+    },
 ]
 
 
@@ -1582,7 +1961,11 @@ class _FakeDeployment:
         self.adapter_prefix = adapter_prefix
 
     def to_dict(self):
-        return {"state": "ready", "run_id": "X", "adapter_hf_prefix": f"{self.adapter_prefix}/adapter"}
+        return {
+            "state": "ready",
+            "run_id": "X",
+            "adapter_hf_prefix": f"{self.adapter_prefix}/adapter",
+        }
 
 
 def _make_run(api, key, state):
@@ -1639,9 +2022,7 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    monkeypatch.setattr(
-        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
-    )
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
 
     key = _login()
     run_id = _make_run(api, key, "cancelled")
@@ -1653,6 +2034,140 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
     # ...but the serving deployment is recorded and listed as active.
     deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
     assert any(d["run_id"] == run_id for d in deployments)
+
+
+@pytest.mark.parametrize("state", ["queued", "provisioning", "running", "failed"])
+def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, state):
+    """A resolved checkpoint step proves the adapter exists, so run state does not gate serving it."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
+
+    key = _login()
+    run_id = _make_run(api, key, state)
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert r.json()["checkpoint_step"] == 40
+    status = runner.get_status(run_id)
+    assert status.state == state
+    assert status.deployment["checkpoint_step"] == 40
+    deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
+    assert any(d["run_id"] == run_id and d["state"] == state for d in deployments)
+
+
+def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "running")
+
+    def fake_deploy(**kwargs):
+        status = runner.get_status(run_id)
+        status.state = "done"
+        runner._save_status(status)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    status = runner.get_status(run_id)
+    assert status.state == "deployed"
+    assert status.deployment["checkpoint_step"] == 40
+
+
+def test_deploy_checkpoint_rolls_back_if_final_deploy_wins_cas(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    rollbacks = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+
+    def fake_deploy(**kwargs):
+        runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "final"})
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 409, r.text
+    assert rollbacks == [run_id]
+    status = runner.get_status(run_id)
+    assert status.state == "deployed"
+    assert status.deployment == {"state": "ready", "endpoint_name": "final"}
+
+
+def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_k: pytest.fail("dry-run run must not touch serving"),
+    )
+
+    key = _login()
+    run_id = _make_run(api, key, "dry_run")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 409, r.text
+    assert "dry-run runs cannot be deployed" in r.json()["detail"]
+
+
+def test_deploy_checkpoint_preserves_finished_run_undeploy_cas(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    rollbacks = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    status = runner.get_status(run_id)
+    status.deployment = {"state": "ready", "endpoint_name": "old"}
+    runner._save_status(status)
+
+    def fake_deploy(**kwargs):
+        runner.mark_undeployed(run_id)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 409, r.text
+    assert rollbacks == [run_id]
+    status = runner.get_status(run_id)
+    assert status.state == "done"
+    assert status.deployment["state"] == "undeployed"
+
+
+def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: [run_id])
+
+    key = _login()
+    run_id = _make_run(api, key, "running")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+
+    r = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    status = runner.get_status(run_id)
+    assert status.state == "running"
+    assert status.deployment["state"] == "undeployed"
 
 
 def test_deploy_cancelled_run_without_step_is_409(api):
@@ -1675,13 +2190,14 @@ def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
 
 
 def test_deploy_rejects_non_integer_step(api, monkeypatch):
-    """A bool (True->1) or non-integer step must be rejected, not silently coerced."""
+    """A bool (True->1) or non-integer step must be rejected, not silently coerced. An all-digit string
+    over Python's 4300-digit int()-conversion limit must also be a clean 400, not int()->uncaught 500."""
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
     run_id = _make_run(api, key, "done")
-    for bad in (True, 40.9, "40.9"):
+    for bad in (True, 40.9, "40.9", "1" * 5000):
         r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": bad}, headers=_bearer(key))
         assert r.status_code == 400, f"{bad!r} -> {r.status_code} {r.text}"
 
@@ -1695,7 +2211,7 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
         "record_environment_use",
         lambda **kwargs: calls.append(kwargs) or True,
     )
-    spec = {**SPEC, "environment": {"id": "dev-clado-ai/my-env"}}
+    spec = {**SPEC, "environment": {"id": "acme/my-env"}}
     key = _login()
 
     resp = api.post(
@@ -1706,7 +2222,7 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
 
     assert resp.status_code == 200, resp.text
     assert calls
-    assert calls[0]["slug"] == "dev-clado-ai/my-env"
+    assert calls[0]["slug"] == "acme/my-env"
     assert calls[0]["run_id"] == resp.json()["run_id"]
     assert calls[0]["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
 
@@ -1790,6 +2306,57 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     assert seen["dest_repo"] == "me/adapters"
     assert seen["dest_token"] == "hf_user"
     assert seen["private"] is True  # private by default
+    assert seen["base_model"] == SPEC["model"]
+
+
+def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
+    """The /export handler must take the per-run deploy lock FROM THE VERY TOP — before even the
+    payload-shape validation — and keep it across owned_run/the artifact read (mirroring /deploy,
+    which locks first). Taking the lock after body validation leaves a window for another deploy,
+    undeploy, or export operation to interleave with the request. Assert the lock is already held during
+    the payload validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run
+    runs."""
+    import flash.server.app as app_mod
+    from flash.server.routes import serving as serving_routes
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    real_owned_run = serving_routes.owned_run
+    real_validate = serving_routes._validate_hf_repo_id
+    seen: dict = {}
+
+    def checking_validate(repository):
+        # The payload validation runs BEFORE owned_run; assert it too is inside the lock.
+        lk = app_mod._deploy_lock(run_id)
+        acquired = lk.acquire(blocking=False)
+        seen["locked_during_validation"] = not acquired
+        if acquired:
+            lk.release()
+        return real_validate(repository)
+
+    def checking_owned_run(rid, k):
+        # A non-blocking acquire from outside must FAIL (lock already held by the handler) — proving
+        # the handler is INSIDE the `with _deploy_lock(...)` block by the time owned_run runs.
+        lk = app_mod._deploy_lock(rid)
+        acquired = lk.acquire(blocking=False)
+        seen["locked_during_owned_run"] = not acquired
+        if acquired:
+            lk.release()
+        return real_owned_run(rid, k)
+
+    monkeypatch.setattr(serving_routes, "_validate_hf_repo_id", checking_validate)
+    monkeypatch.setattr(serving_routes, "owned_run", checking_owned_run)
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/a")
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["locked_during_validation"] is True
+    assert seen["locked_during_owned_run"] is True
 
 
 def test_export_public_flag_sets_private_false(api, monkeypatch):
@@ -1957,6 +2524,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     assert ok.status_code == 200, ok.text
     assert ok.json()["step"] == 40
     assert seen["source_subfolder"] == f"rl/{run_id}/checkpoints/step-40/adapter"
+    assert seen["base_model"] == SPEC["model"]
 
     bad = api.post(
         f"/v1/runs/{run_id}/export",

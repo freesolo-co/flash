@@ -11,25 +11,34 @@ ALGORITHMS = ("sft", "grpo")
 
 def normalize_algorithm(value: str) -> str:
     """Canonical (lowercased, validated) algorithm name."""
-    value = (value or "grpo").lower()
+    if not value:
+        value = "grpo"
+    elif not isinstance(value, str):
+        # A truthy non-string (e.g. a JSON number/bool/array) would AttributeError on .lower(), which
+        # escapes the callers' ValueError/ConfigError guards -> uncaught 500. Raise ValueError instead.
+        raise ValueError(f"algorithm must be a string, got {type(value).__name__}")
+    value = value.lower()
     if value not in ALGORITHMS:
         raise ValueError(f"unsupported algorithm: {value}; known: {', '.join(ALGORITHMS)}")
     return value
 
 
-# The default GPU class used as the open-model-policy
-# sizing reference and the spec/from_dict fallback). The managed GPU class set (KNOWN)
-# lives in providers.base; RunPod pricing lives under providers/runpod. Defined above
-# ModelInfo so it can back the recommended_gpu field default.
 DEFAULT_GPU = "RTX 5090"
 
-# Output vocab (== config.vocab_size, the lm_head / logits width — the PADDED model vocab,
-# NOT the raw tokenizer token count). Sizes the GRPO fp32-logits VRAM term (engine.vram) and
-# the per-device completion cap (engine.worker.rl_per_device_comps). This is the open-model
-# fallback; curated per-model values live on each ModelInfo below and are read via
-# vocab_size_for(). Over-estimating is the memory-SAFE direction (smaller cap, larger VRAM
-# estimate), so the fallback is the largest catalog vocab.
+# Over-estimating is memory-safe (larger VRAM estimate, smaller cap); fallback = largest catalog vocab.
 _DEFAULT_VOCAB_SIZE = 248_320
+
+
+@dataclass(frozen=True)
+class ServingCapacity:
+    gpu: str
+    max_loras: int
+    max_lora_rank: int
+    max_model_len: int
+    serve_model_id: str = ""
+    max_num_seqs: int = 0
+    max_num_batched_tokens: int = 0
+    gpu_memory_utilization: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -49,48 +58,59 @@ class ModelInfo:
     params_b: float
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
-    # GRPO needs more VRAM than SFT (a colocated vLLM rollout engine holds a second copy of
-    # the weights + KV cache). 0 => GRPO uses ``min_vram_gb`` like SFT; set it when the GRPO
-    # tier needs a bigger card than SFT (the colocate 2nd weight copy + KV pool). Consumed by
-    # engine.vram.model_required_vram_gb.
+    # 0 => GRPO uses min_vram_gb like SFT; set when colocated vLLM rollout needs a bigger card.
     grpo_min_vram_gb: int = 0
-    # SFT hard VRAM floor (GB). 0 => SFT sizes purely from the param-based estimate and is free to
-    # down-route to a smaller validated card (the default — e.g. a 4B SFT estimates ~17 GB and rents
-    # a 48 GB card, NOT its ``min_vram_gb`` reference). Set it ONLY when a curated model must not be
-    # placed on the cheapest card the estimate would otherwise allow — e.g. a very large checkpoint
-    # whose ~param-est margin over the frozen-weights floor is too thin on the next card down.
-    # Consumed by engine.vram.model_required_vram_gb (the SFT analog of ``grpo_min_vram_gb``).
+    # 0 => SFT sizes from param-based estimate; set only when a model must not down-route to the cheapest card.
     sft_min_vram_gb: int = 0
+    # vLLM sleep mode (offload the colocate rollout engine between GRPO steps) is NON-FUNCTIONAL for
+    # this model: the wake/reload HANGS the rollout (a ~70 GB weight reallocation can't be placed in
+    # the fragmented non-expandable allocator sleep forces -- live-confirmed on the 35B-A3B, every
+    # attempt stalled). So this model is RESIDENT-ONLY: a config that doesn't fit resident must be
+    # REJECTED (model_required_vram_gb sizes it on the resident peak) rather than routed to the hanging
+    # sleep path. grpo_sleep_mode raises for it instead of ever returning True. Dense/small models that
+    # sleep cleanly leave this False.
+    sleep_unsupported: bool = False
     notes: str = ""
-    # Worker container disk this model needs (GB). 0 = the platform default (64 GB)
-    # suffices. The runner raises gpu.disk_gb to at least this, so big-checkpoint
-    # models whose weights alone exceed 64 GB work out of the box.
+    # 0 = platform default (64 GB) suffices. Runner raises gpu.disk_gb to at least this.
     min_disk_gb: int = 0
-    # Thinking/reasoning capability of the checkpoint's chat template:
-    #   "none"    no <think> support (or a non-thinking variant) — `thinking = true` is
-    #             rejected for these models
-    #   "hybrid"  template honors enable_thinking (Qwen3-style hybrid reasoning)
-    #   "always"  the model always emits reasoning; enable_thinking can't turn it off,
-    #             so `thinking = true` is required
-    #   "unknown" open-model-policy entries (capability not verified)
+    # Deployment capacity of the external freesolo multi-LoRA serving app. This is separate from
+    # Flash's training GPU recommendation above; serving uses Modal/vLLM and sizes hot LoRA buffers
+    # by max_loras x max_lora_rank at engine init.
+    serving: ServingCapacity | None = None
+    # "none" / "hybrid" (Qwen3-style) / "always" (can't disable) / "unknown" (open-model policy)
     thinking: str = "none"
-    # Output vocab = config.vocab_size (lm_head / logits width, the padded model vocab — not
-    # the raw tokenizer count). Drives the GRPO fp32-logits memory term and the per-device
-    # completion cap. Curated per model below; defaults to the open-model fallback.
     vocab_size: int = _DEFAULT_VOCAB_SIZE
     # Parameters ACTIVE per token in billions — only meaningful for an MoE, where a token routes
     # through a small subset of experts. The cost estimator's per-token FLOPs/step-time term reads
     # this (a token exercises only the active params), while VRAM/disk/download keep using the total
     # ``params_b``. 0.0 (the dense default) means "same as params_b" — every token hits every param.
     active_params_b: float = 0.0
+    # Transformer geometry (decoder layers x hidden width) — the SFT gradient-checkpointing-OFF gate
+    # sizes the no-recompute activation peak from these (engine.vram.sft_gc_off_peak_gb). 0/0 (the
+    # default) means "unknown": the worker falls back to reading the HF config at runtime, and the
+    # GC-off gate stays conservative (keeps GC on) if neither is available. Curated for the MoE whose
+    # SFT runs the gate — a live B200 SFT showed the runtime AutoConfig probe returning (0, 0) on the
+    # multimodal-nested config, so the curated values are what actually engage the gate.
+    num_layers: int = 0
+    hidden_size: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        serving = data.get("serving")
+        if serving is None:
+            data.pop("serving", None)
+        else:
+            for key in (
+                "serve_model_id",
+                "max_num_seqs",
+                "max_num_batched_tokens",
+                "gpu_memory_utilization",
+            ):
+                if serving.get(key) in ("", 0, 0.0, None):
+                    serving.pop(key, None)
+        return data
 
 
-# The default model Flash trains when a config omits one. A current-gen dense 4B
-# (text-only fine-tune) on the modern worker stack — the safe out-of-the-box choice for
-# the average developer. It is thinking-"hybrid"; the thinking flag defaults OFF.
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 MODELS: dict[str, ModelInfo] = {
@@ -103,14 +123,10 @@ MODELS: dict[str, ModelInfo] = {
         algos=("sft", "grpo"),
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
+        serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
         thinking="hybrid",
         notes="On-device class SLM (131k ctx); standard Llama architecture.",
     ),
-    # Qwen3.5 dense family: validated on the modern worker stack
-    # (trl 1.x / vllm 0.19 / transformers 5.x). Trained + served TEXT-ONLY: the
-    # checkpoints are natively multimodal, so LoRA excludes the vision tower and vLLM
-    # loads language_model_only (see flash.engine.worker). Each entry passed a real
-    # train+eval smoke on its recommended GPU (bench/results/phase1/).
     "Qwen/Qwen3.5-0.8B": ModelInfo(
         id="Qwen/Qwen3.5-0.8B",
         display_name="Qwen3.5 0.8B",
@@ -120,6 +136,7 @@ MODELS: dict[str, ModelInfo] = {
         algos=("sft", "grpo"),
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
+        serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
         thinking="hybrid",
         notes="Smallest Qwen3.5; cheap smoke/dev runs with the modern arch.",
     ),
@@ -132,6 +149,7 @@ MODELS: dict[str, ModelInfo] = {
         algos=("sft", "grpo"),
         min_vram_gb=16,
         recommended_gpu="RTX 4090",
+        serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
         thinking="hybrid",
     ),
     "Qwen/Qwen3.5-4B": ModelInfo(
@@ -143,6 +161,15 @@ MODELS: dict[str, ModelInfo] = {
         algos=("sft", "grpo"),
         min_vram_gb=32,
         recommended_gpu="RTX 5090",
+        serving=ServingCapacity(
+            gpu="L4",
+            serve_model_id="lovedheart/Qwen3.5-4B-FP8",
+            max_loras=64,
+            max_lora_rank=32,
+            max_model_len=8192,
+            max_num_seqs=8,
+            gpu_memory_utilization=0.98,
+        ),
         thinking="hybrid",
         notes="Current-gen 4B. GRPO uses the sleep-mode memory recipe (hybrid arch needs "
         "extra engine state-cache); fused DeltaNet kernels ship in the default stack.",
@@ -155,74 +182,59 @@ MODELS: dict[str, ModelInfo] = {
         vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=48,
-        # bf16 LoRA (NOT QLoRA). 4-bit QLoRA was abandoned for the 9B because the GRPO vLLM
-        # rollout MERGES the LoRA into the 4-bit base (peft bnb merge), and that rounding makes
-        # the sampler policy diverge from the bf16 trainer -> TRL importance-sampling ratio
-        # collapses to 0 (no learning) + runaway/non-terminating generations. bf16 keeps the
-        # rollout and trainer in the same precision so GRPO actually learns. Costs a bigger GPU:
-        # ~19 GB weights; SFT fits a 48 GB card, colocated GRPO (two bf16 copies + KV + the
-        # 248k-vocab fp32 logits) needs an 80 GB class -> grpo_min_vram_gb floor below.
+        # NOT QLoRA: peft bnb merge during GRPO rollout diverges trainer precision -> TRL ratio collapses to 0.
         grpo_min_vram_gb=80,
         quant="bf16",
         recommended_gpu="A100 PCIe",
+        serving=ServingCapacity(
+            gpu="L4",
+            serve_model_id="lovedheart/Qwen3.5-9B-FP8",
+            max_loras=44,
+            max_lora_rank=32,
+            max_model_len=8192,
+            max_num_seqs=8,
+            gpu_memory_utilization=0.98,
+        ),
         thinking="hybrid",
         notes="bf16 LoRA. ~19 GB of weights; SFT fits a 48 GB card, while colocated GRPO "
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
     ),
-    # ---- Qwen3.6 MoE: the big-checkpoint tier (H200 for SFT, B200 for GRPO) ----
-    # 35B-A3B is a Mixture-of-Experts checkpoint: ~3B parameters are ACTIVE per token, but all 35B
-    # are materialized on the GPU, so the MEMORY/disk/download terms size the FULL 35B (~70 GB bf16)
-    # while the COMPUTE terms (activations, KV pool, rank-linear LoRA) size the ~3B active backbone
-    # (engine.vram is MoE-aware via active_params_b). bf16 LoRA, NOT QLoRA — same reason as the 9B.
-    # Because the resident weights dominate and the active compute is tiny, the GPU tier is set by
-    # how many weight copies each algorithm holds, NOT by context length:
-    #   * SFT — ONE ~70 GB copy + small active-compute (~82 GB peak, ~flat in context) -> fits the
-    #     141 GB H200 with wide margin (context ~unbounded by VRAM). Live-validated on a B200; the
-    #     H200 down-tier is the MoE-aware win (cheaper, plentiful stock).
-    #   * GRPO — colocates the vLLM rollout, so TWO ~70 GB copies (trainer + engine) are resident at
-    #     the rollout peak (~167 GB) -> needs the 180 GB B200; the H200 can't hold both. The MoE
-    #     rollout weight-sync needed a fused-expert name fix (engine.worker.lora._remap_vl_sync_weights
-    #     passes the multimodal ``model.language_model.*`` names through to vLLM's own mapper). Both
-    #     single- and multi-turn GRPO live-validated on a B200.
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
         display_name="Qwen3.6 35B-A3B (MoE)",
         params="35B total / ~3B active (MoE)",
-        # TOTAL parameters (billions) the SFT VRAM equation + cost projection read. For an MoE
-        # checkpoint the size term is the TOTAL count, not the ~3B active: download/VRAM/disk size the
-        # FULL checkpoint that lands on the GPU (all experts are materialized). 35.0 is the CALIBRATED
-        # total: the live-validated single-B200 SFT fit depends on it — the honest-peak equation lands
-        # at the 180 GB B200's usable budget, and the marketing "~35.95B" figure tips it over (186 GB,
-        # see test_sft_equation_covers_honest_peak_across_seq_boundary). Keep 35.0.
+        # 35.0 not 35.95: the marketing figure tips the SFT equation over the B200 budget (see test_sft_equation_covers_honest_peak_across_seq_boundary).
         params_b=35.0,
-        # ~3B ACTIVE per token (the "A3B" in the name): a token routes through a small subset of
-        # experts, so cost/step-time FLOPs scale with ~3B, not the 35B total. Without this the
-        # estimator would price SFT as if every token exercised all 35B params — ~10x too slow/costly.
         active_params_b=3.0,
+        # Geometry for the SFT GC-off activation estimate (config.json text_config): 40 decoder
+        # layers x 2048 hidden (hybrid GatedDeltaNet + full-attention, 256 experts / 8 active).
+        num_layers=40,
+        hidden_size=2048,
         vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=141,
-        # Hard SFT floor: with MoE-aware sizing the SFT estimate is ~82 GB (the 70 GB resident weights
-        # dominate; the active-3B activations/KV are tiny), which would otherwise down-route to the
-        # 96 GB RTX Pro 6000 (consumer Blackwell, thin margin over the 70 GB base) or the 80 GB H100
-        # (too tight). Floor to 100 GB so SFT lands on the 141 GB H200 — a datacenter card with wide
-        # margin, ~$1.50/hr cheaper than the B200 and not needed here.
+        # Floor to 100 GB so SFT lands on H200, not the thin-margin consumer Blackwell or 80 GB H100.
         sft_min_vram_gb=100,
-        # GRPO floor = the 180 GB B200 (colocated GRPO holds two ~70 GB weight copies + a KV pool; the
-        # 141 GB H200 can't hold the trainer + vLLM rollout). The base ~167 GB two-copy estimate already
-        # routes GRPO to the B200, but setting the floor ALSO ENGAGES the long-context escalation —
-        # model_required_vram_gb only adds grpo_seq_escalation_gb when a grpo floor is set. The
-        # escalation keys on the ~3B ACTIVE params, so default/moderate GRPO still fits the B200 but a
-        # long (>~16k-token, e.g. 32k) rollout is sized PAST 180 GB and rejected at parse time, instead
-        # of booting a B200 and OOMing in vLLM's KV allocation.
+        # Floor also engages grpo_seq_escalation_gb: long (>16k) rollouts are rejected at parse time instead of OOMing in vLLM.
         grpo_min_vram_gb=180,
+        # vLLM sleep mode HANGS the 35B colocate rollout (wake/reload stalls — live-confirmed, every
+        # attempt). So GRPO is RESIDENT-ONLY: model_required_vram_gb sizes on the resident peak and a
+        # config too long to fit resident is REJECTED at parse time (not routed to the hanging sleep).
+        sleep_unsupported=True,
         quant="bf16",
         recommended_gpu="H200",
+        serving=ServingCapacity(
+            gpu="A100-80GB",
+            serve_model_id="Qwen/Qwen3.6-35B-A3B-FP8",
+            max_loras=12,
+            max_lora_rank=32,
+            max_model_len=8192,
+            max_num_seqs=8,
+            max_num_batched_tokens=4096,
+            gpu_memory_utilization=0.98,
+        ),
         thinking="hybrid",
-        # ~70 GB bf16 checkpoint. Peak disk = HF download (~70 GB) + Xet temp (~70 GB) + per-step
-        # deployable-checkpoint saves; floor to 200 GB so the rent doesn't hit "No space left on
-        # device" (the runner raises gpu.disk_gb to this out of the box).
         min_disk_gb=200,
         notes="MoE (35B total / ~3B active), bf16 LoRA. SFT runs on the 141 GB H200 (the ~70 GB "
         "weights dominate; active-3B compute keeps activations/KV tiny, so context is ~unbounded by "
@@ -247,11 +259,26 @@ def get_model(model_id: str) -> ModelInfo:
         ) from exc
 
 
+def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
+    """Return the model's serving LoRA rank cap, or None when Flash has no local cap.
+
+    Serving capacity is model-specific: small serving models currently allow rank 64, while larger
+    serving paths can cap at rank 32. Unknown/open-policy models intentionally return None instead
+    of inheriting a global fallback.
+    """
+    if isinstance(model, ModelInfo):
+        info = model
+    elif isinstance(model, str) and model.strip():
+        info = MODELS.get(model.strip())
+    else:
+        info = None
+    if info is None or info.serving is None:
+        return None
+    return int(info.serving.max_lora_rank)
+
+
 def vocab_size_for(model_id: str) -> int:
-    """Output vocab (== config.vocab_size, the lm_head / logits width) for a model — the
-    number that sizes the GRPO fp32-logits VRAM term and the per-device completion cap.
-    Returns the curated catalog value, else the safe default for open-model-policy entries.
-    This is the PADDED model vocab, not the raw tokenizer token count."""
+    """Curated vocab_size for a model, or the safe default for open-model-policy entries."""
     info = MODELS.get(model_id)
     return info.vocab_size if info is not None else _DEFAULT_VOCAB_SIZE
 
@@ -262,26 +289,17 @@ def resolve_model(
     policy: str = "catalog",
     gpu: str | None = None,
 ) -> ModelInfo:
-    """Resolve a model under the configured policy.
-
-    ``catalog`` (default): the model must be a curated catalog entry.
-    ``allow``: any HF model is accepted; a coarse VRAM-fit estimate (HF safetensors
-    metadata, no download) blocks only provably-impossible fits and warns on tight ones.
-    """
+    """Resolve a model under the configured policy; "allow" accepts any HF model."""
     algo = normalize_algorithm(algorithm)
     if model_id in MODELS:
         return validate_model_for_algorithm(model_id, algo)
     if policy != "allow":
-        # Reuse get_model's error (includes the open-model hint).
         return get_model(model_id)
     return _resolve_open_model(model_id, algo, gpu)
 
 
 def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
-    """Synthesize a ModelInfo for the open-model "allow" policy from a coarse VRAM-fit
-    estimate (HF safetensors metadata, no download). Blocks provably-impossible fits and
-    warns on tight ones. Isolates the engine.vram dependency + disk-floor heuristic from
-    the curated-catalog path in resolve_model."""
+    """Synthesize a ModelInfo for the open-model "allow" policy via a coarse HF VRAM-fit estimate."""
     from flash.engine.vram import check_fit
 
     est = check_fit(model_id, algo, gpu or DEFAULT_GPU)
@@ -293,11 +311,6 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
     if est.verdict in ("tight", "unknown"):
         print(f"warning: open-model policy: {est.describe()}")
     params = f"{est.params_b:.1f}B" if est.params_b else "unknown size"
-    # Disk floor for the open model: a bf16 checkpoint is ~2 GB per billion params;
-    # add worker-stack headroom so a large model that passes the VRAM check can't
-    # provision a paid worker and then fail in prefetch_model when the checkpoint
-    # overflows the 64 GB container default. 0 (unknown size) leaves the default
-    # (the user can still raise it with gpu.disk_gb).
     min_disk = int(est.params_b * 2) + 64 if est.params_b else 0
     return ModelInfo(
         id=model_id,
@@ -318,8 +331,6 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     info = get_model(model_id)
     algo = normalize_algorithm(algorithm)
-    # Catalog entries advertise the capability classes "sft" and "grpo": grpo needs the
-    # colocated rollout engine, sft is trainer-only.
     required = "grpo" if algo == "grpo" else "sft"
     if required not in info.algos:
         allowed = ", ".join(info.algos)

@@ -261,7 +261,9 @@ def test_heartbeat_commit_is_throttled(monkeypatch):
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("stage", ["model_prefetching", "sft_initializing", "rl_initializing"])
+@pytest.mark.parametrize(
+    "stage", ["model_prefetching", "sft_pretokenizing", "sft_initializing", "rl_initializing"]
+)
 def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
     """The periodic setup pings run on a side thread every 30s through a long phase (a cold
     snapshot_download can pull tens of GB for ~40 min, and disaggregated workers share one HF_REPO),
@@ -529,7 +531,7 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     assert f(9, 0, fa3_available=False, fa2_available=False) is None
     # Ampere (8.0/8.6) + Ada (8.9): FA2 when the wheel is present, else SDPA. FA3 never applies.
     assert f(8, 0, fa2_available=True) == "flash_attention_2"  # A100
-    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A6000
+    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A10
     assert f(8, 9, fa2_available=True) == "flash_attention_2"  # Ada 4090
     assert f(8, 7, fa2_available=True) is None  # sm87 Jetson Orin: NOT a validated FA2 arch -> SDPA
     assert f(8, 0, fa2_available=False) is None
@@ -624,9 +626,10 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
 
 def test_force_vllm_backend_for_sm120(monkeypatch):
     """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); deterministic, no operator
-    override. A non-sm120 GPU leaves VLLM_ATTENTION_BACKEND untouched. Regression for the
-    empty-5090-rollout."""
-    import os
+    override. Codex MsOqv: on the pinned vLLM 0.19.1 the VLLM_ATTENTION_BACKEND env was DROPPED from
+    the registry (setting it is a no-op), so the backend must be injected as the colocate LLM(...)
+    `attention_backend` kwarg via patch_trl_colocate_llm_kwargs — assert THAT, not the dead env. A
+    non-sm120 GPU pins nothing. Regression for the empty-5090-rollout."""
     import sys
     import types
 
@@ -640,22 +643,54 @@ def test_force_vllm_backend_for_sm120(monkeypatch):
         )
         return t
 
-    # sm120, backend unset -> FLASHINFER is forced
-    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    captured: dict = {}
+
+    def _fresh_vg():
+        """A throwaway trl.generation.vllm_generation whose LLM records its construction kwargs, so we
+        can assert the attention backend reaches the colocate engine. Fresh per call (no carried patch
+        state) so each scenario's injected kwarg is observed in isolation."""
+
+        class _FakeLLM:
+            def __init__(self, *a, **kw):
+                captured.clear()
+                captured.update(kw)
+
+        mod = types.ModuleType("trl.generation.vllm_generation")
+        mod.LLM = _FakeLLM
+        for name in ("trl", "trl.generation"):
+            pkg = types.ModuleType(name)
+            pkg.__path__ = []
+            monkeypatch.setitem(sys.modules, name, pkg)
+        monkeypatch.setitem(sys.modules, "trl.generation.vllm_generation", mod)
+        return mod
+
+    def _backend_injected(vg):
+        """Construct via the (now-patched) colocate LLM symbol and return the attention_backend it got."""
+        vg.LLM(model="m")
+        return captured.get("attention_backend")
+
+    # sm120, flashinfer importable -> FLASHINFER is forced (as an LLM kwarg, not an env var)
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(12))
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    vg = _fresh_vg()
     assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
-    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
+    assert _backend_injected(vg) == "FLASHINFER"
 
-    # sm120: a pre-set value is OVERWRITTEN — there is no operator override anymore (deterministic)
-    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
-    assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
-    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
+    # Codex MsPFr/MsZa4: sm120 with an ABI-broken/absent flashinfer must NOT ship a silently-broken
+    # FLASHINFER backend (it would crash at the first engine init), and the fallback must be a
+    # REGISTERED decoder backend — TRITON_ATTN (PTX-independent), NOT TORCH_SDPA (ViT-only on vllm
+    # 0.19.1, would raise at backend validation). A None entry in sys.modules makes `import flashinfer`
+    # raise ImportError — the same shape as an ABI-broken wheel.
+    monkeypatch.setitem(sys.modules, "flashinfer", None)
+    vg = _fresh_vg()
+    assert worker.force_vllm_backend_for_sm120() == "TRITON_ATTN"
+    assert _backend_injected(vg) == "TRITON_ATTN"
 
-    # non-sm120 (sm90 Hopper) -> untouched
-    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    # non-sm120 (sm90 Hopper) -> nothing pinned (the colocate engine gets no attention_backend kwarg)
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(9))
+    vg = _fresh_vg()
     assert worker.force_vllm_backend_for_sm120() is None
-    assert "VLLM_ATTENTION_BACKEND" not in os.environ
+    assert _backend_injected(vg) is None
 
 
 # ---------------------------------------------------------------------------

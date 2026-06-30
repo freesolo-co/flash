@@ -18,6 +18,8 @@ import pytest
 
 from flash.spec import JobSpec
 
+CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
+
 
 def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
     gpu = {"type": gpu_type, "max_wall_seconds": 3600, **gpu_kw}
@@ -69,6 +71,7 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     assert payload["hf_repo"] == "org/repo"
     # The worker env's HF_REPO is sourced from the run's [train] hf_repo (not an operator default).
     assert payload["env"]["HF_REPO"] == "org/repo"
+    assert builders.build_payload(_spec(), seed=0, attempt=1, code_prefix=CODE_PREFIX)["code_prefix"] == CODE_PREFIX
 
     script = builders.build_user_data(payload)
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
@@ -148,6 +151,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
             "env": {},
             "extra_pip": [],
             "hf_prefix": "sft/x",
+            "code_prefix": CODE_PREFIX,
             "max_wall_s": 60,
             "attempt": 0,
         },
@@ -188,6 +192,8 @@ def test_bootstrap_train_success(monkeypatch):
 
 def test_bootstrap_fails_without_metrics(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
+    # A genuine crash: no local metrics AND nothing on HF (stub keeps the check offline + deterministic).
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
     assert lb.main() == 1
     ok, error, retriable = markers[0]
     assert not ok
@@ -197,16 +203,135 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
     assert retriable is False
 
 
+def test_bootstrap_missing_local_metrics_but_remote_confirmed_is_retriable(monkeypatch):
+    """No local /tmp/metrics.json but the run IS complete on HF (DONE+metrics uploaded) — e.g. the
+    idempotency replay hit a transient HF read. This is a SUCCEEDED run; the bootstrap must consult
+    remote completion BEFORE the missing-local-file RuntimeError and surface a RETRIABLE marker so a
+    fresh worker re-fetches the persisted metrics, never fail a confirmed-complete run."""
+    lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
+    assert lb.main() == 1
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert "complete on HF" in error
+    assert retriable is True  # confirmed-complete -> reschedule to re-fetch, not a fatal job_failed
+
+
+def test_bootstrap_fetch_code_failure_is_retriable(monkeypatch):
+    # A transient HF blip fetching the run's OWN code (the control plane uploaded it before submit) is
+    # infra-shaped, exactly like the already-wrapped fetch_spec_from_hf — it must surface as a
+    # retriable marker so the run walks to a fresh host, NOT a fatal job_failed (the asymmetry = bug).
+    lb, calls, markers = _bootstrap_env(monkeypatch)
+
+    def boom(_payload):
+        raise RuntimeError("HF 503 storm")
+
+    monkeypatch.setattr(lb, "fetch_code", boom)
+    assert lb.main() == 1
+    assert calls == []  # crashed before launching the worker subprocess
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert "fetch run code from HF" in error
+    assert retriable is True
+
+
 def test_bootstrap_sets_lambda_arm():
     """The shared bootstrap stamps FLASH_ARM from payload['flash_arm'] so the metrics record
     attributes the substrate (Lambda's build_payload sets it to 'lambda')."""
     from flash.providers import _instance_bootstrap as lb
 
-    env = lb.build_worker_env({"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"})
+    env = lb.build_worker_env(
+        {"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda", "code_prefix": CODE_PREFIX}
+    )
     assert env["FLASH_ARM"] == "lambda"
     # And Lambda's build_payload is what sets flash_arm='lambda'.
     from flash.providers.lambdalabs.jobs.builders import build_payload
     assert build_payload(_spec(), 0, 0)["flash_arm"] == "lambda"
+
+
+def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
+    # The instance bootstrap must stamp ATTEMPT into the worker env (RunPod does it in jobs.py) — the
+    # worker reads it into every heartbeat, and the poller's stale-heartbeat rejection is dead without
+    # it (a prior attempt's leftover heartbeat would disarm the new attempt's fast failover).
+    from flash.providers import _instance_bootstrap as lb
+    from flash.providers.lambdalabs.jobs.builders import build_payload
+
+    base = {"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda", "code_prefix": CODE_PREFIX}
+    assert lb.build_worker_env({**base, "attempt": 3})["ATTEMPT"] == "3"
+    # First attempt + a missing key both stamp "0" (matching RunPod's str(int(attempt))).
+    assert lb.build_worker_env({**base, "attempt": 0})["ATTEMPT"] == "0"
+    assert lb.build_worker_env(base)["ATTEMPT"] == "0"
+    # And the producer end actually carries the launched attempt into the payload bootstrap reads.
+    assert build_payload(_spec(), seed=0, attempt=2)["attempt"] == 2
+
+
+def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
+    import types
+
+    import huggingface_hub
+
+    from flash.providers import _instance_bootstrap as lb
+
+    monkeypatch.setattr(lb, "CODE_ROOT", str(tmp_path))
+    list_calls = []
+    download_calls = []
+    sleeps = []
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_tree(self, **kw):
+            list_calls.append(kw)
+            return [
+                types.SimpleNamespace(path=f"{CODE_PREFIX}/__init__.py", size=0),
+                types.SimpleNamespace(path=f"{CODE_PREFIX}/runner.py", size=10),
+                types.SimpleNamespace(path=f"{CODE_PREFIX}", tree_id="folder"),
+            ]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(lb.time, "sleep", sleeps.append)
+
+    class _Response:
+        status_code = 429
+
+        def __init__(self) -> None:
+            self.headers = {"Retry-After": "3"}
+
+    class _RateLimited(Exception):
+        response = _Response()
+
+    def fake_hf_hub_download(*, filename, local_dir, **kw):
+        download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
+        if filename.endswith("runner.py") and len(
+            [call for call in download_calls if call["filename"] == filename]
+        ) == 1:
+            raise _RateLimited("slow down")
+        target = tmp_path / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("")
+        return str(target)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
+
+    lb.fetch_code({"hf_repo": "org/repo", "code_prefix": CODE_PREFIX, "env": {"HF_TOKEN": "tok"}})
+
+    assert list_calls == [
+        {
+            "repo_id": "org/repo",
+            "repo_type": "dataset",
+            "path_in_repo": CODE_PREFIX,
+            "recursive": True,
+            "token": "tok",
+        }
+    ]
+    assert [call["filename"] for call in download_calls] == [
+        f"{CODE_PREFIX}/__init__.py",
+        f"{CODE_PREFIX}/runner.py",
+        f"{CODE_PREFIX}/runner.py",
+    ]
+    assert all(call["local_dir"] == str(tmp_path) for call in download_calls)
+    assert sleeps == [3.0]
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +701,36 @@ def test_poll_caps_recovered_cost_at_done_timestamp(monkeypatch):
     assert res.metrics["cost_usd"] == round((9100.0 - 9000.0) / 3600.0 * 1.29, 6)
 
 
+def test_poll_retries_transient_metrics_blip_after_done(monkeypatch):
+    # A fresh DONE guarantees metrics.json was uploaded first, so a None read is a transient HF blip
+    # (the reader swallows 429/network and returns None) — it must be retried, not turned into a
+    # terminal job_failed that discards (while still billing) a successful run.
+    reads = {"n": 0}
+
+    def metrics():
+        reads["n"] += 1
+        return None if reads["n"] <= 2 else json.dumps({"wall_seconds": 100, "cost_usd": 0.0})
+
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], done="10500.0", metrics=metrics
+    )
+    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
+    assert res.ok, res
+    assert reads["n"] >= 3  # retried past the two transient None reads instead of failing
+
+
+def test_poll_persistent_metrics_unreadable_is_retriable_not_job_failed(monkeypatch):
+    # If metrics.json stays unreadable after retries, fail RETRIABLY (poll_error) so the run is
+    # re-attempted (a re-launch hits the worker's DONE-idempotency and restores the persisted
+    # metrics without re-training) — NEVER the terminal job_failed that drops a billed success.
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}], done="10500.0", metrics=lambda: None
+    )
+    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "poll_error"
+
+
 def test_poll_marker_failure_is_job_failed(monkeypatch):
     jobs = _wire_poll(
         monkeypatch,
@@ -663,7 +818,7 @@ def test_poll_heartbeat_stall(monkeypatch):
     # A FRESH training heartbeat (ts >= launch 10_000) that then FROZE: it proves liveness (so the
     # fast first-liveness failover is satisfied) AND arms the tight training stall window, so the
     # subsequent no-progress gap past stall_after_s is the stall actually under test here.
-    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0}
+    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0, "attempt": "0"}
     res = jobs.poll_lambda_job(
         _handle(),
         _spec(),
@@ -809,7 +964,7 @@ def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
         seed=0,
         interval_s=0,
         first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0, "attempt": "0"},
     )
     assert res.failure == "job_preempted"
     assert "no worker liveness" not in (res.detail or "")
@@ -826,7 +981,7 @@ def test_poll_active_stale_heartbeat_does_not_satisfy_liveness(monkeypatch):
         seed=0,
         interval_s=0,
         first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 1.0},  # < launch
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 1.0, "attempt": "0"},
     )
     assert res.failure == "stalled"
     assert "no worker liveness" in res.detail
@@ -866,6 +1021,8 @@ def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")
     monkeypatch.setenv("HF_TOKEN", "hf")
     payload = builders.build_payload(_spec(), seed=0, attempt=2)
+    assert payload["code_prefix"].startswith("code/")
+    assert payload["code_prefix"].endswith("/flash")
     script = builders.build_user_data(payload)
     # the uploader INVOCATION precedes the image pull
     assert "python3 /opt/flash/hostlog.py" in script
@@ -941,7 +1098,7 @@ def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     import re
 
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
-    hb = {"stage": "rl", "step": 7, "ts": 8500.0}
+    hb = {"stage": "rl", "step": 7, "ts": 8500.0, "attempt": "0"}
     res = jobs.poll_lambda_job(
         _handle(started_ts=8_000.0),
         _spec(),
@@ -1551,7 +1708,15 @@ def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
     big = '{"k":"' + "v" * 200_000 + '"}'
     monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: big)
     env = lb.build_worker_env(
-        {"job_spec_json": "", "job_spec_in_hf": True, "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}
+        {
+            "job_spec_json": "",
+            "job_spec_in_hf": True,
+            "phase": "sft",
+            "seed": 0,
+            "env": {},
+            "flash_arm": "lambda",
+            "code_prefix": CODE_PREFIX,
+        }
     )
     # A >96k spec is passed via file, mirroring the inline-large path.
     assert env["FLASH_JOB_SPEC_PATH"] == "/tmp/job_spec.json"
@@ -1600,7 +1765,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
         lambda path=lb.PAYLOAD_PATH: {
             "hf_repo": "org/repo", "job_spec_json": "", "job_spec_in_hf": True,
             "phase": "sft", "seed": 0, "flash_arm": "lambda", "env": {}, "extra_pip": [],
-            "hf_prefix": "sft/x", "max_wall_s": 60, "attempt": 0,
+            "hf_prefix": "sft/x", "code_prefix": CODE_PREFIX, "max_wall_s": 60, "attempt": 0,
         },
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)

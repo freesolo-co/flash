@@ -16,21 +16,13 @@ from typing import TYPE_CHECKING
 from flash.spec import JobSpec
 
 if TYPE_CHECKING:
-    # RunStatus lives in flash.runner.__init__ and is only referenced here as a return
-    # annotation (stringized by `from __future__ import annotations`), so a TYPE_CHECKING
-    # import keeps it resolvable for tooling without a runtime import cycle.
     from flash.runner import RunStatus
+
+_FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
 
 
 def cancel_run(run_id: str) -> RunStatus:
-    """Cancel a run: delete its remote Flash endpoint (stopping the worker), then mark it
-    cancelled.
-
-    Uses ``terminate_endpoint`` (reconstructs the run's uniquely-named endpoint and deletes it
-    via the RunPod API) so the cancel works **cross-process** — a fresh ``flash cancel`` actually
-    stops the GPU worker, instead of leaving it running until the wall cap. Best-effort: any
-    teardown error is recorded but still flips the run to ``cancelled``.
-    """
+    """Cancel a run: stop the remote worker and mark it cancelled."""
     from flash.runner import (
         TERMINAL_STATES,
         _gc_run_endpoints,
@@ -42,46 +34,19 @@ def cancel_run(run_id: str) -> RunStatus:
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
-    # Whether the run was a live `deployed` serving run at cancel entry. This scopes the
-    # final `cancelled` transition's terminal override below: only a `deployed` run can have
-    # a concurrent undeploy (`mark_undeployed`) race this teardown and write a non-completion
-    # terminal `done`. A non-deployed run (running/provisioning/queued) has an in-flight
-    # TRAINING thread whose only terminal `done` is a GENUINE completion — which cancel must
-    # never clobber. See the final _update call for how this gates the override.
+    # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
     entered_deployed = status.state == "deployed"
     spec = JobSpec.from_dict(status.spec)
     remote = status.remote or {}
-    # A deployed run also owns a serving registration with the freesolo serving
-    # app that the training-endpoint GC below does not touch; deregister it too so
-    # a cancelled run can't leave a deployment registered as active.
     if status.state == "deployed":
         try:
             from flash.serve.deploy import undeploy_adapter
 
             undeploy_adapter(run_id)
-            # Mark the deployment inactive so /v1/deployments and /chat stop treating the
-            # cancelled run as active. Delete is idempotent: an already-absent adapter still
-            # means the local deployment record can be cleared.
             if status.deployment:
-                # Mark the deployment inactive through the lock-guarded path so this write
-                # participates in the same _STATUS_LOCK as the rest of the runner. A bare
-                # _save_status here would persist a stale pre-teardown snapshot OUTSIDE the
-                # lock, bypassing serialization and potentially clobbering a concurrent field
-                # update. We mark ONLY the deployment field and leave the run's state alone
-                # (no state re-assert): a concurrent mark_undeployed can move the run to
-                # terminal `done` between our get_status read and this write, and _update's
-                # compare-and-set rejects ANY transition off a terminal state (even a
-                # same-field re-assert of the stale `deployed`), which would silently leave
-                # the deployment advertised as `ready`. mark_deployment_undeployed flips the
-                # deployment regardless of (and without disturbing) the current state.
                 mark_deployment_undeployed(run_id)
         except Exception:
-            # Best-effort serving teardown: a failure here must not block the cancel
-            # below (the run still flips to cancelled and the training endpoint is GC'd).
             pass
-    # Durable path first: stop the exact remote worker via the handle's provider
-    # (works from any process); endpoint/instance teardown is shared with the GC.
-    # Dispatched generically through the registry — never a hardcoded per-provider branch.
     if remote:
         try:
             from flash.providers import get_provider
@@ -90,49 +55,30 @@ def cancel_run(run_id: str) -> RunStatus:
             handle = JobHandle.from_dict(remote)
             provider = get_provider(handle.provider)
             provider.cancel(handle)
-            # Belt-and-suspenders destroy after cancel; RunPod endpoint GC follows.
             provider.destroy(handle)
         except Exception:
-            # Best-effort remote stop; _gc_run_endpoints below still tears the endpoint down.
             pass
     _gc_run_endpoints(spec)
-    # Final transition to `cancelled`. The run was NON-terminal at entry, but teardown takes
-    # time and a terminal state can race in mid-teardown. We must distinguish two cases:
-    #
-    #   - A concurrent mark_undeployed() (an external `DELETE /v1/runs/{id}/deploy`) flipped a
-    #     `deployed` run to terminal `done`. That `done` is NOT a fresh result — it just
-    #     restored the run's pre-deploy completion marker while retiring serving. The user
-    #     explicitly asked to cancel, so this must be OVERRIDDEN to `cancelled`.
-    #   - A genuine training-COMPLETION `done` from the run's own training thread
-    #     (_run_job_inner / attach_run), which persisted real metrics+cost+artifacts. Cancel
-    #     must NEVER clobber that — the run finished, so the real result is preserved.
-    #
-    # These two races are mutually exclusive on the entry state: only a `deployed` run owns a
-    # deployment that mark_undeployed can race, and only a non-deployed (running/provisioning/
-    # queued) run has an in-flight training thread that can complete mid-teardown. So scope the
-    # terminal override to runs that were `deployed` at entry — there a racing `done` is always
-    # an undeploy artifact (cancel wins); elsewhere a racing `done` is a genuine completion that
-    # _update's CAS correctly protects (cancel loses to a real finish).
-    _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
-    # A run cancelled mid-RL keeps whatever per-step adapters the worker already streamed to
-    # HF; mirror them to the backend store now so the cancelled run is immediately listable +
-    # deployable (`flash checkpoints` / `flash deploy --step N`). Best-effort: never let
-    # checkpoint bookkeeping fail a cancel.
-    with contextlib.suppress(Exception):
-        from flash.server.checkpoints import register_checkpoints_best_effort
+    from flash.server._locks import _deploy_lock
 
-        register_checkpoints_best_effort(get_status(run_id))
+    with _deploy_lock(run_id):
+        _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
+        final = get_status(run_id)
+        if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
+            with contextlib.suppress(Exception):
+                from flash.serve.deploy import undeploy_adapter
+
+                undeploy_adapter(run_id)
+                mark_deployment_undeployed(run_id)
+        with contextlib.suppress(Exception):
+            from flash.server.checkpoints import register_checkpoints_best_effort
+
+            register_checkpoints_best_effort(get_status(run_id))
     return get_status(run_id)
 
 
 def attach_run(run_id: str, log_stream=None) -> RunStatus:
-    """Re-attach to a run's remote job from ANY process (after a client crash/restart).
-
-    Uses the persisted {endpoint_id, job_id} handle to resume polling; on completion,
-    persists metrics exactly like the original client would have, flips the state, and
-    GCs the endpoint. Raises if the run has no persisted handle (it failed or was
-    cancelled before a worker was provisioned).
-    """
+    """Re-attach to a run's remote job from any process (after a client crash/restart)."""
     import sys
 
     from flash.runner import (
@@ -156,14 +102,13 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     spec = JobSpec.from_dict(status.spec)
     remote = dict(status.remote)
     seed = int(remote.pop("seed", FIXED_SEED))
+    code_prefix = remote.pop("code_prefix", None)
     # The class the run actually provisioned (a policy retry may have walked past the
     # provisional spec.gpu.type). The in-process success path stamps this into metrics;
     # on recovery the worker output carries no such field, so recover it from the handle
     # to cost the right card.
     allocated_gpu = remote.pop("allocated_gpu", None)
     log = log_stream or sys.stderr
-    # Dispatch the poll generically via the handle's provider (the provider owns its
-    # heartbeat reader + poll loop); the orchestrator stays provider-agnostic.
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
 
@@ -171,9 +116,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
     res = get_provider(handle.provider).poll(handle, spec, seed, log=log)
     try:
-        # A best-effort cancel deletes the job/instance, which the poller reports as a
-        # failure (or a late worker may still succeed) — either way, re-read the state
-        # first so a recovery thread can't overwrite the user's terminal `cancelled`.
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
@@ -219,10 +161,14 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
-            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0))
+            if code_prefix is None:
+                from flash.providers.runpod.train import upload_code
+                from flash.runner import flash_code_prefix
+
+                code_prefix = flash_code_prefix()
+                upload_code(spec.train.hf_repo, code_prefix=code_prefix)
+            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0), code_prefix=code_prefix)
             return get_status(run_id)
-        # Carry the provisioned class into metrics so _persist_metrics costs the card the
-        # run actually used (the in-process path stamps this; recovery must restore it).
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
         # Add the recovered run's cost to any already booked before the restart so recovery
@@ -235,8 +181,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             raise _RunCancelled(f"run {run_id} was cancelled")
         _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
     except _RunCancelled:
-        # Intentional: cancel_run already wrote the terminal `cancelled` state; leave it.
-        pass
+        pass  # cancel_run already wrote terminal `cancelled`
     except Exception as exc:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
@@ -245,85 +190,64 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     return get_status(run_id)
 
 
+def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
+    """Apply the lifecycle state for a final-adapter deployment."""
+    # Preserve teardown time for legacy `done` runs (finished_at=None) before deploy bumps updated_at.
+    if status.state == "done" and status.finished_at is None and not status.reconciled_at:
+        status.finished_at = status.updated_at
+    status.deployment = deployment
+    status.state = "deployed"
+
+
 def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None) -> RunStatus:
     from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
 
-    # Atomic + terminal-respecting (same guard as _update): a /cancel landing during
-    # deployment writes `cancelled`; this must NOT overwrite it with
-    # `deployed` and resurrect the run as an active deployment. `done` is deployable
-    # though (the common case: deploy a finished run), so only the non-`done` terminal
-    # states block here — otherwise a freshly finished run could never be deployed.
-    #
-    # expect_state is a compare-and-set: the deploy flow passes the state it expects the
-    # run to still be in (the pre-deploy snapshot, or "deployed" after the provisional
-    # mark). If an undeploy raced finalization — deleting the endpoint and writing `done`
-    # with deployment.state="undeployed" mid-warmup — the state no longer matches and we
-    # refuse to re-advertise the just-deleted endpoint.
     with _STATUS_LOCK:
         status = get_status(run_id)
         if status.state in _UNDEPLOYABLE_STATES:
             return status
         if expect_state is not None and status.state != expect_state:
             return status
-        # Freeze the training-teardown time before the deploy bumps updated_at. New terminal runs
-        # already stamp finished_at on their first terminal transition, but a LEGACY run that went
-        # `done` before that field existed has finished_at=None while its current updated_at still
-        # holds the real teardown time. Capture it ONLY on the `done` -> `deployed` transition, where
-        # updated_at == teardown (mark_deployed is also called on an already-`deployed` run via the
-        # CAS finalization with expect_state="deployed", where updated_at is the DEPLOY time), and
-        # only when not yet reconciled — record_realized_cost moves updated_at to the reconcile time,
-        # so a reconciled-then-deployed legacy run would otherwise freeze that later stamp. Both
-        # guards keep us from stamping past the real teardown (the over-billing this fixes); a
-        # reconciled run is never re-billed, so leaving finished_at unset there is harmless.
-        if status.state == "done" and status.finished_at is None and not status.reconciled_at:
-            status.finished_at = status.updated_at
-        status.deployment = deployment
-        status.state = "deployed"
+        _promote_final_deployment(status, deployment)
         status.updated_at = time.time()
         _save_status(status)
         return status
 
 
-def attach_checkpoint_deployment(run_id: str, deployment: dict) -> RunStatus:
-    """Attach a serving deployment to a run WITHOUT changing its training state.
+def mark_checkpoint_deployed(
+    run_id: str, deployment: dict, expect_state: str | None = None
+) -> RunStatus:
+    """Record a checkpoint deployment using the run's current lifecycle state.
 
-    Used when deploying a specific intermediate checkpoint of a run that never reached
-    ``done`` — e.g. one cancelled or failed mid-RL. The checkpoint adapter exists on HF, so it
-    can be served, but the run's terminal training outcome (``cancelled``/``failed``) must be
-    preserved: flipping it to ``deployed`` would both erase that outcome and make a later
-    undeploy wrongly restore it to ``done`` (``mark_undeployed`` sends non-terminal runs to
-    ``done``). The deployment is tracked via the ``deployment`` field exactly like a normal
-    deploy, so ``/v1/deployments`` lists it and undeploy clears it. Lock-guarded so it
-    serializes with a racing deploy/undeploy on the same run.
+    If training has finished by the time serving registration completes, the run behaves like any
+    finished deployed run. Otherwise, keep the training state and only attach the deployment record.
     """
     from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
-        status.deployment = deployment
+        if status.state == "dry_run":
+            return status
+        if expect_state is not None and status.state != expect_state:
+            return status
+        if status.state in _FINAL_DEPLOYMENT_STATES:
+            _promote_final_deployment(status, deployment)
+        else:
+            status.deployment = deployment
         status.updated_at = time.time()
         _save_status(status)
         return status
 
 
 def mark_undeployed(run_id: str) -> RunStatus:
-    """Record an explicit undeploy (endpoint torn down -> run back to `done`).
-
-    Lock-guarded so it serializes with a racing deploy finalization: the raw read +
-    _save_status the endpoint used to do could interleave with mark_deployed and be
-    clobbered. With this under the same lock, mark_deployed's expect_state CAS then sees
-    the `done`/undeployed write and won't re-advertise the deleted endpoint.
-    """
-    from flash.runner import _STATUS_LOCK, TERMINAL_STATES, _save_status, get_status
+    """Record an explicit undeploy; live final-adapter deployments return to `done`."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}
-        # Record the teardown but don't resurrect a terminal run: undeploying a
-        # cancelled/failed run keeps its terminal state (only a live `deployed` run goes
-        # back to `done`). `done` is terminal too, so this naturally no-ops the state.
-        if status.state not in TERMINAL_STATES:
+        if status.state == "deployed":
             status.state = "done"
         status.updated_at = time.time()
         _save_status(status)
@@ -333,15 +257,8 @@ def mark_undeployed(run_id: str) -> RunStatus:
 def mark_deployment_undeployed(run_id: str) -> RunStatus:
     """Flip ONLY the deployment field to ``undeployed``, leaving the run's state untouched.
 
-    Used by ``cancel_run`` to retire a deployed run's serving record. Unlike
-    ``mark_undeployed`` (which is a state transition: a live `deployed` run goes back to
-    `done`), this never asserts or changes the run state. That matters under the cancel
-    race: a concurrent ``mark_undeployed`` may have already moved the run to terminal
-    `done`, and ``_update``'s compare-and-set rejects any transition off a terminal state —
-    even re-asserting `deployed` to carry the deployment field — which would leave the
-    deployment advertised as `ready`. Marking the field directly (lock-guarded for
-    serialization) sidesteps the CAS so the deployment reliably ends `undeployed`, while the
-    trailing ``cancelled`` transition is left to ``_update``.
+    Used by cancel_run — unlike mark_undeployed, never asserts or changes the run state,
+    so it works even after a racing mark_undeployed has already written terminal `done`.
     """
     from flash.runner import _STATUS_LOCK, _save_status, get_status
 

@@ -1,16 +1,10 @@
-"""Adapter that runs Freesolo SDK environments on Flash.
-
-Flash environment ids are Freesolo Hub slugs (``namespace/name``). Explicit
-low-level refs remain parseable for compatibility. The canonical generated environment file is
-``environment.py`` and its
-``load_environment`` function must return a Freesolo SDK environment:
-``EnvironmentSingleTurn`` or ``EnvironmentMultiTurn``.
-"""
+"""Adapter that runs Freesolo SDK environments on Flash."""
 
 from __future__ import annotations
 
+import contextlib
+import gzip
 import hashlib
-import io
 import json
 import os
 import re
@@ -20,9 +14,10 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from flash.envs.base import BaseEnvironment
 
@@ -31,7 +26,11 @@ _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+_MAX_TARBALL_BYTES = 1024 * 1024 * 1024
+_MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
+_MAX_ARCHIVE_SCAN_MEMBERS = 200_000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _TAR_METADATA_TYPES = {
@@ -45,14 +44,7 @@ _CANONICAL_OUTPUT_KEY = "output"
 
 
 class GitHubRateLimitError(RuntimeError):
-    """Raised when the GitHub API rate-limits us (HTTP 429, or a 403 whose body says "rate limit").
-
-    Raised by ``_urlopen`` only after the in-process jittered retry is exhausted, so it signals a
-    *persistent* limit. The worker's top-level handler catches it and stamps ``retriable=True`` so
-    the control plane reschedules the job on a fresh worker once the limit window resets, instead of
-    permanently failing the run. The real spawn-wave mitigation is the control-plane resolve-once
-    pin (EnvironmentSpec.resolved_sha) that lets workers skip the GitHub resolve entirely.
-    """
+    """Persistent GitHub rate-limit; worker handler stamps retriable=True for rescheduling."""
 
 
 @dataclass(frozen=True)
@@ -146,14 +138,10 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
         if not _is_safe_github_path_parts((ref,)):
             return None
         raw_path = "/".join(parts[4:])
-        if not _is_safe_environment_path(raw_path):
-            return None
         try:
             path = _normalize_env_path(raw_path)
         except ValueError:
             return None
-        if not raw_path:
-            path = _DEFAULT_ENVIRONMENT_PATH
         if parts[2] == "tree" and raw_path and not path.endswith(".py"):
             path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
     elif len(parts) == 2:
@@ -183,18 +171,6 @@ def _normalize_env_path(path: str | None) -> str:
     return "/".join(parts)
 
 
-def _is_safe_environment_path(path: str) -> bool:
-    if not path:
-        return True
-    raw = path.strip().replace("\\", "/")
-    if raw.startswith("/"):
-        return False
-    parts = [part for part in raw.split("/") if part]
-    if not parts:
-        return True
-    return not any(part in {".", ".."} for part in parts)
-
-
 def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
     if not parts:
         return False
@@ -218,22 +194,12 @@ def _resolve_ref_sha(
     timeout: float = 60.0,
     max_rate_limit_retries: int = 5,
 ) -> str:
-    # Resolve-once hook: the control plane resolves ref->sha ONCE (runner._assign_resolved_env_sha)
-    # and threads the pinned commit sha through, so every worker in a fan-out short-circuits here
-    # without hitting GitHub at all — this is what actually defuses a cold spawn wave (the prior
-    # in-process cache could not, since each worker is a separate process). Same effect as the
-    # immutable-ref fast path below, but applied to a symbolic ref (e.g. "main"). Only a real
-    # 40-char sha is trusted; anything else falls through to a live resolve. The control plane
-    # passes a short timeout + max_rate_limit_retries=0 so its best-effort pin can't block run
-    # creation; the worker keeps the full retry budget.
+    # Control plane pins sha once; workers skip GitHub entirely on a fan-out.
     if pinned_sha and _is_commit_sha(pinned_sha):
         return pinned_sha
     if _is_commit_sha(parsed.ref):
         return parsed.ref
-    # No pin (legacy spec / non-managed ref / control-plane resolve failed): resolve the symbolic
-    # ref live every time. We deliberately do NOT cache symbolic refs in-process — a long-lived
-    # process must see a moved branch (managed slugs point at environment-hub@main, which moves on
-    # `flash env push`), and the immutable-sha cases above already skip the network.
+    # Symbolic refs are NOT cached in-process: managed slugs point at environment-hub@main which moves.
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
     token = _github_token()
     if token:
@@ -253,22 +219,39 @@ def _resolve_ref_sha(
     return sha
 
 
+def _iter_capped_chunks(resp: object, max_bytes: int) -> Iterator[bytes]:
+    total = 0
+    while True:
+        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        if total + len(chunk) > max_bytes:
+            raise RuntimeError(
+                f"GitHub response body exceeded the maximum allowed size ({max_bytes} bytes); "
+                "download aborted"
+            )
+        total += len(chunk)
+        yield chunk
+
+
+def _read_capped(resp: object, max_bytes: int) -> bytes:
+    return b"".join(_iter_capped_chunks(resp, max_bytes))
+
+
+def _copy_capped(resp: object, max_bytes: int, out: BinaryIO) -> None:
+    for chunk in _iter_capped_chunks(resp, max_bytes):
+        out.write(chunk)
+
+
 def _urlopen(
-    req: urllib.request.Request, *, timeout: float = 60.0, max_rate_limit_retries: int = 5
+    req: urllib.request.Request,
+    *,
+    timeout: float = 60.0,
+    max_rate_limit_retries: int = 5,
+    max_bytes: int | None = None,
+    out: BinaryIO | None = None,
 ) -> bytes:
-    """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
-
-    On a 429 or a 403 whose body says "rate limit" (a cold spawn wave of workers all hitting the
-    commits/tarball endpoint trips GitHub's abuse detection), retry up to ``max_rate_limit_retries``
-    times with jitter so concurrent workers don't all retry in lockstep. If the limit persists past
-    the retries, raise ``GitHubRateLimitError`` so the worker's top-level handler stamps
-    ``retriable=True`` and the run reschedules on a fresh worker, instead of hard-failing on a
-    transient limit. Any other HTTP / URL error raises a plain ``RuntimeError`` (non-retriable).
-
-    ``max_rate_limit_retries=0`` makes it fail fast (one request, no sleeps): the control plane uses
-    that for its best-effort resolve-once pin so a persistent limit can never block run creation —
-    the long retry belongs on the worker, which can afford to wait.
-    """
+    """Fetch bytes for a GitHub request with jittered retry on rate limits."""
     import random
     import time
 
@@ -277,37 +260,57 @@ def _urlopen(
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if max_bytes is not None:
+                    if out is not None:
+                        _copy_capped(resp, max_bytes, out)
+                        return b""
+                    return _read_capped(resp, max_bytes)
+                if out is not None:
+                    shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
+                    return b""
                 return resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
-            # GitHub signals an exhausted primary limit with a 403 + `X-RateLimit-Remaining: 0`
-            # header; the body may be empty or omit the phrase "rate limit", so check the header too
-            # rather than relying on substring matching alone. Secondary (abuse) limits come back 429.
             remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
             is_rate_limit = exc.code == 429 or (
                 exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
             )
-            if is_rate_limit and attempt < max_rate_limit_retries:
-                delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
+            is_transient = is_rate_limit or exc.code >= 500
+            if is_transient and attempt < max_rate_limit_retries:
+                delay = max(
+                    _RATE_LIMIT_BASE_DELAY,
+                    min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
+                )
                 time.sleep(delay)
                 attempt += 1
                 continue
             if is_rate_limit:
-                # Persistent limit: signal retriable so the control plane reschedules (#209).
                 raise GitHubRateLimitError(
                     f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
                 ) from exc
-            raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
+            if exc.code >= 500:
+                raise GitHubRateLimitError(
+                    f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
+                ) from exc
+            raise RuntimeError(
+                f"GitHub environment request failed ({exc.code}): {body[:500]}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            if attempt < max_rate_limit_retries:
+                delay = max(
+                    _RATE_LIMIT_BASE_DELAY,
+                    min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)),
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            reason = getattr(exc, "reason", exc)
+            raise GitHubRateLimitError(
+                f"GitHub environment request failed after {attempt} retries (transient network): {reason}"
+            ) from exc
 
 
-def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
-    # Callers download the tarball for the ALREADY-resolved commit sha (see
-    # _resolve_github_environment_file), which extracts it into the content-addressed disk cache
-    # under _CACHE_ROOT/<hash(repo@sha:path)> and never re-downloads on a hit. So reuse is handled
-    # on disk; we deliberately do NOT also retain the (up to _MAX_ARCHIVE_BYTES) archive bytes in a
-    # module-level cache for the worker's lifetime — that wasted hundreds of MiB of RAM per process.
+def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -316,43 +319,301 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
-    if len(data) > _MAX_ARCHIVE_BYTES:
+    tar_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="flash-env-tar-", suffix=".tar.gz", delete=False
+        ) as spill:
+            tar_path = Path(spill.name)
+            _urlopen(
+                urllib.request.Request(url, headers=headers),
+                timeout=120.0,
+                max_bytes=_MAX_TARBALL_BYTES,
+                out=spill,
+            )
+    except BaseException:
+        if tar_path is not None:
+            with contextlib.suppress(OSError):
+                tar_path.unlink()
+        raise
+    return tar_path
+
+
+def _managed_hub_package_root(ref: GitHubEnvironmentRef) -> str:
+    if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
+        return ""
+    parts = [part for part in ref.path.split("/") if part]
+    if len(parts) < 2 or not _is_safe_github_path_parts(tuple(parts[:2])):
+        return ""
+    return "/".join(parts[:2])
+
+
+def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
+    quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/") if part)
+    return (
+        f"https://api.github.com/repos/{ref.repo_full_name}/contents/{quoted_path}"
+        f"?ref={urllib.parse.quote(ref.ref, safe='')}"
+    )
+
+
+def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool = False) -> str:
+    url = (
+        f"https://api.github.com/repos/{ref.repo_full_name}/git/trees/"
+        f"{urllib.parse.quote(treeish, safe='')}"
+    )
+    if recursive:
+        url = f"{url}?recursive=1"
+    return url
+
+
+def _github_headers(accept: str) -> dict[str, str]:
+    headers = {"Accept": accept, "User-Agent": "freesolo-flash"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _safe_contents_path(path: object, root_parts: list[str]) -> str:
+    if not isinstance(path, str):
+        raise RuntimeError("GitHub contents response did not include a path")
+    try:
+        normalized = _normalize_env_path(path)
+    except ValueError as exc:
+        raise RuntimeError(f"unsafe path in environment contents: {path!r}") from exc
+    parts = normalized.split("/")
+    if parts[: len(root_parts)] != root_parts:
+        raise RuntimeError(f"unexpected path in environment contents: {path!r}")
+    return normalized
+
+
+def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> Any:
+    data = _urlopen(
+        urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
+        timeout=120.0,
+        max_bytes=_MAX_CONTENTS_JSON_BYTES,
+    )
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"environment archive is too large ({len(data)} bytes; "
-            f"limit {_MAX_ARCHIVE_BYTES} bytes)"
+            "GitHub environment request failed for "
+            f"{ref.repo_full_name}@{ref.ref}:{context}: invalid response"
+        ) from exc
+
+
+def _github_response_message(payload: object) -> str:
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            return f" ({message})"
+    return ""
+
+
+def _github_tree_entries(ref: GitHubEnvironmentRef, treeish: str, context: str) -> list[dict]:
+    payload = _download_github_json(ref, _github_tree_url(ref, treeish), context)
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        raise RuntimeError(
+            f"GitHub path {context!r} is not an environment directory"
+            f"{_github_response_message(payload)}"
         )
-    return data
+    if payload.get("truncated"):
+        raise RuntimeError(
+            f"GitHub tree response for environment directory {context!r} was truncated"
+        )
+    entries = payload["tree"]
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise RuntimeError("GitHub tree response included an invalid entry")
+    return entries
 
 
-def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
+def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
+    treeish = ref.ref
+    current = ""
+    for part in [part for part in repo_dir.split("/") if part]:
+        entries = _github_tree_entries(ref, treeish, current or ref.ref)
+        match = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("path") == part
+                and entry.get("type") == "tree"
+                and isinstance(entry.get("sha"), str)
+            ),
+            None,
+        )
+        current = f"{current}/{part}" if current else part
+        if match is None:
+            raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
+        treeish = match["sha"]
+    return treeish
+
+
+def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
+    """Download one GitHub directory into a repo-shaped tree under ``dest``."""
+    repo_root = dest / "repo"
+    root_parts = [part for part in repo_dir.split("/") if part]
+    state = {"members": 0, "bytes": 0}
+
+    def record_member(path: str) -> None:
+        state["members"] += 1
+        if state["members"] > _MAX_ARCHIVE_MEMBERS:
+            raise RuntimeError(f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})")
+        target = (repo_root / path).resolve()
+        root = repo_root.resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError(f"unsafe path in environment contents: {path!r}")
+
+    def download_file(path: str, declared_size: object, mode: object = None) -> None:
+        record_member(path)
+        if (
+            isinstance(declared_size, int)
+            and declared_size >= 0
+            and state["bytes"] + declared_size > _MAX_ARCHIVE_BYTES
+        ):
+            raise RuntimeError(
+                "environment archive is too large uncompressed "
+                f"({state['bytes'] + declared_size} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+            )
+        remaining = _MAX_ARCHIVE_BYTES - state["bytes"]
+        target = repo_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as out:
+            _urlopen(
+                urllib.request.Request(
+                    _github_contents_url(ref, path),
+                    headers=_github_headers("application/vnd.github.raw"),
+                ),
+                timeout=120.0,
+                max_bytes=remaining,
+                out=out,
+            )
+        state["bytes"] += target.stat().st_size
+        if state["bytes"] > _MAX_ARCHIVE_BYTES:
+            raise RuntimeError(
+                "environment archive is too large uncompressed "
+                f"({state['bytes']} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+            )
+        if isinstance(mode, str):
+            with contextlib.suppress(ValueError):
+                target.chmod(int(mode, 8) & 0o777)
+
+    def create_dir(path: str) -> None:
+        record_member(path)
+        (repo_root / path).mkdir(parents=True, exist_ok=True)
+
+    create_dir(repo_dir)
+    package_tree_sha = _resolve_github_directory_tree_sha(ref, repo_dir)
+    payload = _download_github_json(
+        ref,
+        _github_tree_url(ref, package_tree_sha, recursive=True),
+        repo_dir,
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        raise RuntimeError(
+            f"GitHub path {repo_dir!r} is not an environment directory"
+            f"{_github_response_message(payload)}"
+        )
+    if payload.get("truncated"):
+        raise RuntimeError(
+            f"GitHub tree response for environment directory {repo_dir!r} was truncated"
+        )
+    for entry in payload["tree"]:
+        if not isinstance(entry, dict):
+            raise RuntimeError("GitHub tree response included an invalid entry")
+        rel_path = entry.get("path")
+        if not isinstance(rel_path, str):
+            raise RuntimeError("GitHub tree response included an entry without a path")
+        child_path = _safe_contents_path(f"{repo_dir}/{rel_path}", root_parts)
+        kind = entry.get("type")
+        if kind == "tree":
+            create_dir(child_path)
+        elif kind == "blob" and entry.get("mode") != "120000":
+            download_file(child_path, entry.get("size"), entry.get("mode"))
+        else:
+            raise RuntimeError(f"unsupported entry in environment contents: {child_path!r}")
+    return repo_root
+
+
+class _LimitedReader:
+    """Reader wrapper that caps decompressed tar bytes, including header payloads."""
+
+    def __init__(self, raw, limit: int):
+        self._raw = raw
+        self._remaining = limit
+
+    def read(self, size: int = -1) -> bytes:
+        want = self._remaining + 1 if size is None or size < 0 else min(size, self._remaining + 1)
+        chunk = self._raw.read(want)
+        self._remaining -= len(chunk)
+        if self._remaining < 0:
+            raise RuntimeError(
+                f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
+            )
+        return chunk
+
+
+def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path, subdir: str = "") -> Path:
+    tarball = _download_github_tarball(ref)
+    try:
+        return _safe_extract_archive(tarball, dest, subdir=subdir)
+    finally:
+        if isinstance(tarball, Path):
+            with contextlib.suppress(OSError):
+                tarball.unlink()
+
+
+def _safe_extract_archive(
+    tar_source: bytes | bytearray | Path, dest: Path, subdir: str = ""
+) -> Path:
+    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
+    if isinstance(tar_source, (bytes, bytearray)):
+        with tempfile.NamedTemporaryFile(prefix="flash-env-tar-", suffix=".tar.gz") as spill:
+            spill.write(tar_source)
+            spill.seek(0)
+            return _safe_extract_archive_file(spill, dest, subdir)
+    with tar_source.open("rb") as spill:
+        return _safe_extract_archive_file(spill, dest, subdir)
+
+
+def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
+    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
     root = dest.resolve()
+    want = [p for p in subdir.split("/") if p] if subdir else []
     top_dirs: set[str] = set()
     total = 0
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-        for count, member in enumerate(tar, start=1):
-            if count > _MAX_ARCHIVE_MEMBERS:
+    extracted = 0
+    scanned = 0
+    stream_cap = _MAX_ARCHIVE_BYTES + _MAX_ARCHIVE_MEMBERS * 1024 + (1 << 20)
+    reader = _LimitedReader(gzip.GzipFile(fileobj=tar_file), stream_cap)
+    with tarfile.open(fileobj=reader, mode="r|") as tar:
+        for member in tar:
+            scanned += 1
+            if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
                 raise RuntimeError(
-                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
+                    f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
                 )
             if member.type in _TAR_METADATA_TYPES:
                 continue
-            parts: list[str] = []
-            for part in member.name.replace("\\", "/").split("/"):
-                if not part or part == ".":
-                    continue
-                if part == "..":
-                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-                parts.append(part)
-            if not parts:
+            raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
+            if not raw:
                 continue
-            normalized_name = "/".join(parts)
+            top_dirs.add(raw[0])
+            if want and raw[1 : 1 + len(want)] != want:
+                continue
+            if ".." in raw:
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+            normalized_name = "/".join(raw)
             target = (dest / normalized_name).resolve()
             if target != root and root not in target.parents:
                 raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
-            top_dirs.add(parts[0])
+            extracted += 1
+            if extracted > _MAX_ARCHIVE_MEMBERS:
+                raise RuntimeError(
+                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
+                )
             total += max(0, member.size)
             if total > _MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
@@ -362,23 +623,30 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
             tar.extract(member, dest)
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")
-    extracted = dest / next(iter(top_dirs))
-    if not extracted.is_dir():
-        raise RuntimeError("environment archive did not extract to a directory")
-    return extracted
+    extracted_dir = dest / next(iter(top_dirs))
+    if extracted_dir.exists() and not extracted_dir.is_dir():
+        raise RuntimeError("environment archive had an unexpected layout")
+    if not extracted_dir.is_dir():
+        if want:
+            extracted_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            raise RuntimeError("environment archive did not extract to a directory")
+    return extracted_dir
 
 
 def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
-    # Only forward pinned_sha when set, so the unpatched _resolve_ref_sha(parsed) call shape stays
-    # single-arg (a test monkeypatch like ``lambda parsed: ...`` keeps working).
-    resolved_ref = (
-        _resolve_ref_sha(parsed, pinned_sha=pinned_sha) if pinned_sha else _resolve_ref_sha(parsed)
-    )
+    resolved_ref = _resolve_ref_sha(parsed, pinned_sha=pinned_sha)
+    package_root = _managed_hub_package_root(parsed)
+    if parsed.repo_full_name.lower() == _DEFAULT_MANAGED_ENV_REPO.lower() and not package_root:
+        raise ValueError(
+            "managed environment hub refs must include a namespace/name environment path"
+        )
+    cache_scope = "managed-hub" if package_root else "github"
     cache_key = hashlib.sha256(
-        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
+        f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
     env_file = cache_dir / parsed.path
@@ -394,7 +662,14 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
+        if package_root:
+            # The shared managed hub can be much larger than one environment. Download only the
+            # requested package so worker cache/extraction limits apply to that env, not the hub.
+            extracted = _download_github_directory(resolved, package_root, tmp_parent)
+        else:
+            # Generic GitHub refs keep repo-level sidecars available to relative paths/imports.
+            # User-facing pulls filter to the requested env subtree in flash.envs.pull.
+            extracted = _extract_github_tarball(resolved, tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
@@ -412,9 +687,6 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
 
 
 def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
-    # pinned_sha (resolve-once hook, item 3): when the control plane already resolved this env's
-    # ref->sha, it threads the commit sha here so the GitHub commits API is skipped entirely. None
-    # (the default and today's behavior) means the worker resolves the ref itself.
     if is_managed_environment_slug(env_ref):
         return str(
             _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
@@ -486,6 +758,40 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
+class _ScoredResponseText(str):
+    """String-compatible response passed to SDK scorers.
+
+    The string value is the answer-only completion so existing graders keep their old behavior.
+    Thinking-aware scorers can opt into the structured views.
+    """
+
+    completion: str
+    thinking: str | None
+    raw: str
+
+    def __new__(cls, completion: str, *, raw: str, thinking: str | None):
+        obj = str.__new__(cls, completion)
+        obj.completion = completion
+        obj.thinking = thinking
+        obj.raw = raw
+        return obj
+
+
+def _completion_for_scoring(completion: str, state: dict | None) -> str:
+    if state:
+        raw = state.get("raw")
+        if not isinstance(raw, str):
+            return completion
+        answer = state.get("completion")
+        thinking = state.get("thinking")
+        return _ScoredResponseText(
+            answer if isinstance(answer, str) else completion,
+            raw=raw,
+            thinking=thinking if isinstance(thinking, str) else None,
+        )
+    return completion
+
+
 class FreesoloEnvironment(BaseEnvironment):
     """Flash environment backed by ``freesolo.environments``."""
 
@@ -514,27 +820,14 @@ class FreesoloEnvironment(BaseEnvironment):
 
     @property
     def max_turns(self) -> int:
-        """Rollout turn ceiling the worker reads for the batch-level loop cap.
-
-        A pure multi-turn freesolo env sets a *per-example* budget via
-        ``max_episode_turns(example)`` (e.g. #user turns + a tool-iteration budget per
-        turn). The batch cap the rollout loop uses must be at least the largest such
-        budget, or it would truncate the deepest scenarios before they finish (e.g.
-        support-chat's 4-customer-turn rollouts need ~20 turns, not 8). Take the
-        dataset-wide max once, bounded so a pathological env can't make rollouts
-        unbounded; single-turn / non-multi-turn envs keep the small default. The exact
-        per-example budget is still enforced in :meth:`rollout_done`.
-        """
+        """Batch-level turn ceiling: dataset-wide max of per-example budgets, clamped to [8, 64]."""
         if self._max_turns_cache is not None:
             return self._max_turns_cache
         cap = 8
         if self.multi_turn:
-            cap = 24  # safe default if no per-example budget can be read at all
-            best: int | None = None  # running max — no intermediate list for large datasets
-            for ex in self.dataset():  # cached; see dataset()
-                # Per-example so ONE malformed row (or an env whose max_episode_turns raises on it)
-                # is skipped rather than discarding every budget and silently falling back to 24,
-                # which would reintroduce the truncation this is meant to prevent.
+            cap = 24
+            best: int | None = None
+            for ex in self.dataset():
                 try:
                     turns = int(self._env.max_episode_turns(self._task_example(ex)))
                 except Exception:
@@ -581,9 +874,6 @@ class FreesoloEnvironment(BaseEnvironment):
         return out
 
     def dataset(self) -> list[dict]:
-        # Parse once and cache: the worker reads ``env.dataset()`` AND ``env.max_turns`` (which
-        # also scans the dataset), so without this a multi-turn run would parse/load the whole
-        # dataset twice at startup.
         if self._dataset_cache is not None:
             return self._dataset_cache
         if self._source is None:
@@ -599,15 +889,12 @@ class FreesoloEnvironment(BaseEnvironment):
         records = []
         for example in examples:
             raw = dict(getattr(example, "record", {}) or {})
-            task = getattr(example, "task", None)
-            if _CANONICAL_INPUT_KEY not in raw and task is not None:
-                raw[_CANONICAL_INPUT_KEY] = task
-            task_id = getattr(example, "task_id", None)
-            if task_id is not None:
-                raw.setdefault("id", task_id)
-            expected = getattr(example, "expected_output", None)
-            if expected is not None:
-                raw.setdefault(_CANONICAL_OUTPUT_KEY, _json_safe(expected))
+            if _CANONICAL_INPUT_KEY not in raw and getattr(example, "input", None) is not None:
+                raw[_CANONICAL_INPUT_KEY] = example.input
+            if getattr(example, "id", None) is not None:
+                raw.setdefault("id", example.id)
+            if getattr(example, "output", None) is not None:
+                raw.setdefault(_CANONICAL_OUTPUT_KEY, _json_safe(example.output))
             metadata = getattr(example, "metadata", None)
             if isinstance(metadata, dict) and metadata:
                 raw.setdefault("metadata", metadata)
@@ -621,16 +908,7 @@ class FreesoloEnvironment(BaseEnvironment):
         return [dict(message) for message in messages]
 
     def sft_completion(self, example: dict) -> list[dict]:
-        """Target completion messages to append after the prompt for one SFT example.
-
-        Delegates to the freesolo-sdk env's first-class ``Environment.sft_completion``, which turns
-        the record's ``output`` into the target messages: a MULTI-TURN target trajectory —
-        assistant turns, tool calls, tool results, replies (authored as ``output = {"messages":
-        [...]}`` or a bare message list) — when the row ships one, else a single assistant turn from
-        a scalar output. So the SFT example shape is owned by the freesolo-sdk dataset layer
-        (``freesolo.datasets.target_messages``), not a flash-only convention; ``len(...) > 1`` is
-        multi-turn. Falls back to reading the raw record only for an older installed SDK that
-        predates the method."""
+        """Target completion messages for one SFT example; falls back to raw record output."""
         fn = getattr(self._env, "sft_completion", None)
         if callable(fn):
             msgs = fn(self._task_example(example))
@@ -639,24 +917,58 @@ class FreesoloEnvironment(BaseEnvironment):
         value = example.get(_CANONICAL_OUTPUT_KEY)
         if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
             return [dict(m) for m in value]
-        if isinstance(value, dict) and list(value) == ["messages"] and isinstance(value["messages"], list):
+        if (
+            isinstance(value, dict)
+            and list(value) == ["messages"]
+            and isinstance(value["messages"], list)
+        ):
             return [dict(m) for m in value["messages"]]
         return [{"role": "assistant", "content": "" if value is None else str(value)}]
+
+    def _single(self, results, method: str):
+        if len(results) != 1:
+            raise RuntimeError(f"Freesolo environment {method} returned the wrong length")
+        return results[0]
+
+    def _score_one(self, completion: str, example: dict, state: dict | None):
+        if state and self.multi_turn:
+            return self._score_episode(example, state)
+        rewards = self._env.score_responses(
+            self._task_example(example), [_completion_for_scoring(completion, state)]
+        )
+        return self._single(rewards, "score_responses")
 
     def scores_breakdown(
         self, completion: str, example: dict, state: dict | None = None
     ) -> dict[str, float]:
-        if state and self.multi_turn:
-            reward = self._score_episode(example, state)
-        else:
-            rewards = self._env.score_responses(self._task_example(example), [completion])
-            if len(rewards) != 1:
-                raise RuntimeError("Freesolo environment score_responses returned the wrong length")
-            reward = rewards[0]
-        return self._reward_to_breakdown(reward)
+        return self._reward_to_breakdown(self._score_one(completion, example, state))
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
-        return float(self.scores_breakdown(completion, example, state)["total"])
+        return float(getattr(self._score_one(completion, example, state), "score", 0.0))
+
+    def _grouped_score(self, items, *, task_of, payload_of, scorer, method: str) -> list[float]:
+        """Group rollouts that share an example (input order preserved), score each group with ONE
+        concurrent ``scorer(task, payloads)`` call, then scatter rewards back to per-item order.
+        ``task_of(ex, st)`` builds a group's task; ``payload_of(st)`` its per-rollout payload."""
+        groups: dict[str, dict] = {}
+        order: list[str] = []
+        for i, (ex, st) in enumerate(items):
+            key = json.dumps(ex, sort_keys=True, default=str)
+            grp = groups.get(key)
+            if grp is None:
+                grp = groups[key] = {"task": task_of(ex, st), "idxs": [], "payloads": []}
+                order.append(key)
+            grp["idxs"].append(i)
+            grp["payloads"].append(payload_of(st))
+        out: list[float] = [0.0] * len(items)
+        for key in order:
+            grp = groups[key]
+            rewards = scorer(grp["task"], grp["payloads"])
+            if len(rewards) != len(grp["payloads"]):
+                raise RuntimeError(f"Freesolo environment {method} returned the wrong length")
+            for idx, rw in zip(grp["idxs"], rewards, strict=True):
+                out[idx] = float(rw.score)
+        return out
 
     def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
         """Reward for many ``(example, state)`` rollouts at once, in input order.
@@ -685,75 +997,30 @@ class FreesoloEnvironment(BaseEnvironment):
             # paths below — passing it as the completion is a no-op for the multi-turn (state) branch.
             return [self.reward(str(st.get("response_text") or ""), ex, st) for ex, st in items]
         if not self.multi_turn:
-            # Single-turn: group rollouts of the same example so their completions go through ONE
-            # score_responses() call (env-concurrent), mirroring the multi-turn score_episodes()
-            # batching below. Without this, a GRPO step's whole completion batch was scored by
-            # serial per-rollout reward() calls — one blocking judge/API round-trip at a time, with
-            # the GPU idle throughout. Scoring grades the rollout's actual response (stored on the
-            # state), not "" (which would score every item empty).
-            groups: dict[str, dict] = {}
-            order: list[str] = []
-            for i, (ex, st) in enumerate(items):
-                key = json.dumps(ex, sort_keys=True, default=str)
-                grp = groups.get(key)
-                if grp is None:
-                    grp = groups[key] = {"task": self._task_example(ex), "idxs": [], "responses": []}
-                    order.append(key)
-                grp["idxs"].append(i)
-                grp["responses"].append(str(st.get("response_text") or ""))
-            out: list[float] = [0.0] * len(items)
-            for key in order:
-                grp = groups[key]
-                rewards = self._env.score_responses(grp["task"], grp["responses"])
-                if len(rewards) != len(grp["responses"]):
-                    raise RuntimeError("Freesolo environment score_responses returned the wrong length")
-                for idx, rw in zip(grp["idxs"], rewards, strict=True):
-                    out[idx] = float(rw.score)
-            return out
-        groups: dict[str, dict] = {}
-        order: list[str] = []
-        for i, (ex, st) in enumerate(items):
-            # Group rollouts of the same example (a GRPO group shares one prompt) so their episodes
-            # are scored together; the example dict is the stable grouping key.
-            key = json.dumps(ex, sort_keys=True, default=str)
-            grp = groups.get(key)
-            if grp is None:
-                grp = groups[key] = {
-                    "task": st.get("task") or self._task_example(ex),
-                    "idxs": [],
-                    "episodes": [],
-                }
-                order.append(key)
-            grp["idxs"].append(i)
-            grp["episodes"].append(self._episode_from_state(st))
-        out: list[float] = [0.0] * len(items)
-        for key in order:
-            grp = groups[key]
-            rewards = self._env.score_episodes(grp["task"], grp["episodes"])
-            if len(rewards) != len(grp["episodes"]):
-                raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
-            for idx, rw in zip(grp["idxs"], rewards, strict=True):
-                out[idx] = float(rw.score)
-        return out
+            return self._grouped_score(
+                items,
+                task_of=lambda ex, st: self._task_example(ex),
+                payload_of=lambda st: _completion_for_scoring(
+                    str(st.get("response_text") or ""), st
+                ),
+                scorer=self._env.score_responses,
+                method="score_responses",
+            )
+        return self._grouped_score(
+            items,
+            task_of=lambda ex, st: st.get("task") or self._task_example(ex),
+            payload_of=self._episode_from_state,
+            scorer=self._env.score_episodes,
+            method="score_episodes",
+        )
 
     @property
     def reward_thread_safe(self) -> bool:
-        """Whether ``reward`` may be called concurrently across rollouts (multiturn_rollout's
-        ``_score_rollouts`` thread-pool fallback, used when the env has no ``reward_many``). The
-        verifiers reward contract is a pure scorer — ``score_responses`` reads the per-call inputs +
-        immutable env config — so the default is True. An underlying env whose scorer keeps mutable
-        state or a thread-bound client opts out with ``reward_thread_safe = False`` (scored serially)."""
+        """Whether reward() may be called concurrently; delegates to the underlying env."""
         return bool(getattr(self._env, "reward_thread_safe", True))
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
-        if state and self.multi_turn:
-            reward = self._score_episode(example, state)
-        else:
-            rewards = self._env.score_responses(self._task_example(example), [completion])
-            if len(rewards) != 1:
-                raise RuntimeError("Freesolo environment score_responses returned the wrong length")
-            reward = rewards[0]
-        return bool(reward.resolved_success())
+        return bool(self._score_one(completion, example, state).resolved_success())
 
     def tools(self) -> list:
         return []
@@ -761,9 +1028,6 @@ class FreesoloEnvironment(BaseEnvironment):
     def new_rollout_state(self, example: dict) -> dict:
         task = self._task_example(example)
         prompt = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
-        # Per-example turn budget (env's max_episode_turns) so rollout_done caps THIS
-        # rollout at its own budget rather than the batch-wide ceiling -- a single-turn
-        # scenario stops after a few turns while a deep one gets its full budget.
         try:
             episode_turns: int | None = int(self._env.max_episode_turns(task))
         except Exception:
@@ -818,9 +1082,7 @@ class FreesoloEnvironment(BaseEnvironment):
             return True
         if bool(state.get("done")):
             return True
-        # Prefer THIS rollout's own per-example budget (set in new_rollout_state); fall
-        # back to the batch-wide cap the worker passes. The env normally terminates via
-        # step.done well before either, so this is a non-termination guard.
+        # Per-example budget takes precedence over batch-wide cap.
         cap = state.get("max_episode_turns")
         if cap is None:
             cap = max_turns
@@ -839,9 +1101,7 @@ class FreesoloEnvironment(BaseEnvironment):
     def _score_episode(self, example: dict, state: dict):
         task = state.get("task") or self._task_example(example)
         rewards = self._env.score_episodes(task, [self._episode_from_state(state)])
-        if len(rewards) != 1:
-            raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
-        return rewards[0]
+        return self._single(rewards, "score_episodes")
 
     def reward_from_messages(
         self, completion_msgs: list[dict], example: dict, prompt_msgs: list[dict] | None = None
@@ -861,19 +1121,13 @@ class FreesoloEnvironment(BaseEnvironment):
             turns=tuple(turns),
         )
         rewards = self._env.score_episodes(self._task_example(example), [episode])
-        if len(rewards) != 1:
-            raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
-        return float(rewards[0].score)
+        return float(self._single(rewards, "score_episodes").score)
 
 
 def load_freesolo_environment(
     env_id: str, pinned_sha: str | None = None, /, **kwargs
 ) -> FreesoloEnvironment:
-    # pinned_sha is a POSITIONAL-ONLY resolve-once hook (the control-plane-pinned commit sha). It is
-    # positional-only (the `/`) precisely so a user [environment.params] entry of ANY name — even
-    # one literally named "pinned_sha" — lands in **kwargs and is forwarded verbatim to the Freesolo
-    # SDK loader, never binding to or shadowing this internal pin. None (default) preserves today's
-    # behavior — the worker resolves the env ref->sha itself.
+    # pinned_sha is positional-only so user [environment.params] named "pinned_sha" goes to **kwargs, not here.
     tools = _import_freesolo_environment_tools()
     reference = _resolve_environment_reference(env_id, pinned_sha)
     reference_path = Path(reference)
