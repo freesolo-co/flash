@@ -102,6 +102,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     spec = JobSpec.from_dict(status.spec)
     remote = dict(status.remote)
     seed = int(remote.pop("seed", FIXED_SEED))
+    code_prefix = remote.pop("code_prefix", None)
     # The class the run actually provisioned (a policy retry may have walked past the
     # provisional spec.gpu.type). The in-process success path stamps this into metrics;
     # on recovery the worker output carries no such field, so recover it from the handle
@@ -132,7 +133,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
-            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0))
+            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0), code_prefix=code_prefix)
             return get_status(run_id)
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)

@@ -492,12 +492,20 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     import contextlib
     import os
     import subprocess
+    import types
 
     import huggingface_hub
 
     from flash.providers.runpod.train import endpoints
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(tmp_path))
+    code_prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    list_calls = []
+    download_calls = []
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda *a, **k: pytest.fail("code download should not use snapshot_download"),
+    )
 
     uploads = []
 
@@ -505,14 +513,29 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         def __init__(self, token=None):
             pass
 
+        def list_repo_tree(self, **kw):
+            list_calls.append(kw)
+            return [
+                types.SimpleNamespace(path=f"{code_prefix}/__init__.py", size=0),
+                types.SimpleNamespace(path=f"{code_prefix}/engine/worker.py", size=10),
+                types.SimpleNamespace(path=f"{code_prefix}/engine", tree_id="folder"),
+            ]
+
         def upload_file(self, **kw):
             uploads.append(kw)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
+    def fake_hf_hub_download(*, filename, local_dir, **kw):
+        download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
+        return os.path.join(local_dir, filename)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
+
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
+            assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
             self.stdout = iter(["worker booting\n", "torch.cuda.OutOfMemoryError: CUDA OOM\n"])
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
@@ -528,6 +551,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         "hf_repo": "owner/runs",
         "job_spec_json": job_spec,
         "env": {"HF_TOKEN": "tok", "PYTHONPATH": ""},
+        "code_prefix": code_prefix,
     }
 
     try:
@@ -538,9 +562,45 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         console_uploads = [u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")]
         assert console_uploads, f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
         assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
+        assert list_calls[0]["path_in_repo"] == code_prefix
+        assert [call["filename"] for call in download_calls] == [
+            f"{code_prefix}/__init__.py",
+            f"{code_prefix}/engine/worker.py",
+        ]
     finally:
         # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
         # doesn't leak state across tests (flaky under isolated/parallel runners).
         for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(_p)
+
+
+def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
+    import huggingface_hub
+
+    from flash.providers.runpod.train import endpoints
+
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda *a, **k: pytest.fail("snapshot_download should not run with an invalid code prefix"),
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(
+            {
+                "phase": "sft",
+                "seed": 0,
+                "hf_repo": "owner/runs",
+                "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
+                "env": {"HF_TOKEN": "tok"},
+                "code_prefix": "../code/flash",
+            }
+        )
+
+
+def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
+    from flash.providers import _instance_bootstrap
+    from flash.providers.runpod.train import endpoints
+
+    assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 600.0
+    assert _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 600.0

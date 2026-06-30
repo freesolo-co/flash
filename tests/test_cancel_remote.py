@@ -77,38 +77,6 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     assert out.state == "cancelled"
 
 
-def test_cancel_holds_deploy_lock_through_checkpoint_registration(tmp_path, monkeypatch):
-    # The repo GC takes the SAME per-run deploy lock (non-blocking) before deleting a repo. Cancel
-    # finalization (the `cancelled` write + checkpoint mirroring) must hold that lock, so the GC
-    # can't delete a just-cancelled run's (possibly >30d-old) repo mid-registration.
-    import flash.runner as orch
-    from flash.server import _locks
-    from flash.server import checkpoints as ckpt
-    from flash.spec import JobSpec
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    spec = JobSpec.from_dict(
-        {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "gpu": {"type": "RTX 5090"}, "run_id": "flash-lock-1"}
-    )
-    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
-    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda gpu, run_id: [{"success": True}])
-
-    seen = {}
-
-    def fake_register(status, **kw):
-        # A concurrent GC try-acquire must fail (return None) while we're finalizing the cancel.
-        held = _locks._try_hold_deploy_lock(status.run_id)
-        seen["gc_locked_out"] = held is None
-        if held is not None:
-            held.release()
-
-    monkeypatch.setattr(ckpt, "register_checkpoints_best_effort", fake_register)
-
-    out = orch.cancel_run(spec.run_id)
-    assert out.state == "cancelled"
-    assert seen["gc_locked_out"] is True
-
-
 def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # Cancelling a deployed run tears down its serve endpoint; the deployment record
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the

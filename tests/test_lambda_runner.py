@@ -18,6 +18,8 @@ import pytest
 
 from flash.spec import JobSpec
 
+CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
+
 
 def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
     gpu = {"type": gpu_type, "max_wall_seconds": 3600, **gpu_kw}
@@ -69,6 +71,7 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     assert payload["hf_repo"] == "org/repo"
     # The worker env's HF_REPO is sourced from the run's [train] hf_repo (not an operator default).
     assert payload["env"]["HF_REPO"] == "org/repo"
+    assert builders.build_payload(_spec(), seed=0, attempt=1, code_prefix=CODE_PREFIX)["code_prefix"] == CODE_PREFIX
 
     script = builders.build_user_data(payload)
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
@@ -148,6 +151,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
             "env": {},
             "extra_pip": [],
             "hf_prefix": "sft/x",
+            "code_prefix": CODE_PREFIX,
             "max_wall_s": 60,
             "attempt": 0,
         },
@@ -220,7 +224,9 @@ def test_bootstrap_sets_lambda_arm():
     attributes the substrate (Lambda's build_payload sets it to 'lambda')."""
     from flash.providers import _instance_bootstrap as lb
 
-    env = lb.build_worker_env({"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"})
+    env = lb.build_worker_env(
+        {"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda", "code_prefix": CODE_PREFIX}
+    )
     assert env["FLASH_ARM"] == "lambda"
     # And Lambda's build_payload is what sets flash_arm='lambda'.
     from flash.providers.lambdalabs.jobs.builders import build_payload
@@ -234,13 +240,65 @@ def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
     from flash.providers import _instance_bootstrap as lb
     from flash.providers.lambdalabs.jobs.builders import build_payload
 
-    base = {"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}
+    base = {"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda", "code_prefix": CODE_PREFIX}
     assert lb.build_worker_env({**base, "attempt": 3})["ATTEMPT"] == "3"
     # First attempt + a missing key both stamp "0" (matching RunPod's str(int(attempt))).
     assert lb.build_worker_env({**base, "attempt": 0})["ATTEMPT"] == "0"
     assert lb.build_worker_env(base)["ATTEMPT"] == "0"
     # And the producer end actually carries the launched attempt into the payload bootstrap reads.
     assert build_payload(_spec(), seed=0, attempt=2)["attempt"] == 2
+
+
+def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
+    import types
+
+    import huggingface_hub
+
+    from flash.providers import _instance_bootstrap as lb
+
+    monkeypatch.setattr(lb, "CODE_ROOT", str(tmp_path))
+    list_calls = []
+    download_calls = []
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_tree(self, **kw):
+            list_calls.append(kw)
+            return [
+                types.SimpleNamespace(path=f"{CODE_PREFIX}/__init__.py", size=0),
+                types.SimpleNamespace(path=f"{CODE_PREFIX}/runner.py", size=10),
+                types.SimpleNamespace(path=f"{CODE_PREFIX}", tree_id="folder"),
+            ]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    def fake_hf_hub_download(*, filename, local_dir, **kw):
+        download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
+        target = tmp_path / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("")
+        return str(target)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
+
+    lb.fetch_code({"hf_repo": "org/repo", "code_prefix": CODE_PREFIX, "env": {"HF_TOKEN": "tok"}})
+
+    assert list_calls == [
+        {
+            "repo_id": "org/repo",
+            "repo_type": "dataset",
+            "path_in_repo": CODE_PREFIX,
+            "recursive": True,
+            "token": "tok",
+        }
+    ]
+    assert [call["filename"] for call in download_calls] == [
+        f"{CODE_PREFIX}/__init__.py",
+        f"{CODE_PREFIX}/runner.py",
+    ]
+    assert all(call["local_dir"] == str(tmp_path) for call in download_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +988,8 @@ def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")
     monkeypatch.setenv("HF_TOKEN", "hf")
     payload = builders.build_payload(_spec(), seed=0, attempt=2)
+    assert payload["code_prefix"].startswith("code/")
+    assert payload["code_prefix"].endswith("/flash")
     script = builders.build_user_data(payload)
     # the uploader INVOCATION precedes the image pull
     assert "python3 /opt/flash/hostlog.py" in script
@@ -1615,7 +1675,15 @@ def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
     big = '{"k":"' + "v" * 200_000 + '"}'
     monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: big)
     env = lb.build_worker_env(
-        {"job_spec_json": "", "job_spec_in_hf": True, "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}
+        {
+            "job_spec_json": "",
+            "job_spec_in_hf": True,
+            "phase": "sft",
+            "seed": 0,
+            "env": {},
+            "flash_arm": "lambda",
+            "code_prefix": CODE_PREFIX,
+        }
     )
     # A >96k spec is passed via file, mirroring the inline-large path.
     assert env["FLASH_JOB_SPEC_PATH"] == "/tmp/job_spec.json"
@@ -1664,7 +1732,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
         lambda path=lb.PAYLOAD_PATH: {
             "hf_repo": "org/repo", "job_spec_json": "", "job_spec_in_hf": True,
             "phase": "sft", "seed": 0, "flash_arm": "lambda", "env": {}, "extra_pip": [],
-            "hf_prefix": "sft/x", "max_wall_s": 60, "attempt": 0,
+            "hf_prefix": "sft/x", "code_prefix": CODE_PREFIX, "max_wall_s": 60, "attempt": 0,
         },
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)

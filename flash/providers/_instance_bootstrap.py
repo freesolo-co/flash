@@ -16,7 +16,7 @@ import time
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
-CODE_DIR = "/runcode/code"
+_CONSOLE_UPLOAD_INTERVAL_S = 600.0
 
 
 class RetriableBootstrapError(RuntimeError):
@@ -30,6 +30,28 @@ def load_payload() -> dict:
 
 def _arm(payload: dict) -> str:
     return str(payload.get("flash_arm") or "instance")
+
+
+def _code_prefix(payload: dict) -> str:
+    raw = payload.get("code_prefix")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("missing code_prefix")
+    prefix = raw.strip().strip("/")
+    parts = prefix.split("/")
+    digest = parts[1] if len(parts) == 3 else ""
+    if (
+        len(parts) != 3
+        or parts[0] != "code"
+        or parts[2] != "flash"
+        or len(digest) != 32
+        or any(c not in "0123456789abcdef" for c in digest)
+    ):
+        raise ValueError(f"invalid code_prefix: {prefix!r}")
+    return prefix
+
+
+def _code_dir(payload: dict) -> str:
+    return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)) or ".")
 
 
 def hf_upload(payload: dict, local_path: str, repo_subpath: str) -> None:
@@ -114,27 +136,45 @@ def build_worker_env(payload: dict) -> dict:
     env["ATTEMPT"] = str(int(payload.get("attempt") or 0))
     # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
-    env["PYTHONPATH"] = CODE_DIR + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    code_dir = _code_dir(payload)
+    env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
 
 
 def fetch_code(payload: dict) -> None:
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfApi, hf_hub_download
 
-    snapshot_download(
-        repo_id=payload["hf_repo"],
-        repo_type="dataset",
-        allow_patterns=["code/**"],
-        local_dir=CODE_ROOT,
-        token=(payload.get("env") or {}).get("HF_TOKEN"),
-    )
+    prefix = _code_prefix(payload)
+    token = (payload.get("env") or {}).get("HF_TOKEN")
+    api = HfApi(token=token)
+    files = [
+        entry.path
+        for entry in api.list_repo_tree(
+            repo_id=payload["hf_repo"],
+            repo_type="dataset",
+            path_in_repo=prefix,
+            recursive=True,
+            token=token,
+        )
+        if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
+    ]
+    if not files:
+        raise RuntimeError(f"no flash code files found under {payload['hf_repo']}:{prefix}")
+    for filename in files:
+        hf_hub_download(
+            repo_id=payload["hf_repo"],
+            repo_type="dataset",
+            filename=filename,
+            local_dir=CODE_ROOT,
+            token=token,
+        )
 
 
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
     timed_out = False
-    upload_interval = 30.0
+    upload_interval = _CONSOLE_UPLOAD_INTERVAL_S
 
     def upload_console_tail(extra: str = "") -> None:
         tail_path = console + ".tail"
@@ -159,9 +199,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                 print(f"console upload warn: {exc}", flush=True)
 
     with open(console, "w", buffering=1) as cf:
+        code_dir = _code_dir(payload)
         proc = subprocess.Popen(
             [sys.executable, "-m", "flash.engine.worker"],
-            cwd=CODE_DIR,
+            cwd=code_dir,
             env={**env, "RUN_MODE": mode},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

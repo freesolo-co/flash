@@ -28,6 +28,7 @@ FLASH_SDK_LOCK = threading.Lock()
 RUNPOD_ENDPOINT_SLOT_CAP = 28
 _SLOT_QUEUE_WAIT_S = 10.0
 _SLOT_STORE_MAX_ERRORS = 6
+_CONSOLE_UPLOAD_INTERVAL_S = 600.0
 
 _LOCAL_SLOTS = threading.Semaphore(RUNPOD_ENDPOINT_SLOT_CAP)
 # name -> "shared"|"local": tracks how this process acquired each slot so release routes correctly.
@@ -233,14 +234,53 @@ def _train_body(input_data: dict) -> dict:
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
 
     overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
-    snapshot_download(
-        repo_id=input_data["hf_repo"],
-        repo_type="dataset",
-        allow_patterns=["code/**"],
-        local_dir="/runcode",
-        token=overrides.get("HF_TOKEN"),
-    )
-    code_dir = "/runcode/code"
+
+    def _code_prefix() -> str:
+        raw = input_data.get("code_prefix")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("missing code_prefix")
+        prefix = raw.strip().strip("/")
+        parts = prefix.split("/")
+        digest = parts[1] if len(parts) == 3 else ""
+        if (
+            len(parts) != 3
+            or parts[0] != "code"
+            or parts[2] != "flash"
+            or len(digest) != 32
+            or any(c not in "0123456789abcdef" for c in digest)
+        ):
+            raise ValueError(f"invalid code_prefix: {prefix!r}")
+        return prefix
+
+    def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        api = HfApi(token=token)
+        files = [
+            entry.path
+            for entry in api.list_repo_tree(
+                repo_id=repo_id,
+                repo_type="dataset",
+                path_in_repo=prefix,
+                recursive=True,
+                token=token,
+            )
+            if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
+        ]
+        if not files:
+            raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
+        for filename in files:
+            hf_hub_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                filename=filename,
+                local_dir="/runcode",
+                token=token,
+            )
+
+    code_prefix = _code_prefix()
+    _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
+    code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
 
     env = dict(os.environ)
     env.update(overrides)
@@ -295,7 +335,7 @@ def _train_body(input_data: dict) -> dict:
     def run_mode(mode: str, check: bool) -> int:
         """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
         console = f"/tmp/console_{mode}.txt"
-        interval = 30.0
+        interval = _CONSOLE_UPLOAD_INTERVAL_S
         stop_upload = threading.Event()
 
         def _upload_loop() -> None:

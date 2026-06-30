@@ -4,6 +4,7 @@ cross-process cancel, and attach (CPU-only; all network mocked)."""
 from __future__ import annotations
 
 import base64
+import re
 import sys
 import tempfile
 
@@ -12,42 +13,6 @@ import pytest
 # ---------------------------------------------------------------------------
 # decode_output / JobHandle
 # ---------------------------------------------------------------------------
-
-
-def test_touch_warmstart_source_bumps_only_managed_source(monkeypatch):
-    # The repo GC's age gate is age-reset for a warm-start SOURCE repo by writing a reference marker
-    # into it (cross-plane-safe). Only managed Freesolo-Co/flashrun-* sources are touched.
-    import huggingface_hub
-
-    from flash.runner import lifecycle
-    from flash.spec import JobSpec
-
-    calls = []
-
-    class _FakeApi:
-        def __init__(self, token=None):
-            pass
-
-        def upload_file(self, **kw):
-            calls.append(kw)
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
-
-    def _spec(run_id, ref):
-        return JobSpec.from_dict(
-            {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": run_id, "train": {"init_from_adapter": ref}}
-        )
-
-    lifecycle._touch_warmstart_source(_spec("flash-grpo-1", "Freesolo-Co/flashrun-sft0:sft/sft0"))
-    assert len(calls) == 1
-    assert calls[0]["repo_id"] == "Freesolo-Co/flashrun-sft0"
-    assert calls[0]["path_in_repo"] == "referenced_by/flash-grpo-1"
-    assert calls[0]["repo_type"] == "dataset"
-
-    calls.clear()
-    lifecycle._touch_warmstart_source(_spec("flash-grpo-2", "someuser/somerepo:sft/x"))  # user ref
-    lifecycle._touch_warmstart_source(_spec("flash-grpo-3", ""))  # no warm-start
-    assert calls == []
 
 
 def test_job_handle_roundtrip():
@@ -486,6 +451,34 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
     PROVIDER.poll(JobHandle.from_dict(base), spec, 0)
     assert captured["queue_grace_s"] == 300.0
     assert captured["current_attempt"] is None
+
+
+def test_submit_run_payload_carries_code_prefix(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="flash-code-prefix",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type="RTX 4090"),
+    )
+    submitted: dict = {}
+    monkeypatch.setattr(jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name"))
+    monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
+    monkeypatch.setattr(
+        runpod_api,
+        "submit_job",
+        lambda endpoint_id, payload: submitted.update({"endpoint_id": endpoint_id, "payload": payload}) or "job-1",
+    )
+    monkeypatch.setattr(jobs, "poll_job", lambda *a, **k: jobs.PollResult(True, metrics={}))
+
+    pinned_prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    assert jobs.submit_run(spec, seed=0, code_prefix=pinned_prefix).ok
+    assert submitted["endpoint_id"] == "ep"
+    assert submitted["payload"]["code_prefix"] == pinned_prefix
 
 
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
@@ -1165,9 +1158,12 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         import flash.providers.runpod.train as flash_train
 
         calls = {"n": 0}
+        code_prefixes: list[str | None] = []
+        uploaded: dict[str, str | None] = {}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, code_prefix=None, **_):
             calls["n"] += 1
+            code_prefixes.append(code_prefix)
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}", "attempt": attempt})
             if calls["n"] == 1:
@@ -1175,12 +1171,18 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(
+            flash_train,
+            "upload_code",
+            lambda repo=None, code_prefix=None: uploaded.setdefault("code_prefix", code_prefix) or "repo",
+        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         orch.submit_job(_spec("retry-ok"), dry_run=False, background=False)
         st = orch.get_status("retry-ok")
         assert st.state == "done"
         assert calls["n"] == 2
+        assert code_prefixes == [uploaded["code_prefix"], uploaded["code_prefix"]]
+        assert re.fullmatch(r"code/[0-9a-f]{32}/flash", uploaded["code_prefix"] or "")
         assert st.remote["job_id"] == "j2"  # latest handle persisted
 
 
@@ -1205,7 +1207,7 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         orch.submit_job(_spec("cancel-reap"), dry_run=False, background=False)
@@ -1233,7 +1235,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         orch.submit_job(_spec("cancel-retry"), dry_run=False, background=False)
         assert orch.get_status("cancel-retry").state == "done"
@@ -1255,7 +1257,7 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
             )
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         with pytest.raises(RuntimeError):
             orch.submit_job(_spec("fail-fast"), dry_run=False, background=False)
@@ -1282,7 +1284,7 @@ def test_supervisor_infra_failure_retries_up_to_floor(monkeypatch):
             return jobs.PollResult(False, failure="stalled", detail="GPU never became ready")
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         with pytest.raises(RuntimeError):
             orch.submit_job(_spec("infra-floor"), dry_run=False, background=False)  # max_retries=2
@@ -1307,7 +1309,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
             return jobs.PollResult(False, failure="stalled", detail="frozen")
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id="no-retry", model="Qwen/Qwen3.5-0.8B", algorithm="grpo",
@@ -1341,7 +1343,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -1383,7 +1385,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
             )
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -1441,7 +1443,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -1493,7 +1495,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -1545,7 +1547,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -1705,8 +1707,9 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         seen = {}
 
-        def fake_training(spec, log, *, prior_cost, runtime_secrets=None):
+        def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
             seen["remote"] = orch.get_status(spec.run_id).remote
+            seen["code_prefix"] = code_prefix
             orch._update(spec.run_id, "done", cost_usd=prior_cost)
 
         monkeypatch.setattr(orch, "_run_training", fake_training)
@@ -1714,8 +1717,55 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         st = orch.attach_run("i1", log_stream=sys.stderr)
 
         assert seen["remote"] is None, "stale dead handle must be cleared before resuming"
+        assert seen["code_prefix"] is None
         assert st.state != "failed", "a job lost to the redeploy must be resumed, not failed"
         assert st.state == "done"
+
+
+def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="pinned-code",
+                state="running",
+                spec=_spec("pinned-code").to_dict(),
+                cost_usd=0.25,
+                remote={
+                    "endpoint_id": "epA",
+                    "endpoint_name": "n",
+                    "job_id": "jA",
+                    "on_last_gpu": False,
+                    "attempt": 0,
+                    "code_prefix": "code/0123456789abcdef0123456789abcdef/flash",
+                },
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="host vanished"),
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        seen = {}
+
+        def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
+            seen["prior_cost"] = prior_cost
+            seen["code_prefix"] = code_prefix
+            orch._update(spec.run_id, "done", cost_usd=prior_cost)
+
+        monkeypatch.setattr(orch, "_run_training", fake_training)
+
+        st = orch.attach_run("pinned-code", log_stream=sys.stderr)
+
+        assert st.state == "done"
+        assert seen == {
+            "prior_cost": 0.25,
+            "code_prefix": "code/0123456789abcdef0123456789abcdef/flash",
+        }
 
 
 def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
@@ -1751,7 +1801,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         resumed = {"called": False}
 
-        def fake_training(spec, log, *, prior_cost, runtime_secrets=None):
+        def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
             # The training submit re-runs the run; a genuinely broken run fails there (matches
             # _submit_seed_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True

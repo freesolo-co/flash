@@ -19,7 +19,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
         # _run_job_inner uploads the run code before training; stub it (no HF).
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "mock/repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "mock/repo")
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
@@ -71,17 +71,20 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
 
 def test_upload_code_forces_private_on_reused_repo(monkeypatch):
-    """Run artifact repos are ALWAYS private. create_repo(exist_ok=True) is a no-op on an existing
-    repo, so a repo previously created public must still be flipped private via
-    update_repo_settings — otherwise reused/public repos leak run code, adapters, and metrics."""
+    """Run artifact repos are ALWAYS private. Existing repos must be flipped private without calling
+    create_repo, so reused environment repos do not consume the HF repository-creation budget."""
     import sys
     import types
 
-    calls = {"create": [], "settings": [], "upload": []}
+    calls = {"info": [], "create": [], "settings": [], "upload": []}
 
     class _FakeApi:
         def __init__(self, token=None):
             pass
+
+        def repo_info(self, **kw):
+            calls["info"].append(kw)
+            return types.SimpleNamespace(private=False)
 
         def create_repo(self, repo, **kw):
             calls["create"].append((repo, kw))
@@ -98,23 +101,171 @@ def test_upload_code_forces_private_on_reused_repo(monkeypatch):
 
     import flash.providers.runpod.train as flash_train
 
+    flash_train._VERIFIED_PRIVATE_ARTIFACT_REPOS.clear()
     assert flash_train.upload_code("owner/run-artifacts") == "owner/run-artifacts"
 
-    # created private...
-    assert calls["create"], "create_repo was not called"
-    assert calls["create"][0][1].get("private") is True
-    # ...AND visibility forced private on the (possibly pre-existing public) repo
+    assert calls["info"], "repo_info should verify whether the repo already exists"
+    assert calls["create"] == [], "existing repos must not hit the repository-creation endpoint"
     assert calls["settings"], "update_repo_settings was not called — reused public repo can leak"
     assert calls["settings"][0].get("private") is True
     assert calls["settings"][0].get("repo_id") == "owner/run-artifacts"
 
 
-def test_upload_code_mirrors_package_purging_stale_remote(monkeypatch):
-    """The upload must MIRROR the local flash package: delete_patterns=['**'] (relative to
-    code/flash) so any orphaned/renamed remote module from a prior commit is purged, not left for
-    the worker to re-import. This is the deployment-robustness guard against a run picking up OLD
-    code in code/flash after a redeploy (the "missing recent fixes on submit" symptom)."""
+def test_upload_code_creates_repo_only_when_missing(monkeypatch):
+    import sys
+    import types
+
+    calls = {"info": [], "create": [], "settings": [], "upload": []}
+
+    class _NotFound(Exception):
+        pass
+
+    _NotFound.__name__ = "RepositoryNotFoundError"
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def repo_info(self, **kw):
+            calls["info"].append(kw)
+            raise _NotFound("missing")
+
+        def create_repo(self, repo, **kw):
+            calls["create"].append((repo, kw))
+
+        def update_repo_settings(self, **kw):
+            calls["settings"].append(kw)
+
+        def upload_folder(self, **kw):
+            calls["upload"].append(kw)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    import flash.providers.runpod.train as flash_train
+
+    flash_train._VERIFIED_PRIVATE_ARTIFACT_REPOS.clear()
+    flash_train.upload_code("owner/new-env-artifacts")
+    flash_train.upload_code("owner/new-env-artifacts")
+
+    assert len(calls["info"]) == 1
+    assert len(calls["create"]) == 1
+    assert calls["create"][0][1]["private"] is True
+    assert len(calls["settings"]) == 1
+    assert len(calls["upload"]) == 2
+
+
+def test_upload_code_retries_transient_repo_settings(monkeypatch):
+    import sys
+    import types
+
+    calls = {"settings": 0, "upload": []}
+
+    class _Response:
+        status_code = 504
+
+    class _Transient(Exception):
+        response = _Response()
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(private=True)
+
+        def create_repo(self, repo, **kw):
+            raise AssertionError("existing repo should not be created")
+
+        def update_repo_settings(self, **kw):
+            calls["settings"] += 1
+            if calls["settings"] == 1:
+                raise _Transient("gateway timeout")
+
+        def upload_folder(self, **kw):
+            calls["upload"].append(kw)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    import flash.providers.runpod.train as flash_train
+
+    flash_train._VERIFIED_PRIVATE_ARTIFACT_REPOS.clear()
+    monkeypatch.setattr(flash_train.time, "sleep", lambda _delay: None)
+
+    flash_train.upload_code("owner/transient-settings")
+
+    assert calls["settings"] == 2
+    assert calls["upload"]
+
+
+def test_hf_call_honors_retry_after(monkeypatch):
+    import flash.providers.runpod.train as flash_train
+
+    sleeps: list[float] = []
+    logs: list[tuple[str, tuple]] = []
+
+    class _Response:
+        status_code = 429
+
+        def __init__(self) -> None:
+            self.headers = {"Retry-After": "17"}
+
+    class _RateLimited(Exception):
+        response = _Response()
+
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _RateLimited("slow down")
+        return "ok"
+
+    monkeypatch.setattr(flash_train.time, "sleep", sleeps.append)
+    monkeypatch.setattr(flash_train.logger, "warning", lambda msg, *args: logs.append((msg, args)))
+
+    assert flash_train._hf_call(flaky, "upload") == "ok"
+    assert sleeps == [17.0]
+    assert logs
+
+
+def test_hf_call_caps_http_date_retry_after(monkeypatch):
+    import flash.providers.runpod.train as flash_train
+
+    sleeps: list[float] = []
+
+    class _Response:
+        status_code = 429
+
+        def __init__(self) -> None:
+            self.headers = {"Retry-After": "Wed, 21 Oct 2099 07:28:00 GMT"}
+
+    class _RateLimited(Exception):
+        response = _Response()
+
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _RateLimited("slow down")
+        return "ok"
+
+    monkeypatch.setattr(flash_train.time, "sleep", sleeps.append)
+    monkeypatch.setattr(flash_train.logger, "warning", lambda *_args: None)
+
+    assert flash_train._hf_call(flaky, "upload") == "ok"
+    assert sleeps == [60.0]
+
+
+def test_upload_code_uses_content_addressed_prefix(monkeypatch):
+    """Code uploads are additive under immutable content-addressed prefixes, so different package
+    snapshots cannot overwrite or delete one another inside the shared environment repo."""
     import os
+    import re
     import sys
     import types
 
@@ -124,6 +275,9 @@ def test_upload_code_mirrors_package_purging_stale_remote(monkeypatch):
 
     class _FakeApi:
         def __init__(self, token=None):
+            pass
+
+        def repo_info(self, **kw):
             pass
 
         def create_repo(self, repo, **kw):
@@ -141,12 +295,12 @@ def test_upload_code_mirrors_package_purging_stale_remote(monkeypatch):
 
     import flash.providers.runpod.train as flash_train
 
+    flash_train._VERIFIED_PRIVATE_ARTIFACT_REPOS.clear()
     flash_train.upload_code("owner/run-artifacts")
     assert calls["upload"], "upload_folder was not called"
     up = calls["upload"][0]
-    assert up["path_in_repo"] == "code/flash"
-    # the exact-mirror guard: delete everything under code/flash not in this upload
-    assert up.get("delete_patterns") == ["**"]
+    assert re.fullmatch(r"code/[0-9a-f]{32}/flash", up["path_in_repo"])
+    assert "delete_patterns" not in up
     # still uploads from the real (symlink-collapsed) package dir, and skips bytecode
     assert up["folder_path"] == os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     assert "*.pyc" in up.get("ignore_patterns", [])
