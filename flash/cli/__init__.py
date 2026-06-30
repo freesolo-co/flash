@@ -66,7 +66,7 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         "catalog",
         [
             ("models", "list supported base models"),
-            ("gpus", "list managed GPU classes with live $/hr"),
+            ("gpus", "list managed GPU classes with estimated $/hr"),
         ],
     ),
     (
@@ -226,7 +226,7 @@ def _build_parser() -> argparse.ArgumentParser:
     models = sub.add_parser("models", help="list supported base models")
     models.set_defaults(func=cmd_models)
 
-    gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
+    gpus = sub.add_parser("gpus", help="list managed GPU classes with estimated $/hr")
     gpus.set_defaults(func=cmd_gpus)
 
     env = sub.add_parser("env", help="manage Freesolo environments")
@@ -268,7 +268,9 @@ def _build_parser() -> argparse.ArgumentParser:
     env_pull.set_defaults(func=cmd_env_pull)
 
     env_delete = env_sub.add_parser("delete", help="delete a published Freesolo environment")
-    env_delete.add_argument("env_id", help="the Freesolo environment id to delete, e.g. you/your-env")
+    env_delete.add_argument(
+        "env_id", help="the Freesolo environment id to delete, e.g. you/your-env"
+    )
     env_delete.add_argument(
         "-y",
         "--yes",
