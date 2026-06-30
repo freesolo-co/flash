@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import gzip
 import hashlib
@@ -12,7 +11,6 @@ import re
 import shutil
 import tarfile
 import tempfile
-import tokenize
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,7 +20,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from flash.envs.base import BaseEnvironment
-from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES
+from flash.envs.training_params import apply_training_max_examples
 
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
@@ -44,92 +42,6 @@ _TAR_METADATA_TYPES = {
 }
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
-
-
-def _resolved_import_path(base: Path, module: str | None, level: int) -> Path | None:
-    if module is None:
-        return None
-    parts = module.split(".")
-    if any(not part.isidentifier() for part in parts):
-        return None
-
-    root = base.parent
-    for _ in range(max(level - 1, 0)):
-        root = root.parent
-
-    candidate = root.joinpath(*parts)
-    file_candidate = candidate.with_suffix(".py")
-    if file_candidate.is_file():
-        return file_candidate
-    init_candidate = candidate / "__init__.py"
-    if init_candidate.is_file():
-        return init_candidate
-    return None
-
-
-def _load_environment_params(
-    path: Path, target_name: str = "load_environment", seen: set[Path] | None = None
-) -> tuple[set[str], bool]:
-    if seen is None:
-        seen = set()
-    resolved_path = path.resolve()
-    if resolved_path in seen or len(seen) >= 8:
-        return set(), False
-    seen.add(resolved_path)
-    try:
-        with tokenize.open(path) as source:
-            tree = ast.parse(source.read(), filename=os.fspath(path))
-    except Exception:
-        return set(), False
-
-    found = False
-    result: tuple[set[str], bool] = (set(), False)
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == target_name:
-            args = node.args
-            names = {
-                arg.arg
-                for arg in (
-                    *args.posonlyargs,
-                    *args.args,
-                    *args.kwonlyargs,
-                )
-            }
-            result = names, args.kwarg is not None
-            found = True
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if (alias.asname or alias.name) != target_name:
-                    continue
-                import_path = _resolved_import_path(path, node.module, node.level)
-                if import_path is None:
-                    continue
-                result = _load_environment_params(import_path, alias.name, seen)
-                found = True
-                break
-    return result if found else (set(), False)
-
-
-def _apply_training_max_examples(reference: str, params: dict[str, Any]) -> dict[str, Any]:
-    if _FLASH_TRAIN_MAX_EXAMPLES not in params:
-        return params
-
-    params.pop(_FLASH_TRAIN_MAX_EXAMPLES)
-    if "max_examples" in params or "limit" in params:
-        return params
-
-    ref_path = Path(reference)
-    names, accepts_kwargs = _load_environment_params(ref_path) if ref_path.is_file() else (set(), False)
-    # Flash applies train.max_examples after a fixed-seed shuffle; passing that value into
-    # loaders would pre-truncate the dataset and change which rows are sampled.
-    if "max_examples" in names:
-        params["max_examples"] = None
-    if "limit" in names:
-        params["limit"] = None
-    if not names.intersection({"max_examples", "limit"}) and accepts_kwargs:
-        params["max_examples"] = None
-        params["limit"] = None
-    return params
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -1182,7 +1094,7 @@ def load_freesolo_environment(
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 
-    params = _apply_training_max_examples(reference, dict(kwargs))
+    params = apply_training_max_examples(reference, dict(kwargs))
     source = params.pop("records", None)
     dataset_path = params.get("dataset_path")
     if source is None and dataset_path:

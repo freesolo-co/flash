@@ -13,7 +13,7 @@ from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
 from flash.engine.recipe import RECIPE
-from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES, training_env_params
+from flash.envs.training_params import _FLASH_TRAIN_MAX_EXAMPLES, training_env_params
 from flash.schema import spec_from_dict
 
 GRPO_RAW = {
@@ -166,9 +166,11 @@ def test_sft_uncapped_count_forwards_loader_no_cap(monkeypatch):
         _sft_spec(max_examples=0, batch_size=32, epochs=2),
     )
     for spec in specs:
-        assert _spec_steps(spec) == _worker_sft_steps(
-            examples=10_178, requested_batch=32, epochs=2
-        ) == 638
+        assert (
+            _spec_steps(spec)
+            == _worker_sft_steps(examples=10_178, requested_batch=32, epochs=2)
+            == 638
+        )
 
     assert captured == [
         {_FLASH_TRAIN_MAX_EXAMPLES: None},
@@ -362,7 +364,10 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
         "train": {
             "hf_repo": "owner/runs",
-            "max_examples": 320, "batch_size": 6, "epochs": 2, "max_length": 1024,
+            "max_examples": 320,
+            "batch_size": 6,
+            "epochs": 2,
+            "max_length": 1024,
         },
         "gpu": {"type": "RTX 4090"},
     }

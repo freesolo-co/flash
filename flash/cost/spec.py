@@ -73,7 +73,7 @@ def _sft_example_count(spec) -> int:
     pinned_examples = int(t.max_examples) if t.max_examples else 0
     if pinned_examples > 0:
         return pinned_examples
-    from flash.envs.registry import training_env_params
+    from flash.envs.training_params import training_env_params
 
     examples = count_env_examples(spec.environment.id, training_env_params(spec))
     if examples is None:
@@ -148,7 +148,7 @@ def count_sft_train_tokens(spec) -> int | None:
     """
     if spec.algorithm != "sft":
         return None
-    from flash.envs.registry import training_env_params
+    from flash.envs.training_params import training_env_params
 
     env = _load_env(spec.environment.id, training_env_params(spec))
     if env is None:

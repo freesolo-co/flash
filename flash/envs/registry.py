@@ -2,39 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from .base import Environment
-
-_FLASH_TRAIN_MAX_EXAMPLES = "__flash_train_max_examples"
 
 
 def worker_pip_for_env(env_id: str) -> list[str]:
     """Pip deps the GPU worker needs to run a Freesolo environment."""
     return ["freesolo"]
-
-
-def training_env_params(spec) -> dict[str, Any]:
-    """Environment-loader params for a training run.
-
-    ``[train].max_examples`` caps Flash training after the worker shuffles examples, but
-    some environments also have a loader-side cap (commonly ``max_examples`` or ``limit``)
-    with a small default. Carry an internal marker so the adapter can clear that loader
-    cap before the worker calls ``env.dataset()``.
-    """
-    params = dict(getattr(getattr(spec, "environment", None), "params", None) or {})
-    train = getattr(spec, "train", None)
-    if train is None:
-        return params
-    if "max_examples" in params or "limit" in params:
-        return params
-
-    algorithm = str(getattr(spec, "algorithm", "") or "").lower()
-    if algorithm != "sft":
-        return params
-
-    params[_FLASH_TRAIN_MAX_EXAMPLES] = None
-    return params
 
 
 def load_environment(

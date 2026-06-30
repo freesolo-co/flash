@@ -129,7 +129,8 @@ from flash.engine.worker.wandb_log import (
     wandb_run_name,
 )
 from flash.envs.adapter import GitHubRateLimitError
-from flash.envs.registry import load_environment, training_env_params
+from flash.envs.registry import load_environment
+from flash.envs.training_params import training_env_params
 from flash.spec import FIXED_SEED, load_job_spec_from_env
 
 HF_REPO = os.environ.get("HF_REPO", "")
