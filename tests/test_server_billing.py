@@ -250,6 +250,11 @@ def api(tmp_path, monkeypatch):
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+    # The new submit-time budget precheck would urllib-POST the real backend; stub it to a pass so
+    # the default submit path stays hermetic. Gate-specific tests below override this per-test.
+    import flash.server.billing as billing_mod
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
     with TestClient(app_mod.create_app()) as client:
         yield client
 
@@ -288,6 +293,50 @@ def test_internal_identity_skips_billing(api, monkeypatch):
     assert res.status_code == 200, res.text
     assert res.json()["billing_state"] is None
     assert res.json()["billing_context"] is None
+
+
+def test_submit_blocked_when_precheck_402(api, monkeypatch):
+    # a hard 402 from the budget precheck rejects the run up front, before any GPU is allocated,
+    # and the run is never recorded.
+    import flash.server.billing as billing_mod
+
+    def _block(**k):
+        raise billing_mod.BillingError(402, "insufficient balance")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+    assert res.status_code == 402, res.text
+    assert "insufficient" in res.text
+    # rejected before record_run: nothing persisted for this user.
+    assert api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"] == []
+
+
+def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
+    # a non-402 billing error (backend unreachable / 5xx) must NOT block training; the completion
+    # charge is the backstop. The run is still accepted and recorded.
+    import flash.server.billing as billing_mod
+
+    def _unreachable(**k):
+        raise billing_mod.BillingError(503, "billing service unavailable")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _unreachable)
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+    assert res.status_code == 200, res.text
+    assert [r["run_id"] for r in api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"]] == [
+        res.json()["run_id"]
+    ]
+
+
+def test_dry_run_skips_precheck(api, monkeypatch):
+    # dry runs never bill, so they must never be gated either.
+    import flash.server.billing as billing_mod
+
+    def _block(**k):
+        raise billing_mod.BillingError(402, "insufficient balance")
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
+    res = api.post("/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer("fslo-user-1"))
+    assert res.status_code == 200, res.text
 
 
 def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch):

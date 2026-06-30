@@ -125,6 +125,7 @@ def build_payload(
     cache_block_device: bool = False,
     mode: str | None = None,
     models: list | None = None,
+    code_prefix: str | None = None,
 ) -> dict:
     """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
@@ -135,6 +136,7 @@ def build_payload(
         chalk_extra_pip,
         strip_runpod_volume_env,
     )
+    from flash.runner import flash_code_prefix
 
     # Strip the RunPod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
     env = strip_runpod_volume_env(build_worker_env(spec, seed, runtime_secrets=runtime_secrets))
@@ -151,6 +153,7 @@ def build_payload(
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
+        "code_prefix": code_prefix or flash_code_prefix(),
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
         "attempt": int(attempt),
     }

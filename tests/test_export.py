@@ -6,11 +6,14 @@ the calls instead of touching the Hub).
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
 
 import pytest
+
+BASE_MODEL = "Qwen/Qwen3.5-0.8B"
 
 
 def _install_fake_hub(monkeypatch, *, download, hf_api):
@@ -90,6 +93,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
         source_token="hf_operator",
         private=True,
     )
@@ -125,6 +129,93 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     assert calls["upload"]["parent_commit"] == "parent-sha"
 
 
+def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
+    """Warm-start GRPO can save PEFT/HF metadata pointing at a temporary merged SFT path.
+
+    Export must publish the real catalog base model from the run spec so downstream Hub loaders and
+    model cards do not point at a deleted `/tmp/flash_sft_merged_*` directory.
+    """
+    uploaded: dict = {}
+    temp_base = "/tmp/flash_sft_merged_abcd1234"
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text(
+            json.dumps(
+                {
+                    "base_model_name_or_path": temp_base,
+                    "r": 32,
+                    "target_modules": "all-linear",
+                }
+            )
+            + "\n"
+        )
+        (adapter / "README.md").write_text(
+            f"---\nbase_model:\n- {temp_base}\nlibrary_name: peft\n---\n# Adapter\n"
+        )
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, folder_path, **kw):
+            folder = Path(folder_path)
+            uploaded["adapter_config"] = json.loads((folder / "adapter_config.json").read_text())
+            uploaded["readme"] = (folder / "README.md").read_text()
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        source_token="hf_operator",
+        base_model=BASE_MODEL,
+    )
+
+    assert uploaded["adapter_config"]["base_model_name_or_path"] == BASE_MODEL
+    assert BASE_MODEL in uploaded["readme"]
+    assert temp_base not in uploaded["readme"]
+
+
+def test_export_metadata_repair_skips_non_utf8_files(tmp_path):
+    from flash.serve import export
+
+    (tmp_path / "adapter_config.json").write_bytes(b"\xff")
+    (tmp_path / "README.md").write_bytes(b"\xfe")
+
+    assert export._rewrite_adapter_config_base_model(tmp_path, BASE_MODEL) is False
+    assert export._rewrite_readme_temp_base_model(tmp_path, BASE_MODEL) is False
+
+
+def test_export_readme_base_model_replacement_is_literal(tmp_path):
+    from flash.serve import export
+
+    temp_base = "/tmp/flash_sft_merged_abcd1234"
+    literal_base_model = r"org\1/model"
+    (tmp_path / "README.md").write_text(
+        f"---\nbase_model:\n- {temp_base}\nlibrary_name: peft\n---\n",
+        encoding="utf-8",
+    )
+
+    assert export._rewrite_readme_temp_base_model(tmp_path, literal_base_model) is True
+    assert literal_base_model in (tmp_path / "README.md").read_text(encoding="utf-8")
+
+
 def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeypatch):
     """A re-export into a repo holding a previous, differently-serialized adapter must clear the stale
     adapter weights (so a leftover ``.bin`` can't be loaded next to the new ``.safetensors``) WITHOUT
@@ -149,7 +240,9 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
             pass
 
         def list_repo_files(self, *, repo_id, repo_type):
-            listed["called"] = True  # must NOT be called: cleanup is pattern-based, not listing-based
+            listed["called"] = (
+                True  # must NOT be called: cleanup is pattern-based, not listing-based
+            )
             return []
 
         def update_repo_settings(self, **kw):
@@ -170,6 +263,7 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
         source_token="hf_operator",
     )
     # Static, adapter-scoped delete patterns: ``adapter_model*`` clears a stale ``.bin`` (and sharded /
@@ -218,6 +312,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
         source_token="hf_operator",
         private=False,
     )
@@ -262,6 +357,7 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
         source_token="hf_operator",
         private=True,
     )
@@ -305,6 +401,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
+        base_model=BASE_MODEL,
     )
     assert seen["token"] == "hf_from_env"  # no source_token -> HF_TOKEN
 
@@ -327,6 +424,7 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
             source_subfolder="rl/run-x/seed0/adapter",
             dest_repo="me/adapters",
             dest_token="hf_user",
+            base_model=BASE_MODEL,
             source_token="hf_operator",
         )
 
@@ -363,6 +461,7 @@ def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
             source_subfolder="rl/run-x/seed0/adapter",
             dest_repo="me/adapters",
             dest_token="hf_user",
+            base_model=BASE_MODEL,
             source_token="hf_operator",
         )
     assert not uploaded["called"], "must reject before touching the destination repo"
@@ -387,6 +486,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
             source_subfolder="rl/run-x/seed0/adapter",
             dest_repo="me/adapters",
             dest_token="hf_user",
+            base_model=BASE_MODEL,
             source_token="hf_operator",
         )
 
@@ -460,6 +560,7 @@ def test_export_missing_operator_token_raises_runtime_error_not_serving_error(mo
             source_subfolder="runs/r/adapter",
             dest_repo="me/out",
             dest_token="hf_dest",
+            base_model=BASE_MODEL,
             source_token=None,
         )
     assert not isinstance(ei.value, ServingError)  # NOT the 502 path

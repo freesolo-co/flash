@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from .base import Environment
 
+FREESOLO_WORKER_SPEC = "freesolo>=0.2.52"
+
 
 def worker_pip_for_env(env_id: str) -> list[str]:
     """Pip deps the GPU worker needs to run a Freesolo environment."""
-    return ["freesolo"]
+    return [FREESOLO_WORKER_SPEC]
 
 
 def load_environment(

@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from flash.runner import (
     adapter_prefix,
-    attach_checkpoint_deployment,
+    mark_checkpoint_deployed,
     mark_deployed,
     mark_undeployed,
 )
@@ -81,26 +81,24 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
 def _resolve_deployable_target(
     run_id: str, spec, status, raw_step, *, action: str, enforce_state: bool
 ) -> tuple[int | None, bool, str]:
-    """Resolve checkpoint step, gate on training state, and return (checkpoint_step, is_checkpoint, prefix)."""
+    """Resolve the deploy/export target and gate final-adapter targets on training state."""
     checkpoint_step = _resolve_deploy_step(run_id, spec, raw_step)
     is_checkpoint = checkpoint_step is not None
-    # Per-step checkpoints survive cancelled/failed runs; final adapter only exists once done.
-    allowed_states = (
-        _app._CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _app._DEPLOYABLE_STATES
-    )
-    if enforce_state and status.state not in allowed_states:
+    # A resolved checkpoint step has already proven a servable adapter exists; only final-adapter
+    # deploy/export needs the run-state gate because the final adapter exists only after completion.
+    if enforce_state and is_checkpoint and status.state == "dry_run":
+        raise HTTPException(
+            status_code=409,
+            detail=f"run {run_id} is 'dry_run'; dry-run runs cannot be {action}ed",
+        )
+    if enforce_state and not is_checkpoint and status.state not in _app._DEPLOYABLE_STATES:
         detail = (
-            f"run {run_id} is {status.state!r}; {action} a checkpoint only once the run "
-            "has finished, failed, or been cancelled"
-            if is_checkpoint
-            else f"run {run_id} is {status.state!r}; only finished runs with "
+            f"run {run_id} is {status.state!r}; only finished runs with "
             f"trained adapter artifacts can be {'deployed' if action == 'deploy' else 'exported'}"
         )
         raise HTTPException(status_code=409, detail=detail)
     prefix = (
-        checkpoint_adapter_prefix(spec, checkpoint_step)
-        if is_checkpoint
-        else adapter_prefix(spec)
+        checkpoint_adapter_prefix(spec, checkpoint_step) if is_checkpoint else adapter_prefix(spec)
     )
     return checkpoint_step, is_checkpoint, prefix
 
@@ -127,9 +125,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         # write is lock-serialized), so capture state before deploy and re-verify it on the write.
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
-        deploy_org_id = (
-            run_org_id(status) or str(key.get("org_id") or "").strip() or None
-        )
+        deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
         try:
             dep = _app.deploy_adapter(
                 run_id=run_id,
@@ -153,20 +149,23 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
         if not dry_run:
-            if is_checkpoint and status.state not in _app._DEPLOYABLE_STATES:
-                # Keep the terminal training state — flipping to `deployed` would erase the outcome
-                # and make undeploy wrongly restore it to `done`.
-                attach_checkpoint_deployment(run_id, dep_dict)
+            state_guard = prev_state
+            if is_checkpoint:
+                state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
+                marked = mark_checkpoint_deployed(run_id, dep_dict, expect_state=state_guard)
             else:
-                # CAS: if /cancel raced us, the adapter is orphaned — deregister and 409.
                 marked = mark_deployed(run_id, dep_dict, expect_state=prev_state)
-                if marked.state != "deployed":
-                    with contextlib.suppress(Exception):
-                        _app.undeploy_adapter(run_id)
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
-                    )
+            # CAS: if /cancel or /undeploy raced us, the adapter is orphaned — deregister and 409.
+            cas_failed = (
+                marked.deployment != dep_dict if is_checkpoint else marked.state != "deployed"
+            )
+            if state_guard is not None and cas_failed:
+                with contextlib.suppress(Exception):
+                    _app.undeploy_adapter(run_id)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
+                )
         return dep_dict
 
 
@@ -231,6 +230,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 dest_repo=repository,
                 dest_token=hf_token,
                 private=private,
+                base_model=spec.model,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -270,9 +270,9 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
     has_active_deploy = deployment.get("state") not in (None, "undeployed", "dry_run")
-    # A cancelled run can still serve a per-step checkpoint it deployed: attach_checkpoint_deployment
-    # keeps the run `cancelled` but registers a live adapter that /v1/deployments lists as active. Only
-    # block chat when there's no active deployment to serve (the deploy itself is gated in deploy()).
+    # A cancelled run can still serve a per-step checkpoint it deployed: checkpoint deploy records
+    # a live adapter that /v1/deployments lists as active without requiring a final adapter.
+    # Only block chat when there's no active deployment to serve.
     if status.state == "cancelled" and not has_active_deploy:
         raise HTTPException(
             status_code=409,

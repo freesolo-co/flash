@@ -40,6 +40,7 @@ class RunpodProvider:
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
+        code_prefix: str | None = None,
     ) -> PollResult:
         from flash.providers.runpod.jobs import submit_run
 
@@ -48,6 +49,7 @@ class RunpodProvider:
             "on_handle": on_handle,
             "attempt": attempt,
             "on_last_gpu": on_last_gpu,
+            "code_prefix": code_prefix,
         }
         if runtime_secrets:
             kwargs["runtime_secrets"] = runtime_secrets
