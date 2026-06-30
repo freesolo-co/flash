@@ -36,7 +36,6 @@ from flash.providers.runpod.train.endpoints import (  # noqa: F401
     terminate_endpoint,
 )
 
-_VERIFIED_PRIVATE_ARTIFACT_REPOS: set[str] = set()
 _HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
@@ -84,7 +83,8 @@ def _hf_call(call, label: str):
                 _HF_RETRY_DELAYS_S
             ):
                 raise
-            delay = _hf_retry_after(exc) or _HF_RETRY_DELAYS_S[attempt]
+            retry_after = _hf_retry_after(exc)
+            delay = retry_after if retry_after is not None else _HF_RETRY_DELAYS_S[attempt]
             logger.warning(
                 "%s transient Hugging Face error; retrying in %.0fs: %s",
                 label,
@@ -100,8 +100,6 @@ def _is_hf_not_found(exc: BaseException) -> bool:
 
 
 def _ensure_private_artifact_repo(api, repo: str) -> None:
-    if repo in _VERIFIED_PRIVATE_ARTIFACT_REPOS:
-        return
     try:
         _hf_call(
             lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
@@ -119,7 +117,6 @@ def _ensure_private_artifact_repo(api, repo: str) -> None:
         lambda: api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True),
         f"force artifact repo private {repo}",
     )
-    _VERIFIED_PRIVATE_ARTIFACT_REPOS.add(repo)
 
 
 def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> str:
@@ -138,13 +135,19 @@ def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> s
     api = HfApi(token=token)
     _ensure_private_artifact_repo(api, repo)
     code_prefix = code_prefix or flash_code_prefix()
+    code_marker = f"{code_prefix}/__init__.py"
+    if _hf_call(
+        lambda: api.file_exists(repo_id=repo, filename=code_marker, repo_type="dataset"),
+        f"check flash code snapshot {repo}:{code_marker}",
+    ):
+        return repo
     _hf_call(
         lambda: api.upload_folder(
             folder_path=pkg_dir,
             path_in_repo=code_prefix,
             repo_id=repo,
             repo_type="dataset",
-            ignore_patterns=["__pycache__/*", "*.pyc"],
+            ignore_patterns=["__pycache__/*", "*.pyc", "*.pyo"],
         ),
         f"upload flash code to {repo}:{code_prefix}",
     )

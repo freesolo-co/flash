@@ -92,6 +92,9 @@ def test_upload_code_forces_private_on_reused_repo(monkeypatch):
         def update_repo_settings(self, **kw):
             calls["settings"].append(kw)
 
+        def file_exists(self, **kw):
+            return False
+
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
 
@@ -101,7 +104,6 @@ def test_upload_code_forces_private_on_reused_repo(monkeypatch):
 
     import flash.providers.runpod.train as flash_train
 
-    flash_train._VERIFIED_PRIVATE_ARTIFACT_REPOS.clear()
     assert flash_train.upload_code("owner/run-artifacts") == "owner/run-artifacts"
 
     assert calls["info"], "repo_info should verify whether the repo already exists"
@@ -128,13 +130,18 @@ def test_upload_code_creates_repo_only_when_missing(monkeypatch):
 
         def repo_info(self, **kw):
             calls["info"].append(kw)
-            raise _NotFound("missing")
+            if len(calls["info"]) == 1:
+                raise _NotFound("missing")
+            return types.SimpleNamespace(private=True)
 
         def create_repo(self, repo, **kw):
             calls["create"].append((repo, kw))
 
         def update_repo_settings(self, **kw):
             calls["settings"].append(kw)
+
+        def file_exists(self, **kw):
+            return False
 
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
@@ -145,14 +152,53 @@ def test_upload_code_creates_repo_only_when_missing(monkeypatch):
 
     import flash.providers.runpod.train as flash_train
 
-    flash_train._VERIFIED_PRIVATE_ARTIFACT_REPOS.clear()
     flash_train.upload_code("owner/new-env-artifacts")
     flash_train.upload_code("owner/new-env-artifacts")
 
-    assert len(calls["info"]) == 1
+    assert len(calls["info"]) == 2
     assert len(calls["create"]) == 1
     assert calls["create"][0][1]["private"] is True
-    assert len(calls["settings"]) == 1
+    assert len(calls["settings"]) == 2
+    assert len(calls["upload"]) == 2
+
+
+def test_upload_code_rechecks_privacy_on_each_submit(monkeypatch):
+    import sys
+    import types
+
+    calls = {"info": [], "settings": [], "upload": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def repo_info(self, **kw):
+            calls["info"].append(kw)
+            return types.SimpleNamespace(private=len(calls["info"]) == 1)
+
+        def create_repo(self, repo, **kw):
+            raise AssertionError("existing repo should not be created")
+
+        def update_repo_settings(self, **kw):
+            calls["settings"].append(kw)
+
+        def file_exists(self, **kw):
+            return False
+
+        def upload_folder(self, **kw):
+            calls["upload"].append(kw)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    import flash.providers.runpod.train as flash_train
+
+    flash_train.upload_code("owner/rechecked-env-artifacts")
+    flash_train.upload_code("owner/rechecked-env-artifacts")
+
+    assert len(calls["info"]) == 2
+    assert len(calls["settings"]) == 2
     assert len(calls["upload"]) == 2
 
 
@@ -183,6 +229,9 @@ def test_upload_code_retries_transient_repo_settings(monkeypatch):
             if calls["settings"] == 1:
                 raise _Transient("gateway timeout")
 
+        def file_exists(self, **kw):
+            return False
+
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
 
@@ -192,7 +241,6 @@ def test_upload_code_retries_transient_repo_settings(monkeypatch):
 
     import flash.providers.runpod.train as flash_train
 
-    flash_train._VERIFIED_PRIVATE_ARTIFACT_REPOS.clear()
     monkeypatch.setattr(flash_train.time, "sleep", lambda _delay: None)
 
     flash_train.upload_code("owner/transient-settings")
@@ -286,6 +334,9 @@ def test_upload_code_uses_content_addressed_prefix(monkeypatch):
         def update_repo_settings(self, **kw):
             pass
 
+        def file_exists(self, **kw):
+            return False
+
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
 
@@ -295,7 +346,6 @@ def test_upload_code_uses_content_addressed_prefix(monkeypatch):
 
     import flash.providers.runpod.train as flash_train
 
-    flash_train._VERIFIED_PRIVATE_ARTIFACT_REPOS.clear()
     flash_train.upload_code("owner/run-artifacts")
     assert calls["upload"], "upload_folder was not called"
     up = calls["upload"][0]
@@ -304,6 +354,52 @@ def test_upload_code_uses_content_addressed_prefix(monkeypatch):
     # still uploads from the real (symlink-collapsed) package dir, and skips bytecode
     assert up["folder_path"] == os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     assert "*.pyc" in up.get("ignore_patterns", [])
+    assert "*.pyo" in up.get("ignore_patterns", [])
+
+
+def test_upload_code_skips_existing_content_prefix(monkeypatch):
+    import sys
+    import types
+
+    calls = {"file_exists": [], "upload": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(private=True)
+
+        def create_repo(self, repo, **kw):
+            raise AssertionError("existing repo should not be created")
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def file_exists(self, **kw):
+            calls["file_exists"].append(kw)
+            return True
+
+        def upload_folder(self, **kw):
+            calls["upload"].append(kw)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    import flash.providers.runpod.train as flash_train
+
+    prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    flash_train.upload_code("owner/run-artifacts", code_prefix=prefix)
+
+    assert calls["file_exists"] == [
+        {
+            "repo_id": "owner/run-artifacts",
+            "filename": f"{prefix}/__init__.py",
+            "repo_type": "dataset",
+        }
+    ]
+    assert calls["upload"] == []
 
 
 def test_run_job_background_swallows_exception(monkeypatch):

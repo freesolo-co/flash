@@ -1705,6 +1705,8 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="host vanished"),
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        uploads = []
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo, *, code_prefix: uploads.append((repo, code_prefix)) or repo)
         seen = {}
 
         def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
@@ -1717,7 +1719,8 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         st = orch.attach_run("i1", log_stream=sys.stderr)
 
         assert seen["remote"] is None, "stale dead handle must be cleared before resuming"
-        assert seen["code_prefix"] is None
+        assert re.fullmatch(r"code/[0-9a-f]{32}/flash", seen["code_prefix"] or "")
+        assert uploads == [(_spec("i1").train.hf_repo, seen["code_prefix"])]
         assert st.state != "failed", "a job lost to the redeploy must be resumed, not failed"
         assert st.state == "done"
 
@@ -1799,6 +1802,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             ),
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo, *, code_prefix: repo)
         resumed = {"called": False}
 
         def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):

@@ -144,9 +144,9 @@ PHASE = os.environ.get(
 
 _HB_LAST_UPLOAD = 0.0
 _HB_LAST_PROGRESS_TS = 0.0
-# Environment-scoped artifact repos are shared by many runs. Keep per-run heartbeat commits low
-# enough that shared repos do not trade the HF repo-creation cap for the HF commit cap.
-_HB_MIN_INTERVAL_S = 600.0
+# Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
+# per-repo commit cap while staying under the provider poller's 1200s training stall window.
+_HB_MIN_INTERVAL_S = 900.0
 _HB_TERMINAL_ONLY = False
 
 _WANDB_FINISH_WAIT_S = 120.0

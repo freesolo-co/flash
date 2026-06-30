@@ -250,7 +250,8 @@ def test_sft_step_liveness_upload_is_throttled(monkeypatch):
 def test_default_heartbeat_interval_fits_shared_environment_repos():
     import flash.engine.worker as ne
 
-    assert ne._HB_MIN_INTERVAL_S >= 600.0
+    assert ne._HB_MIN_INTERVAL_S >= 900.0
+    assert ne._HB_MIN_INTERVAL_S < 1200.0
 
 
 # --------------------------------------------------------------------------------------------

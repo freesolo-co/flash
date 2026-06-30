@@ -13,10 +13,15 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
-_CONSOLE_UPLOAD_INTERVAL_S = 600.0
+_CONSOLE_UPLOAD_INTERVAL_S = 3600.0
+_HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+_HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
+_HF_RETRY_AFTER_MAX_S = 60.0
 
 
 class RetriableBootstrapError(RuntimeError):
@@ -52,6 +57,58 @@ def _code_prefix(payload: dict) -> str:
 
 def _code_dir(payload: dict) -> str:
     return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)) or ".")
+
+
+def _hf_status_code(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hf_retry_after(exc: BaseException) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    value = headers.get("retry-after") if hasattr(headers, "get") else None
+    if not value and hasattr(headers, "items"):
+        for key, candidate in headers.items():
+            if str(key).lower() == "retry-after":
+                value = candidate
+                break
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            seconds = (retry_at - datetime.now(UTC)).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return min(_HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
+
+
+def _hf_call(call, label: str):
+    for attempt in range(len(_HF_RETRY_DELAYS_S) + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if _hf_status_code(exc) not in _HF_TRANSIENT_STATUS_CODES or attempt >= len(
+                _HF_RETRY_DELAYS_S
+            ):
+                raise
+            retry_after = _hf_retry_after(exc)
+            delay = retry_after if retry_after is not None else _HF_RETRY_DELAYS_S[attempt]
+            print(
+                f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {exc}",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def hf_upload(payload: dict, local_path: str, repo_subpath: str) -> None:
@@ -149,24 +206,32 @@ def fetch_code(payload: dict) -> None:
     api = HfApi(token=token)
     files = [
         entry.path
-        for entry in api.list_repo_tree(
-            repo_id=payload["hf_repo"],
-            repo_type="dataset",
-            path_in_repo=prefix,
-            recursive=True,
-            token=token,
+        for entry in _hf_call(
+            lambda: list(
+                api.list_repo_tree(
+                    repo_id=payload["hf_repo"],
+                    repo_type="dataset",
+                    path_in_repo=prefix,
+                    recursive=True,
+                    token=token,
+                )
+            ),
+            f"list flash code under {payload['hf_repo']}:{prefix}",
         )
         if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
     ]
     if not files:
         raise RuntimeError(f"no flash code files found under {payload['hf_repo']}:{prefix}")
     for filename in files:
-        hf_hub_download(
-            repo_id=payload["hf_repo"],
-            repo_type="dataset",
-            filename=filename,
-            local_dir=CODE_ROOT,
-            token=token,
+        _hf_call(
+            lambda filename=filename: hf_hub_download(
+                repo_id=payload["hf_repo"],
+                repo_type="dataset",
+                filename=filename,
+                local_dir=CODE_ROOT,
+                token=token,
+            ),
+            f"download flash code file {payload['hf_repo']}:{filename}",
         )
 
 

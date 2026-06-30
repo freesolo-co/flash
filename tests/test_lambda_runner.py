@@ -259,6 +259,7 @@ def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
     monkeypatch.setattr(lb, "CODE_ROOT", str(tmp_path))
     list_calls = []
     download_calls = []
+    sleeps = []
 
     class _FakeApi:
         def __init__(self, token=None):
@@ -273,9 +274,23 @@ def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
             ]
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(lb.time, "sleep", sleeps.append)
+
+    class _Response:
+        status_code = 429
+
+        def __init__(self) -> None:
+            self.headers = {"Retry-After": "3"}
+
+    class _RateLimited(Exception):
+        response = _Response()
 
     def fake_hf_hub_download(*, filename, local_dir, **kw):
         download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
+        if filename.endswith("runner.py") and len(
+            [call for call in download_calls if call["filename"] == filename]
+        ) == 1:
+            raise _RateLimited("slow down")
         target = tmp_path / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("")
@@ -297,8 +312,10 @@ def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
     assert [call["filename"] for call in download_calls] == [
         f"{CODE_PREFIX}/__init__.py",
         f"{CODE_PREFIX}/runner.py",
+        f"{CODE_PREFIX}/runner.py",
     ]
     assert all(call["local_dir"] == str(tmp_path) for call in download_calls)
+    assert sleeps == [3.0]
 
 
 # ---------------------------------------------------------------------------

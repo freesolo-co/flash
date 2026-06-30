@@ -515,6 +515,8 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
 
         def list_repo_tree(self, **kw):
             list_calls.append(kw)
+            if len(list_calls) == 1:
+                raise _RateLimited("slow down")
             return [
                 types.SimpleNamespace(path=f"{code_prefix}/__init__.py", size=0),
                 types.SimpleNamespace(path=f"{code_prefix}/engine/worker.py", size=10),
@@ -525,6 +527,15 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
             uploads.append(kw)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    class _Response:
+        status_code = 429
+
+        def __init__(self) -> None:
+            self.headers = {"Retry-After": "0"}
+
+    class _RateLimited(Exception):
+        response = _Response()
 
     def fake_hf_hub_download(*, filename, local_dir, **kw):
         download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
@@ -562,7 +573,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         console_uploads = [u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")]
         assert console_uploads, f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
         assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
-        assert list_calls[0]["path_in_repo"] == code_prefix
+        assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",
             f"{code_prefix}/engine/worker.py",
@@ -599,8 +610,13 @@ def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
 
 
 def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
+    import flash.engine.worker as worker
     from flash.providers import _instance_bootstrap
     from flash.providers.runpod.train import endpoints
 
-    assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 600.0
-    assert _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 600.0
+    assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
+    assert _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
+    steady_state_commits_per_hour = (
+        3600.0 / worker._HB_MIN_INTERVAL_S + 3600.0 / endpoints._CONSOLE_UPLOAD_INTERVAL_S
+    )
+    assert steady_state_commits_per_hour <= 5.0

@@ -133,6 +133,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
+            if code_prefix is None:
+                from flash.providers.runpod.train import upload_code
+                from flash.runner import flash_code_prefix
+
+                code_prefix = flash_code_prefix()
+                upload_code(spec.train.hf_repo, code_prefix=code_prefix)
             _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0), code_prefix=code_prefix)
             return get_status(run_id)
         if allocated_gpu and isinstance(res.metrics, dict):
