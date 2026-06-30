@@ -718,6 +718,40 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
+class _ScoredResponseText(str):
+    """String-compatible response passed to SDK scorers.
+
+    The string value is the answer-only completion so existing graders keep their old behavior.
+    Thinking-aware scorers can opt into the structured views.
+    """
+
+    completion: str
+    thinking: str | None
+    raw: str
+
+    def __new__(cls, completion: str, *, raw: str, thinking: str | None):
+        obj = str.__new__(cls, completion)
+        obj.completion = completion
+        obj.thinking = thinking
+        obj.raw = raw
+        return obj
+
+
+def _completion_for_scoring(completion: str, state: dict | None) -> str:
+    if state:
+        raw = state.get("raw")
+        if not isinstance(raw, str):
+            return completion
+        answer = state.get("completion")
+        thinking = state.get("thinking")
+        return _ScoredResponseText(
+            answer if isinstance(answer, str) else completion,
+            raw=raw,
+            thinking=thinking if isinstance(thinking, str) else None,
+        )
+    return completion
+
+
 class FreesoloEnvironment(BaseEnvironment):
     """Flash environment backed by ``freesolo.environments``."""
 
@@ -859,7 +893,9 @@ class FreesoloEnvironment(BaseEnvironment):
     def _score_one(self, completion: str, example: dict, state: dict | None):
         if state and self.multi_turn:
             return self._score_episode(example, state)
-        rewards = self._env.score_responses(self._task_example(example), [completion])
+        rewards = self._env.score_responses(
+            self._task_example(example), [_completion_for_scoring(completion, state)]
+        )
         return self._single(rewards, "score_responses")
 
     def scores_breakdown(
@@ -924,7 +960,9 @@ class FreesoloEnvironment(BaseEnvironment):
             return self._grouped_score(
                 items,
                 task_of=lambda ex, st: self._task_example(ex),
-                payload_of=lambda st: str(st.get("response_text") or ""),
+                payload_of=lambda st: _completion_for_scoring(
+                    str(st.get("response_text") or ""), st
+                ),
                 scorer=self._env.score_responses,
                 method="score_responses",
             )
