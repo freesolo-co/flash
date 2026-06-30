@@ -401,20 +401,21 @@ def test_poll_success_stamps_real_cost(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        done="10500.0",
+        done="10005.0",
         metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
     )
     res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
     assert res.ok
     assert res.metrics["train_tokens"] == 4096
-    # cost comes from the offer's real live $/hr x wall time, not a runpod table rate
-    assert res.metrics["cost_usd"] > 0
+    # Customer cost comes from Vast's live $/hr x worker training wall, not setup/instance wall.
+    assert res.metrics["cost_usd"] == round((100.0 / 3600.0) * 0.47, 6)
     assert res.metrics["notes"]["provider"] == "vast"
     assert res.metrics["notes"]["vast_rate_usd_hr"] == 0.47
     assert res.metrics["notes"]["vast_offer_id"] == 1
+    assert res.metrics["notes"]["vast_instance_wall_seconds"] == 1005.0
 
 
-def test_poll_caps_recovered_cost_at_done_timestamp(monkeypatch):
+def test_poll_records_recovered_instance_wall_at_done_timestamp(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
@@ -423,24 +424,24 @@ def test_poll_caps_recovered_cost_at_done_timestamp(monkeypatch):
     )
     res = vast.poll_vast_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
     assert res.ok
-    assert res.metrics["cost_usd"] == round((9100.0 - 9000.0) / 3600.0 * 0.47, 6)
+    assert res.metrics["cost_usd"] == round((100.0 / 3600.0) * 0.47, 6)
+    assert res.metrics["notes"]["vast_instance_wall_seconds"] == 100.0
 
 
-def test_poll_ok_marker_without_done_bills_to_marker_ts(monkeypatch):
-    # Codex: when the ok-marker is visible but DONE is absent/stale, finish_from_ok_marker must bill to
-    # the marker's OWN completion ts, not the (possibly much later) poll time — else a success recovered
-    # after an outage / HF-propagation gap inflates cost_usd by the downtime.
+def test_poll_ok_marker_without_done_records_instance_wall_to_marker_ts(monkeypatch):
+    # Codex: when the ok-marker is visible but DONE is absent/stale, finish_from_ok_marker must measure
+    # provider-instance wall to the marker's OWN completion ts, not the possibly much later poll time.
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
         marker=json.dumps({"ok": True, "attempt": 0, "ts": 10_005.0}),
         metrics=json.dumps({"wall_seconds": 5, "cost_usd": 0.0}),
-        # no DONE -> finish_from_ok_marker falls back to the marker ts for pricing
+        # no DONE -> finish_from_ok_marker falls back to the marker ts for the instance-wall note
     )
     res = vast.poll_vast_job(_handle(started_ts=10_000.0), _spec(), seed=0, interval_s=0)
     assert res.ok
-    # billed launch->marker_ts (5s), NOT launch->poll_time (which the advancing clock pushes higher)
-    assert res.metrics["cost_usd"] == round((10_005.0 - 10_000.0) / 3600.0 * 0.47, 6)
+    assert res.metrics["cost_usd"] == round((5.0 / 3600.0) * 0.47, 6)
+    assert res.metrics["notes"]["vast_instance_wall_seconds"] == 5.0
 
 
 def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):

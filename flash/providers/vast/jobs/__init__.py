@@ -466,8 +466,8 @@ def poll_vast_job(
         if raw is None:
             return PollResult(False, failure="job_failed", detail="DONE without metrics.json")
         metrics = json.loads(raw)
-        # Prefer the worker's DONE timestamp when present and sane; fall back to now (a delayed
-        # recovery poll hours after the box wrote DONE would otherwise over-bill by the downtime).
+        # Prefer the worker's DONE timestamp when present and sane; fall back to now for the
+        # provider-instance wall note. Customer-facing cost below uses worker training wall only.
         end_ts = time.time()
         if done_content:
             try:
@@ -477,18 +477,20 @@ def poll_vast_job(
             except ValueError:
                 pass
         elif fallback_end_ts is not None:
-            # No usable DONE, but a terminal ok-marker carries the worker's OWN completion ts. After a
-            # control-plane outage / HF-propagation gap the worker may have finished (and self-destroyed)
-            # hours before this poll, so billing to now() would inflate cost_usd by the downtime — bill
-            # to the marker ts when it's sane (Codex).
+            # No usable DONE, but a terminal ok-marker carries the worker's OWN completion ts. Use it
+            # for the provider-instance wall note so delayed recovery does not look like runtime.
             try:
                 ts = float(fallback_end_ts)
                 if launch_ts <= ts <= end_ts:
                     end_ts = ts
             except (TypeError, ValueError):
                 pass
-        wall_h = (end_ts - launch_ts) / 3600.0
-        metrics["cost_usd"] = round(wall_h * handle.hourly_usd, 6)
+        instance_wall_s = max(0.0, end_ts - launch_ts)
+        try:
+            train_wall_s = max(0.0, float(metrics.get("wall_seconds") or 0.0))
+        except (TypeError, ValueError):
+            train_wall_s = 0.0
+        metrics["cost_usd"] = round((train_wall_s / 3600.0) * handle.hourly_usd, 6)
         notes = metrics.get("notes") if isinstance(metrics.get("notes"), dict) else {}
         notes.update(
             {
@@ -496,6 +498,7 @@ def poll_vast_job(
                 "vast_rate_usd_hr": handle.hourly_usd,
                 "vast_gpu": handle.gpu,
                 "vast_offer_id": handle.offer_id,
+                "vast_instance_wall_seconds": round(instance_wall_s, 3),
             }
         )
         metrics["notes"] = notes
@@ -511,9 +514,9 @@ def poll_vast_job(
 
     def finish_from_ok_marker(marker: dict | None = None) -> PollResult:
         # An ok marker means the worker finished (it wrote metrics.json before the marker), even if the
-        # DONE sentinel is STALE — pass DONE only when genuinely fresh (so cost bills to it). When DONE
-        # is absent/stale, fall back to the marker's own completion ts for pricing so a recovered success
-        # isn't billed to the (possibly much later) poll time (Codex).
+        # DONE sentinel is STALE — pass DONE only when genuinely fresh. When DONE is absent/stale, fall
+        # back to the marker's own completion ts for the provider-instance wall note so a recovered
+        # success is not measured to the possibly much later poll time (Codex).
         d = done_reader(force=True)
         fresh = d is not None and done_is_fresh(d)
         marker_ts = marker.get("ts") if isinstance(marker, dict) else None

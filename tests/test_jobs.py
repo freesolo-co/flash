@@ -24,7 +24,11 @@ def test_job_handle_roundtrip():
     h2 = JobHandle("ep123", "flash-5090-abc", "job456", 2)
     assert h2.to_dict()["attempt"] == 2
     assert JobHandle.from_dict(h2.to_dict()) == h2
+    h3 = JobHandle("ep123", "flash-5090-abc", "job456", 2, 12_345.0)
+    assert h3.to_dict()["started_ts"] == 12_345.0
+    assert JobHandle.from_dict(h3.to_dict()) == h3
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).attempt == 0
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).started_ts == 0.0
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).endpoint_name == ""
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job", "attempt": "x"}).attempt == 0
 
@@ -680,6 +684,7 @@ def test_reattach_passes_persisted_current_attempt(monkeypatch):
 
     def fake_poll_job(rh, **kw):
         captured.clear()
+        captured["handle"] = rh
         captured.update(kw)
         return base.PollResult(ok=True)
 
@@ -688,10 +693,17 @@ def test_reattach_passes_persisted_current_attempt(monkeypatch):
 
     handle = base.JobHandle(
         provider="runpod",
-        data={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "attempt": 2},
+        data={
+            "endpoint_id": "ep",
+            "endpoint_name": "n",
+            "job_id": "j",
+            "attempt": 2,
+            "started_ts": 12_345.0,
+        },
     )
     RunpodProvider().poll(handle, spec, 0)
     assert captured["current_attempt"] == 2
+    assert captured["handle"].started_ts == 12_345.0
 
     for raw_attempt in ("", "x", None):
         handle = base.JobHandle(
