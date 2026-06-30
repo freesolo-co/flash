@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -133,13 +134,58 @@ def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
 
 
 _ARTIFACT_NAMESPACE = "Freesolo-Co"
+_ARTIFACT_REPO_PREFIX = "flashrun-"
+_ARTIFACT_REPO_NAME_MAX = 96
+
+
+def _environment_artifact_repo_name(env_id: str) -> str:
+    """Stable HF dataset repo name for all runs of one environment."""
+    raw = (env_id or "default-environment").strip() or "default-environment"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", raw.lower()).strip("-") or "environment"
+    budget = _ARTIFACT_REPO_NAME_MAX - len(_ARTIFACT_REPO_PREFIX) - len(digest) - 1
+    slug = slug[:budget].rstrip("-") or "environment"
+    return f"{_ARTIFACT_REPO_PREFIX}{slug}-{digest}"
+
+
+def managed_hf_repo_for_environment(env_id: str) -> str:
+    """Private HF dataset repo shared by runs that use the same environment id."""
+    return f"{_ARTIFACT_NAMESPACE}/{_environment_artifact_repo_name(env_id)}"
+
+
+def _file_digest(path: str, digest) -> None:
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+
+def flash_code_prefix() -> str:
+    """Content-addressed HF path for the current ``flash`` package snapshot."""
+    import flash
+
+    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
+    digest = hashlib.sha1()
+    for root, dirs, files in os.walk(pkg_dir):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
+        for name in sorted(files):
+            if name.endswith((".pyc", ".pyo")):
+                continue
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            rel = os.path.relpath(path, pkg_dir).replace(os.sep, "/")
+            digest.update(rel.encode("utf-8"))
+            digest.update(b"\0")
+            _file_digest(path, digest)
+            digest.update(b"\0")
+    return f"code/{digest.hexdigest()[:32]}/flash"
 
 
 def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
-    """Assign the per-run HF artifact repo (platform-managed, never user-set); run_id must be finalized first."""
+    """Assign the environment-scoped HF artifact repo (platform-managed, never user-set)."""
     if not spec.run_id or spec.run_id == "local":
-        raise ValueError("run_id must be finalized before assigning the per-run artifact repo")
-    repo = f"{_ARTIFACT_NAMESPACE}/flashrun-{spec.run_id}"
+        raise ValueError("run_id must be finalized before assigning the artifact repo")
+    repo = managed_hf_repo_for_environment(spec.environment.id)
     d = spec.to_dict()
     d["train"] = {**d["train"], "hf_repo": repo}
     return JobSpec.from_dict(d)
