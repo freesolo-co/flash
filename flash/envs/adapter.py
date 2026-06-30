@@ -410,6 +410,45 @@ def _github_response_message(payload: object) -> str:
     return ""
 
 
+def _github_tree_entries(ref: GitHubEnvironmentRef, treeish: str, context: str) -> list[dict]:
+    payload = _download_github_json(ref, _github_tree_url(ref, treeish), context)
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        raise RuntimeError(
+            f"GitHub path {context!r} is not an environment directory"
+            f"{_github_response_message(payload)}"
+        )
+    if payload.get("truncated"):
+        raise RuntimeError(
+            f"GitHub tree response for environment directory {context!r} was truncated"
+        )
+    entries = payload["tree"]
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise RuntimeError("GitHub tree response included an invalid entry")
+    return entries
+
+
+def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
+    treeish = ref.ref
+    current = ""
+    for part in [part for part in repo_dir.split("/") if part]:
+        entries = _github_tree_entries(ref, treeish, current or ref.ref)
+        match = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("path") == part
+                and entry.get("type") == "tree"
+                and isinstance(entry.get("sha"), str)
+            ),
+            None,
+        )
+        current = f"{current}/{part}" if current else part
+        if match is None:
+            raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
+        treeish = match["sha"]
+    return treeish
+
+
 def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
     """Download one GitHub directory into a repo-shaped tree under ``dest``."""
     repo_root = dest / "repo"
@@ -464,9 +503,10 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
         (repo_root / path).mkdir(parents=True, exist_ok=True)
 
     create_dir(repo_dir)
+    package_tree_sha = _resolve_github_directory_tree_sha(ref, repo_dir)
     payload = _download_github_json(
         ref,
-        _github_tree_url(ref, f"{ref.ref}:{repo_dir}", recursive=True),
+        _github_tree_url(ref, package_tree_sha, recursive=True),
         repo_dir,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):

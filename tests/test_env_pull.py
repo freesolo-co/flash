@@ -543,7 +543,15 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
     monkeypatch.setattr(adapter, "_download_github_tarball", fail_tarball)
 
     trees = {
-        ("a" * 40 + ":david-freesolo-co/stuff", True): {
+        ("a" * 40, False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "david-freesolo-co", "sha": "namespace-sha"}],
+        },
+        ("namespace-sha", False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "stuff", "sha": "package-sha"}],
+        },
+        ("package-sha", True): {
             "truncated": False,
             "tree": [
                 {
@@ -616,7 +624,15 @@ def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
 
     monkeypatch.setattr(adapter, "_download_github_tarball", fail_tarball)
     trees = {
-        ("a" * 40 + ":david-freesolo-co/stuff", True): {
+        ("a" * 40, False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "david-freesolo-co", "sha": "namespace-sha"}],
+        },
+        ("namespace-sha", False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "stuff", "sha": "package-sha"}],
+        },
+        ("package-sha", True): {
             "truncated": False,
             "tree": [
                 {
@@ -696,7 +712,15 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
     )
     shard_count = 1001
     trees = {
-        ("b" * 40 + ":david-freesolo-co/big", True): {
+        ("b" * 40, False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "david-freesolo-co", "sha": "namespace-sha"}],
+        },
+        ("namespace-sha", False): {
+            "truncated": False,
+            "tree": [{"type": "tree", "path": "big", "sha": "package-sha"}],
+        },
+        ("package-sha", True): {
             "truncated": False,
             "tree": [
                 {

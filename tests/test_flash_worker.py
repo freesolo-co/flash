@@ -360,6 +360,7 @@ def test_train_body_imports_every_name_it_uses():
     # the always-on console uploader).
     for name in ("contextlib", "json", "os", "subprocess", "sys", "threading"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
+    assert "_CONSOLE_UPLOAD_INTERVAL_S" not in inspect.getsource(train._train_body)
 
 
 def test_train_body_has_no_prime_install_path():
@@ -400,9 +401,9 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
 
     # --- every prior optimization still present ---
     # example packing (all three backends: TRL bfd, SDPA 4D-mask, GDN varlen)
-    assert 'cfg_kwargs["packing"] = True' in src                  # TRL bfd (pure-attn FA2)
+    assert 'cfg_kwargs["packing"] = True' in src  # TRL bfd (pure-attn FA2)
     assert "BlockDiagonalCollator(pad_token_id=tok.pad_token_id)" in src  # SDPA 4D-mask
-    assert "emit_varlen=True" in src                              # GDN varlen
+    assert "emit_varlen=True" in src  # GDN varlen
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
     # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
@@ -450,9 +451,7 @@ def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
         )
 
     assert any(
-        isinstance(node, ast.If)
-        and "packing" in ast.dump(node.test)
-        and _stores_grad_accum(node)
+        isinstance(node, ast.If) and "packing" in ast.dump(node.test) and _stores_grad_accum(node)
         for node in ast.walk(tree)
     ), "bfd path must re-derive gradient_accumulation_steps under a packing guard"
 
@@ -469,7 +468,7 @@ def test_trl_collator_masks_prompt_from_pretokenized_rows():
     col = DataCollatorForLanguageModeling(pad_token_id=0, completion_only_loss=True)
     rows = [
         {"input_ids": [10, 11, 12, 13, 14], "completion_mask": [0, 0, 0, 1, 1]},  # 3-tok prompt
-        {"input_ids": [20, 21, 22], "completion_mask": [0, 1, 1]},                # 2-tok prompt
+        {"input_ids": [20, 21, 22], "completion_mask": [0, 1, 1]},  # 2-tok prompt
     ]
     out = col(rows)
     labels = out["labels"]
@@ -570,8 +569,12 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
             endpoints._train_body(input_data)
 
         # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
-        console_uploads = [u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")]
-        assert console_uploads, f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
+        console_uploads = [
+            u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")
+        ]
+        assert console_uploads, (
+            f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
+        )
         assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
         assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
