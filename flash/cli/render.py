@@ -357,6 +357,21 @@ def _color_json(obj, depth: int) -> str:
     return _paint(json.dumps(obj), _GREEN)
 
 
+def _hide_provider_metadata(obj):
+    """Styled CLI details are for humans; keep backend provider names out of that view."""
+    if isinstance(obj, dict):
+        return {
+            k: _hide_provider_metadata(v)
+            for k, v in obj.items()
+            if k.lower() not in {"provider", "flash_arm"}
+        }
+    if isinstance(obj, list):
+        return [_hide_provider_metadata(v) for v in obj]
+    if isinstance(obj, str) and obj.lower() in {"runpod", "lambda"}:
+        return "managed"
+    return obj
+
+
 def version(value: str) -> str:
     """The wordmark + version."""
     mark = _paint(CLI_NAME, _ACCENT, "1")
@@ -388,13 +403,9 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
-def _run_where(spec: dict, remote: dict) -> tuple[str, str]:
-    """Return ``(gpu, provider)`` from remote (preferred) or spec fallback."""
-    provider = remote.get("provider") or (
-        "runpod" if remote else (spec.get("gpu") or {}).get("provider", "")
-    )
-    gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
-    return gpu, provider
+def _run_gpu(spec: dict, remote: dict) -> str:
+    """Human-facing GPU label. Provider metadata stays internal."""
+    return remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
 
 
 def runs_table(runs: list[dict]) -> str:
@@ -404,8 +415,7 @@ def runs_table(runs: list[dict]) -> str:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        gpu, provider = _run_where(spec, r.get("remote") or {})
-        where = f"{gpu}@{provider}" if provider else gpu
+        where = _run_gpu(spec, r.get("remote") or {})
         color, uni, ascii_dot = _STATE_STYLE.get(str(r.get("state", "")).lower(), (_GRAY, "•", "-"))
         body.append(
             [
@@ -471,8 +481,7 @@ def _humanize_ts(value) -> str | None:
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
-    gpu, provider = _run_where(spec, obj.get("remote") or {})
-    where = f"{gpu} @ {provider}" if gpu and provider else (gpu or None)
+    where = _run_gpu(spec, obj.get("remote") or {}) or None
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),
@@ -492,7 +501,7 @@ def run_status(obj: dict) -> str:
     if obj.get("error"):
         pairs.append(("error", _paint(str(obj["error"]), _RED)))
     head = f"{header('status')}\n  {badge(obj.get('state', 'unknown'))}\n\n{_kv(pairs)}"
-    raw = f"{_dim('details')}\n{_json(obj)}"
+    raw = f"{_dim('details')}\n{_json(_hide_provider_metadata(obj))}"
     return _safe(f"{head}\n\n{raw}")
 
 
@@ -509,7 +518,7 @@ def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
         if rid:
             line += "   " + _paint(rid, _ACCENT2)
         parts.append(line + "\n")
-    parts.append(_json(obj))
+    parts.append(_json(_hide_provider_metadata(obj)))
     return _safe("\n".join(parts))
 
 
@@ -586,7 +595,7 @@ def cost_panel(est) -> str:
         ),
         (
             "gpu",
-            f"{est.gpu} on {est.provider}  "
+            f"{est.gpu}  "
             f"{_dim(f'({est.gpu_vram_gb} GB; needs >= {est.required_vram_gb} GB)')}  "
             f"@ {money(est.gpu_hourly_usd, 2)}/hr",
         ),
