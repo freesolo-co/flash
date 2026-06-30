@@ -30,6 +30,7 @@ from flash.engine.worker.decoding import (
     render_prompt,
     strip_think,
     think_token_count,
+    thinking_text,
 )
 from flash.engine.worker.finalize import write_train_meta
 from flash.engine.worker.gpu_setup import (
@@ -407,6 +408,7 @@ __all__ = [
     "strip_language_model_infix",
     "strip_think",
     "think_token_count",
+    "thinking_text",
     "upload_debug_jsonl",
     "vllm_language_model_only_kwargs",
     "wait_for_gpu",

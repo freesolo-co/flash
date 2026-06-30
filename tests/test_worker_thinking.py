@@ -1,10 +1,9 @@
 """CPU dry-run of the worker's thinking-mode behavior (heavy deps mocked).
 
-Covers the run-wide THINKING flag: strip_think drops <think> blocks before the env
-reward sees a completion (an unclosed block scores 0 even when the gold number
-appears inside the reasoning), and the thinking-aware GRPO micro-batch default kicks
-in. strip_think is applied once in worker.graded_text before the env rewards — so it
-works for every environment.
+Covers the run-wide THINKING flag: strip_think extracts the answer text from
+<think>-wrapped completions (an unclosed block extracts no final answer even when
+the gold number appears inside the reasoning), and the thinking-aware GRPO
+micro-batch default kicks in.
 """
 
 from __future__ import annotations
@@ -66,6 +65,22 @@ def test_strip_think_unit():
     # unclosed <think> (completion budget exhausted): pre-think text only
     assert ne.strip_think("preamble<think>still going 42") == "preamble"
     assert ne.strip_think("<think>still going 42") == ""
+
+
+def test_thinking_text_unit():
+    import flash.engine.worker as ne
+
+    assert ne.thinking_text(None) is None
+    assert ne.thinking_text("no tags, answer 42") is None
+    assert ne.thinking_text("<think>reason 99</think>\\boxed{42}") == "reason 99"
+    assert ne.thinking_text("<think>a</think>mid<think>b</think> ans 7") == "a\nb"
+    assert ne.thinking_text("reasoning...</think>\\boxed{5}") == "reasoning..."
+    assert (
+        ne.thinking_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True)
+        == "reasoning..."
+    )
+    assert ne.thinking_text("preamble<think>still going 42") == "still going 42"
+    assert ne.thinking_text("<think>still going 42") == "still going 42"
 
 
 def test_thinking_budget_selection(monkeypatch):
