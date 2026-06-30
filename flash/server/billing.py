@@ -10,6 +10,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, org_id_of
 
 _COMPLETION_CHARGE_PATH = "/api/billing/training-usage/internal"
+_PRECHECK_PATH = "/api/billing/training-usage/precheck"
 
 
 class BillingError(Exception):
@@ -66,6 +67,18 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
     except ValueError as exc:
         # The backend responded but the body isn't JSON -- a bad gateway, not an outage.
         raise BillingError(502, f"billing service returned an invalid response: {exc}") from exc
+
+
+def precheck_training_run(*, internal_key: str, org_id: str, estimate_usd: float) -> dict:
+    """Verify-only budget pre-flight before a run is submitted.
+
+    Asks the backend whether ``org_id`` could cover the run's flash.cost estimate. Raises
+    ``BillingError`` (status_code 402) when it can't, so the caller can reject the run before any
+    GPU is allocated. Moves no money -- the real charge still happens at completion. Backend
+    unreachable / 5xx surface as ``BillingError`` with a non-402 status_code so the caller can
+    fail open (a billing-infra blip must not block all training)."""
+    body = {"orgId": org_id, "estimateCents": _cents(estimate_usd)}
+    return _post_billing(token=internal_key, path=_PRECHECK_PATH, body=body)
 
 
 def charge_completed_run(*, internal_key: str, status) -> dict:
