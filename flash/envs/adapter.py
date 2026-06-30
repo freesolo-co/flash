@@ -359,7 +359,7 @@ def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
 def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool = False) -> str:
     url = (
         f"https://api.github.com/repos/{ref.repo_full_name}/git/trees/"
-        f"{urllib.parse.quote(treeish, safe='')}"
+        f"{urllib.parse.quote(treeish, safe='/:')}"
     )
     if recursive:
         url = f"{url}?recursive=1"
@@ -408,28 +408,6 @@ def _github_response_message(payload: object) -> str:
         if isinstance(message, str) and message:
             return f" ({message})"
     return ""
-
-
-def _find_github_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
-    treeish = ref.ref
-    traversed: list[str] = []
-    for part in [part for part in repo_dir.split("/") if part]:
-        payload = _download_github_json(ref, _github_tree_url(ref, treeish), "/".join(traversed))
-        entries = payload.get("tree") if isinstance(payload, dict) else None
-        if not isinstance(entries, list):
-            raise RuntimeError(
-                f"GitHub path {repo_dir!r} is not an environment directory"
-                f"{_github_response_message(payload)}"
-            )
-        match = next(
-            (entry for entry in entries if isinstance(entry, dict) and entry.get("path") == part),
-            None,
-        )
-        if not match or match.get("type") != "tree" or not isinstance(match.get("sha"), str):
-            raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
-        treeish = match["sha"]
-        traversed.append(part)
-    return treeish
 
 
 def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
@@ -486,10 +464,9 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
         (repo_root / path).mkdir(parents=True, exist_ok=True)
 
     create_dir(repo_dir)
-    env_tree_sha = _find_github_tree_sha(ref, repo_dir)
     payload = _download_github_json(
         ref,
-        _github_tree_url(ref, env_tree_sha, recursive=True),
+        _github_tree_url(ref, f"{ref.ref}:{repo_dir}", recursive=True),
         repo_dir,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
