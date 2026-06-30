@@ -1140,6 +1140,22 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     assert out.deployment["state"] == "undeployed"  # not re-advertised
 
 
+def test_mark_checkpoint_deployed_refuses_dry_run(monkeypatch, tmp_path):
+    import flash.runner as runner
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-dry"}
+    runner._save_status(
+        runner.RunStatus(run_id="dep-dry", state="dry_run", spec=spec, remote=None)
+    )
+    out = runner.mark_checkpoint_deployed("dep-dry", {"endpoint_name": "e"})
+    assert out.state == "dry_run"
+    assert out.deployment is None
+
+
 def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monkeypatch, tmp_path):
     # The legacy finished_at backfill (for runs that went `done` before finished_at existed) must
     # run ONLY on the done->deployed transition, where updated_at == training teardown. On an
@@ -1670,6 +1686,119 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
     # ...but the serving deployment is recorded and listed as active.
     deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
     assert any(d["run_id"] == run_id for d in deployments)
+
+
+@pytest.mark.parametrize("state", ["queued", "provisioning", "running", "failed"])
+def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, state):
+    """A resolved checkpoint step proves the adapter exists, so run state does not gate serving it."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(
+        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
+    )
+
+    key = _login()
+    run_id = _make_run(api, key, state)
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert r.json()["checkpoint_step"] == 40
+    status = runner.get_status(run_id)
+    assert status.state == state
+    assert status.deployment["checkpoint_step"] == 40
+    deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
+    assert any(d["run_id"] == run_id and d["state"] == state for d in deployments)
+
+
+def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "running")
+
+    def fake_deploy(**kwargs):
+        status = runner.get_status(run_id)
+        status.state = "done"
+        runner._save_status(status)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    status = runner.get_status(run_id)
+    assert status.state == "deployed"
+    assert status.deployment["checkpoint_step"] == 40
+
+
+def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_k: pytest.fail("dry-run run must not touch serving"),
+    )
+
+    key = _login()
+    run_id = _make_run(api, key, "dry_run")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 409, r.text
+    assert "dry-run runs cannot be deployed" in r.json()["detail"]
+
+
+def test_deploy_checkpoint_preserves_finished_run_undeploy_cas(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    rollbacks = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    status = runner.get_status(run_id)
+    status.deployment = {"state": "ready", "endpoint_name": "old"}
+    runner._save_status(status)
+
+    def fake_deploy(**kwargs):
+        runner.mark_undeployed(run_id)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 409, r.text
+    assert rollbacks == [run_id]
+    status = runner.get_status(run_id)
+    assert status.state == "done"
+    assert status.deployment["state"] == "undeployed"
+
+
+def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(
+        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
+    )
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: [run_id])
+
+    key = _login()
+    run_id = _make_run(api, key, "running")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+
+    r = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    status = runner.get_status(run_id)
+    assert status.state == "running"
+    assert status.deployment["state"] == "undeployed"
 
 
 def test_deploy_cancelled_run_without_step_is_409(api):

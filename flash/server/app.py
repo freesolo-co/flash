@@ -47,10 +47,6 @@ from ._runtime import (
 
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
-# A specific intermediate checkpoint can also be deployed from a run that stopped mid-RL
-# (cancelled/failed): the per-step adapter was already streamed to HF, so it serves even though
-# the run never sealed a final adapter. `dry_run` is excluded — it never trained.
-_CHECKPOINT_DEPLOYABLE_STATES = _DEPLOYABLE_STATES | {"cancelled", "failed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 _log = logging.getLogger("flash.server")
