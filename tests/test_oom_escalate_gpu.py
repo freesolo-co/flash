@@ -64,6 +64,7 @@ def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
     assert (retriable, oom) == (False, True)
     assert reads["n"] == 1  # surfacing + both flags share ONE forced read
     assert surfaced_worker_flags(lambda force=False: {"retriable": True}, None, say)[1:] == (True, False)
+    assert surfaced_worker_flags(lambda force=False: {"retriable": True}, None, say, 0)[1:] == (True, False)
     assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
     stale = lambda force=False: {"oom": True, "attempt": "0", "retriable": False}  # noqa: E731
     assert surfaced_worker_flags(stale, None, say, 0)[1:] == (False, True)

@@ -20,7 +20,6 @@ from flash.providers._poll import (
     PollErrorTracker,
     _attempt_int,
     heartbeat_oom_for_attempt,
-    heartbeat_progress_ts,
     is_training_heartbeat,
     make_say,
     surface_heartbeat,
@@ -798,10 +797,9 @@ def worker_flagged_retriable(
     heartbeat path is shared across retries, so a leftover ``retriable=True`` from attempt N-1 must
     NOT override attempt N's own (non-retriable) failure marker — otherwise a deterministic
     bootstrap/config error that fails BEFORE this attempt's worker emits any heartbeat would be
-    reported job_preempted and burn GPUs on an endless retry instead of failing fast. Same staleness
-    rule as ``heartbeat_progress_ts`` (ts predates launch OR an explicit attempt mismatch -> stale ->
-    ignored). With NEITHER arg the flag is honored ungated (back-compat for callers that don't date
-    heartbeats)."""
+    reported job_preempted and burn GPUs on an endless retry instead of failing fast. Only positive
+    prior-attempt evidence gates the flag: a ts that predates launch OR an explicit attempt mismatch.
+    With NEITHER arg the flag is honored ungated (back-compat for callers that don't date heartbeats)."""
     if heartbeat_reader is None:
         return False
     hb = heartbeat_reader(force=True)
@@ -811,9 +809,18 @@ def worker_flagged_retriable(
         return False
     if launch_ts is None and current_attempt is None:
         return True  # ungated: caller can't date the heartbeat -> preserve prior behavior
-    hb_key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
-    _ts, fresh = heartbeat_progress_ts(hb_key, launch_ts, current_attempt)
-    return fresh
+    hb_attempt = _attempt_int(hb.get("attempt"))
+    cur_attempt = _attempt_int(current_attempt)
+    if hb_attempt is not None and cur_attempt is not None and hb_attempt != cur_attempt:
+        return False
+    if launch_ts:
+        try:
+            ts = float(hb.get("ts"))
+        except (TypeError, ValueError):
+            ts = None
+        if ts is not None and ts < float(launch_ts):
+            return False
+    return True
 
 
 def heartbeat_is_stale_prior_attempt(

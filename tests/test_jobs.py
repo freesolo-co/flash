@@ -327,6 +327,14 @@ def test_worker_flagged_retriable_gates_stale_prior_attempt_heartbeat():
     # Gated: a genuine THIS-attempt retriable heartbeat is still honored.
     fresh = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "attempt": 1, "retriable": True}
     assert worker_flagged_retriable(reader(fresh), launch_ts=10_000.0, current_attempt=1) is True
+    # A missing attempt field is not an explicit mismatch. Keep honoring the worker-stamped retry
+    # flag unless the heartbeat timestamp proves it predates this attempt's launch.
+    fresh_no_attempt = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "retriable": True}
+    assert worker_flagged_retriable(reader(fresh_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
+    stale_no_attempt = {"stage": "rl_step", "step": 5, "ts": 9_000.0, "retriable": True}
+    assert worker_flagged_retriable(reader(stale_no_attempt), launch_ts=10_000.0, current_attempt=1) is False
+    undated_no_attempt = {"stage": "rl_step", "retriable": True}
+    assert worker_flagged_retriable(reader(undated_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
     # No retriable flag -> False regardless of gating.
     no_flag = {"ts": 10_500.0, "attempt": 1}
     assert worker_flagged_retriable(reader(no_flag), launch_ts=10_000.0, current_attempt=1) is False
