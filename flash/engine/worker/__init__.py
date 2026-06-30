@@ -128,7 +128,7 @@ from flash.engine.worker.wandb_log import (
     wandb_run_name,
 )
 from flash.envs.adapter import GitHubRateLimitError
-from flash.envs.registry import load_environment
+from flash.envs.registry import load_environment, training_env_params
 from flash.spec import FIXED_SEED, load_job_spec_from_env
 
 HF_REPO = os.environ.get("HF_REPO", "")
@@ -165,7 +165,7 @@ def _load_active_env():
             "`flash env push --name <name>`)."
         )
     return load_environment(
-        env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
+        env_id, training_env_params(JOB_SPEC), resolved_sha=JOB_SPEC.environment.resolved_sha
     )
 
 

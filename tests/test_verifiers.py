@@ -397,6 +397,35 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
 
 
+def test_training_max_examples_maps_to_freesolo_loader_max_examples(monkeypatch, tmp_path):
+    seen = _install_fake_freesolo(monkeypatch)
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(max_examples=1024):\n    return None\n")
+
+    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES
+
+    load_freesolo_environment(str(env_file), **{_FLASH_TRAIN_MAX_EXAMPLES: None})
+
+    assert seen["kwargs"]["max_examples"] is None
+
+
+def test_training_max_examples_prefers_freesolo_loader_limit(monkeypatch, tmp_path):
+    seen = _install_fake_freesolo(monkeypatch)
+    env_file = tmp_path / "environment.py"
+    env_file.write_text(
+        "def load_environment(use_hf=True, limit=None, **kwargs):\n    return None\n"
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES
+
+    load_freesolo_environment(str(env_file), **{_FLASH_TRAIN_MAX_EXAMPLES: 10_178})
+
+    assert seen["kwargs"]["limit"] == 10_178
+    assert "max_examples" not in seen["kwargs"]
+
+
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 

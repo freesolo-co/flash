@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import gzip
 import hashlib
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from flash.envs.base import BaseEnvironment
+from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES
 
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
@@ -41,6 +43,45 @@ _TAR_METADATA_TYPES = {
 }
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+
+
+def _load_environment_params(path: Path) -> tuple[set[str], bool]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except Exception:
+        return set(), False
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "load_environment":
+            args = node.args
+            names = {
+                arg.arg
+                for arg in (
+                    *args.posonlyargs,
+                    *args.args,
+                    *args.kwonlyargs,
+                )
+            }
+            return names, args.kwarg is not None
+    return set(), False
+
+
+def _apply_training_max_examples(reference: str, params: dict[str, Any]) -> dict[str, Any]:
+    if _FLASH_TRAIN_MAX_EXAMPLES not in params:
+        return params
+
+    value = params.pop(_FLASH_TRAIN_MAX_EXAMPLES)
+    if "max_examples" in params or "limit" in params:
+        return params
+
+    ref_path = Path(reference)
+    names, accepts_kwargs = _load_environment_params(ref_path) if ref_path.is_file() else (set(), False)
+    if "max_examples" in names:
+        params["max_examples"] = value
+    elif "limit" in names:
+        params["limit"] = value
+    elif accepts_kwargs:
+        params["max_examples"] = value
+    return params
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -1055,7 +1096,7 @@ def load_freesolo_environment(
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 
-    params = dict(kwargs)
+    params = _apply_training_max_examples(reference, dict(kwargs))
     source = params.pop("records", None)
     dataset_path = params.get("dataset_path")
     if source is None and dataset_path:
