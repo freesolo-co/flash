@@ -20,6 +20,7 @@ from flash.engine.worker.multimodal import (
     multimodal_sft_row,
     multimodal_token_estimate,
 )
+from flash.engine.worker.rl import _single_turn_completion_text
 from flash.envs.adapter import FreesoloEnvironment, load_freesolo_environment
 
 _RED_DOT = (
@@ -243,6 +244,29 @@ def test_grpo_multimodal_path_is_wired_to_trl_vlm_support():
     assert "not conversational and not _multimodal" in src
     assert "multimodal GRPO currently supports single-turn image prompts only" in src
     assert "base_dirs=image_base_dirs" in src
+    assert "_single_turn_completion_text(comp)" in src
+    assert "if isinstance(comp, list) and is_multi_turn:" in src
+
+
+def test_grpo_single_turn_conversational_completion_scores_text():
+    completion = [{"role": "assistant", "content": "red"}]
+    assert _single_turn_completion_text(completion) == "red"
+
+    content_blocks = [
+        {"type": "text", "text": "blue"},
+        {"type": "image"},
+        {"type": "text", "text": "square"},
+    ]
+    assert _single_turn_completion_text([{"role": "assistant", "content": content_blocks}]) == (
+        "blue\nsquare"
+    )
+
+    transcript = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "draft"},
+        {"role": "assistant", "content": "final"},
+    ]
+    assert _single_turn_completion_text(transcript) == "final"
 
 
 def test_freesolo_env_threads_image_base_dirs():

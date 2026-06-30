@@ -37,6 +37,33 @@ from flash.engine.worker.perf import (
 )
 
 
+def _single_turn_completion_text(completion):
+    """Return the assistant text TRL wraps in conversational completions for single-turn GRPO."""
+    if not isinstance(completion, list):
+        return completion
+    text = ""
+    for message in completion:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text" or block.get("text") is not None:
+                        parts.append(str(block.get("text") or ""))
+                elif block is not None:
+                    parts.append(str(block))
+            text = "\n".join(p for p in parts if p)
+        elif content is None:
+            text = ""
+        else:
+            text = str(content)
+    return text
+
+
 def run_rl():
     from datasets import Dataset
     from transformers import AutoProcessor, AutoTokenizer
@@ -63,7 +90,9 @@ def run_rl():
             import torch._dynamo
 
             torch._dynamo.config.suppress_errors = True
-            print("[rl] multi-turn: torch._dynamo suppress_errors=True (Liger loss falls back to eager on dynamic shapes)")
+            print(
+                "[rl] multi-turn: torch._dynamo suppress_errors=True (Liger loss falls back to eager on dynamic shapes)"
+            )
         except Exception as exc:
             print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
@@ -72,7 +101,9 @@ def run_rl():
     download_seconds = _w.prefetch_model(model_id)
     rl = RECIPE.rl
     steps = int(
-        _w.JOB_SPEC.train.steps if _w.JOB_SPEC and _w.JOB_SPEC.train.steps is not None else rl.num_steps
+        _w.JOB_SPEC.train.steps
+        if _w.JOB_SPEC and _w.JOB_SPEC.train.steps is not None
+        else rl.num_steps
     )
     gcfg = _w.grpo_overrides()
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
@@ -137,7 +168,10 @@ def run_rl():
     elif conversational:
         prompts = [{"prompt": msgs, "example": ex} for msgs, ex in prompt_messages_rows]
     else:
-        prompts = [{"prompt": _w.render_prompt(tok, ex), "example": ex} for _msgs, ex in prompt_messages_rows]
+        prompts = [
+            {"prompt": _w.render_prompt(tok, ex), "example": ex}
+            for _msgs, ex in prompt_messages_rows
+        ]
     _max_completion = int(
         gcfg.get("max_tokens")
         or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
@@ -154,9 +188,7 @@ def run_rl():
 
     # TRL 1.5's GRPOConfig doesn't truncate prompts, so drop over-budget prompts up front (applies
     # to both string and conversational prompts) before the paid worker rolls out.
-    _oai_tools = (
-        getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
-    )
+    _oai_tools = getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
 
     def _render_for_budget(p) -> str:
         """Render a prompt to text EXACTLY as the rollout does (incl. tool schemas)."""
@@ -253,19 +285,22 @@ def run_rl():
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
+            reward_completion = _single_turn_completion_text(comp)
             try:
-                if isinstance(comp, list):
+                if isinstance(comp, list) and is_multi_turn:
                     # Conversational transcript (list of messages): score the whole transcript.
                     r = env.reward_from_messages(comp, ex)
                     rewards.append(r)
                     continue
-                graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
+                graded = _w.graded_text(
+                    reward_completion, prompt_opened_thinking=_prompt_opens_thinking
+                )
                 state = (
                     {
-                        "raw": comp,
+                        "raw": reward_completion,
                         "completion": graded,
                         "thinking": _w.thinking_text(
-                            comp, prompt_opened_thinking=_prompt_opens_thinking
+                            reward_completion, prompt_opened_thinking=_prompt_opens_thinking
                         ),
                     }
                     if _w.THINKING
@@ -291,7 +326,7 @@ def run_rl():
                 # Gated on _prompt_opens_thinking so a template that ignores enable_thinking
                 # doesn't get its tagless answers counted as reasoning.
                 r -= _think_penalty * _w.think_token_count(
-                    comp, tok, prompt_opened_thinking=_prompt_opens_thinking
+                    reward_completion, tok, prompt_opened_thinking=_prompt_opens_thinking
                 )
             rewards.append(r)
             if idx < 8:
@@ -506,6 +541,7 @@ def run_rl():
             vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
             vllm_enable_sleep_mode=sleep_mode,
         )
+
         def _set_vllm_field(names, value, label):
             for _f in names:
                 if _f in _grpo_fields:
@@ -524,9 +560,7 @@ def run_rl():
         _kv_dtype = "fp8" if _cc >= (8, 9) else None
         _mnbt = max(8192, vllm_max_len) if _card_gb >= 140 else None
         if _kv_dtype or _mnbt:
-            _w.patch_trl_colocate_llm_kwargs(
-                kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt
-            )
+            _w.patch_trl_colocate_llm_kwargs(kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt)
         _set_vllm_field(
             ("vllm_enable_prefix_caching", "enable_prefix_caching"),
             True,
@@ -618,7 +652,9 @@ def run_rl():
         grpo_kwargs[_tis_clip_field] = _tis_c
         print(f"[rl] tis clip c_max={_tis_c} ({_tis_clip_field})")
     else:
-        print("[rl] tis: trl default importance-sampling correction in effect; no clip field on this trl")
+        print(
+            "[rl] tis: trl default importance-sampling correction in effect; no clip field on this trl"
+        )
     cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
     _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
@@ -693,7 +729,9 @@ def run_rl():
         _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
         if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
             _liger_loss.chunk_size = _cs
-            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
+            print(
+                f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)"
+            )
     # Run Liger's fused loss eager: drop only its torch.compile (broken on torch 2.10), keep the
     # chunked memory path. Must run BEFORE the mask-aware wrap below.
     if disable_liger_grpo_torch_compile(trainer):
@@ -705,7 +743,9 @@ def run_rl():
     # preserving; no-op when nothing is masked).
     if grpo_kwargs.get("use_liger_kernel") and patch_grpo_mask_aware_lm_head(trainer):
         _masked_kind = "env + padding" if use_rollout_func else "padding"
-        print(f"[rl] mask-aware lm_head: skipping masked ({_masked_kind}) positions in the GRPO loss")
+        print(
+            f"[rl] mask-aware lm_head: skipping masked ({_masked_kind}) positions in the GRPO loss"
+        )
     # Activate the weight-sync remap only now, after the initial checkpoint load is built.
     if use_vllm:
         _LM_SYNC_REMAP_ON["on"] = True
