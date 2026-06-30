@@ -594,14 +594,17 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     return extracted_dir
 
 
-def _resolve_github_environment_file(
-    env_ref: str, pinned_sha: str | None = None, *, managed_hub: bool = False
-) -> Path:
+def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
     resolved_ref = _resolve_ref_sha(parsed, pinned_sha=pinned_sha)
-    cache_scope = "managed-hub" if managed_hub else "github"
+    package_root = _managed_hub_package_root(parsed)
+    if parsed.repo_full_name.lower() == _DEFAULT_MANAGED_ENV_REPO.lower() and not package_root:
+        raise ValueError(
+            "managed environment hub refs must include a namespace/name environment path"
+        )
+    cache_scope = "managed-hub" if package_root else "github"
     cache_key = hashlib.sha256(
         f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
@@ -619,7 +622,6 @@ def _resolve_github_environment_file(
         parsed.path,
     )
     try:
-        package_root = _managed_hub_package_root(parsed) if managed_hub else ""
         if package_root:
             # The shared managed hub can be much larger than one environment. Download only the
             # requested package so worker cache/extraction limits apply to that env, not the hub.
@@ -647,9 +649,7 @@ def _resolve_github_environment_file(
 def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
     if is_managed_environment_slug(env_ref):
         return str(
-            _resolve_github_environment_file(
-                managed_slug_to_github_ref(env_ref), pinned_sha, managed_hub=True
-            )
+            _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
         )
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
