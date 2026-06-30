@@ -192,6 +192,30 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
     assert temp_base not in uploaded["readme"]
 
 
+def test_export_metadata_repair_skips_non_utf8_files(tmp_path):
+    from flash.serve import export
+
+    (tmp_path / "adapter_config.json").write_bytes(b"\xff")
+    (tmp_path / "README.md").write_bytes(b"\xfe")
+
+    assert export._rewrite_adapter_config_base_model(tmp_path, BASE_MODEL) is False
+    assert export._rewrite_readme_temp_base_model(tmp_path, BASE_MODEL) is False
+
+
+def test_export_readme_base_model_replacement_is_literal(tmp_path):
+    from flash.serve import export
+
+    temp_base = "/tmp/flash_sft_merged_abcd1234"
+    literal_base_model = r"org\1/model"
+    (tmp_path / "README.md").write_text(
+        f"---\nbase_model:\n- {temp_base}\nlibrary_name: peft\n---\n",
+        encoding="utf-8",
+    )
+
+    assert export._rewrite_readme_temp_base_model(tmp_path, literal_base_model) is True
+    assert literal_base_model in (tmp_path / "README.md").read_text(encoding="utf-8")
+
+
 def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeypatch):
     """A re-export into a repo holding a previous, differently-serialized adapter must clear the stale
     adapter weights (so a leftover ``.bin`` can't be loaded next to the new ``.safetensors``) WITHOUT
@@ -216,7 +240,9 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
             pass
 
         def list_repo_files(self, *, repo_id, repo_type):
-            listed["called"] = True  # must NOT be called: cleanup is pattern-based, not listing-based
+            listed["called"] = (
+                True  # must NOT be called: cleanup is pattern-based, not listing-based
+            )
             return []
 
         def update_repo_settings(self, **kw):

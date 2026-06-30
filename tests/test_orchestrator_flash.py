@@ -60,9 +60,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         assert captured["gpu"] == "RTX 4090"
 
         # Metrics are namespaced by run id so same-phase runs cannot collide.
-        metrics_path = os.path.join(
-            tmp, "results", "runpod", "rl", status.run_id, "metrics.json"
-        )
+        metrics_path = os.path.join(tmp, "results", "runpod", "rl", status.run_id, "metrics.json")
         assert os.path.exists(metrics_path)
         with open(metrics_path) as f:
             m = json.load(f)
@@ -76,7 +74,7 @@ def test_upload_code_forces_private_on_reused_repo(monkeypatch):
     import sys
     import types
 
-    calls = {"info": [], "create": [], "settings": [], "upload": []}
+    calls = {"info": [], "create": [], "settings": [], "upload": [], "marker": []}
 
     class _FakeApi:
         def __init__(self, token=None):
@@ -98,6 +96,9 @@ def test_upload_code_forces_private_on_reused_repo(monkeypatch):
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
 
+        def upload_file(self, **kw):
+            calls["marker"].append(kw)
+
     fake_hub = types.ModuleType("huggingface_hub")
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
@@ -117,7 +118,7 @@ def test_upload_code_creates_repo_only_when_missing(monkeypatch):
     import sys
     import types
 
-    calls = {"info": [], "create": [], "settings": [], "upload": []}
+    calls = {"info": [], "create": [], "settings": [], "upload": [], "marker": []}
 
     class _NotFound(Exception):
         pass
@@ -146,6 +147,9 @@ def test_upload_code_creates_repo_only_when_missing(monkeypatch):
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
 
+        def upload_file(self, **kw):
+            calls["marker"].append(kw)
+
     fake_hub = types.ModuleType("huggingface_hub")
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
@@ -160,13 +164,14 @@ def test_upload_code_creates_repo_only_when_missing(monkeypatch):
     assert calls["create"][0][1]["private"] is True
     assert len(calls["settings"]) == 2
     assert len(calls["upload"]) == 2
+    assert len(calls["marker"]) == 2
 
 
 def test_upload_code_rechecks_privacy_on_each_submit(monkeypatch):
     import sys
     import types
 
-    calls = {"info": [], "settings": [], "upload": []}
+    calls = {"info": [], "settings": [], "upload": [], "marker": []}
 
     class _FakeApi:
         def __init__(self, token=None):
@@ -188,6 +193,9 @@ def test_upload_code_rechecks_privacy_on_each_submit(monkeypatch):
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
 
+        def upload_file(self, **kw):
+            calls["marker"].append(kw)
+
     fake_hub = types.ModuleType("huggingface_hub")
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
@@ -200,13 +208,14 @@ def test_upload_code_rechecks_privacy_on_each_submit(monkeypatch):
     assert len(calls["info"]) == 2
     assert len(calls["settings"]) == 2
     assert len(calls["upload"]) == 2
+    assert len(calls["marker"]) == 2
 
 
 def test_upload_code_retries_transient_repo_settings(monkeypatch):
     import sys
     import types
 
-    calls = {"settings": 0, "upload": []}
+    calls = {"settings": 0, "upload": [], "marker": []}
 
     class _Response:
         status_code = 504
@@ -235,6 +244,9 @@ def test_upload_code_retries_transient_repo_settings(monkeypatch):
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
 
+        def upload_file(self, **kw):
+            calls["marker"].append(kw)
+
     fake_hub = types.ModuleType("huggingface_hub")
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
@@ -247,6 +259,7 @@ def test_upload_code_retries_transient_repo_settings(monkeypatch):
 
     assert calls["settings"] == 2
     assert calls["upload"]
+    assert calls["marker"]
 
 
 def test_hf_call_honors_retry_after(monkeypatch):
@@ -319,7 +332,7 @@ def test_upload_code_uses_content_addressed_prefix(monkeypatch):
 
     import flash
 
-    calls = {"upload": []}
+    calls = {"upload": [], "marker": []}
 
     class _FakeApi:
         def __init__(self, token=None):
@@ -340,6 +353,9 @@ def test_upload_code_uses_content_addressed_prefix(monkeypatch):
         def upload_folder(self, **kw):
             calls["upload"].append(kw)
 
+        def upload_file(self, **kw):
+            calls["marker"].append(kw)
+
     fake_hub = types.ModuleType("huggingface_hub")
     fake_hub.HfApi = _FakeApi
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
@@ -355,6 +371,9 @@ def test_upload_code_uses_content_addressed_prefix(monkeypatch):
     assert up["folder_path"] == os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     assert "*.pyc" in up.get("ignore_patterns", [])
     assert "*.pyo" in up.get("ignore_patterns", [])
+    assert (
+        calls["marker"][0]["path_in_repo"] == f"{up['path_in_repo']}/.flash-code-snapshot-complete"
+    )
 
 
 def test_upload_code_skips_existing_content_prefix(monkeypatch):
@@ -395,11 +414,60 @@ def test_upload_code_skips_existing_content_prefix(monkeypatch):
     assert calls["file_exists"] == [
         {
             "repo_id": "owner/run-artifacts",
-            "filename": f"{prefix}/__init__.py",
+            "filename": f"{prefix}/.flash-code-snapshot-complete",
             "repo_type": "dataset",
         }
     ]
     assert calls["upload"] == []
+
+
+def test_upload_code_reuploads_when_completion_marker_missing(monkeypatch):
+    import sys
+    import types
+
+    calls = {"file_exists": [], "upload": [], "marker": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(private=True)
+
+        def create_repo(self, repo, **kw):
+            raise AssertionError("existing repo should not be created")
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def file_exists(self, **kw):
+            calls["file_exists"].append(kw)
+            return False
+
+        def upload_folder(self, **kw):
+            calls["upload"].append(kw)
+
+        def upload_file(self, **kw):
+            calls["marker"].append(kw)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    import flash.providers.runpod.train as flash_train
+
+    prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    flash_train.upload_code("owner/run-artifacts", code_prefix=prefix)
+
+    assert calls["file_exists"] == [
+        {
+            "repo_id": "owner/run-artifacts",
+            "filename": f"{prefix}/.flash-code-snapshot-complete",
+            "repo_type": "dataset",
+        }
+    ]
+    assert calls["upload"], "missing completion marker must force a fresh folder upload"
+    assert calls["marker"][0]["path_in_repo"] == f"{prefix}/.flash-code-snapshot-complete"
 
 
 def test_run_job_background_swallows_exception(monkeypatch):
