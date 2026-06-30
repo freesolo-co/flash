@@ -56,6 +56,7 @@ def _gnu_longname_bomb(name_len: int) -> bytes:
         g.write(tail)
     return buf.getvalue()
 
+
 _MINIMAL = {
     "pyproject.toml": "[project]\nname = 'e'\n",
     "environment.py": "def load_environment(**k):\n    return None\n",
@@ -229,6 +230,81 @@ def test_record_published_environment_is_best_effort(monkeypatch):
             slug="acme/my-env",
             name="My Env",
             key={"org_id": "org-1"},
+        )
+        is False
+    )
+
+
+def _capture_delete_request(monkeypatch):
+    """Stub urlopen for record_deleted_environment and return the dict it records into."""
+    from flash.server import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["method"] = req.get_method()
+        seen["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(environment_registry.urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def test_record_deleted_environment_uses_caller_org_for_internal_key(monkeypatch):
+    # The internal key is org-agnostic, so the web UI delete supplies the org explicitly.
+    from flash.server import environment_registry
+
+    seen = _capture_delete_request(monkeypatch)
+    ok = environment_registry.record_deleted_environment(
+        slug="acme/my-env",
+        key={"auth_kind": "internal"},
+        org_id="org-acme",
+    )
+    assert ok is True
+    assert seen["method"] == "DELETE"
+    assert json.loads(seen["body"]) == {"orgId": "org-acme", "slug": "acme/my-env"}
+
+
+def test_record_deleted_environment_prefers_key_org_over_supplied(monkeypatch):
+    # A user key carries its own org, which must win over any caller-supplied override so a
+    # forged header can't drop another org's row.
+    from flash.server import environment_registry
+
+    seen = _capture_delete_request(monkeypatch)
+    ok = environment_registry.record_deleted_environment(
+        slug="acme/my-env",
+        key={"org_id": "org-key"},
+        org_id="org-other",
+    )
+    assert ok is True
+    assert json.loads(seen["body"])["orgId"] == "org-key"
+
+
+def test_record_deleted_environment_without_any_org_is_noop(monkeypatch):
+    # No key org and no supplied org: nothing to target, so it must not POST.
+    from flash.server import environment_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setattr(
+        environment_registry.urllib.request,
+        "urlopen",
+        lambda *a, **k: pytest.fail("must not call the backend without an org"),
+    )
+    assert (
+        environment_registry.record_deleted_environment(
+            slug="acme/my-env",
+            key={"auth_kind": "internal"},
         )
         is False
     )
@@ -627,9 +703,7 @@ def test_delete_package_user_can_delete_own_namespace(monkeypatch):
         return True
 
     monkeypatch.setattr(envs, "_github_delete", fake_github_delete)
-    assert (
-        envs.delete_package(slug="acme/my-env", key={"org_slug": "acme"}) is True
-    )
+    assert envs.delete_package(slug="acme/my-env", key={"org_slug": "acme"}) is True
     assert seen == {"slug": "acme/my-env", "token": "ghp-test"}
 
 
@@ -704,8 +778,20 @@ def test_delete_package_validates_slug(monkeypatch):
     # must be REJECTED, not silently normalized to ns/env (which would leak a non-canonical id that
     # the response / metadata mirror would then carry while deletion targets the trimmed slug).
     for bad in (
-        "noslash", "a/b/c", "ns/..", "../escape", "ns/", "/name", "ns/bad name", "ns/env/", "/ns/env",
-        "ns/env ", " ns/env", "ns/env\t", "ns /env", "  ns/env  ",
+        "noslash",
+        "a/b/c",
+        "ns/..",
+        "../escape",
+        "ns/",
+        "/name",
+        "ns/bad name",
+        "ns/env/",
+        "/ns/env",
+        "ns/env ",
+        " ns/env",
+        "ns/env\t",
+        "ns /env",
+        "  ns/env  ",
     ):
         with pytest.raises(envs.EnvPublishError):
             envs.delete_package(slug=bad, key={"auth_kind": "internal"})
