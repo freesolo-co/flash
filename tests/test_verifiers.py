@@ -410,6 +410,24 @@ def test_training_max_examples_maps_to_freesolo_loader_max_examples(monkeypatch,
     assert seen["kwargs"]["max_examples"] is None
 
 
+def test_training_max_examples_honors_python_source_encoding(monkeypatch, tmp_path):
+    seen = _install_fake_freesolo(monkeypatch)
+    env_file = tmp_path / "environment.py"
+    env_file.write_bytes(
+        b"# coding: latin-1\n"
+        b"# caf\xe9\n"
+        b"def load_environment(max_examples=1024):\n"
+        b"    return None\n"
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES
+
+    load_freesolo_environment(str(env_file), **{_FLASH_TRAIN_MAX_EXAMPLES: None})
+
+    assert seen["kwargs"]["max_examples"] is None
+
+
 def test_training_max_examples_keeps_flash_cap_out_of_loader(monkeypatch, tmp_path):
     seen = _install_fake_freesolo(monkeypatch)
     env_file = tmp_path / "environment.py"

@@ -12,6 +12,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import tokenize
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,7 +48,8 @@ _CANONICAL_OUTPUT_KEY = "output"
 
 def _load_environment_params(path: Path) -> tuple[set[str], bool]:
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        with tokenize.open(path) as source:
+            tree = ast.parse(source.read(), filename=os.fspath(path))
     except Exception:
         return set(), False
     for node in tree.body:
