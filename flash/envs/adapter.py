@@ -46,14 +46,42 @@ _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
 
 
-def _load_environment_params(path: Path) -> tuple[set[str], bool]:
+def _resolved_import_path(base: Path, module: str | None, level: int) -> Path | None:
+    if module is None:
+        return None
+    parts = module.split(".")
+    if any(not part.isidentifier() for part in parts):
+        return None
+
+    root = base.parent
+    for _ in range(max(level - 1, 0)):
+        root = root.parent
+
+    candidate = root.joinpath(*parts)
+    file_candidate = candidate.with_suffix(".py")
+    if file_candidate.is_file():
+        return file_candidate
+    init_candidate = candidate / "__init__.py"
+    if init_candidate.is_file():
+        return init_candidate
+    return None
+
+
+def _load_environment_params(
+    path: Path, target_name: str = "load_environment", seen: set[Path] | None = None
+) -> tuple[set[str], bool]:
+    seen = seen or set()
+    resolved_path = path.resolve()
+    if resolved_path in seen or len(seen) >= 8:
+        return set(), False
+    seen.add(resolved_path)
     try:
         with tokenize.open(path) as source:
             tree = ast.parse(source.read(), filename=os.fspath(path))
     except Exception:
         return set(), False
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "load_environment":
+        if isinstance(node, ast.FunctionDef) and node.name == target_name:
             args = node.args
             names = {
                 arg.arg
@@ -64,6 +92,14 @@ def _load_environment_params(path: Path) -> tuple[set[str], bool]:
                 )
             }
             return names, args.kwarg is not None
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if (alias.asname or alias.name) != target_name:
+                    continue
+                import_path = _resolved_import_path(path, node.module, node.level)
+                if import_path is None:
+                    continue
+                return _load_environment_params(import_path, alias.name, seen)
     return set(), False
 
 
@@ -81,9 +117,9 @@ def _apply_training_max_examples(reference: str, params: dict[str, Any]) -> dict
     # loaders would pre-truncate the dataset and change which rows are sampled.
     if "max_examples" in names:
         params["max_examples"] = None
-    elif "limit" in names:
+    if "limit" in names:
         params["limit"] = None
-    elif accepts_kwargs:
+    if not names.intersection({"max_examples", "limit"}) and accepts_kwargs:
         params["max_examples"] = None
     return params
 
