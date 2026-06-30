@@ -182,7 +182,7 @@ def test_grpo_train_max_examples_does_not_forward_loader_cap():
     assert training_env_params(spec) == {}
 
 
-def test_sft_train_token_count_forwards_loader_cap(monkeypatch):
+def test_sft_train_token_count_forwards_loader_no_cap(monkeypatch):
     captured = []
 
     def fake_load_env(env_id, params=None):
@@ -192,7 +192,7 @@ def test_sft_train_token_count_forwards_loader_cap(monkeypatch):
     spec = _sft_spec(max_examples=10_178, batch_size=32, epochs=2)
 
     assert count_sft_train_tokens(spec) is None
-    assert captured == [{_FLASH_TRAIN_MAX_EXAMPLES: 10_178}]
+    assert captured == [{_FLASH_TRAIN_MAX_EXAMPLES: None}]
 
 
 def test_sft_steps_unpinned_requires_countable_env(monkeypatch):

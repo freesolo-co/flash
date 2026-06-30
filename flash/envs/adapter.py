@@ -69,18 +69,20 @@ def _apply_training_max_examples(reference: str, params: dict[str, Any]) -> dict
     if _FLASH_TRAIN_MAX_EXAMPLES not in params:
         return params
 
-    value = params.pop(_FLASH_TRAIN_MAX_EXAMPLES)
+    params.pop(_FLASH_TRAIN_MAX_EXAMPLES)
     if "max_examples" in params or "limit" in params:
         return params
 
     ref_path = Path(reference)
     names, accepts_kwargs = _load_environment_params(ref_path) if ref_path.is_file() else (set(), False)
+    # Flash applies train.max_examples after a fixed-seed shuffle; passing that value into
+    # loaders would pre-truncate the dataset and change which rows are sampled.
     if "max_examples" in names:
-        params["max_examples"] = value
+        params["max_examples"] = None
     elif "limit" in names:
-        params["limit"] = value
+        params["limit"] = None
     elif accepts_kwargs:
-        params["max_examples"] = value
+        params["max_examples"] = None
     return params
 
 

@@ -17,10 +17,10 @@ def worker_pip_for_env(env_id: str) -> list[str]:
 def training_env_params(spec) -> dict[str, Any]:
     """Environment-loader params for a training run.
 
-    ``[train].max_examples`` caps Flash training, but some environments also have a
-    loader-side cap (commonly ``max_examples`` or ``limit``) with a small default. Carry
-    the training intent through an internal marker so the adapter can disable or raise that
-    loader cap before the worker calls ``env.dataset()``.
+    ``[train].max_examples`` caps Flash training after the worker shuffles examples, but
+    some environments also have a loader-side cap (commonly ``max_examples`` or ``limit``)
+    with a small default. Carry an internal marker so the adapter can clear that loader
+    cap before the worker calls ``env.dataset()``.
     """
     params = dict(getattr(getattr(spec, "environment", None), "params", None) or {})
     train = getattr(spec, "train", None)
@@ -33,10 +33,7 @@ def training_env_params(spec) -> dict[str, Any]:
     if algorithm != "sft":
         return params
 
-    max_examples = getattr(train, "max_examples", None)
-    params[_FLASH_TRAIN_MAX_EXAMPLES] = (
-        int(max_examples) if max_examples is not None and int(max_examples) > 0 else None
-    )
+    params[_FLASH_TRAIN_MAX_EXAMPLES] = None
     return params
 
 
