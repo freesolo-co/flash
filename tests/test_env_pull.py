@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import stat
 import tarfile
 import urllib.parse
 import urllib.request
@@ -562,12 +563,20 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
                     "mode": "100644",
                     "size": len(b'{"a":1}\n'),
                 },
+                {"type": "tree", "path": "bin", "sha": "bin-sha"},
+                {
+                    "type": "blob",
+                    "path": "bin/run-helper",
+                    "mode": "100755",
+                    "size": len(b"#!/bin/sh\n"),
+                },
             ],
         },
     }
     files = {
         "david-freesolo-co/stuff/environment.py": b"# env\n",
         "david-freesolo-co/stuff/datasets/train.jsonl": b'{"a":1}\n',
+        "david-freesolo-co/stuff/bin/run-helper": b"#!/bin/sh\n",
     }
     seen_urls: list[str] = []
 
@@ -595,8 +604,38 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
 
     assert env_file.read_bytes() == b"# env\n"
     assert (env_file.parent / "datasets" / "train.jsonl").read_bytes() == b'{"a":1}\n'
+    assert stat.S_IMODE((env_file.parent / "bin" / "run-helper").stat().st_mode) == 0o755
     assert not (env_file.parents[2] / "other-org").exists()
     assert all("other-org" not in url for url in seen_urls)
+
+
+def test_explicit_environment_hub_github_ref_keeps_tarball_scope(monkeypatch, tmp_path):
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    def fail_directory(ref, repo_dir, dest):
+        raise AssertionError("explicit GitHub refs should keep the whole-repo tarball path")
+
+    monkeypatch.setattr(adapter, "_download_github_directory", fail_directory)
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: _tarball(
+            {
+                "david-freesolo-co/stuff/environment.py": b"# env\n",
+                "shared/helper.py": b"# helper\n",
+            }
+        ),
+    )
+
+    env_file = Path(
+        adapter._resolve_environment_reference(
+            "github:freesolo-co/environment-hub@main:david-freesolo-co/stuff/environment.py"
+        )
+    )
+
+    assert env_file.read_bytes() == b"# env\n"
+    assert (env_file.parents[2] / "shared" / "helper.py").read_bytes() == b"# helper\n"
 
 
 def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_path):

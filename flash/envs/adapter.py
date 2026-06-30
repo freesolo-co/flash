@@ -447,7 +447,7 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
         if target != root and root not in target.parents:
             raise RuntimeError(f"unsafe path in environment contents: {path!r}")
 
-    def download_file(path: str, declared_size: object) -> None:
+    def download_file(path: str, declared_size: object, mode: object = None) -> None:
         record_member(path)
         if (
             isinstance(declared_size, int)
@@ -477,6 +477,9 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
                 "environment archive is too large uncompressed "
                 f"({state['bytes']} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
             )
+        if isinstance(mode, str):
+            with contextlib.suppress(ValueError):
+                target.chmod(int(mode, 8) & 0o777)
 
     def create_dir(path: str) -> None:
         record_member(path)
@@ -509,7 +512,7 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
         if kind == "tree":
             create_dir(child_path)
         elif kind == "blob" and entry.get("mode") != "120000":
-            download_file(child_path, entry.get("size"))
+            download_file(child_path, entry.get("size"), entry.get("mode"))
         else:
             raise RuntimeError(f"unsupported entry in environment contents: {child_path!r}")
     return repo_root
@@ -614,13 +617,16 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     return extracted_dir
 
 
-def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
+def _resolve_github_environment_file(
+    env_ref: str, pinned_sha: str | None = None, *, managed_hub: bool = False
+) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
     resolved_ref = _resolve_ref_sha(parsed, pinned_sha=pinned_sha)
+    cache_scope = "managed-hub" if managed_hub else "github"
     cache_key = hashlib.sha256(
-        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
+        f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
     env_file = cache_dir / parsed.path
@@ -636,7 +642,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        package_root = _managed_hub_package_root(parsed)
+        package_root = _managed_hub_package_root(parsed) if managed_hub else ""
         if package_root:
             # The shared managed hub can be much larger than one environment. Download only the
             # requested package so worker cache/extraction limits apply to that env, not the hub.
@@ -664,7 +670,9 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
 def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
     if is_managed_environment_slug(env_ref):
         return str(
-            _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
+            _resolve_github_environment_file(
+                managed_slug_to_github_ref(env_ref), pinned_sha, managed_hub=True
+            )
         )
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
