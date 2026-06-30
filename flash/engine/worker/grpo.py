@@ -50,7 +50,14 @@ def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
     trivially-typed columns (prompt + integer example_idx); reward_fn maps the index back.
     """
     examples = [p["example"] for p in prompts]
-    rows = [{"prompt": p["prompt"], "example_idx": i} for i, p in enumerate(prompts)]
+    rows = []
+    for i, p in enumerate(prompts):
+        row = {"prompt": p["prompt"], "example_idx": i}
+        if "image" in p:
+            row["image"] = p["image"]
+        if "images" in p:
+            row["images"] = p["images"]
+        rows.append(row)
     return rows, examples
 
 

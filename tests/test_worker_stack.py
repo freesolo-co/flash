@@ -82,7 +82,13 @@ def test_lora_exclude_modules_qwen35(monkeypatch):
     # which let LoRA onto visual.* and broke vLLM adapter loading).
     assert re.fullmatch(excl, "visual.blocks.0.attn.qkv")
     assert re.fullmatch(excl, "model.visual.blocks.3.mlp.linear_fc1")
+    assert re.fullmatch(excl, "multi_modal_projector.linear")
     assert not re.fullmatch(excl, "model.layers.0.self_attn.q_proj")
+
+    mm_excl = worker.lora_exclude_modules("Qwen/Qwen3.5-4B", multimodal=True)
+    assert mm_excl is not None
+    assert re.fullmatch(mm_excl, "visual.blocks.0.attn.qkv")
+    assert not re.fullmatch(mm_excl, "multi_modal_projector.linear")
 
 
 def test_lora_exclude_modules_text_model(monkeypatch):
@@ -614,7 +620,7 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     monkeypatch.setitem(sys.modules, "peft", fake_peft)
 
     worker = _import_worker(monkeypatch)
-    monkeypatch.setattr(worker, "lora_exclude_modules", lambda m: None)
+    monkeypatch.setattr(worker, "lora_exclude_modules", lambda m, **kw: None)
 
     for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
         captured.clear()

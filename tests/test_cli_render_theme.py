@@ -46,11 +46,12 @@ def test_plain_path_stays_machine_readable(monkeypatch, fake_client, capsys) -> 
 
     assert cli.main(["models"]) == 0
     out = capsys.readouterr().out
-    # plain output is bare model ids, one per line, with no themed header or detail columns
+    # plain output is one parseable row per model: id<TAB>modality, with no themed header.
     assert "Qwen/Qwen3.5-0.8B" in out
+    assert "Qwen/Qwen3.5-0.8B\timage+text" in out
+    assert "openbmb/MiniCPM5-1B\ttext-only" in out
     assert "supported base models" not in out
     assert all(line in out for line in ("Qwen/Qwen3.5-9B", "openbmb/MiniCPM5-1B"))
-    assert "\t" not in out
 
     assert cli.main(["status", "flash-1"]) == 0
     payload = json.loads(capsys.readouterr().out)  # must stay parseable JSON
@@ -68,6 +69,8 @@ def test_styled_path_is_themed_but_lossless(monkeypatch, fake_client, capsys) ->
     out = capsys.readouterr().out
     assert "supported base models" in out  # themed header
     assert "Qwen/Qwen3.5-0.8B" in out
+    assert "image+text" in out
+    assert "text-only" in out
     assert "PARAMS" not in out  # ids only — no reintroduced detail columns
 
     assert cli.main(["status", "flash-1"]) == 0

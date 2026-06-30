@@ -79,6 +79,9 @@ class ModelInfo:
     serving: ServingCapacity | None = None
     # "none" / "hybrid" (Qwen3-style) / "always" (can't disable) / "unknown" (open-model policy)
     thinking: str = "none"
+    # Ordered user-facing modality labels. The first modality is always "text"; image-capable
+    # catalog entries add "image" and are routed through TRL's VLM data path when rows carry images.
+    modalities: tuple[str, ...] = ("text",)
     vocab_size: int = _DEFAULT_VOCAB_SIZE
     # Parameters ACTIVE per token in billions — only meaningful for an MoE, where a token routes
     # through a small subset of experts. The cost estimator's per-token FLOPs/step-time term reads
@@ -96,6 +99,7 @@ class ModelInfo:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data["multimodal"] = supports_multimodal(self)
         serving = data.get("serving")
         if serving is None:
             data.pop("serving", None)
@@ -125,6 +129,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
         thinking="hybrid",
+        modalities=("text",),
         notes="On-device class SLM (131k ctx); standard Llama architecture.",
     ),
     "Qwen/Qwen3.5-0.8B": ModelInfo(
@@ -138,7 +143,8 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
         thinking="hybrid",
-        notes="Smallest Qwen3.5; cheap smoke/dev runs with the modern arch.",
+        modalities=("text", "image"),
+        notes="Smallest Qwen3.5; cheap smoke/dev runs with the modern multimodal arch.",
     ),
     "Qwen/Qwen3.5-2B": ModelInfo(
         id="Qwen/Qwen3.5-2B",
@@ -151,6 +157,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
         thinking="hybrid",
+        modalities=("text", "image"),
     ),
     "Qwen/Qwen3.5-4B": ModelInfo(
         id="Qwen/Qwen3.5-4B",
@@ -171,6 +178,7 @@ MODELS: dict[str, ModelInfo] = {
             gpu_memory_utilization=0.98,
         ),
         thinking="hybrid",
+        modalities=("text", "image"),
         notes="Current-gen 4B. GRPO uses the sleep-mode memory recipe (hybrid arch needs "
         "extra engine state-cache); fused DeltaNet kernels ship in the default stack.",
     ),
@@ -196,6 +204,7 @@ MODELS: dict[str, ModelInfo] = {
             gpu_memory_utilization=0.98,
         ),
         thinking="hybrid",
+        modalities=("text", "image"),
         notes="bf16 LoRA. ~19 GB of weights; SFT fits a 48 GB card, while colocated GRPO "
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
@@ -235,6 +244,7 @@ MODELS: dict[str, ModelInfo] = {
             gpu_memory_utilization=0.98,
         ),
         thinking="hybrid",
+        modalities=("text", "image"),
         min_disk_gb=200,
         notes="MoE (35B total / ~3B active), bf16 LoRA. SFT runs on the 141 GB H200 (the ~70 GB "
         "weights dominate; active-3B compute keeps activations/KV tiny, so context is ~unbounded by "
@@ -245,6 +255,17 @@ MODELS: dict[str, ModelInfo] = {
 
 def list_models() -> list[ModelInfo]:
     return sorted(MODELS.values(), key=lambda m: (m.min_vram_gb, m.id))
+
+
+def supports_multimodal(model: str | ModelInfo | None) -> bool:
+    """Whether the catalog entry is validated for image-bearing training rows."""
+    if isinstance(model, ModelInfo):
+        info = model
+    elif isinstance(model, str) and model.strip():
+        info = MODELS.get(model.strip())
+    else:
+        info = None
+    return bool(info and "image" in tuple(info.modalities))
 
 
 def get_model(model_id: str) -> ModelInfo:

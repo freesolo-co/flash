@@ -1,0 +1,12 @@
+model = "Qwen/Qwen3.5-0.8B"
+algorithm = "grpo"
+
+[environment]
+id = ""
+
+[train]
+steps = 2
+batch_size = 1
+group_size = 2
+max_tokens = 16
+lora_rank = 8

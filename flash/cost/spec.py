@@ -160,6 +160,7 @@ def count_sft_train_tokens(spec) -> int | None:
     try:
         from transformers import AutoTokenizer
 
+        from flash.engine.worker.multimodal import has_image_input, message_text
         from flash.engine.worker.sft import _pretokenize_completion_only
 
         tok = AutoTokenizer.from_pretrained(spec.model, trust_remote_code=True)
@@ -171,6 +172,14 @@ def count_sft_train_tokens(spec) -> int | None:
             prompt_messages = list(env.prompt_messages(ex) or [])
             completion = list(env.sft_completion(ex) or [])
             msgs = [*prompt_messages, *completion]
+            if has_image_input(prompt_messages, ex) or has_image_input(completion, None):
+                texts.append(
+                    {
+                        "text": message_text(msgs),
+                        "prompt_text": message_text(prompt_messages),
+                    }
+                )
+                continue
             texts.append(
                 {
                     "text": tok.apply_chat_template(

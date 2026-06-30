@@ -1,0 +1,10 @@
+model = "Qwen/Qwen3.5-0.8B"
+algorithm = "sft"
+
+[environment]
+id = ""
+
+[train]
+epochs = 1
+max_examples = 2
+lora_rank = 8

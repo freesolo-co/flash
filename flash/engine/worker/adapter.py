@@ -19,8 +19,13 @@ from flash.engine.worker.lora import (
 from flash.engine.worker.perf import optimal_attn_impl
 
 
-def make_lora(model_id: str | None = None):
-    """Build LoRA config targeting all linear layers; vision tower excluded for VL models."""
+def make_lora(model_id: str | None = None, *, multimodal: bool = False):
+    """Build LoRA config targeting all linear layers.
+
+    Text-only runs on VL checkpoints exclude the projector too so existing language-model-only
+    serving remains compatible. Image-bearing runs leave the projector trainable while excluding the
+    large vision tower.
+    """
     from peft import LoraConfig
 
     targets = "all-linear"
@@ -41,7 +46,7 @@ def make_lora(model_id: str | None = None):
     # rsLoRA removed: ~5.6x effective LR inflation with catalog LRs causes SFT divergence + serve corruption.
     kwargs["use_rslora"] = False
     if model_id and targets == "all-linear":
-        exclude = _w.lora_exclude_modules(model_id)
+        exclude = _w.lora_exclude_modules(model_id, multimodal=multimodal)
         if exclude:
             kwargs["exclude_modules"] = exclude
             print(f"[lora] excluding modules for {model_id}: {exclude}")
@@ -116,13 +121,13 @@ def _merge_vl_warmstart_adapter(adir: str, model_id: str, attn_kw: dict) -> str:
     return merged_dir
 
 
-def _init_adapter_model(model_id: str):
+def _init_adapter_model(model_id: str, *, multimodal: bool = False):
     """Load init_from_adapter as a trainable PeftModel, or return model_id + fresh LoRA."""
     _w._VL_WARMSTART_SFT_DIR = None
     _w._VL_WARMSTART_MODEL_ID = None
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     if not prefix:
-        return model_id, make_lora(model_id)
+        return model_id, make_lora(model_id, multimodal=multimodal)
     adir = _download_adapter(prefix)
     if not adir:
         raise RuntimeError(
@@ -149,7 +154,7 @@ def _init_adapter_model(model_id: str):
         )
         merged_dir = _merge_vl_warmstart_adapter(adir, model_id, attn_kw)
         print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
-        return merged_dir, make_lora(merged_dir)
+        return merged_dir, make_lora(merged_dir, multimodal=multimodal)
 
     # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
     # so keep it — TRL trains the LOADED adapter (peft_config=None).

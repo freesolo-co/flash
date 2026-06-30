@@ -39,8 +39,14 @@ from flash.engine.worker.perf import (
 
 def run_rl():
     from datasets import Dataset
-    from transformers import AutoTokenizer
+    from transformers import AutoProcessor, AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
+
+    from flash.engine.worker.multimodal import (
+        has_image_input,
+        model_supports_images,
+        multimodal_grpo_prompt_row,
+    )
 
     env = _w.require_active_env()
     t_start = time.time()
@@ -95,14 +101,50 @@ def run_rl():
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    processor = None
 
     train = env.dataset()
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
+    prompt_messages_rows = [(env.prompt_messages(ex), ex) for ex in train]
+    image_rows = sum(1 for msgs, ex in prompt_messages_rows if has_image_input(msgs, ex))
+    _multimodal = image_rows > 0
+    if _multimodal and not model_supports_images(model_id):
+        raise ValueError(
+            f"{model_id} is text-only in the Flash catalog, but {image_rows}/{len(train)} GRPO "
+            "prompt(s) include image data. Pick an image+text model from `flash models`, or remove "
+            "image/image_url content from the environment."
+        )
+    if _multimodal:
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        tok = getattr(processor, "tokenizer", tok)
+        if getattr(tok, "pad_token", None) is None:
+            tok.pad_token = tok.eos_token
+        print(f"[rl] multimodal GRPO: {image_rows}/{len(train)} prompt(s) include image inputs")
     if conversational:
-        prompts = [{"prompt": env.prompt_messages(ex), "example": ex} for ex in train]
+        if _multimodal:
+            prompts = [multimodal_grpo_prompt_row(msgs, ex) for msgs, ex in prompt_messages_rows]
+        else:
+            prompts = [{"prompt": msgs, "example": ex} for msgs, ex in prompt_messages_rows]
+    elif _multimodal:
+        prompts = []
+        for msgs, ex in prompt_messages_rows:
+            row = multimodal_grpo_prompt_row(msgs, ex)
+            try:
+                row["prompt"] = processor.apply_chat_template(
+                    row["prompt"],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=_w.THINKING,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "failed to render a multimodal prompt with this model's processor chat template "
+                    f"(fix the model/template or the env's prompts): {exc}"
+                ) from exc
+            prompts.append(row)
     else:
-        prompts = [{"prompt": _w.render_prompt(tok, ex), "example": ex} for ex in train]
+        prompts = [{"prompt": _w.render_prompt(tok, ex), "example": ex} for _msgs, ex in prompt_messages_rows]
     _max_completion = int(
         gcfg.get("max_tokens")
         or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
@@ -129,7 +171,8 @@ def run_rl():
             return p["prompt"]
         kw = {"tools": _oai_tools} if _oai_tools else {}
         try:
-            return tok.apply_chat_template(
+            template_owner = processor or tok
+            return template_owner.apply_chat_template(
                 p["prompt"],
                 add_generation_prompt=True,
                 tokenize=False,
@@ -330,7 +373,11 @@ def run_rl():
         # with _vllm_is_logprob_forward (TIS on by default), the cap is in practice always kept on the
         # colocated-vLLM path. liger_on (True) is also False off-GPU/without the liger wheel -> cap stays.
         fused_logits=(
-            liger_on(True) and _mu_one and _kl_beta == 0 and not _vllm_is_logprob_forward
+            (not _multimodal)
+            and liger_on(True)
+            and _mu_one
+            and _kl_beta == 0
+            and not _vllm_is_logprob_forward
         ),
     )
     if is_multi_turn and _cap_completion_len != _max_completion:
@@ -417,7 +464,7 @@ def run_rl():
     }
     # Liger fused GRPO loss: fuses lm_head + logprob so the fp32 248k-vocab logits never
     # materialize. DEFAULT ON regardless of size — without it even 0.8B OOMs a 24 GB card.
-    if liger_on(True):
+    if (not _multimodal) and liger_on(True):
         grpo_kwargs["use_liger_kernel"] = True
         print("[rl] liger fused GRPO loss enabled")
     if use_vllm:
@@ -527,7 +574,7 @@ def run_rl():
                 "vLLM cudagraph_mode (verl rollout default)",
             )
     # Continue the SFT adapter when train.init_from_adapter is set, else a fresh LoRA on the id.
-    init_model, init_peft = _w._init_adapter_model(model_id)
+    init_model, init_peft = _w._init_adapter_model(model_id, multimodal=_multimodal)
     # chalk kernels are applied below against trainer.model (the authoritative target); TRL may
     # rebuild/wrap the PeftModel, and the fresh-LoRA path only passes the model-id string here.
     if init_peft is not None:
@@ -570,9 +617,10 @@ def run_rl():
     setup_seconds = time.time() - t_start
     _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
-    # VL checkpoints train text-only: make the colocated rollout engine skip the vision tower.
+    # Text-only runs on VL checkpoints make the colocated rollout engine skip the vision tower.
     if use_vllm:
-        patch_vllm_language_model_only(model_id)
+        if not _multimodal:
+            patch_vllm_language_model_only(model_id)
         # Install (but don't yet activate) the TRL->vLLM weight-sync name remap for VL checkpoints;
         # activated below, after the trainer's initial checkpoint load is built.
         patch_vllm_lm_weight_sync(model_id)
@@ -625,7 +673,7 @@ def run_rl():
             train_dataset=ds,
             reward_funcs=reward_fn,
             peft_config=init_peft,
-            processing_class=tok,
+            processing_class=processor or tok,
             callbacks=[hb_cb, _w.make_checkpoint_upload_callback()],
             **extra_trainer_kwargs,
         )
@@ -696,7 +744,10 @@ def run_rl():
         )
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
+    if processor is not None:
+        processor.save_pretrained(adapter_dir)
+    else:
+        tok.save_pretrained(adapter_dir)
     # VL merge-into-base warm-start (#296) saves a GRPO-ONLY LoRA trained on the SFT-merged base;
     # deployed on the catalog base it drops the SFT and the served model collapses to ~base. Stack
     # the original SFT LoRA back in so the DEPLOYED adapter reproduces base+SFT+GRPO on the original

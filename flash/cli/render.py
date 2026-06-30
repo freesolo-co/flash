@@ -386,9 +386,13 @@ def submitted(run_id: str) -> str:
 
 
 def models_table(rows: list[dict]) -> str:
-    """Supported base models — a clean themed list of ids (the CLI lists ids only)."""
+    """Supported base models with their training modality."""
     dot = _glyph("•", "-")
-    ids = "\n".join(f"  {_paint(dot, _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
+    ids = "\n".join(
+        f"  {_paint(dot, _FAINT)} {_paint(r['id'], _ACCENT2)} "
+        f"{_dim('image+text' if r.get('multimodal') else 'text-only')}"
+        for r in rows
+    )
     foot = arrow("train one with: flash train configs/rl.toml")
     return _safe(f"{header('models', 'supported base models')}\n{ids}\n\n{foot}")
 

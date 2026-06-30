@@ -38,6 +38,7 @@ gpu = [
     "datasets>=2.19",
     "freesolo>=0.2.52",
     "huggingface-hub>=0.34",
+    "pillow>=10",
 ]
 # freesolo-chalk (Freesolo's custom Triton/CUDA kernels, complements Liger) is an OPTIONAL,
 # separately-installed package — it is not on PyPI yet, so it is deliberately NOT a hard
@@ -66,6 +67,7 @@ server = [
     "datasets>=2.19",
     "freesolo>=0.2.52",
     "transformers>=5.6,<5.11",
+    "pillow>=10",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
@@ -80,6 +82,7 @@ dev = [
     "datasets>=2.19",
     "freesolo>=0.2.52",
     "transformers>=5.6,<5.11",
+    "pillow>=10",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.

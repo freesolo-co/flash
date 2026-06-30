@@ -99,9 +99,16 @@ def _model_arch_dims(model_id: str) -> tuple[int, int]:
 
 def run_sft():
     from datasets import Dataset
-    from transformers import AutoTokenizer
+    from transformers import AutoProcessor, AutoTokenizer
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
+
+    from flash.engine.worker.multimodal import (
+        has_image_input,
+        message_text,
+        model_supports_images,
+        multimodal_sft_row,
+    )
 
     env = _w.require_active_env()
     t_start = time.time()
@@ -113,6 +120,7 @@ def run_sft():
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    processor = None
 
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
 
@@ -127,13 +135,27 @@ def run_sft():
     if max_examples > 0:
         train = train[:max_examples]
     texts = []
+    sft_message_rows = []
+    image_rows = 0
     multiturn_targets = 0
     for ex in train:
         completion = env.sft_completion(ex)
         if len(completion) > 1:
             multiturn_targets += 1
         prompt_messages = env.prompt_messages(ex)
+        row_has_images = has_image_input(prompt_messages, ex) or has_image_input(completion, None)
+        if row_has_images:
+            image_rows += 1
+        sft_message_rows.append((prompt_messages, completion, ex))
         msgs = [*prompt_messages, *completion]
+        if row_has_images:
+            texts.append(
+                {
+                    "text": message_text(msgs),
+                    "prompt_text": message_text(prompt_messages),
+                }
+            )
+            continue
         texts.append(
             {
                 "text": tok.apply_chat_template(
@@ -144,6 +166,23 @@ def run_sft():
                 ),
             }
         )
+    _multimodal = image_rows > 0
+    if _multimodal and not model_supports_images(model_id):
+        raise ValueError(
+            f"{model_id} is text-only in the Flash catalog, but {image_rows}/{len(train)} SFT "
+            "row(s) include image data. Pick an image+text model from `flash models`, or remove "
+            "image/image_url content from the environment."
+        )
+    if _multimodal:
+        multimodal_rows = [
+            multimodal_sft_row(prompt_messages, completion, ex)
+            for prompt_messages, completion, ex in sft_message_rows
+        ]
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        tok = getattr(processor, "tokenizer", tok)
+        if getattr(tok, "pad_token", None) is None:
+            tok.pad_token = tok.eos_token
+        print(f"[sft] multimodal SFT: {image_rows}/{len(train)} row(s) include image inputs")
     if multiturn_targets:
         print(f"[sft] multi-turn SFT: {multiturn_targets}/{len(train)} rows train on a full target transcript")
     elif getattr(env, "multi_turn", False):
@@ -173,26 +212,42 @@ def run_sft():
     sft_max_len = _train_opt(
         "max_length", RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len
     )
-    with liveness_heartbeat("sft_pretokenizing"):
-        texts, _pretok, _dropped = _pretokenize_completion_only(texts, tok, sft_max_len)
-    if _dropped:
-        print(
-            f"[sft] dropped {_dropped} rows with no real completion target "
-            "(sft_max_len truncated away the whole completion, or an empty/content-free completion)"
-        )
-    if not _pretok:
-        raise ValueError(
-            "every SFT example has an empty completion after sft_max_len truncation (nothing to "
-            "train on); increase sft_max_len or shorten the prompts"
-        )
-    ds = Dataset.from_list(_pretok)
-    _masked_tok = sum(m.count(0) for m in (r["completion_mask"] for r in _pretok))
-    _total_tok = sum(len(r["input_ids"]) for r in _pretok)
-    if _total_tok:
-        print(
-            f"[sft] completion-only loss: masking {_masked_tok}/{_total_tok} "
-            f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
-        )
+    if _multimodal:
+        with liveness_heartbeat("sft_pretokenizing"):
+            ds = Dataset.from_list(multimodal_rows)
+        _prompt_text = [message_text(r["prompt"]) for r in multimodal_rows]
+        _completion_text = [message_text(r["completion"]) for r in multimodal_rows]
+        _prompt_tok = tok(_prompt_text, add_special_tokens=False)["input_ids"]
+        _completion_tok = tok(_completion_text, add_special_tokens=False)["input_ids"]
+        _masked_tok = sum(len(ids) for ids in _prompt_tok)
+        _total_tok = _masked_tok + sum(len(ids) for ids in _completion_tok)
+        _pretok = []
+        if _total_tok:
+            print(
+                f"[sft] multimodal completion-only loss: masking ~{_masked_tok}/{_total_tok} "
+                f"({_masked_tok / _total_tok:.0%}) text tokens; image tokens are processor-managed"
+            )
+    else:
+        with liveness_heartbeat("sft_pretokenizing"):
+            texts, _pretok, _dropped = _pretokenize_completion_only(texts, tok, sft_max_len)
+        if _dropped:
+            print(
+                f"[sft] dropped {_dropped} rows with no real completion target "
+                "(sft_max_len truncated away the whole completion, or an empty/content-free completion)"
+            )
+        if not _pretok:
+            raise ValueError(
+                "every SFT example has an empty completion after sft_max_len truncation (nothing to "
+                "train on); increase sft_max_len or shorten the prompts"
+            )
+        ds = Dataset.from_list(_pretok)
+        _masked_tok = sum(m.count(0) for m in (r["completion_mask"] for r in _pretok))
+        _total_tok = sum(len(r["input_ids"]) for r in _pretok)
+        if _total_tok:
+            print(
+                f"[sft] completion-only loss: masking {_masked_tok}/{_total_tok} "
+                f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
+            )
     effective_batch = _train_opt("batch_size", RECIPE.sft.effective_batch)
     # Large-vocab OOM guard: without fused CE, SFTTrainer materializes [per_device, seq, vocab] fp32
     # logits; cap micro-batch so they fit, raise grad-accum to keep effective batch unchanged.
@@ -241,6 +296,7 @@ def run_sft():
     )
 
     max_steps = int(_t.max_steps or 0 if _t and _t.max_steps is not None else 0)
+    _cfg_max_length = None if (_multimodal and not (_t and _t.max_length)) else sft_max_len
     cfg_kwargs = {
         "output_dir": out_dir,
         "num_train_epochs": epochs,
@@ -254,7 +310,7 @@ def run_sft():
         # save_only_model=False: saves optimizer/scheduler state so a resumed worker truly continues
         # instead of re-initializing Adam moments. The deployable snapshot strips trainer state separately.
         "save_only_model": False,
-        "max_length": sft_max_len,
+        "max_length": _cfg_max_length,
         "bf16": True,
         "report_to": _w.wandb_report_to(),
         "run_name": _w.wandb_run_name(),
@@ -277,7 +333,9 @@ def run_sft():
     _pure_attn = model_is_pure_attention(model_id)
     _gdn = model_is_gdn_hybrid(model_id)
     _fa_ok = _flash_attn_available()
-    if _fa_ok and _pure_attn:
+    if _multimodal:
+        print("[sft] multimodal rows: token packing disabled; TRL VLM collator owns image/text collation")
+    elif _fa_ok and _pure_attn:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
     elif _fa_ok and _gdn:
@@ -288,7 +346,7 @@ def run_sft():
     else:
         _bfd_why = "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
         print(f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below.")
-    if liger_on(_memory_mode(model_id, sft_max_len)):
+    if not _multimodal and liger_on(_memory_mode(model_id, sft_max_len)):
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
     _attn = optimal_attn_impl()
@@ -325,7 +383,7 @@ def run_sft():
     # Cap at 16384: dense [B,1,T,T] mask is O(T^2) memory; above this packing gains little anyway.
     _PACK_MASK_MAX_LEN = 16384
     _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
-    _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
+    _sdpa_pack = bool(not _multimodal and not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
     if _sdpa_pack:
         if _attn in ("flash_attention_2", "flash_attention_3"):
             print(f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)")
@@ -357,7 +415,7 @@ def run_sft():
             f"pd={_pd_pack} ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept "
             f"~{effective_batch} ex); no flash-attn / no flex_attention"
         )
-    elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available(model_id) and _mask_pack_ok:
+    elif not _multimodal and not cfg_kwargs.get("packing") and _gdn and gdn_packing_available(model_id) and _mask_pack_ok:
         # GDN hybrid: 4D mask for full-attn layers + cu_seqlens/seq_idx to reset DeltaNet recurrence.
         # Flash varlen would ignore the 4D mask — downgrade to sdpa for the full-attn layers.
         if _attn in ("flash_attention_2", "flash_attention_3"):
@@ -382,13 +440,13 @@ def run_sft():
             f"ex/block, {packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} "
             f"tok; pd=1 ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept ~{effective_batch} ex)"
         )
-    elif not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
+    elif not _multimodal and not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
         print(
             f"[sft] packing stays OFF: max_length {sft_max_len} > {_PACK_MASK_MAX_LEN} — the dense "
             "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
             "efficient there, and long rows already fill a block)."
         )
-    elif not cfg_kwargs.get("packing") and not _pure_attn:
+    elif not _multimodal and not cfg_kwargs.get("packing") and not _pure_attn:
         _why = (
             "hybrid GatedDeltaNet but the fla/causal_conv1d varlen kernels aren't both importable"
             if _gdn
@@ -472,8 +530,8 @@ def run_sft():
             model=model_id,
             args=cfg,
             train_dataset=ds,
-            peft_config=_w.make_lora(model_id),
-            processing_class=tok,
+            peft_config=_w.make_lora(model_id, multimodal=_multimodal),
+            processing_class=processor or tok,
             data_collator=_collator,
             callbacks=[_w.make_sft_heartbeat_callback(), _w.make_checkpoint_upload_callback()],
         )
@@ -490,7 +548,10 @@ def run_sft():
 
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
+    if processor is not None:
+        processor.save_pretrained(adapter_dir)
+    else:
+        tok.save_pretrained(adapter_dir)
     _w.hf_upload_folder(adapter_dir, "adapter", required=True)
     # Ensure `flash deploy --step <final>` always resolves: save_steps may not align with the last step.
     _final_step = int(getattr(trainer.state, "global_step", 0) or 0)

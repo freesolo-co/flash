@@ -275,7 +275,8 @@ def cmd_models(args) -> int:
         print(render.models_table(rows))
         return 0
     for row in rows:
-        print(row["id"])
+        label = "image+text" if row.get("multimodal") else "text-only"
+        print(f"{row['id']}\t{label}")
     return 0
 
 

@@ -31,7 +31,7 @@ command.
 pip install freesolo-flash          # installs the `flash` CLI (import name is also `flash`)
 flash login --api-key fslo_...       # or: export FREESOLO_API_KEY=fslo_...  (create a key at https://freesolo.co)
 flash whoami                         # confirm the identity behind your key
-flash models                         # supported base models (and which support `thinking`)
+flash models                         # supported base models (text-only vs image+text)
 flash gpus                           # managed GPU classes with estimated $/hr
 ```
 
@@ -200,7 +200,7 @@ spending another GPU run:
 | Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `steps`, `epochs`, `group_size`, `max_tokens`, `temperature`, `max_length`, LoRA, and other training knobs under `[train]`. |
 | Trying to pin managed infrastructure | `gpu.type`, `train.hf_repo`, or `model_policy` changes do not do what you expected | Treat GPU choice, model policy, and the run artifact repo as managed. Tune the model, algorithm, environment, and `[train]` knobs instead. |
 | Secrets are not available on the worker | Reward code works locally but remote logs show missing API keys or auth failures | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never put secret values in `[worker_env]` or hard-code them in the config. |
-| Wrong model / thinking setting | Config validation fails, or chat behavior does not match the run | Use `flash models`; set `thinking = true` only for supported models. Thinking is a training-time/run-level choice and serving preserves that parity, so `flash chat` does not expose an override flag. |
+| Wrong model / modality / thinking setting | Config validation fails, or chat behavior does not match the run | Use `flash models`; image rows require an `image+text` model, and `thinking = true` only works on thinking-capable models. Thinking is a training-time/run-level choice and serving preserves that parity, so `flash chat` does not expose an override flag. |
 | Thinking reward grades the wrong text | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields. |
 | All-zero or flat GRPO reward | `reward_mean` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
 | Reward rises but behavior is worse | Short, templated, malformed, or reward-hacked outputs score well | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string. |

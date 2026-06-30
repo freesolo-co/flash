@@ -14,19 +14,21 @@ from __future__ import annotations
 # DO touch them cannot be loaded by vLLM in text-only (language_model_only) serving —
 # its LoRA loader rejects "unexpected modules" (observed with Qwen3.5-2B).
 _VL_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "multi_modal_projector", "mtp")
+_VLM_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "mtp")
 
 
-def lora_exclude_modules(model_id: str) -> str | None:
+def lora_exclude_modules(model_id: str, *, multimodal: bool = False) -> str | None:
     """Regex (peft fullmatch semantics) excluding vision-tower modules from LoRA.
 
     Returns None when no exclusion is needed (pure text architectures). NOTE: peft's
     list-form exclude_modules uses suffix matching (like target_modules), which does
-    NOT match leaf modules under 'visual.*' — a regex string is required.
+    NOT match leaf modules under 'visual.*' — a regex string is required. Image-bearing
+    training keeps LoRA off the vision tower but allows the projector to adapt.
     """
     excludes = {
-        "qwen3_5": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_5_moe": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_6": _VL_EXCLUDE_SEGMENTS,
+        "qwen3_5": _VLM_EXCLUDE_SEGMENTS if multimodal else _VL_EXCLUDE_SEGMENTS,
+        "qwen3_5_moe": _VLM_EXCLUDE_SEGMENTS if multimodal else _VL_EXCLUDE_SEGMENTS,
+        "qwen3_6": _VLM_EXCLUDE_SEGMENTS if multimodal else _VL_EXCLUDE_SEGMENTS,
     }
     try:
         from transformers import AutoConfig

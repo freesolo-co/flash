@@ -33,6 +33,7 @@ WORKER_DEPS = [
     # >=0.2.52: includes robust JSONL loading and corrected package metadata.
     FREESOLO_WORKER_SPEC,
     "huggingface_hub>=0.25",
+    "pillow>=10",
     "accelerate>=1.4",
     # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
     "wandb>=0.17",

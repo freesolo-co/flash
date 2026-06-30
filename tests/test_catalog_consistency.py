@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-from flash.catalog import DEFAULT_MODEL, MODELS, get_model
+from flash.catalog import DEFAULT_MODEL, MODELS, get_model, supports_multimodal
 from flash.providers.base import KNOWN, canonical_gpu
 
 
@@ -105,6 +105,8 @@ def test_public_rows_include_serving_capacity():
     assert row["serving"]["gpu"] == "L4"
     assert row["serving"]["max_loras"] == 64
     assert row["serving"]["serve_model_id"] == "lovedheart/Qwen3.5-4B-FP8"
+    assert row["multimodal"] is True
+    assert row["modalities"] == ("text", "image")
 
 
 def test_public_rows_prune_unset_serving_capacity_fields():
@@ -125,9 +127,24 @@ def test_default_model_is_thinking_capable():
 
 
 def test_default_model_is_a_dense_text_model():
-    # Guard against regressing the default back to a multimodal / novel-arch model: the
-    # default should be the proven dense instruction model.
+    # Guard against regressing the default away from the proven 4B instruction model. It is
+    # image-capable, but still text-capable and remains the default for ordinary text runs.
     assert DEFAULT_MODEL == "Qwen/Qwen3.5-4B"
+    assert supports_multimodal(DEFAULT_MODEL) is True
+
+
+def test_multimodal_capability_values_are_valid():
+    expected = {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
+    for model_id, info in MODELS.items():
+        assert info.modalities[0] == "text"
+        assert set(info.modalities) <= {"text", "image"}
+        assert supports_multimodal(info) is (model_id in expected)
 
 
 def test_every_catalog_entry_sets_params_b():
