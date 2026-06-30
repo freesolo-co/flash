@@ -143,22 +143,35 @@ def test_deployment_roundtrip_dict():
 
 def test_serving_prices_cover_catalog():
     from flash.catalog import MODELS
-    from flash.serve.pricing import SERVING_PRICES, serving_price_rows
+    from flash.serve.pricing import SERVING_MARKUP, SERVING_PRICES, serving_price_rows
 
     assert set(SERVING_PRICES) == set(MODELS)
+    assert pytest.approx(1.20) == SERVING_MARKUP
     rows = serving_price_rows()
     assert len(rows) == len(MODELS)
     for row in rows:
+        assert row["typical_input_usd_per_mtok"] > 0
+        assert row["typical_output_usd_per_mtok"] > 0
+        assert row["typical_cached_input_usd_per_mtok"] > 0
         assert row["billed_input_usd_per_mtok"] > 0
         assert row["billed_output_usd_per_mtok"] > 0
         assert row["billed_cached_input_usd_per_mtok"] > 0
         assert row["billed_cached_input_usd_per_mtok"] < row["billed_input_usd_per_mtok"]
+        assert row["billed_input_usd_per_mtok"] == pytest.approx(
+            row["typical_input_usd_per_mtok"] * SERVING_MARKUP
+        )
+        assert row["billed_output_usd_per_mtok"] == pytest.approx(
+            row["typical_output_usd_per_mtok"] * SERVING_MARKUP
+        )
+        assert row["billed_cached_input_usd_per_mtok"] == pytest.approx(
+            row["typical_cached_input_usd_per_mtok"] * SERVING_MARKUP
+        )
 
 
-def test_serving_prices_pin_public_rates():
-    from flash.serve.pricing import SERVING_PRICES
+def test_serving_prices_pin_public_rates_plus_markup():
+    from flash.serve.pricing import SERVING_MARKUP, SERVING_PRICES
 
-    expected = {
+    typical = {
         "openbmb/MiniCPM5-1B": (0.01, 0.05, 0.002),
         "Qwen/Qwen3.5-0.8B": (0.01, 0.05, 0.002),
         "Qwen/Qwen3.5-2B": (0.02, 0.10, 0.004),
@@ -166,11 +179,16 @@ def test_serving_prices_pin_public_rates():
         "Qwen/Qwen3.5-9B": (0.10, 0.15, 0.020),
         "Qwen/Qwen3.6-35B-A3B": (0.15, 1.00, 0.050),
     }
-    for model_id, (input_rate, output_rate, cached_rate) in expected.items():
+    for model_id, (input_rate, output_rate, cached_rate) in typical.items():
         price = SERVING_PRICES[model_id]
-        assert price.billed_input_usd_per_mtok == pytest.approx(input_rate)
-        assert price.billed_output_usd_per_mtok == pytest.approx(output_rate)
-        assert price.billed_cached_input_usd_per_mtok == pytest.approx(cached_rate)
+        assert price.typical_input_usd_per_mtok == pytest.approx(input_rate)
+        assert price.typical_output_usd_per_mtok == pytest.approx(output_rate)
+        assert price.typical_cached_input_usd_per_mtok == pytest.approx(cached_rate)
+        assert price.billed_input_usd_per_mtok == pytest.approx(input_rate * SERVING_MARKUP)
+        assert price.billed_output_usd_per_mtok == pytest.approx(output_rate * SERVING_MARKUP)
+        assert price.billed_cached_input_usd_per_mtok == pytest.approx(
+            cached_rate * SERVING_MARKUP
+        )
 
 
 def test_resolve_deploy_step_rejects_malformed_step_as_400():
