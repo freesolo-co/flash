@@ -605,24 +605,55 @@ def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, t
     assert all("other-org" not in url for url in seen_urls)
 
 
-def test_explicit_environment_hub_github_ref_keeps_tarball_scope(monkeypatch, tmp_path):
+def test_explicit_environment_hub_github_ref_downloads_only_requested_package(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
 
-    def fail_directory(ref, repo_dir, dest):
-        raise AssertionError("explicit GitHub refs should keep the whole-repo tarball path")
+    def fail_tarball(ref):
+        raise AssertionError("environment-hub refs should not download the whole repo tarball")
 
-    monkeypatch.setattr(adapter, "_download_github_directory", fail_directory)
-    monkeypatch.setattr(
-        adapter,
-        "_download_github_tarball",
-        lambda ref: _tarball(
-            {
-                "david-freesolo-co/stuff/environment.py": b"# env\n",
-                "shared/helper.py": b"# helper\n",
-            }
-        ),
-    )
+    monkeypatch.setattr(adapter, "_download_github_tarball", fail_tarball)
+    trees = {
+        ("a" * 40 + ":david-freesolo-co/stuff", True): {
+            "truncated": False,
+            "tree": [
+                {
+                    "type": "blob",
+                    "path": "environment.py",
+                    "mode": "100644",
+                    "size": len(b"# env\n"),
+                },
+                {
+                    "type": "blob",
+                    "path": "datasets/train.jsonl",
+                    "mode": "100644",
+                    "size": len(b'{"a":1}\n'),
+                },
+            ],
+        },
+    }
+    files = {
+        "david-freesolo-co/stuff/environment.py": b"# env\n",
+        "david-freesolo-co/stuff/datasets/train.jsonl": b'{"a":1}\n',
+    }
+
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+        accept = req.headers.get("Accept")
+        if "/git/trees/" in req.full_url:
+            assert accept == "application/vnd.github+json"
+            treeish = urllib.parse.unquote(req.full_url.split("/git/trees/", 1)[1].split("?", 1)[0])
+            return json.dumps(trees[(treeish, "recursive=1" in req.full_url)]).encode()
+        assert accept == "application/vnd.github.raw"
+        path = urllib.parse.unquote(req.full_url.split("/contents/", 1)[1].split("?", 1)[0])
+        payload = files[path]
+        if out is not None:
+            out.write(payload)
+            return b""
+        return payload
+
+    monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
 
     env_file = Path(
         adapter._resolve_environment_reference(
@@ -631,7 +662,29 @@ def test_explicit_environment_hub_github_ref_keeps_tarball_scope(monkeypatch, tm
     )
 
     assert env_file.read_bytes() == b"# env\n"
-    assert (env_file.parents[2] / "shared" / "helper.py").read_bytes() == b"# helper\n"
+    assert (env_file.parent / "datasets" / "train.jsonl").read_bytes() == b'{"a":1}\n'
+    assert not (env_file.parents[2] / "shared").exists()
+
+
+def test_environment_hub_github_ref_requires_package_path(monkeypatch):
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    with pytest.raises(ValueError, match="namespace/name"):
+        adapter._resolve_environment_reference("github:freesolo-co/environment-hub@main")
+
+
+def test_github_tree_url_encodes_treeish_path_segment():
+    ref = adapter.GitHubEnvironmentRef(
+        "freesolo-co",
+        "environment-hub",
+        "a" * 40,
+        "david-freesolo-co/stuff/environment.py",
+    )
+
+    url = adapter._github_tree_url(ref, "a" * 40 + ":david-freesolo-co/stuff", recursive=True)
+
+    assert url.endswith("a" * 40 + "%3Adavid-freesolo-co%2Fstuff?recursive=1")
+    assert "/stuff" not in url.split("/git/trees/", 1)[1]
 
 
 def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_path):

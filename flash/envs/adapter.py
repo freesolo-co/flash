@@ -359,7 +359,7 @@ def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
 def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool = False) -> str:
     url = (
         f"https://api.github.com/repos/{ref.repo_full_name}/git/trees/"
-        f"{urllib.parse.quote(treeish, safe='/:')}"
+        f"{urllib.parse.quote(treeish, safe='')}"
     )
     if recursive:
         url = f"{url}?recursive=1"
