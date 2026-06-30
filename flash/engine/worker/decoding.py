@@ -36,6 +36,40 @@ def strip_think(completion: str | None, *, prompt_opened_thinking: bool = False)
     return completion
 
 
+def thinking_text(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
+    """Extract reasoning text for scorers; ``None`` means no thinking span was present."""
+    if completion is None:
+        return None
+    if prompt_opened_thinking:
+        text = completion.rsplit("</think>", 1)[0] if "</think>" in completion else completion
+        open_idx = text.find("<think>")
+        if open_idx != -1 and not text[:open_idx].strip():
+            text = text[open_idx + len("<think>") :]
+        return text
+
+    segments: list[str] = []
+    pos = 0
+    while True:
+        open_idx = completion.find("<think>", pos)
+        close_idx = completion.find("</think>", pos)
+        if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+            segments.append(completion[pos:close_idx])
+            pos = close_idx + len("</think>")
+            continue
+        if open_idx == -1:
+            break
+        start = open_idx + len("<think>")
+        close_idx = completion.find("</think>", start)
+        if close_idx == -1:
+            segments.append(completion[start:])
+            break
+        segments.append(completion[start:close_idx])
+        pos = close_idx + len("</think>")
+    if not segments:
+        return None
+    return "\n".join(segments)
+
+
 def graded_text(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
     """Answer text extracted for grading; reward state may still carry the raw completion."""
     return (

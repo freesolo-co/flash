@@ -212,7 +212,13 @@ def run_rl():
                     continue
                 graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
                 state = (
-                    {"raw_completion": comp, "graded_completion": graded}
+                    {
+                        "raw": comp,
+                        "completion": graded,
+                        "thinking": _w.thinking_text(
+                            comp, prompt_opened_thinking=_prompt_opens_thinking
+                        ),
+                    }
                     if _w.THINKING
                     else None
                 )

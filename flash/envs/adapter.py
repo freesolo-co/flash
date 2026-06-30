@@ -719,24 +719,35 @@ def _json_safe(value: Any) -> Any:
 
 
 class _ScoredResponseText(str):
-    """String passed to SDK scorers when Flash has both raw and answer-extracted text."""
+    """String-compatible response passed to SDK scorers.
 
-    raw_completion: str
-    graded_completion: str
+    The string value is the answer-only completion so existing graders keep their old behavior.
+    Thinking-aware scorers can opt into the structured views.
+    """
 
-    def __new__(cls, value: str, *, graded_completion: str):
-        obj = str.__new__(cls, value)
-        obj.raw_completion = value
-        obj.graded_completion = graded_completion
+    completion: str
+    thinking: str | None
+    raw: str
+
+    def __new__(cls, completion: str, *, raw: str, thinking: str | None):
+        obj = str.__new__(cls, completion)
+        obj.completion = completion
+        obj.thinking = thinking
+        obj.raw = raw
         return obj
 
 
 def _completion_for_scoring(completion: str, state: dict | None) -> str:
-    if state and isinstance(state.get("raw_completion"), str):
-        graded = state.get("graded_completion")
+    if state:
+        raw = state.get("raw")
+        if not isinstance(raw, str):
+            return completion
+        answer = state.get("completion")
+        thinking = state.get("thinking")
         return _ScoredResponseText(
-            state["raw_completion"],
-            graded_completion=graded if isinstance(graded, str) else completion,
+            answer if isinstance(answer, str) else completion,
+            raw=raw,
+            thinking=thinking if isinstance(thinking, str) else None,
         )
     return completion
 

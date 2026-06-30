@@ -235,11 +235,9 @@ def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
     assert sdk_env.batch_sizes == [1, 1, 1]
 
 
-def test_single_turn_scoring_gets_raw_thinking_with_graded_metadata(monkeypatch):
-    """Thinking-mode GRPO passes the stripped answer as the scalar completion, but threads
-    the raw rollout through state. SDK score_responses should see the raw text so
-    reasoning/format/evidence rewards can inspect <think>, while the stripped answer remains
-    available on the response object."""
+def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
+    """Thinking-mode GRPO passes an answer-only string to existing scorers while exposing
+    structured thinking/raw fields for scorers that need them."""
     _install_fake_freesolo(monkeypatch)
 
     from flash.envs.adapter import FreesoloEnvironment
@@ -250,27 +248,37 @@ def test_single_turn_scoring_gets_raw_thinking_with_graded_metadata(monkeypatch)
 
         def score_responses(self, example, response_texts):
             response = response_texts[0]
-            raw_score = 1.0 if "<think>cite evidence</think>" in response else 0.0
-            graded_score = 1.0 if getattr(response, "graded_completion", "") == " yes" else 0.0
+            assert response == " 5"
+            assert response.completion == " 5"
+            assert response.thinking == "4"
+            assert response.raw == "<think>4</think> 5"
+            legacy_score = 1.0 if str(example.output) in response else 0.0
+            thinking_score = 1.0 if response.thinking == "4" else 0.0
+            raw_score = 1.0 if "<think>4</think>" in response.raw else 0.0
+            answer_score = 1.0 if response.completion == " 5" else 0.0
             return [
                 _RewardResult(
-                    score=raw_score + graded_score,
+                    score=legacy_score + thinking_score + raw_score + answer_score,
                     metrics=(
+                        _RewardMetric("legacy_answer_match", legacy_score),
+                        _RewardMetric("thinking", thinking_score),
                         _RewardMetric("raw_reasoning", raw_score),
-                        _RewardMetric("graded_answer", graded_score),
+                        _RewardMetric("answer", answer_score),
                     ),
                 )
             ]
 
     env = FreesoloEnvironment(_ThinkingAwareEnv(), "owner/env", source=None, contract_text="")
-    raw = "<think>cite evidence</think> yes"
-    state = {"raw_completion": raw, "graded_completion": " yes"}
+    raw = "<think>4</think> 5"
+    state = {"completion": " 5", "thinking": "4", "raw": raw}
 
-    breakdown = env.scores_breakdown(" yes", {"input": "q", "output": "yes"}, state)
+    breakdown = env.scores_breakdown(" 5", {"input": "q", "output": "4"}, state)
 
+    assert breakdown["legacy_answer_match"] == 0.0
+    assert breakdown["thinking"] == 1.0
     assert breakdown["raw_reasoning"] == 1.0
-    assert breakdown["graded_answer"] == 1.0
-    assert breakdown["total"] == 2.0
+    assert breakdown["answer"] == 1.0
+    assert breakdown["total"] == 3.0
 
 
 def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):

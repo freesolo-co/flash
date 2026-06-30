@@ -67,6 +67,22 @@ def test_strip_think_unit():
     assert ne.strip_think("<think>still going 42") == ""
 
 
+def test_thinking_text_unit():
+    import flash.engine.worker as ne
+
+    assert ne.thinking_text(None) is None
+    assert ne.thinking_text("no tags, answer 42") is None
+    assert ne.thinking_text("<think>reason 99</think>\\boxed{42}") == "reason 99"
+    assert ne.thinking_text("<think>a</think>mid<think>b</think> ans 7") == "a\nb"
+    assert ne.thinking_text("reasoning...</think>\\boxed{5}") == "reasoning..."
+    assert (
+        ne.thinking_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True)
+        == "reasoning..."
+    )
+    assert ne.thinking_text("preamble<think>still going 42") == "still going 42"
+    assert ne.thinking_text("<think>still going 42") == "still going 42"
+
+
 def test_thinking_budget_selection(monkeypatch):
     # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
     # this CPU dry-run doesn't load the Freesolo env. We only exercise THINKING / micro-batch here.
