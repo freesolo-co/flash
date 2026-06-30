@@ -162,6 +162,8 @@ def test_resolve_deploy_step_rejects_malformed_step_as_400():
     """A malformed ``step`` must raise HTTPException(400), never a 500. Regression for ``"--5"``:
     ``str.lstrip("-").isdigit()`` accepted it, then ``int("--5")`` raised an uncaught ValueError.
     The 400 path raises before any checkpoint lookup, so the spec/app args are unused here."""
+    pytest.importorskip("fastapi")
+
     from fastapi import HTTPException
 
     from flash.server.routes.serving import _resolve_deploy_step

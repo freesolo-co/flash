@@ -78,28 +78,26 @@ def test_styled_path_is_themed_but_lossless(monkeypatch, fake_client, capsys) ->
     assert '"state": "done"' in out
 
 
-def test_run_where_keeps_runs_and_status_provider_consistent(monkeypatch) -> None:
-    # A remote handle present but carrying no explicit provider label means RunPod (the original
-    # sole provider). `flash runs` and `flash status` derive `(gpu, provider)` from the single
-    # `_run_where` helper so the two views can't drift — `flash status` used to drop the runpod
-    # fallback and show a bare gpu while `flash runs` showed `gpu@runpod`.
+def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
+    # Provider metadata may exist in API payloads for lifecycle/accounting, but human CLI summaries
+    # show only the managed GPU class and redact backend fields from styled details.
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
-
-    assert render._run_where({"gpu": {"type": "RTX 4090"}}, {"gpu": "RTX 4090"}) == (
-        "RTX 4090",
-        "runpod",
-    )
 
     run = {
         "run_id": "flash-1",
         "state": "done",
         "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
-        "remote": {"gpu": "RTX 4090"},  # allocated, but provider unlabeled -> runpod
+        "remote": {"gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
     }
-    # each view keeps its own `@` spacing, but both name the same place
-    assert "RTX 4090@runpod" in render.runs_table([run])
-    assert "RTX 4090 @ runpod" in render.run_status(run)
+    runs = render.runs_table([run])
+    status = render.run_status(run)
+    assert "RTX 4090" in runs
+    assert "RTX 4090" in status
+    assert "runpod" not in runs.lower()
+    assert "runpod" not in status.lower()
+    assert "provider" not in status.lower()
+    assert "flash_arm" not in status.lower()
 
 
 def test_color_respects_no_color(monkeypatch) -> None:
@@ -230,7 +228,7 @@ def test_deploy_dry_run_is_not_a_false_success(monkeypatch) -> None:
     )
     assert "dry run" in dry
     assert "nothing deployed" in dry
-    assert "dry_run" not in dry  # the old green `✓ deploy ● dry_run` badge form is gone
+    assert "dry_run" not in dry
 
 
 def test_undeploy_confirms_teardown_and_names_endpoints(monkeypatch) -> None:
