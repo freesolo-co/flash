@@ -1186,9 +1186,7 @@ def test_mark_checkpoint_deployed_refuses_dry_run(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
     spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-dry"}
-    runner._save_status(
-        runner.RunStatus(run_id="dep-dry", state="dry_run", spec=spec, remote=None)
-    )
+    runner._save_status(runner.RunStatus(run_id="dep-dry", state="dry_run", spec=spec, remote=None))
     out = runner.mark_checkpoint_deployed("dep-dry", {"endpoint_name": "e"})
     assert out.state == "dry_run"
     assert out.deployment is None
@@ -1733,9 +1731,7 @@ def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, 
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    monkeypatch.setattr(
-        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
-    )
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
 
     key = _login()
     run_id = _make_run(api, key, state)
@@ -1770,6 +1766,31 @@ def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, mon
     status = runner.get_status(run_id)
     assert status.state == "deployed"
     assert status.deployment["checkpoint_step"] == 40
+
+
+def test_deploy_checkpoint_rolls_back_if_final_deploy_wins_cas(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    rollbacks = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+
+    def fake_deploy(**kwargs):
+        runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "final"})
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 409, r.text
+    assert rollbacks == [run_id]
+    status = runner.get_status(run_id)
+    assert status.state == "deployed"
+    assert status.deployment == {"state": "ready", "endpoint_name": "final"}
 
 
 def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
@@ -1822,9 +1843,7 @@ def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatc
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    monkeypatch.setattr(
-        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
-    )
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
     monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: [run_id])
 
     key = _login()

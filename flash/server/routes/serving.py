@@ -98,9 +98,7 @@ def _resolve_deployable_target(
         )
         raise HTTPException(status_code=409, detail=detail)
     prefix = (
-        checkpoint_adapter_prefix(spec, checkpoint_step)
-        if is_checkpoint
-        else adapter_prefix(spec)
+        checkpoint_adapter_prefix(spec, checkpoint_step) if is_checkpoint else adapter_prefix(spec)
     )
     return checkpoint_step, is_checkpoint, prefix
 
@@ -127,9 +125,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         # write is lock-serialized), so capture state before deploy and re-verify it on the write.
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
-        deploy_org_id = (
-            run_org_id(status) or str(key.get("org_id") or "").strip() or None
-        )
+        deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
         try:
             dep = _app.deploy_adapter(
                 run_id=run_id,
@@ -156,13 +152,14 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             state_guard = prev_state
             if is_checkpoint:
                 state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
-                marked = mark_checkpoint_deployed(
-                    run_id, dep_dict, expect_state=state_guard
-                )
+                marked = mark_checkpoint_deployed(run_id, dep_dict, expect_state=state_guard)
             else:
                 marked = mark_deployed(run_id, dep_dict, expect_state=prev_state)
             # CAS: if /cancel or /undeploy raced us, the adapter is orphaned — deregister and 409.
-            if state_guard is not None and marked.state != "deployed":
+            cas_failed = (
+                marked.deployment != dep_dict if is_checkpoint else marked.state != "deployed"
+            )
+            if state_guard is not None and cas_failed:
                 with contextlib.suppress(Exception):
                     _app.undeploy_adapter(run_id)
                 raise HTTPException(

@@ -194,13 +194,17 @@ def _train_body(input_data: dict) -> dict:
         # gets persisted to the volume (phantom warm).
         if not hf_home or not hf_home.startswith("/runpod-volume"):
             return {
-                "preloaded": [], "already_cached": [], "failed": {},
+                "preloaded": [],
+                "already_cached": [],
+                "failed": {},
                 "error": f"preload requires HF_HOME rooted at /runpod-volume (got HF_HOME={hf_home!r})",
                 "hf_home": hf_home,
             }
         if not os.path.isdir("/runpod-volume"):
             return {
-                "preloaded": [], "already_cached": [], "failed": {},
+                "preloaded": [],
+                "already_cached": [],
+                "failed": {},
                 "error": f"weight-cache volume not mounted at /runpod-volume (HF_HOME={hf_home})",
                 "hf_home": hf_home,
             }
@@ -212,8 +216,11 @@ def _train_body(input_data: dict) -> dict:
             try:
                 try:
                     snapshot_download(
-                        repo_id=repo_id, token=tok, cache_dir=cache_dir,
-                        ignore_patterns=ignore_patterns, local_files_only=True,
+                        repo_id=repo_id,
+                        token=tok,
+                        cache_dir=cache_dir,
+                        ignore_patterns=ignore_patterns,
+                        local_files_only=True,
                     )
                     already.append(repo_id)
                     continue
@@ -397,7 +404,7 @@ def _train_body(input_data: dict) -> dict:
     def run_mode(mode: str, check: bool) -> int:
         """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
         console = f"/tmp/console_{mode}.txt"
-        interval = _CONSOLE_UPLOAD_INTERVAL_S
+        interval = 3600.0
         stop_upload = threading.Event()
 
         def _upload_loop() -> None:
