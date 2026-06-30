@@ -16,6 +16,4 @@ def hourly_rate(gpu_name: str) -> float:
 
     name = canonical_gpu(gpu_name)
     rates = static_rates()
-    # Retired classes aren't in the static table (built from the catalog) but stay priceable for the
-    # teardown/billing of an in-flight run via their retained metadata.
     return rates[name] if name in rates else get_gpu_info(name).hourly_usd
