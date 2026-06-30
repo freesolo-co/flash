@@ -236,8 +236,8 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
-            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
-            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
     sft = Path("configs/sft.toml")
     if not sft.exists():
@@ -248,8 +248,8 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "epochs = 1\n"
             "lora_rank = 32\n"
-            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
-            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
     training = Path("TRAINING.md")
     if not training.exists():
@@ -280,7 +280,7 @@ def cmd_models(args) -> int:
 
 
 def cmd_gpus(args) -> int:
-    """List RunPod GPU classes, VRAM, and $/hr."""
+    """List validated managed GPU classes, VRAM, and estimated $/hr."""
     from flash.providers.base import GPU_INFO
     from flash.providers.runpod.pricing import static_rates as runpod_static_rates
 
@@ -290,7 +290,7 @@ def cmd_gpus(args) -> int:
     )
     tip = (
         "Tip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest validated RunPod class that fits the model, so you don't pin a GPU type."
+        "cheapest validated managed class that fits the model, so you don't pin a GPU type."
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
@@ -300,7 +300,7 @@ def cmd_gpus(args) -> int:
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}")
+    print(f"{'gpu':<16}{'vram':>6}{'$/hr':>11}")
     for info in infos:
         runpod_rate = runpod_rates.get(info.name)
         print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}")
@@ -483,8 +483,7 @@ def cmd_runs(args) -> int:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        gpu, provider = render._run_where(spec, r.get("remote") or {})
-        where = f"{gpu}@{provider}" if provider else gpu
+        where = render._run_gpu(spec, r.get("remote") or {})
         print(
             f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
             f"{r.get('cost_usd', 0.0):>8.4f}  {where:<22}  {model}"
