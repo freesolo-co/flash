@@ -13,7 +13,7 @@ from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
 from flash.engine.recipe import RECIPE
-from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES
+from flash.envs.registry import _FLASH_TRAIN_MAX_EXAMPLES, training_env_params
 from flash.schema import spec_from_dict
 
 GRPO_RAW = {
@@ -174,6 +174,12 @@ def test_sft_uncapped_count_forwards_loader_no_cap(monkeypatch):
         {_FLASH_TRAIN_MAX_EXAMPLES: None},
         {_FLASH_TRAIN_MAX_EXAMPLES: None},
     ]
+
+
+def test_grpo_train_max_examples_does_not_forward_loader_cap():
+    spec = _spec(**{"train.max_examples": 10_178})
+
+    assert training_env_params(spec) == {}
 
 
 def test_sft_train_token_count_forwards_loader_cap(monkeypatch):

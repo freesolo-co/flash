@@ -29,11 +29,11 @@ def training_env_params(spec) -> dict[str, Any]:
     if "max_examples" in params or "limit" in params:
         return params
 
-    max_examples = getattr(train, "max_examples", None)
     algorithm = str(getattr(spec, "algorithm", "") or "").lower()
-    if algorithm != "sft" and max_examples is None:
+    if algorithm != "sft":
         return params
 
+    max_examples = getattr(train, "max_examples", None)
     params[_FLASH_TRAIN_MAX_EXAMPLES] = (
         int(max_examples) if max_examples is not None and int(max_examples) > 0 else None
     )
