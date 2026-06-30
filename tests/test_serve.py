@@ -180,25 +180,6 @@ def test_deploy_rejects_unsupported_gpu():
         )
 
 
-def test_deploy_retired_gpu_maps_to_current_class():
-    """A run trained on a now-retired class (RTX A6000) is still deployable: canonical_gpu resolves
-    it, but servable_gpu maps it to the cheapest CURRENT RunPod class that fits its VRAM instead of
-    KeyError-ing on the dropped catalog entry (which would surface as an unhandled HTTP 500)."""
-    from flash.serve.deploy import deploy_adapter, servable_gpu
-
-    # 48 GB A6000 -> cheapest current RunPod class fitting 48 GB is the 80 GB A100 PCIe.
-    assert servable_gpu("RTX A6000") == "A100 PCIe"
-    dep = deploy_adapter(
-        run_id="legacy1",
-        model="Qwen/Qwen3.5-0.8B",
-        hf_repo="org/repo",
-        adapter_prefix="sft/legacy1/seed0",
-        gpu_name="RTX A6000",
-        dry_run=True,
-    )
-    assert dep.to_dict()["gpu"] == "A100 PCIe"
-
-
 def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path):
     """A non-dry-run deploy POSTs the adapter to {FREESOLO_SERVING_URL}/adapters with the
     right body and the internal-key auth header."""

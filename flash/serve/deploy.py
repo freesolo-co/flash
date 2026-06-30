@@ -105,17 +105,15 @@ def servable_gpu(gpu_name: str) -> str:
     from flash.providers.base import GPU_INFO, cheapest_gpu, get_gpu_info
 
     friendly = canonical_gpu(gpu_name)
-    info = get_gpu_info(friendly)  # resolves retired classes too (canonical_gpu now accepts them)
-    # A current RunPod class serves directly; a Lambda-only OR retired class (the latter is not in
-    # GPU_INFO and is no longer provisionable) maps to the cheapest current RunPod class that fits.
+    info = get_gpu_info(friendly)
+    # A directly servable class serves as-is; other managed classes map to the cheapest serving class
+    # that fits their VRAM.
     if friendly in GPU_INFO and info.enum_member:
         return friendly
     return cheapest_gpu(info.vram_gb)
 
 
-def validate_serving_lora_rank(
-    model: str, lora_rank: int, *, rank_source: str = "adapter"
-) -> None:
+def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str = "adapter") -> None:
     """Fail before registration when a trained adapter rank exceeds serving capacity."""
     from flash.catalog import serving_lora_rank_cap
 
@@ -140,7 +138,9 @@ def _rank_from_adapter_config(config: dict, *, source: str) -> int:
                 raise TypeError("rank_pattern is not a mapping")
             ranks.extend(int(v) for v in rank_pattern.values())
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"could not verify adapter rank: {source} has invalid rank metadata") from exc
+        raise ValueError(
+            f"could not verify adapter rank: {source} has invalid rank metadata"
+        ) from exc
     if not ranks:
         raise ValueError(f"could not verify adapter rank: {source} has no LoRA rank metadata")
     rank = max(ranks)
@@ -155,7 +155,9 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
-        raise ServingError("could not verify adapter rank: huggingface_hub is not installed") from exc
+        raise ServingError(
+            "could not verify adapter rank: huggingface_hub is not installed"
+        ) from exc
     try:
         local = hf_hub_download(
             repo_id=hf_repo,
@@ -164,14 +166,20 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
             token=os.environ.get("HF_TOKEN"),
         )
     except Exception as exc:
-        raise ServingError(f"could not verify adapter rank: failed to read {hf_repo}:{filename}") from exc
+        raise ServingError(
+            f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
+        ) from exc
     try:
         with open(local, encoding="utf-8") as f:
             config = json.load(f)
     except Exception as exc:
-        raise ValueError(f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}") from exc
+        raise ValueError(
+            f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}"
+        ) from exc
     if not isinstance(config, dict):
-        raise ValueError(f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object")
+        raise ValueError(
+            f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
+        )
     return _rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
@@ -308,7 +316,7 @@ def chat_stream(
             # client.stream() leaves body unread; must call resp.read() before .json().
             resp.read()
             payload = resp.json()
-            content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+            content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
             if content:
                 yield str(content)
             return
