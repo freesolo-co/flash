@@ -105,7 +105,9 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
     # ...and that same key makes create_app() startup run the RunPod slot-store reconcile
     # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
-    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
+    )
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
@@ -453,8 +455,7 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
 
             def read(self):
                 return (
-                    b'{"email":"cached@example.com","key_prefix":"fslo_cached",'
-                    b'"org_slug":"acme"}'
+                    b'{"email":"cached@example.com","key_prefix":"fslo_cached","org_slug":"acme"}'
                 )
 
             def __enter__(self):
@@ -1522,14 +1523,19 @@ def test_delete_env_endpoint_removes_package(api, monkeypatch):
     monkeypatch.setattr(
         environment_registry,
         "record_deleted_environment",
-        lambda *, slug, key: recorded.update(slug=slug) or True,
+        lambda *, slug, key, org_id=None: recorded.update(slug=slug, org_id=org_id) or True,
     )
 
-    resp = api.delete("/v1/envs/acme/my-env", headers=_bearer(_login()))
+    resp = api.delete(
+        "/v1/envs/acme/my-env",
+        headers={**_bearer(_login()), "X-Freesolo-Org-Id": "org-acme"},
+    )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"id": "acme/my-env", "deleted": True}
     assert seen["slug"] == "acme/my-env"
     assert recorded["slug"] == "acme/my-env"
+    # the caller-supplied org (web UI delete) reaches the metadata-mirror drop.
+    assert recorded["org_id"] == "org-acme"
 
     # Unauthenticated requests are rejected.
     assert api.delete("/v1/envs/acme/my-env").status_code in (401, 403)
@@ -1554,7 +1560,7 @@ def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
 
     monkeypatch.setattr(envs_mod, "delete_package", lambda *, slug, key: True)
 
-    def boom(*, slug, key):
+    def boom(*, slug, key, org_id=None):
         raise RuntimeError("backend down")
 
     monkeypatch.setattr(environment_registry, "record_deleted_environment", boom)
@@ -1585,12 +1591,20 @@ def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
 # Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
 # --------------------------------------------------------------------------------------------
 _FAKE_CKPTS = [
-    {"step": 40, "adapter_prefix": "rl/X/checkpoints/step-40",
-     "subfolder": "rl/X/checkpoints/step-40/adapter",
-     "repo_id": "org/test-runs", "repo_type": "dataset"},
-    {"step": 80, "adapter_prefix": "rl/X/checkpoints/step-80",
-     "subfolder": "rl/X/checkpoints/step-80/adapter",
-     "repo_id": "org/test-runs", "repo_type": "dataset"},
+    {
+        "step": 40,
+        "adapter_prefix": "rl/X/checkpoints/step-40",
+        "subfolder": "rl/X/checkpoints/step-40/adapter",
+        "repo_id": "org/test-runs",
+        "repo_type": "dataset",
+    },
+    {
+        "step": 80,
+        "adapter_prefix": "rl/X/checkpoints/step-80",
+        "subfolder": "rl/X/checkpoints/step-80/adapter",
+        "repo_id": "org/test-runs",
+        "repo_type": "dataset",
+    },
 ]
 
 
@@ -1599,7 +1613,11 @@ class _FakeDeployment:
         self.adapter_prefix = adapter_prefix
 
     def to_dict(self):
-        return {"state": "ready", "run_id": "X", "adapter_hf_prefix": f"{self.adapter_prefix}/adapter"}
+        return {
+            "state": "ready",
+            "run_id": "X",
+            "adapter_hf_prefix": f"{self.adapter_prefix}/adapter",
+        }
 
 
 def _make_run(api, key, state):
@@ -1656,9 +1674,7 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    monkeypatch.setattr(
-        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
-    )
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
 
     key = _login()
     run_id = _make_run(api, key, "cancelled")
