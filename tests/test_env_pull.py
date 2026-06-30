@@ -656,6 +656,23 @@ def test_download_github_directory_handles_large_tree_listing(monkeypatch, tmp_p
     assert (repo_root / "david-freesolo-co/big/shard-1000.jsonl").read_bytes() == b"x"
 
 
+def test_download_github_directory_surfaces_tree_error_message(monkeypatch, tmp_path):
+    ref = adapter.GitHubEnvironmentRef(
+        "freesolo-co",
+        "environment-hub",
+        "c" * 40,
+        "david-freesolo-co/missing/environment.py",
+    )
+
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+        return json.dumps({"message": "Not Found"}).encode()
+
+    monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="Not Found"):
+        adapter._download_github_directory(ref, "david-freesolo-co/missing", tmp_path)
+
+
 def test_urlopen_streams_and_aborts_over_max_bytes(monkeypatch):
     served = {"n": 0}
 

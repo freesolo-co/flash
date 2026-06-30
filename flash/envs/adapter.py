@@ -402,6 +402,14 @@ def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> 
         ) from exc
 
 
+def _github_response_message(payload: object) -> str:
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            return f" ({message})"
+    return ""
+
+
 def _find_github_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
     treeish = ref.ref
     traversed: list[str] = []
@@ -409,7 +417,10 @@ def _find_github_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
         payload = _download_github_json(ref, _github_tree_url(ref, treeish), "/".join(traversed))
         entries = payload.get("tree") if isinstance(payload, dict) else None
         if not isinstance(entries, list):
-            raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
+            raise RuntimeError(
+                f"GitHub path {repo_dir!r} is not an environment directory"
+                f"{_github_response_message(payload)}"
+            )
         match = next(
             (entry for entry in entries if isinstance(entry, dict) and entry.get("path") == part),
             None,
@@ -479,7 +490,10 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
         repo_dir,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
-        raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
+        raise RuntimeError(
+            f"GitHub path {repo_dir!r} is not an environment directory"
+            f"{_github_response_message(payload)}"
+        )
     if payload.get("truncated"):
         raise RuntimeError(
             f"GitHub tree response for environment directory {repo_dir!r} was truncated"
