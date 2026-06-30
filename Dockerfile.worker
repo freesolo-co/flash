@@ -63,7 +63,7 @@ RUN pip install --no-cache-dir \
     "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
-    "freesolo>=0.2.51" \
+    "freesolo>=0.2.52" \
     "runpod"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
