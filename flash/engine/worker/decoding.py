@@ -37,7 +37,7 @@ def strip_think(completion: str | None, *, prompt_opened_thinking: bool = False)
 
 
 def graded_text(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
-    """What the env grader sees: strips <think> blocks when THINKING is on."""
+    """Answer text extracted for grading; reward state may still carry the raw completion."""
     return (
         strip_think(completion, prompt_opened_thinking=prompt_opened_thinking)
         if _w.THINKING

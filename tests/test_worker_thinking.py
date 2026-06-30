@@ -1,10 +1,9 @@
 """CPU dry-run of the worker's thinking-mode behavior (heavy deps mocked).
 
-Covers the run-wide THINKING flag: strip_think drops <think> blocks before the env
-reward sees a completion (an unclosed block scores 0 even when the gold number
-appears inside the reasoning), and the thinking-aware GRPO micro-batch default kicks
-in. strip_think is applied once in worker.graded_text before the env rewards — so it
-works for every environment.
+Covers the run-wide THINKING flag: strip_think extracts the answer text from
+<think>-wrapped completions (an unclosed block extracts no final answer even when
+the gold number appears inside the reasoning), and the thinking-aware GRPO
+micro-batch default kicks in.
 """
 
 from __future__ import annotations

@@ -718,6 +718,29 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
+class _ScoredResponseText(str):
+    """String passed to SDK scorers when Flash has both raw and answer-extracted text."""
+
+    raw_completion: str
+    graded_completion: str
+
+    def __new__(cls, value: str, *, graded_completion: str):
+        obj = str.__new__(cls, value)
+        obj.raw_completion = value
+        obj.graded_completion = graded_completion
+        return obj
+
+
+def _completion_for_scoring(completion: str, state: dict | None) -> str:
+    if state and isinstance(state.get("raw_completion"), str):
+        graded = state.get("graded_completion")
+        return _ScoredResponseText(
+            state["raw_completion"],
+            graded_completion=graded if isinstance(graded, str) else completion,
+        )
+    return completion
+
+
 class FreesoloEnvironment(BaseEnvironment):
     """Flash environment backed by ``freesolo.environments``."""
 
@@ -859,7 +882,9 @@ class FreesoloEnvironment(BaseEnvironment):
     def _score_one(self, completion: str, example: dict, state: dict | None):
         if state and self.multi_turn:
             return self._score_episode(example, state)
-        rewards = self._env.score_responses(self._task_example(example), [completion])
+        rewards = self._env.score_responses(
+            self._task_example(example), [_completion_for_scoring(completion, state)]
+        )
         return self._single(rewards, "score_responses")
 
     def scores_breakdown(
@@ -924,7 +949,9 @@ class FreesoloEnvironment(BaseEnvironment):
             return self._grouped_score(
                 items,
                 task_of=lambda ex, st: self._task_example(ex),
-                payload_of=lambda st: str(st.get("response_text") or ""),
+                payload_of=lambda st: _completion_for_scoring(
+                    str(st.get("response_text") or ""), st
+                ),
                 scorer=self._env.score_responses,
                 method="score_responses",
             )

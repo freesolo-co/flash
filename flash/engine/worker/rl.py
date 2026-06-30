@@ -211,12 +211,17 @@ def run_rl():
                     rewards.append(r)
                     continue
                 graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
+                state = (
+                    {"raw_completion": comp, "graded_completion": graded}
+                    if _w.THINKING
+                    else None
+                )
                 breakdown = None
                 if hasattr(env, "scores_breakdown"):
-                    breakdown = env.scores_breakdown(graded, ex)
+                    breakdown = env.scores_breakdown(graded, ex, state)
                     r = float(breakdown.get("total", 0.0))
                 else:
-                    r = env.reward(graded, ex)
+                    r = env.reward(graded, ex, state)
             except Exception as _reward_exc:
                 # The user's env raised during scoring: score 0 rather than killing the run.
                 # Scoped to the env calls only — flash's own logic below stays outside.

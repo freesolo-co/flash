@@ -235,6 +235,44 @@ def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
     assert sdk_env.batch_sizes == [1, 1, 1]
 
 
+def test_single_turn_scoring_gets_raw_thinking_with_graded_metadata(monkeypatch):
+    """Thinking-mode GRPO passes the stripped answer as the scalar completion, but threads
+    the raw rollout through state. SDK score_responses should see the raw text so
+    reasoning/format/evidence rewards can inspect <think>, while the stripped answer remains
+    available on the response object."""
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _ThinkingAwareEnv(_EnvironmentSingleTurn):
+        def start_episode(self, example, prompt_text):
+            return [{"role": "user", "content": example.input}]
+
+        def score_responses(self, example, response_texts):
+            response = response_texts[0]
+            raw_score = 1.0 if "<think>cite evidence</think>" in response else 0.0
+            graded_score = 1.0 if getattr(response, "graded_completion", "") == " yes" else 0.0
+            return [
+                _RewardResult(
+                    score=raw_score + graded_score,
+                    metrics=(
+                        _RewardMetric("raw_reasoning", raw_score),
+                        _RewardMetric("graded_answer", graded_score),
+                    ),
+                )
+            ]
+
+    env = FreesoloEnvironment(_ThinkingAwareEnv(), "owner/env", source=None, contract_text="")
+    raw = "<think>cite evidence</think> yes"
+    state = {"raw_completion": raw, "graded_completion": " yes"}
+
+    breakdown = env.scores_breakdown(" yes", {"input": "q", "output": "yes"}, state)
+
+    assert breakdown["raw_reasoning"] == 1.0
+    assert breakdown["graded_answer"] == 1.0
+    assert breakdown["total"] == 2.0
+
+
 def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
