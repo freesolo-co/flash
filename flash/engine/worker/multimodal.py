@@ -80,6 +80,10 @@ def _image_max_bytes() -> int:
     return _env_int("FLASH_IMAGE_MAX_BYTES", _DEFAULT_IMAGE_MAX_BYTES, minimum=1)
 
 
+def _image_max_pixels() -> int:
+    return _env_int("FLASH_IMAGE_MAX_PIXELS", _DEFAULT_IMAGE_MAX_PIXELS, minimum=1)
+
+
 def image_token_reserve() -> int:
     return _env_int("FLASH_IMAGE_TOKEN_RESERVE", _DEFAULT_IMAGE_TOKEN_RESERVE, minimum=0)
 
@@ -100,23 +104,34 @@ def multimodal_token_estimate(text: str, tokenizer, image_count: int) -> int:
 
 
 def _configure_image_limits(Image) -> None:
-    Image.MAX_IMAGE_PIXELS = _env_int(
-        "FLASH_IMAGE_MAX_PIXELS", _DEFAULT_IMAGE_MAX_PIXELS, minimum=1
-    )
+    Image.MAX_IMAGE_PIXELS = _image_max_pixels()
 
 
 def _allow_remote_images() -> bool:
-    return os.environ.get("FLASH_ALLOW_REMOTE_IMAGES", "").strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get("FLASH_ALLOW_REMOTE_IMAGES", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _open_rgb_image(Image, source):
     with Image.open(source) as img:
+        _check_image_pixels(*img.size, label="image")
         return img.convert("RGB")
 
 
 def _check_image_size(size: int | None, *, label: str) -> None:
     if size is not None and size > _image_max_bytes():
         raise ValueError(f"{label} exceeds FLASH_IMAGE_MAX_BYTES={_image_max_bytes()}")
+
+
+def _check_image_pixels(width: int, height: int, *, label: str) -> None:
+    pixels = max(0, int(width)) * max(0, int(height))
+    limit = _image_max_pixels()
+    if pixels > limit:
+        raise ValueError(f"{label} is {pixels} pixels, exceeding FLASH_IMAGE_MAX_PIXELS={limit}")
 
 
 def _read_limited_response(resp) -> bytes:
@@ -142,7 +157,8 @@ def _read_limited_response(resp) -> bytes:
 
 def _allowed_base_dirs(base_dirs: tuple[Path, ...] | None = None) -> tuple[Path, ...]:
     return tuple(
-        Path(base).expanduser().resolve(strict=False) for base in (base_dirs or _base_dirs_from_env())
+        Path(base).expanduser().resolve(strict=False)
+        for base in (base_dirs or _base_dirs_from_env())
     )
 
 
@@ -155,7 +171,9 @@ def _is_under_base(path: Path, bases: tuple[Path, ...]) -> bool:
 
 def _local_image_paths(value: str, *, base_dirs: tuple[Path, ...] | None = None) -> list[Path]:
     parsed = urllib.parse.urlparse(value)
-    candidate = Path(urllib.request.url2pathname(parsed.path)) if parsed.scheme == "file" else Path(value)
+    candidate = (
+        Path(urllib.request.url2pathname(parsed.path)) if parsed.scheme == "file" else Path(value)
+    )
     bases = _allowed_base_dirs(base_dirs)
     paths = [candidate] if candidate.is_absolute() else [base / candidate for base in bases]
     out: list[Path] = []
@@ -179,6 +197,7 @@ def _load_image(value: Any, *, base_dirs: tuple[Path, ...] | None = None):
     _configure_image_limits(Image)
 
     if isinstance(value, Image.Image):
+        _check_image_pixels(*value.size, label="PIL image")
         return value.convert("RGB")
     if isinstance(value, (bytes, bytearray)):
         _check_image_size(len(value), label="image bytes")
@@ -186,7 +205,9 @@ def _load_image(value: Any, *, base_dirs: tuple[Path, ...] | None = None):
     if hasattr(value, "read"):
         return _open_rgb_image(Image, value)
     if not isinstance(value, str):
-        raise TypeError(f"unsupported image value {type(value).__name__}; expected path, URL, bytes, or PIL.Image")
+        raise TypeError(
+            f"unsupported image value {type(value).__name__}; expected path, URL, bytes, or PIL.Image"
+        )
 
     text = value.strip()
     if not text:
@@ -239,7 +260,10 @@ def image_input_count(messages: list[dict] | None = None, example: dict | None =
         content = message.get("content")
         if isinstance(content, list):
             for block in content:
-                if isinstance(block, dict) and str(block.get("type") or "").lower() in _IMAGE_BLOCK_TYPES:
+                if (
+                    isinstance(block, dict)
+                    and str(block.get("type") or "").lower() in _IMAGE_BLOCK_TYPES
+                ):
                     block_count += 1
     return block_count or top_level
 
@@ -318,12 +342,18 @@ def normalize_messages_with_images(
                     if isinstance(content, list):
                         message["content"] = [*placeholders, *content]
                     else:
-                        message["content"] = [*placeholders, {"type": "text", "text": str(content or "")}]
+                        message["content"] = [
+                            *placeholders,
+                            {"type": "text", "text": str(content or "")},
+                        ]
                     injected = True
                     break
             if not injected and normalized:
                 content = normalized[0].get("content")
-                normalized[0]["content"] = [*placeholders, {"type": "text", "text": str(content or "")}]
+                normalized[0]["content"] = [
+                    *placeholders,
+                    {"type": "text", "text": str(content or "")},
+                ]
 
     return normalized, _load_images(values, base_dirs=base_dirs)
 
@@ -335,7 +365,9 @@ def multimodal_sft_row(
     *,
     base_dirs: tuple[Path, ...] | None = None,
 ) -> dict:
-    prompt, prompt_images = normalize_messages_with_images(prompt_messages, example, base_dirs=base_dirs)
+    prompt, prompt_images = normalize_messages_with_images(
+        prompt_messages, example, base_dirs=base_dirs
+    )
     completion, completion_images = normalize_messages_with_images(
         completion_messages, {}, base_dirs=base_dirs
     )

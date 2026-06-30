@@ -125,16 +125,19 @@ def _remap_vl_sync_weights(weights):
             name = name[len("base_model.model.") :]
         # MULTIMODAL-named trainers: when AutoModelForCausalLM resolves the checkpoint to the FULL
         # ``*ForConditionalGeneration`` (the Qwen3.6-35B-A3B MoE does — its params are
-        # ``model.language_model.*`` / ``model.visual.*`` / ``lm_head.*``), the vLLM engine's OWN
-        # ``hf_to_vllm_mapper`` already maps these (``model.language_model.`` -> ``language_model.model.``,
-        # ``model.visual.`` -> ``visual.``, ``lm_head.`` -> ``language_model.lm_head.``). Pass them
+        # ``model.language_model.*`` / ``model.visual.*`` / ``model.multi_modal_projector.*`` /
+        # ``lm_head.*``), the vLLM engine's OWN ``hf_to_vllm_mapper`` already maps these
+        # (``model.language_model.`` -> ``language_model.model.``, ``model.visual.`` -> ``visual.``,
+        # projector names -> the root projector, ``lm_head.`` -> ``language_model.lm_head.``). Pass them
         # through UNTOUCHED so the sync is byte-identical to the proven initial on-disk load.
         # Prepending ``language_model.`` here would yield ``language_model.model.language_model.*``,
         # which the mapper's ``startswith("model.language_model.")`` rule no longer matches -> the
         # fused-MoE expert lookup then crashes with
         # ``KeyError: 'language_model.layers.N.mlp.experts.w13_weight'`` (the ``.model.`` segment is
         # lost in the AutoWeightsLoader recursion).
-        if name.startswith(("model.language_model.", "model.visual.", "lm_head.")):
+        if name.startswith(
+            ("model.language_model.", "model.visual.", "model.multi_modal_projector.", "lm_head.")
+        ):
             yield name, tensor
             continue
         # TEXT-ONLY trainers: the dense Qwen3.5 family resolves to ``Qwen3_5ForCausalLM``
@@ -280,11 +283,22 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
         # OTHER per-token tensor shaped (B, T[, *]), it would stay full-length while the rest are
         # gathered to T' -> a shape mismatch or misaligned credit. Bail to the unmodified loss instead.
         # (Per-sequence ``advantages`` is (B,) and 2-D ``vllm_is_ratio`` is handled explicitly below.)
-        _known = {"attention_mask", "_input", "selected_token_ids", "old_per_token_logps",
-                  "ref_per_token_logps", "vllm_is_ratio"}
+        _known = {
+            "attention_mask",
+            "_input",
+            "selected_token_ids",
+            "old_per_token_logps",
+            "ref_per_token_logps",
+            "vllm_is_ratio",
+        }
         for _k, _v in kwargs.items():
-            if (_k not in _known and isinstance(_v, torch.Tensor) and _v.dim() >= 2
-                    and _v.size(0) == mask.size(0) and _v.size(1) == full_t):
+            if (
+                _k not in _known
+                and isinstance(_v, torch.Tensor)
+                and _v.dim() >= 2
+                and _v.size(0) == mask.size(0)
+                and _v.size(1) == full_t
+            ):
                 return orig(**kwargs)  # unknown per-token tensor -> don't risk a misaligned gather
         # One shared gather index: the unmasked positions first (stable argsort -> their original
         # order preserved), then the remaining masked positions in original order. Keep only the
@@ -479,6 +493,19 @@ def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
     return is_vl_checkpoint(model_id)
 
 
+def adapter_has_multi_modal_projector_lora(adapter_dir: str) -> bool:
+    """True when a saved LoRA adapter actually carries projector trainable weights."""
+    try:
+        keys = _read_adapter_tensor_keys(adapter_dir)
+    except Exception as e:
+        print(
+            f"[init-adapter] adapter projector-key probe failed for adir={adapter_dir!r}; "
+            f"assuming no projector LoRA keys for recombine compatibility: {e}"
+        )
+        return False
+    return bool(keys) and any("multi_modal_projector" in k for k in keys if _is_lora_key(k))
+
+
 def adapter_lora_rank(adapter_dir: str) -> int:
     """Read a saved PEFT LoRA adapter's uniform rank from adapter_config.json."""
     import json
@@ -496,9 +523,7 @@ def adapter_lora_rank(adapter_dir: str) -> int:
             f"adapter rank preflight: {cfg_path!r} must contain a positive integer `r`"
         ) from exc
     if rank <= 0:
-        raise ValueError(
-            f"adapter rank preflight: {cfg_path!r} has non-positive rank r={rank}"
-        )
+        raise ValueError(f"adapter rank preflight: {cfg_path!r} has non-positive rank r={rank}")
     for key in ("rank_pattern", "alpha_pattern"):
         if cfg.get(key):
             raise ValueError(
@@ -518,7 +543,9 @@ def validate_recombined_lora_rank(
     try:
         grpo_rank = int(grpo_rank)
     except (TypeError, ValueError) as exc:
-        raise ValueError("VL warm-start rank preflight: GRPO train.lora_rank must be an integer") from exc
+        raise ValueError(
+            "VL warm-start rank preflight: GRPO train.lora_rank must be an integer"
+        ) from exc
     if grpo_rank <= 0:
         raise ValueError(
             f"VL warm-start rank preflight: GRPO train.lora_rank must be positive, got {grpo_rank}"
@@ -691,7 +718,9 @@ def recombine_lora_adapters(
     # lora_B with no paired lora_A would be silently DROPPED from the output (an incomplete adapter),
     # not caught by the equal-key-set check above. Fail loudly, like the A-without-B case.
     orphan_b = sorted(
-        bk for bk in sft_ab if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in sft_ab
+        bk
+        for bk in sft_ab
+        if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in sft_ab
     )
     if orphan_b:
         raise ValueError(

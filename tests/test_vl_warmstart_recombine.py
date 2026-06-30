@@ -43,8 +43,20 @@ MODULES = [
 TEXT_MODULES = [m.replace(".language_model.", ".") for m in MODULES]
 
 
-def _write_adapter(adir: str, *, modules, r, alpha, in_f=8, out_f=6, use_rslora=False, seed=0,
-                   use_dora=False, modules_to_save=None, dtype=torch.float32):
+def _write_adapter(
+    adir: str,
+    *,
+    modules,
+    r,
+    alpha,
+    in_f=8,
+    out_f=6,
+    use_rslora=False,
+    seed=0,
+    use_dora=False,
+    modules_to_save=None,
+    dtype=torch.float32,
+):
     os.makedirs(adir, exist_ok=True)
     g = torch.Generator().manual_seed(seed)
     sd = {}
@@ -55,8 +67,12 @@ def _write_adapter(adir: str, *, modules, r, alpha, in_f=8, out_f=6, use_rslora=
         sd[f"{m}.lora_B.default.weight"] = torch.randn(out_f, r, generator=g, dtype=dtype) * 0.1
     save_file(sd, os.path.join(adir, "adapter_model.safetensors"), metadata={"format": "pt"})
     cfg = {
-        "peft_type": "LORA", "r": r, "lora_alpha": alpha, "lora_dropout": 0.0,
-        "use_rslora": use_rslora, "use_dora": use_dora,
+        "peft_type": "LORA",
+        "r": r,
+        "lora_alpha": alpha,
+        "lora_dropout": 0.0,
+        "use_rslora": use_rslora,
+        "use_dora": use_dora,
         "target_modules": ["q_proj", "v_proj", "gate_proj"],
         "base_model_name_or_path": "Qwen/Qwen3.5-2B",
     }
@@ -88,12 +104,14 @@ def _delta(adir, module):
 @pytest.mark.parametrize(
     ("r_sft", "a_sft", "rs_sft", "r_grpo", "a_grpo", "rs_grpo"),
     [
-        (4, 8, False, 4, 8, False),    # equal scale 2.0 (the common managed-flash case)
-        (4, 8, False, 2, 8, False),    # differing scales 2.0 vs 4.0, differing ranks
-        (8, 16, True, 4, 8, False),    # rsLoRA on one side
+        (4, 8, False, 4, 8, False),  # equal scale 2.0 (the common managed-flash case)
+        (4, 8, False, 2, 8, False),  # differing scales 2.0 vs 4.0, differing ranks
+        (8, 16, True, 4, 8, False),  # rsLoRA on one side
     ],
 )
-def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_grpo, a_grpo, rs_grpo):
+def test_recombine_reproduces_sum_of_deltas(
+    tmp_path, r_sft, a_sft, rs_sft, r_grpo, a_grpo, rs_grpo
+):
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
@@ -112,7 +130,9 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
 
     # Output is emitted in the VL SFT key namespace; serving expects the language_model wrapper.
     out_sd = load_file(os.path.join(out, "adapter_model.safetensors"))
-    assert all(".language_model." in k for k in out_sd), "recombined keys must target language_model"
+    assert all(".language_model." in k for k in out_sd), (
+        "recombined keys must target language_model"
+    )
     assert not any(k.startswith("base_model.model.model.layers.") for k in out_sd)
 
     # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base. GRPO's
@@ -132,7 +152,9 @@ def test_recombine_normalizes_language_model_infix(tmp_path):
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
     _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)  # infixed (full VL model)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)  # text-only (AutoModelForCausalLM)
+    _write_adapter(
+        grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2
+    )  # text-only (AutoModelForCausalLM)
 
     rank = recombine_lora_adapters(sft, grpo, out)
     assert rank == 8
@@ -248,7 +270,9 @@ def test_init_adapter_model_uses_model_specific_serving_cap(tmp_path, monkeypatc
         "_merge_vl_warmstart_adapter",
         fake_merge,
     )
-    monkeypatch.setattr(worker_adapter, "make_lora", lambda model_id: {"model_id": model_id})
+    monkeypatch.setattr(
+        worker_adapter, "make_lora", lambda model_id, **_kwargs: {"model_id": model_id}
+    )
     monkeypatch.setattr(W, "_VL_WARMSTART_MODEL_ID", None, raising=False)
     monkeypatch.setattr(
         W,
@@ -272,7 +296,9 @@ def test_init_adapter_model_uses_model_specific_serving_cap(tmp_path, monkeypatc
 def test_init_adapter_model_clears_stale_vl_warmstart_state(monkeypatch):
     import flash.engine.worker.adapter as worker_adapter
 
-    monkeypatch.setattr(worker_adapter, "make_lora", lambda model_id: {"model_id": model_id})
+    monkeypatch.setattr(
+        worker_adapter, "make_lora", lambda model_id, **_kwargs: {"model_id": model_id}
+    )
     monkeypatch.setattr(W, "_VL_WARMSTART_SFT_DIR", "/tmp/stale-sft", raising=False)
     monkeypatch.setattr(W, "_VL_WARMSTART_MODEL_ID", "Qwen/Qwen3.5-2B", raising=False)
     monkeypatch.setattr(
@@ -295,8 +321,13 @@ def test_recombine_rejects_mismatched_target_modules(tmp_path):
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
     _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
-    _write_adapter(grpo, modules=[*MODULES[:-1], "base_model.model.model.language_model.layers.9.mlp.up_proj"],
-                   r=4, alpha=8, seed=2)
+    _write_adapter(
+        grpo,
+        modules=[*MODULES[:-1], "base_model.model.model.language_model.layers.9.mlp.up_proj"],
+        r=4,
+        alpha=8,
+        seed=2,
+    )
     with pytest.raises(ValueError, match=r"DIFFERENT modules"):
         recombine_lora_adapters(sft, grpo, out)
 
@@ -470,7 +501,7 @@ def test_recombine_preserves_higher_dtype_of_either_adapter(tmp_path):
 
 # --- orchestrator gating: recombined_warmstart_adapter_dir(src) ---------------------------------
 # Gated on the `_VL_WARMSTART_SFT_DIR` marker that _init_adapter_model sets ONLY on the VL merge path.
-import flash.engine.worker as W
+from flash.engine.worker._pkg import W
 
 
 def test_orchestrator_noop_when_not_vl_warmstart(tmp_path, monkeypatch):

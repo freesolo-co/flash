@@ -9,6 +9,7 @@ from flash.catalog import serving_lora_rank_cap
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.lora import (
+    adapter_has_multi_modal_projector_lora,
     adapter_is_vl_warmstart,
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
@@ -152,9 +153,18 @@ def _init_adapter_model(model_id: str, *, multimodal: bool = False):
             f"SFT rank {sft_rank} + GRPO rank {grpo_rank} = deploy rank {recombined_rank} "
             f"({cap_note})"
         )
+        warmstart_multimodal = multimodal and adapter_has_multi_modal_projector_lora(adir)
+        if multimodal and not warmstart_multimodal:
+            print(
+                "[init-adapter] VL warm-start adapter has no multi_modal_projector LoRA keys; "
+                "training GRPO with the matching text-only VL target set so SFT+GRPO recombine "
+                "can finalize cleanly"
+            )
         merged_dir = _merge_vl_warmstart_adapter(adir, model_id, attn_kw)
-        print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
-        return merged_dir, make_lora(merged_dir, multimodal=multimodal)
+        print(
+            f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it"
+        )
+        return merged_dir, make_lora(merged_dir, multimodal=warmstart_multimodal)
 
     # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
     # so keep it — TRL trains the LOADED adapter (peft_config=None).

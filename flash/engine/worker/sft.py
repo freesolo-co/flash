@@ -87,7 +87,9 @@ def _model_arch_dims(model_id: str) -> tuple[int, int]:
 
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         tc = getattr(cfg, "text_config", None) or cfg
-        hidden = c_hidden or int(getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0)
+        hidden = c_hidden or int(
+            getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0
+        )
         layers = c_layers or int(
             getattr(tc, "num_hidden_layers", 0) or getattr(cfg, "num_hidden_layers", 0) or 0
         )
@@ -165,7 +167,10 @@ def run_sft():
                     msgs, tokenize=False, add_generation_prompt=False, enable_thinking=_w.THINKING
                 ),
                 "prompt_text": tok.apply_chat_template(
-                    prompt_messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
+                    prompt_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=_w.THINKING,
                 ),
             }
         )
@@ -203,12 +208,14 @@ def run_sft():
         sft_message_rows = kept_message_rows
         print(f"[sft] multimodal SFT: {image_rows}/{len(train)} row(s) include image inputs")
     if multiturn_targets:
-        print(f"[sft] multi-turn SFT: {multiturn_targets}/{len(train)} rows train on a full target transcript")
+        print(
+            f"[sft] multi-turn SFT: {multiturn_targets}/{len(train)} rows train on a full target transcript"
+        )
     elif getattr(env, "multi_turn", False):
         print(
             "[sft][warn] this is a multi-turn Freesolo environment but no row ships a multi-turn "
             "target completion; SFT collapses to a single assistant turn per row (tool/env turns "
-            "ignored). Provide target transcripts (output={\"messages\": [...]}) for proper multi-turn SFT."
+            'ignored). Provide target transcripts (output={"messages": [...]}) for proper multi-turn SFT.'
         )
     if _w.THINKING and not any("<think>" in t["text"] for t in texts[:256]):
         print(
@@ -239,7 +246,9 @@ def run_sft():
             ]
             ds = Dataset.from_list(multimodal_rows)
         _masked_tok = sum(
-            multimodal_token_estimate(message_text(r["prompt"]), tok, image_input_count(r["prompt"]))
+            multimodal_token_estimate(
+                message_text(r["prompt"]), tok, image_input_count(r["prompt"])
+            )
             for r in multimodal_rows
         )
         _completion_tok = sum(
@@ -281,9 +290,8 @@ def run_sft():
     # logits; cap micro-batch so they fit, raise grad-accum to keep effective batch unchanged.
     _sft_params_b = resolve_params_b(model_id)
     _sft_vocab = vocab_size_for(model_id)
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and liger_on(
-        _memory_mode(model_id, sft_max_len)
-    )
+    _sft_liger_on = (not _multimodal) and liger_on(_memory_mode(model_id, sft_max_len))
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and _sft_liger_on
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
     )
@@ -362,7 +370,9 @@ def run_sft():
     _gdn = model_is_gdn_hybrid(model_id)
     _fa_ok = _flash_attn_available()
     if _multimodal:
-        print("[sft] multimodal rows: token packing disabled; TRL VLM collator owns image/text collation")
+        print(
+            "[sft] multimodal rows: token packing disabled; TRL VLM collator owns image/text collation"
+        )
     elif _fa_ok and _pure_attn:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
@@ -372,9 +382,13 @@ def run_sft():
             "the cu_seqlens/seq_idx varlen collator handles its packing when both kernels are present."
         )
     else:
-        _bfd_why = "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
-        print(f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below.")
-    if not _multimodal and liger_on(_memory_mode(model_id, sft_max_len)):
+        _bfd_why = (
+            "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
+        )
+        print(
+            f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below."
+        )
+    if _sft_liger_on:
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
     _attn = optimal_attn_impl()
@@ -386,13 +400,17 @@ def run_sft():
             print(f"[sft] attn_implementation={_attn} (packing boundary-correct varlen)")
         elif _attn == "sdpa":
             cfg_kwargs["packing"] = False
-            print("[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)")
+            print(
+                "[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)"
+            )
         elif _fa_ok:
             _attn = "flash_attention_2"
             print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
         else:
             cfg_kwargs["packing"] = False
-            print("[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA")
+            print(
+                "[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA"
+            )
     if cfg_kwargs.get("packing"):
         _bfd_ids = [r["input_ids"] for r in _pretok]
         _bfd_ex = len(_bfd_ids) / max(1, len(pack_token_ids(_bfd_ids, sft_max_len)))
@@ -411,10 +429,14 @@ def run_sft():
     # Cap at 16384: dense [B,1,T,T] mask is O(T^2) memory; above this packing gains little anyway.
     _PACK_MASK_MAX_LEN = 16384
     _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
-    _sdpa_pack = bool(not _multimodal and not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
+    _sdpa_pack = bool(
+        not _multimodal and not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok
+    )
     if _sdpa_pack:
         if _attn in ("flash_attention_2", "flash_attention_3"):
-            print(f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)")
+            print(
+                f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)"
+            )
         _attn = "sdpa"
         cfg_kwargs["packing"] = False  # we own the packing; TRL must not also pack
         _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
@@ -426,7 +448,9 @@ def run_sft():
         ds = Dataset.from_list(_packed_rows)
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
         _pd_pack, _ = sft_grad_accum(
-            effective_batch, seq_len=sft_max_len, vocab=vocab_size_for(model_id),
+            effective_batch,
+            seq_len=sft_max_len,
+            vocab=vocab_size_for(model_id),
             fused=bool(cfg_kwargs.get("use_liger_kernel")),
         )
         # Cap pd so the dense [pd,1,T,T] mask stays <=512MB (only bites past ~12k tokens).
@@ -443,11 +467,19 @@ def run_sft():
             f"pd={_pd_pack} ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept "
             f"~{effective_batch} ex); no flash-attn / no flex_attention"
         )
-    elif not _multimodal and not cfg_kwargs.get("packing") and _gdn and gdn_packing_available(model_id) and _mask_pack_ok:
+    elif (
+        not _multimodal
+        and not cfg_kwargs.get("packing")
+        and _gdn
+        and gdn_packing_available(model_id)
+        and _mask_pack_ok
+    ):
         # GDN hybrid: 4D mask for full-attn layers + cu_seqlens/seq_idx to reset DeltaNet recurrence.
         # Flash varlen would ignore the 4D mask — downgrade to sdpa for the full-attn layers.
         if _attn in ("flash_attention_2", "flash_attention_3"):
-            print(f"[sft] GDN packing under SDPA: downgrading {_attn} -> sdpa for the full-attn layers")
+            print(
+                f"[sft] GDN packing under SDPA: downgrading {_attn} -> sdpa for the full-attn layers"
+            )
         _attn = "sdpa"
         cfg_kwargs["packing"] = False
         _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
@@ -461,14 +493,21 @@ def run_sft():
         # cu_seqlens spans one block -> per-device=1; re-derive grad_accum to keep effective batch in examples.
         _ex_per_block = len(_ids) / max(1, len(_packed_rows))
         cfg_kwargs["per_device_train_batch_size"] = 1
-        cfg_kwargs["gradient_accumulation_steps"] = max(1, math.ceil(effective_batch / max(1.0, _ex_per_block)))
+        cfg_kwargs["gradient_accumulation_steps"] = max(
+            1, math.ceil(effective_batch / max(1.0, _ex_per_block))
+        )
         print(
             "[sft] true token packing ENABLED for GatedDeltaNet hybrid (4D mask + cu_seqlens/seq_idx "
             f"varlen): {len(_ids)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} "
             f"ex/block, {packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} "
             f"tok; pd=1 ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept ~{effective_batch} ex)"
         )
-    elif not _multimodal and not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
+    elif (
+        not _multimodal
+        and not cfg_kwargs.get("packing")
+        and (_pure_attn or _gdn)
+        and not _mask_pack_ok
+    ):
         print(
             f"[sft] packing stays OFF: max_length {sft_max_len} > {_PACK_MASK_MAX_LEN} — the dense "
             "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
@@ -480,7 +519,9 @@ def run_sft():
             if _gdn
             else "non-full-attention arch (e.g. sliding-window) a block-diagonal mask can't pack"
         )
-        print(f"[sft] packing stays OFF: {_why}. (Pure full-attention models pack via the SDPA mask.)")
+        print(
+            f"[sft] packing stays OFF: {_why}. (Pure full-attention models pack via the SDPA mask.)"
+        )
     # Explicit bf16 + device_map=None: transformers-5 string loading otherwise falls back to fp32
     # (2x VRAM) or accelerate-offloads to meta ("expected device meta but got cuda:0" in backward).
     mik = {"dtype": "bfloat16", "device_map": None}

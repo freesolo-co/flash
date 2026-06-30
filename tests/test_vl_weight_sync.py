@@ -42,10 +42,14 @@ def test_remap_multimodal_names_pass_through_for_engine_mapper():
     from flash.engine.worker.lora import _remap_vl_sync_weights
 
     src = [
-        ("model.language_model.layers.0.mlp.experts.gate_up_proj", "E0"),  # the crashing fused expert
+        (
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            "E0",
+        ),  # the crashing fused expert
         ("model.language_model.layers.0.mlp.experts.down_proj", "E1"),
         ("model.language_model.layers.0.self_attn.qkv_proj.weight", "D0"),
         ("model.visual.blocks.0.attn.qkv.weight", "V0"),
+        ("model.multi_modal_projector.linear.weight", "P0"),
         ("lm_head.weight", "L0"),
     ]
     out = list(_remap_vl_sync_weights(iter(src)))
@@ -74,11 +78,13 @@ def test_remap_strips_peft_base_model_wrapper():
     src = [
         ("base_model.model.model.layers.1.mlp.up_proj.weight", "X"),
         ("base_model.model.lm_head.weight", "Y"),
+        ("base_model.model.model.multi_modal_projector.linear.weight", "P"),
     ]
     out = dict(_remap_vl_sync_weights(iter(src)))
     assert out == {
         "language_model.model.layers.1.mlp.up_proj.weight": "X",
         "lm_head.weight": "Y",  # passthrough after wrapper strip: the engine mapper handles lm_head.
+        "model.multi_modal_projector.linear.weight": "P",
     }
 
 

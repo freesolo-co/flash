@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import inspect
 import io
+import types
 from typing import ClassVar
 
 import pytest
@@ -154,6 +155,14 @@ def test_remote_image_urls_are_opt_in_by_default():
         _load_image("https://example.invalid/image.png")
 
 
+def test_image_loader_enforces_decoded_pixel_cap(monkeypatch):
+    Image = pytest.importorskip("PIL.Image")
+
+    monkeypatch.setenv("FLASH_IMAGE_MAX_PIXELS", "8")
+    with pytest.raises(ValueError, match="FLASH_IMAGE_MAX_PIXELS=8"):
+        _load_image(Image.new("RGB", (3, 3)))
+
+
 def test_empty_and_explicit_image_placeholders_keep_order():
     blue_dot = _png_data_uri((0, 0, 255))
     red_dot = _png_data_uri((255, 0, 0))
@@ -231,6 +240,56 @@ def test_sft_multimodal_path_is_wired_to_trl_vlm_support():
     assert "dropped_empty_targets" in src
     assert "multimodal_token_estimate" in src
     assert "base_dirs=image_base_dirs" in src
+    assert "_sft_liger_on = (not _multimodal)" in src
+    assert (
+        "sft_grad_accum(\n        effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused"
+        in src
+    )
+
+
+@pytest.mark.parametrize(("has_projector", "expected_multimodal"), [(False, False), (True, True)])
+def test_vl_warmstart_grpo_matches_sft_projector_targets(
+    has_projector, expected_multimodal, monkeypatch, tmp_path
+):
+    import flash.engine.worker.adapter as worker_adapter
+    from flash.engine.worker._pkg import W
+
+    adir = str(tmp_path / "sft")
+    merged = str(tmp_path / "merged")
+    monkeypatch.setattr(worker_adapter, "_download_adapter", lambda _prefix: adir)
+    monkeypatch.setattr(worker_adapter, "adapter_is_vl_warmstart", lambda _adir, _model_id: True)
+    monkeypatch.setattr(
+        worker_adapter, "adapter_has_multi_modal_projector_lora", lambda _adir: has_projector
+    )
+    monkeypatch.setattr(worker_adapter, "optimal_attn_impl", lambda: None)
+    monkeypatch.setattr(worker_adapter, "serving_lora_rank_cap", lambda _model_id: None)
+    monkeypatch.setattr(worker_adapter, "validate_recombined_lora_rank", lambda *a, **k: (8, 8, 16))
+    monkeypatch.setattr(worker_adapter, "_merge_vl_warmstart_adapter", lambda *_args: merged)
+    monkeypatch.setattr(
+        W,
+        "JOB_SPEC",
+        types.SimpleNamespace(
+            train=types.SimpleNamespace(
+                init_from_adapter="owner/runs:sft/adapter",
+                lora_rank=8,
+            )
+        ),
+        raising=False,
+    )
+    seen = {}
+
+    def fake_make_lora(model_id, *, multimodal=False):
+        seen["model_id"] = model_id
+        seen["multimodal"] = multimodal
+        return {"model_id": model_id, "multimodal": multimodal}
+
+    monkeypatch.setattr(worker_adapter, "make_lora", fake_make_lora)
+
+    assert worker_adapter._init_adapter_model("Qwen/Qwen3.5-4B", multimodal=True) == (
+        merged,
+        {"model_id": merged, "multimodal": expected_multimodal},
+    )
+    assert seen == {"model_id": merged, "multimodal": expected_multimodal}
 
 
 def test_grpo_multimodal_path_is_wired_to_trl_vlm_support():
