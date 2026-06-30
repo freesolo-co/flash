@@ -356,6 +356,16 @@ def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
     )
 
 
+def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool = False) -> str:
+    url = (
+        f"https://api.github.com/repos/{ref.repo_full_name}/git/trees/"
+        f"{urllib.parse.quote(treeish, safe='')}"
+    )
+    if recursive:
+        url = f"{url}?recursive=1"
+    return url
+
+
 def _github_headers(accept: str) -> dict[str, str]:
     headers = {"Accept": accept, "User-Agent": "freesolo-flash"}
     token = _github_token()
@@ -375,6 +385,40 @@ def _safe_contents_path(path: object, root_parts: list[str]) -> str:
     if parts[: len(root_parts)] != root_parts:
         raise RuntimeError(f"unexpected path in environment contents: {path!r}")
     return normalized
+
+
+def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> Any:
+    data = _urlopen(
+        urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
+        timeout=120.0,
+        max_bytes=_MAX_CONTENTS_JSON_BYTES,
+    )
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "GitHub environment request failed for "
+            f"{ref.repo_full_name}@{ref.ref}:{context}: invalid response"
+        ) from exc
+
+
+def _find_github_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
+    treeish = ref.ref
+    traversed: list[str] = []
+    for part in [part for part in repo_dir.split("/") if part]:
+        payload = _download_github_json(ref, _github_tree_url(ref, treeish), "/".join(traversed))
+        entries = payload.get("tree") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
+        match = next(
+            (entry for entry in entries if isinstance(entry, dict) and entry.get("path") == part),
+            None,
+        )
+        if not match or match.get("type") != "tree" or not isinstance(match.get("sha"), str):
+            raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
+        treeish = match["sha"]
+        traversed.append(part)
+    return treeish
 
 
 def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
@@ -423,39 +467,37 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
                 f"({state['bytes']} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
             )
 
-    def download_dir(path: str) -> None:
+    def create_dir(path: str) -> None:
         record_member(path)
         (repo_root / path).mkdir(parents=True, exist_ok=True)
-        data = _urlopen(
-            urllib.request.Request(
-                _github_contents_url(ref, path),
-                headers=_github_headers("application/vnd.github+json"),
-            ),
-            timeout=120.0,
-            max_bytes=_MAX_CONTENTS_JSON_BYTES,
-        )
-        try:
-            payload = json.loads(data)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "GitHub environment request failed for "
-                f"{ref.repo_full_name}@{ref.ref}:{path}: invalid response"
-            ) from exc
-        if not isinstance(payload, list):
-            raise RuntimeError(f"GitHub path {path!r} is not an environment directory")
-        for entry in payload:
-            if not isinstance(entry, dict):
-                raise RuntimeError("GitHub contents response included an invalid entry")
-            child_path = _safe_contents_path(entry.get("path"), root_parts)
-            kind = entry.get("type")
-            if kind == "dir":
-                download_dir(child_path)
-            elif kind == "file":
-                download_file(child_path, entry.get("size"))
-            else:
-                raise RuntimeError(f"unsupported entry in environment contents: {child_path!r}")
 
-    download_dir(repo_dir)
+    create_dir(repo_dir)
+    env_tree_sha = _find_github_tree_sha(ref, repo_dir)
+    payload = _download_github_json(
+        ref,
+        _github_tree_url(ref, env_tree_sha, recursive=True),
+        repo_dir,
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
+    if payload.get("truncated"):
+        raise RuntimeError(
+            f"GitHub tree response for environment directory {repo_dir!r} was truncated"
+        )
+    for entry in payload["tree"]:
+        if not isinstance(entry, dict):
+            raise RuntimeError("GitHub tree response included an invalid entry")
+        rel_path = entry.get("path")
+        if not isinstance(rel_path, str):
+            raise RuntimeError("GitHub tree response included an entry without a path")
+        child_path = _safe_contents_path(f"{repo_dir}/{rel_path}", root_parts)
+        kind = entry.get("type")
+        if kind == "tree":
+            create_dir(child_path)
+        elif kind == "blob" and entry.get("mode") != "120000":
+            download_file(child_path, entry.get("size"))
+        else:
+            raise RuntimeError(f"unsupported entry in environment contents: {child_path!r}")
     return repo_root
 
 
