@@ -43,6 +43,7 @@ class LambdaProvider:
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
+        code_prefix: str | None = None,
     ) -> PollResult:
         from flash.providers.lambdalabs.jobs import submit_run_lambda
 
@@ -53,6 +54,7 @@ class LambdaProvider:
             on_handle=on_handle,
             attempt=attempt,
             runtime_secrets=runtime_secrets,
+            code_prefix=code_prefix,
         )
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
