@@ -19,7 +19,7 @@ from flash.engine.worker.multimodal import (
     multimodal_sft_row,
     multimodal_token_estimate,
 )
-from flash.envs.adapter import FreesoloEnvironment
+from flash.envs.adapter import FreesoloEnvironment, load_freesolo_environment
 
 _RED_DOT = (
     "data:image/png;base64,"
@@ -150,6 +150,42 @@ def test_every_catalog_multimodal_model_accepts_image_rows():
         assert grpo_row["prompt"][0]["content"][0]["type"] == "image"
 
 
+def test_mixed_multimodal_sft_rows_are_arrow_compatible():
+    from datasets import Dataset
+
+    text_row = multimodal_sft_row(
+        [{"role": "user", "content": "Text-only question?"}],
+        _completion(),
+        {"input": "Text-only question?", "output": "red"},
+    )
+    image_row = multimodal_sft_row(_prompt(), _completion(), _example())
+
+    ds = Dataset.from_list([text_row, image_row])
+    assert ds.column_names == ["prompt", "completion", "images"]
+    assert ds[0]["images"] == []
+    assert ds[0]["prompt"][0]["content"] == [{"type": "text", "text": "Text-only question?"}]
+    assert ds[1]["images"][0].size == (1, 1)
+
+
+def test_mixed_multimodal_grpo_rows_are_arrow_compatible():
+    from datasets import Dataset
+
+    prompts = [
+        multimodal_grpo_prompt_row(
+            [{"role": "user", "content": "Text-only question?"}],
+            {"input": "Text-only question?", "output": "red"},
+        ),
+        multimodal_grpo_prompt_row(_prompt(), _example()),
+    ]
+    rows, examples = grpo.build_grpo_prompt_dataset(prompts)
+
+    ds = Dataset.from_list(rows)
+    assert ds.column_names == ["prompt", "example_idx", "images"]
+    assert ds[0]["images"] == []
+    assert ds[1]["images"][0].size == (1, 1)
+    assert examples[1]["image"] == _RED_DOT
+
+
 def test_sft_multimodal_path_is_wired_to_trl_vlm_support():
     src = inspect.getsource(sft.run_sft)
     assert "AutoProcessor.from_pretrained" in src
@@ -159,6 +195,7 @@ def test_sft_multimodal_path_is_wired_to_trl_vlm_support():
     assert "token packing disabled" in src
     assert "dropped_empty_targets" in src
     assert "multimodal_token_estimate" in src
+    assert "base_dirs=image_base_dirs" in src
 
 
 def test_grpo_multimodal_path_is_wired_to_trl_vlm_support():
@@ -169,6 +206,15 @@ def test_grpo_multimodal_path_is_wired_to_trl_vlm_support():
     assert "_init_adapter_model(model_id, multimodal=_multimodal)" in src
     assert "if not _multimodal:\n            patch_vllm_language_model_only(model_id)" in src
     assert "multimodal_token_estimate" in src
+    assert "not conversational and not _multimodal" in src
+    assert "multimodal GRPO currently supports single-turn image prompts only" in src
+    assert "base_dirs=image_base_dirs" in src
+
+
+def test_freesolo_env_threads_image_base_dirs():
+    src = inspect.getsource(load_freesolo_environment)
+    assert "image_base_dirs = [base_dir]" in src
+    assert "image_base_dirs=tuple" in src
 
 
 def test_grpo_prompt_dataset_preserves_image_columns_without_rich_examples():

@@ -106,6 +106,7 @@ def run_rl():
     processor = None
 
     train = env.dataset()
+    image_base_dirs = getattr(env, "image_base_dirs", None) or None
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
     prompt_messages_rows = [(env.prompt_messages(ex), ex) for ex in train]
@@ -117,34 +118,24 @@ def run_rl():
             "prompt(s) include image data. Pick an image+text model from `flash models`, or remove "
             "image/image_url content from the environment."
         )
+    if _multimodal and is_multi_turn:
+        raise ValueError(
+            "multimodal GRPO currently supports single-turn image prompts only; multi-turn image "
+            "rollouts need a VLM-aware rollout implementation"
+        )
     if _multimodal:
         processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         tok = getattr(processor, "tokenizer", tok)
         if getattr(tok, "pad_token", None) is None:
             tok.pad_token = tok.eos_token
         print(f"[rl] multimodal GRPO: {image_rows}/{len(train)} prompt(s) include image inputs")
-    if conversational:
-        if _multimodal:
-            prompts = [multimodal_grpo_prompt_row(msgs, ex) for msgs, ex in prompt_messages_rows]
-        else:
-            prompts = [{"prompt": msgs, "example": ex} for msgs, ex in prompt_messages_rows]
-    elif _multimodal:
-        prompts = []
-        for msgs, ex in prompt_messages_rows:
-            row = multimodal_grpo_prompt_row(msgs, ex)
-            try:
-                row["prompt"] = processor.apply_chat_template(
-                    row["prompt"],
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    enable_thinking=_w.THINKING,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "failed to render a multimodal prompt with this model's processor chat template "
-                    f"(fix the model/template or the env's prompts): {exc}"
-                ) from exc
-            prompts.append(row)
+    if _multimodal:
+        prompts = [
+            multimodal_grpo_prompt_row(msgs, ex, base_dirs=image_base_dirs)
+            for msgs, ex in prompt_messages_rows
+        ]
+    elif conversational:
+        prompts = [{"prompt": msgs, "example": ex} for msgs, ex in prompt_messages_rows]
     else:
         prompts = [{"prompt": _w.render_prompt(tok, ex), "example": ex} for _msgs, ex in prompt_messages_rows]
     _max_completion = int(
@@ -169,7 +160,7 @@ def run_rl():
 
     def _render_for_budget(p) -> str:
         """Render a prompt to text EXACTLY as the rollout does (incl. tool schemas)."""
-        if not conversational:
+        if not conversational and not _multimodal:
             return p["prompt"]
         kw = {"tools": _oai_tools} if _oai_tools else {}
         try:

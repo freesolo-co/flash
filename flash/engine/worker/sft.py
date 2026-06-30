@@ -131,6 +131,7 @@ def run_sft():
         return val if val is not None else default
 
     train = env.dataset()
+    image_base_dirs = getattr(env, "image_base_dirs", None) or None
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
     max_examples = int(_train_opt("max_examples", 0) or 0)
@@ -233,7 +234,7 @@ def run_sft():
     if _multimodal:
         with liveness_heartbeat("sft_pretokenizing"):
             multimodal_rows = [
-                multimodal_sft_row(prompt_messages, completion, ex)
+                multimodal_sft_row(prompt_messages, completion, ex, base_dirs=image_base_dirs)
                 for prompt_messages, completion, ex in sft_message_rows
             ]
             ds = Dataset.from_list(multimodal_rows)

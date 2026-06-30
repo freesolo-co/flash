@@ -231,9 +231,11 @@ def image_input_count(messages: list[dict] | None = None, example: dict | None =
 
 def _normalize_content(content: Any, *, block_payloads: list[Any], empty_image_blocks: list[int]) -> Any:
     if isinstance(content, str):
-        return content
+        return [{"type": "text", "text": content}]
+    if content is None:
+        return []
     if not isinstance(content, list):
-        return content
+        return [{"type": "text", "text": str(content)}]
     out = []
     for block in content:
         if not isinstance(block, dict):
@@ -321,11 +323,8 @@ def multimodal_sft_row(
     completion, completion_images = normalize_messages_with_images(
         completion_messages, {}, base_dirs=base_dirs
     )
-    row = {"prompt": prompt, "completion": completion}
     images = [*prompt_images, *completion_images]
-    if images:
-        row["images"] = images
-    return row
+    return {"prompt": prompt, "completion": completion, "images": images}
 
 
 def multimodal_grpo_prompt_row(
@@ -335,10 +334,7 @@ def multimodal_grpo_prompt_row(
     base_dirs: tuple[Path, ...] | None = None,
 ) -> dict:
     prompt, images = normalize_messages_with_images(prompt_messages, example, base_dirs=base_dirs)
-    row = {"prompt": prompt, "example": example}
-    if images:
-        row["images"] = images
-    return row
+    return {"prompt": prompt, "example": example, "images": images}
 
 
 def message_text(messages: list[dict]) -> str:

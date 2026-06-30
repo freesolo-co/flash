@@ -802,11 +802,13 @@ class FreesoloEnvironment(BaseEnvironment):
         *,
         source: object | None,
         contract_text: str = "",
+        image_base_dirs: tuple[Path, ...] = (),
     ):
         super().__init__(id=env_id)
         self._env = sdk_env
         self._source = source
         self._contract_text = contract_text
+        self.image_base_dirs = image_base_dirs
         tools = _import_freesolo_environment_tools()
         self._task_example_from_record = tools["task_example_from_record"]
         self._load_task_examples = tools["load_task_examples"]
@@ -1163,11 +1165,17 @@ def load_freesolo_environment(
     )
 
     sdk_env = tools["load_environment"](reference, **params)
+    image_base_dirs = [base_dir]
+    if isinstance(source, str):
+        source_path = Path(source)
+        if source_path.exists():
+            image_base_dirs.append(source_path.parent)
     return FreesoloEnvironment(
         sdk_env,
         env_id,
         source=source,
         contract_text=contract_text,
+        image_base_dirs=tuple(dict.fromkeys(p.resolve(strict=False) for p in image_base_dirs)),
     )
 
 
