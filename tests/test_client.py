@@ -150,6 +150,17 @@ def test_logs_offset_in_query(stub):
     assert seen["path"].endswith("/v1/runs/r1/logs?offset=3")
 
 
+def test_chat_omits_thinking_template_controls(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.chat("json-chat", messages=[{"role": "user", "content": "hi"}])
+    assert seen["body"] == {
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.0,
+        "max_tokens": 512,
+    }
+
+
 def test_chat_stream_sends_stream_request_and_yields_text(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
