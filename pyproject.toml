@@ -36,7 +36,7 @@ gpu = [
     "accelerate>=1.4",
     # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
     "datasets>=2.19",
-    "freesolo>=0.2.50",
+    "freesolo>=0.2.51",
     "huggingface-hub>=0.34",
 ]
 # freesolo-chalk (Freesolo's custom Triton/CUDA kernels, complements Liger) is an OPTIONAL,
@@ -64,7 +64,7 @@ server = [
     "httpx>=0.27",
     "huggingface-hub>=0.34",
     "datasets>=2.19",
-    "freesolo>=0.2.50",
+    "freesolo>=0.2.51",
     "transformers>=5.6,<5.11",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
@@ -78,7 +78,7 @@ dev = [
     "httpx>=0.27",
     "huggingface-hub>=0.34",
     "datasets>=2.19",
-    "freesolo>=0.2.50",
+    "freesolo>=0.2.51",
     "transformers>=5.6,<5.11",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
@@ -133,7 +133,7 @@ dev = [
     # Offline worker/env tests import these without the heavy `gpu` stack; the CI test env
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
-    "freesolo>=0.2.50",
+    "freesolo>=0.2.51",
 ]
 
 [tool.mypy]
