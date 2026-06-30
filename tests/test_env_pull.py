@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import tarfile
+import urllib.parse
 import urllib.request
 from argparse import Namespace
 from pathlib import Path
@@ -82,6 +84,7 @@ def test_download_environment_file_uses_raw_media_type(monkeypatch):
         captured["url"] = req.full_url
         captured["accept"] = req.headers.get("Accept")
         return _Resp(payload)
+
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
@@ -109,6 +112,7 @@ def test_download_environment_file_sends_token(monkeypatch):
     def fake_urlopen(req, timeout):
         captured["auth"] = req.headers.get("Authorization")
         return _Resp(b"ok")
+
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
 
@@ -526,6 +530,62 @@ def test_download_github_tarball_uses_whole_repo_ceiling(monkeypatch):
         assert tarball.read_bytes() == big
     finally:
         tarball.unlink()
+
+
+def test_resolve_managed_hub_env_downloads_only_requested_package(monkeypatch, tmp_path):
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **kwargs: "a" * 40)
+
+    def fail_tarball(ref):
+        raise AssertionError("managed hub refs should not download the whole repo tarball")
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fail_tarball)
+
+    listings = {
+        "david-freesolo-co/stuff": [
+            {
+                "type": "file",
+                "path": "david-freesolo-co/stuff/environment.py",
+                "size": len(b"# env\n"),
+            },
+            {"type": "dir", "path": "david-freesolo-co/stuff/datasets", "size": 0},
+        ],
+        "david-freesolo-co/stuff/datasets": [
+            {
+                "type": "file",
+                "path": "david-freesolo-co/stuff/datasets/train.jsonl",
+                "size": len(b'{"a":1}\n'),
+            }
+        ],
+    }
+    files = {
+        "david-freesolo-co/stuff/environment.py": b"# env\n",
+        "david-freesolo-co/stuff/datasets/train.jsonl": b'{"a":1}\n',
+    }
+    seen_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=None, max_bytes=None, out=None):
+        seen_urls.append(req.full_url)
+        path = urllib.parse.unquote(req.full_url.split("/contents/", 1)[1].split("?", 1)[0])
+        accept = req.headers.get("Accept")
+        if accept == "application/vnd.github+json":
+            return json.dumps(listings[path]).encode()
+        if accept == "application/vnd.github.raw":
+            payload = files[path]
+            if out is not None:
+                out.write(payload)
+                return b""
+            return payload
+        raise AssertionError(f"unexpected Accept header: {accept!r}")
+
+    monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
+
+    env_file = Path(adapter._resolve_environment_reference("david-freesolo-co/stuff"))
+
+    assert env_file.read_bytes() == b"# env\n"
+    assert (env_file.parent / "datasets" / "train.jsonl").read_bytes() == b'{"a":1}\n'
+    assert not (env_file.parents[2] / "other-org").exists()
+    assert all("other-org" not in url for url in seen_urls)
 
 
 def test_urlopen_streams_and_aborts_over_max_bytes(monkeypatch):

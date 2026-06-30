@@ -27,6 +27,7 @@ _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
+_MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
 _MAX_ARCHIVE_SCAN_MEMBERS = 200_000
@@ -291,7 +292,9 @@ def _urlopen(
                 raise GitHubRateLimitError(
                     f"GitHub server error ({exc.code}, transient) after {attempt} retries: {body[:300]}"
                 ) from exc
-            raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+            raise RuntimeError(
+                f"GitHub environment request failed ({exc.code}): {body[:500]}"
+            ) from exc
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             if attempt < max_rate_limit_retries:
                 delay = max(
@@ -334,6 +337,126 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
                 tar_path.unlink()
         raise
     return tar_path
+
+
+def _managed_hub_package_root(ref: GitHubEnvironmentRef) -> str:
+    if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
+        return ""
+    parts = [part for part in ref.path.split("/") if part]
+    if len(parts) < 2 or not _is_safe_github_path_parts(tuple(parts[:2])):
+        return ""
+    return "/".join(parts[:2])
+
+
+def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
+    quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/") if part)
+    return (
+        f"https://api.github.com/repos/{ref.repo_full_name}/contents/{quoted_path}"
+        f"?ref={urllib.parse.quote(ref.ref, safe='')}"
+    )
+
+
+def _github_headers(accept: str) -> dict[str, str]:
+    headers = {"Accept": accept, "User-Agent": "freesolo-flash"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _safe_contents_path(path: object, root_parts: list[str]) -> str:
+    if not isinstance(path, str):
+        raise RuntimeError("GitHub contents response did not include a path")
+    try:
+        normalized = _normalize_env_path(path)
+    except ValueError as exc:
+        raise RuntimeError(f"unsafe path in environment contents: {path!r}") from exc
+    parts = normalized.split("/")
+    if parts[: len(root_parts)] != root_parts:
+        raise RuntimeError(f"unexpected path in environment contents: {path!r}")
+    return normalized
+
+
+def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
+    """Download one GitHub directory into a repo-shaped tree under ``dest``."""
+    repo_root = dest / "repo"
+    root_parts = [part for part in repo_dir.split("/") if part]
+    state = {"members": 0, "bytes": 0}
+
+    def record_member(path: str) -> None:
+        state["members"] += 1
+        if state["members"] > _MAX_ARCHIVE_MEMBERS:
+            raise RuntimeError(f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})")
+        target = (repo_root / path).resolve()
+        root = repo_root.resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError(f"unsafe path in environment contents: {path!r}")
+
+    def download_file(path: str, declared_size: object) -> None:
+        record_member(path)
+        if (
+            isinstance(declared_size, int)
+            and declared_size >= 0
+            and state["bytes"] + declared_size > _MAX_ARCHIVE_BYTES
+        ):
+            raise RuntimeError(
+                "environment archive is too large uncompressed "
+                f"({state['bytes'] + declared_size} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+            )
+        remaining = _MAX_ARCHIVE_BYTES - state["bytes"]
+        target = repo_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as out:
+            _urlopen(
+                urllib.request.Request(
+                    _github_contents_url(ref, path),
+                    headers=_github_headers("application/vnd.github.raw"),
+                ),
+                timeout=120.0,
+                max_bytes=remaining,
+                out=out,
+            )
+        state["bytes"] += target.stat().st_size
+        if state["bytes"] > _MAX_ARCHIVE_BYTES:
+            raise RuntimeError(
+                "environment archive is too large uncompressed "
+                f"({state['bytes']} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+            )
+
+    def download_dir(path: str) -> None:
+        record_member(path)
+        (repo_root / path).mkdir(parents=True, exist_ok=True)
+        data = _urlopen(
+            urllib.request.Request(
+                _github_contents_url(ref, path),
+                headers=_github_headers("application/vnd.github+json"),
+            ),
+            timeout=120.0,
+            max_bytes=_MAX_CONTENTS_JSON_BYTES,
+        )
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "GitHub environment request failed for "
+                f"{ref.repo_full_name}@{ref.ref}:{path}: invalid response"
+            ) from exc
+        if not isinstance(payload, list):
+            raise RuntimeError(f"GitHub path {path!r} is not an environment directory")
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise RuntimeError("GitHub contents response included an invalid entry")
+            child_path = _safe_contents_path(entry.get("path"), root_parts)
+            kind = entry.get("type")
+            if kind == "dir":
+                download_dir(child_path)
+            elif kind == "file":
+                download_file(child_path, entry.get("size"))
+            else:
+                raise RuntimeError(f"unsupported entry in environment contents: {child_path!r}")
+
+    download_dir(repo_dir)
+    return repo_root
 
 
 class _LimitedReader:
@@ -457,9 +580,15 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        # Runtime loading keeps repo-level sidecars available to relative paths/imports.
-        # User-facing pulls filter to the requested env subtree in flash.envs.pull.
-        extracted = _extract_github_tarball(resolved, tmp_parent)
+        package_root = _managed_hub_package_root(parsed)
+        if package_root:
+            # The shared managed hub can be much larger than one environment. Download only the
+            # requested package so worker cache/extraction limits apply to that env, not the hub.
+            extracted = _download_github_directory(resolved, package_root, tmp_parent)
+        else:
+            # Generic GitHub refs keep repo-level sidecars available to relative paths/imports.
+            # User-facing pulls filter to the requested env subtree in flash.envs.pull.
+            extracted = _extract_github_tarball(resolved, tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
