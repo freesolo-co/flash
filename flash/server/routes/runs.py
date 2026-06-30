@@ -20,6 +20,41 @@ _LOG = logging.getLogger("flash.server.runs")
 router = APIRouter()
 
 
+def _precheck_budget_or_block(spec: JobSpec, org_id: str) -> None:
+    """Reject a run up front when its org can't afford the flash.cost estimate.
+
+    Runs at submit, BEFORE any GPU is allocated, so a run that can't be billed never trains to
+    completion only to fail the charge at the end. Blocks ONLY on a definitive 402 (insufficient
+    balance / no billing record). Fails open on everything else -- internal reporting disabled, a
+    cost-estimate error, or an unreachable/5xx billing service must not halt training over a
+    transient blip (the completion charge is the backstop). Verify-only: no money moves here.
+    """
+    from flash.server._internal_client import internal_key as _internal_key
+
+    key = _internal_key()
+    if not key:
+        # internal reporting is off -> no completion billing either, so there is nothing to gate.
+        return
+    try:
+        from flash.cost.spec import estimate_for_spec
+
+        estimate_usd = float(estimate_for_spec(spec).total_usd)
+    except Exception:
+        _LOG.warning("budget precheck skipped for %s: cost estimate failed", spec.run_id, exc_info=True)
+        return
+    try:
+        from flash.server.billing import precheck_training_run
+
+        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=estimate_usd)
+    except Exception as exc:
+        from flash.server.billing import BillingError
+
+        if isinstance(exc, BillingError) and exc.status_code == 402:
+            raise HTTPException(status_code=402, detail=exc.detail) from exc
+        # backend unreachable / 5xx / unexpected -> fail open, never block training on infra noise.
+        _LOG.warning("budget precheck skipped for %s (billing service error): %s", spec.run_id, exc)
+
+
 @router.post("/v1/runs")
 def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
     spec = _parse_spec(payload, run_id=new_run_id())
@@ -36,6 +71,8 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
                 detail="org id is required to bill a completed training run",
             )
         billing_context = {"org_id": org_id}
+        # gate BEFORE recording/submitting: reject an unaffordable run before any GPU is allocated.
+        _precheck_budget_or_block(spec, org_id)
     try:
         db.record_run(spec.run_id, key["id"])
         submit_kwargs = {"dry_run": dry_run, "background": True}

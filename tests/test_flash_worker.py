@@ -360,6 +360,7 @@ def test_train_body_imports_every_name_it_uses():
     # the always-on console uploader).
     for name in ("contextlib", "json", "os", "subprocess", "sys", "threading"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
+    assert "_CONSOLE_UPLOAD_INTERVAL_S" not in inspect.getsource(train._train_body)
 
 
 def test_train_body_has_no_prime_install_path():
@@ -400,9 +401,9 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
 
     # --- every prior optimization still present ---
     # example packing (all three backends: TRL bfd, SDPA 4D-mask, GDN varlen)
-    assert 'cfg_kwargs["packing"] = True' in src                  # TRL bfd (pure-attn FA2)
+    assert 'cfg_kwargs["packing"] = True' in src  # TRL bfd (pure-attn FA2)
     assert "BlockDiagonalCollator(pad_token_id=tok.pad_token_id)" in src  # SDPA 4D-mask
-    assert "emit_varlen=True" in src                              # GDN varlen
+    assert "emit_varlen=True" in src  # GDN varlen
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
     # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
@@ -450,9 +451,7 @@ def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
         )
 
     assert any(
-        isinstance(node, ast.If)
-        and "packing" in ast.dump(node.test)
-        and _stores_grad_accum(node)
+        isinstance(node, ast.If) and "packing" in ast.dump(node.test) and _stores_grad_accum(node)
         for node in ast.walk(tree)
     ), "bfd path must re-derive gradient_accumulation_steps under a packing guard"
 
@@ -469,7 +468,7 @@ def test_trl_collator_masks_prompt_from_pretokenized_rows():
     col = DataCollatorForLanguageModeling(pad_token_id=0, completion_only_loss=True)
     rows = [
         {"input_ids": [10, 11, 12, 13, 14], "completion_mask": [0, 0, 0, 1, 1]},  # 3-tok prompt
-        {"input_ids": [20, 21, 22], "completion_mask": [0, 1, 1]},                # 2-tok prompt
+        {"input_ids": [20, 21, 22], "completion_mask": [0, 1, 1]},  # 2-tok prompt
     ]
     out = col(rows)
     labels = out["labels"]
@@ -492,12 +491,20 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     import contextlib
     import os
     import subprocess
+    import types
 
     import huggingface_hub
 
     from flash.providers.runpod.train import endpoints
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(tmp_path))
+    code_prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    list_calls = []
+    download_calls = []
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda *a, **k: pytest.fail("code download should not use snapshot_download"),
+    )
 
     uploads = []
 
@@ -505,14 +512,40 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         def __init__(self, token=None):
             pass
 
+        def list_repo_tree(self, **kw):
+            list_calls.append(kw)
+            if len(list_calls) == 1:
+                raise _RateLimited("slow down")
+            return [
+                types.SimpleNamespace(path=f"{code_prefix}/__init__.py", size=0),
+                types.SimpleNamespace(path=f"{code_prefix}/engine/worker.py", size=10),
+                types.SimpleNamespace(path=f"{code_prefix}/engine", tree_id="folder"),
+            ]
+
         def upload_file(self, **kw):
             uploads.append(kw)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
+    class _Response:
+        status_code = 429
+
+        def __init__(self) -> None:
+            self.headers = {"Retry-After": "0"}
+
+    class _RateLimited(Exception):
+        response = _Response()
+
+    def fake_hf_hub_download(*, filename, local_dir, **kw):
+        download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
+        return os.path.join(local_dir, filename)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
+
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
+            assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
             self.stdout = iter(["worker booting\n", "torch.cuda.OutOfMemoryError: CUDA OOM\n"])
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
@@ -528,6 +561,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         "hf_repo": "owner/runs",
         "job_spec_json": job_spec,
         "env": {"HF_TOKEN": "tok", "PYTHONPATH": ""},
+        "code_prefix": code_prefix,
     }
 
     try:
@@ -535,12 +569,57 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
             endpoints._train_body(input_data)
 
         # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
-        console_uploads = [u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")]
-        assert console_uploads, f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
+        console_uploads = [
+            u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")
+        ]
+        assert console_uploads, (
+            f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
+        )
         assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
+        assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
+        assert [call["filename"] for call in download_calls] == [
+            f"{code_prefix}/__init__.py",
+            f"{code_prefix}/engine/worker.py",
+        ]
     finally:
         # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
         # doesn't leak state across tests (flaky under isolated/parallel runners).
         for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(_p)
+
+
+def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
+    import huggingface_hub
+
+    from flash.providers.runpod.train import endpoints
+
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda *a, **k: pytest.fail("snapshot_download should not run with an invalid code prefix"),
+    )
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(
+            {
+                "phase": "sft",
+                "seed": 0,
+                "hf_repo": "owner/runs",
+                "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
+                "env": {"HF_TOKEN": "tok"},
+                "code_prefix": "../code/flash",
+            }
+        )
+
+
+def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
+    import flash.engine.worker as worker
+    from flash.providers import _instance_bootstrap
+    from flash.providers.runpod.train import endpoints
+
+    assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
+    assert _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
+    steady_state_commits_per_hour = (
+        3600.0 / worker._HB_MIN_INTERVAL_S + 3600.0 / endpoints._CONSOLE_UPLOAD_INTERVAL_S
+    )
+    assert steady_state_commits_per_hour <= 5.0

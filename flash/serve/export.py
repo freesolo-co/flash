@@ -6,7 +6,9 @@ the destination model repo, so the user never needs access to internal artifact 
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -18,6 +20,55 @@ logger = get_logger(__name__)
 # Delete stale adapter artifacts on re-export so old weights can't linger beside new ones.
 # Scoped to PEFT filenames only — never touch the user's unrelated repo files.
 _STALE_ADAPTER_DELETE_PATTERNS = ["adapter_model*", "adapter_config.json"]
+_TEMP_MERGED_BASE_MODEL_RE = re.compile(
+    r"(?:/[^\s\"'`,\]\){}]+)*/flash_sft_merged_[^\s\"'`,\]\){}]+"
+)
+
+
+def _clean_base_model(base_model: str) -> str:
+    if not isinstance(base_model, str) or not base_model.strip():
+        raise RuntimeError("base_model is required to export adapter metadata")
+    return base_model.strip()
+
+
+def _rewrite_adapter_config_base_model(adapter_dir: Path, base_model: str) -> bool:
+    path = adapter_dir / "adapter_config.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+
+    changed = config.get("base_model_name_or_path") != base_model
+    config["base_model_name_or_path"] = base_model
+    if "base_model" in config and config.get("base_model") != base_model:
+        config["base_model"] = base_model
+        changed = True
+    if changed:
+        path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return changed
+
+
+def _rewrite_readme_temp_base_model(adapter_dir: Path, base_model: str) -> bool:
+    path = adapter_dir / "README.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    repaired = _TEMP_MERGED_BASE_MODEL_RE.sub(lambda _match: base_model, text)
+    if repaired == text:
+        return False
+    path.write_text(repaired, encoding="utf-8")
+    return True
+
+
+def _repair_export_metadata(adapter_dir: Path, base_model: str) -> None:
+    changed = 0
+    changed += int(_rewrite_adapter_config_base_model(adapter_dir, base_model))
+    changed += int(_rewrite_readme_temp_base_model(adapter_dir, base_model))
+    if changed:
+        logger.info("repaired exported adapter metadata base_model=%s", base_model)
 
 
 def _hf_api():
@@ -38,10 +89,12 @@ def export_adapter(
     source_subfolder: str,
     dest_repo: str,
     dest_token: str,
+    base_model: str,
     source_token: str | None = None,
     private: bool = True,
 ) -> str:
     """Copy adapter ``source_repo:{source_subfolder}`` into ``dest_repo`` and return its URL."""
+    base_model = _clean_base_model(base_model)
     HfApi, snapshot_download = _hf_api()
     read_token = source_token or os.environ.get("HF_TOKEN")
     if not read_token:
@@ -66,9 +119,7 @@ def export_adapter(
             ) from exc
         adapter_dir = Path(tmp) / source_subfolder
         files = (
-            sorted(p for p in adapter_dir.rglob("*") if p.is_file())
-            if adapter_dir.is_dir()
-            else []
+            sorted(p for p in adapter_dir.rglob("*") if p.is_file()) if adapter_dir.is_dir() else []
         )
         names = {p.name for p in files}
         has_weight = any(n.startswith("adapter_model") for n in names)
@@ -77,12 +128,11 @@ def export_adapter(
                 f"no loadable LoRA adapter at {source_repo}:{source_subfolder} "
                 "(need adapter_config.json + an adapter_model* weight; nothing to export)"
             )
+        _repair_export_metadata(adapter_dir, base_model)
         api = HfApi(token=dest_token)
         try:
             # Always create private first so the repo is never transiently exposed empty/partial.
-            api.create_repo(
-                repo_id=dest_repo, repo_type="model", private=True, exist_ok=True
-            )
+            api.create_repo(repo_id=dest_repo, repo_type="model", private=True, exist_ok=True)
             if private:
                 api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=True)
             # parent_commit guards against concurrent exports leaving mixed weights in the same dest repo.

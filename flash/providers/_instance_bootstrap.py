@@ -13,10 +13,15 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
-CODE_DIR = "/runcode/code"
+_CONSOLE_UPLOAD_INTERVAL_S = 3600.0
+_HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+_HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
+_HF_RETRY_AFTER_MAX_S = 60.0
 
 
 class RetriableBootstrapError(RuntimeError):
@@ -30,6 +35,80 @@ def load_payload() -> dict:
 
 def _arm(payload: dict) -> str:
     return str(payload.get("flash_arm") or "instance")
+
+
+def _code_prefix(payload: dict) -> str:
+    raw = payload.get("code_prefix")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("missing code_prefix")
+    prefix = raw.strip().strip("/")
+    parts = prefix.split("/")
+    digest = parts[1] if len(parts) == 3 else ""
+    if (
+        len(parts) != 3
+        or parts[0] != "code"
+        or parts[2] != "flash"
+        or len(digest) != 32
+        or any(c not in "0123456789abcdef" for c in digest)
+    ):
+        raise ValueError(f"invalid code_prefix: {prefix!r}")
+    return prefix
+
+
+def _code_dir(payload: dict) -> str:
+    return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)) or ".")
+
+
+def _hf_status_code(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hf_retry_after(exc: BaseException) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    value = headers.get("retry-after") if hasattr(headers, "get") else None
+    if not value and hasattr(headers, "items"):
+        for key, candidate in headers.items():
+            if str(key).lower() == "retry-after":
+                value = candidate
+                break
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            seconds = (retry_at - datetime.now(UTC)).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return min(_HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
+
+
+def _hf_call(call, label: str):
+    for attempt in range(len(_HF_RETRY_DELAYS_S) + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if _hf_status_code(exc) not in _HF_TRANSIENT_STATUS_CODES or attempt >= len(
+                _HF_RETRY_DELAYS_S
+            ):
+                raise
+            retry_after = _hf_retry_after(exc)
+            delay = retry_after if retry_after is not None else _HF_RETRY_DELAYS_S[attempt]
+            print(
+                f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {exc}",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def hf_upload(payload: dict, local_path: str, repo_subpath: str) -> None:
@@ -114,27 +193,53 @@ def build_worker_env(payload: dict) -> dict:
     env["ATTEMPT"] = str(int(payload.get("attempt") or 0))
     # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
-    env["PYTHONPATH"] = CODE_DIR + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    code_dir = _code_dir(payload)
+    env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
 
 
 def fetch_code(payload: dict) -> None:
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfApi, hf_hub_download
 
-    snapshot_download(
-        repo_id=payload["hf_repo"],
-        repo_type="dataset",
-        allow_patterns=["code/**"],
-        local_dir=CODE_ROOT,
-        token=(payload.get("env") or {}).get("HF_TOKEN"),
-    )
+    prefix = _code_prefix(payload)
+    token = (payload.get("env") or {}).get("HF_TOKEN")
+    api = HfApi(token=token)
+    files = [
+        entry.path
+        for entry in _hf_call(
+            lambda: list(
+                api.list_repo_tree(
+                    repo_id=payload["hf_repo"],
+                    repo_type="dataset",
+                    path_in_repo=prefix,
+                    recursive=True,
+                    token=token,
+                )
+            ),
+            f"list flash code under {payload['hf_repo']}:{prefix}",
+        )
+        if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
+    ]
+    if not files:
+        raise RuntimeError(f"no flash code files found under {payload['hf_repo']}:{prefix}")
+    for filename in files:
+        _hf_call(
+            lambda filename=filename: hf_hub_download(
+                repo_id=payload["hf_repo"],
+                repo_type="dataset",
+                filename=filename,
+                local_dir=CODE_ROOT,
+                token=token,
+            ),
+            f"download flash code file {payload['hf_repo']}:{filename}",
+        )
 
 
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
     timed_out = False
-    upload_interval = 30.0
+    upload_interval = _CONSOLE_UPLOAD_INTERVAL_S
 
     def upload_console_tail(extra: str = "") -> None:
         tail_path = console + ".tail"
@@ -159,9 +264,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                 print(f"console upload warn: {exc}", flush=True)
 
     with open(console, "w", buffering=1) as cf:
+        code_dir = _code_dir(payload)
         proc = subprocess.Popen(
             [sys.executable, "-m", "flash.engine.worker"],
-            cwd=CODE_DIR,
+            cwd=code_dir,
             env={**env, "RUN_MODE": mode},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

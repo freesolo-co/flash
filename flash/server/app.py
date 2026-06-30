@@ -40,17 +40,12 @@ from ._runtime import (
     _charge_retry_loop,
     _charge_retry_startup,
     _reconcile_cost_loop,
-    _repo_cleanup_loop,
     _worker_artifacts,
     recover_runs,
 )
 
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
-# A specific intermediate checkpoint can also be deployed from a run that stopped mid-RL
-# (cancelled/failed): the per-step adapter was already streamed to HF, so it serves even though
-# the run never sealed a final adapter. `dry_run` is excluded — it never trained.
-_CHECKPOINT_DEPLOYABLE_STATES = _DEPLOYABLE_STATES | {"cancelled", "failed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 _log = logging.getLogger("flash.server")
@@ -65,7 +60,6 @@ __all__ = [
     "_charge_retry_startup",
     "_deploy_lock",
     "_reconcile_cost_loop",
-    "_repo_cleanup_loop",
     "_worker_artifacts",
     "create_app",
     "deploy_adapter",
@@ -305,7 +299,6 @@ def create_app():
         from flash.providers.preflight import check_run_preflight
         from flash.server.billing_retry import charge_retry_enabled
         from flash.server.reconcile import reconcile_enabled
-        from flash.server.repo_cleanup import repo_cleanup_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
@@ -349,17 +342,10 @@ def create_app():
             if _instance_providers_configured()
             else None
         )
-        # Periodic repo GC: delete per-run HF artifact repos that aren't currently deployed once
-        # they pass the fixed 30-day age, reclaiming the operator org's private-storage quota. Runs
-        # wherever an operator HF_TOKEN is configured; each sweep fails closed (deletes nothing) if
-        # the serving live set can't be confirmed.
-        repo_gc_task = (
-            asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
-        )
         try:
             yield
         finally:
-            for task in (startup_charge_task, cost_task, charge_task, reap_task, sweep_task, repo_gc_task):
+            for task in (startup_charge_task, cost_task, charge_task, reap_task, sweep_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
