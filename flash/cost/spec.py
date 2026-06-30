@@ -160,24 +160,34 @@ def count_sft_train_tokens(spec) -> int | None:
     try:
         from transformers import AutoTokenizer
 
-        from flash.engine.worker.multimodal import has_image_input, message_text
+        from flash.engine.worker.multimodal import (
+            has_image_input,
+            image_input_count,
+            message_text,
+            multimodal_token_estimate,
+        )
         from flash.engine.worker.sft import _pretokenize_completion_only
 
         tok = AutoTokenizer.from_pretrained(spec.model, trust_remote_code=True)
         if getattr(tok, "pad_token", None) is None:
             tok.pad_token = tok.eos_token
         texts: list[dict[str, str]] = []
+        multimodal_tokens: list[int] = []
+        special_ids = set(getattr(tok, "all_special_ids", None) or [])
         for idx in row_indexes:
             ex = rows[idx]
             prompt_messages = list(env.prompt_messages(ex) or [])
             completion = list(env.sft_completion(ex) or [])
             msgs = [*prompt_messages, *completion]
             if has_image_input(prompt_messages, ex) or has_image_input(completion, None):
-                texts.append(
-                    {
-                        "text": message_text(msgs),
-                        "prompt_text": message_text(prompt_messages),
-                    }
+                completion_ids = tok(message_text(completion), add_special_tokens=False)["input_ids"]
+                if not any(tid not in special_ids for tid in completion_ids):
+                    continue
+                image_count = image_input_count(prompt_messages, ex) + image_input_count(
+                    completion, None
+                )
+                multimodal_tokens.append(
+                    multimodal_token_estimate(message_text(msgs), tok, image_count)
                 )
                 continue
             texts.append(
@@ -196,15 +206,18 @@ def count_sft_train_tokens(spec) -> int | None:
                     ),
                 }
             )
-        _, token_rows, _ = _pretokenize_completion_only(texts, tok, _sft_seq_len(spec))
-        tokens = sum(len(row["input_ids"]) for row in token_rows)
+        if texts:
+            _, token_rows, _ = _pretokenize_completion_only(texts, tok, _sft_seq_len(spec))
+        else:
+            token_rows = []
+        tokens = sum(len(row["input_ids"]) for row in token_rows) + sum(multimodal_tokens)
     except Exception:
         return None
-    if not token_rows:
+    trainable_examples = len(token_rows) + len(multimodal_tokens)
+    if not trainable_examples:
         return None
 
     total = max(1, tokens * _sft_epochs(spec))
-    trainable_examples = len(token_rows)
     uncapped_steps = _sft_steps_from_examples(spec, trainable_examples, apply_cap=False)
     capped_steps = _sft_steps_from_examples(spec, trainable_examples, apply_cap=True)
     if capped_steps < uncapped_steps:

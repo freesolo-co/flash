@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import base64
 import inspect
+from typing import ClassVar
+
+import pytest
 
 from flash.catalog import MODELS, supports_multimodal
 from flash.engine.worker import grpo, rl, sft
 from flash.engine.worker.multimodal import (
+    _load_image,
+    _read_limited_response,
     has_image_input,
+    image_input_count,
     message_text,
     model_supports_images,
     multimodal_grpo_prompt_row,
     multimodal_sft_row,
+    multimodal_token_estimate,
 )
+from flash.envs.adapter import FreesoloEnvironment
 
 _RED_DOT = (
     "data:image/png;base64,"
@@ -72,6 +81,64 @@ def test_explicit_image_block_uses_top_level_image_data():
     assert has_image_input(messages, {}) is True
 
 
+def test_freesolo_canonical_record_preserves_image_fields():
+    record = FreesoloEnvironment._canonical_record(
+        {
+            "id": "one",
+            "input": "What color?",
+            "output": "red",
+            "image": _RED_DOT,
+            "images": [_RED_DOT],
+            "metadata": {"split": "train"},
+            "custom": {"kept": True},
+        }
+    )
+    assert record["image"] == _RED_DOT
+    assert record["images"] == [_RED_DOT]
+    assert record["custom"] == {"kept": True}
+
+
+def test_local_image_loading_is_confined_to_base_dirs(tmp_path):
+    pytest.importorskip("PIL")
+    allowed_dir = tmp_path / "images"
+    allowed_dir.mkdir()
+    allowed = allowed_dir / "red.png"
+    outside = tmp_path / "secret.png"
+    payload = base64.b64decode(_RED_DOT.split(",", 1)[1])
+    allowed.write_bytes(payload)
+    outside.write_bytes(payload)
+
+    image = _load_image("red.png", base_dirs=(allowed_dir,))
+    assert image.size == (1, 1)
+    with pytest.raises(FileNotFoundError, match="outside FLASH_IMAGE_BASE_DIR"):
+        _load_image("../secret.png", base_dirs=(allowed_dir,))
+    with pytest.raises(FileNotFoundError, match="outside FLASH_IMAGE_BASE_DIR"):
+        _load_image(str(outside), base_dirs=(allowed_dir,))
+
+
+def test_remote_image_reader_enforces_byte_cap(monkeypatch):
+    class Response:
+        headers: ClassVar[dict[str, str]] = {"Content-Length": "4"}
+
+        def read(self, _n):
+            return b""
+
+    monkeypatch.setenv("FLASH_IMAGE_MAX_BYTES", "3")
+    with pytest.raises(ValueError, match="FLASH_IMAGE_MAX_BYTES=3"):
+        _read_limited_response(Response())
+
+
+def test_multimodal_token_estimate_reserves_image_tokens(monkeypatch):
+    class Tokenizer:
+        def __call__(self, _text, *, add_special_tokens=False):
+            assert add_special_tokens is False
+            return {"input_ids": [1, 2, 3]}
+
+    monkeypatch.setenv("FLASH_IMAGE_TOKEN_RESERVE", "7")
+    assert multimodal_token_estimate("hello", Tokenizer(), image_count=2) == 17
+    assert image_input_count(_prompt(), _example()) == 1
+
+
 def test_every_catalog_multimodal_model_accepts_image_rows():
     image_models = [model_id for model_id, info in MODELS.items() if supports_multimodal(info)]
     assert image_models
@@ -90,6 +157,8 @@ def test_sft_multimodal_path_is_wired_to_trl_vlm_support():
     assert "processing_class=processor or tok" in src
     assert "make_lora(model_id, multimodal=_multimodal)" in src
     assert "token packing disabled" in src
+    assert "dropped_empty_targets" in src
+    assert "multimodal_token_estimate" in src
 
 
 def test_grpo_multimodal_path_is_wired_to_trl_vlm_support():
@@ -99,6 +168,7 @@ def test_grpo_multimodal_path_is_wired_to_trl_vlm_support():
     assert "processing_class=processor or tok" in src
     assert "_init_adapter_model(model_id, multimodal=_multimodal)" in src
     assert "if not _multimodal:\n            patch_vllm_language_model_only(model_id)" in src
+    assert "multimodal_token_estimate" in src
 
 
 def test_grpo_prompt_dataset_preserves_image_columns_without_rich_examples():

@@ -1061,7 +1061,6 @@ server = [
     { name = "freesolo" },
     { name = "httpx" },
     { name = "huggingface-hub" },
-    { name = "pillow" },
     { name = "runpod-flash" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -1072,6 +1071,7 @@ dev = [
     { name = "datasets" },
     { name = "freesolo" },
     { name = "mypy" },
+    { name = "pillow" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -1097,7 +1097,6 @@ requires-dist = [
     { name = "peft", marker = "extra == 'gpu'", specifier = ">=0.19" },
     { name = "pillow", marker = "extra == 'dev'", specifier = ">=10" },
     { name = "pillow", marker = "extra == 'gpu'", specifier = ">=10" },
-    { name = "pillow", marker = "extra == 'server'", specifier = ">=10" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "runpod-flash", marker = "extra == 'dev'" },
@@ -1118,6 +1117,7 @@ dev = [
     { name = "datasets", specifier = ">=2.19" },
     { name = "freesolo", specifier = ">=0.2.52" },
     { name = "mypy", specifier = ">=1.13.0" },
+    { name = "pillow", specifier = ">=10" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.6" },
 ]

@@ -67,7 +67,6 @@ server = [
     "datasets>=2.19",
     "freesolo>=0.2.52",
     "transformers>=5.6,<5.11",
-    "pillow>=10",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
@@ -137,6 +136,7 @@ dev = [
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
     "freesolo>=0.2.52",
+    "pillow>=10",
 ]
 
 [tool.mypy]

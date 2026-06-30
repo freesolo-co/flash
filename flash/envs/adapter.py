@@ -845,9 +845,9 @@ class FreesoloEnvironment(BaseEnvironment):
     @staticmethod
     def _canonical_record(record: dict) -> dict:
         raw = dict(record)
-        canonical = {}
         if _CANONICAL_INPUT_KEY not in raw:
             raise ValueError("Freesolo dataset records must contain an input field")
+        canonical = dict(raw)
         canonical[_CANONICAL_INPUT_KEY] = raw[_CANONICAL_INPUT_KEY]
         if _CANONICAL_OUTPUT_KEY in raw:
             canonical[_CANONICAL_OUTPUT_KEY] = raw[_CANONICAL_OUTPUT_KEY]

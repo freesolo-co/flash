@@ -8,7 +8,6 @@ from pathlib import Path
 from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
-
 DEFAULT_DATASET_PATH = Path(__file__).parent / "datasets" / "train.jsonl"
 
 

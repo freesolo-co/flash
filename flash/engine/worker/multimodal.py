@@ -21,6 +21,9 @@ from flash.catalog import supports_multimodal
 
 _IMAGE_BLOCK_TYPES = {"image", "input_image", "image_url"}
 _TEXT_BLOCK_TYPES = {"text", "input_text"}
+_DEFAULT_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+_DEFAULT_IMAGE_MAX_PIXELS = 64_000_000
+_DEFAULT_IMAGE_TOKEN_RESERVE = 1024
 
 
 def model_supports_images(model_id: str) -> bool:
@@ -62,6 +65,98 @@ def _base_dirs_from_env() -> tuple[Path, ...]:
     return tuple(dirs)
 
 
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _image_max_bytes() -> int:
+    return _env_int("FLASH_IMAGE_MAX_BYTES", _DEFAULT_IMAGE_MAX_BYTES, minimum=1)
+
+
+def image_token_reserve() -> int:
+    return _env_int("FLASH_IMAGE_TOKEN_RESERVE", _DEFAULT_IMAGE_TOKEN_RESERVE, minimum=0)
+
+
+def multimodal_token_estimate(text: str, tokenizer, image_count: int) -> int:
+    """Conservative context estimate for VLM prompts.
+
+    Model processors differ in whether image patch tokens are visible through ``input_ids`` before
+    collation/rollout. Reserve a fixed budget per image so prompt filtering and cost estimates do
+    not count image rows as text-only.
+    """
+    tokenized = tokenizer(text, add_special_tokens=False)
+    input_ids = getattr(tokenized, "input_ids", None)
+    if input_ids is None and isinstance(tokenized, dict):
+        input_ids = tokenized.get("input_ids")
+    text_tokens = len(input_ids or [])
+    return text_tokens + max(0, int(image_count)) * image_token_reserve()
+
+
+def _configure_image_limits(Image) -> None:
+    Image.MAX_IMAGE_PIXELS = _env_int(
+        "FLASH_IMAGE_MAX_PIXELS", _DEFAULT_IMAGE_MAX_PIXELS, minimum=1
+    )
+
+
+def _check_image_size(size: int | None, *, label: str) -> None:
+    if size is not None and size > _image_max_bytes():
+        raise ValueError(f"{label} exceeds FLASH_IMAGE_MAX_BYTES={_image_max_bytes()}")
+
+
+def _read_limited_response(resp) -> bytes:
+    content_length = resp.headers.get("Content-Length") if hasattr(resp, "headers") else None
+    if content_length:
+        try:
+            declared = int(content_length)
+        except (TypeError, ValueError):
+            pass
+        else:
+            _check_image_size(declared, label="remote image")
+    limit = _image_max_bytes()
+    data = bytearray()
+    while True:
+        chunk = resp.read(min(1024 * 1024, limit + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > limit:
+            raise ValueError(f"remote image exceeds FLASH_IMAGE_MAX_BYTES={limit}")
+    return bytes(data)
+
+
+def _allowed_base_dirs(base_dirs: tuple[Path, ...] | None = None) -> tuple[Path, ...]:
+    return tuple(
+        Path(base).expanduser().resolve(strict=False) for base in (base_dirs or _base_dirs_from_env())
+    )
+
+
+def _is_under_base(path: Path, bases: tuple[Path, ...]) -> bool:
+    try:
+        return any(path == base or path.is_relative_to(base) for base in bases)
+    except AttributeError:  # pragma: no cover - Python 3.11+ in CI/worker
+        return any(path == base or base in path.parents for base in bases)
+
+
+def _local_image_paths(value: str, *, base_dirs: tuple[Path, ...] | None = None) -> list[Path]:
+    parsed = urllib.parse.urlparse(value)
+    candidate = Path(urllib.request.url2pathname(parsed.path)) if parsed.scheme == "file" else Path(value)
+    bases = _allowed_base_dirs(base_dirs)
+    paths = [candidate] if candidate.is_absolute() else [base / candidate for base in bases]
+    out: list[Path] = []
+    for path in paths:
+        resolved = path.expanduser().resolve(strict=False)
+        if not _is_under_base(resolved, bases):
+            continue
+        out.append(resolved)
+    return out
+
+
 def _load_image(value: Any, *, base_dirs: tuple[Path, ...] | None = None):
     """Load a PIL image from a path, URL, data URI, raw bytes, or pass through a PIL image."""
     try:
@@ -71,10 +166,12 @@ def _load_image(value: Any, *, base_dirs: tuple[Path, ...] | None = None):
             "image-bearing training rows require Pillow; install pillow in the worker image "
             "or add it to the environment pip requirements"
         ) from exc
+    _configure_image_limits(Image)
 
     if isinstance(value, Image.Image):
         return value.convert("RGB")
     if isinstance(value, (bytes, bytearray)):
+        _check_image_size(len(value), label="image bytes")
         return Image.open(io.BytesIO(bytes(value))).convert("RGB")
     if hasattr(value, "read"):
         return Image.open(value).convert("RGB")
@@ -88,22 +185,28 @@ def _load_image(value: Any, *, base_dirs: tuple[Path, ...] | None = None):
         _head, _sep, payload = text.partition(",")
         if not _sep:
             raise ValueError("invalid data URI image reference")
-        return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
+        data = base64.b64decode(payload)
+        _check_image_size(len(data), label="data URI image")
+        return Image.open(io.BytesIO(data)).convert("RGB")
 
     parsed = urllib.parse.urlparse(text)
     if parsed.scheme in {"http", "https"}:
         with urllib.request.urlopen(text, timeout=60.0) as resp:
-            return Image.open(io.BytesIO(resp.read())).convert("RGB")
+            return Image.open(io.BytesIO(_read_limited_response(resp))).convert("RGB")
     if parsed.scheme and parsed.scheme != "file":
         raise ValueError(f"unsupported image URL scheme {parsed.scheme!r}")
 
-    candidate = Path(urllib.request.url2pathname(parsed.path)) if parsed.scheme == "file" else Path(text)
-    paths = [candidate] if candidate.is_absolute() else [d / candidate for d in (base_dirs or _base_dirs_from_env())]
+    paths = _local_image_paths(text, base_dirs=base_dirs)
     for path in paths:
         if path.is_file():
+            _check_image_size(path.stat().st_size, label=f"image file {path}")
             return Image.open(path).convert("RGB")
     searched = ", ".join(str(p) for p in paths)
-    raise FileNotFoundError(f"image file not found: {text!r} (searched {searched})")
+    allowed = ", ".join(str(p) for p in _allowed_base_dirs(base_dirs))
+    raise FileNotFoundError(
+        f"image file not found or outside FLASH_IMAGE_BASE_DIR: {text!r} "
+        f"(searched {searched or '<none>'}; allowed roots {allowed})"
+    )
 
 
 def _load_images(values: Iterable[Any], *, base_dirs: tuple[Path, ...] | None = None) -> list:
@@ -111,15 +214,19 @@ def _load_images(values: Iterable[Any], *, base_dirs: tuple[Path, ...] | None = 
 
 
 def has_image_input(messages: list[dict] | None = None, example: dict | None = None) -> bool:
-    if _image_values_from_example(example):
-        return True
+    return bool(image_input_count(messages, example))
+
+
+def image_input_count(messages: list[dict] | None = None, example: dict | None = None) -> int:
+    top_level = len(_image_values_from_example(example))
+    block_count = 0
     for message in messages or []:
         content = message.get("content")
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and str(block.get("type") or "").lower() in _IMAGE_BLOCK_TYPES:
-                    return True
-    return False
+                    block_count += 1
+    return block_count or top_level
 
 
 def _normalize_content(content: Any, *, block_payloads: list[Any], empty_image_blocks: list[int]) -> Any:

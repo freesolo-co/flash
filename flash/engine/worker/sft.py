@@ -105,9 +105,11 @@ def run_sft():
 
     from flash.engine.worker.multimodal import (
         has_image_input,
+        image_input_count,
         message_text,
         model_supports_images,
         multimodal_sft_row,
+        multimodal_token_estimate,
     )
 
     env = _w.require_active_env()
@@ -174,14 +176,30 @@ def run_sft():
             "image/image_url content from the environment."
         )
     if _multimodal:
-        multimodal_rows = [
-            multimodal_sft_row(prompt_messages, completion, ex)
-            for prompt_messages, completion, ex in sft_message_rows
-        ]
         processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         tok = getattr(processor, "tokenizer", tok)
         if getattr(tok, "pad_token", None) is None:
             tok.pad_token = tok.eos_token
+        special_ids = set(getattr(tok, "all_special_ids", None) or [])
+        kept_message_rows = []
+        dropped_empty_targets = 0
+        for prompt_messages, completion, ex in sft_message_rows:
+            target_ids = tok(message_text(completion), add_special_tokens=False)["input_ids"]
+            if any(tid not in special_ids for tid in target_ids):
+                kept_message_rows.append((prompt_messages, completion, ex))
+            else:
+                dropped_empty_targets += 1
+        if dropped_empty_targets:
+            print(
+                f"[sft] dropped {dropped_empty_targets} multimodal row(s) with no real "
+                "completion target"
+            )
+        if not kept_message_rows:
+            raise ValueError(
+                "every multimodal SFT example has an empty/content-free completion (nothing to "
+                "train on); provide assistant target text in sft_completion/output"
+            )
+        sft_message_rows = kept_message_rows
         print(f"[sft] multimodal SFT: {image_rows}/{len(train)} row(s) include image inputs")
     if multiturn_targets:
         print(f"[sft] multi-turn SFT: {multiturn_targets}/{len(train)} rows train on a full target transcript")
@@ -214,18 +232,27 @@ def run_sft():
     )
     if _multimodal:
         with liveness_heartbeat("sft_pretokenizing"):
+            multimodal_rows = [
+                multimodal_sft_row(prompt_messages, completion, ex)
+                for prompt_messages, completion, ex in sft_message_rows
+            ]
             ds = Dataset.from_list(multimodal_rows)
-        _prompt_text = [message_text(r["prompt"]) for r in multimodal_rows]
-        _completion_text = [message_text(r["completion"]) for r in multimodal_rows]
-        _prompt_tok = tok(_prompt_text, add_special_tokens=False)["input_ids"]
-        _completion_tok = tok(_completion_text, add_special_tokens=False)["input_ids"]
-        _masked_tok = sum(len(ids) for ids in _prompt_tok)
-        _total_tok = _masked_tok + sum(len(ids) for ids in _completion_tok)
+        _masked_tok = sum(
+            multimodal_token_estimate(message_text(r["prompt"]), tok, image_input_count(r["prompt"]))
+            for r in multimodal_rows
+        )
+        _completion_tok = sum(
+            multimodal_token_estimate(
+                message_text(r["completion"]), tok, image_input_count(r["completion"])
+            )
+            for r in multimodal_rows
+        )
+        _total_tok = _masked_tok + _completion_tok
         _pretok = []
         if _total_tok:
             print(
                 f"[sft] multimodal completion-only loss: masking ~{_masked_tok}/{_total_tok} "
-                f"({_masked_tok / _total_tok:.0%}) text tokens; image tokens are processor-managed"
+                f"({_masked_tok / _total_tok:.0%}) estimated text+image tokens"
             )
     else:
         with liveness_heartbeat("sft_pretokenizing"):

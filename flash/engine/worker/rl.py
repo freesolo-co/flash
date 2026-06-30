@@ -44,8 +44,10 @@ def run_rl():
 
     from flash.engine.worker.multimodal import (
         has_image_input,
+        image_input_count,
         model_supports_images,
         multimodal_grpo_prompt_row,
+        multimodal_token_estimate,
     )
 
     env = _w.require_active_env()
@@ -185,8 +187,21 @@ def run_rl():
                 f"(fix the model/template or the env's prompts): {exc}"
             ) from exc
 
+    def _prompt_image_count(p) -> int:
+        images = p.get("images")
+        if images is not None:
+            try:
+                return len(images)
+            except TypeError:
+                return 1
+        prompt = p.get("prompt")
+        return image_input_count(prompt if isinstance(prompt, list) else None)
+
     def _prompt_tokens(p) -> int:
-        return len(tok(_render_for_budget(p), add_special_tokens=False).input_ids)
+        rendered = _render_for_budget(p)
+        if _multimodal:
+            return multimodal_token_estimate(rendered, tok, _prompt_image_count(p))
+        return len(tok(rendered, add_special_tokens=False).input_ids)
 
     kept = [p for p in prompts if 0 < _prompt_tokens(p) <= prompt_budget]
     if len(kept) < len(prompts):
