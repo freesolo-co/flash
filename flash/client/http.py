@@ -247,7 +247,7 @@ class ApiClient:
         return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=10 * 60)
 
     def checkpoints(self, run_id: str) -> list[dict]:
-        """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""
+        """Deployable per-step RL checkpoints for a run (serve one with `flash deploy RUN/step-N`)."""
         return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
 
     def deploy(

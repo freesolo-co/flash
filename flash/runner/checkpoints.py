@@ -4,7 +4,7 @@ The GPU worker publishes each trainer save's LoRA adapter to a stable, NON-prune
 (``<adapter_prefix>/checkpoints/step-<N>/adapter``; see
 ``flash.engine.worker.publish_deployable_checkpoint``). This module is the control-plane
 reader: it enumerates those snapshots so ``flash checkpoints`` can list them and
-``flash deploy --step N`` can serve a specific one — including for a run that was cancelled or
+``flash deploy <run-id>/step-N`` can serve a specific one — including for a run that was cancelled or
 failed mid-RL and so never sealed a final adapter. HF (not the backend DB) is the source of
 truth for what's deployable; backend persistence is a mirror (see
 ``flash.server.checkpoints``)."""
@@ -39,7 +39,7 @@ def list_checkpoints(spec: JobSpec) -> list[dict]:
     """Deployable per-step adapter snapshots for ``spec``, ascending by step.
 
     A step is included only if its adapter folder carries BOTH ``adapter_config.json`` AND a
-    weights file (so ``/deploy --step`` can never target a half-uploaded, unloadable step). Each
+    weights file (so checkpoint deploy can never target a half-uploaded, unloadable step). Each
     entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
     ``adapter_prefix`` is the value to hand ``deploy_adapter`` to serve that exact step and
     ``subfolder`` is the full path of the adapter folder in the repo. Returns ``[]`` when the

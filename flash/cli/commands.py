@@ -548,7 +548,7 @@ def cmd_checkpoints(args) -> int:
         # the canonical short form, paste-able into train.init_from_adapter.
         print(f"step {c['step']} {format_checkpoint_ref(args.run_id, c['step'])}")
     print(
-        f"\ndeploy one with `flash deploy {args.run_id} --step <STEP>`.",
+        f"\ndeploy one with `flash deploy {args.run_id}/step-<STEP>`.",
         file=sys.stderr,
     )
     return 0

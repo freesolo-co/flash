@@ -462,7 +462,7 @@ def checkpoints_table(run_id: str, rows: list[dict]) -> str:
         for c in sorted(rows, key=lambda c: c.get("step", 0))
     ]
     table = _table(["STEP", "CHECKPOINT"], body, aligns=["r", "l"])
-    foot = arrow(f"deploy one with: flash deploy {run_id} --step <STEP>")
+    foot = arrow(f"deploy one with: flash deploy {run_id}/step-<STEP>")
     return _safe(f"{header('checkpoints', f'{len(rows)} deployable')}\n{table}\n\n{foot}")
 
 

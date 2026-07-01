@@ -879,7 +879,7 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
 def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkeypatch):
     """A run whose finalize never published the run-level <prefix>/adapter (but which streamed
     per-step deployable checkpoints) must not fail run-level deploy with an opaque 502 rank
-    error: it returns a 409 telling the caller to `flash deploy <run> --step N`."""
+    error: it returns a 409 telling the caller to `flash deploy <run>/step-N`."""
     import flash.runner as runner
     import flash.server.app as app_mod
     from flash.serve.deploy import AdapterConfigMissing
@@ -906,7 +906,7 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
     assert "no run-level adapter" in detail
-    assert f"flash deploy {run_id} --step 40" in detail
+    assert f"flash deploy {run_id}/step-40" in detail
     assert "10, 40" in detail
 
 
