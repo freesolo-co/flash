@@ -41,10 +41,11 @@ def cancel_run(run_id: str) -> RunStatus:
     spec = JobSpec.from_dict(status.spec)
     # A run cancelled MID-training is re-priced to how far it got: the same flash.cost estimate, but
     # at the steps it actually ran instead of the planned steps. A `deployed` run already COMPLETED
-    # training (its cost_usd is the full quote), so it keeps that and isn't re-priced here.
-    cancel_charge_usd: float | None = None
-    if status.billing_context and not entered_deployed:
-        cancel_charge_usd = charge_usd_for_spec(spec, steps=actual_steps_run(status), fallback=0.0)
+    # training (its cost_usd is the full quote), so it keeps that and isn't re-priced here. The price
+    # is snapshotted AFTER the remote worker is torn down (below), from the freshest persisted
+    # heartbeat, so a step the worker finished between this cancel request and teardown isn't
+    # undercounted.
+    bill_cancel = bool(status.billing_context) and not entered_deployed
     remote = status.remote or {}
     if status.state == "deployed":
         try:
@@ -67,6 +68,12 @@ def cancel_run(run_id: str) -> RunStatus:
         except Exception:
             pass
     _gc_run_endpoints(spec)
+    # Price the cancel now that the worker is torn down, from the freshest persisted heartbeat.
+    cancel_charge_usd: float | None = (
+        charge_usd_for_spec(spec, steps=actual_steps_run(get_status(run_id)), fallback=0.0)
+        if bill_cancel
+        else None
+    )
     from flash.server._locks import _deploy_lock
 
     with _deploy_lock(run_id):

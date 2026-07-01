@@ -42,6 +42,26 @@ def test_charge_usd_for_spec_scales_with_actual_steps():
     assert runner.charge_usd_for_spec(spec, steps=0) == 0.0
 
 
+def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
+    # SFT is priced from train_tokens, not steps, so a cancel must scale the token count to the
+    # fraction of steps that ran -- lowering steps alone would leave the full-run token estimate.
+    from dataclasses import replace
+
+    from flash.cost import spec as cost_spec
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=20, train_tokens=4_000_000)
+    monkeypatch.setattr(cost_spec, "runconfig_from_spec", lambda spec: cfg)
+
+    full = float(estimate_cost(cfg).total_usd)  # the 20-step / full-token quote
+    naive = float(estimate_cost(replace(cfg, steps=10)).total_usd)  # steps lowered, tokens NOT scaled
+    half = runner.charge_usd_for_spec(object(), steps=10)  # cancelled at 10 of 20 steps
+    assert 0 < half < full
+    # the token scaling is what prorates SFT: a steps-only replace (naive) barely moves the price.
+    assert half < naive
+
+
 def test_charge_usd_for_spec_falls_back_when_unpriceable():
     # a spec that can't be priced returns the fallback rather than raising (a charge is never blocked)
     assert runner.charge_usd_for_spec(object(), fallback=1.5) == 1.5
@@ -56,10 +76,14 @@ def test_actual_steps_run_reads_last_heartbeat_step():
         return runner.RunStatus(run_id="r", state="cancelled", spec={}, last_heartbeat=hb)
 
     assert runner.actual_steps_run(st({"stage": "rl_step", "step": 7})) == 7
-    # no heartbeat / no step / non-positive -> 0 (cancelled during setup)
+    # no heartbeat / setup stage -> 0 (cancelled during cold-start, no GPU training yet)
     assert runner.actual_steps_run(st(None)) == 0
     assert runner.actual_steps_run(st({"stage": "setup"})) == 0
-    assert runner.actual_steps_run(st({"stage": "rl_step", "step": 0})) == 0
+    # training started but no step completed yet (the ~17-min first GRPO rollout emits no `step`) ->
+    # floor to 1 so real GPU time isn't billed as $0.
+    assert runner.actual_steps_run(st({"stage": "rl_step", "step": 0})) == 1
+    assert runner.actual_steps_run(st({"stage": "rl_step"})) == 1
+    assert runner.actual_steps_run(st({"stage": "sft_step"})) == 1
 
 
 # --------------------------------------------------------------------------- cancel re-pricing

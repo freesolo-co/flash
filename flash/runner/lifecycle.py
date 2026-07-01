@@ -515,7 +515,9 @@ def _charge_completed_run_by_id(run_id: str, log) -> None:
     _apply_charge_with_state(
         run_id,
         log,
-        noun="completed",
+        # "terminal" not "completed": the retry sweep bills cancelled-mid-training runs through here
+        # too, so the not-billed log/error text must read accurately for both.
+        noun="terminal",
         charge_call=lambda internal_key, status: charge_completed_run(
             internal_key=internal_key, status=status
         ),

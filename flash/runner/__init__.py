@@ -77,21 +77,45 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
             return 0.0  # cancelled before any training step -> nothing to charge
         from dataclasses import replace
 
-        return float(estimate_cost(replace(runconfig_from_spec(spec), steps=n)).total_usd)
+        cfg = runconfig_from_spec(spec)
+        planned = int(cfg.steps or 0)
+        if planned > 0:
+            n = min(n, planned)
+        # SFT is priced from train_tokens (not steps), so lowering steps ALONE wouldn't prorate a
+        # cancel -- estimate_cost would still charge the full-run token estimate. Scale the token
+        # count to the fraction of steps that ran so a mid-training SFT cancel is charged its share,
+        # mirroring GRPO's steps-based proration.
+        if not cfg.is_grpo and cfg.train_tokens and planned > 0:
+            scaled_tokens = max(1, int(cfg.train_tokens * n / planned))
+            cfg = replace(cfg, steps=n, train_tokens=scaled_tokens)
+        else:
+            cfg = replace(cfg, steps=n)
+        return float(estimate_cost(cfg).total_usd)
     except Exception:
         return float(fallback)
 
 
-def actual_steps_run(status: RunStatus) -> int:
-    """How many optimizer steps a (cancelled) run actually completed.
+# Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
+# `step` field is 1-indexed and only appears once a step COMPLETES, so the expensive first step (a
+# GRPO rollout can be ~17 min) streams one of these stages with NO step yet -- still real GPU time.
+_TRAINING_STAGES = frozenset({"rl_step", "sft_step"})
 
-    The worker streams a per-step heartbeat carrying ``global_step`` (the last one we persisted is
-    the most recent step it reached). Returns 0 when no training heartbeat was seen -- e.g. cancelled
-    during cold-start/setup, before any step -> 0 steps -> $0."""
+
+def actual_steps_run(status: RunStatus) -> int:
+    """How many optimizer steps to bill a (cancelled) run for.
+
+    The worker streams a per-step heartbeat whose ``step`` field is the last COMPLETED optimizer step
+    (1-indexed; the last one we persisted is the furthest it reached). Cancelled after N steps -> N.
+    The first step reports no ``step`` until it completes, so a cancel mid-first-step would look like
+    0 steps despite real GPU time -- we floor to 1 whenever a training-stage heartbeat is present.
+    Returns 0 only when no training heartbeat was seen (cancelled during cold-start/setup) -> $0."""
     hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
     step = hb.get("step")
     if isinstance(step, (int, float)) and step > 0:
         return int(step)
+    # Training started (rl_step/sft_step) but no completed step yet -> mid-first-step -> bill 1.
+    if hb.get("stage") in _TRAINING_STAGES:
+        return 1
     return 0
 
 
