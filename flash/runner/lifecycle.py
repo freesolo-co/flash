@@ -202,7 +202,9 @@ def _submit_seed_supervised(
     # A non-shared per-org volume earns no bonus — that's the user's own choice.
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
-    started_with_shared_cache = getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
+    started_with_shared_cache = (
+        getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
+    )
     cache_fallback_attempts = 1 if started_with_shared_cache else 0
     retry_budget = _RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
     # Grow only when an attempt actually provisioned a class and lost it to infra.
@@ -349,9 +351,7 @@ def _submit_seed_supervised(
             and getattr(run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
         )
         first_cache_drop = (
-            run_had_cache
-            and not drop_weight_cache
-            and res.failure in ("no_capacity", "poll_error")
+            run_had_cache and not drop_weight_cache and res.failure in ("no_capacity", "poll_error")
         )
         oom_mode = oom_vram_floor > 0
         will_retry = retry_budget.can_retry(
@@ -434,6 +434,7 @@ def _run_training(
         _submit_seed_supervised,
         _update,
         artifacts_dir,
+        charge_usd_for_spec,
         get_status,
     )
 
@@ -457,7 +458,11 @@ def _run_training(
     metrics = _submit_seed_supervised(
         spec, FIXED_SEED, log, runtime_secrets=runtime_secrets, code_prefix=code_prefix
     )
-    total_cost = prior_cost + _persist_metrics(spec, metrics)
+    # measured wall x $/hr is recorded in metrics.json for analytics, but is NOT what we charge.
+    measured_cost = prior_cost + _persist_metrics(spec, metrics)
+    # The customer is charged the QUOTE: the flash.cost estimate this run was priced at (planned
+    # steps). Falls back to the measured cost only if the spec can't be re-priced.
+    charge_usd = charge_usd_for_spec(spec, fallback=measured_cost)
     # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
     # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.
     with contextlib.suppress(FileNotFoundError):
@@ -467,11 +472,12 @@ def _run_training(
     applied = _update(
         spec.run_id,
         "done",
-        cost_usd=total_cost,
+        cost_usd=charge_usd,
         artifacts_dir=artifacts_dir(spec),
     )
     print(
-        f"done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
+        f"done: train_wall={metrics.get('wall_seconds')} measured={measured_cost:.4f} "
+        f"charge_usd={charge_usd:.4f}",
         file=log,
         flush=True,
     )
@@ -504,9 +510,28 @@ def _charge_completed_run_by_id(run_id: str, log) -> None:
     ``cost_usd`` + the raw ``spec`` dict), so a run id is the only input. The retry sweep calls this
     directly so a legacy/stale persisted spec that ``JobSpec.from_dict`` would reject does NOT block
     recovery of a real pending/failed charge."""
+    from flash.server.billing import charge_completed_run
+
+    _apply_charge_with_state(
+        run_id,
+        log,
+        noun="completed",
+        charge_call=lambda internal_key, status: charge_completed_run(
+            internal_key=internal_key, status=status
+        ),
+    )
+
+
+def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> None:
+    """Drive the billing state machine around one charge attempt (charging -> charged/failed).
+
+    ``charge_call(internal_key, status)`` performs the actual backend charge and returns its response
+    dict. Reading org/cost from the
+    persisted ``RunStatus`` (never a reparsed spec) is what lets a legacy/stale spec still be charged.
+    """
     from flash.runner import get_status, record_billing_state
     from flash.server.auth import INTERNAL_KEY_ENV
-    from flash.server.billing import BillingError, charge_completed_run
+    from flash.server.billing import BillingError
 
     status = get_status(run_id)
     if not status.billing_context or status.billing_state == "charged":
@@ -514,7 +539,7 @@ def _charge_completed_run_by_id(run_id: str, log) -> None:
 
     internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
     if not internal_key:
-        detail = f"{INTERNAL_KEY_ENV} is not configured; completed run was not billed"
+        detail = f"{INTERNAL_KEY_ENV} is not configured; {noun} run was not billed"
         # Field-only billing write that re-reads state under the lock: never overwrite a `deployed`
         # that a concurrent /deploy may have written since we last read the run.
         record_billing_state(run_id, billing_state="failed", billing_error=detail)
@@ -524,7 +549,7 @@ def _charge_completed_run_by_id(run_id: str, log) -> None:
     record_billing_state(run_id, billing_state="charging", billing_error=None)
     status = get_status(run_id)
     try:
-        charge = charge_completed_run(internal_key=internal_key, status=status)
+        charge = charge_call(internal_key, status)
     except BillingError as exc:
         record_billing_state(run_id, billing_state="failed", billing_error=exc.detail)
         print(f"billing failed: {exc.detail}", file=log, flush=True)

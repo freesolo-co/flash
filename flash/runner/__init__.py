@@ -59,6 +59,42 @@ def _gpu_rate(gpu_type: str) -> float:
         return 0.80
 
 
+def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0) -> float:
+    """The customer charge for a run: the flash.cost estimate (training-only steps x sec/step x $/hr).
+
+    This is the price the run was QUOTED at submit. ``steps=None`` prices the spec's planned steps
+    (a completed run is charged exactly its quote); pass the actual steps that ran to re-price a
+    CANCELLED run at how far it got. Returns ``fallback`` if the spec can't be priced (so a charge is
+    never blocked by a pricing failure)."""
+    try:
+        from flash.cost.analytical import estimate_cost
+        from flash.cost.spec import estimate_for_spec, runconfig_from_spec
+
+        if steps is None:
+            return float(estimate_for_spec(spec).total_usd)
+        n = max(0, int(steps))
+        if n == 0:
+            return 0.0  # cancelled before any training step -> nothing to charge
+        from dataclasses import replace
+
+        return float(estimate_cost(replace(runconfig_from_spec(spec), steps=n)).total_usd)
+    except Exception:
+        return float(fallback)
+
+
+def actual_steps_run(status: RunStatus) -> int:
+    """How many optimizer steps a (cancelled) run actually completed.
+
+    The worker streams a per-step heartbeat carrying ``global_step`` (the last one we persisted is
+    the most recent step it reached). Returns 0 when no training heartbeat was seen -- e.g. cancelled
+    during cold-start/setup, before any step -> 0 steps -> $0."""
+    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
+    step = hb.get("step")
+    if isinstance(step, (int, float)) and step > 0:
+        return int(step)
+    return 0
+
+
 @dataclass
 class RunStatus:
     run_id: str
@@ -74,9 +110,9 @@ class RunStatus:
     remote: dict | None = None
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
     # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
-    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the wall x $/hr
-    # PROJECTION); ``reconciled_at`` marks that the realized pull has happened so it isn't
-    # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
+    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the flash.cost ESTIMATE
+    # we charge the customer); ``reconciled_at`` marks that the realized pull has happened so it
+    # isn't re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
@@ -234,7 +270,9 @@ _WEIGHT_CACHE_PEAK_FACTOR = 2.0
 def _fits_weight_cache(info: ModelInfo) -> bool:
     """Whether the model's peak download footprint fits the shared weight-cache volume."""
     if not info.params_b:
-        return True  # unknown size -> keep the (attach) default; curated catalog models always set it
+        return (
+            True  # unknown size -> keep the (attach) default; curated catalog models always set it
+        )
     download_gb = info.params_b * 2.0  # bf16: 2 bytes/param (mirrors cost.facts.download_weight_gb)
     return _WEIGHT_CACHE_PEAK_FACTOR * download_gb <= WEIGHT_CACHE_VOLUME_GB
 
