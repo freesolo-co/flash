@@ -470,6 +470,38 @@ def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
     ]
 
 
+def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
+    class BlankSystemEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
+
+        def start_episode(self, example, prompt_text):
+            return [
+                {"role": "system", "content": "   "},
+                {"role": "user", "content": example.input},
+            ]
+
+        def score_responses(self, example, response_texts):
+            return [_RewardResult(score=0.0) for _ in response_texts]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=BlankSystemEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        BlankSystemEnv(),
+        "owner/env",
+        source=None,
+        contract_text="follow the contract",
+    )
+
+    expected = [
+        {"role": "system", "content": "follow the contract"},
+        {"role": "user", "content": "2+2?"},
+    ]
+    assert env.prompt_messages({"input": "2+2?", "output": "4"}) == expected
+    assert env.new_rollout_state({"input": "2+2?", "output": "4"})["prompt"] == expected
+
+
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
