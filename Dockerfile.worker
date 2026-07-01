@@ -42,7 +42,7 @@ ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
 RUN mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor \
     /opt/flash/kernelcache/flashinfer_cubin /opt/flash/kernelcache/flashinfer
 
-# build-essential for Triton/Inductor (Liger) + any source builds; git for pip VCS installs.
+# build-essential for Triton/Inductor/chalk + any source builds; git for pip VCS installs.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -58,7 +58,6 @@ RUN pip install --no-cache-dir \
     "huggingface_hub>=0.25" \
     "accelerate>=1.4" \
     "wandb>=0.17" \
-    "liger-kernel>=0.5" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \
     "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
@@ -148,7 +147,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # affect another tenant). The redirect can't be a static image ENV: the volume mounts at a fixed path
 # only at runtime and only when attached, so a baked ENV would break cache-less (no-volume) cold runs.
 #
-# Compiled-kernel cache: OPT-IN bake, JIT fallback. The fused Triton (Liger/fla/chalk),
+# Compiled-kernel cache: OPT-IN bake, JIT fallback. The fused Triton (fla/chalk),
 # TorchInductor, and Hopper tilelang kernels the trainer builds on first use are content-addressed
 # by GPU ARCH + toolchain version, so they can only be compiled on a real GPU of each catalog arch
 # (8.0/8.6/8.9/9.0/12.0) — which the CI image builder normally lacks (the FA2 *source* path above
@@ -187,7 +186,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
 # bootstrap code + the WORKER_DEPS list above): the core stack, the optimizer/accelerator libs
-# (liger, flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
+# (flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
 # missing or ABI-broken package fails the build HERE instead of silently shipping (the FA wheel in
 # particular can install yet fail to import against this torch). cuDNN comes from the base image.
 # flash_attn is BEST-EFFORT (the install above tolerates a build failure -> SDPA fallback), so it
@@ -195,7 +194,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
 import torch, transformers, trl, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
-liger_kernel, fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
+fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
@@ -207,7 +206,7 @@ cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into t
 ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
-'accelerate','wandb','liger-kernel','flash-linear-attention','bitsandbytes', \
+'accelerate','wandb','flash-linear-attention','bitsandbytes', \
 'hf-transfer','freesolo','runpod']]"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py

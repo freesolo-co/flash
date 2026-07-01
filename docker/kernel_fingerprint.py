@@ -11,7 +11,7 @@ Two fingerprints, because "out of date" has two flavors with very different cost
   * fp_cache = hash of the inputs whose kernels live in the baked mega-cache
     (torch.compiler.save_cache_artifacts: Triton/Inductor/torch.compile). Changing one of these
     INVALIDATES the cache, so the per-arch image needs a real GPU re-warm. These are: the base
-    FROM image (torch+triton), the fla git pin, liger, tilelang, apache-tvm-ffi, the default chalk
+    FROM image (torch+triton), the fla git pin, tilelang, apache-tvm-ffi, the default chalk
     spec, and the warmup script itself (it decides which kernels get compiled).
 
   * fp_base = hash of everything else baked into :cu128 that is NOT in the cache (FA2/FA3 wheels,
@@ -27,7 +27,7 @@ time, which is why every parse below FAILS LOUD rather than hashing a None.
 Known limitations (deliberately scoped -- each only ever costs a recoverable cold-JIT, never
 correctness, and the alternatives over-fire the paid GPU bake):
   * fp_cache hashes the Dockerfile dep PINS, not pip-resolved versions. A cache-affecting range
-    (liger-kernel>=, the chalk spec) could resolve a newer build on a later worker-image rebuild with
+    (the chalk spec) could resolve a newer build on a later worker-image rebuild with
     no text change, leaving fp_cache unmoved. Pin those exactly for airtight coverage. (fp_base DOES
     hash the whole Dockerfile.worker, so arbitrary base edits -- apt/ENV/CMD/cache-dir -- still
     trigger a free re-layer; only a cache-affecting change that isn't a parsed pin slips through.)
@@ -56,7 +56,7 @@ LABEL_REVISION = "org.opencontainers.image.revision"
 
 # pip specs in Dockerfile.worker's main stack whose kernels land in the mega-cache. everything else
 # in that block is a base-layer dep (fp_base). fla is matched separately (it carries the git sha).
-_CACHE_PKGS = {"liger-kernel", "tilelang", "apache-tvm-ffi"}
+_CACHE_PKGS = {"tilelang", "apache-tvm-ffi"}
 
 
 def _search(pattern: str, text: str, what: str, *, flags: int = 0) -> str:
@@ -134,7 +134,6 @@ def collect_inputs(
     cache_inputs = {
         "from_image": from_image,
         "fla": fla,
-        "liger": _need("liger-kernel"),
         "tilelang": _need("tilelang"),
         "tvm_ffi": _need("apache-tvm-ffi"),
         "chalk": chalk,

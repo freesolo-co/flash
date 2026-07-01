@@ -39,14 +39,11 @@ gpu = [
     "freesolo>=0.2.52",
     "huggingface-hub>=0.34",
 ]
-# freesolo-chalk (Freesolo's custom Triton/CUDA kernels, complements Liger) is an OPTIONAL,
-# separately-installed package — it is not on PyPI yet, so it is deliberately NOT a hard
-# dependency here (that would break resolution). flash auto-detects it at runtime and no-ops
-# when it's absent (see flash/engine/chalk_kernels.py). chalk is install-on-call (it reads NO env
-# vars), so the worker selects kernels via per-kernel FLASH_* flags. Enable on a remote run by
-# setting the FLASH_* kernel flag(s) AND FLASH_CHALK_SPEC=<installable chalk spec> (git URL with
-# access, or a wheel); the submit path appends that spec to the worker's extra_pip, which is
-# installed for every job (works on the default baked-image path, unlike FLASH_WORKER_EXTRA_DEPS).
+# freesolo-chalk (Freesolo's custom Triton/CUDA kernels) is a worker-side package selected by the
+# submit path, not a control-plane dependency. flash appends DEFAULT_CHALK_SPEC to each worker job's
+# extra_pip and then applies chalk standalone after the trainer builds the live model. It no-ops when
+# unavailable (see flash/engine/chalk_kernels.py), but normal remote runs install the pinned Chalk
+# PR 11 merge SHA unless FLASH_CHALK_SPEC overrides the source.
 # Control-plane / operator deps. runpod-flash (RunPod provider SDK) + huggingface-hub (provider
 # code upload + repo settings) are imported server-side; httpx is the serving client (flash/serve).
 # Keeping runpod-flash out of the base install also stops its `flash` console script shadowing

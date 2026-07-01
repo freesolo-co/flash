@@ -1,7 +1,8 @@
 """Optional chalk GPU kernels (the ``freesolo-chalk`` package).
 
-Gap-filling Triton kernels for qwen3.5 applied on top of Liger (liger=False; TRL owns Liger).
-Degrades to a no-op if freesolo-chalk is not installed.
+Standalone Triton kernels for qwen3.5/3.6. Flash does not ask TRL to apply Liger; chalk owns the
+RMSNorm, SwiGLU, fused-linear-CE, RoPE, LoRA-delta, trainable attention epilogue, embedding, and GDN
+patches. Degrades to a no-op if freesolo-chalk is not installed.
 """
 
 from __future__ import annotations
@@ -14,11 +15,16 @@ log = get_logger(__name__)
 
 _KERNELS: list[tuple[str, bool]] = [
     ("rope", True),
+    ("rmsnorm", True),
+    ("swiglu", True),
+    ("fused_linear_cross_entropy", True),
     ("fused_lora_delta", True),
+    ("trainable_attn_epilogue", True),
     ("fused_embedding", True),
-    ("fused_mlp", False),  # off (Liger owns MLP/SwiGLU)
+    ("gdn", True),
+    ("fused_mlp", False),  # off: eval-only bf16 MLP forward, not the training activation path
     ("attn_epilogue", False),  # off (eval-only; needs q/k/v out of LoRA)
-    ("fp8_frozen_base", False),  # off (Hopper sm_90+ only)
+    ("fp8_frozen_base", False),  # off by default: speed/memory tradeoff, enable only after run A/B
 ]
 
 
@@ -45,7 +51,7 @@ def install_chalk_kernels(model=None) -> dict:
     except ImportError:
         log.info(
             "freesolo-chalk is not installed on this worker (set FLASH_CHALK_SPEC to an installable "
-            "spec, or check the default PyPI install); chalk kernels off, using eager/Liger."
+            "spec, or check the default install); chalk kernels off, using eager kernels."
         )
         return {}
     except Exception as e:
@@ -53,7 +59,7 @@ def install_chalk_kernels(model=None) -> dict:
         return {}
 
     try:
-        # liger=False: TRL already applied Liger; chalk composes on top of the live Liger modules.
+        # liger=False: flash uses chalk standalone. TRL must not have applied Liger first.
         report = apply_chalk_kernel_to_qwen35(model, liger=False, **kwargs)
     except Exception as e:  # never block training on the optional kernel stack
         log.warning("chalk apply failed (ignored, kernels disabled): %s", e)

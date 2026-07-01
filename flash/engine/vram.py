@@ -153,7 +153,8 @@ _VOCAB_DEFAULT = 248_320
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
-# Single source of truth for Liger gate — engine.worker.perf imports these.
+# Single source of truth for the SFT fused-CE gate. Keep the historical constant names because
+# engine.worker.perf and tests import them.
 _LIGER_MIN_PARAMS_B = 3.0
 _LIGER_LONG_CTX_TOKENS = 2048
 
@@ -333,7 +334,7 @@ def sft_gc_off_peak_gb(
 ) -> float:
     """Estimated peak VRAM (GB) for a FUSED-CE LoRA SFT step with gradient checkpointing OFF: the
     resident weights + optimizer/base + the no-recompute activations held across ALL ``num_layers``.
-    Fused CE (Liger FLCE) is assumed, so there is no ``[B, T, vocab]`` logits term (the thing that
+    Fused CE (chalk FLCE) is assumed, so there is no ``[B, T, vocab]`` logits term (the thing that
     made GC-off impossible at a 248k vocab). Unknown architecture dims -> ``inf`` (caller keeps GC on).
 
     MoE: the activation backbone scales with the model's real ``hidden`` x ``num_layers`` (geometry),

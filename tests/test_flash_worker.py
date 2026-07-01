@@ -145,7 +145,7 @@ def _clear_chalk_flags(monkeypatch):
 
 def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
     """chalk is always selected (fixed gap-fillers), so a set FLASH_CHALK_SPEC IS appended to
-    extra_pip (chalk installs + auto-applies, like Liger)."""
+    extra_pip (chalk installs + auto-applies)."""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
@@ -153,16 +153,19 @@ def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
     assert chalk_extra_pip() == ["freesolo-chalk"]
 
 
-def test_chalk_extra_pip_defaults_to_pypi_without_spec(monkeypatch):
-    """chalk is published on PyPI, so with FLASH_CHALK_SPEC unset flash auto-installs the
-    VERSION-PINNED PyPI package by default (just like Liger) — no operator spec required, and a
-    breaking release can't silently land (the pin is bounded)."""
-    from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
+def test_chalk_extra_pip_defaults_to_latest_main_without_spec(monkeypatch):
+    """With FLASH_CHALK_SPEC unset, flash auto-installs the latest chalk main SHA by default.
+    The commit pin is reproducible and guarantees the worker sees the expected kernel surface."""
+    from flash.providers.runpod.train import (
+        DEFAULT_CHALK_SPEC,
+        LATEST_CHALK_MAIN_SHA,
+        chalk_extra_pip,
+    )
 
     _clear_chalk_flags(monkeypatch)
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk")
-    assert "<" in DEFAULT_CHALK_SPEC  # bounded range, not an unpinned floating install
+    assert DEFAULT_CHALK_SPEC.startswith("git+https://github.com/freesolo-co/chalk.git@")
+    assert DEFAULT_CHALK_SPEC.endswith(LATEST_CHALK_MAIN_SHA)
 
 
 def test_chalk_extra_pip_adds_spec_when_set(monkeypatch):
@@ -375,7 +378,7 @@ def test_train_body_has_no_prime_install_path():
 
 def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     """Guard: completion-only loss is ON and every prior SFT optimization is still wired. The
-    completion-only change only touched the data representation + label masking — packing, Liger,
+    completion-only change only touched the data representation + label masking — packing, chalk,
     LoRA+, the large-vocab logits cap, grad-checkpointing, and the 8-bit optimizer must all survive."""
     import inspect
 
@@ -407,8 +410,9 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
     # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
-    # Liger fused CE/RMSNorm/RoPE
-    assert 'cfg_kwargs["use_liger_kernel"] = True' in src
+    # chalk standalone fused CE/RMSNorm/SwiGLU/RoPE
+    assert "install_chalk_kernels(" in src
+    assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
     # LoRA+ (B-matrix LR ratio)
     assert "create_loraplus_optimizer" in src
     assert "_lp_ratio" in src

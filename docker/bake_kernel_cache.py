@@ -109,7 +109,7 @@ def main() -> int:
 
             chalk_spec = DEFAULT_CHALK_SPEC
         except Exception:
-            chalk_spec = "freesolo-chalk>=0.1.0,<0.2.0"
+            chalk_spec = "git+https://github.com/freesolo-co/chalk.git@ad1a9345fdfe175b7916e344fd8fb23ba89c89c0"
 
     _upload_flash_code(api, repo, token)
 

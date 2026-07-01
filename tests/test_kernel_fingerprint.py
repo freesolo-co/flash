@@ -62,7 +62,6 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     for key in (
         "from_image",
         "fla",
-        "liger",
         "tilelang",
         "tvm_ffi",
         "chalk",
@@ -84,7 +83,7 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     sha = re.search(r"flash-linear-attention\.git@([0-9a-f]{40})\b", dockerfile).group(1)
     assert sha in cache_inputs["fla"]
-    # the cache toolchain must NOT leak into the base pip list (else a liger bump would fire a re-layer)
+    # the cache toolchain must NOT leak into the base pip list (else a cache-toolchain bump would fire a re-layer)
     assert not any("liger-kernel" in s or "tilelang" in s for s in base_partial["pip_base"])
 
 

@@ -33,7 +33,6 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
-    liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
     setup_perf_backends,
@@ -194,13 +193,12 @@ def run_sft():
             f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
         )
     effective_batch = _train_opt("batch_size", RECIPE.sft.effective_batch)
-    # Large-vocab OOM guard: without fused CE, SFTTrainer materializes [per_device, seq, vocab] fp32
-    # logits; cap micro-batch so they fit, raise grad-accum to keep effective batch unchanged.
+    # Large-vocab OOM guard: chalk standalone owns fused CE by default. Without fused CE, SFTTrainer
+    # materializes [per_device, seq, vocab] fp32 logits; cap micro-batch so they fit, raise
+    # grad-accum to keep effective batch unchanged.
     _sft_params_b = resolve_params_b(model_id)
     _sft_vocab = vocab_size_for(model_id)
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and liger_on(
-        _memory_mode(model_id, sft_max_len)
-    )
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len)
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
     )
@@ -288,9 +286,8 @@ def run_sft():
     else:
         _bfd_why = "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
         print(f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below.")
-    if liger_on(_memory_mode(model_id, sft_max_len)):
-        cfg_kwargs["use_liger_kernel"] = True
-        print("[sft] liger fused kernels enabled")
+    if _memory_mode(model_id, sft_max_len):
+        print("[sft] chalk standalone fused kernels scheduled after trainer build")
     _attn = optimal_attn_impl()
     # When bfd packing is on, ensure a varlen-capable flash impl; sdpa cross-contaminates packed examples.
     # _attn=="sdpa" (Blackwell): disable bfd — don't force FA2 (unverified SASS). SDPA-mask path below still packs.
@@ -341,7 +338,7 @@ def run_sft():
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
         _pd_pack, _ = sft_grad_accum(
             effective_batch, seq_len=sft_max_len, vocab=vocab_size_for(model_id),
-            fused=bool(cfg_kwargs.get("use_liger_kernel")),
+            fused=_sft_fused,
         )
         # Cap pd so the dense [pd,1,T,T] mask stays <=512MB (only bites past ~12k tokens).
         _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
