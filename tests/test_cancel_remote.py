@@ -9,6 +9,7 @@ runpod_flash's persisted registry and delete it via the RunPod API (cross-proces
 
 from __future__ import annotations
 
+import sys
 import types
 
 import flash.providers.runpod.train as ftrain
@@ -17,6 +18,128 @@ from flash.providers.runpod.train import _run_suffix, _select_endpoint_resources
 
 def _res(name):
     return types.SimpleNamespace(name=name)
+
+
+def test_isolate_flash_state_resets_runpod_flash_manager_on_scope_change(tmp_path, monkeypatch):
+    import flash.providers.runpod.train.endpoints as ep_mod
+
+    for mod_name in (
+        "runpod_flash",
+        "runpod_flash.core",
+        "runpod_flash.core.resources",
+    ):
+        stub = types.ModuleType(mod_name)
+        stub.__path__ = []
+        monkeypatch.setitem(sys.modules, mod_name, stub)
+
+    class FakeRM:
+        pass
+
+    FakeRM._resources = {"old-class": object()}
+    FakeRM._resource_configs = {"old-class": "hash"}
+    FakeRM._deployment_locks = {"old-class": object()}
+    FakeRM._resources_initialized = True
+
+    fake_instance = types.SimpleNamespace(
+        _resources={"old-instance": object()},
+        _resource_configs={"old-instance": "hash"},
+        _deployment_locks={"old-instance": object()},
+    )
+    FakeRM._instances = {FakeRM: fake_instance}
+
+    rm_mod = types.ModuleType("runpod_flash.core.resources.resource_manager")
+    rm_mod.ResourceManager = FakeRM
+    rm_mod.FLASH_STATE_DIR = tmp_path / "old"
+    rm_mod.RESOURCE_STATE_FILE = tmp_path / "old" / "resources.pkl"
+    rm_mod.RUNPOD_FLASH_DIR = tmp_path / "old"
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", rm_mod)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    ep_mod.isolate_flash_state("run-a")
+
+    state_dir = tmp_path / ".flash" / "flash-state" / "run-a"
+    assert state_dir == rm_mod.FLASH_STATE_DIR
+    assert state_dir / "resources.pkl" == rm_mod.RESOURCE_STATE_FILE
+    assert state_dir == rm_mod.RUNPOD_FLASH_DIR
+    assert FakeRM._resources == {}
+    assert FakeRM._resource_configs == {}
+    assert FakeRM._deployment_locks == {}
+    assert fake_instance._resources == {}
+    assert fake_instance._resource_configs == {}
+    assert fake_instance._deployment_locks == {}
+    assert FakeRM._resources_initialized is False
+
+    FakeRM._resources["kept"] = object()
+    fake_instance._resources["kept"] = object()
+    FakeRM._resources_initialized = True
+    ep_mod.isolate_flash_state("run-a")
+
+    assert "kept" in FakeRM._resources
+    assert "kept" in fake_instance._resources
+    assert FakeRM._resources_initialized is True
+
+
+def test_get_train_endpoint_locks_sdk_state_and_does_not_cache_run_scoped_handlers(monkeypatch):
+    import flash.providers.runpod.auth as auth
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.train.endpoints as ep_mod
+
+    locked_events = []
+
+    class FakeEndpoint:
+        def __init__(self, **kwargs):
+            assert ep_mod.FLASH_SDK_LOCK.locked()
+            self.kwargs = kwargs
+            locked_events.append(("endpoint", kwargs["name"]))
+
+        def __call__(self, fn):
+            assert ep_mod.FLASH_SDK_LOCK.locked()
+            locked_events.append(("handler", self.kwargs["name"]))
+            return types.SimpleNamespace(endpoint=self, fn=fn)
+
+        def _build_resource_config(self):
+            assert ep_mod.FLASH_SDK_LOCK.locked()
+            locked_events.append(("config", self.kwargs["name"]))
+            return {}
+
+    runpod_flash = types.ModuleType("runpod_flash")
+    runpod_flash.Endpoint = FakeEndpoint
+    monkeypatch.setitem(sys.modules, "runpod_flash", runpod_flash)
+
+    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(ep_mod, "_patch_runpod_backoff", lambda: None)
+
+    def rec_isolate(scope):
+        assert ep_mod.FLASH_SDK_LOCK.locked()
+        locked_events.append(("isolate", scope))
+
+    acquired = []
+    monkeypatch.setattr(ep_mod, "isolate_flash_state", rec_isolate)
+    monkeypatch.setattr(ep_mod, "_acquire_endpoint_slot", lambda name: acquired.append(name))
+    monkeypatch.setattr(ep_mod, "_release_endpoint_slot", lambda _name: None)
+    monkeypatch.setattr(ep_mod, "canonical_gpu", lambda gpu: gpu)
+    monkeypatch.setattr(ep_mod, "flash_gpu", lambda gpu: gpu)
+    monkeypatch.setattr(ep_mod, "gpu_short", lambda gpu: gpu.lower().replace(" ", ""))
+    monkeypatch.setattr(ep_mod, "worker_image_for_gpu", lambda *_args, **_kwargs: "image")
+    monkeypatch.setattr(jobs, "weight_cache_endpoint_kwargs", lambda _spec: {})
+    monkeypatch.setattr(jobs, "apply_disk_gb", lambda _cfg, _disk_gb: None)
+    monkeypatch.setattr(ep_mod, "_ENDPOINT_CACHE", {})
+
+    run_handler = ep_mod.get_train_endpoint("RTX 5090", name_suffix="run-a")
+    assert run_handler.endpoint.kwargs["name"] == "flash-rtx5090-run-a"
+    assert ep_mod._ENDPOINT_CACHE == {}
+    assert acquired == ["flash-rtx5090-run-a"]
+    assert ("isolate", "run-a") in locked_events
+
+    default_handler = ep_mod.get_train_endpoint("RTX 5090")
+    assert default_handler.endpoint.kwargs["name"] == "flash-rtx5090"
+    assert {"flash-rtx5090": default_handler} == ep_mod._ENDPOINT_CACHE
+    assert acquired == ["flash-rtx5090-run-a", "flash-rtx5090"]
+    assert ("isolate", None) in locked_events
+
+    cached_handler = ep_mod.get_train_endpoint("RTX 5090")
+    assert cached_handler is default_handler
+    assert acquired == ["flash-rtx5090-run-a", "flash-rtx5090"]
 
 
 def test_select_matches_live_prefixed_endpoint():
