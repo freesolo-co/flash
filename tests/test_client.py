@@ -109,28 +109,6 @@ def test_api_error_carries_server_detail(stub):
     assert "unknown run_id: missing" in str(excinfo.value)
 
 
-def test_get_worker_output_tolerates_missing_route(monkeypatch):
-    """A managed server predating the /worker route returns a bare 404 'Not Found' -> get_worker_output
-    yields {} so a CLI upgraded ahead of the rollout doesn't hard-fail. Real 404s (unknown run_id) and
-    other errors still propagate."""
-    client = ApiClient("http://127.0.0.1:1", "fslo-user-test")
-
-    def _raise(status, msg):
-        def _req(method, path, **kw):
-            raise ApiError(status, msg)
-
-        return _req
-
-    monkeypatch.setattr(client, "_request", _raise(404, "Not Found"))
-    assert client.get_worker_output("r1") == {}  # route absent -> graceful empty
-    monkeypatch.setattr(client, "_request", _raise(404, "unknown run_id: r1"))
-    with pytest.raises(ApiError):  # a real 404 still surfaces
-        client.get_worker_output("r1")
-    monkeypatch.setattr(client, "_request", _raise(500, "boom"))
-    with pytest.raises(ApiError):  # non-404 propagates
-        client.get_worker_output("r1")
-
-
 def test_api_error_mentions_env_override(stub):
     url, _ = stub
     client = ApiClient(url, "fslo-user-test", key_source="FREESOLO_API_KEY")
@@ -150,12 +128,43 @@ def test_logs_offset_in_query(stub):
     assert seen["path"].endswith("/v1/runs/r1/logs?offset=3")
 
 
+def test_get_worker_output_preserves_unknown_run_404(stub):
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+    with pytest.raises(ApiError) as excinfo:
+        client.get_worker_output("missing")
+    assert excinfo.value.status == 404
+    assert "unknown run_id: missing" in str(excinfo.value)
+
+
 def test_chat_omits_thinking_template_controls(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
     client.chat("json-chat", messages=[{"role": "user", "content": "hi"}])
     assert seen["body"] == {
         "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.0,
+        "max_tokens": 512,
+    }
+
+
+def test_chat_sends_user_supplied_system_prompt(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    client.chat(
+        "json-chat",
+        messages=[
+            {"role": "system", "content": "stay terse"},
+            {"role": "user", "content": "hi"},
+        ],
+    )
+
+    assert seen["body"] == {
+        "messages": [
+            {"role": "system", "content": "stay terse"},
+            {"role": "user", "content": "hi"},
+        ],
         "temperature": 0.0,
         "max_tokens": 512,
     }

@@ -443,6 +443,69 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
 
 
+def test_freesolo_adapter_preserves_missing_system_prompt(monkeypatch):
+    class NoSystemEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
+
+        def start_episode(self, example, prompt_text):
+            return [{"role": "user", "content": example.input}]
+
+        def score_responses(self, example, response_texts):
+            return [_RewardResult(score=0.0) for _ in response_texts]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=NoSystemEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        NoSystemEnv(),
+        "owner/env",
+        source=None,
+        contract_text="follow the contract",
+    )
+
+    assert env.prompt_messages({"input": "2+2?", "output": "4"}) == [
+        {"role": "user", "content": "2+2?"},
+    ]
+
+
+def test_freesolo_adapter_preserves_blank_system_prompt(monkeypatch):
+    class BlankSystemEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
+
+        def start_episode(self, example, prompt_text):
+            return [
+                {"role": "system", "content": "   "},
+                {"role": "user", "content": example.input},
+            ]
+
+        def score_responses(self, example, response_texts):
+            return [_RewardResult(score=0.0) for _ in response_texts]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=BlankSystemEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        BlankSystemEnv(),
+        "owner/env",
+        source=None,
+        contract_text="follow the contract",
+    )
+
+    expected = [
+        {"role": "system", "content": "   "},
+        {"role": "user", "content": "2+2?"},
+    ]
+    assert env.prompt_messages({"input": "2+2?", "output": "4"}) == expected
+    state = env.new_rollout_state({"input": "2+2?", "output": "4"})
+    assert state["prompt"] == expected
+    assert state["messages"] == expected
+    assert state["messages"] is not state["prompt"]
+    state["messages"][0]["content"] = "changed"
+    assert state["prompt"][0]["content"] == "   "
+
+
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
@@ -518,8 +581,12 @@ def test_freesolo_multiturn_hooks(monkeypatch):
         contract_text="contract",
     )
     state = env.new_rollout_state({"input": "browse", "output": "done"})
-    assert state["prompt"] == [{"role": "user", "content": "contract:browse"}]
-    assert state["messages"] == [{"role": "user", "content": "contract:browse"}]
+    assert state["prompt"] == [
+        {"role": "user", "content": "contract:browse"},
+    ]
+    assert state["messages"] == [
+        {"role": "user", "content": "contract:browse"},
+    ]
     env.record_model_turn(state, "click")
     replies = env.env_reply(state["messages"], state)
     assert replies == [{"role": "user", "content": "observed click"}]

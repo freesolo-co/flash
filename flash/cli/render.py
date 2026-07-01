@@ -381,7 +381,7 @@ def version(value: str) -> str:
 def submitted(run_id: str) -> str:
     """The `flash train` hand-off note (printed to stderr before logs start streaming)."""
     head = ok(f"run {_paint(run_id, _ACCENT2)} submitted")
-    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash status {run_id} --follow`")
+    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash log {run_id} --follow`")
     return _safe(f"{head}\n{hint}")
 
 
@@ -659,7 +659,7 @@ def chat_label() -> str:
 
 
 def log_section(name: str) -> str:
-    """A themed divider above a passthrough worker-log section in `flash status --logs` — the same
+    """A themed divider above a passthrough worker-log section in `flash log` — the same
     idiom as chat_label sitting above a raw chat reply (the log body stays raw). The machine path
     keeps the plain ``----- name -----`` divider that scripts and tests match on."""
     rule = _paint(_glyph("─", "-") * 3, _FAINT)
