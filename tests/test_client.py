@@ -27,7 +27,9 @@ def stub():
         def do_GET(self):
             seen["auth"] = self.headers.get("Authorization")
             seen["path"] = self.path
-            if self.path.startswith("/v1/runs/authfail"):
+            if self.path == "/v1/runs/old-api/worker":
+                self._send(404, {"detail": "Not Found"})
+            elif self.path.startswith("/v1/runs/authfail"):
                 self._send(401, {"detail": "invalid or missing API key"})
             elif self.path.startswith("/v1/runs/missing"):
                 self._send(404, {"detail": "unknown run_id: missing"})
@@ -126,6 +128,21 @@ def test_logs_offset_in_query(stub):
     assert page["offset"] == 3
     assert page["logs"] == "hi\n"
     assert seen["path"].endswith("/v1/runs/r1/logs?offset=3")
+
+
+def test_get_worker_output_tolerates_missing_optional_route(stub):
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+    assert client.get_worker_output("old-api") == {}
+
+
+def test_get_worker_output_preserves_unknown_run_404(stub):
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+    with pytest.raises(ApiError) as excinfo:
+        client.get_worker_output("missing")
+    assert excinfo.value.status == 404
+    assert "unknown run_id: missing" in str(excinfo.value)
 
 
 def test_chat_omits_thinking_template_controls(stub):

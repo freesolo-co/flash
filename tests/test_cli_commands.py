@@ -252,18 +252,25 @@ def test_log_prints_partial_log_line_with_newline(fake_client, capsys) -> None:
     assert out == "partial log line\n"
 
 
-def test_log_drains_offset_pages_without_status(fake_client, capsys) -> None:
+def test_log_snapshot_reads_one_offset_page_without_status(fake_client, capsys) -> None:
+    calls = []
     pages = {
         0: {"run_id": "flash-1", "logs": "first\n", "offset": 6, "state": "running"},
         6: {"run_id": "flash-1", "logs": "second\n", "offset": 13, "state": "done"},
         13: {"run_id": "flash-1", "logs": "", "offset": 13, "state": "done"},
     }
-    fake_client.get_logs = lambda run_id, offset=0: pages[offset]
+
+    def get_logs(run_id: str, offset: int = 0) -> dict:
+        calls.append(offset)
+        return pages[offset]
+
+    fake_client.get_logs = get_logs
     fake_client.get_worker_output = lambda run_id: {}
 
     assert _run(["log", "flash-1"]) == 0
     out = capsys.readouterr().out
-    assert out == "first\nsecond\n"
+    assert out == "first\n"
+    assert calls == [0]
 
 
 def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:

@@ -462,22 +462,9 @@ def _print_log_text(text: str) -> bool:
 
 
 def _print_log_snapshot(client: ApiClient, run_id: str) -> bool:
-    """Print the complete log snapshot by draining offset pages until no new bytes remain."""
-    offset = 0
-    printed_any = False
-    while True:
-        page = client.get_logs(run_id, offset=offset)
-        try:
-            next_offset = int(page.get("offset", offset))
-        except (TypeError, ValueError):
-            next_offset = offset
-        if next_offset <= offset and offset > 0:
-            break
-        printed_any = _print_log_text(str(page.get("logs") or "")) or printed_any
-        if next_offset <= offset:
-            break
-        offset = next_offset
-    return printed_any
+    """Print a finite snapshot from the log endpoint without following new bytes."""
+    page = client.get_logs(run_id, offset=0)
+    return _print_log_text(str(page.get("logs") or ""))
 
 
 def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:

@@ -499,7 +499,12 @@ def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
         {"role": "user", "content": "2+2?"},
     ]
     assert env.prompt_messages({"input": "2+2?", "output": "4"}) == expected
-    assert env.new_rollout_state({"input": "2+2?", "output": "4"})["prompt"] == expected
+    state = env.new_rollout_state({"input": "2+2?", "output": "4"})
+    assert state["prompt"] == expected
+    assert state["messages"] == expected
+    assert state["messages"] is not state["prompt"]
+    state["messages"][0]["content"] = "changed"
+    assert state["prompt"][0]["content"] == "follow the contract"
 
 
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
