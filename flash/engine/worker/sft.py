@@ -279,6 +279,9 @@ def run_sft():
         "remove_unused_columns": False,
         "optim": fused_optim_name(),
     }
+    _sft_config_fields = set(getattr(TRLSFTConfig, "__dataclass_fields__", {}))
+    if "use_liger_kernel" in _sft_config_fields:
+        cfg_kwargs["use_liger_kernel"] = False
     if max_steps > 0:
         cfg_kwargs["max_steps"] = max_steps
     # TRL 'bfd' packing: boundary-correct only under FA2/FA3 varlen (SDPA cross-contaminates).

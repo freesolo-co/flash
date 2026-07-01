@@ -365,6 +365,8 @@ def run_rl():
         # 8-bit paged AdamW: colocated GRPO is memory-tight, so int8 state paged to host RAM.
         "optim": fused_optim_name(),
     }
+    if "use_liger_kernel" in _grpo_fields:
+        grpo_kwargs["use_liger_kernel"] = False
     if use_vllm:
         # sm120: pin a PTX-independent vLLM attention backend before TRL builds the engine, else
         # the rollout can silently produce no completions (flash-attn PTX JIT failure).

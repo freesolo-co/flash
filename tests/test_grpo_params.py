@@ -893,6 +893,8 @@ def test_run_rl_keeps_logits_cap_without_chalk_grpo_fused_loss() -> None:
     assert fused_kw is not None, "rl_per_device_comps call no longer passes fused_logits"
     assert isinstance(fused_kw.value, ast.Constant)
     assert fused_kw.value.value is False
+    assert 'grpo_kwargs["use_liger_kernel"] = False' in src
+    assert '"use_liger_kernel": True' not in src
 
 
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:
