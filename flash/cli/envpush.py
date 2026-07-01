@@ -190,8 +190,23 @@ _ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
 def _normalize_env_name(raw: str) -> str | None:
     import re
 
-    name = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
-    return name or None
+    def normalize_segment(value: str) -> str | None:
+        segment = re.sub(r"[^a-z0-9._-]+", "-", value.lower()).strip("-")
+        if segment in {"", ".", ".."} or not re.search(r"[a-z0-9]", segment):
+            return None
+        return segment
+
+    text = str(raw or "").strip()
+    if "/" not in text:
+        return normalize_segment(text)
+    parts = [part.strip() for part in text.split("/")]
+    if len(parts) != 2 or not all(parts):
+        return None
+    namespace = normalize_segment(parts[0])
+    name = normalize_segment(parts[1])
+    if not namespace or not name:
+        return None
+    return f"{namespace}/{name}"
 
 
 def _with_syspath_bootstrap(env_source: str) -> str:
