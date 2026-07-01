@@ -233,6 +233,39 @@ def test_bootstrap_sets_lambda_arm():
     assert build_payload(_spec(), 0, 0)["flash_arm"] == "lambda"
 
 
+def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch):
+    import os
+    from pathlib import Path
+
+    from flash.providers import _instance_bootstrap as lb
+
+    calls = []
+    askpass_paths = []
+
+    def fake_run(cmd, *, check, env=None):
+        askpass = Path(env["GIT_ASKPASS"])
+        assert askpass.exists()
+        assert os.access(askpass, os.X_OK)
+        assert "ghp-secret" not in askpass.read_text()
+        askpass_paths.append(askpass)
+        calls.append({"cmd": cmd, "check": check, "env": env})
+
+    monkeypatch.setattr(lb.subprocess, "run", fake_run)
+    lb.install_extra_pip(
+        {
+            "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+            "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+        }
+    )
+
+    assert len(calls) == 1
+    env = calls[0]["env"]
+    assert env["GITHUB_TOKEN"] == "ghp-secret"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert askpass_paths
+    assert all(not p.exists() for p in askpass_paths)
+
+
 def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
     # The instance bootstrap must stamp ATTEMPT into the worker env (RunPod does it in jobs.py) — the
     # worker reads it into every heartbeat, and the poller's stale-heartbeat rejection is dead without

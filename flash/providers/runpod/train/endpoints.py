@@ -176,6 +176,7 @@ def _train_body(input_data: dict) -> dict:
     import os
     import subprocess
     import sys
+    import tempfile
     import threading
     import time
     from datetime import UTC, datetime
@@ -241,13 +242,14 @@ def _train_body(input_data: dict) -> dict:
 
     overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
 
-    def _extra_pip_env() -> dict[str, str]:
+    def _extra_pip_env() -> tuple[dict[str, str], str | None]:
         env = dict(os.environ)
         env.update(overrides)
         env["GIT_TERMINAL_PROMPT"] = "0"
+        askpass = None
         if env.get("GITHUB_TOKEN"):
-            askpass = "/tmp/flash-github-askpass.sh"
-            with open(askpass, "w", encoding="utf-8") as f:
+            fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(
                     "#!/bin/sh\n"
                     'case "$1" in\n'
@@ -257,15 +259,21 @@ def _train_body(input_data: dict) -> dict:
                 )
             os.chmod(askpass, 0o700)
             env["GIT_ASKPASS"] = askpass
-        return env
+        return env, askpass
 
     extra_pip = input_data.get("extra_pip") or []
     if extra_pip:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", *extra_pip],
-            check=True,
-            env=_extra_pip_env(),
-        )
+        extra_env, askpass = _extra_pip_env()
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", *extra_pip],
+                check=True,
+                env=extra_env,
+            )
+        finally:
+            if askpass:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(askpass)
 
     def _code_prefix() -> str:
         raw = input_data.get("code_prefix")

@@ -226,6 +226,7 @@ def estimate_vram_gb(
     sleep_offload: bool = True,
     active_params_b: float | None = None,
     fp8_kv: bool = False,
+    sft_fused_ce: bool | None = None,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU.
 
@@ -254,7 +255,7 @@ def estimate_vram_gb(
         logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + (max(rollout, train) if sleep_offload else rollout + train)
-    fused = sft_logits_fused(params_b, seq_len)
+    fused = sft_logits_fused(params_b, seq_len) if sft_fused_ce is None else bool(sft_fused_ce)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
     # Don't clamp to budget: pd=1 is irreducible and the logits can exceed the budget at near-2048 ctx.
@@ -444,14 +445,22 @@ def model_required_vram_gb(
             use_vllm=use_vllm,
             vocab=vocab,
             active_params_b=active_params_b,
+            sft_fused_ce=sft_fused_ce,
         )
         return math.ceil(est * headroom)
 
     from flash.catalog import MODELS, vocab_size_for
+    from flash.engine.chalk_kernels import chalk_supports_fused_ce_model
 
     info = MODELS.get(model_id)
     model_vocab = vocab_size_for(model_id)
     is_grpo = (algorithm or "").lower() in ("grpo", "rl")
+    sft_fused_ce = (
+        None
+        if is_grpo
+        else sft_logits_fused(resolve_params_b(model_id), seq_len)
+        and chalk_supports_fused_ce_model(model_id)
+    )
     if info is not None:
         params_b = info.params_b  # curated, authoritative (required field) — no string parsing
         quant = getattr(info, "quant", "bf16") or "bf16"

@@ -323,9 +323,11 @@ def run_sft():
             print(
                 "[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA"
             )
+    _sft_examples_per_block = 1.0
     if cfg_kwargs.get("packing"):
         _bfd_ids = [r["input_ids"] for r in _pretok]
         _bfd_ex = len(_bfd_ids) / max(1, len(pack_token_ids(_bfd_ids, sft_max_len)))
+        _sft_examples_per_block = _bfd_ex
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, per_device_bs * _bfd_ex))
         )
@@ -366,6 +368,7 @@ def run_sft():
         # Cap pd so the dense [pd,1,T,T] mask stays <=512MB (only bites past ~12k tokens).
         _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
         _ex_per_block = len(_ids) / max(1, len(_packed_rows))
+        _sft_examples_per_block = _ex_per_block
         cfg_kwargs["per_device_train_batch_size"] = _pd_pack
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, _pd_pack * _ex_per_block))
@@ -398,6 +401,7 @@ def run_sft():
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
         # cu_seqlens spans one block -> per-device=1; re-derive grad_accum to keep effective batch in examples.
         _ex_per_block = len(_ids) / max(1, len(_packed_rows))
+        _sft_examples_per_block = _ex_per_block
         cfg_kwargs["per_device_train_batch_size"] = 1
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, _ex_per_block))
@@ -508,10 +512,14 @@ def run_sft():
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
     _chalk_active = active_kernels(_chalk_report)
     if _sft_fused and "fused_linear_cross_entropy" not in _chalk_active:
-        safe_pd, safe_ga = sft_grad_accum(
+        current_pd = int(getattr(trainer.args, "per_device_train_batch_size", per_device_bs) or per_device_bs)
+        current_ga = int(getattr(trainer.args, "gradient_accumulation_steps", grad_accum) or grad_accum)
+        safe_pd_cap, _ = sft_grad_accum(
             effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=False
         )
-        if safe_pd != per_device_bs or safe_ga != grad_accum:
+        safe_pd = max(1, min(current_pd, safe_pd_cap))
+        safe_ga = max(1, math.ceil(effective_batch / max(1.0, safe_pd * _sft_examples_per_block)))
+        if safe_pd != current_pd or safe_ga != current_ga:
             print(
                 "[sft] chalk fused CE did not engage; restoring large-vocab logits cap: "
                 f"per_device={safe_pd} grad_accum={safe_ga}"

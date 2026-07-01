@@ -37,14 +37,15 @@ def active_kernels(report: Mapping[str, object] | None) -> list[str]:
     )
 
 
-def _chalk_supports_model(model_id: str | None) -> bool:
+def chalk_supports_fused_ce_model(model_id: str | None) -> bool:
+    """True when chalk's standalone fused-CE patch supports this model family."""
     mid = (model_id or "").lower()
     return any(token in mid for token in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6"))
 
 
 def chalk_fused_ce_available(model_id: str | None = None) -> bool:
     """Best-effort preflight for SFT fused-CE sizing before the trainer exists."""
-    if model_id is not None and not _chalk_supports_model(model_id):
+    if model_id is not None and not chalk_supports_fused_ce_model(model_id):
         return False
     try:
         from chalk.transformers import apply_chalk_kernel_to_qwen35 as _apply
@@ -54,7 +55,7 @@ def chalk_fused_ce_available(model_id: str | None = None) -> bool:
 
 
 def install_chalk_kernels(model=None) -> dict:
-    """Apply chalk's gap-filling kernels to ``model``; call AFTER TRL builds the trainer.
+    """Apply chalk standalone kernels to ``model``; call AFTER TRL builds the trainer.
 
     Returns chalk's per-kernel report, or ``{}`` when freesolo-chalk isn't installed.
     """

@@ -383,8 +383,14 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     from flash.providers.runpod.train import endpoints
 
     calls = []
+    askpass_paths = []
 
     def fake_run(cmd, *, check, env=None):
+        askpass = Path(env["GIT_ASKPASS"])
+        assert askpass.exists()
+        assert os.access(askpass, os.X_OK)
+        assert "ghp-secret" not in askpass.read_text()
+        askpass_paths.append(askpass)
         calls.append({"cmd": cmd, "check": check, "env": env})
 
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -406,13 +412,8 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     env = calls[0]["env"]
     assert env["GITHUB_TOKEN"] == "ghp-secret"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
-    askpass = Path(env["GIT_ASKPASS"])
-    try:
-        assert askpass.exists()
-        assert os.access(askpass, os.X_OK)
-        assert "ghp-secret" not in askpass.read_text()
-    finally:
-        askpass.unlink(missing_ok=True)
+    assert askpass_paths
+    assert all(not p.exists() for p in askpass_paths)
 
 
 def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
@@ -453,6 +454,9 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "install_chalk_kernels(" in src
     assert "chalk_fused_ce_available(model_id)" in src
     assert "chalk fused CE did not engage" in src
+    assert "_sft_examples_per_block" in src
+    assert "safe_pd * _sft_examples_per_block" in src
+    assert 'getattr(trainer.args, "per_device_train_batch_size"' in src
     assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
     # LoRA+ (B-matrix LR ratio)
     assert "create_loraplus_optimizer" in src
