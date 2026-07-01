@@ -233,12 +233,7 @@ class ApiClient:
         return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
-        try:
-            return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
-        except ApiError as exc:
-            if exc.status == 404 and str(exc).strip().lower() == "not found":
-                return {}
-            raise
+        return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
 
     def cancel_run(self, run_id: str) -> dict:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")
