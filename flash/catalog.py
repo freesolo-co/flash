@@ -113,6 +113,15 @@ class ModelInfo:
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
+SERVING_FP8_MODEL_REPOS: dict[str, str] = {
+    "openbmb/MiniCPM5-1B": "Freesolo-Co/MiniCPM5-1B-FP8",
+    "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
+    "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
+    "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
+    "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
+    "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B-FP8",
+}
+
 MODELS: dict[str, ModelInfo] = {
     "openbmb/MiniCPM5-1B": ModelInfo(
         id="openbmb/MiniCPM5-1B",
@@ -123,7 +132,13 @@ MODELS: dict[str, ModelInfo] = {
         algos=("sft", "grpo"),
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
-        serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
+        serving=ServingCapacity(
+            gpu="L4",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["openbmb/MiniCPM5-1B"],
+            max_loras=16,
+            max_lora_rank=64,
+            max_model_len=32768,
+        ),
         thinking="hybrid",
         notes="On-device class SLM (131k ctx); standard Llama architecture.",
     ),
@@ -136,7 +151,13 @@ MODELS: dict[str, ModelInfo] = {
         algos=("sft", "grpo"),
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
-        serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
+        serving=ServingCapacity(
+            gpu="L4",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-0.8B"],
+            max_loras=16,
+            max_lora_rank=64,
+            max_model_len=32768,
+        ),
         thinking="hybrid",
         notes="Smallest Qwen3.5; cheap smoke/dev runs with the modern arch.",
     ),
@@ -149,7 +170,13 @@ MODELS: dict[str, ModelInfo] = {
         algos=("sft", "grpo"),
         min_vram_gb=16,
         recommended_gpu="RTX 4090",
-        serving=ServingCapacity(gpu="L4", max_loras=16, max_lora_rank=64, max_model_len=32768),
+        serving=ServingCapacity(
+            gpu="L4",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-2B"],
+            max_loras=16,
+            max_lora_rank=64,
+            max_model_len=32768,
+        ),
         thinking="hybrid",
     ),
     "Qwen/Qwen3.5-4B": ModelInfo(
@@ -163,7 +190,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 5090",
         serving=ServingCapacity(
             gpu="L4",
-            serve_model_id="lovedheart/Qwen3.5-4B-FP8",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-4B"],
             max_loras=64,
             max_lora_rank=32,
             max_model_len=8192,
@@ -188,7 +215,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="A100 PCIe",
         serving=ServingCapacity(
             gpu="L4",
-            serve_model_id="lovedheart/Qwen3.5-9B-FP8",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-9B"],
             max_loras=44,
             max_lora_rank=32,
             max_model_len=8192,
@@ -226,7 +253,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="H200",
         serving=ServingCapacity(
             gpu="A100-80GB",
-            serve_model_id="Qwen/Qwen3.6-35B-A3B-FP8",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
             max_loras=12,
             max_lora_rank=32,
             max_model_len=8192,

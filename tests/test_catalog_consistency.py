@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-from flash.catalog import DEFAULT_MODEL, MODELS, get_model
+from flash.catalog import DEFAULT_MODEL, MODELS, SERVING_FP8_MODEL_REPOS, get_model
 from flash.providers.base import KNOWN, canonical_gpu
 
 
@@ -48,25 +48,28 @@ def test_serving_capacity_matches_validated_matrix():
     expected = {
         "openbmb/MiniCPM5-1B": {
             "gpu": "L4",
+            "serve_model_id": "Freesolo-Co/MiniCPM5-1B-FP8",
             "max_loras": 16,
             "max_lora_rank": 64,
             "max_model_len": 32768,
         },
         "Qwen/Qwen3.5-0.8B": {
             "gpu": "L4",
+            "serve_model_id": "Freesolo-Co/Qwen3.5-0.8B-FP8",
             "max_loras": 16,
             "max_lora_rank": 64,
             "max_model_len": 32768,
         },
         "Qwen/Qwen3.5-2B": {
             "gpu": "L4",
+            "serve_model_id": "Freesolo-Co/Qwen3.5-2B-FP8",
             "max_loras": 16,
             "max_lora_rank": 64,
             "max_model_len": 32768,
         },
         "Qwen/Qwen3.5-4B": {
             "gpu": "L4",
-            "serve_model_id": "lovedheart/Qwen3.5-4B-FP8",
+            "serve_model_id": "Freesolo-Co/Qwen3.5-4B-FP8",
             "max_loras": 64,
             "max_lora_rank": 32,
             "max_model_len": 8192,
@@ -75,7 +78,7 @@ def test_serving_capacity_matches_validated_matrix():
         },
         "Qwen/Qwen3.5-9B": {
             "gpu": "L4",
-            "serve_model_id": "lovedheart/Qwen3.5-9B-FP8",
+            "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
             "max_loras": 44,
             "max_lora_rank": 32,
             "max_model_len": 8192,
@@ -104,17 +107,25 @@ def test_public_rows_include_serving_capacity():
     row = get_model("Qwen/Qwen3.5-4B").to_dict()
     assert row["serving"]["gpu"] == "L4"
     assert row["serving"]["max_loras"] == 64
-    assert row["serving"]["serve_model_id"] == "lovedheart/Qwen3.5-4B-FP8"
+    assert row["serving"]["serve_model_id"] == "Freesolo-Co/Qwen3.5-4B-FP8"
 
 
 def test_public_rows_prune_unset_serving_capacity_fields():
     row = get_model("openbmb/MiniCPM5-1B").to_dict()
     assert row["serving"] == {
         "gpu": "L4",
+        "serve_model_id": "Freesolo-Co/MiniCPM5-1B-FP8",
         "max_loras": 16,
         "max_lora_rank": 64,
         "max_model_len": 32768,
     }
+
+
+def test_serving_fp8_repos_are_owned_except_official_35b() -> None:
+    owned = {k: v for k, v in SERVING_FP8_MODEL_REPOS.items() if k != "Qwen/Qwen3.6-35B-A3B"}
+    assert len(owned) == 5
+    assert all(repo.startswith("Freesolo-Co/") for repo in owned.values())
+    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B-FP8"
 
 
 def test_default_model_is_thinking_capable():
