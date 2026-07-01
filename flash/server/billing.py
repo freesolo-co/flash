@@ -81,17 +81,22 @@ def precheck_training_run(*, internal_key: str, org_id: str, estimate_usd: float
     return _post_billing(token=internal_key, path=_PRECHECK_PATH, body=body)
 
 
-def charge_completed_run(*, internal_key: str, status) -> dict:
-    """Charge one completed run; backend route is idempotent by runId."""
+def _charge_run(
+    *, internal_key: str, status, total_usd: float, cost_basis: str, cost_source: str
+) -> dict:
+    """POST a customer charge for one run; backend route is idempotent by runId.
+
+    ``cost_basis``/``cost_source`` ride on the (free-form) estimate metadata for audit -- they say
+    where ``total_usd`` came from."""
     context = status.billing_context if isinstance(status.billing_context, dict) else {}
     org_id = org_id_of(context)
     if not org_id:
-        raise BillingError(400, "missing billing org id for completed training run")
+        raise BillingError(400, "missing billing org id for training run")
     spec = status.spec or {}
     remote = status.remote or {}
     gpu = remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type")
     provider = remote.get("provider")
-    total_usd = float(status.cost_usd or 0.0)
+    total_usd = float(total_usd or 0.0)
     body = {
         "orgId": org_id,
         "runId": status.run_id,
@@ -102,8 +107,23 @@ def charge_completed_run(*, internal_key: str, status) -> dict:
         "model": spec.get("model"),
         "estimate": {
             "totalUsd": total_usd,
-            "costBasis": "final",
-            "costSource": "run_status.cost_usd",
+            "costBasis": cost_basis,
+            "costSource": cost_source,
         },
     }
     return _post_billing(token=internal_key, path=_COMPLETION_CHARGE_PATH, body=body)
+
+
+def charge_completed_run(*, internal_key: str, status) -> dict:
+    """Charge one run its ``cost_usd`` -- the flash.cost estimate we quoted it at.
+
+    ``cost_usd`` is the quote (planned steps) for a completed run, or the estimate at the steps
+    actually run for a run cancelled mid-training (set by deploy.cancel_run). Backend route is
+    idempotent by runId."""
+    return _charge_run(
+        internal_key=internal_key,
+        status=status,
+        total_usd=float(status.cost_usd or 0.0),
+        cost_basis="estimate",
+        cost_source="run_status.cost_usd",
+    )

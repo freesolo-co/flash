@@ -27,6 +27,8 @@ def cancel_run(run_id: str) -> RunStatus:
         TERMINAL_STATES,
         _gc_run_endpoints,
         _update,
+        actual_steps_run,
+        charge_usd_for_spec,
         get_status,
         mark_deployment_undeployed,
     )
@@ -37,6 +39,13 @@ def cancel_run(run_id: str) -> RunStatus:
     # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
     entered_deployed = status.state == "deployed"
     spec = JobSpec.from_dict(status.spec)
+    # A run cancelled MID-training is re-priced to how far it got: the same flash.cost estimate, but
+    # at the steps it actually ran instead of the planned steps. A `deployed` run already COMPLETED
+    # training (its cost_usd is the full quote), so it keeps that and isn't re-priced here. The price
+    # is snapshotted AFTER the remote worker is torn down (below), from the freshest persisted
+    # heartbeat, so a step the worker finished between this cancel request and teardown isn't
+    # undercounted.
+    bill_cancel = bool(status.billing_context) and not entered_deployed
     remote = status.remote or {}
     if status.state == "deployed":
         try:
@@ -59,10 +68,20 @@ def cancel_run(run_id: str) -> RunStatus:
         except Exception:
             pass
     _gc_run_endpoints(spec)
+    # Price the cancel now that the worker is torn down, from the freshest persisted heartbeat.
+    cancel_charge_usd: float | None = (
+        charge_usd_for_spec(spec, steps=actual_steps_run(get_status(run_id)), fallback=0.0)
+        if bill_cancel
+        else None
+    )
     from flash.server._locks import _deploy_lock
 
     with _deploy_lock(run_id):
-        _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
+        # Set the cancel charge (estimate at actual steps) when re-pricing a mid-training cancel; a
+        # deployed-then-cancelled run keeps its already-quoted cost_usd. The billing_retry sweep
+        # charges the run from cost_usd (idempotent by runId).
+        cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
+        _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
         final = get_status(run_id)
         if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
             with contextlib.suppress(Exception):
@@ -90,6 +109,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _RunCancelled,
         _update,
         artifacts_dir,
+        charge_usd_for_spec,
         get_status,
     )
 
@@ -139,19 +159,24 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
 
                 code_prefix = flash_code_prefix()
                 upload_code(spec.train.hf_repo, code_prefix=code_prefix)
-            _run_training(spec, log, prior_cost=float(status.cost_usd or 0.0), code_prefix=code_prefix)
+            _run_training(
+                spec, log, prior_cost=float(status.cost_usd or 0.0), code_prefix=code_prefix
+            )
             return get_status(run_id)
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
         # Add the recovered run's cost to any already booked before the restart so recovery
         # doesn't underreport spend.
-        total = float(status.cost_usd or 0.0) + _persist_metrics(spec, res.metrics)
+        measured = float(status.cost_usd or 0.0) + _persist_metrics(spec, res.metrics)
+        # Charge the QUOTE (flash.cost estimate for the planned steps), not the measured wall;
+        # recovery doesn't change the quote. Falls back to measured only if the spec can't be priced.
+        charge_usd = charge_usd_for_spec(spec, fallback=measured)
         # A cancel can land while this thread persists the recovered metrics (after the late-cancel
         # check above). Re-read before the terminal "done" so a late worker success can't resurrect
         # a user-cancelled run. _RunCancelled is caught below, leaving the cancellation intact.
         if get_status(run_id).state == "cancelled":
             raise _RunCancelled(f"run {run_id} was cancelled")
-        _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
+        _update(run_id, "done", cost_usd=charge_usd, artifacts_dir=artifacts_dir(spec))
     except _RunCancelled:
         pass  # cancel_run already wrote terminal `cancelled`
     except Exception as exc:
