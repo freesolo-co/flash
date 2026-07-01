@@ -650,6 +650,9 @@ def cmd_deployments(args) -> int:
 def cmd_chat(args) -> int:
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
+    system = getattr(args, "system", None)
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
     if render.styled():
         print(render.chat_label())
     stream = getattr(client, "chat_stream", None)

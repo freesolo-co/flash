@@ -241,7 +241,10 @@ class ApiClient:
             raise
 
     def cancel_run(self, run_id: str) -> dict:
-        return self._request("POST", f"/v1/runs/{run_id}/cancel")
+        # Cancel blocks on synchronous provider teardown (worker stop + instance destroy +
+        # endpoint GC), which can far exceed the default 60s — timing out here left the CLI
+        # printing a traceback while the server went on to mark the run cancelled anyway.
+        return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=10 * 60)
 
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""

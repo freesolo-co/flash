@@ -330,6 +330,22 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat_stream"
 
 
+def test_chat_system_flag_prepends_system_message(fake_client) -> None:
+    """--system gives evals training-prompt parity without calling the HTTP API directly."""
+    assert _run(["chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0
+    _, _, messages = fake_client.calls[-1]
+    assert messages == [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "What is 6*7?"},
+    ]
+
+
+def test_chat_without_system_flag_sends_user_message_only(fake_client) -> None:
+    assert _run(["chat", "flash-1", "-m", "What is 6*7?"]) == 0
+    _, _, messages = fake_client.calls[-1]
+    assert messages == [{"role": "user", "content": "What is 6*7?"}]
+
+
 @pytest.mark.parametrize("flag", ["--enable-thinking", "--disable-thinking"])
 def test_chat_does_not_expose_thinking_override_flags(fake_client, flag) -> None:
     with pytest.raises(SystemExit) as excinfo:

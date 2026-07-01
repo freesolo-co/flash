@@ -519,6 +519,32 @@ def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp
     assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
 
 
+def test_freesolo_adapter_warns_on_dropped_record_keys(monkeypatch, tmp_path, capsys):
+    """Canonicalization keeps only input/output/id/metadata; extra top-level keys used to be
+    dropped silently — now a one-time stderr warning names them."""
+    import flash.envs.adapter as adapter_mod
+
+    monkeypatch.setattr(adapter_mod, "_WARNED_DROPPED_RECORD_KEYS", set())
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "datasets/train.jsonl": (
+                '{"id":"t","input":"x","output":"y","initial_state":[1,2],'
+                '"metadata":{"kept":true}}\n'
+            )
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    rows = env.dataset()
+    assert rows == [{"id": "t", "input": "x", "output": "y", "metadata": {"kept": True}}]
+    err = capsys.readouterr().err
+    assert "initial_state" in err and "dropped" in err
+
+
 def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
     class NoSystemEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]

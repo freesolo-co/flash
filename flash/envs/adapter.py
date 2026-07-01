@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tarfile
 import tempfile
 import urllib.error
@@ -41,6 +42,8 @@ _TAR_METADATA_TYPES = {
 }
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+# Key names already warned about as dropped by record canonicalization (warn once per name).
+_WARNED_DROPPED_RECORD_KEYS: set[str] = set()
 
 
 def _with_system_prompt(messages: list[dict], contract_text: str) -> list[dict]:
@@ -877,6 +880,19 @@ class FreesoloEnvironment(BaseEnvironment):
         metadata = raw.get("metadata")
         if isinstance(metadata, dict) and metadata:
             canonical["metadata"] = metadata
+        # Canonicalization keeps only input/output/id/metadata; anything else (board state,
+        # minimal_solutions, ...) is dropped. That used to be SILENT, so envs relying on extra
+        # top-level keys trained/scored without them. Warn once per key name.
+        dropped = set(raw) - {_CANONICAL_INPUT_KEY, _CANONICAL_OUTPUT_KEY, "id", "metadata"}
+        new = dropped - _WARNED_DROPPED_RECORD_KEYS
+        if new:
+            _WARNED_DROPPED_RECORD_KEYS.update(new)
+            print(
+                f"[env] warning: dataset record keys {sorted(new)} are dropped by "
+                "canonicalization (records keep only input/output/id/metadata); nest task "
+                "data under 'metadata' to preserve it on the worker",
+                file=sys.stderr,
+            )
         return canonical
 
     def _reward_to_breakdown(self, reward) -> dict[str, float]:
