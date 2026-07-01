@@ -114,7 +114,7 @@ def retry_completion_charges_once(should_stop: Callable[[], bool] | None = None)
             # (billing_context + cost_usd + the raw spec dict), so we never reparse the JobSpec. A
             # legacy/stale persisted spec that `JobSpec.from_dict` would reject must NOT block recovery
             # of a real pending/failed charge. Append to the run log so retries surface in
-            # `flash status --logs`.
+            # `flash log`.
             with open(runner.runs_file_path(run_id, ".log"), "a") as log:
                 _charge_completed_run_by_id(run_id, log)
             if runner.get_status(run_id).billing_state == "charged":

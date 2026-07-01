@@ -61,10 +61,11 @@ class _FakeClient:
         }
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        logs = self.log_text[max(0, int(offset)) :]
         return {
             "run_id": run_id,
-            "logs": self.log_text,
-            "offset": 22,
+            "logs": logs,
+            "offset": len(self.log_text),
             "state": "done",
         }
 
@@ -216,7 +217,7 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert "[gpu] config table" not in out
 
 
-def test_status_runs_and_status_logs(fake_client, capsys) -> None:
+def test_status_runs_and_log_command(fake_client, capsys) -> None:
     assert _run(["status", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert "done" in out
@@ -229,27 +230,47 @@ def test_status_runs_and_status_logs(fake_client, capsys) -> None:
     assert "done" in out
     assert "SFT" in out
 
-    assert _run(["status", "flash-1", "--logs"]) == 0
-    out = capsys.readouterr().out
-    assert "hello from the worker" in out
-    # --logs always appends the real train-subprocess stdout fetched from the run's HF repo.
-    assert "----- console_sft.txt -----" in out
-    assert "worker stdout line" in out
-    assert "cost_usd" in out
-
     assert _run(["status", "flash-1", "--follow"]) == 0
     out = capsys.readouterr().out
-    assert "hello from the worker" in out
     assert "cost_usd" in out
+    assert "hello from the worker" not in out
 
-
-def test_status_logs_separates_partial_log_line_from_json(fake_client, capsys) -> None:
-    fake_client.log_text = "partial log line"
-    fake_client.get_worker_output = lambda run_id: {}  # isolate: log->status separation only
-
-    assert _run(["status", "flash-1", "--logs"]) == 0
+    assert _run(["log", "flash-1"]) == 0
     out = capsys.readouterr().out
-    assert "partial log line\n{" in out
+    assert "hello from the worker" in out
+    assert "----- console_sft.txt -----" in out
+    assert "worker stdout line" in out
+    assert "cost_usd" not in out
+
+
+def test_log_prints_partial_log_line_with_newline(fake_client, capsys) -> None:
+    fake_client.log_text = "partial log line"
+    fake_client.get_worker_output = lambda run_id: {}
+
+    assert _run(["log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+    assert out == "partial log line\n"
+
+
+def test_log_snapshot_reads_one_offset_page_without_status(fake_client, capsys) -> None:
+    calls = []
+    pages = {
+        0: {"run_id": "flash-1", "logs": "first\n", "offset": 6, "state": "running"},
+        6: {"run_id": "flash-1", "logs": "second\n", "offset": 13, "state": "done"},
+        13: {"run_id": "flash-1", "logs": "", "offset": 13, "state": "done"},
+    }
+
+    def get_logs(run_id: str, offset: int = 0) -> dict:
+        calls.append(offset)
+        return pages[offset]
+
+    fake_client.get_logs = get_logs
+    fake_client.get_worker_output = lambda run_id: {}
+
+    assert _run(["log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+    assert out == "first\n"
+    assert calls == [0]
 
 
 def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:

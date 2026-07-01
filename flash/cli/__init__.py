@@ -35,6 +35,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_env_setup,
     cmd_export,
     cmd_gpus,
+    cmd_log,
     cmd_login,
     cmd_models,
     cmd_runs,
@@ -83,7 +84,8 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         "training",
         [
             ("train", "submit a managed run from a TOML config"),
-            ("status", "show a run's status, logs, or live follow"),
+            ("status", "show a run's current status"),
+            ("log", "print or follow a run's logs"),
             ("runs", "list runs with their state and cost"),
             ("checkpoints", "list a run's deployable RL checkpoints"),
             ("cancel", "cancel a running job"),
@@ -309,21 +311,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     train.set_defaults(func=cmd_train)
 
-    status = sub.add_parser("status", help="show a run's status, logs, or follow logs")
+    status = sub.add_parser("status", help="show a run's current status")
     status.add_argument("run_id")
-    status.add_argument(
-        "--logs",
-        action="store_true",
-        help="print current logs before status — the orchestrator log plus the train-subprocess "
-        "stdout + traceback (console_/error_<phase>.txt) fetched from the run's HF artifact repo",
-    )
     status.add_argument(
         "-f",
         "--follow",
         action="store_true",
-        help="stream logs until the run ends, then print final status",
+        help="poll status until the run ends without replaying logs",
     )
     status.set_defaults(func=cmd_status)
+
+    log = sub.add_parser(
+        "log",
+        help="print a run's full logs, including worker console/error artifacts",
+    )
+    log.add_argument("run_id")
+    log.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="stream logs until the run reaches a terminal state",
+    )
+    log.set_defaults(func=cmd_log)
 
     runs = sub.add_parser("runs", help="list runs and their state/cost")
     runs.set_defaults(func=cmd_runs)

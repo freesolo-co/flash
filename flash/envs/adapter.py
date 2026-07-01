@@ -1032,10 +1032,11 @@ class FreesoloEnvironment(BaseEnvironment):
             episode_turns: int | None = int(self._env.max_episode_turns(task))
         except Exception:
             episode_turns = None
+        messages = [dict(message) for message in prompt]
         return {
             "task": task,
-            "prompt": [dict(message) for message in prompt],
-            "messages": [dict(message) for message in prompt],
+            "prompt": prompt,
+            "messages": messages,
             "turns": [],
             "done": False,
             "response_text": "",
