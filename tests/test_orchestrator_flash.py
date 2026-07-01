@@ -53,10 +53,10 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         status = runner.submit_job(spec, dry_run=False, background=False)
 
         assert status.state == "done", status.error
-        # 1h on a 4090 at the projected static rate.
         from flash.providers.runpod.pricing import hourly_rate
 
-        assert abs(status.cost_usd - hourly_rate("RTX 4090")) < 1e-6, status.cost_usd
+        # We charge the QUOTE (flash.cost estimate); the measured 1h-on-a-4090 cost lands in metrics.json.
+        assert status.cost_usd == runner.charge_usd_for_spec(spec), status.cost_usd
         assert captured["gpu"] == "RTX 4090"
 
         # Metrics are namespaced by run id so same-phase runs cannot collide.
@@ -64,6 +64,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         assert os.path.exists(metrics_path)
         with open(metrics_path) as f:
             m = json.load(f)
+        assert abs(m["cost_usd"] - hourly_rate("RTX 4090")) < 1e-6  # measured: 1h on the 4090
         assert m["trained_eval_acc"] == 0.7
         assert m["notes"]["runpod_gpu"] == "RTX 4090"
 
