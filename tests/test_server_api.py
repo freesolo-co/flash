@@ -882,7 +882,7 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
     error: it returns a 409 telling the caller to `flash deploy <run> --step N`."""
     import flash.runner as runner
     import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    from flash.serve.deploy import AdapterConfigMissing
 
     key = _login()
     run_id = api.post(
@@ -893,7 +893,7 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
     runner._save_status(status)
 
     def boom(**kwargs):
-        raise ServingError(
+        raise AdapterConfigMissing(
             "could not verify adapter rank: failed to read org/repo:rl/x/adapter/adapter_config.json"
         )
 
@@ -914,7 +914,7 @@ def test_deploy_missing_adapter_without_checkpoints_stays_502(api, monkeypatch):
     """No checkpoints to point at -> keep the 502 with the upstream reason."""
     import flash.runner as runner
     import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    from flash.serve.deploy import AdapterConfigMissing
 
     key = _login()
     run_id = api.post(
@@ -925,7 +925,7 @@ def test_deploy_missing_adapter_without_checkpoints_stays_502(api, monkeypatch):
     runner._save_status(status)
 
     def boom(**kwargs):
-        raise ServingError("could not verify adapter rank: failed to read org/repo:x")
+        raise AdapterConfigMissing("could not verify adapter rank: failed to read org/repo:x")
 
     monkeypatch.setattr(app_mod, "deploy_adapter", boom)
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: [])

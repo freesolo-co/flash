@@ -25,6 +25,10 @@ class ServingError(RuntimeError):
         self.status_code = status_code
 
 
+class AdapterConfigMissing(ServingError):
+    """The adapter's adapter_config.json could not be read from HF (artifact likely absent)."""
+
+
 def _serving_request(
     method: str,
     url: str,
@@ -166,7 +170,7 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
             token=os.environ.get("HF_TOKEN"),
         )
     except Exception as exc:
-        raise ServingError(
+        raise AdapterConfigMissing(
             f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
         ) from exc
     try:

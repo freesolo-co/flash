@@ -21,7 +21,7 @@ from flash.runner import (
     mark_undeployed,
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
-from flash.serve.deploy import ServingError
+from flash.serve.deploy import AdapterConfigMissing, ServingError
 from flash.server import app as _app
 from flash.server import db
 from flash.server._deps import _require_bool, owned_run, require_key
@@ -157,9 +157,9 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             # A run-level deploy targets <prefix>/adapter, which only exists once finalize
             # completed; a cancelled/preempted/interrupted run may carry only per-step
             # checkpoints/step-N/adapter snapshots. Reading the missing run-level config
-            # surfaces as "failed to read ...adapter_config.json" — turn that into actionable
-            # guidance (deploy --step N) instead of an opaque 502 rank-verification error.
-            if not is_checkpoint and "failed to read" in str(exc):
+            # surfaces as AdapterConfigMissing — turn that into actionable guidance
+            # (deploy --step N) instead of an opaque 502 rank-verification error.
+            if not is_checkpoint and isinstance(exc, AdapterConfigMissing):
                 steps = [c["step"] for c in _app.list_checkpoints(spec)]
                 if steps:
                     raise HTTPException(
