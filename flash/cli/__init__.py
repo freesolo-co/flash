@@ -354,6 +354,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
     )
     deploy.add_argument("--dry-run", action="store_true")
+    deploy.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="skip the post-deploy smoke generation (registration alone does NOT guarantee the "
+        "adapter serves; only verified deployments should be scored by evals)",
+    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")

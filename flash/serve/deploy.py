@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 
@@ -15,6 +16,12 @@ from flash.providers.base import canonical_gpu
 logger = get_logger(__name__)
 
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
+
+# Read-back verification: after POST /adapters, poll the serving registry until the adapter is
+# visible at the requested checkpoint, so "ready" is a registry-backed claim rather than an
+# assumption (see _verify_adapter_registered).
+READBACK_ATTEMPTS = 5
+READBACK_DELAY_SECONDS = 2.0
 
 
 class ServingError(RuntimeError):
@@ -120,6 +127,9 @@ class Deployment:
     openai_model: str
     endpoint_name: str
     state: str = "ready"
+    # The OpenAI-compatible base URL. endpoint_name is the bare serving root; OpenAI clients must
+    # be pointed at {endpoint_name}/v1 or their /chat/completions calls 404.
+    url: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -231,18 +241,19 @@ def deploy_adapter(
             adapter_artifact_lora_rank(hf_repo, subfolder),
             rank_source="adapter artifact",
         )
+    base = serving_base_url()
     dep = Deployment(
         run_id=run_id,
         model=model,
         adapter_hf_prefix=subfolder,
         gpu=friendly,
         openai_model=run_id,
-        endpoint_name=serving_base_url(),
+        endpoint_name=base,
         state="dry_run" if dry_run else "ready",
+        url=f"{base}/v1",
     )
     if dry_run:
         return dep
-    base = serving_base_url()
     body = {
         "adapterId": run_id,
         "repoId": hf_repo,
@@ -257,9 +268,91 @@ def deploy_adapter(
     normalized_org_id = (org_id or "").strip()
     if normalized_org_id:
         body["orgId"] = normalized_org_id
-    _post_adapter_or_raise(f"{base}/adapters", body)
+    try:
+        _post_adapter_or_raise(f"{base}/adapters", body)
+    except ServingError as exc:
+        # A 4xx means serving rejected the request outright and nothing changed. Anything else
+        # (5xx, timeout, unreachable) is ambiguous: the registry may or may not have switched to
+        # the new checkpoint. Read it back and report the actual state instead of guessing.
+        if exc.status_code is not None and exc.status_code < 500:
+            raise
+        recorded = _record_subfolder(_registered_adapter(run_id))
+        if recorded == subfolder:
+            logger.warning(
+                "POST /adapters for %s failed (%s) but the serving registry shows the requested "
+                "checkpoint; continuing",
+                run_id,
+                exc,
+            )
+        elif recorded is not None:
+            raise ServingError(
+                f"{exc} — the serving registry still shows adapter {run_id} at the previously "
+                f"deployed checkpoint ({recorded!r}, requested {subfolder!r}), so the OLD "
+                "checkpoint remains active. Retry `flash deploy` once serving recovers",
+                status_code=exc.status_code,
+            ) from exc
+        else:
+            raise
+    else:
+        _verify_adapter_registered(run_id, subfolder)
     logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
+
+
+def _record_subfolder(record: dict | None) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    value = record.get("subfolder")
+    return str(value) if value is not None else None
+
+
+def _registered_adapter(run_id: str) -> dict | None:
+    """The adapter's record in the serving registry, or None when absent or unreadable."""
+    try:
+        resp = _serving_request("GET", f"{serving_base_url()}/adapters")
+        payload = resp.json()
+    except (ServingError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for record in payload.get("adapters") or []:
+        if isinstance(record, dict) and record.get("adapter_id", record.get("adapterId")) == run_id:
+            return record
+    return None
+
+
+def _verify_adapter_registered(run_id: str, subfolder: str) -> None:
+    """Poll the serving registry until the adapter is visible at the requested checkpoint.
+
+    A 2xx from POST /adapters only proves the registration request was accepted. If the record
+    never lands in the registry, /v1/chat/completions 404s with "Unknown adapter id" even though
+    the deployment record claims ready. Polling here makes "ready" a registry-backed claim.
+    """
+    recorded: str | None = None
+    seen = False
+    for attempt in range(READBACK_ATTEMPTS):
+        if attempt:
+            time.sleep(READBACK_DELAY_SECONDS * attempt)
+        record = _registered_adapter(run_id)
+        if record is None:
+            continue
+        seen = True
+        recorded = _record_subfolder(record)
+        # Older serving builds may omit subfolder from the record; presence then has to count.
+        if recorded is None or recorded == subfolder:
+            return
+    if seen:
+        raise ServingError(
+            f"adapter {run_id} is registered at checkpoint {recorded!r} instead of the requested "
+            f"{subfolder!r}; the previously deployed checkpoint is still active — retry "
+            "`flash deploy`"
+        )
+    raise ServingError(
+        f"adapter {run_id} was accepted by serving but never appeared in its registry; chat "
+        "requests would fail with HTTP 404 'Unknown adapter id'. The deployment was not marked "
+        "ready — retry `flash deploy`, and if this persists an operator must check the freesolo "
+        "serving app"
+    )
 
 
 def undeploy_adapter(run_id: str) -> list[str]:
@@ -269,6 +362,12 @@ def undeploy_adapter(run_id: str) -> list[str]:
     resp = _serving_request("DELETE", url, ok_statuses=(404,))
     if resp.status_code == 404:
         return []
+    if _registered_adapter(run_id) is not None:
+        logger.warning(
+            "adapter %s still appears in the serving registry after DELETE; a stale router may "
+            "keep serving it until its next reload",
+            run_id,
+        )
     logger.info("deregistered adapter %s from freesolo serving (%s)", run_id, base)
     return [run_id]
 

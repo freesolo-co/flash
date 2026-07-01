@@ -212,7 +212,13 @@ def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
         # Idempotent: clear local record even if serving side already had no adapter.
         if status.deployment:
             mark_undeployed(run_id)
-        return {"run_id": run_id, "deleted_endpoints": deleted}
+        # serving_deregistered=False means serving had nothing to delete (already gone or never
+        # actually registered) — the record teardown above still happened either way.
+        return {
+            "run_id": run_id,
+            "deleted_endpoints": deleted,
+            "serving_deregistered": bool(deleted),
+        }
 
 
 @router.post("/v1/runs/{run_id}/export")
