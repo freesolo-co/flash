@@ -30,6 +30,20 @@ from flash.spec import JobSpec
 
 router = APIRouter()
 
+def _chat_messages_from_payload(payload: dict) -> list[dict]:
+    raw = payload.get("messages")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="messages must be a list")
+    for index, message in enumerate(raw):
+        if not isinstance(message, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"messages[{index}] must be a chat message object",
+            )
+    return raw
+
 
 def _validate_hf_repo_id(repository: str) -> None:
     """Validate HF repo id grammar early — malformed ids only 502 AFTER downloading the private source adapter."""
@@ -266,6 +280,7 @@ def deployments(key: Annotated[dict, Depends(require_key)]):
 
 @router.post("/v1/runs/{run_id}/chat")
 def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)]):
+    messages = _chat_messages_from_payload(payload)
     status = owned_run(run_id, key)
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
@@ -315,7 +330,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             return StreamingResponse(
                 _app.serve_chat_stream(
                     run_id=run_id,
-                    messages=payload.get("messages") or [],
+                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     thinking=spec.thinking,
@@ -324,7 +339,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             )
         return _app.serve_chat(
             run_id=run_id,
-            messages=payload.get("messages") or [],
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             thinking=spec.thinking,

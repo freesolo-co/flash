@@ -1,10 +1,10 @@
 """Daily realized-cost reconciliation: pull what the GPU provider actually billed for each
 finished run and report it to the freesolo backend for estimator accuracy tracking.
 
-Flash charges customer-facing training usage from the completed run's final ``cost_usd``. This
-job is the COGS side: the realized provider invoice (RunPod /v1/billing/endpoints).
-The backend's training_cost_accuracy view joins the two per run to surface
-charged-vs-realized error.
+Flash charges customer-facing training usage from the run's ``cost_usd`` (the flash.cost estimate).
+This job is the COGS side: the realized provider invoice (RunPod /v1/billing/endpoints). What it
+REPORTS (via ``/api/billing/training-cost``) is COGS, not a customer charge. The backend's
+training_cost_accuracy view joins the two per run to surface charged-vs-realized error.
 
 Best-effort and entirely off the run hot path: it runs in a background loop (see the server
 lifespan), never blocks request handling, and any failure is swallowed and retried next cycle.
@@ -92,7 +92,9 @@ def _due(status: runner.RunStatus, now: float) -> bool:
         return False
     if status.reconciled_at:
         return False
-    age = now - _terminal_ts(status)  # from teardown, not a later updated_at bump (see _terminal_ts)
+    age = now - _terminal_ts(
+        status
+    )  # from teardown, not a later updated_at bump (see _terminal_ts)
     if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
         return False
     return bool(status.remote)
@@ -115,7 +117,9 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     run_end = _terminal_ts(status)
     # RunPod's billing query pads past run end so the settled invoice is in range; the instance
     # providers bill flat $/hr to teardown, so they get the UN-padded run_end (no extra settle hour).
-    realized = realized_cost_for_remote(remote, start=start, end=run_end + _SETTLE_SECONDS, run_end=run_end)
+    realized = realized_cost_for_remote(
+        remote, start=start, end=run_end + _SETTLE_SECONDS, run_end=run_end
+    )
     if realized is None or realized.realized_usd <= 0:
         return False
 

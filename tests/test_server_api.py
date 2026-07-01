@@ -1026,6 +1026,47 @@ def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
     assert "enable_thinking" not in seen
 
 
+def test_chat_forwards_user_supplied_system_prompt(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
+
+    messages = [
+        {"role": "system", "content": "stay terse"},
+        {"role": "user", "content": "hello"},
+    ]
+    resp = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": messages,
+            "chat_template_kwargs": {"enable_thinking": True},
+            "enable_thinking": True,
+        },
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["messages"] == messages
+    assert seen["thinking"] is False
+    assert "enable_thinking" not in seen
+
+
 def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkeypatch):
     """A run cancelled mid-RL can deploy a per-step checkpoint (stays `cancelled`, listed active by
     /v1/deployments). The chat route must SERVE that live adapter, not 409 on the cancelled state."""

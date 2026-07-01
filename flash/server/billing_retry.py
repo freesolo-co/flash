@@ -13,6 +13,11 @@ re-invokes the same charge hook. The backend charge route is IDEMPOTENT by ``run
 that races or duplicates a charge the inline path (or a prior sweep) already landed is a safe no-op
 (replay) -- there is no way to double-charge.
 
+It also bills runs CANCELLED mid-training: those never reach the inline completion charge. The cancel
+path (deploy.cancel_run) re-prices such a run to the steps it actually ran -- the same flash.cost
+estimate at ``actual_steps`` instead of the planned steps -- and stores it as ``cost_usd``, so the
+sweep charges it through the SAME path as a completed run.
+
 It runs once at startup (so a crash between the ``done`` write and the charge is recovered promptly,
 even though those runs are terminal and outside recover_runs) and then on a fixed interval, which is
 the bounded backoff. Gated on the operator internal key (the charge needs it); off entirely without
@@ -34,14 +39,11 @@ from flash.server.auth import INTERNAL_KEY_ENV
 # never ran (a crash between the `done` write and the charge) is recovered via this set.
 _BILLABLE_STATES = frozenset({"done", "deployed"})
 
-# billing_state values that PROVE the completion charge machine already ran for this run, which only
-# happens after a run reached `done` (lifecycle._charge_completed_run_best_effort). So a run carrying
-# one of these has DEFINITELY completed training and incurred a charge, no matter what its current
-# state is now. This recovers a run that completed (`done`/`deployed`) and was LATER `cancelled`
-# (cancel flips a deployed run to `cancelled`, deploy.py:116) while its charge was still pending in
-# the backend -- without it, the widened cancel state would drop out of `_BILLABLE_STATES` and leak.
-# `pending` is intentionally NOT here: it is the submit-time default that a run cancelled BEFORE ever
-# completing also carries, so charging on `pending`+`cancelled` would bill a run that never trained.
+# billing_state values that mean a charge attempt already STARTED for this run. Paired with a
+# `cost_usd > 0` price (see `_needs_charge`), they recover a run whose charge was attempted but never
+# landed -- e.g. a `done`/`deployed` run later `cancelled` while its charge was still `charging`/
+# `failed`. `pending` is intentionally NOT here: it is the submit-time default a run cancelled BEFORE
+# running any step also carries, and such a run has `cost_usd` 0 -- it is never charged.
 _CHARGE_STARTED_STATES = frozenset({"charging", "failed"})
 
 
@@ -51,38 +53,35 @@ def charge_retry_enabled() -> bool:
 
 
 def _needs_charge(status: runner.RunStatus) -> bool:
-    """True for a completed run that carries customer billing context but isn't `charged` yet.
+    """True for a terminal run that carries customer billing context, has a price, and isn't charged.
 
-    Eligible when the run carries a customer billing context, isn't already `charged`, and EITHER it
-    is still in a billable terminal state (`done`/`deployed`) OR its charge machine already started
-    (`charging`/`failed`). The second arm recovers a run that completed training and was then
-    `cancelled` (e.g. a deployed run gets cancelled) while its charge was pending -- such a run leaves
-    `_BILLABLE_STATES` but provably completed, so its pending/failed charge must still be recovered.
-    A run cancelled BEFORE completing keeps the submit-time `pending` and a non-billable state, so it
-    stays ineligible: a run that never trained is never charged.
+    ``cost_usd`` is the amount we charge: the flash.cost quote for a completed run, or the estimate at
+    the steps actually run for a run cancelled mid-training (set by deploy.cancel_run). Eligible when
+    the run carries a billing context, isn't already `charged`, and:
+      - it is in a billable terminal state (`done`/`deployed`) -- charge its quote; or
+      - it is `cancelled` with `cost_usd > 0` -- charge the estimate-at-actual-steps the cancel path
+        priced (a run cancelled before any step has `cost_usd` 0 -> nothing to charge); or
+      - its charge machine already started (`charging`/`failed`) and it has a price (`cost_usd > 0`)
+        -- recover a charge that was attempted but never landed.
+    The backend route is idempotent by runId, so the inline charge and this sweep never double-charge.
 
-    KNOWN RESIDUAL LEAK (intentionally NOT closed here): a run that completed ALL training but whose
-    FIRST charge attempt never ran (e.g. attach_run finishes the run without the inline charge, so
-    billing_state stays `pending`) and is THEN deployed and cancelled ends up `cancelled`+`pending`
-    and is skipped. Post multi-seed-removal, `artifacts_dir`/`cost_usd` are written ONLY at the
-    terminal `done` hook (deploy.py attach_run + lifecycle.py), never mid-`running` -- so in principle
-    a `cancelled`+`pending` run that HAS `artifacts_dir` set provably reached `done` and could be
-    recovered, while one without it never completed (no separate "training completed" column is
-    needed -- `artifacts_dir` already is that durable marker). Gating the predicate on that changes
-    who gets charged, so it is deliberately left as a billing-reviewed follow-up rather than bundled
-    into cleanup; charging a partial/incomplete run is worse than this narrow leak, so the predicate
-    stays conservative."""
+    A run cancelled BEFORE running any step keeps the submit-time `pending`, a non-billable state, and
+    `cost_usd` 0, so it stays ineligible -- a run that never trained is never charged."""
     if not status.billing_context:
         return False
     if status.billing_state == "charged":
         return False
     if status.state in _BILLABLE_STATES:
         return True
-    return status.billing_state in _CHARGE_STARTED_STATES
+    cost = float(status.cost_usd or 0.0)
+    if status.state == "cancelled" and cost > 0:
+        return True
+    return status.billing_state in _CHARGE_STARTED_STATES and cost > 0
 
 
 def retry_completion_charges_once(should_stop: Callable[[], bool] | None = None) -> int:
-    """One sweep: re-invoke the completion charge for every completed-but-uncharged run.
+    """One sweep: charge every terminal-but-uncharged run from its ``cost_usd`` (the quote for a
+    completed run, or the estimate-at-actual-steps for a cancelled one).
 
     Returns how many runs ended this sweep ``charged``. Reuses the runner's charge hook (the single
     source of truth for the billing state machine -- it sets ``charging``, charges, then records
@@ -113,9 +112,9 @@ def retry_completion_charges_once(should_stop: Callable[[], bool] | None = None)
                 continue
             # Charge by run id -- the charge reads everything it needs from the persisted RunStatus
             # (billing_context + cost_usd + the raw spec dict), so we never reparse the JobSpec. A
-            # legacy/stale persisted spec that `JobSpec.from_dict` would reject must NOT block
-            # recovery of a real pending/failed charge.
-            # Append to the run log so retry attempts surface in `flash status --logs`.
+            # legacy/stale persisted spec that `JobSpec.from_dict` would reject must NOT block recovery
+            # of a real pending/failed charge. Append to the run log so retries surface in
+            # `flash log`.
             with open(runner.runs_file_path(run_id, ".log"), "a") as log:
                 _charge_completed_run_by_id(run_id, log)
             if runner.get_status(run_id).billing_state == "charged":
