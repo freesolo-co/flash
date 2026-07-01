@@ -175,6 +175,21 @@ def test_publish_rejects_mismatched_explicit_namespace(monkeypatch):
     assert "namespace" in str(excinfo.value)
 
 
+def test_publish_rejects_invalid_explicit_namespace(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
+
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL),
+            name="!!!/math-python",
+            key={"org_slug": "env"},
+        )
+
+    assert excinfo.value.status == 400
+    assert "env namespace" in str(excinfo.value)
+
+
 def test_publish_rejects_bad_input(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)

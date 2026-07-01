@@ -44,6 +44,7 @@ _TAR_METADATA_TYPES = {
 }
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+_NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
 def _human_mb(n: int) -> str:
@@ -65,7 +66,7 @@ def namespace_for(key: dict) -> str:
             "authenticated Freesolo key must include an org slug (used to derive the hub namespace) — "
             "publish with a key created at https://freesolo.co/sign-in (`flash login`)"
         )
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", slug):
+    if not _NAMESPACE_RE.fullmatch(slug):
         raise EnvPublishError("authenticated Freesolo key has an invalid org slug")
     return slug
 
@@ -85,7 +86,9 @@ def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
     parts = [part.strip() for part in raw.split("/")]
     if len(parts) != 2 or not all(parts):
         raise EnvPublishError("env name with namespace must be 'namespace/name'")
-    namespace = _sanitize_name(parts[0])
+    namespace = parts[0]
+    if not _NAMESPACE_RE.fullmatch(namespace):
+        raise EnvPublishError("env namespace must match [a-z0-9][a-z0-9._-]*")
     clean = _sanitize_name(parts[1])
     if namespace != caller_namespace:
         raise EnvPublishError(
