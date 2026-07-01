@@ -259,7 +259,7 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     if not env_id or spec.environment.resolved_sha:
         return spec
     try:
-        from flash.envs.adapter import (
+        from flash.envs.loader import (
             _parse_github_environment_ref,
             _resolve_ref_sha,
             is_managed_environment_slug,

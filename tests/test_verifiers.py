@@ -751,7 +751,7 @@ def test_github_environment_ref_parsing():
 
 
 def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(
@@ -776,7 +776,7 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
 
 
 def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -796,7 +796,7 @@ def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, 
 
 
 def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -821,7 +821,7 @@ def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path,
 
 
 def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -836,7 +836,7 @@ def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, mon
 
 
 def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
-    from flash.envs.adapter import _safe_extract_archive
+    from flash.envs.loader import _safe_extract_archive
 
     def make_members_tar(members: list[tuple[str, bytes | None]]):
         tar = io.BytesIO()
@@ -854,14 +854,14 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
 
     dest = tmp_path / "extract_many"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 0)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_MEMBERS", 0)
     with pytest.raises(RuntimeError, match="too many members"):
         _safe_extract_archive(make_members_tar([("a", b"")]), dest)
 
     dest = tmp_path / "extract_big"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 5)
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 1)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_MEMBERS", 5)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_BYTES", 1)
     with pytest.raises(RuntimeError, match="too large"):
         _safe_extract_archive(
             make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest
@@ -869,7 +869,7 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
 
     dest = tmp_path / "extract_pax"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 100)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_BYTES", 100)
     tar = io.BytesIO()
     with tarfile.open(fileobj=tar, mode="w:gz") as handle:
         pax = tarfile.TarInfo("pax_global_header")
@@ -890,7 +890,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
     # A GNU LONGNAME header payload is consumed inside tarfile.next() and never yielded, so per-member
     # accounting can't see it. A tiny gzip declaring a 400MB name must be rejected with memory bounded
     # near the limit, not OOM the worker.
-    from flash.envs.adapter import _safe_extract_archive
+    from flash.envs.loader import _safe_extract_archive
 
     def header(name: str, size: int, typeflag: str) -> bytes:
         h = bytearray(512)
