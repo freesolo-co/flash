@@ -266,6 +266,41 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
     assert all(not p.exists() for p in askpass_paths)
 
 
+def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
+    from pathlib import Path
+
+    from flash.providers import _instance_bootstrap as lb
+
+    askpass_paths = []
+
+    def fake_run(cmd, *, check, env=None):
+        askpass_paths.append(Path(env["GIT_ASKPASS"]))
+
+    original_remove = lb.os.remove
+
+    def fake_remove(path):
+        if Path(path) in askpass_paths:
+            raise PermissionError("locked askpass helper")
+        return original_remove(path)
+
+    monkeypatch.setattr(lb.subprocess, "run", fake_run)
+    monkeypatch.setattr(lb.os, "remove", fake_remove)
+
+    try:
+        lb.install_extra_pip(
+            {
+                "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+                "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+            }
+        )
+    finally:
+        for askpass in askpass_paths:
+            if askpass.exists():
+                original_remove(askpass)
+
+    assert askpass_paths
+
+
 def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
     # The instance bootstrap must stamp ATTEMPT into the worker env (RunPod does it in jobs.py) — the
     # worker reads it into every heartbeat, and the poller's stale-heartbeat rejection is dead without

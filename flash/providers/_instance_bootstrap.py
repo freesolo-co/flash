@@ -228,7 +228,7 @@ def install_extra_pip(payload: dict) -> None:
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True, env=env)
     finally:
         if askpass:
-            with contextlib.suppress(FileNotFoundError):
+            with contextlib.suppress(OSError):
                 os.remove(askpass)
 
 

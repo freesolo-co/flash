@@ -272,7 +272,7 @@ def _train_body(input_data: dict) -> dict:
             )
         finally:
             if askpass:
-                with contextlib.suppress(FileNotFoundError):
+                with contextlib.suppress(OSError):
                     os.remove(askpass)
 
     def _code_prefix() -> str:

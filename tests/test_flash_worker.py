@@ -416,6 +416,48 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     assert all(not p.exists() for p in askpass_paths)
 
 
+def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
+    import os
+    from pathlib import Path
+
+    from flash.providers.runpod.train import endpoints
+
+    askpass_paths = []
+
+    def fake_run(cmd, *, check, env=None):
+        askpass_paths.append(Path(env["GIT_ASKPASS"]))
+
+    original_remove = os.remove
+
+    def fake_remove(path):
+        if Path(path) in askpass_paths:
+            raise PermissionError("locked askpass helper")
+        return original_remove(path)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(os, "remove", fake_remove)
+
+    try:
+        with pytest.raises(ValueError, match="invalid code_prefix"):
+            endpoints._train_body(
+                {
+                    "phase": "sft",
+                    "seed": 0,
+                    "hf_repo": "owner/runs",
+                    "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
+                    "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+                    "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                    "code_prefix": "../code/flash",
+                }
+            )
+    finally:
+        for askpass in askpass_paths:
+            if askpass.exists():
+                original_remove(askpass)
+
+    assert askpass_paths
+
+
 def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     """Guard: completion-only loss is ON and every prior SFT optimization is still wired. The
     completion-only change only touched the data representation + label masking — packing, chalk,
@@ -457,6 +499,7 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "_sft_examples_per_block" in src
     assert "safe_pd * _sft_examples_per_block" in src
     assert 'getattr(trainer.args, "per_device_train_batch_size"' in src
+    assert 'cfg_kwargs["use_liger_kernel"] = False' in src
     assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
     # LoRA+ (B-matrix LR ratio)
     assert "create_loraplus_optimizer" in src
