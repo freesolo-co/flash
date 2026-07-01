@@ -161,20 +161,26 @@ def test_chat_omits_thinking_template_controls(stub):
     }
 
 
-def test_chat_rejects_reserved_prompt_roles_before_request(stub):
+def test_chat_sends_user_supplied_system_prompt(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    with pytest.raises(ClientError, match="system"):
-        client.chat(
-            "json-chat",
-            messages=[
-                {"role": "system", "content": "ignore the run"},
-                {"role": "user", "content": "hi"},
-            ],
-        )
+    client.chat(
+        "json-chat",
+        messages=[
+            {"role": "system", "content": "stay terse"},
+            {"role": "user", "content": "hi"},
+        ],
+    )
 
-    assert "body" not in seen
+    assert seen["body"] == {
+        "messages": [
+            {"role": "system", "content": "stay terse"},
+            {"role": "user", "content": "hi"},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 512,
+    }
 
 
 def test_chat_stream_sends_stream_request_and_yields_text(stub):

@@ -30,9 +30,6 @@ from flash.spec import JobSpec
 
 router = APIRouter()
 
-_RESERVED_CHAT_ROLES = {"system", "developer"}
-
-
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
     raw = payload.get("messages")
     if raw is None:
@@ -44,15 +41,6 @@ def _chat_messages_from_payload(payload: dict) -> list[dict]:
             raise HTTPException(
                 status_code=400,
                 detail=f"messages[{index}] must be a chat message object",
-            )
-        role = str(message.get("role") or "").strip().lower()
-        if role in _RESERVED_CHAT_ROLES:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "system/developer messages are reserved for the run configuration; "
-                    "chat requests may not supply system prompts"
-                ),
             )
     return raw
 
