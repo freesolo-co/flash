@@ -38,7 +38,6 @@ class ServingCapacity:
     serve_model_id: str = ""
     max_num_seqs: int = 0
     max_num_batched_tokens: int = 0
-    tensor_parallel_size: int = 0
     gpu_memory_utilization: float = 0.0
 
 
@@ -105,7 +104,6 @@ class ModelInfo:
                 "serve_model_id",
                 "max_num_seqs",
                 "max_num_batched_tokens",
-                "tensor_parallel_size",
                 "gpu_memory_utilization",
             ):
                 if serving.get(key) in ("", 0, 0.0, None):
@@ -254,14 +252,13 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="H200",
         serving=ServingCapacity(
-            gpu="A100-80GB:2",
+            gpu="H200",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
             max_loras=12,
             max_lora_rank=64,
             max_model_len=8192,
             max_num_seqs=8,
             max_num_batched_tokens=4096,
-            tensor_parallel_size=2,
             gpu_memory_utilization=0.98,
         ),
         thinking="hybrid",

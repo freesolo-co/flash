@@ -86,14 +86,13 @@ def test_serving_capacity_matches_validated_matrix():
             "gpu_memory_utilization": 0.98,
         },
         "Qwen/Qwen3.6-35B-A3B": {
-            "gpu": "A100-80GB:2",
+            "gpu": "H200",
             "serve_model_id": "Qwen/Qwen3.6-35B-A3B-FP8",
             "max_loras": 12,
             "max_lora_rank": 64,
             "max_model_len": 8192,
             "max_num_seqs": 8,
             "max_num_batched_tokens": 4096,
-            "tensor_parallel_size": 2,
             "gpu_memory_utilization": 0.98,
         },
     }
