@@ -190,6 +190,33 @@ def grpo_seq_escalation_gb(params_b: float | None, seq_len: int) -> int:
     return math.ceil(coef * params_b * (seq_len / seq_thresh - 1))
 
 
+def grpo_kv_floor_gb(
+    params_b: float | None,
+    vllm_max_len: int,
+    group_size: int = 8,
+    active_params_b: float | None = None,
+    fp8_kv: bool = False,
+) -> int:
+    """Smallest card (GB) whose colocated vLLM executor budget still leaves a viable KV pool.
+
+    ``colocate_kv_util`` caps ``gpu_memory_utilization`` at ~0.45 of the card, and that budget
+    must carry vLLM's bf16 weight copy BEFORE any KV cache blocks. On a card sized only for the
+    training peak, a long-context / large-group rollout can leave the pool so small that vLLM
+    init fails with "No available memory for the cache blocks" — an OOM the preflight never
+    caught (e.g. group_size=16 multi-turn rollouts on a 31 GB card). Require the capped budget
+    to hold the weight copy plus at least HALF the concurrent group's working KV (full KV is a
+    throughput target, not an init requirement; half keeps validated lean configs admitted
+    while pushing the observed init-OOM shapes onto a bigger card or a parse-time reject)."""
+    weights_gb = max(0.5, float(params_b or 1.0)) * 2.0
+    kv_need = 0.5 * _resident_kv_gb(
+        float(active_params_b) if active_params_b else params_b,
+        vllm_max_len,
+        group_size,
+        fp8_kv=fp8_kv,
+    )
+    return math.ceil((weights_gb + kv_need) / 0.45)
+
+
 @dataclass(frozen=True)
 class VramEstimate:
     params_b: float | None
@@ -506,6 +533,15 @@ def model_required_vram_gb(
         if is_grpo and use_vllm:
             floor_gb = 24 if (params_b or 0.0) <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
             need = max(need, floor_gb)
+            # vLLM KV-cache init preflight: the card must leave a viable cache-block pool
+            # under the colocate utilization cap, or the engine dies at init ("No available
+            # memory for the cache blocks") on a card the training-peak estimate accepted.
+            need = max(
+                need,
+                grpo_kv_floor_gb(
+                    params_b or 4.0, seq_len, group_size, active_params_b=active_b
+                ),
+            )
         return need
     params_b = fetch_hf_params_b(model_id)
     if params_b is None:
@@ -513,6 +549,7 @@ def model_required_vram_gb(
     need = _need(params_b, "grpo", vocab=model_vocab)
     if is_grpo:
         need += grpo_seq_escalation_gb(params_b, seq_len)
+        need = max(need, grpo_kv_floor_gb(params_b, seq_len, group_size))
     return need
 
 
