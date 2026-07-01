@@ -186,9 +186,7 @@ def test_serving_prices_pin_public_rates_plus_markup():
         assert price.typical_cached_input_usd_per_mtok == pytest.approx(cached_rate)
         assert price.billed_input_usd_per_mtok == pytest.approx(input_rate * SERVING_MARKUP)
         assert price.billed_output_usd_per_mtok == pytest.approx(output_rate * SERVING_MARKUP)
-        assert price.billed_cached_input_usd_per_mtok == pytest.approx(
-            cached_rate * SERVING_MARKUP
-        )
+        assert price.billed_cached_input_usd_per_mtok == pytest.approx(cached_rate * SERVING_MARKUP)
 
 
 def test_resolve_deploy_step_rejects_malformed_step_as_400():
@@ -237,9 +235,7 @@ def test_deploy_reads_registry_back_before_ready(monkeypatch):
 
     def fake_get(url, **k):
         gets.append(url)
-        return _registry_resp(
-            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
-        )
+        return _registry_resp([{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}])
 
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
     monkeypatch.setattr(deploy_mod.httpx, "get", fake_get)
@@ -317,6 +313,27 @@ def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatc
         lambda *a, **k: _registry_resp(
             [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
         ),
+    )
+
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert dep.state == "ready"
+
+
+def test_deploy_5xx_recovers_when_registry_record_omits_subfolder(monkeypatch):
+    """Older serving builds omit subfolder; during ambiguous POST recovery, presence is enough."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(502, text="bad gateway", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    monkeypatch.setattr(
+        deploy_mod.httpx,
+        "get",
+        lambda *a, **k: _registry_resp([{"adapter_id": "flash-1-abc"}]),
     )
 
     dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")

@@ -250,11 +250,12 @@ def deploy_adapter(
         # the new checkpoint. Read it back and report the actual state instead of guessing.
         if exc.status_code is not None and exc.status_code < 500:
             raise
-        recorded = _record_subfolder(_registered_adapter(run_id))
-        if recorded == subfolder:
+        record = _registered_adapter(run_id)
+        recorded = _record_subfolder(record)
+        if record is not None and recorded in (None, subfolder):
             logger.warning(
-                "POST /adapters for %s failed (%s) but the serving registry shows the requested "
-                "checkpoint; continuing",
+                "POST /adapters for %s failed (%s) but the serving registry shows the adapter "
+                "registered; continuing",
                 run_id,
                 exc,
             )
