@@ -132,9 +132,52 @@ def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
     assert body["model"] == "Qwen/Qwen3.5-4B"
     assert body["estimate"] == {
         "totalUsd": 12.345,
-        "costBasis": "final",
+        "costBasis": "estimate",
         "costSource": "run_status.cost_usd",
     }
+
+
+def test_charge_bills_cost_usd_for_a_cancelled_run(monkeypatch):
+    """A cancelled run is charged its cost_usd exactly like a completed one -- the cancel path already
+    set cost_usd to the estimate at the steps actually run, so charge_completed_run just bills it."""
+    from flash.runner import RunStatus
+    from flash.server import billing
+
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"amountCents": 250, "balanceCents": 9750, "replay": False}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    spec = _spec(monkeypatch)
+    status = RunStatus(
+        run_id=spec.run_id,
+        state="cancelled",
+        spec=spec.to_dict(),
+        cost_usd=2.50,  # cancel path priced this at the actual steps run
+        remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+        billing_context={"org_id": "org-A"},
+        billing_state="pending",
+    )
+
+    out = billing.charge_completed_run(internal_key="fslo-internal", status=status)
+    assert out == {"amountCents": 250, "balanceCents": 9750, "replay": False}
+    body = captured["body"]
+    assert body["runId"] == "run-1"
+    assert body["costCents"] == 250  # the cancel estimate on cost_usd
+    assert body["estimate"]["costBasis"] == "estimate"
 
 
 def test_charge_completed_run_raises_billing_error_on_402(monkeypatch):
@@ -246,7 +289,9 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
     # FREESOLO_INTERNAL_KEY also makes create_app() startup run the RunPod slot-store reconcile
     # (reconcile_endpoint_slots() -> runpod.slots.reconcile() urllib POST). No-op it at the entry.
-    monkeypatch.setattr(rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        rp_endpoints, "reconcile_endpoint_slots", lambda *a, **k: None, raising=False
+    )
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
@@ -322,9 +367,9 @@ def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
     monkeypatch.setattr(billing_mod, "precheck_training_run", _unreachable)
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
     assert res.status_code == 200, res.text
-    assert [r["run_id"] for r in api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"]] == [
-        res.json()["run_id"]
-    ]
+    assert [
+        r["run_id"] for r in api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"]
+    ] == [res.json()["run_id"]]
 
 
 def test_dry_run_skips_precheck(api, monkeypatch):

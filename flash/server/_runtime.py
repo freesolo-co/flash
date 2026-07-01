@@ -105,7 +105,7 @@ async def _charge_retry_loop() -> None:
 
 
 def _append_run_log(run_id: str, message: str) -> None:
-    """Append a timestamped note to a run's log so it surfaces in `flash status --logs`."""
+    """Append a timestamped note to a run's log so it surfaces in `flash log`."""
     import time
 
     with open(runs_file_path(run_id, ".log"), "a") as f:
@@ -158,7 +158,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
     truncated tail of the worker console). The full ``console_<phase>.txt`` / ``error_<phase>.txt``
     the worker streams to HF are the real train stdout/traceback — but the repo is PRIVATE, so a
     user's own HF token 404s. We fetch them here with the OPERATOR ``HF_TOKEN`` (the control plane
-    already holds it) so ``flash status --logs`` shows the real worker output regardless of run
+    already holds it) so ``flash log`` shows the real worker output regardless of run
     state and without the user needing repo access. Best-effort: a missing file / no repo yields {}.
     """
     repo = getattr(getattr(spec, "train", None), "hf_repo", None)
