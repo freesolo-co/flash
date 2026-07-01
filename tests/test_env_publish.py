@@ -140,6 +140,41 @@ def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
     assert captured["files"] == ["environment.py", "pyproject.toml"]
 
 
+def test_publish_accepts_matching_explicit_namespace(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    captured: dict[str, object] = {}
+
+    def fake_publish_once(*, publish_root, message, **_kwargs):
+        captured.update(publish_root=publish_root, message=message)
+
+    monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
+
+    ref = envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="benchmark/Math Python",
+        key={"org_slug": "benchmark"},
+    )
+
+    assert ref == "benchmark/math-python"
+    assert captured["publish_root"] == "benchmark/math-python"
+    assert captured["message"] == "Upload Flash environment benchmark/math-python"
+
+
+def test_publish_rejects_mismatched_explicit_namespace(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
+
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL),
+            name="benchmark/math-python",
+            key={"org_slug": "acme"},
+        )
+
+    assert excinfo.value.status == 403
+    assert "namespace" in str(excinfo.value)
+
+
 def test_publish_rejects_bad_input(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)

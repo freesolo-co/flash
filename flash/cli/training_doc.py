@@ -127,8 +127,9 @@ flash train configs/rl.toml --background  # submit and return immediately
 
 ```bash
 flash status <run-id>            # state + accrued cost
-flash status <run-id> --logs     # reward/loss trend + worker console/error logs + any traceback
-flash status <run-id> --follow   # stream a live run to completion
+flash log <run-id>               # reward/loss trend + worker console/error logs + any traceback
+flash log <run-id> --follow      # stream a live run to completion
+flash status <run-id>            # current run state, cost, and deployment info
 flash runs                       # all your runs and their state/cost
 flash cancel <run-id>            # stop a run
 ```
@@ -205,8 +206,8 @@ spending another GPU run:
 | All-zero or flat GRPO reward | `reward_mean` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
 | Reward rises but behavior is worse | Short, templated, malformed, or reward-hacked outputs score well | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string. |
 | Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_tokens` for GRPO rollouts or `max_length` for SFT only after seeing truncation. Oversizing them by default just burns memory/cost. |
-| Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash status <run-id> --logs`, reduce footprint (`max_length`, `max_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
-| Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash status <run-id> --follow` to reattach, `--logs` for the console/error tail, or `flash cancel <run-id>` if you intentionally want to stop it. |
+| Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash log <run-id>`, reduce footprint (`max_length`, `max_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
+| Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash log <run-id> --follow` to reattach, `flash log <run-id>` for the console/error output, or `flash cancel <run-id>` if you intentionally want to stop it. |
 | Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash checkpoints <run-id>`, deploy a specific step with `flash deploy <run-id> --step N`, and compare with held-out probes before exporting or relying on the final adapter. |
 | Export fails before upload | CLI says no HuggingFace token | Pass `flash export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`. |
 | SFT loss improves but quality does not | Train loss falls while held-out behavior stalls or degrades | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes. |
@@ -222,15 +223,15 @@ spending another GPU run:
 - **Read the model's outputs, not just the metrics.** A rising reward can come from
   reward-hacking or a degenerate output the reward still credits — metrics alone never
   establish that the model got better. Flash does not expose training-time rollouts
-  through the CLI (`--logs` gives you the metric trend and the worker's console/error
+  through the CLI (`flash log` gives you the metric trend and the worker's console/error
   logs, not the sampled generations), so to read real outputs **deploy the adapter and
   probe it**: `flash deploy <run-id>` then `flash chat <run-id> -m "..."` on at least a
   few real inputs, including ones it should get wrong.
 
   ```bash
   flash status <run-id>            # state + accrued cost
-  flash status <run-id> --logs     # metric trend + worker console/error logs (+ traceback)
-  flash status <run-id> --follow   # stream a live run until completion
+  flash log <run-id>               # metric trend + worker console/error logs (+ traceback)
+  flash log <run-id> --follow      # stream a live run until completion
   flash deploy <run-id>            # serve the adapter, then `flash chat` it to read real outputs
   ```
 
@@ -472,8 +473,8 @@ flash train configs/rl.toml --dry-run # validate the config locally (no GPU, no 
 flash train configs/rl.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/rl.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
 flash status <run-id>                 # state + accrued cost
-flash status <run-id> --logs          # reward/loss trend + worker console/error logs
-flash status <run-id> --follow        # stream a live run to completion
+flash log <run-id>                    # reward/loss trend + worker console/error logs
+flash log <run-id> --follow           # stream a live run to completion
 flash runs                            # list your runs and their state/cost
 flash cancel <run-id>                 # stop a live run
 flash checkpoints <run-id>            # list deployable RL checkpoints

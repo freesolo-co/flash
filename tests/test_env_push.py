@@ -74,6 +74,16 @@ def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
     assert cap["name"] == "explicit-env"
 
 
+def test_push_preserves_explicit_namespace(monkeypatch, tmp_path):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap, slug="benchmark/math"))
+
+    assert cli.cmd_env_push(_args(env_file, name="benchmark/Math Env")) == 0
+    assert cap["name"] == "benchmark/math-env"
+
+
 def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path):
     env_dir = tmp_path / "math"
     env_dir.mkdir()

@@ -401,7 +401,7 @@ def cmd_train(args) -> int:
     else:
         print(
             f"run {run_id} submitted; following logs "
-            f"(Ctrl-C detaches, `flash status {run_id} --follow` resumes)",
+            f"(Ctrl-C detaches, `flash log {run_id} --follow` resumes)",
             file=sys.stderr,
         )
     return _follow_run(client, run_id)
@@ -437,28 +437,81 @@ def _follow_run(client: ApiClient, run_id: str) -> int:
     return 0 if state in _OK_STATES else 1
 
 
+def _follow_status(client: ApiClient, run_id: str, interval: float = 2.0) -> int:
+    """Poll run status until terminal, without replaying worker logs."""
+    last_rendered: str | None = None
+    while True:
+        status = client.get_run(run_id)
+        rendered = render.run_status(status) if render.styled() else json.dumps(status, indent=2)
+        if rendered != last_rendered:
+            print(rendered)
+            last_rendered = rendered
+        state = str(status.get("state") or "")
+        if state in _CLI_DONE_STATES:
+            return 0 if state in _OK_STATES else 1
+        time.sleep(interval)
+
+
+def _print_log_text(text: str) -> bool:
+    if not text:
+        return False
+    print(text, end="")
+    if not text.endswith("\n"):
+        print()
+    return True
+
+
+def _print_log_snapshot(client: ApiClient, run_id: str) -> bool:
+    """Print the complete log snapshot by draining offset pages until no new bytes remain."""
+    offset = 0
+    printed_any = False
+    while True:
+        page = client.get_logs(run_id, offset=offset)
+        try:
+            next_offset = int(page.get("offset", offset))
+        except (TypeError, ValueError):
+            next_offset = offset
+        if next_offset <= offset and offset > 0:
+            break
+        printed_any = _print_log_text(str(page.get("logs") or "")) or printed_any
+        if next_offset <= offset:
+            break
+        offset = next_offset
+    return printed_any
+
+
+def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
+    for name, text in (client.get_worker_output(run_id) or {}).items():
+        if not text:
+            continue
+        sep = "\n" if printed_any else ""
+        if render.styled():
+            print(f"{sep}{render.log_section(name)}")
+        else:
+            print(f"{sep}----- {name} -----")
+        print(text, end="" if text.endswith("\n") else "\n")
+        printed_any = True
+    return printed_any
+
+
+def cmd_log(args) -> int:
+    client = client_from_config()
+    if getattr(args, "follow", False):
+        state = _poll_logs(client, args.run_id, interval=2.0)
+        _print_worker_output(client, args.run_id, printed_any=True)
+        return 0 if state in _OK_STATES else 1
+    printed_any = _print_log_snapshot(client, args.run_id)
+    _print_worker_output(client, args.run_id, printed_any=printed_any)
+    return 0
+
+
 def cmd_status(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
-        return _follow_run(client, args.run_id)
+        return _follow_status(client, args.run_id)
     if getattr(args, "logs", False):
-        logs = client.get_logs(args.run_id).get("logs", "")
-        printed_any = False
-        if logs:
-            print(logs, end="")
-            if not logs.endswith("\n"):
-                print()
-            printed_any = True
-        for name, text in (client.get_worker_output(args.run_id) or {}).items():
-            if not text:
-                continue
-            sep = "\n" if printed_any else ""
-            if render.styled():
-                print(f"{sep}{render.log_section(name)}")
-            else:
-                print(f"{sep}----- {name} -----")
-            print(text, end="" if text.endswith("\n") else "\n")
-            printed_any = True
+        printed_any = _print_log_snapshot(client, args.run_id)
+        _print_worker_output(client, args.run_id, printed_any=printed_any)
     status = client.get_run(args.run_id)
     if render.styled():
         print(render.run_status(status))

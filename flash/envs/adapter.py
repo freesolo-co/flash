@@ -43,6 +43,16 @@ _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
 
 
+def _with_system_prompt(messages: list[dict], contract_text: str) -> list[dict]:
+    system_text = str(contract_text or "").strip()
+    out = [dict(message) for message in messages]
+    if not system_text:
+        return out
+    if any(str(message.get("role") or "").strip().lower() == "system" for message in out):
+        return out
+    return [{"role": "system", "content": system_text}, *out]
+
+
 class GitHubRateLimitError(RuntimeError):
     """Persistent GitHub rate-limit; worker handler stamps retriable=True for rescheduling."""
 
@@ -905,7 +915,7 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def prompt_messages(self, example: dict) -> list[dict]:
         messages = self._env.start_episode(self._task_example(example), self._contract_text)
-        return [dict(message) for message in messages]
+        return _with_system_prompt([dict(message) for message in messages], self._contract_text)
 
     def sft_completion(self, example: dict) -> list[dict]:
         """Target completion messages for one SFT example; falls back to raw record output."""
@@ -1027,7 +1037,10 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def new_rollout_state(self, example: dict) -> dict:
         task = self._task_example(example)
-        prompt = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
+        prompt = _with_system_prompt(
+            [dict(message) for message in self._env.start_episode(task, self._contract_text)],
+            self._contract_text,
+        )
         try:
             episode_turns: int | None = int(self._env.max_episode_turns(task))
         except Exception:

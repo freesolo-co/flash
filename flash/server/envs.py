@@ -77,6 +77,25 @@ def _sanitize_name(name: str) -> str:
     return slug or "env"
 
 
+def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
+    caller_namespace = namespace_for(key)
+    raw = str(name or "").strip()
+    if "/" not in raw:
+        return caller_namespace, _sanitize_name(raw)
+    parts = [part.strip() for part in raw.split("/")]
+    if len(parts) != 2 or not all(parts):
+        raise EnvPublishError("env name with namespace must be 'namespace/name'")
+    namespace = _sanitize_name(parts[0])
+    clean = _sanitize_name(parts[1])
+    if namespace != caller_namespace:
+        raise EnvPublishError(
+            "env namespace must match your Freesolo org namespace "
+            f"({caller_namespace}/...); got {namespace}/{clean}",
+            status=403,
+        )
+    return namespace, clean
+
+
 class _LimitedReader:
     """Bounds total bytes read from a *decompressed* tar stream. A GNU LONGNAME/LONGLINK or PAX header
     payload is consumed inside ``tarfile.next()`` and never yielded as a member, so per-member size
@@ -362,8 +381,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
             status=503,
         )
     repo = _DEFAULT_GITHUB_REPO
-    ns = namespace_for(key)
-    clean = _sanitize_name(name)
+    ns, clean = _publish_slug_for_name(name, key)
     publish_root = f"{ns}/{clean}"
     if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
         raise EnvPublishError("env package must contain environment.py")

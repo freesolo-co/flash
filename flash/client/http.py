@@ -110,6 +110,23 @@ def _validate_checkpoint_step(step: int | float) -> int:
     return int(step)
 
 
+_RESERVED_CHAT_ROLES = {"system", "developer"}
+
+
+def _validate_chat_messages(messages: list[dict]) -> None:
+    if not isinstance(messages, list):
+        raise ClientError("chat messages must be a list")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ClientError(f"chat messages[{index}] must be an object")
+        role = str(message.get("role") or "").strip().lower()
+        if role in _RESERVED_CHAT_ROLES:
+            raise ClientError(
+                "system/developer messages are reserved for Flash run configuration; "
+                "chat requests may not supply system prompts"
+            )
+
+
 class ApiClient:
     def __init__(
         self,
@@ -289,6 +306,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> dict:
+        _validate_chat_messages(messages)
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/chat",
@@ -303,6 +321,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
+        _validate_chat_messages(messages)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
