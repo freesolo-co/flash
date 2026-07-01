@@ -451,11 +451,13 @@ def deployments_table(rows: list[dict]) -> str:
 
 
 def checkpoints_table(run_id: str, rows: list[dict]) -> str:
-    """Deployable per-step RL checkpoints: the step number + the stable repo path it lives at."""
+    """Deployable per-step RL checkpoints: step number + the canonical `<run_id>/step-N` ref."""
+    from flash.schema import format_checkpoint_ref
+
     body = [
         [
             (str(c.get("step", "")), _TEAL),
-            (f"{c.get('repo_id', '')}:{c.get('subfolder', '')}", _ACCENT2),
+            (format_checkpoint_ref(run_id, c.get("step", 0)), _ACCENT2),
         ]
         for c in sorted(rows, key=lambda c: c.get("step", 0))
     ]

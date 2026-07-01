@@ -1,4 +1,4 @@
-"""init_from_adapter uses the adapter_ref form emitted by flash status."""
+"""Worker adapter downloads consume internal storage refs, not public init_from_adapter refs."""
 
 import os
 import shutil
@@ -29,7 +29,7 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
         shutil.rmtree("/tmp/evdl", ignore_errors=True)
 
 
-def test_status_adapter_ref_downloads_from_other_repo(monkeypatch):
+def test_storage_ref_downloads_from_other_repo(monkeypatch):
     calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX")
     assert calls["repo_id"] == "Freesolo-Co/flashrun-sftX"
     assert calls["allow_patterns"] == ["sft/flash-sftX/adapter/*"]
@@ -38,11 +38,8 @@ def test_status_adapter_ref_downloads_from_other_repo(monkeypatch):
 
 
 def test_checkpoint_step_adapter_ref_downloads_that_step(monkeypatch):
-    """`<ref>/checkpoints/step-N` resolves to the per-step deployable adapter path, so a run can
-    warm-start from a specific saved checkpoint instead of the run-level adapter."""
-    calls, out = _capture(
-        monkeypatch, "Freesolo-Co/flashrun-rlX:rl/flash-rlX/checkpoints/step-40"
-    )
+    """The resolved storage ref can target a deployable per-step adapter snapshot."""
+    calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-rlX:rl/flash-rlX/checkpoints/step-40")
     assert calls["repo_id"] == "Freesolo-Co/flashrun-rlX"
     assert calls["allow_patterns"] == ["rl/flash-rlX/checkpoints/step-40/adapter/*"]
     assert out is not None
@@ -57,13 +54,13 @@ def test_checkpoint_ref_with_trailing_path_is_rejected(monkeypatch):
     assert out is None
 
 
-def test_bare_prefix_is_not_a_public_init_adapter_ref(monkeypatch):
+def test_bare_prefix_is_not_an_internal_storage_ref(monkeypatch):
     calls, out = _capture(monkeypatch, "sft/flash-self")
     assert calls == {}
     assert out is None
 
 
-def test_managed_repo_without_prefix_is_not_a_public_init_adapter_ref(monkeypatch):
+def test_managed_repo_without_prefix_is_not_an_internal_storage_ref(monkeypatch):
     calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff")
     assert calls == {}
     assert out is None

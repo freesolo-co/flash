@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 
 from flash.catalog import serving_lora_rank_cap
 from flash.engine.recipe import RECIPE
@@ -148,7 +147,9 @@ def _init_adapter_model(model_id: str):
             f"({cap_note})"
         )
         merged_dir = _merge_vl_warmstart_adapter(adir, model_id, attn_kw)
-        print(f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it")
+        print(
+            f"[init-adapter] merged VL SFT {prefix!r} -> {merged_dir}; training a fresh LoRA on it"
+        )
         return merged_dir, make_lora(merged_dir)
 
     # Non-VL checkpoints (e.g. MiniCPM): the continued-LoRA path works (GRPO keeps the SFT behavior),
@@ -234,32 +235,24 @@ def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
 
 
 def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
-    """Resolve init_from_adapter into (repo, prefix).
+    """Resolve the INTERNAL adapter storage reference into (repo, prefix).
 
-    Public forms are the exact adapter_ref emitted by ``flash status``
-    (``<owner>/<repo>:<phase>/<run_id>``) and, to warm-start from a specific saved step listed
-    by ``flash checkpoints``, that ref plus a ``/checkpoints/step-<N>`` suffix — per-step
-    deployable adapters live at the identical ``<prefix>/adapter`` layout in the artifact repo
-    (see ``publish_deployable_checkpoint``), so the same download path serves both.
+    Users write the short ``<run_id>[/step-N]`` form (see ``flash.schema.parse_checkpoint_ref``);
+    the control plane resolves it against the source run's metadata into the storage reference
+    the worker receives here (``flash.runner._resolve_init_from_adapter``). Per-step deployable
+    adapters live at the identical ``<prefix>/adapter`` layout in the artifact repo (see
+    ``publish_deployable_checkpoint``), so the same download path serves both.
     """
-    adapter_ref = adapter_ref.strip()
-    match = re.fullmatch(
-        r"(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*):"
-        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
-        r"(?P<checkpoint>/checkpoints/step-\d+)?",
-        adapter_ref,
-    )
-    if not match:
-        return None
-    repo, phase, run_id, checkpoint = match.groups()
-    return repo, f"{phase}/{run_id}{checkpoint or ''}"
+    from flash.schema import parse_adapter_storage_ref
+
+    return parse_adapter_storage_ref(adapter_ref)
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
     """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
 
-    ``adapter_prefix`` must be the full ``adapter_ref`` string emitted by ``flash status``:
-    ``<owner>/<repo>:<phase>/<run_id>``.
+    ``adapter_prefix`` is the internal storage ref resolved by the control plane:
+    ``<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]``.
     """
     if not adapter_prefix:
         return None

@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from flash.catalog import ModelInfo, resolve_model
 from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
@@ -36,17 +36,22 @@ def adapter_prefix(spec: JobSpec) -> str:
 
 
 def adapter_ref(spec: JobSpec) -> str | None:
-    """Full init_from_adapter reference for a run's trained adapter."""
+    """INTERNAL storage reference for a run's trained adapter (artifact registration only)."""
     if not spec.train.hf_repo:
         return None
     return f"{spec.train.hf_repo}:{adapter_prefix(spec)}"
 
 
 def _adapter_ref_from_status_spec(raw: dict) -> str | None:
+    """The public short adapter reference (`<run_id>`) shown by `flash status` — exactly what
+    users paste into train.init_from_adapter; `<run_id>/step-N` targets a saved checkpoint."""
     try:
-        return adapter_ref(JobSpec.from_dict(raw))
+        spec = JobSpec.from_dict(raw)
     except Exception:
         return None
+    if not spec.train.hf_repo:
+        return None
+    return spec.run_id
 
 
 def _gpu_rate(gpu_type: str) -> float:
@@ -336,6 +341,7 @@ def _run_job_background(
     import logging
 
     try:
+        spec = _resolve_init_from_adapter(spec)
         if resolve_env_sha:
             with contextlib.suppress(Exception):
                 spec = _assign_resolved_env_sha(spec)
@@ -348,6 +354,40 @@ def _run_job_background(
             if get_status(spec.run_id).state not in TERMINAL_STATES:
                 _update(spec.run_id, "failed", error=str(e))
         logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
+
+
+def _resolve_init_from_adapter(spec: JobSpec) -> JobSpec:
+    """Resolve the public `<run_id>[/step-N]` warm-start ref into the internal storage reference.
+
+    The control plane owns run metadata, so the short ref is resolved HERE (never on the worker):
+    the source run's hf_repo + phase key the artifact location the worker downloads from.
+    """
+    ref = spec.train.init_from_adapter
+    if not ref:
+        return spec
+    from flash.schema import checkpoint_storage_ref, parse_adapter_storage_ref, parse_checkpoint_ref
+
+    if parse_adapter_storage_ref(ref) is not None:
+        return spec
+
+    parsed = parse_checkpoint_ref(ref)
+    if parsed is None:
+        raise ValueError(
+            "train.init_from_adapter must be `<run_id>` or `<run_id>/step-N` "
+            f"(a checkpoint listed by `flash checkpoints`); got {ref!r}"
+        )
+    src_run_id, step = parsed
+    try:
+        src_status = get_status(src_run_id)
+    except FileNotFoundError:
+        raise ValueError(f"train.init_from_adapter references unknown run {src_run_id!r}") from None
+    src_spec = JobSpec.from_dict(src_status.spec)
+    if not src_spec.train.hf_repo:
+        raise ValueError(
+            f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
+        )
+    storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
+    return replace(spec, train=replace(spec.train, init_from_adapter=storage))
 
 
 def submit_job(
@@ -366,11 +406,13 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     spec = _assign_managed_hf_repo(spec)
     spec = _assign_weight_cache_volume(spec, info)
+    public_spec = spec
+    worker_spec = _resolve_init_from_adapter(public_spec)
     # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
     status = RunStatus(
-        run_id=spec.run_id,
+        run_id=public_spec.run_id,
         state="queued",
-        spec=spec.to_dict(),
+        spec=public_spec.to_dict(),
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
         platform_context=platform_context,
@@ -385,17 +427,17 @@ def submit_job(
     if background:
         threading.Thread(
             target=_run_job_background,
-            args=(spec, runtime_secrets or {}),
+            args=(worker_spec, runtime_secrets or {}),
             kwargs={"resolve_env_sha": True},
             daemon=True,
         ).start()
-        return get_status(spec.run_id)
-    spec = _assign_resolved_env_sha(spec)
+        return get_status(public_spec.run_id)
+    worker_spec = _assign_resolved_env_sha(worker_spec)
     if runtime_secrets:
-        _run_job(spec, runtime_secrets=runtime_secrets)
+        _run_job(worker_spec, runtime_secrets=runtime_secrets)
     else:
-        _run_job(spec)
-    return get_status(spec.run_id)
+        _run_job(worker_spec)
+    return get_status(public_spec.run_id)
 
 
 def _runstatus_from_json(d: dict) -> RunStatus:

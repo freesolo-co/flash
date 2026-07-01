@@ -350,9 +350,9 @@ Pick SFT when you already have good answers and want the model to imitate them.
 algorithm = "grpo"
 
 [train]
-# paste the full adapter_ref `flash status <sft-run-id>` prints, verbatim
-# (shape: <owner>/<repo>:sft/<run-id> — the owner/repo prefix is required)
-init_from_adapter = "your-org/your-repo:sft/<sft-run-id>"
+# the SFT run id (as printed by `flash status`); add /step-N to warm-start from a
+# specific checkpoint listed by `flash checkpoints <run-id>`
+init_from_adapter = "<sft-run-id>"
 lora_rank = 16     # for VL warm-starts, SFT rank + GRPO rank must fit the effective serving cap
 lora_alpha = 32
 ```

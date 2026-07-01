@@ -178,7 +178,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     # themed header + table, not a bare `step N` list
     assert "checkpoints" in ck
     assert "STEP" in ck
-    assert "acme/x:grpo/step-8" in ck
+    assert "flash-1/step-8" in ck  # the canonical short checkpoint ref
 
     dep = render.deployed(
         {"run_id": "flash-1", "state": "deployed", "endpoint_name": "ep", "url": "https://x"}

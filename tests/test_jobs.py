@@ -1186,6 +1186,55 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert st.remote["job_id"] == "j2"  # latest handle persisted
 
 
+def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {
+                    "steps": 1,
+                    "hf_repo": "Freesolo-Co/flashrun-source-env",
+                },
+            }
+        )
+        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {
+                    **base["train"],
+                    "init_from_adapter": "source-run/step-40",
+                },
+            }
+        )
+        launched: dict[str, str] = {}
+
+        def fake_submit(spec, *_, **__):
+            launched["init_from_adapter"] = spec.train.init_from_adapter
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        st = orch.get_status("warm-run")
+        assert st.spec["train"]["init_from_adapter"] == "source-run/step-40"
+        assert (
+            launched["init_from_adapter"]
+            == "Freesolo-Co/flashrun-source-env:rl/source-run/checkpoints/step-40"
+        )
+
+
 def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
     """A cancel landing mid-attempt raised _RunCancelled straight out of the retry loop, skipping
     _gc_seen_endpoints — leaking a walk-provisioned endpoint (one _gc_run_endpoints can't name, whose

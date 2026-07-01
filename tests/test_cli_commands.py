@@ -76,8 +76,8 @@ class _FakeClient:
         self.calls.append(("cancel", run_id))
         return {"run_id": run_id, "state": "cancelled"}
 
-    def deploy(self, run_id: str, **_) -> dict:
-        self.calls.append(("deploy", run_id))
+    def deploy(self, run_id: str, **kwargs) -> dict:
+        self.calls.append(("deploy", run_id, kwargs))
         return {"run_id": run_id, "openai_model": f"flash-{run_id}"}
 
     def undeploy(self, run_id: str) -> dict:
@@ -316,7 +316,10 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert ("cancel", "flash-1") in fake_client.calls
 
     assert _run(["deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1") in fake_client.calls
+    assert ("deploy", "flash-1", {"dry_run": False, "step": None}) in fake_client.calls
+
+    assert _run(["deploy", "flash-1/step-40"]) == 0
+    assert ("deploy", "flash-1", {"dry_run": False, "step": 40}) in fake_client.calls
 
     assert _run(["deployments"]) == 0
     assert "flash-1" in capsys.readouterr().out

@@ -541,9 +541,12 @@ def cmd_checkpoints(args) -> int:
     if render.styled():
         print(render.checkpoints_table(args.run_id, checkpoints))
         return 0
+    from flash.schema import format_checkpoint_ref
+
     for c in checkpoints:
-        # single-space, unpadded columns so a plain `grep "step N"` / awk split works.
-        print(f"step {c['step']} {c['repo_id']}:{c['subfolder']}")
+        # single-space, unpadded columns so a plain `grep "step N"` / awk split works; the ref is
+        # the canonical short form, paste-able into train.init_from_adapter.
+        print(f"step {c['step']} {format_checkpoint_ref(args.run_id, c['step'])}")
     print(
         f"\ndeploy one with `flash deploy {args.run_id} --step <STEP>`.",
         file=sys.stderr,
@@ -552,10 +555,26 @@ def cmd_checkpoints(args) -> int:
 
 
 def cmd_deploy(args) -> int:
+    from flash.schema import parse_checkpoint_ref
+
+    # `flash deploy <run_id>/step-N` is the same checkpoint ref `flash checkpoints` prints.
+    parsed = parse_checkpoint_ref(args.run_id)
+    if parsed is None:
+        print(
+            f"invalid run/checkpoint reference {args.run_id!r} "
+            "(expected <run_id> or <run_id>/step-N)",
+            file=sys.stderr,
+        )
+        return 1
+    run_id, ref_step = parsed
+    step = getattr(args, "step", None)
+    if ref_step is not None and step is not None and int(step) != ref_step:
+        print(f"conflicting steps: {args.run_id!r} vs --step {step}", file=sys.stderr)
+        return 1
     dep = client_from_config().deploy(
-        args.run_id,
+        run_id,
         dry_run=args.dry_run,
-        step=getattr(args, "step", None),
+        step=step if step is not None else ref_step,
     )
     if render.styled():
         print(render.deployed(dep))
