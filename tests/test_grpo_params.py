@@ -313,6 +313,44 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
     assert spec_from_dict(raw, run_id="grpo-y").train.init_from_adapter == ""
 
 
+def test_init_from_adapter_accepts_checkpoint_step_ref() -> None:
+    """A `/checkpoints/step-<N>` suffix (as listed by `flash checkpoints`) warm-starts from that
+    saved step instead of the run-level adapter — e.g. continuing GRPO from the best checkpoint."""
+    ref = "Freesolo-Co/flashrun-run-x:rl/run-x/checkpoints/step-40"
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "model_policy": "allow",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "cheapest"},
+        "train": {"steps": 10, "hf_repo": "owner/runs", "init_from_adapter": ref},
+    }
+    spec = spec_from_dict(raw, run_id="grpo-x")
+    assert spec.train.init_from_adapter == ref
+    assert JobSpec.from_dict(spec.to_dict()).train.init_from_adapter == ref
+
+
+@pytest.mark.parametrize(
+    "bad_suffix_ref",
+    [
+        "Freesolo-Co/flashrun-run-x:rl/run-x/checkpoints/step-",  # no step number
+        "Freesolo-Co/flashrun-run-x:rl/run-x/checkpoints/step-4/adapter",  # trailing path
+        "Freesolo-Co/flashrun-run-x:rl/run-x/checkpoint/step-4",  # wrong dir name
+        "Freesolo-Co/flashrun-run-x:rl/run-x/other/step-4",
+    ],
+)
+def test_init_from_adapter_rejects_malformed_checkpoint_suffix(bad_suffix_ref: str) -> None:
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "cheapest"},
+        "train": {"steps": 10, "init_from_adapter": bad_suffix_ref},
+    }
+    with pytest.raises(ConfigError, match="full adapter_ref emitted by `flash status`"):
+        spec_from_dict(raw, run_id="grpo-x")
+
+
 def test_init_from_adapter_rejects_repo_without_status_prefix() -> None:
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",

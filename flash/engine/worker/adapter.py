@@ -236,19 +236,23 @@ def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
 def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     """Resolve init_from_adapter into (repo, prefix).
 
-    The only public form is the exact adapter_ref emitted by ``flash status``:
-    ``<owner>/<repo>:<phase>/<run_id>``.
+    Public forms are the exact adapter_ref emitted by ``flash status``
+    (``<owner>/<repo>:<phase>/<run_id>``) and, to warm-start from a specific saved step listed
+    by ``flash checkpoints``, that ref plus a ``/checkpoints/step-<N>`` suffix — per-step
+    deployable adapters live at the identical ``<prefix>/adapter`` layout in the artifact repo
+    (see ``publish_deployable_checkpoint``), so the same download path serves both.
     """
     adapter_ref = adapter_ref.strip()
     match = re.fullmatch(
         r"(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*):"
-        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})",
+        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?P<checkpoint>/checkpoints/step-\d+)?",
         adapter_ref,
     )
     if not match:
         return None
-    repo, phase, run_id = match.groups()
-    return repo, f"{phase}/{run_id}"
+    repo, phase, run_id, checkpoint = match.groups()
+    return repo, f"{phase}/{run_id}{checkpoint or ''}"
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:

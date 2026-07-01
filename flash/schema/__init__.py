@@ -30,7 +30,7 @@ _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 _ADAPTER_REF_RE = re.compile(
     rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl)/"
-    rf"(?P<run_id>{_RUN_ID_RE})$"
+    rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
 )
 
 
@@ -98,7 +98,8 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
         return ref
     raise ConfigError(
         "train.init_from_adapter must be the full adapter_ref emitted by `flash status` "
-        "(<owner>/<repo>:<phase>/<run_id>)"
+        "(<owner>/<repo>:<phase>/<run_id>), optionally with a `/checkpoints/step-<N>` suffix "
+        "to warm-start from a specific step listed by `flash checkpoints`"
     )
 
 

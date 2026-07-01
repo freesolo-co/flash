@@ -37,6 +37,26 @@ def test_status_adapter_ref_downloads_from_other_repo(monkeypatch):
     assert out.endswith("sft/flash-sftX/adapter")
 
 
+def test_checkpoint_step_adapter_ref_downloads_that_step(monkeypatch):
+    """`<ref>/checkpoints/step-N` resolves to the per-step deployable adapter path, so a run can
+    warm-start from a specific saved checkpoint instead of the run-level adapter."""
+    calls, out = _capture(
+        monkeypatch, "Freesolo-Co/flashrun-rlX:rl/flash-rlX/checkpoints/step-40"
+    )
+    assert calls["repo_id"] == "Freesolo-Co/flashrun-rlX"
+    assert calls["allow_patterns"] == ["rl/flash-rlX/checkpoints/step-40/adapter/*"]
+    assert out is not None
+    assert out.endswith("rl/flash-rlX/checkpoints/step-40/adapter")
+
+
+def test_checkpoint_ref_with_trailing_path_is_rejected(monkeypatch):
+    calls, out = _capture(
+        monkeypatch, "Freesolo-Co/flashrun-rlX:rl/flash-rlX/checkpoints/step-40/adapter"
+    )
+    assert calls == {}
+    assert out is None
+
+
 def test_bare_prefix_is_not_a_public_init_adapter_ref(monkeypatch):
     calls, out = _capture(monkeypatch, "sft/flash-self")
     assert calls == {}
