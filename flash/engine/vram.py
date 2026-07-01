@@ -79,6 +79,17 @@ def _resident_kv_gb(
     return kv * 0.5 if fp8_kv else kv
 
 
+def _colocate_util_cap(weights_gb: float, total_vram_gb: float) -> float:
+    """Utilization ceiling for the colocated vLLM executor budget.
+
+    0.45 everywhere the blanket cap was tuned; lifted to 0.55 only when the executor carries a BIG
+    weight copy (>=60 GB) AND the card leaves the trainer's resident copy room alongside the lifted
+    budget (0.45*total - weights >= ~10 GB). See colocate_kv_util for the measured rationale."""
+    big_weight_copy = weights_gb >= 60
+    leaves_room_for_trainer_copy = (0.45 * total_vram_gb - weights_gb) >= 10.0
+    return 0.55 if (big_weight_copy and leaves_room_for_trainer_copy) else 0.45
+
+
 def colocate_kv_util(
     params_b: float | None,
     vllm_max_len: int,
@@ -123,9 +134,7 @@ def colocate_kv_util(
     # off the real headroom (not a >=140 GB card threshold, which ALSO catches the H200) is what makes
     # the lift safe. The GRPO step's _GpuPeakSampler verifies the headroom holds. Every other
     # card/model is byte-for-byte unchanged at 0.45.
-    _big_weight_copy = weights_gb >= 60
-    _055_leaves_room_for_trainer_copy = (0.45 * total_vram_gb - weights_gb) >= 10.0
-    _util_cap = 0.55 if (_big_weight_copy and _055_leaves_room_for_trainer_copy) else 0.45
+    _util_cap = _colocate_util_cap(weights_gb, total_vram_gb)
     if not sleep_mode:
         # Resident KV ON TOP of the weight copy: gpu_memory_utilization is the WHOLE executor budget,
         # so budgeting KV alone (the old _KV_CAP/total) starved the weights and vLLM raised "No
@@ -191,11 +200,10 @@ def grpo_seq_escalation_gb(params_b: float | None, seq_len: int) -> int:
 
 
 def grpo_kv_floor_gb(
-    params_b: float | None,
+    params_b: float,
     vllm_max_len: int,
     group_size: int = 8,
     active_params_b: float | None = None,
-    fp8_kv: bool = False,
 ) -> int:
     """Smallest card (GB) whose colocated vLLM executor budget still leaves a viable KV pool.
 
@@ -206,15 +214,17 @@ def grpo_kv_floor_gb(
     caught (e.g. group_size=16 multi-turn rollouts on a 31 GB card). Require the capped budget
     to hold the weight copy plus at least HALF the concurrent group's working KV (full KV is a
     throughput target, not an init requirement; half keeps validated lean configs admitted
-    while pushing the observed init-OOM shapes onto a bigger card or a parse-time reject)."""
-    weights_gb = max(0.5, float(params_b or 1.0)) * 2.0
-    kv_need = 0.5 * _resident_kv_gb(
-        float(active_params_b) if active_params_b else params_b,
-        vllm_max_len,
-        group_size,
-        fp8_kv=fp8_kv,
-    )
-    return math.ceil((weights_gb + kv_need) / 0.45)
+    while pushing the observed init-OOM shapes onto a bigger card or a parse-time reject).
+
+    The utilization cap mirrors ``colocate_kv_util`` (0.45, lifted to 0.55 for big weight copies
+    with headroom) so the floor never overestimates the card a large model actually needs."""
+    kv_params_b = float(active_params_b) if active_params_b else float(params_b)
+    weights_gb = max(0.5, float(params_b)) * 2.0
+    need = weights_gb + 0.5 * _resident_kv_gb(kv_params_b, vllm_max_len, group_size)
+    lifted = math.ceil(need / 0.55)
+    if _colocate_util_cap(weights_gb, lifted) == 0.55:
+        return lifted
+    return math.ceil(need / 0.45)
 
 
 @dataclass(frozen=True)
