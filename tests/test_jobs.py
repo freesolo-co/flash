@@ -1598,11 +1598,18 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         st = orch.attach_run("walked", log_stream=sys.stderr)
 
         assert st.state == "done"
+        import json
+        import os
+
         from flash.providers.runpod.pricing import hourly_rate
 
-        # ~1 GPU-hour on the walked 5090, not the cheaper provisional 4090.
-        assert abs(st.cost_usd - hourly_rate("RTX 5090")) < 1e-6
-        assert st.cost_usd > hourly_rate("RTX 4090")
+        # cost_usd is now the QUOTE (flash.cost estimate we charge); the MEASURED cost in metrics.json
+        # is what proves recovery costed the walked 5090, not the provisional 4090.
+        with open(os.path.join(orch.artifacts_dir(_spec("walked")), "metrics.json")) as f:
+            measured = json.load(f)["cost_usd"]
+        assert abs(measured - hourly_rate("RTX 5090")) < 1e-6  # ~1 GPU-hour on the 5090
+        assert measured > hourly_rate("RTX 4090")
+        assert st.cost_usd == orch.charge_usd_for_spec(_spec("walked"))
 
 
 # ---------------------------------------------------------------------------
@@ -1662,7 +1669,13 @@ def test_attach_completes_run(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         st = orch.attach_run("a1", log_stream=sys.stderr)
         assert st.state == "done"
-        assert abs(st.cost_usd - 0.2) < 1e-9
+        # We charge the QUOTE (flash.cost estimate); the measured 0.2 is recorded in metrics.json.
+        import json
+        import os
+
+        assert st.cost_usd == orch.charge_usd_for_spec(_spec("a1"))
+        with open(os.path.join(orch.artifacts_dir(_spec("a1")), "metrics.json")) as f:
+            assert json.load(f)["cost_usd"] == 0.2
 
 
 def test_attach_requires_handle(monkeypatch):

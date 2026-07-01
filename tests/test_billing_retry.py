@@ -59,17 +59,14 @@ def test_needs_charge_predicate():
         return RunStatus(**base)
 
     ctx = {"org_id": "o"}
-    # a completed external run not yet charged -> needs a charge
+    # a completed run (done/deployed) not yet charged -> charge its quote (cost_usd)
     assert billing_retry._needs_charge(
         st(state="done", billing_context=ctx, billing_state="pending")
     )
     assert billing_retry._needs_charge(
         st(state="done", billing_context=ctx, billing_state="failed")
     )
-    assert billing_retry._needs_charge(
-        st(state="done", billing_context=ctx, billing_state="charging")
-    )
-    # a deployed run still bills (done-then-deployed; its done-time charge may have failed)
+    # deployed = done-then-deployed; its done-time charge may have failed -> still bills
     assert billing_retry._needs_charge(
         st(state="deployed", billing_context=ctx, billing_state="failed")
     )
@@ -77,46 +74,29 @@ def test_needs_charge_predicate():
     assert not billing_retry._needs_charge(
         st(state="done", billing_context=ctx, billing_state="charged")
     )
-    # never completed (failed/cancelled) -> never charged, even if billing_state is still pending
-    # (the submit-time default: the charge machine never ran, so the run never trained)
+    # a training run that FAILED has no price and isn't terminal-billable -> never charged
     assert not billing_retry._needs_charge(
         st(state="failed", billing_context=ctx, billing_state="pending")
     )
+    # a run cancelled before any step ran carries cost_usd 0 -> nothing to charge
     assert not billing_retry._needs_charge(
-        st(state="cancelled", billing_context=ctx, billing_state="pending")
+        st(state="cancelled", billing_context=ctx, billing_state="pending", cost_usd=0.0)
     )
-    # completed-THEN-cancelled: a run that reached `done`/`deployed` (so the charge machine ran and
-    # left `charging`/`failed`) and was later cancelled still owes its completion charge -> needs one,
-    # even though `cancelled` is not a billable state. This is the deployed-then-cancelled leak.
+    # a run cancelled MID-training is priced by cancel_run (cost_usd = estimate at the steps actually
+    # run); charge that, even though `cancelled` is not a billable state and the charge never started.
     assert billing_retry._needs_charge(
-        st(state="cancelled", billing_context=ctx, billing_state="failed")
+        st(state="cancelled", billing_context=ctx, billing_state="pending", cost_usd=0.42)
+    )
+    # completed-THEN-cancelled keeps its quote (cost_usd>0) and is charged whatever its billing_state
+    assert billing_retry._needs_charge(
+        st(state="cancelled", billing_context=ctx, billing_state="failed", cost_usd=1.23)
     )
     assert billing_retry._needs_charge(
-        st(state="cancelled", billing_context=ctx, billing_state="charging")
+        st(state="cancelled", billing_context=ctx, billing_state="charging", cost_usd=1.23)
     )
-    # PARTIAL ATTACH (must NOT charge): a recovery can set `artifacts_dir` + partial `cost_usd`
-    # while the run is still `running`. Such a run -- still running, or later cancelled -- has NOT
-    # finished training, so the predicate must leave it alone. `artifacts_dir`/`cost_usd` are
-    # deliberately NOT eligibility signals here: only `state in {done,deployed}` or a started charge
-    # (`charging`/`failed`) qualifies, neither of which this partial run has. Charging it would bill a
-    # partial amount and pre-empt the real final charge.
+    # a cancelled run with cost_usd 0 stays ineligible even if a charge somehow started ($0 to bill)
     assert not billing_retry._needs_charge(
-        st(
-            state="running",
-            billing_context=ctx,
-            billing_state="pending",
-            artifacts_dir="/results/runpod/rl/run-1",
-            cost_usd=0.5,
-        )
-    )
-    assert not billing_retry._needs_charge(
-        st(
-            state="cancelled",
-            billing_context=ctx,
-            billing_state="pending",
-            artifacts_dir="/results/runpod/rl/run-1",
-            cost_usd=0.5,
-        )
+        st(state="cancelled", billing_context=ctx, billing_state="failed", cost_usd=0.0)
     )
     # internal/non-external run (no billing context) -> nothing to charge
     assert not billing_retry._needs_charge(
@@ -312,21 +292,61 @@ def test_sweep_charges_completed_then_cancelled_run(monkeypatch, tmp_path):
     assert runner.get_status("run-1").billing_state == "charged"
 
 
-def test_sweep_never_charges_cancelled_before_completion(monkeypatch, tmp_path):
-    """Guard against over-correcting finding (1): a run cancelled BEFORE it completed carries the
-    submit-time `pending` (the charge machine never ran) and a non-billable state, so the sweep must
-    leave it alone. A run that never trained must never be charged."""
+def _save_cancelled_run(runner, *, cost_usd, billing_state="pending"):
+    """A cancelled run priced by cancel_run: ``cost_usd`` is the estimate at the steps actually run
+    (0 when cancelled before any step)."""
+    from flash.schema import spec_from_dict
+
+    spec = spec_from_dict(SPEC, run_id="run-1")
+    runner._save_status(
+        runner.RunStatus(
+            run_id="run-1",
+            state="cancelled",
+            spec=spec.to_dict(),
+            cost_usd=cost_usd,
+            remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+            billing_context={"org_id": "org-A"},
+            billing_state=billing_state,
+        )
+    )
+
+
+def test_sweep_charges_cancelled_run_at_its_priced_cost(monkeypatch, tmp_path):
+    """A run cancelled mid-training was priced by cancel_run (cost_usd = estimate at the steps it ran).
+    The sweep charges it exactly like a completed run -- via charge_completed_run, from cost_usd."""
     import flash.runner as runner
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    _save_run(runner, tmp_path, state="cancelled", billing_state="pending")
+    _save_cancelled_run(runner, cost_usd=0.42)
+
+    calls = []
+    monkeypatch.setattr(
+        "flash.server.billing.charge_completed_run",
+        lambda *, internal_key, status: (
+            calls.append((status.run_id, status.cost_usd)) or {"amountCents": 42, "replay": False}
+        ),
+    )
+
+    assert billing_retry.retry_completion_charges_once() == 1
+    assert calls == [("run-1", 0.42)]
+    st = runner.get_status("run-1")
+    assert st.billing_state == "charged"
+    assert st.billing_charge == {"amountCents": 42, "replay": False}
+
+
+def test_sweep_skips_cancelled_run_with_no_cost(monkeypatch, tmp_path):
+    """A run cancelled before any step ran carries cost_usd 0 -> nothing to charge; the sweep leaves it
+    alone and never hits the backend."""
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_cancelled_run(runner, cost_usd=0.0)
 
     monkeypatch.setattr(
         "flash.server.billing.charge_completed_run",
-        lambda **_: (_ for _ in ()).throw(
-            AssertionError("a never-completed run must not be charged")
-        ),
+        lambda **_: (_ for _ in ()).throw(AssertionError("a $0 cancel must not be charged")),
     )
     assert billing_retry.retry_completion_charges_once() == 0
     assert runner.get_status("run-1").billing_state == "pending"
