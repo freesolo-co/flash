@@ -87,6 +87,14 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     assert not any("liger-kernel" in s or "tilelang" in s for s in base_partial["pip_base"])
 
 
+def test_bake_kernel_cache_uses_chalk_default_source_of_truth():
+    from flash.providers.runpod.train.deps import LATEST_CHALK_MAIN_SHA
+
+    bake_src = (ROOT / "docker" / "bake_kernel_cache.py").read_text()
+    assert "DEFAULT_CHALK_SPEC" in bake_src
+    assert LATEST_CHALK_MAIN_SHA not in bake_src
+
+
 def test_dockerfile_only_change_is_a_free_relayer():
     """A Dockerfile.worker edit that isn't a parsed pin (apt/ENV/CMD/cache-dir) must move fp_base
     (a free re-layer) but NOT fp_cache (no paid GPU re-warm). dockerfile_sha256 lives in fp_base."""
