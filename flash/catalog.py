@@ -38,6 +38,7 @@ class ServingCapacity:
     serve_model_id: str = ""
     max_num_seqs: int = 0
     max_num_batched_tokens: int = 0
+    tensor_parallel_size: int = 0
     gpu_memory_utilization: float = 0.0
 
 
@@ -104,6 +105,7 @@ class ModelInfo:
                 "serve_model_id",
                 "max_num_seqs",
                 "max_num_batched_tokens",
+                "tensor_parallel_size",
                 "gpu_memory_utilization",
             ):
                 if serving.get(key) in ("", 0, 0.0, None):
@@ -136,7 +138,7 @@ MODELS: dict[str, ModelInfo] = {
             gpu="L4",
             serve_model_id=SERVING_FP8_MODEL_REPOS["openbmb/MiniCPM5-1B"],
             max_loras=16,
-            max_lora_rank=64,
+            max_lora_rank=128,
             max_model_len=32768,
         ),
         thinking="hybrid",
@@ -155,7 +157,7 @@ MODELS: dict[str, ModelInfo] = {
             gpu="L4",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-0.8B"],
             max_loras=16,
-            max_lora_rank=64,
+            max_lora_rank=128,
             max_model_len=32768,
         ),
         thinking="hybrid",
@@ -174,7 +176,7 @@ MODELS: dict[str, ModelInfo] = {
             gpu="L4",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-2B"],
             max_loras=16,
-            max_lora_rank=64,
+            max_lora_rank=128,
             max_model_len=32768,
         ),
         thinking="hybrid",
@@ -189,10 +191,10 @@ MODELS: dict[str, ModelInfo] = {
         min_vram_gb=32,
         recommended_gpu="RTX 5090",
         serving=ServingCapacity(
-            gpu="L4",
+            gpu="L40S",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-4B"],
             max_loras=64,
-            max_lora_rank=32,
+            max_lora_rank=64,
             max_model_len=8192,
             max_num_seqs=8,
             gpu_memory_utilization=0.98,
@@ -214,10 +216,10 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         serving=ServingCapacity(
-            gpu="L4",
+            gpu="L40S",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-9B"],
             max_loras=44,
-            max_lora_rank=32,
+            max_lora_rank=64,
             max_model_len=8192,
             max_num_seqs=8,
             gpu_memory_utilization=0.98,
@@ -252,13 +254,14 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="H200",
         serving=ServingCapacity(
-            gpu="A100-80GB",
+            gpu="A100-80GB:2",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
             max_loras=12,
-            max_lora_rank=32,
+            max_lora_rank=64,
             max_model_len=8192,
             max_num_seqs=8,
             max_num_batched_tokens=4096,
+            tensor_parallel_size=2,
             gpu_memory_utilization=0.98,
         ),
         thinking="hybrid",
@@ -289,8 +292,8 @@ def get_model(model_id: str) -> ModelInfo:
 def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
     """Return the model's serving LoRA rank cap, or None when Flash has no local cap.
 
-    Serving capacity is model-specific: small serving models currently allow rank 64, while larger
-    serving paths can cap at rank 32. Unknown/open-policy models intentionally return None instead
+    Serving capacity is model-specific: small serving models currently allow rank 128, while larger
+    serving paths currently allow rank 64. Unknown/open-policy models intentionally return None instead
     of inheriting a global fallback.
     """
     if isinstance(model, ModelInfo):
