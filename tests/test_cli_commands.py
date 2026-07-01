@@ -217,7 +217,7 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert "[gpu] config table" not in out
 
 
-def test_status_runs_and_status_logs(fake_client, capsys) -> None:
+def test_status_runs_and_log_command(fake_client, capsys) -> None:
     assert _run(["status", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert "done" in out
@@ -229,14 +229,6 @@ def test_status_runs_and_status_logs(fake_client, capsys) -> None:
     assert "flash-1" in out
     assert "done" in out
     assert "SFT" in out
-
-    assert _run(["status", "flash-1", "--logs"]) == 0
-    out = capsys.readouterr().out
-    assert "hello from the worker" in out
-    # --logs always appends the real train-subprocess stdout fetched from the run's HF repo.
-    assert "----- console_sft.txt -----" in out
-    assert "worker stdout line" in out
-    assert "cost_usd" in out
 
     assert _run(["status", "flash-1", "--follow"]) == 0
     out = capsys.readouterr().out
@@ -251,13 +243,13 @@ def test_status_runs_and_status_logs(fake_client, capsys) -> None:
     assert "cost_usd" not in out
 
 
-def test_status_logs_separates_partial_log_line_from_json(fake_client, capsys) -> None:
+def test_log_prints_partial_log_line_with_newline(fake_client, capsys) -> None:
     fake_client.log_text = "partial log line"
-    fake_client.get_worker_output = lambda run_id: {}  # isolate: log->status separation only
+    fake_client.get_worker_output = lambda run_id: {}
 
-    assert _run(["status", "flash-1", "--logs"]) == 0
+    assert _run(["log", "flash-1"]) == 0
     out = capsys.readouterr().out
-    assert "partial log line\n{" in out
+    assert out == "partial log line\n"
 
 
 def test_log_drains_offset_pages_without_status(fake_client, capsys) -> None:

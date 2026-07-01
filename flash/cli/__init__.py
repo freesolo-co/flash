@@ -314,11 +314,6 @@ def _build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="show a run's current status")
     status.add_argument("run_id")
     status.add_argument(
-        "--logs",
-        action="store_true",
-        help="compatibility alias: print full logs before status; prefer `flash log <run_id>`",
-    )
-    status.add_argument(
         "-f",
         "--follow",
         action="store_true",

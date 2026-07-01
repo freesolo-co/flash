@@ -509,9 +509,6 @@ def cmd_status(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
         return _follow_status(client, args.run_id)
-    if getattr(args, "logs", False):
-        printed_any = _print_log_snapshot(client, args.run_id)
-        _print_worker_output(client, args.run_id, printed_any=printed_any)
     status = client.get_run(args.run_id)
     if render.styled():
         print(render.run_status(status))
