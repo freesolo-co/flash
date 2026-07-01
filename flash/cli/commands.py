@@ -407,9 +407,12 @@ def cmd_train(args) -> int:
     return _follow_run(client, run_id)
 
 
-def _poll_logs(client: ApiClient, run_id: str, interval: float) -> str:
-    """Stream offset-paged logs until the run reaches a terminal state; return that state."""
+def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bool]:
+    """Stream offset-paged logs until the run reaches a terminal state.
+
+    Returns (terminal state, whether any log bytes were printed)."""
     offset = 0
+    printed_any = False
     spinner = _LogFollowSpinner(run_id)
     try:
         while True:
@@ -417,23 +420,25 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> str:
             if page["logs"]:
                 spinner.clear()
                 print(page["logs"], end="", flush=True)
+                printed_any = True
             offset = page["offset"]
             if page["state"] in _CLI_DONE_STATES:
                 spinner.clear()
-                return page["state"]
+                return page["state"], printed_any
             _sleep_with_spinner(interval, spinner, page["state"])
     finally:
         spinner.clear()
 
 
+def _render_status(status: dict) -> str:
+    """One rendering of a run status: themed panel on a TTY, indented JSON on the machine path."""
+    return render.run_status(status) if render.styled() else json.dumps(status, indent=2)
+
+
 def _follow_run(client: ApiClient, run_id: str) -> int:
     """Poll logs until the run reaches a terminal state, then print the final status."""
-    state = _poll_logs(client, run_id, interval=2.0)
-    status = client.get_run(run_id)
-    if render.styled():
-        print(render.run_status(status))
-    else:
-        print(json.dumps(status, indent=2))
+    state, _ = _poll_logs(client, run_id, interval=2.0)
+    print(_render_status(client.get_run(run_id)))
     return 0 if state in _OK_STATES else 1
 
 
@@ -442,7 +447,7 @@ def _follow_status(client: ApiClient, run_id: str, interval: float = 2.0) -> int
     last_rendered: str | None = None
     while True:
         status = client.get_run(run_id)
-        rendered = render.run_status(status) if render.styled() else json.dumps(status, indent=2)
+        rendered = _render_status(status)
         if rendered != last_rendered:
             print(rendered)
             last_rendered = rendered
@@ -450,21 +455,6 @@ def _follow_status(client: ApiClient, run_id: str, interval: float = 2.0) -> int
         if state in _CLI_DONE_STATES:
             return 0 if state in _OK_STATES else 1
         time.sleep(interval)
-
-
-def _print_log_text(text: str) -> bool:
-    if not text:
-        return False
-    print(text, end="")
-    if not text.endswith("\n"):
-        print()
-    return True
-
-
-def _print_log_snapshot(client: ApiClient, run_id: str) -> bool:
-    """Print a finite snapshot from the log endpoint without following new bytes."""
-    page = client.get_logs(run_id, offset=0)
-    return _print_log_text(str(page.get("logs") or ""))
 
 
 def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
@@ -484,11 +474,13 @@ def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = 
 def cmd_log(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
-        state = _poll_logs(client, args.run_id, interval=2.0)
-        _print_worker_output(client, args.run_id, printed_any=True)
+        state, printed_any = _poll_logs(client, args.run_id, interval=2.0)
+        _print_worker_output(client, args.run_id, printed_any=printed_any)
         return 0 if state in _OK_STATES else 1
-    printed_any = _print_log_snapshot(client, args.run_id)
-    _print_worker_output(client, args.run_id, printed_any=printed_any)
+    text = str(client.get_logs(args.run_id, offset=0).get("logs") or "")
+    if text:
+        print(text, end="" if text.endswith("\n") else "\n")
+    _print_worker_output(client, args.run_id, printed_any=bool(text))
     return 0
 
 
@@ -496,11 +488,7 @@ def cmd_status(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
         return _follow_status(client, args.run_id)
-    status = client.get_run(args.run_id)
-    if render.styled():
-        print(render.run_status(status))
-    else:
-        print(json.dumps(status, indent=2))
+    print(_render_status(client.get_run(args.run_id)))
     return 0
 
 
