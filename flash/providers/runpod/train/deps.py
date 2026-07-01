@@ -65,7 +65,7 @@ def _append_tag_suffix(image: str, suffix: str) -> str:
     slash = image.rfind("/")
     colon = image.rfind(":")
     if colon > slash:
-        return f"{image[:colon]}:{image[colon + 1:]}-{suffix}"
+        return f"{image[:colon]}:{image[colon + 1 :]}-{suffix}"
     return f"{image}-{suffix}"
 
 
@@ -107,7 +107,7 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 # Chalk latest main as of this change: freesolo-chalk 0.4.12.
 # Pin the exact commit so worker installs cannot lag behind the merged kernel surface.
 LATEST_CHALK_MAIN_SHA = "ad1a9345fdfe175b7916e344fd8fb23ba89c89c0"
-DEFAULT_CHALK_SPEC = "git+https://github.com/freesolo-co/chalk.git@ad1a9345fdfe175b7916e344fd8fb23ba89c89c0"
+DEFAULT_CHALK_SPEC = f"git+https://github.com/freesolo-co/chalk.git@{LATEST_CHALK_MAIN_SHA}"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:

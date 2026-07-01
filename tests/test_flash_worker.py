@@ -376,6 +376,45 @@ def test_train_body_has_no_prime_install_path():
     assert 'shutil.which("prime")' not in src
 
 
+def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
+    import os
+    from pathlib import Path
+
+    from flash.providers.runpod.train import endpoints
+
+    calls = []
+
+    def fake_run(cmd, *, check, env=None):
+        calls.append({"cmd": cmd, "check": check, "env": env})
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    with pytest.raises(ValueError, match="invalid code_prefix"):
+        endpoints._train_body(
+            {
+                "phase": "sft",
+                "seed": 0,
+                "hf_repo": "owner/runs",
+                "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
+                "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+                "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
+                "code_prefix": "../code/flash",
+            }
+        )
+
+    assert len(calls) == 1
+    env = calls[0]["env"]
+    assert env["GITHUB_TOKEN"] == "ghp-secret"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    askpass = Path(env["GIT_ASKPASS"])
+    try:
+        assert askpass.exists()
+        assert os.access(askpass, os.X_OK)
+        assert "ghp-secret" not in askpass.read_text()
+    finally:
+        askpass.unlink(missing_ok=True)
+
+
 def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     """Guard: completion-only loss is ON and every prior SFT optimization is still wired. The
     completion-only change only touched the data representation + label masking — packing, chalk,
@@ -412,6 +451,8 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
     # chalk standalone fused CE/RMSNorm/SwiGLU/RoPE
     assert "install_chalk_kernels(" in src
+    assert "chalk_fused_ce_available(model_id)" in src
+    assert "chalk fused CE did not engage" in src
     assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
     # LoRA+ (B-matrix LR ratio)
     assert "create_loraplus_optimizer" in src

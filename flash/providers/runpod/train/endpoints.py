@@ -239,11 +239,33 @@ def _train_body(input_data: dict) -> dict:
             "hf_home": os.environ.get("HF_HOME"),
         }
 
+    overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+
+    def _extra_pip_env() -> dict[str, str]:
+        env = dict(os.environ)
+        env.update(overrides)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        if env.get("GITHUB_TOKEN"):
+            askpass = "/tmp/flash-github-askpass.sh"
+            with open(askpass, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'case "$1" in\n'
+                    '*Username*) printf "%s\\n" "x-access-token" ;;\n'
+                    '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
+                    "esac\n"
+                )
+            os.chmod(askpass, 0o700)
+            env["GIT_ASKPASS"] = askpass
+        return env
+
     extra_pip = input_data.get("extra_pip") or []
     if extra_pip:
-        subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
-
-    overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", *extra_pip],
+            check=True,
+            env=_extra_pip_env(),
+        )
 
     def _code_prefix() -> str:
         raw = input_data.get("code_prefix")
