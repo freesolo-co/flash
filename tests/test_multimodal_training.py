@@ -183,6 +183,22 @@ def test_empty_and_explicit_image_placeholders_keep_order():
     assert row["images"][1].getpixel((0, 0)) == (0, 0, 255)
 
 
+def test_top_level_image_fallback_preserves_structured_content():
+    messages = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "Inspect the image."}],
+        }
+    ]
+
+    row = multimodal_grpo_prompt_row(messages, _example())
+
+    assert row["prompt"][0]["content"] == [
+        {"type": "image"},
+        {"type": "text", "text": "Inspect the image."},
+    ]
+
+
 def test_every_catalog_multimodal_model_accepts_image_rows():
     image_models = [model_id for model_id, info in MODELS.items() if supports_multimodal(info)]
     assert image_models
@@ -341,6 +357,43 @@ def test_freesolo_env_threads_image_base_dirs():
     src = inspect.getsource(load_freesolo_environment)
     assert "image_base_dirs = [base_dir]" in src
     assert "image_base_dirs=tuple" in src
+
+
+def test_freesolo_env_does_not_authorize_external_dataset_image_root(monkeypatch, tmp_path):
+    import flash.envs.adapter as env_adapter
+
+    class EnvironmentMultiTurn:
+        pass
+
+    captured = {}
+
+    def fake_load_environment(reference, **kwargs):
+        captured["reference"] = reference
+        captured["kwargs"] = kwargs
+        return object()
+
+    tools = {
+        "EnvironmentEpisode": type("EnvironmentEpisode", (), {}),
+        "EnvironmentMultiTurn": EnvironmentMultiTurn,
+        "EnvironmentSingleTurn": type("EnvironmentSingleTurn", (), {}),
+        "EnvironmentTurn": type("EnvironmentTurn", (), {}),
+        "load_environment": fake_load_environment,
+        "load_task_examples": lambda _source: [],
+        "task_example_from_record": lambda record: record,
+    }
+    monkeypatch.setattr(env_adapter, "_import_freesolo_environment_tools", lambda: tools)
+
+    env_file = tmp_path / "env" / "environment.py"
+    env_file.parent.mkdir()
+    env_file.write_text("def load_environment(**kwargs): pass\n")
+    external = tmp_path / "external" / "train.jsonl"
+    external.parent.mkdir()
+    external.write_text('{"input":"x","output":"y"}\n')
+
+    env = load_freesolo_environment(str(env_file), records=str(external), contract_text="")
+
+    assert captured["reference"] == str(env_file)
+    assert env.image_base_dirs == (env_file.parent.resolve(strict=False),)
 
 
 def test_grpo_prompt_dataset_preserves_image_columns_without_rich_examples():

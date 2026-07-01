@@ -710,6 +710,13 @@ def _resolve_path_arg(value: object, base_dir: Path) -> object:
     return str(candidate) if candidate.exists() else value
 
 
+def _path_is_under(path: Path, base: Path) -> bool:
+    try:
+        return path == base or path.is_relative_to(base)
+    except AttributeError:  # pragma: no cover - Python 3.11+ in CI/worker
+        return path == base or base in path.parents
+
+
 def _load_contract_text(path: str | None) -> str:
     if not path:
         return ""
@@ -1167,9 +1174,12 @@ def load_freesolo_environment(
     sdk_env = tools["load_environment"](reference, **params)
     image_base_dirs = [base_dir]
     if isinstance(source, str):
-        source_path = Path(source)
-        if source_path.exists():
-            image_base_dirs.append(source_path.parent)
+        source_path = Path(source).expanduser()
+        source_candidate = source_path if source_path.is_absolute() else base_dir / source_path
+        resolved_source = source_candidate.resolve(strict=False)
+        resolved_base = base_dir.resolve(strict=False)
+        if source_candidate.exists() and _path_is_under(resolved_source, resolved_base):
+            image_base_dirs.append(resolved_source.parent)
     return FreesoloEnvironment(
         sdk_env,
         env_id,

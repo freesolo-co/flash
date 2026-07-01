@@ -293,6 +293,12 @@ def _normalize_content(content: Any, *, placeholder_values: list[Any]) -> Any:
     return out
 
 
+def _prepend_image_placeholders(content: Any, placeholders: list[dict]) -> list[Any]:
+    if isinstance(content, list):
+        return [*placeholders, *content]
+    return [*placeholders, {"type": "text", "text": str(content or "")}]
+
+
 def normalize_messages_with_images(
     messages: list[dict],
     example: dict | None = None,
@@ -338,22 +344,15 @@ def normalize_messages_with_images(
             injected = False
             for message in normalized:
                 if message.get("role") == "user":
-                    content = message.get("content")
-                    if isinstance(content, list):
-                        message["content"] = [*placeholders, *content]
-                    else:
-                        message["content"] = [
-                            *placeholders,
-                            {"type": "text", "text": str(content or "")},
-                        ]
+                    message["content"] = _prepend_image_placeholders(
+                        message.get("content"), placeholders
+                    )
                     injected = True
                     break
             if not injected and normalized:
-                content = normalized[0].get("content")
-                normalized[0]["content"] = [
-                    *placeholders,
-                    {"type": "text", "text": str(content or "")},
-                ]
+                normalized[0]["content"] = _prepend_image_placeholders(
+                    normalized[0].get("content"), placeholders
+                )
 
     return normalized, _load_images(values, base_dirs=base_dirs)
 
