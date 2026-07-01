@@ -566,6 +566,7 @@ def cmd_deploy(args) -> int:
             file=sys.stderr,
         )
         return 1
+    base_run_id, _step = parsed
     dep = client_from_config().deploy(
         args.run_id,
         dry_run=args.dry_run,
@@ -577,7 +578,7 @@ def cmd_deploy(args) -> int:
     # a dry run creates no deployment, so the billing / undeploy hint would be misleading.
     if dep.get("state") != "dry_run":
         note = (
-            f"serving is billed per token only; use `flash undeploy {args.run_id}` "
+            f"serving is billed per token only; use `flash undeploy {base_run_id}` "
             "to deregister the adapter."
         )
         print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)

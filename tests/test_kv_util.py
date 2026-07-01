@@ -112,6 +112,14 @@ def test_big_card_big_weight_colocate_lifts_cap_to_055():
     assert colocate_kv_util(35.0, 8192, 141.0, sleep_mode=True, num_generations=16) == 0.45
 
 
+def test_grpo_kv_floor_searches_lifted_cap_transition():
+    from flash.engine.vram import grpo_kv_floor_gb
+
+    # The 0.55 cap is gated by total card size. The floor must not only test need/0.55 and
+    # otherwise jump all the way to need/0.45; the first valid lifted-cap card is smaller.
+    assert grpo_kv_floor_gb(35.0, 2048, 8) == 178
+
+
 def test_robust_to_missing_params_and_zero_context():
     u = colocate_kv_util(None, 0, 80.0, sleep_mode=True, num_generations=8)
     assert 0.0 < u <= 0.45

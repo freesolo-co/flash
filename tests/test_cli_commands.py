@@ -319,6 +319,9 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
 
     assert _run(["deploy", "flash-1/step-40"]) == 0
     assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
+    err = capsys.readouterr().err
+    assert "flash undeploy flash-1`" in err
+    assert "flash undeploy flash-1/step-40`" not in err
 
     assert _run(["deployments"]) == 0
     assert "flash-1" in capsys.readouterr().out

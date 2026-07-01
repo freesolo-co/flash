@@ -221,10 +221,12 @@ def grpo_kv_floor_gb(
     kv_params_b = float(active_params_b) if active_params_b else float(params_b)
     weights_gb = max(0.5, float(params_b)) * 2.0
     need = weights_gb + 0.5 * _resident_kv_gb(kv_params_b, vllm_max_len, group_size)
-    lifted = math.ceil(need / 0.55)
-    if _colocate_util_cap(weights_gb, lifted) == 0.55:
-        return lifted
-    return math.ceil(need / 0.45)
+    lower = math.ceil(need / 0.55)
+    upper = math.ceil(need / 0.45)
+    for total_vram_gb in range(lower, upper + 1):
+        if _colocate_util_cap(weights_gb, total_vram_gb) * total_vram_gb >= need:
+            return total_vram_gb
+    return upper
 
 
 @dataclass(frozen=True)
