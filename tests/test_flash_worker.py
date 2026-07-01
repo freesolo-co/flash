@@ -117,7 +117,7 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
 
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
     """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
-    when it exits — so every print reaches `flash status --logs`, not just a post-mortem tail on
+    when it exits — so every print reaches `flash log`, not just a post-mortem tail on
     crash. There is no FLASH_UPLOAD_CONSOLE flag to forget: it is NOT forwarded to the worker (even
     if an operator sets it), and neither worker run_mode path gates the upload."""
     import inspect

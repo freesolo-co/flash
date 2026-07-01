@@ -44,6 +44,7 @@ _TAR_METADATA_TYPES = {
 }
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+_NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
 def _human_mb(n: int) -> str:
@@ -65,7 +66,7 @@ def namespace_for(key: dict) -> str:
             "authenticated Freesolo key must include an org slug (used to derive the hub namespace) — "
             "publish with a key created at https://freesolo.co/sign-in (`flash login`)"
         )
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", slug):
+    if not _NAMESPACE_RE.fullmatch(slug):
         raise EnvPublishError("authenticated Freesolo key has an invalid org slug")
     return slug
 
@@ -75,6 +76,27 @@ def _sanitize_name(name: str) -> str:
     if slug in {".", ".."} or not re.search(r"[a-z0-9]", slug):
         return "env"
     return slug or "env"
+
+
+def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
+    caller_namespace = namespace_for(key)
+    raw = str(name or "").strip()
+    if "/" not in raw:
+        return caller_namespace, _sanitize_name(raw)
+    parts = [part.strip() for part in raw.split("/")]
+    if len(parts) != 2 or not all(parts):
+        raise EnvPublishError("env name with namespace must be 'namespace/name'")
+    namespace = parts[0]
+    if not _NAMESPACE_RE.fullmatch(namespace):
+        raise EnvPublishError("env namespace must match [a-z0-9][a-z0-9._-]*")
+    clean = _sanitize_name(parts[1])
+    if namespace != caller_namespace:
+        raise EnvPublishError(
+            "env namespace must match your Freesolo org namespace "
+            f"({caller_namespace}/...); got {namespace}/{clean}",
+            status=403,
+        )
+    return namespace, clean
 
 
 class _LimitedReader:
@@ -362,8 +384,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
             status=503,
         )
     repo = _DEFAULT_GITHUB_REPO
-    ns = namespace_for(key)
-    clean = _sanitize_name(name)
+    ns, clean = _publish_slug_for_name(name, key)
     publish_root = f"{ns}/{clean}"
     if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
         raise EnvPublishError("env package must contain environment.py")

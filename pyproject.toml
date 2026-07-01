@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "0.2.33"
+version = "0.2.34"
 description = "Flash — managed LoRA post-training (SFT/GRPO) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -111,7 +111,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "0.2.33"
+version = "0.2.34"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

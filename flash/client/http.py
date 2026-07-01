@@ -110,6 +110,14 @@ def _validate_checkpoint_step(step: int | float) -> int:
     return int(step)
 
 
+def _validate_chat_messages(messages: list[dict]) -> None:
+    if not isinstance(messages, list):
+        raise ClientError("chat messages must be a list")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ClientError(f"chat messages[{index}] must be an object")
+
+
 class ApiClient:
     def __init__(
         self,
@@ -225,14 +233,7 @@ class ApiClient:
         return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
-        # Tolerate servers that predate /worker: FastAPI returns bare 404 "Not Found" for unknown
-        # paths; real run-not-found 404s carry "unknown run_id: ..." so we can distinguish them.
-        try:
-            return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
-        except ApiError as exc:
-            if exc.status == 404 and str(exc).strip().lower() == "not found":
-                return {}
-            raise
+        return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
 
     def cancel_run(self, run_id: str) -> dict:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")
@@ -289,6 +290,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> dict:
+        _validate_chat_messages(messages)
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/chat",
@@ -303,6 +305,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
+        _validate_chat_messages(messages)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
