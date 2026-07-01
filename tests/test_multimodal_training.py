@@ -292,6 +292,15 @@ def test_vl_warmstart_grpo_matches_sft_projector_targets(
     assert seen == {"model_id": merged, "multimodal": expected_multimodal}
 
 
+def test_vl_warmstart_projector_probe_fails_closed(tmp_path):
+    from flash.engine.worker.lora import adapter_has_multi_modal_projector_lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    with pytest.raises(ValueError, match="projector preflight failed"):
+        adapter_has_multi_modal_projector_lora(str(adir))
+
+
 def test_grpo_multimodal_path_is_wired_to_trl_vlm_support():
     src = inspect.getsource(rl.run_rl)
     assert "AutoProcessor.from_pretrained" in src

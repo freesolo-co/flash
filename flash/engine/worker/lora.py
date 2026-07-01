@@ -497,12 +497,18 @@ def adapter_has_multi_modal_projector_lora(adapter_dir: str) -> bool:
     """True when a saved LoRA adapter actually carries projector trainable weights."""
     try:
         keys = _read_adapter_tensor_keys(adapter_dir)
-    except Exception as e:
-        print(
-            f"[init-adapter] adapter projector-key probe failed for adir={adapter_dir!r}; "
-            f"assuming no projector LoRA keys for recombine compatibility: {e}"
+    except Exception as exc:
+        raise ValueError(
+            "VL warm-start projector preflight failed: could not inspect adapter_model.safetensors "
+            f"in {adapter_dir!r}, so Flash cannot choose a GRPO LoRA target set compatible with "
+            "the SFT adapter for final recombine"
+        ) from exc
+    if keys is None:
+        raise ValueError(
+            "VL warm-start projector preflight failed: no adapter_model.safetensors found in "
+            f"{adapter_dir!r}; multimodal GRPO warm-start recombine requires safetensors weights "
+            "so Flash can verify whether the SFT adapter targets multi_modal_projector"
         )
-        return False
     return bool(keys) and any("multi_modal_projector" in k for k in keys if _is_lora_key(k))
 
 
