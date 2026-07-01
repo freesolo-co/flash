@@ -98,18 +98,6 @@ class _ProgressReader:
         return chunk
 
 
-def _validate_checkpoint_step(step: int | float) -> int:
-    """Validate a checkpoint step before the request: reject bool (int(True)==1) and fractional floats
-    (int(2.7)==2 would target the WRONG checkpoint), then return the int — fail fast before the server."""
-    if isinstance(step, bool):
-        raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
-    if isinstance(step, float) and not step.is_integer():
-        raise ClientError(
-            f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
-        )
-    return int(step)
-
-
 def _validate_chat_messages(messages: list[dict]) -> None:
     if not isinstance(messages, list):
         raise ClientError("chat messages must be a list")
@@ -254,16 +242,24 @@ class ApiClient:
         self,
         run_id: str,
         dry_run: bool = False,
-        step: int | None = None,
     ) -> dict:
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
+                "for a saved checkpoint"
+            )
+        base_run_id, step = parsed
         # Deploy blocks on registration and serving warmup, which can take many minutes.
         deploy_timeout = 30 * 60 if not dry_run else None
         body: dict = {"dry_run": dry_run}
         if step is not None:
-            body["step"] = _validate_checkpoint_step(step)
+            body["step"] = step
         return self._request(
             "POST",
-            f"/v1/runs/{run_id}/deploy",
+            f"/v1/runs/{base_run_id}/deploy",
             body=body,
             timeout=deploy_timeout,
         )
@@ -274,15 +270,23 @@ class ApiClient:
         *,
         repository: str,
         hf_token: str,
-        step: int | None = None,
         private: bool = True,
     ) -> dict:
         """Copy a run's adapter into a user-owned HuggingFace repo."""
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
+                "for a saved checkpoint"
+            )
+        base_run_id, step = parsed
         body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
         if step is not None:
-            body["step"] = _validate_checkpoint_step(step)
+            body["step"] = step
         return self._request(
-            "POST", f"/v1/runs/{run_id}/export", body=body, timeout=30 * 60
+            "POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60
         )
 
     def undeploy(self, run_id: str) -> dict:

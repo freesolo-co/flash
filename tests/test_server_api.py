@@ -2279,7 +2279,7 @@ def test_export_hf_failure_is_clean_502(api, monkeypatch):
 
 
 def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
-    """`--step N` exports the exact per-step checkpoint `flash deploy --step N` would serve; an
+    """Step export targets the exact per-step checkpoint `flash deploy RUN_ID/step-N` would serve; an
     unknown step 404s with the available list (resolved against published checkpoints)."""
     import flash.server.app as app_mod
 

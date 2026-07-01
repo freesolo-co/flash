@@ -715,7 +715,7 @@ def test_best_effort_no_checkpoints(monkeypatch):
 # Finalize wiring: the FINAL training step is always published as a deployable
 # checkpoint (not only when it lands on a save_steps boundary). The per-save
 # callback / on_train_end publish at/near save boundaries; an unaligned last
-# step would otherwise have no `--step` entry even though it IS the served
+# step would otherwise have no `RUN_ID/step-N` entry even though it IS the served
 # default `<prefix>/adapter`. run_rl/run_sft must close that gap after saving
 # the final adapter. Source-wiring (a runtime test would need a full trainer).
 # ---------------------------------------------------------------------------

@@ -485,7 +485,7 @@ flash chat <run-id> -m "probe"        # stream a reply from the deployed adapter
 flash deployments                     # list active serving deployments
 flash undeploy <run-id>               # tear down an active deployment
 flash export --adapter-id <run-id> --repository <you>/<repo>  # export final adapter
-flash export --adapter-id <run-id> --repository <you>/<repo> --step N  # export a checkpoint
+flash export --adapter-id <run-id>/step-N --repository <you>/<repo>  # export a checkpoint
 ```
 
 See the full reference at https://freesolo.co/docs.

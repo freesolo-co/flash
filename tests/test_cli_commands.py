@@ -102,10 +102,9 @@ class _FakeClient:
         *,
         repository: str,
         hf_token: str,
-        step: int | None = None,
         private: bool = True,
     ) -> dict:
-        self.calls.append(("export", run_id, repository, hf_token, step, private))
+        self.calls.append(("export", run_id, repository, hf_token, private))
         return {
             "run_id": run_id,
             "adapter_id": run_id,
@@ -316,10 +315,10 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert ("cancel", "flash-1") in fake_client.calls
 
     assert _run(["deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False, "step": None}) in fake_client.calls
+    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
 
     assert _run(["deploy", "flash-1/step-40"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False, "step": 40}) in fake_client.calls
+    assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
 
     assert _run(["deployments"]) == 0
     assert "flash-1" in capsys.readouterr().out
@@ -435,26 +434,24 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
 
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:
-    # The --api-key flag is the destination HF token; --step and --public are forwarded.
+    # The --api-key flag is the destination HF token; checkpoint refs and --public are forwarded.
     monkeypatch.delenv("HF_TOKEN", raising=False)
     assert (
         _run(
             [
                 "export",
                 "--adapter-id",
-                "flash-1",
+                "flash-1/step-40",
                 "--repository",
                 "me/adapters",
                 "--api-key",
                 "hf_flag",
-                "--step",
-                "40",
                 "--public",
             ]
         )
         == 0
     )
-    assert ("export", "flash-1", "me/adapters", "hf_flag", 40, False) in fake_client.calls
+    assert ("export", "flash-1/step-40", "me/adapters", "hf_flag", False) in fake_client.calls
     # The destination repo / url are reported back to the user.
     out = capsys.readouterr().out
     assert "me/adapters" in out

@@ -350,13 +350,6 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy = sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
     deploy.add_argument("run_id")
     deploy.add_argument("--dry-run", action="store_true")
-    deploy.add_argument(
-        "--step",
-        type=int,
-        default=None,
-        help="deploy a specific intermediate checkpoint (see `flash checkpoints <run_id>`) "
-        "instead of the run's final adapter; works even for a run cancelled mid-RL",
-    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")
@@ -379,13 +372,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--api-key",
         help="HuggingFace token with write access to --repository "
         "(default: HF_TOKEN from your shell or a local .env / .env.local)",
-    )
-    export.add_argument(
-        "--step",
-        type=int,
-        default=None,
-        help="export a specific intermediate checkpoint (see `flash checkpoints <adapter-id>`) "
-        "instead of the run's final adapter; works even for a run cancelled mid-RL",
     )
     export.add_argument(
         "--public",

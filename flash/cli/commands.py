@@ -566,15 +566,9 @@ def cmd_deploy(args) -> int:
             file=sys.stderr,
         )
         return 1
-    run_id, ref_step = parsed
-    step = getattr(args, "step", None)
-    if ref_step is not None and step is not None and int(step) != ref_step:
-        print(f"conflicting steps: {args.run_id!r} vs --step {step}", file=sys.stderr)
-        return 1
     dep = client_from_config().deploy(
-        run_id,
+        args.run_id,
         dry_run=args.dry_run,
-        step=step if step is not None else ref_step,
     )
     if render.styled():
         print(render.deployed(dep))
@@ -600,9 +594,8 @@ def cmd_export(args) -> int:
             "(export it in your shell or put it in a local .env / .env.local)"
         )
     client = client_from_config()
-    where = f" (step {args.step})" if args.step is not None else ""
     progress = (
-        f"exporting adapter {args.adapter_id}{where} to {args.repository} — "
+        f"exporting adapter {args.adapter_id} to {args.repository} — "
         "downloading then re-uploading; this can take a minute..."
     )
     print(render.note(progress) if render.styled() else progress, file=sys.stderr)
@@ -610,7 +603,6 @@ def cmd_export(args) -> int:
         args.adapter_id,
         repository=args.repository,
         hf_token=hf_token,
-        step=args.step,
         private=not args.public,
     )
     if render.styled():
