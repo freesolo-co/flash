@@ -443,7 +443,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
 
 
-def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
+def test_freesolo_adapter_preserves_missing_system_prompt(monkeypatch):
     class NoSystemEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
 
@@ -465,12 +465,11 @@ def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
     )
 
     assert env.prompt_messages({"input": "2+2?", "output": "4"}) == [
-        {"role": "system", "content": "follow the contract"},
         {"role": "user", "content": "2+2?"},
     ]
 
 
-def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
+def test_freesolo_adapter_preserves_blank_system_prompt(monkeypatch):
     class BlankSystemEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
 
@@ -495,7 +494,7 @@ def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
     )
 
     expected = [
-        {"role": "system", "content": "follow the contract"},
+        {"role": "system", "content": "   "},
         {"role": "user", "content": "2+2?"},
     ]
     assert env.prompt_messages({"input": "2+2?", "output": "4"}) == expected
@@ -504,7 +503,7 @@ def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
     assert state["messages"] == expected
     assert state["messages"] is not state["prompt"]
     state["messages"][0]["content"] = "changed"
-    assert state["prompt"][0]["content"] == "follow the contract"
+    assert state["prompt"][0]["content"] == "   "
 
 
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
@@ -583,11 +582,9 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     )
     state = env.new_rollout_state({"input": "browse", "output": "done"})
     assert state["prompt"] == [
-        {"role": "system", "content": "contract"},
         {"role": "user", "content": "contract:browse"},
     ]
     assert state["messages"] == [
-        {"role": "system", "content": "contract"},
         {"role": "user", "content": "contract:browse"},
     ]
     env.record_model_turn(state, "click")
