@@ -34,6 +34,19 @@ _ADAPTER_REF_RE = re.compile(
 )
 
 
+def normalize_env_name_segment(value: str) -> str | None:
+    """Normalize one env-name segment to the shared grammar ``[a-z0-9][a-z0-9._-]*``.
+
+    Lowercases, collapses runs of other characters to ``-``, strips edge dashes. Returns None
+    when nothing usable remains (empty, ``.``/``..``, or no alphanumeric). Shared by the CLI's
+    pre-publish name normalization and the server's authoritative publish-slug validation.
+    """
+    segment = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").lower()).strip("-")
+    if segment in {"", ".", ".."} or not re.search(r"[a-z0-9]", segment):
+        return None
+    return segment
+
+
 def load_toml(path: str) -> dict[str, Any]:
     with open(path, "rb") as f:
         return tomllib.load(f)

@@ -188,25 +188,23 @@ _ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
 
 
 def _normalize_env_name(raw: str) -> str | None:
-    import re
+    """Normalize only the NAME segment; a namespace prefix is passed through verbatim.
 
-    def normalize_segment(value: str) -> str | None:
-        segment = re.sub(r"[^a-z0-9._-]+", "-", value.lower()).strip("-")
-        if segment in {"", ".", ".."} or not re.search(r"[a-z0-9]", segment):
-            return None
-        return segment
+    The server is the sole authority on namespace grammar and ownership — rewriting the
+    namespace client-side would silently target a different (possibly forbidden) slug.
+    """
+    from flash.schema import normalize_env_name_segment
 
     text = str(raw or "").strip()
     if "/" not in text:
-        return normalize_segment(text)
+        return normalize_env_name_segment(text)
     parts = [part.strip() for part in text.split("/")]
     if len(parts) != 2 or not all(parts):
         return None
-    namespace = normalize_segment(parts[0])
-    name = normalize_segment(parts[1])
-    if not namespace or not name:
+    name = normalize_env_name_segment(parts[1])
+    if name is None:
         return None
-    return f"{namespace}/{name}"
+    return f"{parts[0]}/{name}"
 
 
 def _with_syspath_bootstrap(env_source: str) -> str:

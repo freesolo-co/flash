@@ -72,10 +72,9 @@ def namespace_for(key: dict) -> str:
 
 
 def _sanitize_name(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")
-    if slug in {".", ".."} or not re.search(r"[a-z0-9]", slug):
-        return "env"
-    return slug or "env"
+    from flash.schema import normalize_env_name_segment
+
+    return normalize_env_name_segment(name) or "env"
 
 
 def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
