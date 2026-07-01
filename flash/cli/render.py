@@ -541,11 +541,14 @@ def cancelled(payload: dict) -> str:
 
 def deployed(dep: dict) -> str:
     """`flash deploy`: the endpoint, gpu, and serving url as an aligned card (not a JSON dump)."""
+    endpoint = str(dep.get("endpoint_name") or "")
+    # OpenAI clients need the /v1 base; older servers omit `url`, so derive it from the endpoint.
+    url = dep.get("url") or (f"{endpoint.rstrip('/')}/v1" if endpoint else None)
     pairs = [
         ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
-        ("endpoint", _paint(dep["endpoint_name"], _GREEN) if dep.get("endpoint_name") else None),
+        ("endpoint", _paint(endpoint, _GREEN) if endpoint else None),
         ("gpu", dep.get("gpu")),
-        ("url", _paint(dep["url"], _ACCENT2) if dep.get("url") else None),
+        ("url", _paint(url, _ACCENT2) if url else None),
     ]
     state = dep.get("state", "deployed")
     if state == "dry_run":
@@ -571,6 +574,10 @@ def undeployed(result: dict) -> str:
     line = ok(f"torn down {rid}")
     if deleted:
         line += "\n" + _dim(f"  deregistered {', '.join(deleted)}")
+    else:
+        line += "\n" + _dim(
+            "  serving had no registered adapter to deregister (already gone or never registered)"
+        )
     return _safe(line)
 
 

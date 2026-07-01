@@ -205,3 +205,127 @@ def test_resolve_deploy_step_rejects_malformed_step_as_400():
         with pytest.raises(HTTPException) as ei:
             _resolve_deploy_step("flash-7-abcd", object(), bad)
         assert ei.value.status_code == 400, bad
+
+
+def _registry_resp(records):
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "adapters": records}
+
+    return _Resp()
+
+
+def test_deploy_reads_registry_back_before_ready(monkeypatch):
+    """POST /adapters returning 2xx is not enough: ready must be registry-backed."""
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+
+    class _PostResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    gets: list[str] = []
+
+    def fake_get(url, **k):
+        gets.append(url)
+        return _registry_resp(
+            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
+        )
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
+    monkeypatch.setattr(deploy_mod.httpx, "get", fake_get)
+
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert dep.state == "ready"
+    assert gets == ["https://serve.example/adapters"]
+
+
+def test_deploy_fails_when_adapter_never_appears_in_registry(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+
+    class _PostResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
+    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: _registry_resp([]))
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    msg = str(ei.value)
+    assert "never appeared" in msg
+    assert "Unknown adapter id" in msg
+
+
+def test_deploy_fails_when_registry_keeps_prior_checkpoint(monkeypatch):
+    """A checkpoint swap that leaves the OLD subfolder registered must fail loudly."""
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+
+    class _PostResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
+    monkeypatch.setattr(
+        deploy_mod.httpx,
+        "get",
+        lambda *a, **k: _registry_resp(
+            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/checkpoints/step_100/adapter"}]
+        ),
+    )
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert "previously deployed checkpoint" in str(ei.value)
+
+
+def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatch):
+    """An ambiguous POST failure (timeout/5xx) is resolved by reading the registry back."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(502, text="bad gateway", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    monkeypatch.setattr(
+        deploy_mod.httpx,
+        "get",
+        lambda *a, **k: _registry_resp(
+            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
+        ),
+    )
+
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert dep.state == "ready"
+
+
+def test_deployment_dict_carries_openai_v1_url(monkeypatch):
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090", dry_run=True)
+    data = dep.to_dict()
+    assert data["endpoint_name"] == "https://serve.example"
+    assert data["url"] == "https://serve.example/v1"
