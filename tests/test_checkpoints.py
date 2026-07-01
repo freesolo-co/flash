@@ -341,6 +341,71 @@ def test_on_save_queues_busy_step_instead_of_skipping(
     assert len(deployable) == 1, "a busy-lock save must be queued and uploaded, not skipped"
 
 
+def test_upload_pump_no_lost_wakeup(tmp_path):
+    """Regression: a save enqueued in the window where the in-flight upload has passed its own
+    drain check but not yet finished must still be started by done() — with the old two-lock
+    design it could be silently dropped."""
+    from flash.engine.worker.hf import _UploadPump
+
+    ckpt = tmp_path / "checkpoint-8"
+    ckpt.mkdir()
+    started: list[int] = []
+    pump = _UploadPump(lambda step, d: started.append(step))
+    # Simulate an in-flight upload that has already drained the queue (the racy window).
+    pump.uploading = True
+    pump.enqueue(8, str(ckpt))
+    assert started == [], "enqueue while busy must queue, not start"
+    pump.done()  # in-flight finishes: the queued step MUST be pumped, never lost
+    assert started == [8]
+    pump.done()
+    assert started == [8], "queue is single-slot; nothing left to start"
+
+
+def test_on_train_end_flushes_queued_step(tmp_path, monkeypatch, fake_trainer_callback):
+    """A save queued behind a still-in-flight upload at run end must be uploaded synchronously by
+    on_train_end (resume checkpoint AND deployable), not dropped when the daemon dies."""
+    import threading
+
+    from flash.engine.worker import hf as worker_hf
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(worker_hf, "_CKPT_FLUSH_TIMEOUT_S", 0.05)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)
+    _make_ckpt_dir(out, 8)
+
+    holding = threading.Event()
+    release = threading.Event()
+    base_upload = rec.upload_folder
+
+    def upload(**kwargs):
+        base_upload(**kwargs)
+        if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
+            holding.set()  # the step-4 resume upload is now in flight...
+            release.wait(5)  # ...and stays in flight across on_train_end
+
+    rec.upload_folder = upload
+
+    cb = worker.make_checkpoint_upload_callback()
+    try:
+        cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+        assert holding.wait(5), "the step-4 upload should be in flight"
+        cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=8), None)
+        cb.on_train_end(SimpleNamespace(output_dir=str(out)), None, None)
+        paths = [u["path_in_repo"] for u in rec.uploads]
+        assert "rl/flash-ckpt-1/checkpoints/step-8/adapter" in paths, (
+            "queued step's deployable must be flushed at train end"
+        )
+        assert "rl/flash-ckpt-1/checkpoint/checkpoint-8" in paths, (
+            "queued step's resume checkpoint must be flushed at train end"
+        )
+    finally:
+        release.set()
+
+
 def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
     """The streamed resume checkpoint is latest-only, but upload_folder's delete_patterns can't reach
     sibling step dirs (they're matched relative to the per-step path_in_repo), so older checkpoint-N
