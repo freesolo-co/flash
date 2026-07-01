@@ -256,7 +256,7 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     import flash.client.runtime_secrets as runtime_secrets
 
     class _ExportClient:
-        def export(self, adapter_id, *, repository, hf_token, step, private):
+        def export(self, adapter_id, *, repository, hf_token, private):
             # mirror the real server response shape, which has NO `private` key
             return {
                 "run_id": adapter_id,
@@ -272,9 +272,7 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _ExportClient())
 
     # default export (no --public) is private; the card must say so, not "public"
-    args = argparse.Namespace(
-        adapter_id="flash-1", repository="acme/x", step=None, public=False, api_key=None
-    )
+    args = argparse.Namespace(adapter_id="flash-1", repository="acme/x", public=False, api_key=None)
     assert cli.commands.cmd_export(args) == 0
     out = capsys.readouterr().out
     assert "private" in out

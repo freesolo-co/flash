@@ -461,7 +461,7 @@ def test_export_reads_hf_token_from_env_and_defaults_private(fake_client, monkey
     # No --api-key: the token resolves from HF_TOKEN, and the repo defaults to private.
     monkeypatch.setenv("HF_TOKEN", "hf_env")
     assert _run(["export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 0
-    assert ("export", "flash-1", "me/adapters", "hf_env", None, True) in fake_client.calls
+    assert ("export", "flash-1", "me/adapters", "hf_env", True) in fake_client.calls
 
 
 def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, tmp_path) -> None:
