@@ -554,7 +554,8 @@ def cmd_checkpoints(args) -> int:
         print(render.checkpoints_table(args.run_id, checkpoints))
         return 0
     for c in checkpoints:
-        print(f"step {c['step']:>6}  {c['repo_id']}:{c['subfolder']}")
+        # single-space, unpadded columns so a plain `grep "step N"` / awk split works.
+        print(f"step {c['step']} {c['repo_id']}:{c['subfolder']}")
     print(
         f"\ndeploy one with `flash deploy {args.run_id} --step <STEP>`.",
         file=sys.stderr,

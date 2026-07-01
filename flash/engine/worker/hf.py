@@ -420,6 +420,56 @@ def make_checkpoint_upload_callback():
             if recombined:
                 shutil.rmtree(recombined, ignore_errors=True)
 
+    # `save_every` must not be advisory: a save that fires while a prior upload is still in
+    # flight is QUEUED (newest wins) and uploaded as soon as the in-flight one finishes, instead
+    # of being dropped with "upload busy; skipping step N". Coalescing to the newest pending step
+    # keeps at most one waiter, so a slow uplink can't pile up threads, while the registered step
+    # list stays as dense as the uplink allows.
+    pending_lock = threading.Lock()
+    pending: dict[str, tuple[int, str]] = {}
+
+    def _start_upload_locked(step: int, ckpt_dir: str) -> None:
+        """Upload `step` in a background thread. Caller must hold `lock`; released when done."""
+
+        def _upload():
+            try:
+                # Deployable per-step adapter FIRST: it's small, kept-forever, and the only
+                # artifact that makes a cancelled/preempted run deployable from this step, so
+                # it must land before the larger resume checkpoint (best-effort, latest-only).
+                _publish_deployable_recombined(ckpt_dir, step)
+                _w.hf_api().upload_folder(
+                    folder_path=ckpt_dir,
+                    path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
+                    repo_id=_w.HF_REPO,
+                    repo_type="dataset",
+                )
+                # Prune older step dirs only after the new one is safely up (latest-only resume).
+                _prune_stale_resume_checkpoints(step)
+                _w.heartbeat("checkpoint_uploaded", step=step)
+            except Exception as e:
+                print("ckpt upload warn:", e)
+            finally:
+                lock.release()
+                _drain_pending()
+
+        threading.Thread(target=_upload, daemon=True).start()
+
+    def _drain_pending() -> None:
+        """Start the queued (newest) step's upload if the lock is free; else leave it queued."""
+        with pending_lock:
+            nxt = pending.pop("next", None)
+        if nxt is None:
+            return
+        step, ckpt_dir = nxt
+        if not os.path.isdir(ckpt_dir):  # pruned by the trainer's save_total_limit meanwhile
+            print(f"[ckpt] queued step {step} checkpoint dir is gone; dropping")
+            return
+        if lock.acquire(blocking=False):
+            _start_upload_locked(step, ckpt_dir)
+        else:  # a save re-acquired between release and here; requeue unless a newer step landed
+            with pending_lock:
+                pending.setdefault("next", (step, ckpt_dir))
+
     class _CheckpointUpload(TrainerCallback):
         def on_save(self, args, state, control, **kwargs):
             if not _w.HF_REPO:
@@ -429,30 +479,14 @@ def make_checkpoint_upload_callback():
             if not os.path.isdir(ckpt_dir):
                 return
             if not lock.acquire(blocking=False):
-                print(f"[ckpt] upload busy; skipping step {step}")
+                with pending_lock:
+                    pending["next"] = (step, ckpt_dir)
+                print(
+                    f"[ckpt] upload busy; queued step {step} "
+                    "(uploads when the in-flight one finishes)"
+                )
                 return
-
-            def _upload():
-                try:
-                    # Deployable per-step adapter FIRST: it's small, kept-forever, and the only
-                    # artifact that makes a cancelled/preempted run deployable from this step, so
-                    # it must land before the larger resume checkpoint (best-effort, latest-only).
-                    _publish_deployable_recombined(ckpt_dir, step)
-                    _w.hf_api().upload_folder(
-                        folder_path=ckpt_dir,
-                        path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
-                        repo_id=_w.HF_REPO,
-                        repo_type="dataset",
-                    )
-                    # Prune older step dirs only after the new one is safely up (latest-only resume).
-                    _prune_stale_resume_checkpoints(step)
-                    _w.heartbeat("checkpoint_uploaded", step=step)
-                except Exception as e:
-                    print("ckpt upload warn:", e)
-                finally:
-                    lock.release()
-
-            threading.Thread(target=_upload, daemon=True).start()
+            _start_upload_locked(step, ckpt_dir)
 
         def on_train_end(self, args, state, control, **kwargs):
             # Daemon threads are killed on exit; flush the final deployable synchronously here.

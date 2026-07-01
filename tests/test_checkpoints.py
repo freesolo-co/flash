@@ -10,6 +10,7 @@ All HF/network boundaries are stubbed; nothing here touches a GPU or the network
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -292,6 +293,52 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
         "rl/flash-ckpt-1/checkpoints/step-4/adapter",  # deployable first
         "rl/flash-ckpt-1/checkpoint/checkpoint-4",  # resume second
     ]
+
+
+def test_on_save_queues_busy_step_instead_of_skipping(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """`save_every` must not be advisory: a save that fires while a prior upload is still in
+    flight is queued and uploaded once the in-flight one finishes — previously it was dropped
+    ("upload busy; skipping step N"), leaving a sparse registered step list."""
+    import threading
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)
+    _make_ckpt_dir(out, 8)
+
+    holding = threading.Event()
+    release = threading.Event()
+    base_upload = rec.upload_folder
+
+    def upload(**kwargs):
+        base_upload(**kwargs)
+        if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
+            holding.set()  # the step-4 resume upload now holds the lock...
+            release.wait(5)  # ...until we let it finish
+
+    rec.upload_folder = upload
+
+    cb = worker.make_checkpoint_upload_callback()
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+    assert holding.wait(5), "the step-4 upload should be holding the lock"
+    # step-8 save fires while step-4 is uploading: it must be queued, not skipped.
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=8), None)
+    release.set()
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if any(u["path_in_repo"].endswith("checkpoints/step-8/adapter") for u in rec.uploads):
+            break
+        time.sleep(0.02)
+    deployable = [
+        u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-8/adapter")
+    ]
+    assert len(deployable) == 1, "a busy-lock save must be queued and uploaded, not skipped"
 
 
 def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
