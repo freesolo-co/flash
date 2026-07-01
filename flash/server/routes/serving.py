@@ -154,6 +154,24 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 org_id=deploy_org_id,
             )
         except ServingError as exc:
+            # A run-level deploy targets <prefix>/adapter, which only exists once finalize
+            # completed; a cancelled/preempted/interrupted run may carry only per-step
+            # checkpoints/step-N/adapter snapshots. Reading the missing run-level config
+            # surfaces as "failed to read ...adapter_config.json" — turn that into actionable
+            # guidance (deploy --step N) instead of an opaque 502 rank-verification error.
+            if not is_checkpoint and "failed to read" in str(exc):
+                steps = [c["step"] for c in _app.list_checkpoints(spec)]
+                if steps:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"run {run_id} has no run-level adapter at "
+                            f"{deploy_prefix}/adapter (the run likely never finalized); "
+                            f"deploy a saved checkpoint instead, e.g. `flash deploy "
+                            f"{run_id} --step {steps[-1]}` (available steps: "
+                            f"{', '.join(str(s) for s in steps)})"
+                        ),
+                    ) from exc
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
             if isinstance(exc, ValueError):

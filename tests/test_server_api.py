@@ -876,6 +876,64 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkeypatch):
+    """A run whose finalize never published the run-level <prefix>/adapter (but which streamed
+    per-step deployable checkpoints) must not fail run-level deploy with an opaque 502 rank
+    error: it returns a 409 telling the caller to `flash deploy <run> --step N`."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    def boom(**kwargs):
+        raise ServingError(
+            "could not verify adapter rank: failed to read org/repo:rl/x/adapter/adapter_config.json"
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", boom)
+    monkeypatch.setattr(
+        app_mod, "list_checkpoints", lambda spec: [{"step": 10}, {"step": 40}]
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert "no run-level adapter" in detail
+    assert f"flash deploy {run_id} --step 40" in detail
+    assert "10, 40" in detail
+
+
+def test_deploy_missing_adapter_without_checkpoints_stays_502(api, monkeypatch):
+    """No checkpoints to point at -> keep the 502 with the upstream reason."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    def boom(**kwargs):
+        raise ServingError("could not verify adapter rank: failed to read org/repo:x")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", boom)
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: [])
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 502, resp.text
+
+
 def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
     """The adapter is registered under the RUN's owning org (its persisted billing_context) so
     serving can authorize external chat by org — not merely whatever key initiated the deploy."""
