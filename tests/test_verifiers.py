@@ -519,12 +519,12 @@ def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp
     assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
 
 
-def test_freesolo_adapter_warns_on_dropped_record_keys(monkeypatch, tmp_path, capsys):
+def test_freesolo_adapter_warns_on_dropped_record_keys(monkeypatch, tmp_path):
     """Canonicalization keeps only input/output/id/metadata; extra top-level keys used to be
-    dropped silently — now a one-time stderr warning names them."""
-    import flash.envs.adapter as adapter_mod
+    dropped silently — now a once-per-key warnings.warn names them (per environment instance,
+    not via a mutable module global checked per record)."""
+    import warnings
 
-    monkeypatch.setattr(adapter_mod, "_WARNED_DROPPED_RECORD_KEYS", set())
     _install_fake_freesolo(monkeypatch)
     env_file = _split_env(
         tmp_path,
@@ -539,10 +539,16 @@ def test_freesolo_adapter_warns_on_dropped_record_keys(monkeypatch, tmp_path, ca
     from flash.envs.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), contract_text="c")
-    rows = env.dataset()
-    assert rows == [{"id": "t", "input": "x", "output": "y", "metadata": {"kept": True}}]
-    err = capsys.readouterr().err
-    assert "initial_state" in err and "dropped" in err
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        rows = env.dataset()
+        assert rows == [{"id": "t", "input": "x", "output": "y", "metadata": {"kept": True}}]
+        texts = [str(w.message) for w in caught]
+        assert any("initial_state" in t and "dropped" in t for t in texts)
+        # Re-canonicalizing the same records must not warn again (once per key per instance).
+        before = len(caught)
+        env._canonical_record(rows[0] | {"initial_state": [1, 2]})
+        assert len(caught) == before
 
 
 def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):

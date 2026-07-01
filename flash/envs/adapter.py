@@ -9,13 +9,13 @@ import json
 import os
 import re
 import shutil
-import sys
 import tarfile
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,29 +49,6 @@ _TAR_METADATA_TYPES = {
 }
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
-# Key names already warned about as dropped by record canonicalization (warn once per name).
-_WARNED_DROPPED_RECORD_KEYS: set[str] = set()
-
-
-def _with_system_prompt(messages: list[dict], contract_text: str) -> list[dict]:
-    system_text = str(contract_text or "").strip()
-    out = [dict(message) for message in messages]
-    if not system_text:
-        return out
-    first_blank_system_index: int | None = None
-    for index, message in enumerate(out):
-        if str(message.get("role") or "").strip().lower() != "system":
-            continue
-        content = message.get("content")
-        has_content = bool(content.strip()) if isinstance(content, str) else bool(content)
-        if has_content:
-            return out
-        if first_blank_system_index is None:
-            first_blank_system_index = index
-    if first_blank_system_index is not None:
-        out[first_blank_system_index]["content"] = system_text
-        return out
-    return [{"role": "system", "content": system_text}, *out]
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -892,6 +869,8 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
+        # Key names already warned about as dropped by canonicalization (warn once per name).
+        self._warned_dropped_record_keys: set[str] = set()
 
     @property
     def max_turns(self) -> int:
@@ -917,8 +896,28 @@ class FreesoloEnvironment(BaseEnvironment):
     def _task_example(self, example: dict):
         return self._task_example_from_record(self._canonical_record(example))
 
-    @staticmethod
-    def _canonical_record(record: dict) -> dict:
+    def _with_system_prompt(self, messages: list[dict]) -> list[dict]:
+        """Ensure the training contract rides as the system prompt (fill blank / prepend)."""
+        system_text = str(self._contract_text or "").strip()
+        out = [dict(message) for message in messages]
+        if not system_text:
+            return out
+        first_blank_system_index: int | None = None
+        for index, message in enumerate(out):
+            if str(message.get("role") or "").strip().lower() != "system":
+                continue
+            content = message.get("content")
+            has_content = bool(content.strip()) if isinstance(content, str) else bool(content)
+            if has_content:
+                return out
+            if first_blank_system_index is None:
+                first_blank_system_index = index
+        if first_blank_system_index is not None:
+            out[first_blank_system_index]["content"] = system_text
+            return out
+        return [{"role": "system", "content": system_text}, *out]
+
+    def _canonical_record(self, record: dict) -> dict:
         raw = dict(record)
         canonical = {}
         if _CANONICAL_INPUT_KEY not in raw:
@@ -935,14 +934,14 @@ class FreesoloEnvironment(BaseEnvironment):
         # minimal_solutions, ...) is dropped. That used to be SILENT, so envs relying on extra
         # top-level keys trained/scored without them. Warn once per key name.
         dropped = set(raw) - {_CANONICAL_INPUT_KEY, _CANONICAL_OUTPUT_KEY, "id", "metadata"}
-        new = dropped - _WARNED_DROPPED_RECORD_KEYS
+        new = dropped - self._warned_dropped_record_keys
         if new:
-            _WARNED_DROPPED_RECORD_KEYS.update(new)
-            print(
-                f"[env] warning: dataset record keys {sorted(new)} are dropped by "
-                "canonicalization (records keep only input/output/id/metadata); nest task "
-                "data under 'metadata' to preserve it on the worker",
-                file=sys.stderr,
+            self._warned_dropped_record_keys.update(new)
+            warnings.warn(
+                f"dataset record keys {sorted(new)} are dropped by canonicalization "
+                "(records keep only input/output/id/metadata); nest task data under "
+                "'metadata' to preserve it on the worker",
+                stacklevel=2,
             )
         return canonical
 
@@ -993,7 +992,7 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def prompt_messages(self, example: dict) -> list[dict]:
         messages = self._env.start_episode(self._task_example(example), self._contract_text)
-        return _with_system_prompt(messages, self._contract_text)
+        return self._with_system_prompt(messages)
 
     def sft_completion(self, example: dict) -> list[dict]:
         """Target completion messages for one SFT example; falls back to raw record output."""
@@ -1115,10 +1114,7 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def new_rollout_state(self, example: dict) -> dict:
         task = self._task_example(example)
-        prompt = _with_system_prompt(
-            self._env.start_episode(task, self._contract_text),
-            self._contract_text,
-        )
+        prompt = self._with_system_prompt(self._env.start_episode(task, self._contract_text))
         try:
             episode_turns: int | None = int(self._env.max_episode_turns(task))
         except Exception:
@@ -1216,6 +1212,16 @@ class FreesoloEnvironment(BaseEnvironment):
         return float(self._single(rewards, "score_episodes").score)
 
 
+def _packaged_dataset_file(base_dir: Path, name: str) -> Path | None:
+    """First existing packaged dataset file for split `name`, in the canonical shapes:
+    datasets/<name>.jsonl, datasets/<name>.json, <name>.jsonl, <name>.json."""
+    for rel in (f"datasets/{name}.jsonl", f"datasets/{name}.json", f"{name}.jsonl", f"{name}.json"):
+        candidate = base_dir / rel
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def load_freesolo_environment(
     env_id: str, pinned_sha: str | None = None, /, **kwargs
 ) -> FreesoloEnvironment:
@@ -1237,44 +1243,22 @@ def load_freesolo_environment(
     # SILENTLY trained on the default datasets/train.jsonl even when a side split was requested.
     split = params.get("split")
     split = split.strip() if isinstance(split, str) else None
-    if source is None and split and split != "train":
-        for rel in (
-            f"datasets/{split}.jsonl",
-            f"datasets/{split}.json",
-            f"{split}.jsonl",
-            f"{split}.json",
-        ):
-            candidate = base_dir / rel
-            if candidate.is_file():
-                params.setdefault("dataset_path", str(candidate))
-                source = str(candidate)
-                break
-        else:
+    if source is None:
+        wanted = split if split and split != "train" else "train"
+        found = _packaged_dataset_file(base_dir, wanted)
+        if found is None and wanted != "train" and _packaged_dataset_file(base_dir, "train"):
             # A default train.jsonl exists but the requested split file does not: refuse to fall
             # back silently (that trains on the wrong targets); envs with no packaged dataset at
             # all keep the SDK path, which may implement split itself.
-            if any(
-                (base_dir / rel).is_file()
-                for rel in ("datasets/train.jsonl", "datasets/train.json", "train.jsonl", "train.json")
-            ):
-                raise ValueError(
-                    f"[environment.params] split={split!r} was requested but no "
-                    f"datasets/{split}.jsonl (or {split}.json) exists in the environment; "
-                    "refusing to fall back to the default train split. Package the split file "
-                    "or drop the split param."
-                )
-    if source is None:
-        for rel in (
-            "datasets/train.jsonl",
-            "datasets/train.json",
-            "train.jsonl",
-            "train.json",
-        ):
-            candidate = base_dir / rel
-            if candidate.is_file():
-                params.setdefault("dataset_path", str(candidate))
-                source = str(candidate)
-                break
+            raise ValueError(
+                f"[environment.params] split={split!r} was requested but no "
+                f"datasets/{split}.jsonl (or {split}.json) exists in the environment; "
+                "refusing to fall back to the default train split. Package the split file "
+                "or drop the split param."
+            )
+        if found is not None:
+            params.setdefault("dataset_path", str(found))
+            source = str(found)
 
     contract_path = _resolve_path_arg(params.get("contract_path"), base_dir)
     if isinstance(contract_path, str):
