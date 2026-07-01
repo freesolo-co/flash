@@ -443,6 +443,82 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
 
 
+def _split_env(tmp_path, extra_files):
+    env_file = tmp_path / "freesolo" / "environment.py"
+    env_file.parent.mkdir()
+    env_file.write_text("def load_environment(**kwargs): pass\n")
+    for rel, text in extra_files.items():
+        f = tmp_path / "freesolo" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    return env_file
+
+
+def test_freesolo_adapter_split_param_selects_split_dataset(monkeypatch, tmp_path):
+    """[environment.params] split must pick datasets/<split>.jsonl for Flash's own dataset()
+    (SFT targets AND GRPO problem selection), not silently train on the default train.jsonl."""
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "datasets/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+    assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
+
+
+def test_freesolo_adapter_missing_split_file_refuses_silent_train_fallback(
+    monkeypatch, tmp_path
+):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="split='oracle'"):
+        load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+
+
+def test_freesolo_adapter_split_train_uses_default_dataset(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="train", contract_text="c")
+    assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
+
+
+def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "datasets/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file),
+        dataset_path="datasets/train.jsonl",
+        split="oracle",
+        contract_text="c",
+    )
+    assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
+
+
 def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
     class NoSystemEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]

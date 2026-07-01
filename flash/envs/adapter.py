@@ -1165,6 +1165,37 @@ def load_freesolo_environment(
         resolved_dataset_path = _resolve_path_arg(dataset_path, base_dir)
         params["dataset_path"] = resolved_dataset_path
         source = resolved_dataset_path
+    # [environment.params] split selects which packaged dataset file Flash trains on. It used to
+    # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
+    # SILENTLY trained on the default datasets/train.jsonl even when a side split was requested.
+    split = params.get("split")
+    split = split.strip() if isinstance(split, str) else None
+    if source is None and split and split != "train":
+        for rel in (
+            f"datasets/{split}.jsonl",
+            f"datasets/{split}.json",
+            f"{split}.jsonl",
+            f"{split}.json",
+        ):
+            candidate = base_dir / rel
+            if candidate.is_file():
+                params.setdefault("dataset_path", str(candidate))
+                source = str(candidate)
+                break
+        else:
+            # A default train.jsonl exists but the requested split file does not: refuse to fall
+            # back silently (that trains on the wrong targets); envs with no packaged dataset at
+            # all keep the SDK path, which may implement split itself.
+            if any(
+                (base_dir / rel).is_file()
+                for rel in ("datasets/train.jsonl", "datasets/train.json", "train.jsonl", "train.json")
+            ):
+                raise ValueError(
+                    f"[environment.params] split={split!r} was requested but no "
+                    f"datasets/{split}.jsonl (or {split}.json) exists in the environment; "
+                    "refusing to fall back to the default train split. Package the split file "
+                    "or drop the split param."
+                )
     if source is None:
         for rel in (
             "datasets/train.jsonl",
