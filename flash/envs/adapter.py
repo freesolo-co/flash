@@ -12,6 +12,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +27,12 @@ _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
+# bound the on-disk env cache so it cannot grow without limit (one subdir per env
+# content-sha, ~30-80 MB each). evicted LRU by dir mtime, which we bump on cache hit.
+_CACHE_MAX_ENTRIES = int(os.environ.get("FLASH_ENV_CACHE_MAX_ENTRIES", "32"))
+_CACHE_MAX_BYTES = int(os.environ.get("FLASH_ENV_CACHE_MAX_BYTES", str(4 * 1024 * 1024 * 1024)))
+# never evict an entry used within this window; a concurrent run may be loading it.
+_CACHE_MIN_AGE_SECONDS = 600
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
 _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
@@ -658,6 +665,46 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     return extracted_dir
 
 
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.stat(os.path.join(root, name)).st_size
+    return total
+
+
+def _evict_env_cache(keep: Path) -> None:
+    # evict least-recently-used cache dirs until both the entry count and total
+    # size are under their caps. never remove `keep` (just written) or anything
+    # used within the last _CACHE_MIN_AGE_SECONDS (a concurrent run may be
+    # loading it); overshooting the caps briefly is safer than deleting live env.
+    try:
+        entries = [p for p in _CACHE_ROOT.iterdir() if p.is_dir()]
+    except OSError:
+        return
+    now = time.time()
+    entries.sort(key=_safe_mtime)  # oldest first
+    sizes = {p: _dir_size_bytes(p) for p in entries}
+    total = sum(sizes.values())
+    count = len(entries)
+    for p in entries:
+        if count <= _CACHE_MAX_ENTRIES and total <= _CACHE_MAX_BYTES:
+            break
+        if p == keep or now - _safe_mtime(p) < _CACHE_MIN_AGE_SECONDS:
+            continue
+        shutil.rmtree(p, ignore_errors=True)
+        total -= sizes.get(p, 0)
+        count -= 1
+
+
 def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
@@ -677,6 +724,9 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     if env_file.is_dir():
         env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
     if env_file.is_file():
+        # mark as recently used so LRU eviction keeps hot envs.
+        with contextlib.suppress(OSError):
+            os.utime(cache_dir)
         return env_file
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
     resolved = GitHubEnvironmentRef(
@@ -705,6 +755,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
         shutil.copytree(extracted, cache_dir)
+        _evict_env_cache(keep=cache_dir)
         return cache_dir / candidate.relative_to(extracted)
     finally:
         shutil.rmtree(tmp_parent, ignore_errors=True)
