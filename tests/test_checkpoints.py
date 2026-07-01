@@ -361,9 +361,11 @@ def test_upload_pump_no_lost_wakeup(tmp_path):
     assert started == [8], "queue is single-slot; nothing left to start"
 
 
-def test_on_train_end_flushes_queued_step(tmp_path, monkeypatch, fake_trainer_callback):
-    """A save queued behind a still-in-flight upload at run end must be uploaded synchronously by
-    on_train_end (resume checkpoint AND deployable), not dropped when the daemon dies."""
+def test_on_train_end_flushes_queued_deployable_without_resume_race(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """A save queued behind a still-in-flight upload at run end must publish its deployable adapter
+    without starting a second resume-checkpoint upload/prune race."""
     import threading
 
     from flash.engine.worker import hf as worker_hf
@@ -399,8 +401,8 @@ def test_on_train_end_flushes_queued_step(tmp_path, monkeypatch, fake_trainer_ca
         assert "rl/flash-ckpt-1/checkpoints/step-8/adapter" in paths, (
             "queued step's deployable must be flushed at train end"
         )
-        assert "rl/flash-ckpt-1/checkpoint/checkpoint-8" in paths, (
-            "queued step's resume checkpoint must be flushed at train end"
+        assert "rl/flash-ckpt-1/checkpoint/checkpoint-8" not in paths, (
+            "queued step's resume checkpoint must not race the in-flight resume prune"
         )
     finally:
         release.set()

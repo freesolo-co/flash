@@ -29,6 +29,9 @@ def stub():
             seen["path"] = self.path
             if self.path == "/v1/runs/old-api/worker":
                 self._send(404, {"detail": "Not Found"})
+            elif self.path == "/v1/runs/proxy-old-api/worker":
+                self.send_response(404)
+                self.end_headers()
             elif self.path.startswith("/v1/runs/authfail"):
                 self._send(401, {"detail": "invalid or missing API key"})
             elif self.path.startswith("/v1/runs/missing"):
@@ -134,6 +137,7 @@ def test_get_worker_output_tolerates_missing_optional_route(stub):
     url, _ = stub
     client = ApiClient(url, "fslo-user-test")
     assert client.get_worker_output("old-api") == {}
+    assert client.get_worker_output("proxy-old-api") == {}
 
 
 def test_get_worker_output_preserves_unknown_run_404(stub):

@@ -29,6 +29,27 @@ class AdapterConfigMissing(ServingError):
     """The adapter's adapter_config.json could not be read from HF (artifact likely absent)."""
 
 
+def _is_hf_not_found_error(exc: Exception) -> bool:
+    try:
+        import huggingface_hub.errors as hf_errors  # type: ignore[import-not-found]
+
+        not_found_types = tuple(
+            cls
+            for name in (
+                "EntryNotFoundError",
+                "LocalEntryNotFoundError",
+                "RepositoryNotFoundError",
+                "RevisionNotFoundError",
+            )
+            if isinstance((cls := getattr(hf_errors, name, None)), type)
+        )
+        if not_found_types and isinstance(exc, not_found_types):
+            return True
+    except Exception:
+        pass
+    return getattr(getattr(exc, "response", None), "status_code", None) == 404
+
+
 def _serving_request(
     method: str,
     url: str,
@@ -170,9 +191,10 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
             token=os.environ.get("HF_TOKEN"),
         )
     except Exception as exc:
-        raise AdapterConfigMissing(
-            f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
-        ) from exc
+        message = f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
+        if _is_hf_not_found_error(exc):
+            raise AdapterConfigMissing(message) from exc
+        raise ServingError(message) from exc
     try:
         with open(local, encoding="utf-8") as f:
             config = json.load(f)

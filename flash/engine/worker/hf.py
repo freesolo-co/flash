@@ -536,10 +536,19 @@ def make_checkpoint_upload_callback():
             idle = pump.wait_idle(_CKPT_FLUSH_TIMEOUT_S)
             if queued is not None and os.path.isdir(queued[1]):
                 q_step, q_dir = queued
-                try:
-                    _upload_once(q_step, q_dir)
-                except Exception as e:
-                    print("ckpt upload warn:", e)
+                if idle:
+                    try:
+                        _upload_once(q_step, q_dir)
+                    except Exception as e:
+                        print("ckpt upload warn:", e)
+                else:
+                    # Another upload is still pruning latest-only resume checkpoints. Publish only
+                    # the durable per-step adapter here so concurrent prune passes cannot delete a
+                    # newer resume checkpoint while it is being flushed.
+                    try:
+                        _publish_deployable_recombined(q_dir, q_step, with_retry=True)
+                    except Exception as e:
+                        print("ckpt deployable flush warn:", e)
                 if q_step == step:
                     return  # the queued flush already published the final deployable
             if idle:

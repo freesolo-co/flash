@@ -224,7 +224,7 @@ class ApiClient:
         try:
             return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
         except ApiError as exc:
-            if exc.status == 404 and str(exc).strip().lower() == "not found":
+            if exc.status == 404 and "not found" in str(exc).strip().lower():
                 return {}
             raise
 

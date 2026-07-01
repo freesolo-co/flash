@@ -146,12 +146,41 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
         sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
     )
 
-    with pytest.raises(d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter"):
+    with pytest.raises(d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter") as excinfo:
         d.deploy_adapter(
             run_id="r-hf-down",
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-hf-down/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
+    assert not isinstance(excinfo.value, d.AdapterConfigMissing)
+
+
+def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
+    import flash.serve.deploy as d
+
+    class _Response:
+        status_code = 404
+
+    class _NotFound(RuntimeError):
+        response = _Response()
+
+    def fake_hf_hub_download(**_kwargs):
+        raise _NotFound("adapter_config.json not found")
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+    )
+
+    with pytest.raises(d.AdapterConfigMissing, match="failed to read org/repo:sft/r-missing/seed0/adapter"):
+        d.deploy_adapter(
+            run_id="r-missing",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-missing/seed0",
             gpu_name="RTX 5090",
             dry_run=False,
             lora_rank=32,
