@@ -412,7 +412,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     env_file = tmp_path / "freesolo" / "environment.py"
     env_file.parent.mkdir()
     env_file.write_text("def load_environment(**kwargs): pass\n")
-    dataset = tmp_path / "freesolo" / "datasets" / "train.jsonl"
+    dataset = tmp_path / "freesolo" / "dataset" / "train.jsonl"
     dataset.parent.mkdir()
     dataset.write_text('{"id":"row-1","input":"2+2?","output":"4"}\n')
 
@@ -420,7 +420,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
 
     env = load_freesolo_environment(
         str(env_file),
-        dataset_path="datasets/train.jsonl",
+        dataset_path="dataset/train.jsonl",
         contract_text="be brief",
         difficulty="hard",
     )
@@ -508,16 +508,18 @@ def test_freesolo_adapter_split_train_uses_default_dataset(monkeypatch, tmp_path
     assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
 
 
-def test_freesolo_adapter_split_train_accepts_legacy_datasets_dir(monkeypatch, tmp_path):
-    _install_fake_freesolo(monkeypatch)
+def test_freesolo_adapter_does_not_auto_load_datasets_dir(monkeypatch, tmp_path):
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "sdk", "input": "sdk?", "output": "sdk"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
     env_file = _split_env(
-        tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+        tmp_path, {"datasets/train.jsonl": '{"id":"legacy","input":"old?","output":"old"}\n'}
     )
 
     from flash.envs.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), split="train", contract_text="c")
-    assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
+    assert env.dataset() == [{"id": "sdk", "input": "sdk?", "output": "sdk"}]
 
 
 def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp_path):
@@ -525,8 +527,8 @@ def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp
     env_file = _split_env(
         tmp_path,
         {
-            "datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
-            "datasets/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
         },
     )
 
@@ -534,7 +536,7 @@ def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp
 
     env = load_freesolo_environment(
         str(env_file),
-        dataset_path="datasets/train.jsonl",
+        dataset_path="dataset/train.jsonl",
         split="oracle",
         contract_text="c",
     )
@@ -551,7 +553,7 @@ def test_freesolo_adapter_warns_on_dropped_record_keys(monkeypatch, tmp_path):
     env_file = _split_env(
         tmp_path,
         {
-            "datasets/train.jsonl": (
+            "dataset/train.jsonl": (
                 '{"id":"t","input":"x","output":"y","initial_state":[1,2],'
                 '"metadata":{"kept":true}}\n'
             )

@@ -810,14 +810,11 @@ def _packaged_dataset_file(base_dir: Path, name: str) -> Path | None:
     """First existing packaged dataset file for split `name`.
 
     ``dataset/`` is canonical for new environments because a top-level ``datasets/``
-    directory shadows the Hugging Face ``datasets`` package in local scripts. The
-    legacy ``datasets/`` layout remains supported for existing packages.
+    directory shadows the Hugging Face ``datasets`` package in local scripts.
     """
     for rel in (
         f"dataset/{name}.jsonl",
         f"dataset/{name}.json",
-        f"datasets/{name}.jsonl",
-        f"datasets/{name}.json",
         f"{name}.jsonl",
         f"{name}.json",
     ):
@@ -868,8 +865,7 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
             # all keep the SDK path, which may implement split itself.
             raise ValueError(
                 f"[environment.params] split={split!r} was requested but no "
-                f"dataset/{split}.jsonl, datasets/{split}.jsonl, or {split}.json "
-                "exists in the environment; "
+                f"dataset/{split}.jsonl or {split}.json exists in the environment; "
                 "refusing to fall back to the default train split. Package the split file "
                 "or drop the split param."
             )

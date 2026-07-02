@@ -116,18 +116,6 @@ def test_push_single_py_ships_sibling_dataset(monkeypatch, tmp_path):
     assert "dataset/train.jsonl" in _members(cap["package_b64"])
 
 
-def test_push_single_py_still_ships_legacy_sibling_datasets(monkeypatch, tmp_path):
-    env_file = tmp_path / "environment.py"
-    env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "datasets").mkdir()
-    (tmp_path / "datasets" / "train.jsonl").write_text('{"x": 1}\n')
-    cap: dict = {}
-    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
-
-    assert cli.cmd_env_push(_args(env_file)) == 0
-    assert "datasets/train.jsonl" in _members(cap["package_b64"])
-
-
 def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")

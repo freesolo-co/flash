@@ -168,7 +168,7 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         "source",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"dataset", "datasets"})
+_ENV_PUSH_SIDECAR_DIRS = frozenset({"dataset"})
 # ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
 # user-authored README/NOTES) travels with the env into the hub and back out through
 # ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
