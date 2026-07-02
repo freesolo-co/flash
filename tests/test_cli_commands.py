@@ -341,6 +341,12 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat_stream"
 
 
+def test_chat_checkpoint_ref_uses_base_run_id(fake_client) -> None:
+    assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 0
+    assert fake_client.calls[-1][0] == "chat_stream"
+    assert fake_client.calls[-1][1] == "flash-1"
+
+
 def test_chat_system_flag_prepends_system_message(fake_client) -> None:
     """--system gives evals training-prompt parity without calling the HTTP API directly."""
     assert _run(["chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0
@@ -516,3 +522,19 @@ def test_deploy_dry_run_skips_active_deployment_note(fake_client, monkeypatch, c
     assert _run(["deploy", "flash-1", "--dry-run"]) == 0
     assert not any(c[0] == "chat" for c in fake_client.calls)
     assert "flash deployments" not in capsys.readouterr().err
+
+
+def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "failed",
+            "error": "smoke generation failed",
+        },
+        raising=False,
+    )
+
+    assert _run(["deploy", "flash-1"]) == 1
+    assert "deployment state is 'failed'" in capsys.readouterr().err

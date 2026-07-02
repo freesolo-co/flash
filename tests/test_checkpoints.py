@@ -15,7 +15,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.runner.checkpoints import checkpoint_adapter_prefix, list_checkpoints
+from flash.runner.checkpoints import (
+    checkpoint_adapter_prefix,
+    final_adapter_exists,
+    list_checkpoints,
+)
 from flash.spec import JobSpec
 
 SPEC_DICT = {
@@ -562,6 +566,32 @@ def test_list_checkpoints_swallows_hf_error(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _Boom())
     assert list_checkpoints(_spec()) == []  # best-effort: never raises into a run/route
+
+
+def test_final_adapter_exists_requires_config_and_weights(monkeypatch):
+    base = "rl/flash-ckpt-1"
+    _patch_hf_files(
+        monkeypatch,
+        [
+            f"{base}/adapter/adapter_config.json",
+            f"{base}/adapter/adapter_model.safetensors",
+        ],
+    )
+
+    assert final_adapter_exists(_spec()) is True
+
+
+def test_final_adapter_exists_rejects_incomplete_or_nested_files(monkeypatch):
+    base = "rl/flash-ckpt-1"
+    _patch_hf_files(
+        monkeypatch,
+        [
+            f"{base}/adapter/adapter_config.json",
+            f"{base}/adapter/nested/adapter_model.safetensors",
+        ],
+    )
+
+    assert final_adapter_exists(_spec()) is False
 
 
 # --------------------------------------------------------------------------------------------
