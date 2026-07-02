@@ -105,8 +105,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         TERMINAL_STATES,
         _gc_run_endpoints,
         _persist_metrics,
+        _resolve_init_from_adapter,
         _run_training,
         _RunCancelled,
+        _status_org_id,
         _update,
         artifacts_dir,
         charge_usd_for_spec,
@@ -120,22 +122,32 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
     spec = JobSpec.from_dict(status.spec)
-    remote = dict(status.remote)
-    seed = int(remote.pop("seed", FIXED_SEED))
-    code_prefix = remote.pop("code_prefix", None)
-    # The class the run actually provisioned (a policy retry may have walked past the
-    # provisional spec.gpu.type). The in-process success path stamps this into metrics;
-    # on recovery the worker output carries no such field, so recover it from the handle
-    # to cost the right card.
-    allocated_gpu = remote.pop("allocated_gpu", None)
     log = log_stream or sys.stderr
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
 
-    handle = JobHandle.from_dict(remote)
-    print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
-    res = get_provider(handle.provider).poll(handle, spec, seed, log=log)
     try:
+        owner_key_id = None
+        with contextlib.suppress(Exception):
+            from flash.server import db
+
+            owner_key_id = db.run_owner(run_id)
+        spec = _resolve_init_from_adapter(
+            spec,
+            owner_org_id=_status_org_id(status),
+            owner_key_id=owner_key_id,
+        )
+        remote = dict(status.remote)
+        seed = int(remote.pop("seed", FIXED_SEED))
+        code_prefix = remote.pop("code_prefix", None)
+        # The class the run actually provisioned (a policy retry may have walked past the
+        # provisional spec.gpu.type). The in-process success path stamps this into metrics;
+        # on recovery the worker output carries no such field, so recover it from the handle
+        # to cost the right card.
+        allocated_gpu = remote.pop("allocated_gpu", None)
+        handle = JobHandle.from_dict(remote)
+        print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
+        res = get_provider(handle.provider).poll(handle, spec, seed, log=log)
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
@@ -231,6 +243,46 @@ def mark_checkpoint_deployed(
             _promote_final_deployment(status, deployment)
         else:
             status.deployment = deployment
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def mark_deployment_pending(
+    run_id: str, deployment: dict, expect_state: str | None = None
+) -> RunStatus:
+    """Attach an in-progress deployment record without changing the run lifecycle state."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.state == "dry_run":
+            return status
+        if expect_state is not None and status.state != expect_state:
+            return status
+        status.deployment = deployment
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
+    """Record a failed deployment attempt while preserving the run lifecycle state."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        current = status.deployment or {}
+        # Don't clobber a newer deployment attempt or an explicit undeploy.
+        if current.get("state") == "undeployed":
+            return status
+        if (
+            current.get("requested_at") is not None
+            and deployment.get("requested_at") is not None
+            and current.get("requested_at") != deployment.get("requested_at")
+        ):
+            return status
+        status.deployment = {**deployment, "state": "failed"}
         status.updated_at = time.time()
         _save_status(status)
         return status

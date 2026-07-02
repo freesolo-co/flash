@@ -348,14 +348,17 @@ def _build_parser() -> argparse.ArgumentParser:
     checkpoints.set_defaults(func=cmd_checkpoints)
 
     deploy = sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
-    deploy.add_argument("run_id")
+    deploy.add_argument(
+        "run_id",
+        metavar="RUN_ID[/step-N]",
+        help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
+    )
     deploy.add_argument("--dry-run", action="store_true")
     deploy.add_argument(
-        "--step",
-        type=int,
-        default=None,
-        help="deploy a specific intermediate checkpoint (see `flash checkpoints <run_id>`) "
-        "instead of the run's final adapter; works even for a run cancelled mid-RL",
+        "--no-verify",
+        action="store_true",
+        help="skip the server-side post-deploy smoke generation (registration alone does NOT "
+        "guarantee the adapter serves; only ready deployments should be scored by evals)",
     )
     deploy.set_defaults(func=cmd_deploy)
 
@@ -368,7 +371,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--adapter-id",
         dest="adapter_id",
         required=True,
-        help="the Freesolo adapter id (the run id) to export",
+        metavar="RUN_ID[/step-N]",
+        help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
     )
     export.add_argument(
         "--repository",
@@ -379,13 +383,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--api-key",
         help="HuggingFace token with write access to --repository "
         "(default: HF_TOKEN from your shell or a local .env / .env.local)",
-    )
-    export.add_argument(
-        "--step",
-        type=int,
-        default=None,
-        help="export a specific intermediate checkpoint (see `flash checkpoints <adapter-id>`) "
-        "instead of the run's final adapter; works even for a run cancelled mid-RL",
     )
     export.add_argument(
         "--public",
@@ -400,6 +397,12 @@ def _build_parser() -> argparse.ArgumentParser:
     chat = sub.add_parser("chat", help="chat with a deployed adapter")
     chat.add_argument("run_id")
     chat.add_argument("-m", "--message", required=True)
+    chat.add_argument(
+        "--system",
+        default=None,
+        help="optional system prompt sent ahead of the user message "
+        "(training-prompt parity for evals)",
+    )
     chat.add_argument("--max-tokens", type=int, default=512)
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
