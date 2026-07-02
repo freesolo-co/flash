@@ -44,3 +44,32 @@ def _offline(monkeypatch):
     rp_keys.reset()
     yield
     rp_keys.reset()
+
+
+@pytest.fixture(autouse=True)
+def _fast_serving_readback(monkeypatch):
+    """Zero the deploy read-back backoff so verification polls don't slow the suite."""
+    import flash.serve.deploy as _deploy
+
+    monkeypatch.setattr(_deploy, "READBACK_DELAY_SECONDS", 0.0)
+
+
+@pytest.fixture
+def stub_serving_registry(monkeypatch):
+    """Patch GET /adapters to return the given records (deploy read-back verification)."""
+
+    def _stub(*records: dict):
+        import flash.serve.deploy as _deploy
+
+        class _RegistryResp:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"ok": True, "adapters": list(records)}
+
+        monkeypatch.setattr(_deploy.httpx, "get", lambda *a, **k: _RegistryResp())
+
+    return _stub

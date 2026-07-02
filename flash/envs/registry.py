@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .base import Environment
 
-FREESOLO_WORKER_SPEC = "freesolo>=0.2.52"
+FREESOLO_WORKER_SPEC = "freesolo>=0.2.54"
 
 
 def worker_pip_for_env(env_id: str) -> list[str]:

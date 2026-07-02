@@ -27,7 +27,12 @@ def stub():
         def do_GET(self):
             seen["auth"] = self.headers.get("Authorization")
             seen["path"] = self.path
-            if self.path.startswith("/v1/runs/authfail"):
+            if self.path == "/v1/runs/old-api/worker":
+                self._send(404, {"detail": "Not Found"})
+            elif self.path == "/v1/runs/proxy-old-api/worker":
+                self.send_response(404)
+                self.end_headers()
+            elif self.path.startswith("/v1/runs/authfail"):
                 self._send(401, {"detail": "invalid or missing API key"})
             elif self.path.startswith("/v1/runs/missing"):
                 self._send(404, {"detail": "unknown run_id: missing"})
@@ -126,6 +131,13 @@ def test_logs_offset_in_query(stub):
     assert page["offset"] == 3
     assert page["logs"] == "hi\n"
     assert seen["path"].endswith("/v1/runs/r1/logs?offset=3")
+
+
+def test_get_worker_output_tolerates_missing_optional_route(stub):
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+    assert client.get_worker_output("old-api") == {}
+    assert client.get_worker_output("proxy-old-api") == {}
 
 
 def test_get_worker_output_preserves_unknown_run_404(stub):
@@ -282,49 +294,36 @@ def test_unreachable_server_is_actionable():
         client.health()
 
 
-def test_deploy_rejects_bool_step():
-    """#176: a bool step must be rejected client-side (the server guard treats a bool as invalid).
-    `int(True)`/`int(False)` would silently coerce to step 1/0, so reject before that — without ever
-    reaching the network (a 127.0.0.1:1 target would error if it did)."""
+def test_deploy_rejects_malformed_checkpoint_ref():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in (True, False):
-        with pytest.raises(ClientError, match="invalid checkpoint step"):
-            client.deploy("flash-run", step=bad)
+    for bad in ("flash-run/step-", "flash-run/checkpoints/step-4", "flash-run/step-4/adapter"):
+        with pytest.raises(ClientError, match="invalid adapter id"):
+            client.deploy(bad)
 
 
-def test_deploy_passes_integer_step(stub):
-    """A genuine integer step is forwarded as an int in the body (the bool guard doesn't block it)."""
+def test_deploy_checkpoint_ref_posts_step(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.deploy("flash-run", step=40)
+    client.deploy("flash-run/step-40")
     assert seen["path"] == "/v1/runs/flash-run/deploy"
     assert seen["body"]["step"] == 40
     assert seen["body"]["dry_run"] is False
+    assert seen["body"]["verify"] is True
 
 
-def test_deploy_rejects_fractional_step():
-    """A fractional step would int-truncate (2.7 -> 2) and deploy the WRONG checkpoint, so reject it
-    client-side (mirrors export's guard)."""
-    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in (2.5, 0.1, 3.9):
-        with pytest.raises(ClientError, match="invalid checkpoint step"):
-            client.deploy("flash-run", step=bad)
-
-
-def test_deploy_passes_whole_float_step(stub):
-    """A float that is a whole number (40.0) passes the guard and forwards as an int."""
+def test_deploy_final_ref_omits_step(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.deploy("flash-run", step=40.0)
-    assert seen["body"]["step"] == 40
-    assert isinstance(seen["body"]["step"], int)
+    client.deploy("flash-run")
+    assert seen["path"] == "/v1/runs/flash-run/deploy"
+    assert seen["body"] == {"dry_run": False, "verify": True}
 
 
-def test_export_sends_repository_token_and_step(stub):
-    """`flash export` posts the destination repo, the user's HF token, and an optional step."""
+def test_export_sends_repository_token_and_checkpoint_ref(stub):
+    """`flash export` posts the destination repo, the user's HF token, and parsed checkpoint step."""
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.export("r1", repository="me/adapters", hf_token="hf_secret", step=40, private=False)
+    client.export("r1/step-40", repository="me/adapters", hf_token="hf_secret", private=False)
     assert seen["path"] == "/v1/runs/r1/export"
     assert seen["auth"] == "Bearer fslo-user-test"
     assert seen["body"] == {
@@ -347,18 +346,8 @@ def test_export_omits_step_when_unset_and_defaults_private(stub):
     assert "step" not in seen["body"]
 
 
-def test_export_rejects_bool_step():
-    """A bool step would int-coerce to 0/1 server-side, so fail fast client-side (mirrors deploy)."""
+def test_export_rejects_malformed_checkpoint_ref():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in (True, False):
-        with pytest.raises(ClientError, match="invalid checkpoint step"):
-            client.export("r1", repository="me/a", hf_token="hf", step=bad)
-
-
-def test_export_rejects_fractional_step():
-    """A fractional step would int-truncate (2.7 -> 2) and export the WRONG checkpoint, so reject it
-    client-side."""
-    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in (2.5, 0.1, 3.9):
-        with pytest.raises(ClientError, match="invalid checkpoint step"):
-            client.export("r1", repository="me/a", hf_token="hf", step=bad)
+    for bad in ("r1/step-", "r1/checkpoints/step-4", "r1/step-4/adapter"):
+        with pytest.raises(ClientError, match="invalid adapter id"):
+            client.export(bad, repository="me/a", hf_token="hf")
