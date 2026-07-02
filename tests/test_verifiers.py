@@ -486,6 +486,18 @@ def test_freesolo_adapter_missing_split_file_refuses_silent_train_fallback(
         load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
 
 
+def test_freesolo_adapter_rejects_unsafe_split_names(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="split must be a simple dataset name"):
+        load_freesolo_environment(str(env_file), split="../oracle", contract_text="c")
+
+
 def test_freesolo_adapter_split_train_uses_default_dataset(monkeypatch, tmp_path):
     _install_fake_freesolo(monkeypatch)
     env_file = _split_env(

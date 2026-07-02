@@ -44,6 +44,7 @@ _MAX_ARCHIVE_MEMBERS = 5000
 _MAX_ARCHIVE_SCAN_MEMBERS = 200_000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _TAR_METADATA_TYPES = {
     tarfile.XHDTYPE,
     tarfile.XGLTYPE,
@@ -814,6 +815,15 @@ def _packaged_dataset_file(base_dir: Path, name: str) -> Path | None:
     return None
 
 
+def _validate_packaged_dataset_split(split: str) -> str:
+    if not _DATASET_SPLIT_RE.fullmatch(split):
+        raise ValueError(
+            "[environment.params] split must be a simple dataset name "
+            "(letters, numbers, '.', '_', '-' only; no slashes or traversal)"
+        )
+    return split
+
+
 def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **kwargs):
     # pinned_sha is positional-only so user [environment.params] named "pinned_sha" goes to **kwargs, not here.
     from flash.envs.adapter import FreesoloEnvironment
@@ -835,6 +845,8 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     # SILENTLY trained on the default datasets/train.jsonl even when a side split was requested.
     split = params.get("split")
     split = split.strip() if isinstance(split, str) else None
+    if split:
+        split = _validate_packaged_dataset_split(split)
     if source is None:
         wanted = split if split and split != "train" else "train"
         found = _packaged_dataset_file(base_dir, wanted)
@@ -868,4 +880,3 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         source=source,
         contract_text=contract_text,
     )
-

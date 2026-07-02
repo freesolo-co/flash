@@ -348,7 +348,11 @@ def _build_parser() -> argparse.ArgumentParser:
     checkpoints.set_defaults(func=cmd_checkpoints)
 
     deploy = sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
-    deploy.add_argument("run_id")
+    deploy.add_argument(
+        "run_id",
+        metavar="RUN_ID[/step-N]",
+        help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
+    )
     deploy.add_argument("--dry-run", action="store_true")
     deploy.set_defaults(func=cmd_deploy)
 
@@ -361,7 +365,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--adapter-id",
         dest="adapter_id",
         required=True,
-        help="the Freesolo adapter id (the run id) to export",
+        metavar="RUN_ID[/step-N]",
+        help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
     )
     export.add_argument(
         "--repository",
