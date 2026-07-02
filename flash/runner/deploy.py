@@ -272,6 +272,16 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
 
     with _STATUS_LOCK:
         status = get_status(run_id)
+        current = status.deployment or {}
+        # Don't clobber a newer deployment attempt or an explicit undeploy.
+        if current.get("state") == "undeployed":
+            return status
+        if (
+            current.get("requested_at") is not None
+            and deployment.get("requested_at") is not None
+            and current.get("requested_at") != deployment.get("requested_at")
+        ):
+            return status
         status.deployment = {**deployment, "state": "failed"}
         status.updated_at = time.time()
         _save_status(status)
