@@ -7,7 +7,6 @@ public names are re-exported here so existing ``flash.envs.adapter`` import path
 from __future__ import annotations
 
 import json
-import warnings
 from typing import Any
 
 from flash.envs.base import BaseEnvironment
@@ -93,8 +92,6 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
-        # Key names already warned about as dropped by canonicalization (warn once per name).
-        self._warned_dropped_record_keys: set[str] = set()
 
     @property
     def max_turns(self) -> int:
@@ -143,31 +140,11 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def _canonical_record(self, record: dict) -> dict:
         raw = dict(record)
-        canonical = {}
         if _CANONICAL_INPUT_KEY not in raw:
             raise ValueError("Freesolo dataset records must contain an input field")
-        canonical[_CANONICAL_INPUT_KEY] = raw[_CANONICAL_INPUT_KEY]
-        if _CANONICAL_OUTPUT_KEY in raw:
-            canonical[_CANONICAL_OUTPUT_KEY] = raw[_CANONICAL_OUTPUT_KEY]
-        if raw.get("id") is not None:
-            canonical["id"] = raw["id"]
-        metadata = raw.get("metadata")
-        if isinstance(metadata, dict) and metadata:
-            canonical["metadata"] = metadata
-        # Canonicalization keeps only input/output/id/metadata; anything else (board state,
-        # minimal_solutions, ...) is dropped. That used to be SILENT, so envs relying on extra
-        # top-level keys trained/scored without them. Warn once per key name.
-        dropped = set(raw) - {_CANONICAL_INPUT_KEY, _CANONICAL_OUTPUT_KEY, "id", "metadata"}
-        new = dropped - self._warned_dropped_record_keys
-        if new:
-            self._warned_dropped_record_keys.update(new)
-            warnings.warn(
-                f"dataset record keys {sorted(new)} are dropped by canonicalization "
-                "(records keep only input/output/id/metadata); nest task data under "
-                "'metadata' to preserve it on the worker",
-                stacklevel=2,
-            )
-        return canonical
+        if str(raw.get("id") or "").strip() == "":
+            raise ValueError("Freesolo dataset records must contain an id field")
+        return raw
 
     def _reward_to_breakdown(self, reward) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -202,13 +179,8 @@ class FreesoloEnvironment(BaseEnvironment):
             raw = dict(getattr(example, "record", {}) or {})
             if _CANONICAL_INPUT_KEY not in raw and getattr(example, "input", None) is not None:
                 raw[_CANONICAL_INPUT_KEY] = example.input
-            if getattr(example, "id", None) is not None:
-                raw.setdefault("id", example.id)
             if getattr(example, "output", None) is not None:
                 raw.setdefault(_CANONICAL_OUTPUT_KEY, _json_safe(example.output))
-            metadata = getattr(example, "metadata", None)
-            if isinstance(metadata, dict) and metadata:
-                raw.setdefault("metadata", metadata)
             record = self._canonical_record(raw)
             records.append(record)
         self._dataset_cache = records
