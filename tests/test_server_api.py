@@ -237,6 +237,41 @@ def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkey
     assert not row.get("email")
 
 
+def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch):
+    import flash.lora_rank as rank_mod
+    import flash.runner as runner
+    from flash.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "train": {"epochs": 1, "hf_repo": "Freesolo-Co/source"},
+        }
+    )
+    runner._save_status(runner.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+    monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 96})
+
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "init_from_adapter": "source-run",
+        },
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec},
+    )
+
+    assert resp.status_code == 400
+    assert "has rank 96" in resp.text
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # A freesolo key that verifies with the backend but whose db row was disabled (revoked)
     # must be rejected as 401 (authenticate -> None), not raise a 500.

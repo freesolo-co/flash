@@ -1189,6 +1189,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
 def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.lora_rank as rank_mod
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
         from flash.spec import JobSpec
@@ -1225,6 +1226,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 16})
         monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
