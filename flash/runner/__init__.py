@@ -478,6 +478,10 @@ def submit_job(
         owner_org_id=owner_org_id,
         owner_key_id=owner_key_id,
     )
+    if not dry_run:
+        from flash.lora_rank import preflight_init_adapter_lora_rank
+
+        preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
     # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
     status = RunStatus(
         run_id=public_spec.run_id,

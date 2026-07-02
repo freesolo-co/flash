@@ -123,6 +123,31 @@ def _deployment_cas_lost(run_id: str, state_guard: str | None) -> bool:
     return state_guard is not None and _app.get_status(run_id).state != state_guard
 
 
+def _adapter_prefix_from_deployment(deployment: dict) -> str:
+    subfolder = deployment.get("adapter_hf_prefix")
+    if not isinstance(subfolder, str) or not subfolder.endswith("/adapter"):
+        raise ServingError(
+            "previous deployment record is missing adapter_hf_prefix; "
+            "cannot restore serving registry"
+        )
+    return subfolder[: -len("/adapter")]
+
+
+def _rollback_registered_deployment(
+    *, run_id: str, deploy_kwargs: dict, previous_deployment: dict | None
+) -> None:
+    if isinstance(previous_deployment, dict):
+        _app.deploy_adapter(
+            **{
+                **deploy_kwargs,
+                "adapter_prefix": _adapter_prefix_from_deployment(previous_deployment),
+                "dry_run": False,
+            }
+        )
+    else:
+        _app.undeploy_adapter(run_id)
+
+
 def _finish_deployment_unlocked(
     *,
     run_id: str,
@@ -143,8 +168,10 @@ def _finish_deployment_unlocked(
         return
     current = _deployment_state(deployment, "registering", detail="registering adapter")
     mark_deployment_pending(run_id, current)
+    registered = False
     try:
         dep = _app.deploy_adapter(**deploy_kwargs)
+        registered = True
         previous_deployment = deployment.get("previous_deployment")
         current = dep.to_dict()
         if previous_deployment:
@@ -196,6 +223,28 @@ def _finish_deployment_unlocked(
             error=error,
             detail="deployment failed; retry `flash deploy` after fixing the error",
         )
+        if registered:
+            previous_deployment = deployment.get("previous_deployment")
+            rollback_error = None
+            try:
+                _rollback_registered_deployment(
+                    run_id=run_id,
+                    deploy_kwargs=deploy_kwargs,
+                    previous_deployment=previous_deployment,
+                )
+            except Exception as rollback_exc:
+                rollback_error = str(rollback_exc)
+            if rollback_error:
+                failed.pop("previous_deployment", None)
+                failed["rollback_error"] = rollback_error
+                failed["detail"] = (
+                    "deployment failed and serving rollback failed; "
+                    "operator cleanup required"
+                )
+            elif isinstance(previous_deployment, dict):
+                failed["detail"] = "deployment failed; restored previous deployment"
+            else:
+                failed["detail"] = "deployment failed; deregistered adapter"
         mark_deployment_failed(run_id, failed)
 
 
