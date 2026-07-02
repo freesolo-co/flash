@@ -28,6 +28,14 @@ _HB_THROTTLED_STAGES = frozenset(
         "rl_initializing",
     }
 )
+_HB_SETUP_LIVENESS_STAGES = frozenset(
+    {
+        "model_prefetching",
+        "sft_pretokenizing",
+        "sft_initializing",
+        "rl_initializing",
+    }
+)
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
@@ -96,7 +104,10 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
             )
         else:
             throttled = stage in _HB_THROTTLED_STAGES
-            upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= _w._HB_MIN_INTERVAL_S
+            interval_s = _w._HB_MIN_INTERVAL_S
+            if stage in _HB_SETUP_LIVENESS_STAGES:
+                interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
+            upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
         prev_last_upload = _w._HB_LAST_UPLOAD
         if upload_due:
             _HB_CLAIM_SEQ += 1
