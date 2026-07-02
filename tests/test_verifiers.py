@@ -272,7 +272,7 @@ def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
     raw = "<think>4</think> 5"
     state = {"completion": " 5", "thinking": "4", "raw": raw}
 
-    breakdown = env.scores_breakdown(" 5", {"input": "q", "output": "4"}, state)
+    breakdown = env.scores_breakdown(" 5", {"id": "q", "input": "q", "output": "4"}, state)
 
     assert breakdown["legacy_answer_match"] == 0.0
     assert breakdown["thinking"] == 1.0
@@ -309,14 +309,14 @@ def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
     env = FreesoloEnvironment(
         _BudgetMultiTurnEnv(),
         "owner/env",
-        source=[{"input": "go", "output": ""}],
+        source=[{"id": "go", "input": "go", "output": ""}],
         contract_text="",
     )
     # max_turns is now the dataset-wide max_episode_turns (15), not the old hardcoded 8 —
     # otherwise the rollout loop would truncate this 15-turn scenario at turn 8.
     assert env.max_turns == 15
 
-    state = env.new_rollout_state({"input": "go", "output": ""})
+    state = env.new_rollout_state({"id": "go", "input": "go", "output": ""})
     assert state["max_episode_turns"] == 15
     # rollout_done honors THIS rollout's budget even when the batch cap is larger, and even
     # though the env never sets done=True.
@@ -543,12 +543,7 @@ def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp
     assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
 
 
-def test_freesolo_adapter_warns_on_dropped_record_keys(monkeypatch, tmp_path):
-    """Canonicalization keeps only input/output/id/metadata; extra top-level keys used to be
-    dropped silently — now a once-per-key warnings.warn names them (per environment instance,
-    not via a mutable module global checked per record)."""
-    import warnings
-
+def test_freesolo_adapter_preserves_top_level_record_keys(monkeypatch, tmp_path):
     _install_fake_freesolo(monkeypatch)
     env_file = _split_env(
         tmp_path,
@@ -563,21 +558,47 @@ def test_freesolo_adapter_warns_on_dropped_record_keys(monkeypatch, tmp_path):
     from flash.envs.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), contract_text="c")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        rows = env.dataset()
-        assert rows == [{"id": "t", "input": "x", "output": "y", "metadata": {"kept": True}}]
-        texts = [str(w.message) for w in caught]
-        assert any("initial_state" in t and "dropped" in t for t in texts)
-        # Re-canonicalizing the same records must not warn again (once per key per instance).
-        before = len(caught)
-        env._canonical_record(rows[0] | {"initial_state": [1, 2]})
-        assert len(caught) == before
+    rows = env.dataset()
+    assert rows == [
+        {
+            "id": "t",
+            "input": "x",
+            "output": "y",
+            "initial_state": [1, 2],
+            "metadata": {"kept": True},
+        }
+    ]
+
+
+def test_freesolo_adapter_requires_explicit_record_id(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
+
+    with pytest.raises(ValueError, match="id field"):
+        env._canonical_record({"input": "x"})
+    with pytest.raises(ValueError, match="id field"):
+        env._canonical_record({"id": "   ", "input": "x"})
+
+
+def test_freesolo_adapter_allows_missing_output(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {"dataset/train.jsonl": '{"id":"t","input":"x","difficulty":"easy"}\n'},
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    assert env.dataset() == [{"id": "t", "input": "x", "difficulty": "easy"}]
 
 
 def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
     class NoSystemEnv(_EnvironmentSingleTurn):
-        dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
+        dataset: ClassVar[list[dict]] = [{"id": "math", "input": "2+2?", "output": "4"}]
 
         def start_episode(self, example, prompt_text):
             return [{"role": "user", "content": example.input}]
@@ -596,7 +617,7 @@ def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
         contract_text="follow the contract",
     )
 
-    assert env.prompt_messages({"input": "2+2?", "output": "4"}) == [
+    assert env.prompt_messages({"id": "math", "input": "2+2?", "output": "4"}) == [
         {"role": "system", "content": "follow the contract"},
         {"role": "user", "content": "2+2?"},
     ]
@@ -604,7 +625,7 @@ def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
 
 def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
     class BlankSystemEnv(_EnvironmentSingleTurn):
-        dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
+        dataset: ClassVar[list[dict]] = [{"id": "math", "input": "2+2?", "output": "4"}]
 
         def start_episode(self, example, prompt_text):
             return [
@@ -630,8 +651,8 @@ def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
         {"role": "system", "content": "follow the contract"},
         {"role": "user", "content": "2+2?"},
     ]
-    assert env.prompt_messages({"input": "2+2?", "output": "4"}) == expected
-    state = env.new_rollout_state({"input": "2+2?", "output": "4"})
+    assert env.prompt_messages({"id": "math", "input": "2+2?", "output": "4"}) == expected
+    state = env.new_rollout_state({"id": "math", "input": "2+2?", "output": "4"})
     assert state["prompt"] == expected
     assert state["messages"] == expected
     assert state["messages"] is not state["prompt"]
@@ -657,7 +678,7 @@ def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
     class SdkExampleEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[_TaskExample]] = [
             _TaskExample(
-                record={},
+                record={"id": "ex-1", "input": "2+2?"},
                 input="2+2?",
                 id="ex-1",
                 output="4",
@@ -680,9 +701,23 @@ def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
             "input": "2+2?",
             "output": "4",
             "id": "ex-1",
-            "metadata": {"split": "train"},
         }
     ]
+
+
+def test_freesolo_adapter_does_not_synthesize_record_id(monkeypatch):
+    class SdkExampleEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[_TaskExample]] = [
+            _TaskExample(record={"input": "2+2?"}, input="2+2?", id="ex-1", output="4")
+        ]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=SdkExampleEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(SdkExampleEnv(), "owner/env", source=None, contract_text="")
+    with pytest.raises(ValueError, match="id field"):
+        env.dataset()
 
 
 def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
@@ -710,10 +745,10 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     env = FreesoloEnvironment(
         _FakeMultiTurnEnv(),
         "github:owner/repo@main:env/environment.py",
-        source=[{"input": "browse", "output": "done"}],
+        source=[{"id": "browse", "input": "browse", "output": "done"}],
         contract_text="contract",
     )
-    state = env.new_rollout_state({"input": "browse", "output": "done"})
+    state = env.new_rollout_state({"id": "browse", "input": "browse", "output": "done"})
     assert state["prompt"] == [
         {"role": "system", "content": "contract"},
         {"role": "user", "content": "contract:browse"},
@@ -727,12 +762,12 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     assert replies == [{"role": "user", "content": "observed click"}]
     assert state["done"] is True
     assert env.rollout_done(state) is True
-    assert env.reward("ignored", {"input": "browse", "output": "done"}, state) == 0.5
-    assert env.grade("ignored", {"input": "browse", "output": "done"}, state) is True
+    assert env.reward("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) == 0.5
+    assert env.grade("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) is True
     assert (
         env.reward_from_messages(
             [{"role": "assistant", "content": "final"}],
-            {"input": "browse", "output": "done"},
+            {"id": "browse", "input": "browse", "output": "done"},
             [{"role": "user", "content": "contract:browse"}],
         )
         == 0.5

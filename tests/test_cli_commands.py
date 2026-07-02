@@ -90,7 +90,7 @@ class _FakeClient:
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
     def deployments(self) -> list[dict]:
-        return [{"run_id": "flash-1", "deployment": {"state": "ready", "gpu": "RTX 4090"}}]
+        return [{"run_id": "flash-1", "deployment": {"state": "ready"}}]
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
@@ -296,9 +296,18 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
                     },
                 ]
             )
+            self.statuses = iter(
+                [
+                    {"run_id": "flash-spin", "state": "queued"},
+                    {"run_id": "flash-spin", "state": "done"},
+                ]
+            )
 
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
             return next(self.pages)
+
+        def get_run(self, run_id: str) -> dict:
+            return next(self.statuses)
 
     stderr = _TTYBuffer()
     monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
@@ -313,6 +322,53 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     assert "following logs for flash-spin (queued)" in err
     assert "\r" in err
     assert err.endswith("\r")
+
+
+def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys) -> None:
+    class _TTYBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    class _LaggingLogClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.statuses = iter(
+                [
+                    {
+                        "run_id": "flash-lag",
+                        "state": "running",
+                        "last_heartbeat": {"stage": "rl_step", "step": 42},
+                        "realized_cost_usd": 1.23456,
+                    },
+                    {
+                        "run_id": "flash-lag",
+                        "state": "done",
+                        "last_heartbeat": {"stage": "rl_train_done"},
+                        "realized_cost_usd": 1.5,
+                    },
+                ]
+            )
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            # Stale/lossy log stream: no bytes and a non-terminal page state forever.
+            return {"run_id": run_id, "logs": "", "offset": 0, "state": "running"}
+
+        def get_run(self, run_id: str) -> dict:
+            return next(self.statuses)
+
+    stderr = _TTYBuffer()
+    monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    state, printed_any = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
+
+    assert state == "done"
+    assert printed_any is False
+    assert capsys.readouterr().out == ""
+    err = stderr.getvalue()
+    assert "stage=rl_step" in err
+    assert "step=42" in err
+    assert "realized_cost=$1.2346" in err
 
 
 def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:

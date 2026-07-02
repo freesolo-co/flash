@@ -26,6 +26,7 @@ from flash.envs.archive_policy import (
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+_MAX_DOWNLOAD_BYTES = _MAX_UNCOMPRESSED_BYTES
 _MAX_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
@@ -183,6 +184,19 @@ def _credentialed_repo_url(repo: str, token: str) -> str:
     return f"https://x-access-token:{quoted}@github.com/{repo}.git"
 
 
+def _operation_direction(operation: str) -> str:
+    return "from" if operation in {"delete", "download"} else "to"
+
+
+def _checkout_child(checkout: Path, publish_root: str, *, operation: str) -> Path:
+    target = checkout / publish_root
+    checkout_root = checkout.resolve()
+    target_root = target.resolve()
+    if target_root != checkout_root and checkout_root not in target_root.parents:
+        raise EnvPublishError(f"unsafe environment {operation} path")
+    return target
+
+
 def _run_git(
     cwd: Path, args: list[str], *, token: str, operation: str = "upload"
 ) -> subprocess.CompletedProcess[str]:
@@ -202,7 +216,7 @@ def _run_git(
             timeout=_GIT_TIMEOUT_S,
         )
     except FileNotFoundError as exc:
-        direction = "from" if operation == "delete" else "to"
+        direction = _operation_direction(operation)
         raise EnvPublishError(
             f"git is required to {operation} environments {direction} Freesolo", status=503
         ) from exc
@@ -252,11 +266,7 @@ def _is_retryable_git_publish_error(message: str) -> bool:
 
 
 def _copy_package_to_checkout(*, source: Path, checkout: Path, publish_root: str) -> None:
-    target = checkout / publish_root
-    checkout_root = checkout.resolve()
-    target_root = target.resolve()
-    if target_root != checkout_root and checkout_root not in target_root.parents:
-        raise EnvPublishError("unsafe environment publish path")
+    target = _checkout_child(checkout, publish_root, operation="publish")
     shutil.rmtree(target, ignore_errors=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
@@ -477,6 +487,111 @@ def canonical_env_id(slug: str) -> str:
     return f"{namespace}/{name}"
 
 
+def _require_namespace_access(canonical: str, key: dict, *, action: str) -> None:
+    namespace = canonical.split("/", 1)[0]
+    caller_namespace = None if key.get("auth_kind") == "internal" else namespace_for(key)
+    if caller_namespace is not None and namespace != caller_namespace:
+        raise EnvPublishError(
+            f"you can only {action} environments in your own namespace "
+            f"({caller_namespace}/...); got {canonical!r}",
+            status=403,
+        )
+
+
+def _package_checkout_directory(source: Path) -> bytes:
+    if not (source / _DEFAULT_ENVIRONMENT_FILE).is_file():
+        raise EnvPublishError("environment package not found", status=404)
+
+    total = 0
+    members = 0
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for path in sorted(source.rglob("*")):
+            rel = path.relative_to(source).as_posix()
+            if rel.split("/", 1)[0] in _BLOCKED_TOP_LEVEL_PATHS:
+                raise EnvPublishError(
+                    "env packages must not contain repo-control or source top-level paths",
+                    status=502,
+                )
+            if path.is_symlink():
+                raise EnvPublishError(f"links are not allowed in env packages: {rel!r}", status=502)
+            if path.is_file():
+                total += path.stat().st_size
+                if total > _MAX_UNCOMPRESSED_BYTES:
+                    raise EnvPublishError(
+                        "env package is too large uncompressed "
+                        f"(limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})",
+                        status=413,
+                    )
+            elif not path.is_dir():
+                raise EnvPublishError(
+                    f"only regular files and directories are allowed in env packages, "
+                    f"but {rel!r} is a special file",
+                    status=502,
+                )
+
+            members += 1
+            if members > _MAX_MEMBERS:
+                raise EnvPublishError(f"env package has too many members (limit {_MAX_MEMBERS})")
+            tar.add(path, arcname=rel, recursive=False)
+            if buf.tell() > _MAX_DOWNLOAD_BYTES:
+                raise EnvPublishError(
+                    f"env package download is too large (limit {_human_mb(_MAX_DOWNLOAD_BYTES)})",
+                    status=413,
+                )
+
+    data = buf.getvalue()
+    if len(data) > _MAX_DOWNLOAD_BYTES:
+        raise EnvPublishError(
+            f"env package download is too large (limit {_human_mb(_MAX_DOWNLOAD_BYTES)})",
+            status=413,
+        )
+    return data
+
+
+def _github_download_once(*, repo: str, token: str, publish_root: str) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
+        tmp_path = Path(tmp)
+        checkout = tmp_path / "environment-hub"
+        _run_git(
+            tmp_path,
+            [
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                _GITHUB_BRANCH,
+                "--single-branch",
+                _credentialed_repo_url(repo, token),
+                str(checkout),
+            ],
+            token=token,
+            operation="download",
+        )
+        target = _checkout_child(checkout, publish_root, operation="download")
+        if not target.is_dir():
+            raise EnvPublishError("environment package not found", status=404)
+        return _package_checkout_directory(target)
+
+
+def _github_download(slug: str, *, token: str) -> bytes:
+    return _github_download_once(repo=_DEFAULT_GITHUB_REPO, token=token, publish_root=slug)
+
+
+def download_package(*, slug: str, key: dict) -> bytes:
+    """Return a tar.gz package for a published environment from the GitHub hub."""
+    namespace, name = _validate_slug(slug)
+    canonical = f"{namespace}/{name}"
+    _require_namespace_access(canonical, key, action="download")
+    token = _github_token()
+    if not token:
+        raise EnvPublishError(
+            "Flash control plane is missing its GitHub environment-hub credential",
+            status=503,
+        )
+    return _github_download(canonical, token=token)
+
+
 def _staged_has_changes(checkout: Path) -> bool:
     try:
         proc = subprocess.run(
@@ -524,11 +639,7 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
             token=token,
             operation="delete",
         )
-        target = checkout / publish_root
-        checkout_root = checkout.resolve()
-        target_root = target.resolve()
-        if target_root != checkout_root and checkout_root not in target_root.parents:
-            raise EnvPublishError("unsafe environment delete path")
+        target = _checkout_child(checkout, publish_root, operation="delete")
         if not target.exists():
             # Idempotent: nothing published under this slug, so there is nothing to remove.
             #
@@ -570,9 +681,7 @@ def _github_delete(slug: str, *, token: str) -> bool:
         if attempt:
             time.sleep(_GIT_PUSH_RETRY_DELAYS_SECONDS[attempt - 1])
         try:
-            return _github_delete_once(
-                repo=repo, token=token, publish_root=slug, message=message
-            )
+            return _github_delete_once(repo=repo, token=token, publish_root=slug, message=message)
         except EnvPublishError as exc:
             last_error = exc
             if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
@@ -591,13 +700,7 @@ def delete_package(*, slug: str, key: dict) -> bool:
     """
     namespace, name = _validate_slug(slug)
     canonical = f"{namespace}/{name}"
-    caller_namespace = None if key.get("auth_kind") == "internal" else namespace_for(key)
-    if caller_namespace is not None and namespace != caller_namespace:
-        raise EnvPublishError(
-            "you can only delete environments in your own namespace "
-            f"({caller_namespace}/…); got {canonical!r}",
-            status=403,
-        )
+    _require_namespace_access(canonical, key, action="delete")
     token = _github_token()
     if not token:
         raise EnvPublishError(
