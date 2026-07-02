@@ -15,10 +15,19 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from flash.envs.archive_policy import (
+    ARCHIVE_MEMBER_LIMIT,
+    ARCHIVE_SCAN_MEMBER_LIMIT,
+    TAR_METADATA_TYPES,
+    LimitedArchiveReader,
+    archive_stream_limit,
+    tar_member_segments,
+)
+
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
-_MAX_MEMBERS = 5000
-_MAX_SCAN_MEMBERS = 200_000
+_MAX_MEMBERS = ARCHIVE_MEMBER_LIMIT
+_MAX_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
@@ -36,12 +45,7 @@ _REPO_CONTROL_TOP_LEVEL_PATHS = {
 # NOT a repo-control namespace, so the delete validator must reject only
 # `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
 _BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
-_TAR_METADATA_TYPES = {
-    tarfile.XHDTYPE,
-    tarfile.XGLTYPE,
-    tarfile.GNUTYPE_LONGNAME,
-    tarfile.GNUTYPE_LONGLINK,
-}
+_TAR_METADATA_TYPES = TAR_METADATA_TYPES
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 _NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
@@ -98,35 +102,16 @@ def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
     return namespace, clean
 
 
-class _LimitedReader:
-    """Bounds total bytes read from a *decompressed* tar stream. A GNU LONGNAME/LONGLINK or PAX header
-    payload is consumed inside ``tarfile.next()`` and never yielded as a member, so per-member size
-    accounting can't see it — a tiny gzip can declare a multi-GB header and OOM the process. Reads are
-    clamped to the remaining budget so a single oversized header read allocates at most the limit, then
-    raises ``EnvPublishError``."""
-
-    def __init__(self, raw, limit: int):
-        self._raw = raw
-        self._remaining = limit
-
-    def read(self, size: int = -1) -> bytes:
-        want = self._remaining + 1 if size is None or size < 0 else min(size, self._remaining + 1)
-        chunk = self._raw.read(want)
-        self._remaining -= len(chunk)
-        if self._remaining < 0:
-            raise EnvPublishError(
-                f"env package is too large uncompressed (limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})"
-            )
-        return chunk
-
-
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     root = dest.resolve()
-    # Stream backstop > the per-member content cap by the max header+padding overhead (<=1KB/member),
-    # so it never false-rejects a legitimate package but still bounds an oversized header payload.
-    stream_cap = _MAX_UNCOMPRESSED_BYTES + _MAX_MEMBERS * 1024 + (1 << 20)
     try:
-        reader = _LimitedReader(gzip.GzipFile(fileobj=io.BytesIO(tar_bytes)), stream_cap)
+        reader = LimitedArchiveReader(
+            gzip.GzipFile(fileobj=io.BytesIO(tar_bytes)),
+            archive_stream_limit(_MAX_UNCOMPRESSED_BYTES, _MAX_MEMBERS),
+            lambda: EnvPublishError(
+                f"env package is too large uncompressed (limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})"
+            ),
+        )
         with tarfile.open(fileobj=reader, mode="r|") as tar:
             total = 0
             scanned = 0
@@ -139,13 +124,12 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     )
                 if member.type in _TAR_METADATA_TYPES:
                     continue
-                segments: list[str] = []
-                for segment in member.name.replace("\\", "/").split("/"):
-                    if not segment or segment == ".":
-                        continue
-                    if segment == "..":
-                        raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
-                    segments.append(segment)
+                segments = tar_member_segments(
+                    member.name,
+                    unsafe_error=lambda name: EnvPublishError(
+                        f"unsafe path in env package: {name!r}"
+                    ),
+                )
                 if not segments:
                     continue
                 normalized_name = "/".join(segments)
