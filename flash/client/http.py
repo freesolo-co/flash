@@ -34,6 +34,7 @@ class ApiError(ClientError):
 
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 def freesolo_base_url(override: str | None = None) -> str:
@@ -50,6 +51,23 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> str:
     except (ValueError, AttributeError):
         detail = body.decode(errors="replace") if body else str(exc)
     return str(detail)
+
+
+def _read_capped_response(resp: object, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ClientError(
+                f"response body exceeded the maximum allowed size ({max_bytes} bytes); "
+                "download aborted"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
@@ -186,6 +204,30 @@ class ApiClient:
             raw = resp.read()
             return json.loads(raw) if raw else {}
 
+    def _request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: float | None = None,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        headers = {"Accept": "application/gzip"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{self.api_url}{path}",
+            method=method,
+            headers=headers,
+        )
+        with (
+            self._translate_http_errors(),
+            urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
+        ):
+            if max_bytes is not None:
+                return _read_capped_response(resp, max_bytes)
+            return resp.read()
+
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
 
@@ -219,6 +261,18 @@ class ApiClient:
         server's so the CLI doesn't time out while a destructive delete is still in progress."""
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request("DELETE", f"/v1/envs/{quoted}", timeout=1800.0)
+
+    def download_env_package(self, env_id: str) -> bytes:
+        """Download a managed environment package through the Flash control plane."""
+        from flash.envs import loader as adapter
+
+        quoted = urllib.parse.quote(env_id, safe="/")
+        return self._request_bytes(
+            "GET",
+            f"/v1/envs/{quoted}/package",
+            timeout=1800.0,
+            max_bytes=adapter._MAX_ARCHIVE_BYTES,
+        )
 
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
