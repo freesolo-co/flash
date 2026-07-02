@@ -22,10 +22,10 @@ def test_serving_base_url_default_and_override(monkeypatch):
 
 
 def test_deploy_dry_run_has_no_user_facing_mode():
-    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090", dry_run=True)
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["state"] == "dry_run"
-    assert data["gpu"] == "RTX 4090"
+    assert "gpu" not in data
     assert "mode" not in data
     assert "idle_timeout_s" not in data
     assert "est_idle_cost_usd_per_day" not in data
@@ -44,7 +44,7 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert ei.value.status_code == 500
     assert "500" in str(ei.value)
     assert "no base-model engines loaded" in str(ei.value)
@@ -64,7 +64,7 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     msg = str(ei.value)
     assert ei.value.status_code == 401
     assert "401" in msg
@@ -87,7 +87,7 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
     monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert ei.value.status_code is None
     assert "could not reach" in str(ei.value)
 
@@ -132,12 +132,12 @@ def test_deployment_roundtrip_dict():
         run_id="r",
         model="m",
         adapter_hf_prefix="p",
-        gpu="RTX 4090",
         openai_model="r",
         endpoint_name="https://serve.example",
     )
     data = d.to_dict()
     assert data["run_id"] == "r"
+    assert "gpu" not in data
     assert "mode" not in data
 
 
@@ -240,7 +240,7 @@ def test_deploy_reads_registry_back_before_ready(monkeypatch):
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
     monkeypatch.setattr(deploy_mod.httpx, "get", fake_get)
 
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert dep.state == "ready"
     assert gets == ["https://serve.example/adapters", "https://serve.example/adapters"]
 
@@ -266,7 +266,7 @@ def test_deploy_registry_readback_falls_back_to_camel_adapter_id(monkeypatch):
         ),
     )
 
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert dep.state == "ready"
 
 
@@ -287,7 +287,7 @@ def test_deploy_fails_when_adapter_never_appears_in_registry(monkeypatch):
     monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: _registry_resp([]))
 
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     msg = str(ei.value)
     assert "never appeared" in msg
     assert "Unknown adapter id" in msg
@@ -317,7 +317,7 @@ def test_deploy_fails_when_registry_keeps_prior_checkpoint(monkeypatch):
     )
 
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert "previously deployed checkpoint" in str(ei.value)
 
 
@@ -340,7 +340,7 @@ def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatc
         ),
     )
 
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert dep.state == "ready"
 
 
@@ -358,7 +358,7 @@ def test_deploy_5xx_recovers_when_new_registry_record_omits_subfolder(monkeypatc
     responses = iter([_registry_resp([]), _registry_resp([{"adapter_id": "flash-1-abc"}])])
     monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
 
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert dep.state == "ready"
 
 
@@ -383,13 +383,13 @@ def test_deploy_5xx_rejects_subfolderless_record_after_prior_deployment(monkeypa
     monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
 
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert "cannot confirm" in str(ei.value)
 
 
 def test_deployment_dict_carries_openai_v1_url(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090", dry_run=True)
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
     assert data["url"] == "https://serve.example/v1"

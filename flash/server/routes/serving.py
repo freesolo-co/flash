@@ -382,7 +382,6 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "model": spec.model,
             "hf_repo": spec.train.hf_repo,
             "adapter_prefix": deploy_prefix,
-            "gpu_name": spec.gpu.type,
             "dry_run": dry_run,
             "lora_rank": spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
@@ -414,7 +413,6 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 run_id=run_id,
                 model=spec.model,
                 adapter_prefix=deploy_prefix,
-                gpu_name=spec.gpu.type,
                 state="deploying",
             ).to_dict()
         except ValueError as exc:

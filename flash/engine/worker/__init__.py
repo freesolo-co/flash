@@ -50,6 +50,7 @@ from flash.engine.worker.grpo import (
 )
 from flash.engine.worker.heartbeat import (
     _HB_LOCK,
+    _HB_SETUP_LIVENESS_STAGES,
     _HB_TERMINAL_ONLY_INTERVAL_S,
     _HB_TERMINAL_STAGES,
     _HB_THROTTLED_STAGES,
@@ -148,6 +149,9 @@ _HB_LAST_PROGRESS_TS = 0.0
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
 # per-repo commit cap while staying under the provider poller's 1200s training stall window.
 _HB_MIN_INTERVAL_S = 900.0
+# Setup liveness is the user-visible signal during cold model download/load. Keep it below common
+# external "frozen heartbeat" thresholds without relaxing the noisy per-step training throttle.
+_HB_SETUP_LIVENESS_INTERVAL_S = 240.0
 _HB_TERMINAL_ONLY = False
 
 _WANDB_FINISH_WAIT_S = 120.0
@@ -316,6 +320,8 @@ __all__ = [
     "_HB_LAST_UPLOAD",
     "_HB_LOCK",
     "_HB_MIN_INTERVAL_S",
+    "_HB_SETUP_LIVENESS_INTERVAL_S",
+    "_HB_SETUP_LIVENESS_STAGES",
     "_HB_TERMINAL_ONLY",
     "_HB_TERMINAL_ONLY_INTERVAL_S",
     "_HB_TERMINAL_STAGES",

@@ -697,6 +697,40 @@ def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
     assert "limit 5000s" in res.detail
 
 
+def test_poll_job_liveness_heartbeat_does_not_reset_progress(monkeypatch):
+    # Liveness pings refresh visible status/logs, but they must not extend the provider's progress
+    # clock. Otherwise a wedged setup thread could ping "alive" forever and mask the stall.
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    state = {"t": 0.0}
+
+    def _time():
+        state["t"] += 100.0
+        return state["t"]
+
+    monkeypatch.setattr(jobs.time, "time", _time)
+    hbs = iter(
+        [
+            {"stage": "boot", "step": None, "ts": 1000.0},
+            {"stage": "sft_initializing", "step": None, "ts": 2000.0, "liveness": True},
+        ]
+    )
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs, None),
+        stall_after_s=150.0,
+        setup_grace_s=250.0,
+    )
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail
+    assert state["t"] < 1200.0, "liveness must not buy a fresh setup-grace window"
+
+
 def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
     # A newer heartbeat can be skipped (bounded _HB_UPLOAD_LOCK) while an OLDER one lands late,
     # changing heartbeat.json content but carrying an OLDER ts. That stale heartbeat must NOT buy a
