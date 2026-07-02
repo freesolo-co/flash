@@ -260,10 +260,11 @@ def _copy_env_payload(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
         base = Path(directory)
         for name in names:
             path = base / name
+            lowered_name = name.lower()
             if (
                 name in _ENV_PUSH_IGNORED_NAMES
                 or name.startswith(".")
-                or name.endswith(_ENV_PUSH_IGNORED_SUFFIXES)
+                or lowered_name.endswith(_ENV_PUSH_IGNORED_SUFFIXES)
                 or path.is_symlink()
             ):
                 ignored.add(name)

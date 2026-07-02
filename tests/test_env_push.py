@@ -257,6 +257,8 @@ def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
     (env_dir / ".prime" / ".env-metadata.json").write_text('{"owner": "someone-else"}')
     (env_dir / "__pycache__").mkdir()
     (env_dir / "__pycache__" / "x.pyc").write_text("junk")
+    (env_dir / "loose.pyc").write_text("junk")
+    (env_dir / "LOOSE.PYO").write_text("junk")
     (env_dir / "dist").mkdir()
     (env_dir / "dist" / "artifact.whl").write_text("wheel")
     (env_dir / ".env").write_text("SECRET=1\n")
@@ -269,6 +271,8 @@ def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
     assert "pyproject.toml" in names
     assert not any(n.startswith(".prime") for n in names)
     assert not any("__pycache__" in n for n in names)
+    assert "loose.pyc" not in names
+    assert "LOOSE.PYO" not in names
     assert not any(n.startswith("dist/") for n in names)
     assert ".env" not in names
 
