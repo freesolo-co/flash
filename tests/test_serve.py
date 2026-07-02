@@ -146,12 +146,41 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
         sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
     )
 
-    with pytest.raises(d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter"):
+    with pytest.raises(d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter") as excinfo:
         d.deploy_adapter(
             run_id="r-hf-down",
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-hf-down/seed0",
+            gpu_name="RTX 5090",
+            dry_run=False,
+            lora_rank=32,
+        )
+    assert not isinstance(excinfo.value, d.AdapterConfigMissing)
+
+
+def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
+    import flash.serve.deploy as d
+
+    class _Response:
+        status_code = 404
+
+    class _NotFound(RuntimeError):
+        response = _Response()
+
+    def fake_hf_hub_download(**_kwargs):
+        raise _NotFound("adapter_config.json not found")
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+    )
+
+    with pytest.raises(d.AdapterConfigMissing, match="failed to read org/repo:sft/r-missing/seed0/adapter"):
+        d.deploy_adapter(
+            run_id="r-missing",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-missing/seed0",
             gpu_name="RTX 5090",
             dry_run=False,
             lora_rank=32,
@@ -180,7 +209,7 @@ def test_deploy_rejects_unsupported_gpu():
         )
 
 
-def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path):
+def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serving_registry):
     """A non-dry-run deploy POSTs the adapter to {FREESOLO_SERVING_URL}/adapters with the
     right body and the internal-key auth header."""
     import flash.serve.deploy as d
@@ -205,6 +234,10 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path):
         return _Resp()
 
     monkeypatch.setattr(d.httpx, "post", fake_post)
+    # deploy reads the registry back before reporting ready
+    stub_serving_registry(
+        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+    )
 
     dep = d.deploy_adapter(
         run_id="flash-7-abcd",
@@ -235,7 +268,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path):
     assert dep.state == "ready"
 
 
-def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path):
+def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
     """When the deploying org is known, registration carries `orgId` so serving can persist
     hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""
     import flash.serve.deploy as d
@@ -257,6 +290,10 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path):
         return _Resp()
 
     monkeypatch.setattr(d.httpx, "post", fake_post)
+    # deploy reads the registry back before reporting ready
+    stub_serving_registry(
+        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+    )
 
     d.deploy_adapter(
         run_id="flash-7-abcd",
@@ -279,7 +316,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path):
     assert "orgId" not in seen["json"]
 
 
-def test_deploy_sends_thinking_default(monkeypatch, tmp_path):
+def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_registry):
     """Registration carries the run's training `thinking` flag so serving can default
     enable_thinking to it for raw chat callers (those that omit chat_template_kwargs). A
     thinking=true run registers thinking=true; a thinking=false run registers thinking=false."""
@@ -302,6 +339,10 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path):
         return _Resp()
 
     monkeypatch.setattr(d.httpx, "post", fake_post)
+    # deploy reads the registry back before reporting ready
+    stub_serving_registry(
+        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+    )
 
     d.deploy_adapter(
         run_id="flash-7-abcd",

@@ -24,13 +24,14 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
 
 from flash import __version__
 from flash.runner import get_status, submit_job
 from flash.runner.checkpoints import list_checkpoints
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
-from flash.serve.deploy import deploy_adapter, undeploy_adapter
+from flash.serve.deploy import deploy_adapter, deployment_record, undeploy_adapter
 from flash.serve.export import export_adapter
 
 from . import db
@@ -63,6 +64,7 @@ __all__ = [
     "_worker_artifacts",
     "create_app",
     "deploy_adapter",
+    "deployment_record",
     "export_adapter",
     "get_status",
     "list_checkpoints",
@@ -70,6 +72,7 @@ __all__ = [
     "run_server",
     "serve_chat",
     "serve_chat_stream",
+    "start_deployment_job",
     "submit_job",
     "undeploy_adapter",
 ]
@@ -119,6 +122,20 @@ def _protected_train_endpoint_names() -> set[str]:
 def _known_train_endpoint_names() -> set[str]:
     """Endpoint names for EVERY run this plane has a record of — the reaper's multi-plane scope."""
     return _train_endpoint_names(include_terminal=True)
+
+
+def start_deployment_job(target, *args, **kwargs) -> bool:
+    """Start a deployment lifecycle job.
+
+    Returns True when the job ran synchronously (test mode), False when it was started in a
+    background thread.
+    """
+    if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
+        target(*args, **kwargs)
+        return True
+    thread = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True)
+    thread.start()
+    return False
 
 
 def _reap_idle_endpoints_once(min_idle_s: float) -> int:
@@ -302,6 +319,7 @@ def create_app():
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
+        serving.recover_deployments()
         # Recover completion-time customer charges left pending/failed by a transient blip or a
         # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
         # `done`, so those would otherwise leak revenue; this startup sweep catches them promptly.

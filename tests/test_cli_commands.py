@@ -76,16 +76,21 @@ class _FakeClient:
         self.calls.append(("cancel", run_id))
         return {"run_id": run_id, "state": "cancelled"}
 
-    def deploy(self, run_id: str, **_) -> dict:
-        self.calls.append(("deploy", run_id))
-        return {"run_id": run_id, "openai_model": f"flash-{run_id}"}
+    def deploy(self, run_id: str, **kwargs) -> dict:
+        self.calls.append(("deploy", run_id, kwargs))
+        return {
+            "run_id": run_id,
+            "openai_model": f"flash-{run_id}",
+            "endpoint_name": "https://serve.example",
+            "state": "deploying",
+        }
 
     def undeploy(self, run_id: str) -> dict:
         self.calls.append(("undeploy", run_id))
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
     def deployments(self) -> list[dict]:
-        return [{"run_id": "flash-1", "deployment": {"gpu": "RTX 4090"}}]
+        return [{"run_id": "flash-1", "deployment": {"state": "ready", "gpu": "RTX 4090"}}]
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
@@ -102,10 +107,9 @@ class _FakeClient:
         *,
         repository: str,
         hf_token: str,
-        step: int | None = None,
         private: bool = True,
     ) -> dict:
-        self.calls.append(("export", run_id, repository, hf_token, step, private))
+        self.calls.append(("export", run_id, repository, hf_token, private))
         return {
             "run_id": run_id,
             "adapter_id": run_id,
@@ -300,9 +304,10 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
+    state, printed_any = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
 
     assert state == "done"
+    assert printed_any is True
     assert capsys.readouterr().out == "worker ready\n"
     err = stderr.getvalue()
     assert "following logs for flash-spin (queued)" in err
@@ -315,7 +320,13 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert ("cancel", "flash-1") in fake_client.calls
 
     assert _run(["deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1") in fake_client.calls
+    assert ("deploy", "flash-1", {"dry_run": False, "verify": True}) in fake_client.calls
+
+    assert _run(["deploy", "flash-1/step-40"]) == 0
+    assert ("deploy", "flash-1/step-40", {"dry_run": False, "verify": True}) in fake_client.calls
+    err = capsys.readouterr().err
+    assert "flash undeploy flash-1`" in err
+    assert "flash undeploy flash-1/step-40`" not in err
 
     assert _run(["deployments"]) == 0
     assert "flash-1" in capsys.readouterr().out
@@ -328,6 +339,28 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert _run(["chat", "flash-1", "-m", "What is 6*7?"]) == 0
     assert "42" in capsys.readouterr().out
     assert fake_client.calls[-1][0] == "chat_stream"
+
+
+def test_chat_checkpoint_ref_uses_base_run_id(fake_client) -> None:
+    assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 0
+    assert fake_client.calls[-1][0] == "chat_stream"
+    assert fake_client.calls[-1][1] == "flash-1"
+
+
+def test_chat_system_flag_prepends_system_message(fake_client) -> None:
+    """--system gives evals training-prompt parity without calling the HTTP API directly."""
+    assert _run(["chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0
+    _, _, messages = fake_client.calls[-1]
+    assert messages == [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "What is 6*7?"},
+    ]
+
+
+def test_chat_without_system_flag_sends_user_message_only(fake_client) -> None:
+    assert _run(["chat", "flash-1", "-m", "What is 6*7?"]) == 0
+    _, _, messages = fake_client.calls[-1]
+    assert messages == [{"role": "user", "content": "What is 6*7?"}]
 
 
 @pytest.mark.parametrize("flag", ["--enable-thinking", "--disable-thinking"])
@@ -402,7 +435,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
         model="Qwen/Qwen3.5-0.8B",
         environment=EnvironmentSpec(id="owner/env"),
     )
-    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.52"]
+    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.54"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
@@ -415,26 +448,24 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
 
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:
-    # The --api-key flag is the destination HF token; --step and --public are forwarded.
+    # The --api-key flag is the destination HF token; checkpoint refs and --public are forwarded.
     monkeypatch.delenv("HF_TOKEN", raising=False)
     assert (
         _run(
             [
                 "export",
                 "--adapter-id",
-                "flash-1",
+                "flash-1/step-40",
                 "--repository",
                 "me/adapters",
                 "--api-key",
                 "hf_flag",
-                "--step",
-                "40",
                 "--public",
             ]
         )
         == 0
     )
-    assert ("export", "flash-1", "me/adapters", "hf_flag", 40, False) in fake_client.calls
+    assert ("export", "flash-1/step-40", "me/adapters", "hf_flag", False) in fake_client.calls
     # The destination repo / url are reported back to the user.
     out = capsys.readouterr().out
     assert "me/adapters" in out
@@ -444,7 +475,7 @@ def test_export_reads_hf_token_from_env_and_defaults_private(fake_client, monkey
     # No --api-key: the token resolves from HF_TOKEN, and the repo defaults to private.
     monkeypatch.setenv("HF_TOKEN", "hf_env")
     assert _run(["export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 0
-    assert ("export", "flash-1", "me/adapters", "hf_env", None, True) in fake_client.calls
+    assert ("export", "flash-1", "me/adapters", "hf_env", True) in fake_client.calls
 
 
 def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, tmp_path) -> None:
@@ -457,3 +488,55 @@ def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, t
     assert "HuggingFace token" in err
     # The control plane is never contacted when there's no token to send.
     assert not any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
+    assert _run(["deploy", "flash-1"]) == 0
+    assert ("deploy", "flash-1", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert not any(c[0] == "chat" for c in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "flash deployments" in err
+    assert "OpenAI-compatible base URL" in err
+
+
+def test_deploy_checkpoint_enqueues_base_run_deployment(fake_client) -> None:
+    assert _run(["deploy", "flash-1/step-40"]) == 0
+    assert ("deploy", "flash-1/step-40", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert not any(c[0] == "chat" for c in fake_client.calls)
+
+
+def test_deploy_no_verify_skips_server_smoke(fake_client, capsys) -> None:
+    assert _run(["deploy", "flash-1", "--no-verify"]) == 0
+    assert ("deploy", "flash-1", {"dry_run": False, "verify": False}) in fake_client.calls
+    assert not any(c[0] == "chat" for c in fake_client.calls)
+    assert "smoke verification was skipped" in capsys.readouterr().err
+
+
+def test_deploy_dry_run_skips_active_deployment_note(fake_client, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {"run_id": run_id, "state": "dry_run"},
+        raising=False,
+    )
+    assert _run(["deploy", "flash-1", "--dry-run"]) == 0
+    assert not any(c[0] == "chat" for c in fake_client.calls)
+    assert "flash deployments" not in capsys.readouterr().err
+
+
+def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        fake_client,
+        "deploy",
+        lambda run_id, **_: {
+            "run_id": run_id,
+            "state": "failed",
+            "error": "smoke generation failed",
+        },
+        raising=False,
+    )
+
+    assert _run(["deploy", "flash-1"]) == 1
+    err = capsys.readouterr().err
+    assert "deployment failed: smoke generation failed" in err
+    assert "once it is ready" not in err

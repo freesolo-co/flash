@@ -701,7 +701,7 @@ def run_rl():
     # deployed on the catalog base it drops the SFT and the served model collapses to ~base. Stack
     # the original SFT LoRA back in so the DEPLOYED adapter reproduces base+SFT+GRPO on the original
     # base (no-op for the continued-adapter / fresh-LoRA paths, which already carry the SFT). Both
-    # the default `<prefix>/adapter` upload and the `--step <final>` deployable below ship the
+    # the default `<prefix>/adapter` upload and the `RUN_ID/step-<final>` deployable below ship the
     # recombined adapter; the resume checkpoints (`checkpoint/**`) are untouched — they reattach to
     # the re-merged base on resume.
     recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
@@ -711,9 +711,9 @@ def run_rl():
         # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
         # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
         # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
-        # doesn't land on one would have NO `flash deploy --step` entry even though it IS the served
+        # doesn't land on one would have NO `RUN_ID/step-N` entry even though it IS the served
         # default adapter. Publish the just-saved final adapter here, keyed by the true final
-        # global_step: same bytes as `<prefix>/adapter`, so `--step <final>` always resolves to
+        # global_step: same bytes as `<prefix>/adapter`, so `RUN_ID/step-<final>` always resolves to
         # exactly the deployed default. Idempotent (content-addressed path) when the step already
         # aligned, and best-effort (never fails a paid run).
         if _steps_run:
