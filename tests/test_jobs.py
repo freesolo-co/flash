@@ -1207,11 +1207,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
         import flash.runner.checkpoints as checkpoints
 
-        monkeypatch.setattr(
-            checkpoints,
-            "list_checkpoints",
-            lambda spec: [{"step": 40, "adapter_prefix": "rl/source-run/checkpoints/step-40"}],
-        )
+        monkeypatch.setattr(checkpoints, "checkpoint_step_exists", lambda spec, step: step == 40)
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1280,6 +1276,75 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
             )
 
 
+def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        from flash.server import db
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        monkeypatch.setattr(db, "run_owner", lambda run_id: 7 if run_id == "source-run" else None)
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run"},
+            }
+        )
+
+        status = orch.submit_job(
+            spec,
+            dry_run=True,
+            background=False,
+            billing_context={"org_id": "org-a"},
+            owner_key_id=7,
+        )
+
+        assert status.state == "dry_run"
+
+
+def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        from flash.server import db
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        monkeypatch.setattr(db, "run_owner", lambda run_id: 8 if run_id == "source-run" else None)
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="same Freesolo org"):
+            orch.submit_job(
+                spec,
+                dry_run=True,
+                background=False,
+                billing_context={"org_id": "org-a"},
+                owner_key_id=7,
+            )
+
+
 def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -1302,7 +1367,7 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
                 billing_context={"org_id": "org-a"},
             )
         )
-        monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec: [{"step": 10}])
+        monkeypatch.setattr(checkpoints, "checkpoint_step_exists", lambda spec, step: False)
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1312,6 +1377,52 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
         )
 
         with pytest.raises(ValueError, match="deployable checkpoint was not found"):
+            orch.submit_job(
+                spec,
+                dry_run=True,
+                background=False,
+                billing_context={"org_id": "org-a"},
+            )
+
+
+def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.checkpoints as checkpoints
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                billing_context={"org_id": "org-a"},
+            )
+        )
+
+        def fail_listing(spec, step):
+            raise checkpoints.CheckpointListingError(
+                "could not verify deployable checkpoints for source-run: 503"
+            )
+
+        monkeypatch.setattr(checkpoints, "checkpoint_step_exists", fail_listing)
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="could not verify deployable checkpoints"):
             orch.submit_job(
                 spec,
                 dry_run=True,
@@ -1344,7 +1455,7 @@ def test_attach_resolves_public_init_ref_before_recovery_launch(monkeypatch):
                 billing_context={"org_id": "org-a"},
             )
         )
-        monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec: [{"step": 40}])
+        monkeypatch.setattr(checkpoints, "checkpoint_step_exists", lambda spec, step: step == 40)
         base = _spec("warm-recover").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1384,6 +1495,39 @@ def test_attach_resolves_public_init_ref_before_recovery_launch(monkeypatch):
             launched["init_from_adapter"]
             == "Freesolo-Co/source:rl/source-run/checkpoints/step-40"
         )
+
+
+def test_attach_marks_failed_when_init_ref_resolution_errors(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        from flash.spec import JobSpec
+
+        base = _spec("warm-recover").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="warm-recover",
+                state="running",
+                spec=spec.to_dict(),
+                remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
+            )
+        )
+        monkeypatch.setattr(
+            orch,
+            "_resolve_init_from_adapter",
+            lambda *a, **k: (_ for _ in ()).throw(ValueError("could not verify checkpoints")),
+        )
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+
+        status = orch.attach_run("warm-recover", log_stream=sys.stderr)
+
+        assert status.state == "failed"
+        assert "could not verify checkpoints" in (status.error or "")
 
 
 def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):

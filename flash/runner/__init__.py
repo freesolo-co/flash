@@ -335,14 +335,12 @@ def _run_job_background(
     spec: JobSpec,
     runtime_secrets: dict[str, str] | None = None,
     *,
-    owner_org_id: str = "",
     resolve_env_sha: bool = False,
 ) -> None:
     """Daemon-thread entrypoint: swallows exceptions to suppress noisy thread tracebacks."""
     import logging
 
     try:
-        spec = _resolve_init_from_adapter(spec, owner_org_id=owner_org_id)
         if resolve_env_sha:
             with contextlib.suppress(Exception):
                 spec = _assign_resolved_env_sha(spec)
@@ -367,7 +365,20 @@ def _status_org_id(status: RunStatus) -> str:
     return _context_org_id(status.billing_context) or _context_org_id(status.platform_context)
 
 
-def _resolve_init_from_adapter(spec: JobSpec, *, owner_org_id: str = "") -> JobSpec:
+def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
+    if owner_key_id is None:
+        return False
+    try:
+        from flash.server import db
+
+        return db.run_owner(src_run_id) == owner_key_id
+    except Exception:
+        return False
+
+
+def _resolve_init_from_adapter(
+    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
+) -> JobSpec:
     """Resolve the public `<run_id>[/step-N]` warm-start ref into the internal storage reference.
 
     The control plane owns run metadata, so the short ref is resolved HERE (never on the worker):
@@ -395,7 +406,11 @@ def _resolve_init_from_adapter(spec: JobSpec, *, owner_org_id: str = "") -> JobS
     owner_org_id = owner_org_id.strip()
     if owner_org_id:
         src_org_id = _status_org_id(src_status)
-        if src_org_id != owner_org_id:
+        if src_org_id:
+            owner_ok = src_org_id == owner_org_id
+        else:
+            owner_ok = _source_owned_by_key(src_run_id, owner_key_id)
+        if not owner_ok:
             raise ValueError(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
@@ -405,9 +420,13 @@ def _resolve_init_from_adapter(spec: JobSpec, *, owner_org_id: str = "") -> JobS
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
         )
     if step is not None:
-        from flash.runner.checkpoints import list_checkpoints
+        from flash.runner.checkpoints import CheckpointListingError, checkpoint_step_exists
 
-        if not any(int(item.get("step", -1)) == int(step) for item in list_checkpoints(src_spec)):
+        try:
+            exists = checkpoint_step_exists(src_spec, step)
+        except CheckpointListingError as exc:
+            raise ValueError(str(exc)) from exc
+        if not exists:
             raise ValueError(
                 f"train.init_from_adapter references {src_run_id}/step-{step}, but that "
                 "deployable checkpoint was not found"
@@ -423,6 +442,7 @@ def submit_job(
     runtime_secrets: dict[str, str] | None = None,
     billing_context: dict | None = None,
     platform_context: dict | None = None,
+    owner_key_id: int | None = None,
 ) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     that fits the run; dry-run only records state."""
@@ -434,7 +454,11 @@ def submit_job(
     spec = _assign_weight_cache_volume(spec, info)
     public_spec = spec
     owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
-    worker_spec = _resolve_init_from_adapter(public_spec, owner_org_id=owner_org_id)
+    worker_spec = _resolve_init_from_adapter(
+        public_spec,
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+    )
     # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
     status = RunStatus(
         run_id=public_spec.run_id,
@@ -455,7 +479,7 @@ def submit_job(
         threading.Thread(
             target=_run_job_background,
             args=(worker_spec, runtime_secrets or {}),
-            kwargs={"owner_org_id": owner_org_id, "resolve_env_sha": True},
+            kwargs={"resolve_env_sha": True},
             daemon=True,
         ).start()
         return get_status(public_spec.run_id)

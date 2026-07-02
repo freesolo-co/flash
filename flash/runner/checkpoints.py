@@ -21,6 +21,10 @@ from flash.spec import JobSpec
 _ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors"})
 
 
+class CheckpointListingError(RuntimeError):
+    """Raised when checkpoint listing must be authoritative but HF cannot be queried."""
+
+
 def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:
     """The ``adapter_prefix`` that serves checkpoint ``step``.
 
@@ -35,29 +39,31 @@ def _adapter_file_re(base: str) -> re.Pattern[str]:
     return re.compile(re.escape(base) + r"/checkpoints/step-(\d+)/adapter/([^/]+)$")
 
 
-def list_checkpoints(spec: JobSpec) -> list[dict]:
-    """Deployable per-step adapter snapshots for ``spec``, ascending by step.
+def _repo_files(spec: JobSpec, *, strict: bool) -> list[str]:
+    repo = spec.train.hf_repo
+    if not repo:
+        return []
+    try:
+        from huggingface_hub import HfApi
 
-    A step is included only if its adapter folder carries BOTH ``adapter_config.json`` AND a
-    weights file (so checkpoint deploy can never target a half-uploaded, unloadable step). Each
-    entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
-    ``adapter_prefix`` is the value to hand ``deploy_adapter`` to serve that exact step and
-    ``subfolder`` is the full path of the adapter folder in the repo. Returns ``[]`` when the
-    run has no HF repo or no published snapshots (older runs, or none saved yet)."""
+        return HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
+            repo, repo_type="dataset"
+        )
+    except Exception as exc:
+        if strict:
+            raise CheckpointListingError(
+                f"could not verify deployable checkpoints for {spec.run_id}: {exc}"
+            ) from exc
+        print(f"[ckpt] list warn for {spec.run_id}: {exc}")
+        return []
+
+
+def _checkpoints_from_files(spec: JobSpec, files: list[str]) -> list[dict]:
     repo = spec.train.hf_repo
     if not repo:
         return []
     base = adapter_prefix(spec)
     pattern = _adapter_file_re(base)
-    try:
-        from huggingface_hub import HfApi
-
-        files = HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
-            repo, repo_type="dataset"
-        )
-    except Exception as exc:  # listing is best-effort; never raise into a run/route
-        print(f"[ckpt] list warn for {spec.run_id}: {exc}")
-        return []
     # Collect each step's adapter-folder filenames, then keep only steps with config + weights.
     by_step: dict[int, set[str]] = {}
     for path in files:
@@ -80,3 +86,27 @@ def list_checkpoints(spec: JobSpec) -> list[dict]:
             }
         )
     return out
+
+
+def list_checkpoints(spec: JobSpec) -> list[dict]:
+    """Deployable per-step adapter snapshots for ``spec``, ascending by step.
+
+    A step is included only if its adapter folder carries BOTH ``adapter_config.json`` AND a
+    weights file (so checkpoint deploy can never target a half-uploaded, unloadable step). Each
+    entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
+    ``adapter_prefix`` is the value to hand ``deploy_adapter`` to serve that exact step and
+    ``subfolder`` is the full path of the adapter folder in the repo. Returns ``[]`` when the
+    run has no HF repo or no published snapshots (older runs, or none saved yet)."""
+    return _checkpoints_from_files(spec, _repo_files(spec, strict=False))
+
+
+def checkpoint_step_exists(spec: JobSpec, step: int) -> bool:
+    """Authoritatively verify a warm-start checkpoint step before provisioning a worker.
+
+    Unlike ``list_checkpoints()``, this raises ``CheckpointListingError`` when HF listing fails
+    so transient/auth errors are not misreported as "step missing".
+    """
+    return any(
+        int(item.get("step", -1)) == int(step)
+        for item in _checkpoints_from_files(spec, _repo_files(spec, strict=True))
+    )

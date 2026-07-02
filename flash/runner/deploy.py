@@ -121,26 +121,33 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     if not status.remote:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
-    spec = _resolve_init_from_adapter(
-        JobSpec.from_dict(status.spec),
-        owner_org_id=_status_org_id(status),
-    )
-    remote = dict(status.remote)
-    seed = int(remote.pop("seed", FIXED_SEED))
-    code_prefix = remote.pop("code_prefix", None)
-    # The class the run actually provisioned (a policy retry may have walked past the
-    # provisional spec.gpu.type). The in-process success path stamps this into metrics;
-    # on recovery the worker output carries no such field, so recover it from the handle
-    # to cost the right card.
-    allocated_gpu = remote.pop("allocated_gpu", None)
+    spec = JobSpec.from_dict(status.spec)
     log = log_stream or sys.stderr
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
 
-    handle = JobHandle.from_dict(remote)
-    print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
-    res = get_provider(handle.provider).poll(handle, spec, seed, log=log)
     try:
+        owner_key_id = None
+        with contextlib.suppress(Exception):
+            from flash.server import db
+
+            owner_key_id = db.run_owner(run_id)
+        spec = _resolve_init_from_adapter(
+            spec,
+            owner_org_id=_status_org_id(status),
+            owner_key_id=owner_key_id,
+        )
+        remote = dict(status.remote)
+        seed = int(remote.pop("seed", FIXED_SEED))
+        code_prefix = remote.pop("code_prefix", None)
+        # The class the run actually provisioned (a policy retry may have walked past the
+        # provisional spec.gpu.type). The in-process success path stamps this into metrics;
+        # on recovery the worker output carries no such field, so recover it from the handle
+        # to cost the right card.
+        allocated_gpu = remote.pop("allocated_gpu", None)
+        handle = JobHandle.from_dict(remote)
+        print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
+        res = get_provider(handle.provider).poll(handle, spec, seed, log=log)
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
