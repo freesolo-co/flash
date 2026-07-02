@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from flash.envs import adapter
+from flash.envs import loader as adapter
 
 
 def _coerce_environment_github_ref(env_ref: str) -> adapter.GitHubEnvironmentRef:

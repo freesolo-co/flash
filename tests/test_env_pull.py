@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from flash.cli.envpush import cmd_env_pull
-from flash.envs import adapter
+from flash.envs import loader as adapter
 from flash.envs import pull as env_pull
 from flash.envs.pull import (
     download_environment_file,
