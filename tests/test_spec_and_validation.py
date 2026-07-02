@@ -87,9 +87,21 @@ def test_falsy_algorithm_defaults_to_grpo() -> None:
 
 def test_sft_epochs_must_be_positive() -> None:
     raw = _raw(algorithm="sft")
-    raw["train"] = {"epochs": 0, "lora_rank": 8}
+    raw["train"] = {"epochs": 0, "max_examples": 8, "lora_rank": 8}
     with pytest.raises(ConfigError, match="epochs must be >= 1"):
         spec_from_dict(raw)
+
+
+def test_sft_requires_positive_max_examples() -> None:
+    raw = _raw(algorithm="sft")
+    raw["train"] = {"epochs": 1, "lora_rank": 8}
+    with pytest.raises(ConfigError, match=r"max_examples.*positive"):
+        spec_from_dict(raw)
+    raw["train"]["max_examples"] = 0
+    with pytest.raises(ConfigError, match=r"max_examples.*positive"):
+        spec_from_dict(raw)
+    raw["train"]["max_examples"] = 8
+    assert spec_from_dict(raw).train.max_examples == 8
 
 
 def test_missing_model_is_rejected() -> None:
@@ -385,6 +397,15 @@ def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(FileNotFoundError, match="unknown run_id"):
         orch.get_status("flash-000-nope")
+
+
+def test_programmatic_sft_submit_requires_max_examples(tmp_path, monkeypatch) -> None:
+    from flash.spec import JobSpec
+
+    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    spec = JobSpec(run_id="sft-no-examples", model="Qwen/Qwen3.5-0.8B", algorithm="sft")
+    with pytest.raises(ValueError, match=r"max_examples.*positive"):
+        orch.submit_job(spec, dry_run=True)
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:

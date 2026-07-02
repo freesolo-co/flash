@@ -100,6 +100,21 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
         return float(fallback)
 
 
+def _require_priced_sft_examples(spec: JobSpec) -> None:
+    if spec.algorithm == "sft" and int(spec.train.max_examples or 0) <= 0:
+        raise ValueError(
+            "train.max_examples must be set to a positive row count for SFT "
+            "(use the full dataset row count for an uncapped run)"
+        )
+
+
+def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
+    quote = getattr(status, "estimated_cost_usd", None)
+    if quote is not None:
+        return float(quote)
+    return charge_usd_for_spec(spec, fallback=fallback)
+
+
 # Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
 # `step` field is 1-indexed and only appears once a step COMPLETES, so the expensive first step (a
 # GRPO rollout can be ~17 min) streams one of these stages with NO step yet -- still real GPU time.
@@ -132,6 +147,9 @@ class RunStatus:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     cost_usd: float = 0.0
+    # Submit-time flash.cost quote. Successful runs copy this into cost_usd at completion so the
+    # customer is charged exactly what was estimated before paid work started.
+    estimated_cost_usd: float | None = None
     error: str | None = None
     artifacts_dir: str | None = None
     adapter_ref: str | None = None
@@ -462,6 +480,7 @@ def submit_job(
 ) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     that fits the run; dry-run only records state."""
+    _require_priced_sft_examples(spec)
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
     # "local" is the JobSpec placeholder; treat it as unset so programmatic callers get unique ids.
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
@@ -469,6 +488,11 @@ def submit_job(
     spec = _assign_managed_hf_repo(spec)
     spec = _assign_weight_cache_volume(spec, info)
     public_spec = spec
+    estimated_cost_usd: float | None = None
+    if not dry_run:
+        from flash.cost.spec import estimate_for_spec
+
+        estimated_cost_usd = float(estimate_for_spec(public_spec).total_usd)
     owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
     worker_spec = _resolve_init_from_adapter(
         public_spec,
@@ -484,6 +508,7 @@ def submit_job(
         run_id=public_spec.run_id,
         state="queued",
         spec=public_spec.to_dict(),
+        estimated_cost_usd=estimated_cost_usd,
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
         platform_context=platform_context,

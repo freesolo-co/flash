@@ -110,9 +110,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _run_training,
         _RunCancelled,
         _status_org_id,
+        _status_estimated_charge,
         _update,
         artifacts_dir,
-        charge_usd_for_spec,
         get_status,
     )
 
@@ -184,9 +184,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # Add the recovered run's cost to any already booked before the restart so recovery
         # doesn't underreport spend.
         measured = float(status.cost_usd or 0.0) + _persist_metrics(public_spec, res.metrics)
-        # Charge the QUOTE (flash.cost estimate for the planned steps), not the measured wall;
-        # recovery doesn't change the quote. Falls back to measured only if the spec can't be priced.
-        charge_usd = charge_usd_for_spec(public_spec, fallback=measured)
+        # Charge the submit-time QUOTE, not measured wall; recovery doesn't change the quote.
+        # Legacy runs without a persisted quote are re-priced from the spec.
+        charge_usd = _status_estimated_charge(get_status(run_id), public_spec, fallback=measured)
         # A cancel can land while this thread persists the recovered metrics (after the late-cancel
         # check above). Re-read before the terminal "done" so a late worker success can't resurrect
         # a user-cancelled run. _RunCancelled is caught below, leaving the cancellation intact.
