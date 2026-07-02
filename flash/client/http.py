@@ -6,6 +6,7 @@ import codecs
 import contextlib
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +20,10 @@ ProgressCallback = Callable[[int, int], None]
 
 class ClientError(RuntimeError):
     """Expected client-side errors (no key, unreachable server) — printed cleanly."""
+
+
+class RequestTimeoutError(ClientError):
+    """A request timed out before the control plane returned a response."""
 
 
 class ApiError(ClientError):
@@ -136,8 +141,18 @@ class ApiClient:
             detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
             raise ApiError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
+            if isinstance(getattr(exc, "reason", None), TimeoutError):
+                raise RequestTimeoutError(
+                    f"request to the Flash service at {self.api_url} timed out; "
+                    "check your network connection and FLASH_API_URL"
+                ) from exc
             raise ClientError(
                 f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
+                "check your network connection and FLASH_API_URL"
+            ) from exc
+        except TimeoutError as exc:
+            raise RequestTimeoutError(
+                f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
@@ -229,10 +244,29 @@ class ApiClient:
             raise
 
     def cancel_run(self, run_id: str) -> dict:
-        # Cancel blocks on synchronous provider teardown (worker stop + instance destroy +
-        # endpoint GC), which can far exceed the default 60s — timing out here left the CLI
-        # printing a traceback while the server went on to mark the run cancelled anyway.
-        return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=10 * 60)
+        # Cancel can block inside synchronous provider teardown. A read timeout is ambiguous: the
+        # server may still have accepted the cancel and later persisted a terminal state. Resolve
+        # that by polling the authoritative run status instead of surfacing a raw timeout.
+        try:
+            return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=60.0)
+        except RequestTimeoutError as exc:
+            return self._poll_cancel_status(run_id, cause=exc)
+
+    def _poll_cancel_status(self, run_id: str, *, cause: RequestTimeoutError) -> dict:
+        deadline = time.monotonic() + 120.0
+        last_state = "unknown"
+        while True:
+            with contextlib.suppress(ClientError):
+                status = self.get_run(run_id)
+                last_state = str(status.get("state") or "unknown")
+                if last_state in {"cancelled", "done", "failed", "dry_run"}:
+                    return status
+            if time.monotonic() >= deadline:
+                raise ClientError(
+                    f"cancel request timed out before confirmation; latest state={last_state!r}. "
+                    f"Run `flash status {run_id}` to check the authoritative state before retrying."
+                ) from cause
+            time.sleep(2.0)
 
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (serve one with `flash deploy RUN/step-N`)."""
