@@ -337,6 +337,16 @@ Pick SFT when you already have good answers and want the model to imitate them.
   `max_length` that plausibly fits prompt + completion, and only raise it when you see
   truncation (outputs cut off mid-thought, degraded loss). A bigger context just costs
   more.
+- **For Qwen3.5 thinking multi-turn SFT, put reasoning only in the final assistant
+  turn.** Qwen3.5's chat template strips literal `<think>` blocks from prior assistant
+  history and pre-opens `<think>\n` in the next generation prompt. If every assistant
+  turn in a gold multi-turn transcript includes `<think>...</think>`, training sees a
+  different tag layout than inference and can learn doubled or misplaced thinking
+  tags. Keep intermediate assistant turns as the actual code/tool/action text only;
+  put `<think>...</think>` plus the final answer in the final assistant target. Flash's
+  completion-only SFT masking uses the longest shared token prefix, so the template's
+  pre-opened `<think>\n` is treated as prompt text instead of training the model to
+  emit another opener.
 - **SFT is a great warm start for GRPO.** SFT first to teach the format and a competent
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
   model**. For text-only continued adapters, keep the same adapter shape. For VL
