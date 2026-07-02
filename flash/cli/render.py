@@ -439,14 +439,21 @@ def deployments_table(rows: list[dict]) -> str:
     body = []
     for r in rows:
         d = r.get("deployment") or {}
+        state = str(d.get("state") or "?")
+        color = _GREEN if state in {"ready", "deployed"} else _RED if state == "failed" else _AMBER
+        detail = str(d.get("error") or d.get("detail") or "")
+        if len(detail) > 64:
+            detail = detail[:61] + "..."
         body.append(
             [
                 (r["run_id"], _ACCENT2),
+                (state, color),
                 (d.get("gpu", "?"), _GRAY),
                 (d.get("endpoint_name", ""), _GREEN),
+                (detail, _GRAY),
             ]
         )
-    table = _table(["RUN ID", "GPU", "ENDPOINT"], body)
+    table = _table(["RUN ID", "STATE", "GPU", "ENDPOINT", "DETAIL"], body)
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 

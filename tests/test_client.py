@@ -308,6 +308,7 @@ def test_deploy_checkpoint_ref_posts_step(stub):
     assert seen["path"] == "/v1/runs/flash-run/deploy"
     assert seen["body"]["step"] == 40
     assert seen["body"]["dry_run"] is False
+    assert seen["body"]["verify"] is True
 
 
 def test_deploy_final_ref_omits_step(stub):
@@ -315,7 +316,7 @@ def test_deploy_final_ref_omits_step(stub):
     client = ApiClient(url, "fslo-user-test")
     client.deploy("flash-run")
     assert seen["path"] == "/v1/runs/flash-run/deploy"
-    assert seen["body"] == {"dry_run": False}
+    assert seen["body"] == {"dry_run": False, "verify": True}
 
 
 def test_export_sends_repository_token_and_checkpoint_ref(stub):

@@ -357,8 +357,8 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy.add_argument(
         "--no-verify",
         action="store_true",
-        help="skip the post-deploy smoke generation (registration alone does NOT guarantee the "
-        "adapter serves; only verified deployments should be scored by evals)",
+        help="skip the server-side post-deploy smoke generation (registration alone does NOT "
+        "guarantee the adapter serves; only ready deployments should be scored by evals)",
     )
     deploy.set_defaults(func=cmd_deploy)
 

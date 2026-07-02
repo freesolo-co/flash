@@ -663,6 +663,8 @@ from flash.runner.deploy import (  # noqa: E402,F401
     cancel_run,
     mark_checkpoint_deployed,
     mark_deployed,
+    mark_deployment_failed,
+    mark_deployment_pending,
     mark_deployment_undeployed,
     mark_undeployed,
 )

@@ -82,6 +82,7 @@ class _FakeClient:
             "run_id": run_id,
             "openai_model": f"flash-{run_id}",
             "endpoint_name": "https://serve.example",
+            "state": "deploying",
         }
 
     def undeploy(self, run_id: str) -> dict:
@@ -89,7 +90,7 @@ class _FakeClient:
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
     def deployments(self) -> list[dict]:
-        return [{"run_id": "flash-1", "deployment": {"gpu": "RTX 4090"}}]
+        return [{"run_id": "flash-1", "deployment": {"state": "ready", "gpu": "RTX 4090"}}]
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
@@ -319,10 +320,10 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert ("cancel", "flash-1") in fake_client.calls
 
     assert _run(["deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
+    assert ("deploy", "flash-1", {"dry_run": False, "verify": True}) in fake_client.calls
 
     assert _run(["deploy", "flash-1/step-40"]) == 0
-    assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
+    assert ("deploy", "flash-1/step-40", {"dry_run": False, "verify": True}) in fake_client.calls
     err = capsys.readouterr().err
     assert "flash undeploy flash-1`" in err
     assert "flash undeploy flash-1/step-40`" not in err
@@ -483,28 +484,29 @@ def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, t
     assert not any(call[0] == "export" for call in fake_client.calls)
 
 
-def test_deploy_runs_smoke_verification(fake_client, capsys) -> None:
-    """`flash deploy` only exits 0 after a served smoke generation, not on registration alone."""
+def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
     assert _run(["deploy", "flash-1"]) == 0
-    assert any(c[0] == "chat" and c[1] == "flash-1" for c in fake_client.calls)
+    assert ("deploy", "flash-1", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert not any(c[0] == "chat" for c in fake_client.calls)
     err = capsys.readouterr().err
-    assert "smoke" in err
+    assert "flash deployments" in err
     assert "OpenAI-compatible base URL" in err
 
 
-def test_deploy_checkpoint_smoke_uses_base_run_id(fake_client) -> None:
+def test_deploy_checkpoint_enqueues_base_run_deployment(fake_client) -> None:
     assert _run(["deploy", "flash-1/step-40"]) == 0
-    assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
-    assert any(c[0] == "chat" and c[1] == "flash-1" for c in fake_client.calls)
-    assert not any(c[0] == "chat" and c[1] == "flash-1/step-40" for c in fake_client.calls)
-
-
-def test_deploy_no_verify_skips_smoke(fake_client) -> None:
-    assert _run(["deploy", "flash-1", "--no-verify"]) == 0
+    assert ("deploy", "flash-1/step-40", {"dry_run": False, "verify": True}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
 
 
-def test_deploy_dry_run_skips_smoke(fake_client, monkeypatch) -> None:
+def test_deploy_no_verify_skips_server_smoke(fake_client, capsys) -> None:
+    assert _run(["deploy", "flash-1", "--no-verify"]) == 0
+    assert ("deploy", "flash-1", {"dry_run": False, "verify": False}) in fake_client.calls
+    assert not any(c[0] == "chat" for c in fake_client.calls)
+    assert "smoke verification was skipped" in capsys.readouterr().err
+
+
+def test_deploy_dry_run_skips_active_deployment_note(fake_client, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         fake_client,
         "deploy",
@@ -513,25 +515,4 @@ def test_deploy_dry_run_skips_smoke(fake_client, monkeypatch) -> None:
     )
     assert _run(["deploy", "flash-1", "--dry-run"]) == 0
     assert not any(c[0] == "chat" for c in fake_client.calls)
-
-
-def test_deploy_fails_when_smoke_generation_is_empty(fake_client, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(
-        fake_client,
-        "chat",
-        lambda *a, **k: {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
-        raising=False,
-    )
-    assert _run(["deploy", "flash-1"]) == 1
-    assert "verification FAILED" in capsys.readouterr().err
-
-
-def test_deploy_fails_when_smoke_generation_errors(fake_client, monkeypatch, capsys) -> None:
-    def _boom(*a, **k):
-        raise RuntimeError("HTTP 404 Unknown adapter id")
-
-    monkeypatch.setattr(fake_client, "chat", _boom, raising=False)
-    assert _run(["deploy", "flash-1"]) == 1
-    err = capsys.readouterr().err
-    assert "verification FAILED" in err
-    assert "Unknown adapter id" in err
+    assert "flash deployments" not in capsys.readouterr().err

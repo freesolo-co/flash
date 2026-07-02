@@ -135,6 +135,29 @@ class Deployment:
         return asdict(self)
 
 
+def deployment_record(
+    run_id: str,
+    model: str,
+    adapter_prefix: str,
+    gpu_name: str = "RTX 5090",
+    *,
+    state: str = "ready",
+) -> Deployment:
+    friendly = servable_gpu(gpu_name)
+    subfolder = f"{adapter_prefix}/adapter"
+    base = serving_base_url()
+    return Deployment(
+        run_id=run_id,
+        model=model,
+        adapter_hf_prefix=subfolder,
+        gpu=friendly,
+        openai_model=run_id,
+        endpoint_name=base,
+        state=state,
+        url=f"{base}/v1",
+    )
+
+
 def servable_gpu(gpu_name: str) -> str:
     """Resolve a canonical RunPod GPU class for the deployment record (informational)."""
     from flash.providers.base import GPU_INFO, cheapest_gpu, get_gpu_info
@@ -233,7 +256,6 @@ def deploy_adapter(
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app."""
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
-    friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
     if not dry_run:
         validate_serving_lora_rank(
@@ -241,19 +263,12 @@ def deploy_adapter(
             adapter_artifact_lora_rank(hf_repo, subfolder),
             rank_source="adapter artifact",
         )
-    base = serving_base_url()
-    dep = Deployment(
-        run_id=run_id,
-        model=model,
-        adapter_hf_prefix=subfolder,
-        gpu=friendly,
-        openai_model=run_id,
-        endpoint_name=base,
-        state="dry_run" if dry_run else "ready",
-        url=f"{base}/v1",
+    dep = deployment_record(
+        run_id, model, adapter_prefix, gpu_name, state="dry_run" if dry_run else "ready"
     )
     if dry_run:
         return dep
+    base = serving_base_url()
     body = {
         "adapterId": run_id,
         "repoId": hf_repo,

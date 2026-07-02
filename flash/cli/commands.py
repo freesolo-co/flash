@@ -554,59 +554,6 @@ def cmd_checkpoints(args) -> int:
     return 0
 
 
-_SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
-
-
-def _verify_deployment_smoke(client, run_id: str) -> int:
-    """Run one short served generation so `deploy` only exits 0 when the adapter actually serves.
-
-    Registration (state=ready) alone is not a serving guarantee: the adapter can be missing from
-    the serving registry (chat 404s), the engine can fail to cold-load it, or serving can fall
-    back to the base model. Reports latency, thinking-tag presence, and whether a final answer
-    was reached; exits non-zero when the smoke generation fails so evals are never scored
-    against an unverified deployment.
-    """
-    msg = "smoke-testing the deployment (one short generation; a cold start can take minutes)..."
-    print(render.note(msg) if render.styled() else msg, file=sys.stderr)
-    started = time.monotonic()
-    try:
-        result = client.chat(
-            run_id,
-            [{"role": "user", "content": _SMOKE_PROMPT}],
-            temperature=0.0,
-            max_tokens=256,
-        )
-    except Exception as exc:
-        err = (
-            f"deploy verification FAILED for {run_id}: the smoke generation errored ({exc}). "
-            "state=ready only means the adapter is registered — do not score evals against this "
-            "deployment. Retry `flash deploy`, or `flash undeploy` and redeploy; rerun with "
-            "--no-verify to skip this check."
-        )
-        print(render.error(err) if render.styled() else f"error: {err}", file=sys.stderr)
-        return 1
-    latency = time.monotonic() - started
-    choice = (result.get("choices") or [{}])[0]
-    content = str((choice.get("message") or {}).get("content") or "")
-    finish = choice.get("finish_reason")
-    if not content.strip():
-        err = (
-            f"deploy verification FAILED for {run_id}: the smoke generation returned no content "
-            f"(finish_reason={finish!r}) after {latency:.1f}s — serving accepted the request but "
-            "produced an empty stream. Do not score evals against this deployment."
-        )
-        print(render.error(err) if render.styled() else f"error: {err}", file=sys.stderr)
-        return 1
-    has_thinking = "<think>" in content or "</think>" in content
-    summary = (
-        f"smoke generation ok in {latency:.1f}s "
-        f"(finish_reason={finish!r}, thinking_tag={'yes' if has_thinking else 'no'}): "
-        f"{content.strip()[:80]!r}"
-    )
-    print(render.arrow(summary) if render.styled() else summary, file=sys.stderr)
-    return 0
-
-
 def cmd_deploy(args) -> int:
     from flash.schema import parse_checkpoint_ref
 
@@ -624,6 +571,7 @@ def cmd_deploy(args) -> int:
     dep = client.deploy(
         args.run_id,
         dry_run=args.dry_run,
+        verify=not getattr(args, "no_verify", False),
     )
     if render.styled():
         print(render.deployed(dep))
@@ -644,9 +592,23 @@ def cmd_deploy(args) -> int:
                 "not the bare endpoint (which 404s on /chat/completions)."
             )
             print(render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr)
-    if dep.get("state") == "dry_run" or getattr(args, "no_verify", False):
-        return 0
-    return _verify_deployment_smoke(client, base_run_id)
+    if dep.get("state") != "dry_run":
+        state = dep.get("state", "deploying")
+        status_note = (
+            f"deployment state is {state!r}; run `flash deployments` to check progress "
+            "and use `flash chat` once it is ready."
+        )
+        print(
+            render.arrow(status_note) if render.styled() else f"note: {status_note}",
+            file=sys.stderr,
+        )
+        if getattr(args, "no_verify", False):
+            skip_note = "server-side smoke verification was skipped for this deployment."
+            print(
+                render.arrow(skip_note) if render.styled() else f"note: {skip_note}",
+                file=sys.stderr,
+            )
+    return 0
 
 
 def cmd_export(args) -> int:
@@ -704,10 +666,14 @@ def cmd_deployments(args) -> int:
     if render.styled():
         print(render.deployments_table(rows))
         return 0
-    print(f"{'RUN_ID':<32}  {'GPU':<9}  ENDPOINT")
+    print(f"{'RUN_ID':<32}  {'STATE':<10}  {'GPU':<9}  {'ENDPOINT':<32}  DETAIL")
     for r in rows:
         d = r.get("deployment") or {}
-        print(f"{r['run_id']:<32}  {d.get('gpu', '?'):<9}  {d.get('endpoint_name', '')}")
+        detail = str(d.get("error") or d.get("detail") or "")
+        print(
+            f"{r['run_id']:<32}  {d.get('state', '?'):<10}  "
+            f"{d.get('gpu', '?'):<9}  {d.get('endpoint_name', ''):<32}  {detail}"
+        )
     return 0
 
 

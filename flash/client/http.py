@@ -242,6 +242,7 @@ class ApiClient:
         self,
         run_id: str,
         dry_run: bool = False,
+        verify: bool = True,
     ) -> dict:
         from flash.schema import parse_checkpoint_ref
 
@@ -252,16 +253,13 @@ class ApiClient:
                 "for a saved checkpoint"
             )
         base_run_id, step = parsed
-        # Deploy blocks on registration and serving warmup, which can take many minutes.
-        deploy_timeout = 30 * 60 if not dry_run else None
-        body: dict = {"dry_run": dry_run}
+        body: dict = {"dry_run": dry_run, "verify": verify}
         if step is not None:
             body["step"] = step
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/deploy",
             body=body,
-            timeout=deploy_timeout,
         )
 
     def export(
@@ -301,13 +299,14 @@ class ApiClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 512,
+        timeout: float | None = None,
     ) -> dict:
         _validate_chat_messages(messages)
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/chat",
             body={"messages": messages, "temperature": temperature, "max_tokens": max_tokens},
-            timeout=30 * 60,
+            timeout=timeout if timeout is not None else 30 * 60,
         )
 
     def chat_stream(

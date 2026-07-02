@@ -236,6 +236,36 @@ def mark_checkpoint_deployed(
         return status
 
 
+def mark_deployment_pending(
+    run_id: str, deployment: dict, expect_state: str | None = None
+) -> RunStatus:
+    """Attach an in-progress deployment record without changing the run lifecycle state."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.state == "dry_run":
+            return status
+        if expect_state is not None and status.state != expect_state:
+            return status
+        status.deployment = deployment
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
+    """Record a failed deployment attempt while preserving the run lifecycle state."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        status.deployment = {**deployment, "state": "failed"}
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
 def mark_undeployed(run_id: str) -> RunStatus:
     """Record an explicit undeploy; live final-adapter deployments return to `done`."""
     from flash.runner import _STATUS_LOCK, _save_status, get_status
