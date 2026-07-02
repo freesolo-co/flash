@@ -32,7 +32,7 @@ def _loader(config):
 def test_init_adapter_preflight_rejects_adapter_rank_above_serving_cap():
     spec = _spec(rank=16)
 
-    with pytest.raises(ValueError, match=r"has rank 96.*serving max_lora_rank=64"):
+    with pytest.raises(ValueError, match=r"has rank 96.*serving max_lora_rank=32"):
         preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 96}))
 
 
@@ -41,15 +41,15 @@ def test_init_adapter_preflight_rejects_vl_recombined_rank_before_training():
 
     with pytest.raises(
         ValueError,
-        match=r"rank 72 \(SFT rank 56 \+ GRPO rank 16\).*set GRPO train\.lora_rank <= 8",
+        match=r"rank 40 \(SFT rank 24 \+ GRPO rank 16\).*set GRPO train\.lora_rank <= 8",
     ):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 56}))
+        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 24}))
 
 
 def test_init_adapter_preflight_allows_vl_recombined_rank_at_serving_cap():
     spec = _spec(rank=16)
 
-    preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 48}))
+    preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 16}))
 
 
 def test_init_adapter_preflight_allows_empty_vl_patterns():
@@ -57,7 +57,7 @@ def test_init_adapter_preflight_allows_empty_vl_patterns():
 
     preflight_init_adapter_lora_rank(
         spec,
-        config_loader=_loader({"r": 48, "rank_pattern": {}, "alpha_pattern": {}}),
+        config_loader=_loader({"r": 16, "rank_pattern": {}, "alpha_pattern": {}}),
     )
 
 
@@ -86,8 +86,8 @@ def test_init_adapter_preflight_rejects_falsey_invalid_vl_patterns(key, value):
 def test_init_adapter_preflight_checks_adapter_rank_for_sft_warm_start():
     spec = _spec(model="Qwen/Qwen3.5-0.8B", rank=32, algorithm="sft")
 
-    with pytest.raises(ValueError, match=r"has rank 160.*serving max_lora_rank=128"):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 160}))
+    with pytest.raises(ValueError, match=r"has rank 96.*serving max_lora_rank=64"):
+        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 96}))
 
 
 def test_lora_rank_uses_schema_adapter_storage_ref_parser():
