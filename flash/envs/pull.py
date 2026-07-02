@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import contextlib
+import gzip
+import io
 import os
 import shutil
+import tarfile
 import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from flash.envs import loader as adapter
+from flash.envs.archive_policy import (
+    LimitedArchiveReader,
+    archive_stream_limit,
+    tar_member_segments,
+)
 
 
 def _coerce_environment_github_ref(env_ref: str) -> adapter.GitHubEnvironmentRef:
@@ -155,6 +163,150 @@ def _replace_with_tree(source: Path, dest: Path) -> None:
             shutil.rmtree(staging_parent, ignore_errors=True)
 
 
+def ensure_environment_pull_destination_available(
+    dest: str | Path,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    dest_path = Path(dest)
+    if _path_occupied(dest_path) and not overwrite:
+        raise FileExistsError(
+            f"destination {dest_path} already exists (pass overwrite=True to replace)"
+        )
+    if (
+        overwrite
+        and dest_path.is_dir()
+        and not dest_path.is_symlink()
+        and _cwd_is_inside(dest_path)
+    ):
+        raise RuntimeError(
+            f"refusing to overwrite {dest_path} because it contains the current working directory; "
+            "choose a separate output path"
+        )
+    return dest_path
+
+
+def _copy_environment_source(source: Path, dest_path: Path, *, overwrite: bool = False) -> None:
+    ensure_environment_pull_destination_available(dest_path, overwrite=overwrite)
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_is_real_dir = dest_path.is_dir() and not dest_path.is_symlink()
+    dest_is_empty_dir = dest_is_real_dir and not any(dest_path.iterdir())
+    if not dest_path.exists() and not dest_path.is_symlink():
+        shutil.copytree(source, dest_path)
+    elif dest_is_empty_dir:
+        _populate_empty_dir(source, dest_path)
+    elif dest_is_real_dir and _cwd_is_inside(dest_path):
+        raise RuntimeError(
+            f"refusing to overwrite {dest_path} because it contains the current working directory; "
+            "choose a separate output path"
+        )
+    else:
+        if not overwrite:
+            raise FileExistsError(
+                f"destination {dest_path} already exists (pass overwrite=True to replace)"
+            )
+        _replace_with_tree(source, dest_path)
+
+
+def _extract_environment_package_archive(package: bytes | bytearray, dest: Path) -> Path:
+    """Extract a flat environment package tarball into ``dest`` and return its root."""
+    if len(package) > adapter._MAX_ARCHIVE_BYTES:
+        raise RuntimeError(
+            f"environment archive is too large compressed (limit {adapter._MAX_ARCHIVE_BYTES} bytes)"
+        )
+
+    root = (dest / "package").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    total = 0
+    extracted = 0
+    scanned = 0
+    reader = LimitedArchiveReader(
+        gzip.GzipFile(fileobj=io.BytesIO(package)),
+        archive_stream_limit(adapter._MAX_ARCHIVE_BYTES, adapter._MAX_ARCHIVE_MEMBERS),
+        lambda: RuntimeError(
+            f"environment archive is too large uncompressed (limit {adapter._MAX_ARCHIVE_BYTES} bytes)"
+        ),
+    )
+    with tarfile.open(fileobj=reader, mode="r|") as tar:
+        for member in tar:
+            scanned += 1
+            if scanned > adapter._MAX_ARCHIVE_SCAN_MEMBERS:
+                raise RuntimeError(
+                    "env package has too many entries to scan "
+                    f"(limit {adapter._MAX_ARCHIVE_SCAN_MEMBERS})"
+                )
+            if member.type in adapter._TAR_METADATA_TYPES:
+                continue
+            raw = tar_member_segments(
+                member.name,
+                unsafe_error=lambda name: RuntimeError(
+                    f"unsafe path in environment archive: {name!r}"
+                ),
+            )
+            if not raw:
+                continue
+            normalized_name = "/".join(raw)
+            target = (root / normalized_name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+            if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
+                continue
+            extracted += 1
+            if extracted > adapter._MAX_ARCHIVE_MEMBERS:
+                raise RuntimeError(
+                    f"env package has too many members (limit {adapter._MAX_ARCHIVE_MEMBERS})"
+                )
+            total += max(0, member.size)
+            if total > adapter._MAX_ARCHIVE_BYTES:
+                raise RuntimeError(
+                    "environment archive is too large uncompressed "
+                    f"({total} bytes; limit {adapter._MAX_ARCHIVE_BYTES} bytes)"
+                )
+            member.name = normalized_name
+            tar.extract(member, root)
+    return root
+
+
+def pull_environment_package_from_archive(
+    package: bytes | bytearray,
+    dest: str | Path,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """Extract a backend-returned managed environment package to ``dest``."""
+    dest_path = ensure_environment_pull_destination_available(dest, overwrite=overwrite)
+
+    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
+    try:
+        source = _extract_environment_package_archive(package, tmp_parent)
+        if not (source / adapter._DEFAULT_ENVIRONMENT_PATH).is_file():
+            raise FileNotFoundError(
+                f"environment entrypoint {adapter._DEFAULT_ENVIRONMENT_PATH!r} not found in package"
+            )
+        _copy_environment_source(source, dest_path, overwrite=overwrite)
+        return dest_path
+    finally:
+        shutil.rmtree(tmp_parent, ignore_errors=True)
+
+
+def download_environment_file_from_archive(
+    package: bytes | bytearray,
+    rel_path: str,
+) -> bytes:
+    """Read one file from a backend-returned managed environment package."""
+    safe_rel = _safe_repo_relative_path(rel_path)
+    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
+    try:
+        source = _extract_environment_package_archive(package, tmp_parent)
+        target = source / safe_rel
+        if not target.is_file():
+            raise FileNotFoundError(f"environment file {safe_rel!r} not found in package")
+        return target.read_bytes()
+    finally:
+        shutil.rmtree(tmp_parent, ignore_errors=True)
+
+
 def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool = False) -> Path:
     """Download a published environment directory to ``dest``."""
     ref = _coerce_environment_github_ref(env_ref)
@@ -165,11 +317,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             "specify a managed environment id (namespace/name) or a github ref to its subdirectory"
         )
 
-    dest_path = Path(dest)
-    if _path_occupied(dest_path) and not overwrite:
-        raise FileExistsError(
-            f"destination {dest_path} already exists (pass overwrite=True to replace)"
-        )
+    dest_path = ensure_environment_pull_destination_available(dest, overwrite=overwrite)
 
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
     try:
@@ -187,29 +335,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
                 f"{env_dir or '.'!r} of {ref.repo_full_name}@{ref.ref}"
             )
 
-        if _path_occupied(dest_path) and not overwrite:
-            raise FileExistsError(
-                f"destination {dest_path} already exists (pass overwrite=True to replace)"
-            )
-
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_is_real_dir = dest_path.is_dir() and not dest_path.is_symlink()
-        dest_is_empty_dir = dest_is_real_dir and not any(dest_path.iterdir())
-        if not dest_path.exists() and not dest_path.is_symlink():
-            shutil.copytree(source, dest_path)
-        elif dest_is_empty_dir:
-            _populate_empty_dir(source, dest_path)
-        elif dest_is_real_dir and _cwd_is_inside(dest_path):
-            raise RuntimeError(
-                f"refusing to overwrite {dest_path} because it contains the current working directory; "
-                "choose a separate output path"
-            )
-        else:
-            if not overwrite:
-                raise FileExistsError(
-                    f"destination {dest_path} already exists (pass overwrite=True to replace)"
-                )
-            _replace_with_tree(source, dest_path)
+        _copy_environment_source(source, dest_path, overwrite=overwrite)
         return dest_path
     finally:
         shutil.rmtree(tmp_parent, ignore_errors=True)

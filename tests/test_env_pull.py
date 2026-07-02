@@ -65,7 +65,12 @@ def _custom_entrypoint_tarball() -> bytes:
 
 
 def _args(**kw) -> Namespace:
-    base = {"env_id": "david-freesolo-co/stuff", "path": None, "output": None, "force": False}
+    base = {
+        "env_id": "github:freesolo-co/environment-hub@main:david-freesolo-co/stuff/environment.py",
+        "path": None,
+        "output": None,
+        "force": False,
+    }
     base.update(kw)
     return Namespace(**base)
 
