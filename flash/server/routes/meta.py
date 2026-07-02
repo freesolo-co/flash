@@ -13,8 +13,14 @@ from flash.server._deps import require_key
 router = APIRouter()
 
 
+# NOTE: must stay `async def`. As a coroutine this runs directly on the event loop and never
+# acquires an anyio threadpool token. Sync (`def`) route handlers share one CapacityLimiter
+# (default 40 tokens); when slow sync handlers (chat->Modal, auth/billing/HF calls) saturate it
+# under upstream degradation, a sync health handler gets queued and its Docker HEALTHCHECK times
+# out -> container marked unhealthy -> 502, even though the process is fine. Keeping this async
+# makes the liveness probe structurally immune to that starvation. (See ISSUE.md 2026-07-02.)
 @router.get("/v1/health")
-def health():
+async def health():
     return {"ok": True, "service": "flash", "version": __version__}
 
 
