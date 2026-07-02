@@ -162,29 +162,19 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         ".github",
         "__pycache__",
         ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        "dist",
+        "build",
+        ".eggs",
         ".mypy_cache",
         ".pytest_cache",
-        "pyproject.toml",
-        "source",
+        ".ruff_cache",
+        ".tox",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"datasets"})
-# ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
-# user-authored README/NOTES) travels with the env into the hub and back out through
-# ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
-_ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
-    {
-        ".csv",
-        ".json",
-        ".jsonl",
-        ".md",
-        ".parquet",
-        ".tsv",
-        ".txt",
-        ".yaml",
-        ".yml",
-    }
-)
+_ENV_PUSH_IGNORED_SUFFIXES = (".pyc", ".pyo")
 
 
 def _normalize_env_name(raw: str) -> str | None:
@@ -261,34 +251,25 @@ def _tar_b64(directory: Path) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
-    """Copy helper code and data sidecars beside environment.py."""
+def _copy_env_payload(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
+    """Copy the environment project payload beside the packaged entrypoint."""
     import shutil
 
-    for child in sorted(env_root.iterdir()):
-        if (
-            child == entrypoint
-            or child.name == _ENV_ENTRYPOINT
-            or child.name in _ENV_PUSH_IGNORED_NAMES
-        ):
-            continue
-        if child.name.startswith("."):
-            continue
-        target = dest / child.name
-        if child.is_dir():
-            if child.name in _ENV_PUSH_SIDECAR_DIRS:
-                shutil.copytree(
-                    child,
-                    target,
-                    ignore=shutil.ignore_patterns(*_ENV_PUSH_IGNORED_NAMES),
-                )
-            continue
-        if not child.is_file():
-            continue
-        if (
-            child.suffix == ".py" and not child.name.startswith("__")
-        ) or child.suffix.lower() in _ENV_PUSH_SIDECAR_SUFFIXES:
-            shutil.copy2(child, target)
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored: set[str] = set()
+        base = Path(directory)
+        for name in names:
+            path = base / name
+            if (
+                name in _ENV_PUSH_IGNORED_NAMES
+                or name.startswith(".")
+                or name.endswith(_ENV_PUSH_IGNORED_SUFFIXES)
+                or path.is_symlink()
+            ):
+                ignored.add(name)
+        return ignored
+
+    shutil.copytree(env_root, dest, dirs_exist_ok=True, ignore=ignore)
 
 
 def _human_bytes(n: int) -> str:
@@ -420,11 +401,11 @@ def cmd_env_push(args) -> int:
 
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
+        _copy_env_payload(env_root, pkg, entrypoint=entrypoint)
         module_source = entrypoint.read_text()
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
-        _copy_env_sidecars(env_root, pkg, entrypoint=entrypoint)
         # Only synthesize a stub README when the env didn't ship its own (now carried as a
-        # ``.md`` sidecar) — don't clobber a user-authored README with boilerplate.
+        # regular payload file) — don't clobber a user-authored README with boilerplate.
         readme = pkg / "README.md"
         if not readme.exists():
             readme.write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")

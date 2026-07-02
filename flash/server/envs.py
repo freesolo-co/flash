@@ -31,11 +31,9 @@ _REPO_CONTROL_TOP_LEVEL_PATHS = {
     ".github",
     ".git",
 }
-# Top-level segments barred from env-package CONTENTS by `_safe_extract`. A strict SUPERSET of the
-# repo-control set: it also bars a top-level `source/` dir inside a package. `source` is intentionally
-# NOT a repo-control namespace, so the delete validator must reject only
-# `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
-_BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
+# Top-level segments barred from env-package CONTENTS by `_safe_extract`. Keep this to genuine
+# repo-control directories; ordinary project directories such as `source/` are valid env payload.
+_BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS
 _TAR_METADATA_TYPES = {
     tarfile.XHDTYPE,
     tarfile.XGLTYPE,
@@ -154,7 +152,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
                 if segments[0] in _BLOCKED_TOP_LEVEL_PATHS:
                     raise EnvPublishError(
-                        "env packages must not contain repo-control or source top-level paths"
+                        "env packages must not contain repo-control top-level paths"
                     )
                 if member.islnk() or member.issym():
                     raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")

@@ -629,27 +629,28 @@ def test_safe_extract_rejects_longname_decompression_bomb(tmp_path):
     assert peak < 600 * 1024 * 1024, f"peak memory {peak} not bounded by the limit"
 
 
-def test_safe_extract_rejects_repo_control_and_source_paths(tmp_path):
+def test_safe_extract_rejects_repo_control_paths(tmp_path):
     for label in (
         ".github",
         ".git",
-        "source",
         "./.github",
         "./.git",
-        "./source",
     ):
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             d = tarfile.TarInfo(f"{label}/workflows")
             d.type = tarfile.DIRTYPE
             tar.addfile(d)
-        with pytest.raises(envs.EnvPublishError, match="top-level paths"):
+        with pytest.raises(envs.EnvPublishError, match="repo-control top-level paths"):
             envs._safe_extract(buf.getvalue(), tmp_path)
 
 
 def test_safe_extract_allows_environment_sidecars(tmp_path):
     files = {
         "datasets/train.jsonl": '{"x": 1}\n',
+        "configs/rl.toml": "[train]\n",
+        "pyproject.toml": "[project]\nname = 'e'\n",
+        "source/index.ts": "console.log('ok')\n",
     }
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -795,8 +796,8 @@ def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch)
 
 
 def test_delete_package_allows_publishable_source_namespace(monkeypatch):
-    # Regression guard for publish/delete symmetry: `source` is in publish's package-CONTENT
-    # blocklist (_BLOCKED_TOP_LEVEL_PATHS via _safe_extract) but is a legitimate org namespace.
+    # Regression guard for publish/delete symmetry: `source` is a legitimate org namespace and a
+    # valid package-content directory.
     # Delete must therefore reach storage for `source/<name>` (not 400), or those envs would be
     # publishable-but-undeletable.
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
@@ -810,7 +811,7 @@ def test_delete_package_allows_publishable_source_namespace(monkeypatch):
     # A user key whose org slug is `source` deletes its OWN `source/<name>`.
     source_key = {"org_slug": "source"}
     assert envs.namespace_for(source_key) == "source"
-    assert "source" in envs._BLOCKED_TOP_LEVEL_PATHS  # still barred from package CONTENTS
+    assert "source" not in envs._BLOCKED_TOP_LEVEL_PATHS
     assert envs.delete_package(slug="source/my-env", key=source_key) is True
     assert seen["slug"] == "source/my-env"
     # And the internal key (which may delete any namespace) reaches storage too.

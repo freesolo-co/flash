@@ -69,8 +69,8 @@ def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
     assert rc == 0
     files = _members(cap["package_b64"])
     assert "environment.py" in files
-    assert "pyproject.toml" not in files
-    assert not any(name.startswith("source/") for name in files)
+    assert "pyproject.toml" in files
+    assert "source/index.ts" in files
     assert cap["name"] == "explicit-env"
 
 
@@ -116,7 +116,7 @@ def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
     assert "datasets/train.jsonl" in _members(cap["package_b64"])
 
 
-def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
+def test_push_single_py_ships_sibling_payload(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "state.sqlite").write_text("sqlite bytes")
@@ -132,11 +132,11 @@ def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
 
     assert cli.cmd_env_push(_args(env_file)) == 0
     files = _members(cap["package_b64"])
-    assert "state.sqlite" not in files
-    assert "db/state.sqlite" not in files
-    assert "configs/env.toml" not in files
-    assert "rl.toml" not in files
-    assert "assets/labels.json" not in files
+    assert "state.sqlite" in files
+    assert "db/state.sqlite" in files
+    assert "configs/env.toml" in files
+    assert "rl.toml" in files
+    assert "assets/labels.json" in files
 
 
 def test_push_ships_training_md_and_keeps_user_readme(monkeypatch, tmp_path):
@@ -212,6 +212,7 @@ def test_push_sibling_config_does_not_override_explicit_name(monkeypatch, tmp_pa
     names = set(_members(cap["package_b64"]))
     assert cap["name"] == "new-name"
     assert "environment.py" in names
+    assert "rl.toml" in names
 
 
 def test_push_needs_no_local_github_credentials(monkeypatch, tmp_path):
@@ -256,14 +257,20 @@ def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
     (env_dir / ".prime" / ".env-metadata.json").write_text('{"owner": "someone-else"}')
     (env_dir / "__pycache__").mkdir()
     (env_dir / "__pycache__" / "x.pyc").write_text("junk")
+    (env_dir / "dist").mkdir()
+    (env_dir / "dist" / "artifact.whl").write_text("wheel")
+    (env_dir / ".env").write_text("SECRET=1\n")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_dir, name="clean-env")) == 0
     names = set(_members(cap["package_b64"]))
     assert "environment.py" in names
+    assert "pyproject.toml" in names
     assert not any(n.startswith(".prime") for n in names)
     assert not any("__pycache__" in n for n in names)
+    assert not any(n.startswith("dist/") for n in names)
+    assert ".env" not in names
 
 
 class _FakeTTY(io.StringIO):
