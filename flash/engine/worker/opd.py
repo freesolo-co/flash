@@ -2,10 +2,12 @@
 
 The student (a Qwen catalog model) samples completions on-policy; a Fireworks-hosted GLM teacher
 scores those completions token-by-token over the API; a per-token distillation loss is
-backpropagated through the student LoRA. Three cross-tokenizer strategies bridge the teacher/student
+backpropagated through the student LoRA. Four cross-tokenizer strategies bridge the teacher/student
 vocabulary mismatch (see ``tokenizer_align`` and docs/on-policy-distillation.md):
 
-- ``align`` (default): sparse top-k forward-KL, teacher candidates projected onto the student vocab.
+- ``gkd`` (default): groupwise reverse-KL over shared decoded-text spans (the collinear-ai *spider* /
+  Tinker method) — uses only realized-token logprobs, so it covers every token exactly.
+- ``align``: sparse top-k forward-KL, teacher candidates projected onto the student vocab.
 - ``uld``: sorted-distribution (optimal-transport) matching, vocabulary-agnostic.
 - ``seqkd``: off-policy sequence KD — the teacher generates targets, student trains with CE.
 
@@ -36,6 +38,8 @@ from flash.engine.worker.tokenizer_align import (
     StudentToken,
     align_targets,
     coverage,
+    groupwise_alignment,
+    groupwise_coverage,
     uld_targets,
 )
 
@@ -71,6 +75,8 @@ def _resolve_opd_knobs():
         "group_size": int(opt("group_size", 0) or d.group_size),
         "top_logprobs": int(opt("teacher_top_logprobs", 0) or d.teacher_top_logprobs),
         "kd_temperature": d.kd_temperature,
+        # gkd reverse-KL scale; reuses the existing [train] kl_penalty_coef knob (default 1.0).
+        "kl_coef": float(opt("kl_penalty_coef", None) or d.kl_coef),
         "save_every": int(opt("save_every", 0) or 20),
         "max_length": int(opt("max_length", 0) or 0),
     }
@@ -105,6 +111,37 @@ def _forward_logprobs(model, input_ids):
 
     out = model(input_ids)
     return torch.log_softmax(out.logits[0].float(), dim=-1)  # [T, V]
+
+
+def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
+    """Groupwise reverse-KL on-policy distillation (the collinear-ai *spider* / Tinker method).
+
+    Per aligned text-span group, the per-token loss coefficient is
+    ``(log P_student(span).detach() - log P_teacher(span)) / |span|`` — the REINFORCE surrogate whose
+    gradient IS the reverse-KL gradient ``E_student[∇ log π · (log π - log p*)]`` (Thinking Machines,
+    *On-Policy Distillation*). It needs only the REALIZED-token logprobs (no top-k, no vocabulary
+    projection), so it is exact across arbitrary tokenizer mismatches and covers every token.
+    ``kl_coef`` scales the objective (``[train] kl_penalty_coef``). Scalar loss or None.
+    """
+    import torch
+
+    if not student_ids or not groups:
+        return None
+    input_ids = torch.tensor([prompt_ids + student_ids], device=device)
+    logp = _forward_logprobs(model, input_ids)  # [T, V]
+    P = len(prompt_ids)
+    # Differentiable student logprob of each REALIZED completion token: logits at P+j-1 predict token j.
+    sp = [logp[P + j - 1, student_ids[j]] for j in range(len(student_ids))]
+    terms = []
+    for s_idx, teacher_logsum in groups:
+        student_logsum_det = float(sum(sp[j].detach() for j in s_idx))
+        # coeff > 0 where the student is MORE confident than the teacher on the span (push down);
+        # coeff < 0 where the teacher is more confident (push up). Gradient = reverse-KL gradient.
+        coeff = kl_coef * (student_logsum_det - teacher_logsum) / len(s_idx)
+        terms.extend(coeff * sp[j] for j in s_idx)
+    if not terms:
+        return None
+    return torch.stack(terms).mean()
 
 
 def align_loss(model, prompt_ids, student_ids, targets, device):
@@ -434,16 +471,20 @@ def _train_one(
 
     model.train()
     model.config.use_cache = False
+    if strategy == "align":
+        tgts = align_targets(
+            student_toks, teacher_toks, first_token_id, kd_temperature=knobs["kd_temperature"]
+        )
+        _train_one.last_coverage = coverage(tgts)
+        return align_loss(model, prompt_ids, student_ids, tgts, device)
     if strategy == "uld":
         tgts = uld_targets(student_toks, teacher_toks, kd_temperature=knobs["kd_temperature"])
         _train_one.last_coverage = coverage(tgts)
         return uld_loss(model, prompt_ids, student_ids, tgts, device, knobs["top_logprobs"])
-    # default: align
-    tgts = align_targets(
-        student_toks, teacher_toks, first_token_id, kd_temperature=knobs["kd_temperature"]
-    )
-    _train_one.last_coverage = coverage(tgts)
-    return align_loss(model, prompt_ids, student_ids, tgts, device)
+    # default: gkd — groupwise reverse-KL (spider/Tinker), covers every token from realized logprobs.
+    groups = groupwise_alignment(student_toks, teacher_toks)
+    _train_one.last_coverage = groupwise_coverage(groups, len(student_ids))
+    return gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs["kl_coef"])
 
 
 def _save_adapter(model, tok, adapter_dir: str) -> None:

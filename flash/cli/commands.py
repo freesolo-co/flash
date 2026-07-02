@@ -249,7 +249,7 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "steps = 100                     # opd is step-driven (like GRPO)\n"
             "lora_rank = 32\n"
-            '# tokenizer_alignment = "align" # align | seqkd | uld (cross-tokenizer strategy)\n'
+            '# tokenizer_alignment = "gkd"   # gkd | align | uld | seqkd (cross-tokenizer strategy)\n'
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )

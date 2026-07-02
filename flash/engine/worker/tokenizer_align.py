@@ -124,6 +124,52 @@ def uld_targets(
     return out
 
 
+def groupwise_alignment(
+    student_toks: list[StudentToken], teacher_toks: list[TeacherToken]
+) -> list[tuple[list[int], float]]:
+    """Align student & teacher tokens into matching decoded-text spans, for groupwise reverse-KL.
+
+    This is the collinear-ai *spider* / Tinker-cookbook realignment (``_build_alignment_groups`` +
+    ``_compute_groupwise_reverse_kl``): the coarsest common refinement of the two tokenizations —
+    a group boundary is any character position that starts a token in BOTH tokenizers. Between
+    consecutive shared boundaries, the student tokens and teacher tokens covering that span form one
+    group (both sides possibly a different number of tokens). Unlike ``align``/``uld``, this covers
+    EVERY student token (no masking): where the tokenizers disagree locally, the span just grows
+    until they next agree. Because both offset sets index the same completion string, matching
+    character spans is equivalent to matching decoded text.
+
+    Returns ``[(student_indices, teacher_logprob_sum), ...]`` — for each group the student token
+    indices in it and the summed teacher logprob over that span (``log P_teacher(span)``). The loss
+    (``opd.gkd_loss``) pairs this with the differentiable ``log P_student(span)`` for reverse-KL.
+    """
+    if not student_toks or not teacher_toks:
+        return []
+    s_starts = {st.start for st in student_toks}
+    t_starts = {tt.start for tt in teacher_toks}
+    begin = min(student_toks[0].start, teacher_toks[0].start)
+    # Group boundaries: char positions that begin a token in both tokenizers (always include the
+    # start, so the first group is anchored even if the two first-token offsets differ).
+    boundaries = sorted((s_starts & t_starts) | {begin})
+    end = max(max(st.end for st in student_toks), max(tt.end for tt in teacher_toks))
+    edges = [*boundaries, end]
+    groups: list[tuple[list[int], float]] = []
+    for k in range(len(boundaries)):
+        lo, hi = edges[k], edges[k + 1]
+        s_idx = [i for i, st in enumerate(student_toks) if lo <= st.start < hi]
+        t_lp = [tt.logprob for tt in teacher_toks if lo <= tt.start < hi]
+        if s_idx and t_lp:  # both sides must be non-empty for a valid group
+            groups.append((s_idx, float(sum(t_lp))))
+    return groups
+
+
+def groupwise_coverage(groups: list[tuple[list[int], float]], n_student_tokens: int) -> float:
+    """Fraction of student completion tokens that landed in a valid (both-sided) alignment group."""
+    if not n_student_tokens:
+        return 0.0
+    covered = sum(len(s_idx) for s_idx, _ in groups)
+    return covered / n_student_tokens
+
+
 def coverage(targets: list[dict[int, float] | None] | list[list[float] | None]) -> float:
     """Fraction of student completion positions that received a (non-masked) teacher target."""
     if not targets:

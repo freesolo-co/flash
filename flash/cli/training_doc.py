@@ -385,11 +385,12 @@ far more sample-efficient than reward-based RL and with no reward to design. It 
   `[environment] secrets = ["FIREWORKS_API_KEY"]` and export it in your shell / local `.env`; the
   value travels out-of-band and is never stored in the spec or needed at serving time.
 - **The student is a Qwen model; the teacher is GLM — different tokenizers.** Flash bridges the
-  vocabulary mismatch with `[train] tokenizer_alignment`: `align` (default — sparse top-k
-  forward-KL, the teacher's candidates projected onto the student vocabulary), `uld` (sorted-
-  distribution matching, most robust when the tokenizations diverge hard), or `seqkd` (off-policy:
-  the teacher generates targets and the student imitates them — the simplest, tokenizer-free
-  fallback). Start with `align`.
+  vocabulary mismatch with `[train] tokenizer_alignment`: `gkd` (default — groupwise reverse-KL over
+  shared decoded-text spans, the collinear-ai *spider* / Tinker method; uses only realized-token
+  logprobs so it covers every token exactly), `align` (sparse top-k forward-KL, the teacher's
+  candidates projected onto the student vocabulary), `uld` (sorted-distribution matching, most robust
+  when the tokenizations diverge hard), or `seqkd` (off-policy: the teacher generates targets and the
+  student imitates them — the simplest, tokenizer-free fallback). Start with `gkd`.
 - **Judge it like SFT.** Distillation logs a falling per-token loss; a low loss alone is not proof.
   Keep a held-out split, `flash deploy` the adapter, and score it — confirm the student actually
   moved toward the teacher's behavior, not just its surface tokens.
@@ -406,7 +407,7 @@ secrets = ["FIREWORKS_API_KEY"]
 [train]
 steps = 100
 lora_rank = 32
-# tokenizer_alignment = "align"   # align | uld | seqkd
+# tokenizer_alignment = "gkd"     # gkd | align | uld | seqkd
 # teacher_model = "accounts/fireworks/models/glm-5p2"
 ```
 

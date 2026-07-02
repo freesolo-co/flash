@@ -49,9 +49,10 @@ class OPDConfig:
     # supervise the (much smaller) student.
     teacher_model: str = "accounts/fireworks/models/glm-5p2"
     teacher_base_url: str = "https://api.fireworks.ai/inference/v1"
-    # align | seqkd | uld — how the teacher (GLM) signal is mapped onto student (Qwen) tokens
-    # across the tokenizer mismatch. See docs/on-policy-distillation.md.
-    tokenizer_alignment: str = "align"
+    # gkd | align | uld | seqkd — how the teacher (GLM) signal is mapped onto student (Qwen) tokens
+    # across the tokenizer mismatch. gkd (groupwise reverse-KL, the collinear-ai spider / Tinker
+    # method) is the default. See docs/on-policy-distillation.md.
+    tokenizer_alignment: str = "gkd"
     # OPD is step-driven like GRPO (on-policy sampling), not epoch-driven like SFT.
     num_steps: int = 100
     learning_rate: float = 1e-5
@@ -70,6 +71,9 @@ class OPDConfig:
     teacher_top_logprobs: int = 5
     # KD softmax temperature applied to the teacher distribution (align/uld).
     kd_temperature: float = 1.0
+    # Reverse-KL coefficient for the gkd (groupwise) loss; scales the per-span
+    # (student_logsum - teacher_logsum) advantage. Overridable via [train].kl_penalty_coef.
+    kl_coef: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -86,4 +90,5 @@ class Recipe:
 RECIPE = Recipe()
 
 # Selectable cross-tokenizer distillation strategies (see docs/on-policy-distillation.md).
-OPD_ALIGNMENTS = ("align", "seqkd", "uld")
+# gkd (groupwise reverse-KL, the collinear-ai spider / Tinker method) is the default.
+OPD_ALIGNMENTS = ("gkd", "align", "seqkd", "uld")

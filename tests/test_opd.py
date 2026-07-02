@@ -17,12 +17,22 @@ from flash.engine.worker.tokenizer_align import (
     TeacherToken,
     align_targets,
     coverage,
+    groupwise_alignment,
+    groupwise_coverage,
     uld_targets,
 )
 
 
+def _teacher(spans):
+    """TeacherToken list from (start, end) spans; logprob = -(index+1), no top-k needed for gkd."""
+    return [
+        TeacherToken(text="", logprob=-(i + 1.0), top=(), start=a, end=b)
+        for i, (a, b) in enumerate(spans)
+    ]
+
+
 # --------------------------------------------------------------------------------------------------
-# tokenizer alignment (the 3 cross-tokenizer strategies)
+# tokenizer alignment (the align/uld character-boundary strategies)
 # --------------------------------------------------------------------------------------------------
 def _student(spans):
     return [StudentToken(token_id=i, start=a, end=b) for i, (a, b) in enumerate(spans)]
@@ -79,6 +89,47 @@ def test_kd_temperature_flattens_the_target_distribution():
     flat = align_targets(student, teacher, lambda s: {"a": 1, "b": 2}.get(s), kd_temperature=5.0)
     # Higher temperature -> the low-prob candidate gets relatively more mass.
     assert flat[0][2] > sharp[0][2]
+
+
+# --------------------------------------------------------------------------------------------------
+# gkd groupwise alignment (the default: coarsest common refinement of the two tokenizations)
+# --------------------------------------------------------------------------------------------------
+def test_gkd_groups_are_one_per_shared_boundary_when_tokenizers_agree():
+    # Both tokenizers segment identically -> every student token is its own group.
+    student = _student([(0, 2), (2, 5)])
+    teacher = _teacher([(0, 2), (2, 5)])
+    groups = groupwise_alignment(student, teacher)
+    assert [s_idx for s_idx, _ in groups] == [[0], [1]]
+    assert groups[0][1] == -1.0  # teacher logprob of the first span
+    assert groups[1][1] == -2.0
+    assert groupwise_coverage(groups, len(student)) == 1.0
+
+
+def test_gkd_span_grows_across_disagreement_and_covers_every_token():
+    # Teacher emits one token where the student emits two; no shared interior boundary at char 3,
+    # so both student tokens fall in a single group summing the (single) teacher logprob.
+    student = _student([(0, 3), (3, 6)])
+    teacher = _teacher([(0, 6)])
+    groups = groupwise_alignment(student, teacher)
+    assert len(groups) == 1
+    assert groups[0][0] == [0, 1]  # both student tokens grouped together
+    assert groups[0][1] == -1.0
+    assert groupwise_coverage(groups, len(student)) == 1.0  # NO masking, unlike align/uld
+
+
+def test_gkd_partial_agreement_splits_at_shared_boundaries_only():
+    # Shared boundaries at chars 0 and 2; the student's interior boundary at 4 is not shared.
+    student = _student([(0, 2), (2, 4), (4, 6)])
+    teacher = _teacher([(0, 2), (2, 6)])
+    groups = groupwise_alignment(student, teacher)
+    assert [s_idx for s_idx, _ in groups] == [[0], [1, 2]]
+    assert groupwise_coverage(groups, len(student)) == 1.0
+
+
+def test_gkd_empty_inputs_yield_no_groups():
+    assert groupwise_alignment([], _teacher([(0, 1)])) == []
+    assert groupwise_alignment(_student([(0, 1)]), []) == []
+    assert groupwise_coverage([], 3) == 0.0
 
 
 # --------------------------------------------------------------------------------------------------
@@ -160,9 +211,7 @@ def test_teacher_score_injects_realized_token_when_missing_from_topk(monkeypatch
 def test_teacher_score_clamps_logprobs_to_fireworks_cap(monkeypatch):
     # Fireworks' /completions echo endpoint rejects logprobs > 5; the client must clamp.
     payload = {
-        "choices": [
-            {"logprobs": {"tokens": ["hi"], "token_logprobs": [-0.5], "text_offset": [0]}}
-        ]
+        "choices": [{"logprobs": {"tokens": ["hi"], "token_logprobs": [-0.5], "text_offset": [0]}}]
     }
     capture = {}
     _mock_urlopen(monkeypatch, payload, capture)
@@ -257,6 +306,51 @@ class _TinyLM:
 
     def parameters(self):
         return [self.w]
+
+
+def test_gkd_loss_backpropagates_over_grouped_spans():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import gkd_loss
+
+    V = 8
+    prompt_ids = [1]
+    student_ids = [2, 3]  # 2 completion tokens
+    model = _TinyLM(torch, T=len(prompt_ids) + len(student_ids), V=V)
+    # One group covering both completion tokens (as when the teacher tokenizes them as one span).
+    groups = [([0, 1], -1.5)]
+    loss = gkd_loss(model, prompt_ids, student_ids, groups, device="cpu", kl_coef=1.0)
+    assert loss is not None
+    assert loss.requires_grad
+    loss.backward()
+    # logits at index P+j-1 predict completion token j: index 0 -> tok 0, index 1 -> tok 1.
+    assert model.w.grad[0].abs().sum() > 0
+    assert model.w.grad[1].abs().sum() > 0
+
+
+def test_gkd_loss_none_without_groups_or_tokens():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import gkd_loss
+
+    model = _TinyLM(torch, T=3, V=4)
+    assert gkd_loss(model, [1], [2, 3], [], device="cpu") is None
+    assert gkd_loss(model, [1], [], [([0], -1.0)], device="cpu") is None
+
+
+def test_gkd_loss_coefficient_tracks_student_minus_teacher_logprob():
+    # The per-span coefficient is (student_logsum.detach() - teacher_logsum)/|span|; a more
+    # confident teacher (lower/more-negative teacher_logsum) makes the coefficient larger.
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import gkd_loss
+
+    V = 8
+    prompt_ids = [1]
+    student_ids = [2]
+    model = _TinyLM(torch, T=2, V=V)  # uniform logits -> student logprob = -log V per token
+    hi = gkd_loss(model, prompt_ids, student_ids, [([0], -5.0)], device="cpu", kl_coef=1.0)
+    lo = gkd_loss(model, prompt_ids, student_ids, [([0], -0.5)], device="cpu", kl_coef=1.0)
+    # loss = coeff * student_logprob, student_logprob < 0, and coeff = (s_det - teacher)/1.
+    # teacher=-5.0 -> larger coeff -> more-negative loss than teacher=-0.5.
+    assert float(hi.detach()) < float(lo.detach())
 
 
 def test_align_loss_is_differentiable_only_at_aligned_positions():
