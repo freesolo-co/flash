@@ -9,12 +9,57 @@ from flash.schema import ConfigError, spec_from_dict
 
 
 def test_algorithms_registry():
-    assert set(ALGORITHMS) == {"sft", "grpo"}
+    assert set(ALGORITHMS) == {"sft", "grpo", "opd"}
 
 
 def test_unknown_algorithm_rejected():
     with pytest.raises(ConfigError):
         spec_from_dict({"model": "Qwen/Qwen3.5-0.8B", "algorithm": "ppo"}, run_id="x")
+
+
+def test_opd_algorithm_accepted():
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "opd",
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "train": {"steps": 10, "hf_repo": "owner/runs"},
+        },
+        run_id="x",
+    )
+    assert spec.algorithm == "opd"
+    # phase drives RUN_MODE + the artifact path segment; grpo->rl, everything else->itself.
+    assert spec.phase == "opd"
+    # opd hard-requires the teacher key, auto-declared as a required runtime secret.
+    assert "FIREWORKS_API_KEY" in spec.environment.secrets
+
+
+def test_opd_capability_gated_per_model():
+    # A model whose algos lack "opd" rejects a opd run through the config path.
+    from flash import catalog
+    from flash.catalog import ModelInfo
+
+    catalog.MODELS["test/no-opd"] = ModelInfo(
+        id="test/no-opd",
+        display_name="no opd",
+        params="1B",
+        params_b=1.0,
+        algos=("sft", "grpo"),
+        min_vram_gb=12,
+    )
+    try:
+        with pytest.raises(ConfigError):
+            spec_from_dict(
+                {
+                    "model": "test/no-opd",
+                    "algorithm": "opd",
+                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                    "train": {"steps": 1, "hf_repo": "owner/runs"},
+                },
+                run_id="x",
+            )
+    finally:
+        catalog.MODELS.pop("test/no-opd", None)
 
 
 def test_grpo_capability_still_enforced():

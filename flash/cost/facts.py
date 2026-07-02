@@ -108,3 +108,37 @@ def reward_seconds_per_completion(override: float | None = None) -> float:
     if override is not None:
         return max(0.0, override)
     return AVG_REWARD_SECONDS_PER_COMPLETION
+
+
+# Approximate Fireworks serverless pricing for the on-policy-distillation GLM teacher, $/1M tokens
+# as (input, output). Static like gpu_hourly_usd so cost estimation is deterministic/offline and
+# needs NO FIREWORKS_API_KEY. Update from https://fireworks.ai/pricing. The default opd strategy
+# (align) scores completions via echo (max_tokens=0) so only INPUT tokens are billed; seqkd also
+# generates teacher targets (output tokens).
+TEACHER_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "accounts/fireworks/models/glm-5p2": (0.90, 0.90),
+    "accounts/fireworks/models/glm-5p1": (0.90, 0.90),
+}
+_DEFAULT_TEACHER_USD_PER_1M = (0.90, 0.90)
+# Fireworks echo-scoring round-trip per completion (wall time, concurrency-bound like reward grading).
+AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
+
+
+def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
+    """(input, output) $/1M tokens for a teacher model; falls back to a representative default."""
+    return TEACHER_USD_PER_1M.get(teacher_model or "", _DEFAULT_TEACHER_USD_PER_1M)
+
+
+def teacher_token_cost_usd(
+    input_tokens: float, output_tokens: float = 0.0, teacher_model: str = ""
+) -> float:
+    """External teacher-API dollar cost for a token count. Deterministic; no network."""
+    inp, outp = teacher_price_per_1m(teacher_model)
+    return (max(0.0, input_tokens) * inp + max(0.0, output_tokens) * outp) / 1_000_000.0
+
+
+def teacher_seconds_per_completion(override: float | None = None) -> float:
+    """Per-completion teacher-scoring latency (s): the explicit override, else the average."""
+    if override is not None:
+        return max(0.0, override)
+    return AVG_TEACHER_SECONDS_PER_COMPLETION

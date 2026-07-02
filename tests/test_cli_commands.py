@@ -449,6 +449,11 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "epochs = 1" in sft.read_text()
     assert "cheapest fitting managed class" in sft.read_text()
     assert "private environment-scoped repo" in sft.read_text()
+    opd = tmp_path / "configs/opd.toml"
+    assert opd.is_file()
+    assert 'algorithm = "opd"' in opd.read_text()
+    assert "steps = 100" in opd.read_text()
+    assert "FIREWORKS_API_KEY" in opd.read_text()
     training = tmp_path / "TRAINING.md"
     assert training.is_file()
     training_text = training.read_text(encoding="utf-8")
@@ -470,6 +475,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     out = capsys.readouterr().out
     assert "dataset/train.jsonl" in out
     assert "configs/rl.toml" in out
+    assert "configs/opd.toml" in out
     assert "TRAINING.md" in out
 
 

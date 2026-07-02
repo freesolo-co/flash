@@ -235,6 +235,24 @@ def cmd_env_setup(args) -> int:
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
+    opd = Path("configs/opd.toml")
+    if not opd.exists():
+        opd.write_text(
+            'model = "Qwen/Qwen3.5-4B"\n'
+            'algorithm = "opd"   # on-policy distillation from a Fireworks GLM teacher\n\n'
+            "# Environment: upload this project folder with\n"
+            "# `flash env push --name my-env .`, then paste the returned id below.\n"
+            "# FIREWORKS_API_KEY (the GLM teacher key) is read from your shell/.env at submit time.\n"
+            "[environment]\n"
+            'id = ""\n'
+            'secrets = ["FIREWORKS_API_KEY"]\n\n'
+            "[train]\n"
+            "steps = 100                     # opd is step-driven (like GRPO)\n"
+            "lora_rank = 32\n"
+            '# tokenizer_alignment = "align" # align | seqkd | uld (cross-tokenizer strategy)\n'
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
+        )
     training = Path("TRAINING.md")
     if not training.exists():
         # Explicit UTF-8: TRAINING_MD has non-ASCII chars that raise UnicodeEncodeError under a non-UTF-8 locale.
@@ -244,6 +262,7 @@ def cmd_env_setup(args) -> int:
         "dataset/train.jsonl",
         "configs/rl.toml",
         "configs/sft.toml",
+        "configs/opd.toml",
         "TRAINING.md",
     ]
     if render.styled():
@@ -545,7 +564,7 @@ def cmd_checkpoints(args) -> int:
     if not checkpoints:
         message = (
             f"no deployable checkpoints for {args.run_id} yet "
-            "(RL streams one per save interval; SFT-only runs have none)."
+            "(RL/opd stream one per save interval; SFT-only runs have none)."
         )
         if render.styled():
             print(render.empty("checkpoints", "0 deployable", message))

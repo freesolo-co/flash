@@ -14,7 +14,7 @@ class RunConfig:
     """One training run to price. ``None`` knobs resolve to recipe defaults."""
 
     model_id: str
-    method: str  # "sft" | "grpo"
+    method: str  # "sft" | "grpo" | "opd"
     steps: int
 
     # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
@@ -61,10 +61,31 @@ class RunConfig:
     def is_grpo(self) -> bool:
         return self.method == "grpo"
 
+    @property
+    def is_opd(self) -> bool:
+        return self.method == "opd"
+
+    @property
+    def has_rollout(self) -> bool:
+        """True when a step samples on-policy student completions (GRPO or opd)."""
+        return self.is_grpo or self.is_opd
+
     def normalized(self) -> RunConfig:
         """A copy with every ``None`` knob filled from the recipe for this method."""
         lora = self.lora_rank if self.lora_rank is not None else RECIPE.lora.rank
-        if self.is_grpo:
+        if self.is_opd:
+            d = RECIPE.opd
+            comp = self.completion_len
+            if comp is None:
+                comp = d.max_completion_len_thinking if self.thinking else d.max_completion_len
+            seq = (
+                self.seq_len
+                if self.seq_len is not None
+                else max(1024, d.max_prompt_len + int(comp))
+            )
+            batch = self.batch_size if self.batch_size is not None else d.prompts_per_step
+            group = self.group_size if self.group_size is not None else d.group_size
+        elif self.is_grpo:
             comp = self.completion_len
             if comp is None:
                 comp = (
@@ -118,8 +139,9 @@ class RunConfig:
 class CostEstimate:
     """A pre-flight estimate.
 
-    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is
-    reported as elapsed wall time but is not billed to the user estimate.
+    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd`` (+ ``teacher_api_usd`` for
+    opd). Setup/cold-start time is reported as elapsed wall time but is not billed to the
+    user estimate.
     """
 
     model_id: str
@@ -136,6 +158,9 @@ class CostEstimate:
     wall_clock_seconds: float
     wall_capped: bool
     total_usd: float
+    # opd only: external Fireworks GLM teacher token spend (0.0 for sft/grpo), already folded
+    # into total_usd. Shown as its own itemized line.
+    teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()
 
     @property
@@ -161,8 +186,12 @@ class CostEstimate:
             + ("  [CAPPED at the wall-clock limit]" if self.wall_capped else ""),
             f"Wall clock : {self.wall_clock_hours:.2f} h",
             f"Billable   : {self.billable_hours:.2f} h (training only)",
-            f"TOTAL      : ${self.total_usd:.2f}",
         ]
+        if self.teacher_api_usd > 0:
+            gpu_usd = self.total_usd - self.teacher_api_usd
+            lines.append(f"GPU        : ${gpu_usd:.2f}")
+            lines.append(f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks GLM token spend)")
+        lines.append(f"TOTAL      : ${self.total_usd:.2f}")
         if self.notes:
             lines.append("Notes      :")
             lines.extend(f"  - {n}" for n in self.notes)

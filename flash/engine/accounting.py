@@ -15,7 +15,7 @@ class RunMetrics:
     """Standard metrics record written per phase."""
 
     arm: str = "runpod"
-    phase: str = ""  # "sft" | "rl"
+    phase: str = ""  # "sft" | "rl" | "opd"
     seed: int = 0
     model_id: str = ""
     wall_seconds: float = 0.0  # training-loop wall time used for customer cost

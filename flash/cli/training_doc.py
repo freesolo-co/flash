@@ -19,8 +19,8 @@ actually produced, and decide — honestly — whether the model got better.
 ## Using Flash
 
 Flash is a **managed** training service with a thin CLI/client. You author an
-environment (the task + its reward), publish it, and submit SFT or GRPO runs from a
-TOML config. Flash allocates the cheapest fitting managed GPU class, runs the job,
+environment (the task + its reward), publish it, and submit SFT, GRPO, or on-policy
+**distillation** runs from a TOML config. Flash allocates the cheapest fitting managed GPU class, runs the job,
 streams logs back, and serves the result. You never handle infrastructure credentials —
 you authenticate once with a freesolo API key, and everything below is a `flash` CLI
 command.
@@ -42,6 +42,7 @@ environment.py          # the task: how to prompt the model and how to score it
 dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "output": ...}
 configs/rl.toml         # a GRPO (RL) run config
 configs/sft.toml        # an SFT run config
+configs/opd.toml        # an on-policy distillation run config
 TRAINING.md             # this file
 ```
 
@@ -92,7 +93,7 @@ edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 ```toml
 model = "Qwen/Qwen3.5-4B"   # see `flash models`
-algorithm = "grpo"          # "grpo" (RL) or "sft"
+algorithm = "grpo"          # "grpo" (RL), "sft", or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
 
 [environment]
@@ -369,6 +370,45 @@ lora_alpha = 32
 ```
 
 SFT is **epoch-driven** (`epochs`); GRPO is **step-driven** (`steps`).
+
+---
+
+## On-policy distillation (`algorithm = "opd"`)
+
+Pick distillation when a much stronger **teacher** model can grade your student's work
+token-by-token. The student samples on-policy (like GRPO), a Fireworks-hosted GLM teacher scores
+each of *its own* completions, and a dense per-token loss teaches the student to match the teacher —
+far more sample-efficient than reward-based RL and with no reward to design. It is **step-driven**
+(`steps`) and produces a LoRA served exactly like SFT.
+
+- **Provide the teacher key.** Distillation needs `FIREWORKS_API_KEY` at submit time. List it under
+  `[environment] secrets = ["FIREWORKS_API_KEY"]` and export it in your shell / local `.env`; the
+  value travels out-of-band and is never stored in the spec or needed at serving time.
+- **The student is a Qwen model; the teacher is GLM — different tokenizers.** Flash bridges the
+  vocabulary mismatch with `[train] tokenizer_alignment`: `align` (default — sparse top-k
+  forward-KL, the teacher's candidates projected onto the student vocabulary), `uld` (sorted-
+  distribution matching, most robust when the tokenizations diverge hard), or `seqkd` (off-policy:
+  the teacher generates targets and the student imitates them — the simplest, tokenizer-free
+  fallback). Start with `align`.
+- **Judge it like SFT.** Distillation logs a falling per-token loss; a low loss alone is not proof.
+  Keep a held-out split, `flash deploy` the adapter, and score it — confirm the student actually
+  moved toward the teacher's behavior, not just its surface tokens.
+
+```toml
+# configs/opd.toml
+model = "Qwen/Qwen3.5-4B"
+algorithm = "opd"
+
+[environment]
+id = "your-org/my-env"
+secrets = ["FIREWORKS_API_KEY"]
+
+[train]
+steps = 100
+lora_rank = 32
+# tokenizer_alignment = "align"   # align | uld | seqkd
+# teacher_model = "accounts/fireworks/models/glm-5p2"
+```
 
 ---
 

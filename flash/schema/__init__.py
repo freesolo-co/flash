@@ -8,6 +8,7 @@ import tomllib
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.engine.recipe import OPD_ALIGNMENTS
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -21,6 +22,7 @@ from flash.schema.fields import (
     _train_float,
     _train_int,
     _train_stops,
+    _train_str,
     _wandb_spec,
     _worker_env,
 )
@@ -35,7 +37,7 @@ _CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
-    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl)/"
+    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|opd)/"
     rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
 )
 
@@ -193,6 +195,10 @@ _TRAIN_KEYS = frozenset(
         "stop_sequences",
         "max_steps",
         "max_examples",
+        # on-policy distillation (algorithm="opd")
+        "teacher_model",
+        "tokenizer_alignment",
+        "teacher_top_logprobs",
     }
 )
 
@@ -202,10 +208,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
     if unknown:
         hint = ""
-        if {"grpo", "sft"} & set(unknown):
+        if {"grpo", "sft", "opd"} & set(unknown):
             hint = (
-                " — GRPO/SFT knobs (group_size, batch_size, max_tokens, …) belong under [train], "
-                "not a [grpo]/[sft] table"
+                " — GRPO/SFT/opd knobs (group_size, batch_size, max_tokens, teacher_model, …) "
+                "belong under [train], not a [grpo]/[sft]/[opd] table"
             )
         raise ConfigError(
             f"unknown config section(s): {', '.join(unknown)} "
@@ -252,6 +258,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if env_raw.get("pip") is not None and not all(isinstance(p, str) for p in env_raw["pip"]):
         raise ConfigError("[environment] pip entries must be strings")
     environment_secrets = _environment_secrets(env_raw.get("secrets"))
+    if algorithm == "opd" and "FIREWORKS_API_KEY" not in environment_secrets:
+        # OPD cannot run without the teacher key, so make it a REQUIRED declared secret: the
+        # client (runtime_secrets_from_local_env) and server (_runtime_secrets) both raise on a
+        # missing required secret, so a keyless opd run fails fast before any GPU is provisioned.
+        # It is a name-only declaration (value stays out-of-band); FIREWORKS_API_KEY is also a
+        # default runtime secret so it is collected/allowed on every arm.
+        environment_secrets = (*environment_secrets, "FIREWORKS_API_KEY")
     train_raw = raw.get("train")
     if train_raw is None:
         train_raw = {}
@@ -340,6 +353,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
+            teacher_model=_train_str(train_raw, "teacher_model"),
+            tokenizer_alignment=_train_str(
+                train_raw, "tokenizer_alignment", choices=OPD_ALIGNMENTS
+            ),
+            teacher_top_logprobs=_train_int(train_raw, "teacher_top_logprobs", minimum=1),
         ),
         gpu=GpuSpec(type=gpu_type),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
@@ -366,6 +384,11 @@ def _validate_spec(spec: JobSpec) -> None:
             "train.max_examples must be set to a positive row count for SFT "
             "(use the full dataset row count for an uncapped run)"
         )
+    if spec.algorithm == "opd" and spec.train.steps is not None and spec.train.steps <= 0:
+        # OPD is step-driven (on-policy sampling), like GRPO — not epoch-driven. The teacher
+        # key (FIREWORKS_API_KEY) is auto-declared as a required secret in spec_from_dict, so a
+        # keyless opd run already fails fast in the client/server runtime-secret gate.
+        raise ConfigError("train.steps must be positive for opd")
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "

@@ -20,6 +20,8 @@ from .facts import (
     model_quant,
     pick_gpu,
     reward_seconds_per_completion,
+    teacher_seconds_per_completion,
+    teacher_token_cost_usd,
     total_params_b,
 )
 from .types import CostEstimate, RunConfig
@@ -28,6 +30,9 @@ from .types import CostEstimate, RunConfig
 SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
+# OPD's update is policy fwd+bwd ONLY (6): the teacher's per-token logprobs come from the
+# Fireworks API, so there is NO local frozen-reference forward (GRPO's extra 2).
+OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 6.0
 
 # Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
 # wall clock. LoRA + small batches sit well below dense-pretraining MFU.
@@ -38,6 +43,8 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # Reward grading is CONCURRENT: a step's completions score in parallel slots, so the reward
 # wall is ceil(completions / slots) waves x latency, not completions x latency.
 REWARD_CONCURRENCY = 16.0
+# OPD teacher scoring is likewise concurrent (parallel Fireworks calls per step).
+TEACHER_CONCURRENCY = 16.0
 
 # Cold-start overhead (seconds): container boot + deps + model load (+ vLLM init for GRPO).
 #
@@ -85,6 +92,18 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     params = active_params_b(n.model_id) * 1e9
     peak = gpu_tflops(gpu) * 1e12  # FLOP/s
 
+    if n.is_opd:
+        # OPD step = on-policy student rollout (like GRPO) + remote teacher scoring
+        # (concurrent Fireworks round-trips, replaces reward grading) + policy update (fwd+bwd
+        # only, NO local reference forward — the teacher is the API).
+        completions = n.batch_size * n.group_size
+        gen_tokens = completions * n.completion_len
+        gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
+        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_TRAIN)
+        teacher_lat = teacher_seconds_per_completion(config.reward_seconds_per_completion)
+        teacher_s = math.ceil(completions / TEACHER_CONCURRENCY) * teacher_lat
+        return gen_s + teacher_s + update_s
+
     if not n.is_grpo:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * MFU_SFT_TRAIN)
@@ -95,7 +114,9 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_TRAIN)
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
-    reward_s = math.ceil(completions / REWARD_CONCURRENCY) * latency  # ceil: a partial wave still costs one latency
+    reward_s = (
+        math.ceil(completions / REWARD_CONCURRENCY) * latency
+    )  # ceil: a partial wave still costs one latency
     return gen_s + reward_s + update_s
 
 
@@ -115,7 +136,9 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
     it considers every fitting class, validated or not — so the estimate reflects the cheapest
     card that *could* run the job. The live allocator restricts to the validated pool, so the
     actually-provisioned class can be pricier than this. Catalog sizing is offline/deterministic."""
-    total_params_b(config.model_id)  # catalog-only: reject a non-catalog model before any (HF) sizing
+    total_params_b(
+        config.model_id
+    )  # catalog-only: reject a non-catalog model before any (HF) sizing
     need = required_vram_gb(
         config.model_id,
         config.method,
@@ -126,12 +149,22 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
     return gpu, need
 
 
-def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: float) -> tuple[str, ...]:
+def _notes(
+    config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: float
+) -> tuple[str, ...]:
     n = config.normalized()
     notes: list[str] = []
     if (quant := model_quant(n.model_id)) != "bf16":
         notes.append(f"{quant}: smaller VRAM footprint -> cheaper GPU class fits")
-    if n.is_grpo:
+    if n.is_opd:
+        comps = n.batch_size * n.group_size
+        tsec = teacher_seconds_per_completion(n.reward_seconds_per_completion)
+        notes.append(
+            f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
+            f"@ {n.completion_len} tok + GLM teacher scoring ({tsec:.2f}s/completion) + policy "
+            "update (no local reference forward)"
+        )
+    elif n.is_grpo:
         comps = n.batch_size * n.group_size
         rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)
         notes.append(
@@ -156,7 +189,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     gpu, need = select_gpu(config)
     hourly = gpu_hourly_usd(gpu, provider=config.provider)
     # Mirror the runner's max(60, max_wall_seconds) floor so elapsed wall time is not undercounted.
-    cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
+    cap_s = (
+        max(60.0, float(config.max_wall_seconds))
+        if config.max_wall_seconds is not None
+        else wall_cap_s
+    )
 
     setup = setup_seconds(config)
     sps = seconds_per_step(config, gpu)
@@ -172,6 +209,18 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     train = max(0.0, cap_s - setup) if wall_capped else raw_train
     wall = setup + train
 
+    # OPD: add the external Fireworks teacher token spend. The teacher echo-scores every
+    # sampled completion (input ~ prompt+completion per completion), so bill INPUT tokens over the
+    # EFFECTIVE (wall-capped) step count — not the uncapped `steps` — so a wall-capped run's teacher
+    # bill tracks the GPU time it is actually billed for.
+    teacher_api_usd = 0.0
+    if config.is_opd:
+        n = config.normalized()
+        effective_steps = (train / sps) if sps > 0 else config.steps
+        completions_per_step = n.batch_size * n.group_size
+        teacher_input_tokens = effective_steps * completions_per_step * n.seq_len
+        teacher_api_usd = teacher_token_cost_usd(teacher_input_tokens, 0.0)
+
     return CostEstimate(
         model_id=config.model_id,
         method=config.method,
@@ -186,6 +235,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         train_seconds=train,
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
-        total_usd=train / 3600.0 * hourly,
+        total_usd=train / 3600.0 * hourly + teacher_api_usd,
+        teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),
     )

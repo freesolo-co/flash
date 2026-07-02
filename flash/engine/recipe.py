@@ -41,6 +41,38 @@ class RLConfig:
 
 
 @dataclass(frozen=True)
+class OPDConfig:
+    """On-policy distillation: student samples, a remote teacher scores its tokens."""
+
+    # Fireworks-hosted teacher reached over the OpenAI-compatible API; overridable via
+    # [train].teacher_model. GLM-5.2 is a strong reasoning model whose per-token logprobs
+    # supervise the (much smaller) student.
+    teacher_model: str = "accounts/fireworks/models/glm-5p2"
+    teacher_base_url: str = "https://api.fireworks.ai/inference/v1"
+    # align | seqkd | uld — how the teacher (GLM) signal is mapped onto student (Qwen) tokens
+    # across the tokenizer mismatch. See docs/on-policy-distillation.md.
+    tokenizer_alignment: str = "align"
+    # OPD is step-driven like GRPO (on-policy sampling), not epoch-driven like SFT.
+    num_steps: int = 100
+    learning_rate: float = 1e-5
+    max_prompt_len: int = 1024
+    max_completion_len: int = 512
+    # 512 is short for <think> traces; overridable via [train].max_tokens.
+    max_completion_len_thinking: int = 1536
+    prompts_per_step: int = 8
+    # Student samples per prompt. 1 is enough for a direct KD loss (no group-relative baseline
+    # as in GRPO); raise for more teacher-scored coverage per prompt at higher cost.
+    group_size: int = 1
+    sampling_temperature: float = 1.0
+    sampling_top_p: float = 1.0
+    # Teacher top-k next-token candidates per position (align/uld). Fireworks caps the echo-scoring
+    # endpoint at 5, so the teacher client clamps to that; 5 is the effective max.
+    teacher_top_logprobs: int = 5
+    # KD softmax temperature applied to the teacher distribution (align/uld).
+    kd_temperature: float = 1.0
+
+
+@dataclass(frozen=True)
 class Recipe:
     """The complete shared recipe."""
 
@@ -48,6 +80,10 @@ class Recipe:
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     sft: SFTConfig = field(default_factory=SFTConfig)
     rl: RLConfig = field(default_factory=RLConfig)
+    opd: OPDConfig = field(default_factory=OPDConfig)
 
 
 RECIPE = Recipe()
+
+# Selectable cross-tokenizer distillation strategies (see docs/on-policy-distillation.md).
+OPD_ALIGNMENTS = ("align", "seqkd", "uld")

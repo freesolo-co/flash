@@ -77,6 +77,12 @@ def spec_steps(spec) -> int:
         if t.steps is not None:
             return max(1, int(t.steps))
         return RECIPE.rl.num_steps
+    if spec.algorithm == "opd":
+        # Step-driven like GRPO (on-policy sampling), NOT example-driven — so a opd quote never
+        # demands [train].max_examples (the SFT fallback below would raise).
+        if t.steps is not None:
+            return max(1, int(t.steps))
+        return RECIPE.opd.num_steps
     # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
     # don't let max_examples=0 price a single step.
     return _sft_steps_from_examples(spec, _sft_example_count(spec), apply_cap=True)
@@ -87,15 +93,17 @@ def runconfig_from_spec(spec) -> RunConfig:
     estimate covers a single job. The estimate doesn't pin a GPU -- it does its own cheapest-fit
     (provider="auto")."""
     t, g = spec.train, spec.gpu
-    is_grpo = spec.algorithm == "grpo"
+    # Both grpo and opd sample on-policy student completions, so both carry the rollout
+    # dimensions (completion length + group size) into the cost model.
+    has_rollout = spec.algorithm in ("grpo", "opd")
     return RunConfig(
         model_id=spec.model,
         method=spec.algorithm,
         steps=spec_steps(spec),
         seq_len=t.max_length,
-        completion_len=t.max_tokens if is_grpo else None,
+        completion_len=t.max_tokens if has_rollout else None,
         batch_size=t.batch_size,
-        group_size=t.group_size if is_grpo else None,
+        group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
         provider="auto",

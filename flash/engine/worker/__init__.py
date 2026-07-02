@@ -93,6 +93,7 @@ from flash.engine.worker.lora import (
     strip_language_model_infix,
     vllm_language_model_only_kwargs,
 )
+from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,
@@ -141,7 +142,7 @@ ATTEMPT = os.environ.get("ATTEMPT", "")
 JOB_SPEC = load_job_spec_from_env()
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl") else "sft"),
+    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
 
 _HB_LAST_UPLOAD = 0.0
@@ -273,6 +274,7 @@ def main():
         modes = {
             "sft": run_sft,
             "rl": run_rl,
+            "opd": run_opd,
         }
         handler = modes.get(RUN_MODE)
         if handler is None:
@@ -408,6 +410,7 @@ __all__ = [
     "require_vllm_for_rollout_func",
     "resolve_grpo_prompts_per_step",
     "rl_per_device_comps",
+    "run_opd",
     "run_rl",
     "run_sft",
     "setup_perf_backends",

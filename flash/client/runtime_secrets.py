@@ -5,7 +5,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
+# FIREWORKS_API_KEY is the on-policy-distillation teacher key (GLM on Fireworks). Like
+# WANDB_API_KEY it is optional at large (only opd needs it) and travels out-of-band: this
+# one constant is the single allow-list consumed by client collection (below), the server create
+# gate (server/_deps.py), and worker-env injection (providers/runpod/train/deps.py), so adding it
+# here wires the teacher key end-to-end for every arm. opd hard-requires it at parse time
+# (schema._validate_spec) so a missing key fails before any GPU is provisioned.
+DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY", "FIREWORKS_API_KEY"})
 
 
 def _read_env_file(path: Path, keys: set[str]) -> dict[str, str]:
