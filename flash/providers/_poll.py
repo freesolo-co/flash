@@ -179,6 +179,8 @@ def format_gpu_status(gpu: Any) -> str:
 
 def _format_heartbeat(hb: dict) -> str:
     msg = f"worker: stage={hb.get('stage')}"
+    if hb.get("liveness"):
+        msg += " liveness=true"
     for key, digits in (
         ("step", 0),
         ("epoch", 3),
@@ -250,7 +252,11 @@ def surface_heartbeat(
     last_hb_key: tuple | None,
     say: Callable[[str], None],
 ) -> tuple[tuple | None, str | None]:
-    """Read a heartbeat and, if it advanced, log worker progress. Returns (hb_key, stage)."""
+    """Read a heartbeat and log it if it advanced.
+
+    Returns ``(hb_key, stage)``. ``hb_key`` is for deduping any visible heartbeat; ``stage`` is
+    ``None`` for liveness pings so provider pollers do not count them as progress.
+    """
     if heartbeat_reader is None:
         return last_hb_key, None
     try:
@@ -259,12 +265,15 @@ def surface_heartbeat(
         hb = None
     if not hb:
         return last_hb_key, None
-    if hb.get("liveness"):
-        # Liveness pings must not advance the stall key — a wedged worker pinging "alive" would mask a stall.
-        return last_hb_key, None
     key = (hb.get("stage"), hb.get("step"), hb.get("ts"), hb.get("attempt"))
     if key == last_hb_key:
         return last_hb_key, None
+    if hb.get("liveness"):
+        # Liveness pings update visible run status/logs, but must not advance the stall key — a
+        # wedged worker pinging "alive" would mask a stall.
+        _record_heartbeat(hb)
+        say(_format_heartbeat(hb))
+        return key, None
     _record_heartbeat(hb)
     stage = hb.get("stage")
     say(_format_heartbeat(hb))
