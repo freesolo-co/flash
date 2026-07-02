@@ -102,7 +102,7 @@ def test_config_cheapest_policy_validated_pool(monkeypatch):
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-        "train": {"epochs": 1, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
@@ -143,7 +143,7 @@ def test_config_defaults_gpu_from_model():
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-        "train": {"epochs": 1, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
     # 9B is bf16 (QLoRA dropped): bf16 SFT needs ~29 GB, so the cheapest validated class that fits

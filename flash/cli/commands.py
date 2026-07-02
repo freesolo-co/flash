@@ -27,6 +27,7 @@ from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
 from . import render
+from ._tty import TtyStatusLine
 from .training_doc import TRAINING_MD
 
 logger = get_logger("flash.cli")
@@ -45,17 +46,11 @@ _SPINNER_FRAMES = "|/-\\"
 _SPINNER_TICK_SECONDS = 0.1
 
 
-class _LogFollowSpinner:
+class _LogFollowSpinner(TtyStatusLine):
     def __init__(self, run_id: str):
+        super().__init__()
         self._run_id = run_id
         self._frame = 0
-        self._last_len = 0
-        self._active = False
-        self._enabled = sys.stderr.isatty()
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
 
     def render(self, state: str) -> None:
         if not self._enabled:
@@ -63,18 +58,7 @@ class _LogFollowSpinner:
         frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
         self._frame += 1
         message = f"{frame} following logs for {self._run_id} ({state})"
-        padding = " " * max(0, self._last_len - len(message))
-        sys.stderr.write(f"\r{message}{padding}")
-        sys.stderr.flush()
-        self._last_len = len(message)
-        self._active = True
-
-    def clear(self) -> None:
-        if not (self._enabled and self._active):
-            return
-        sys.stderr.write(f"\r{' ' * self._last_len}\r")
-        sys.stderr.flush()
-        self._active = False
+        self._write(message)
 
 
 def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, state: str) -> None:
@@ -340,9 +324,8 @@ def cmd_env_list(args) -> int:
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Catalog-only and deterministic; SFT uses the actual local training-token count when the env
-    and tokenizer are importable. An uncapped SFT run must be able to count the env's train split,
-    otherwise it errors instead of guessing a dataset size."""
+    Catalog-only and deterministic. SFT cost never imports the environment; it requires a positive
+    [train].max_examples row count instead of guessing or locally counting a dataset."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(

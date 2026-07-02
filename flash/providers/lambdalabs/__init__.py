@@ -91,18 +91,9 @@ class LambdaProvider:
                 lambda_api.terminate_instances([lh.instance_id])
 
     def cancel(self, handle: JobHandle) -> None:
-        from flash.providers.lambdalabs import api as lambda_api
+        _terminate_handle_instance(handle)
 
-        d = handle.to_dict()
-        if d.get("instance_id"):
-            lambda_api.terminate_instances([str(d["instance_id"])])
-
-    def destroy(self, handle: JobHandle) -> None:
-        from flash.providers.lambdalabs import api as lambda_api
-
-        d = handle.to_dict()
-        if d.get("instance_id"):
-            lambda_api.terminate_instances([str(d["instance_id"])])
+    destroy = cancel
 
     def gc(self, spec) -> None:
         from flash.providers.lambdalabs.jobs import terminate_run_instances
@@ -121,3 +112,11 @@ class LambdaProvider:
 
 
 PROVIDER: Provider = LambdaProvider()
+
+
+def _terminate_handle_instance(handle: JobHandle) -> None:
+    from flash.providers.lambdalabs import api as lambda_api
+
+    d = handle.to_dict()
+    if d.get("instance_id"):
+        lambda_api.terminate_instances([str(d["instance_id"])])
