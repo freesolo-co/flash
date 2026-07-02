@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import render
+from ._tty import TtyStatusLine
 
 if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
@@ -301,21 +302,15 @@ def _human_bytes(n: int) -> str:
     return f"{size:.1f} GB"
 
 
-class _UploadProgress:
+class _UploadProgress(TtyStatusLine):
     """Carriage-return upload progress bar on stderr; no-op off a TTY."""
 
     _BAR_WIDTH = 24
 
     def __init__(self, name: str):
+        super().__init__()
         self._name = name
-        self._enabled = sys.stderr.isatty()
-        self._last_len = 0
-        self._active = False
         self._last_pct = -1
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
 
     @property
     def callback(self) -> ProgressCallback | None:
@@ -340,20 +335,6 @@ class _UploadProgress:
         self._write(
             f"uploading {self._name} [{bar}] {pct:3d}% {_human_bytes(sent)}/{_human_bytes(total)}"
         )
-
-    def _write(self, message: str) -> None:
-        padding = " " * max(0, self._last_len - len(message))
-        sys.stderr.write(f"\r{message}{padding}")
-        sys.stderr.flush()
-        self._last_len = len(message)
-        self._active = True
-
-    def clear(self) -> None:
-        if not (self._enabled and self._active):
-            return
-        sys.stderr.write(f"\r{' ' * self._last_len}\r")
-        sys.stderr.flush()
-        self._active = False
 
 
 def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | None = None) -> int:
