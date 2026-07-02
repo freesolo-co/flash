@@ -277,6 +277,7 @@ def test_init_from_adapter_accepts_checkpoint_step_ref() -> None:
         "Freesolo-Co/flashrun-run-x:sft/run-x",  # legacy long storage form: no longer accepted
         "Freesolo-Co/flashrun-run-x:rl/run-x/checkpoints/step-40",
         "run-x/step-",  # no step number
+        "run-x/step-1111111111111111111",  # too many digits to be a bounded step
         "run-x/step-4/adapter",  # trailing path
         "run-x/checkpoints/step-4",  # storage-layout spelling
         "run-x/../other",  # traversal

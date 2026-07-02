@@ -918,6 +918,77 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployments[0]["deployment"]["state"] == "deploying"
 
 
+def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.deployment = {"state": "deploying", "updated_at": 0.0, "requested_at": 0.0}
+    runner._save_status(status)
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "ready"
+
+
+def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    previous = {"state": "ready", "endpoint_name": "old", "adapter_hf_prefix": "rl/old/adapter"}
+    status = runner.get_status(run_id)
+    status.deployment = previous
+    runner._save_status(status)
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_k: (_ for _ in ()).throw(ServingError("new adapter failed smoke")),
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "ready"
+    assert deployment["endpoint_name"] == "old"
+    assert deployment["last_deploy_error"] == "new adapter failed smoke"
+    assert resp.json()["endpoint_name"] == "old"
+
+
+def test_recover_deployments_restores_previous_ready_record(api):
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    previous = {"state": "ready", "endpoint_name": "old", "adapter_hf_prefix": "rl/old/adapter"}
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "verifying",
+        "updated_at": 0.0,
+        "requested_at": 0.0,
+        "previous_deployment": previous,
+    }
+    runner._save_status(status)
+
+    assert serving.recover_deployments() == 1
+
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "ready"
+    assert deployment["endpoint_name"] == "old"
+    assert "interrupted" in deployment["last_deploy_error"]
+
+
 def test_deploy_rejects_unsupported_stored_gpu_as_400(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -1496,6 +1567,57 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
     # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
     assert runner.get_status("nohandle-1").state != "failed"
+
+
+def test_recover_runs_resolves_init_ref_for_no_handle_resubmit(monkeypatch, tmp_path):
+    import threading
+
+    import flash.runner as runner
+    import flash.runner.checkpoints as checkpoints
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+
+    source_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"steps": 1, "hf_repo": "org/source-runs"},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "source-run",
+    }
+    warm_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"steps": 1, "init_from_adapter": "source-run"},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "nohandle-warm",
+    }
+    runner._save_status(runner.RunStatus(run_id="source-run", state="done", spec=source_spec))
+    runner._save_status(
+        runner.RunStatus(run_id="nohandle-warm", state="provisioning", spec=warm_spec, remote=None)
+    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-warm"}])
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
+    resubmitted: list[str] = []
+    done = threading.Event()
+
+    def fake_run_job(s):
+        resubmitted.append(s.train.init_from_adapter)
+        done.set()
+
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
+
+    app_mod.recover_runs()
+
+    assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
+    assert resubmitted == ["org/source-runs:rl/source-run"]
 
 
 def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):

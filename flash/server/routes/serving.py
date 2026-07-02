@@ -34,11 +34,62 @@ from flash.spec import JobSpec
 router = APIRouter()
 
 _DEPLOYMENT_BUSY_STATES = {"deploying", "registering", "verifying"}
+_DEPLOYMENT_READY_STATES = {"ready", "deployed"}
+_DEPLOYMENT_STALE_SECONDS = 30 * 60
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
 
 
 def _deployment_state(deployment: dict, state: str, **fields) -> dict:
     return {**deployment, **fields, "state": state, "updated_at": time.time()}
+
+
+def _public_deployment(deployment: dict) -> dict:
+    out = dict(deployment)
+    out.pop("previous_deployment", None)
+    return out
+
+
+def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) -> bool:
+    if deployment.get("state") not in _DEPLOYMENT_BUSY_STATES:
+        return False
+    raw = deployment.get("updated_at") or deployment.get("requested_at")
+    try:
+        stamp = float(raw)
+    except (TypeError, ValueError):
+        return True
+    return (time.time() if now is None else now) - stamp >= _DEPLOYMENT_STALE_SECONDS
+
+
+def _previous_ready_deployment(deployment: dict) -> dict | None:
+    if deployment.get("state") in _DEPLOYMENT_READY_STATES:
+        return dict(deployment)
+    previous = deployment.get("previous_deployment")
+    if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
+        return dict(previous)
+    return None
+
+
+def recover_deployments() -> int:
+    """Clear deployment lifecycle records left busy by a control-plane restart."""
+    recovered = 0
+    for row in db.all_runs():
+        try:
+            status = _app.get_status(row["run_id"])
+        except FileNotFoundError:
+            continue
+        deployment = status.deployment or {}
+        if not _deployment_attempt_is_stale(deployment):
+            continue
+        failed = _deployment_state(
+            deployment,
+            "failed",
+            error="deployment lifecycle interrupted by control-plane restart",
+            detail="deployment interrupted; retry `flash deploy`",
+            recovered_at=time.time(),
+        )
+        mark_deployment_failed(status.run_id, failed)
+        recovered += 1
+    return recovered
 
 
 def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
@@ -94,7 +145,10 @@ def _finish_deployment_unlocked(
     mark_deployment_pending(run_id, current)
     try:
         dep = _app.deploy_adapter(**deploy_kwargs)
+        previous_deployment = deployment.get("previous_deployment")
         current = dep.to_dict()
+        if previous_deployment:
+            current["previous_deployment"] = previous_deployment
         if checkpoint_step is not None:
             current["checkpoint_step"] = checkpoint_step
         current["verify"] = verify
@@ -111,6 +165,7 @@ def _finish_deployment_unlocked(
             current = _deployment_state(current, "ready", **_run_deployment_smoke(run_id, spec))
         else:
             current = _deployment_state(current, "ready", detail="registered; smoke skipped")
+        current = _public_deployment(current)
 
         if is_checkpoint:
             marked = mark_checkpoint_deployed(run_id, current, expect_state=state_guard)
@@ -244,7 +299,11 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         dry_run = _require_bool(payload, "dry_run", False)
         verify = _require_bool(payload, "verify", True)
         current_deployment = status.deployment or {}
-        if not dry_run and current_deployment.get("state") in _DEPLOYMENT_BUSY_STATES:
+        if (
+            not dry_run
+            and current_deployment.get("state") in _DEPLOYMENT_BUSY_STATES
+            and not _deployment_attempt_is_stale(current_deployment)
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -320,6 +379,9 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         )
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
+        previous_deployment = _previous_ready_deployment(current_deployment)
+        if previous_deployment:
+            dep_dict["previous_deployment"] = previous_deployment
         marked = mark_deployment_pending(run_id, dep_dict, expect_state=prev_state)
         if marked.deployment != dep_dict:
             raise HTTPException(
@@ -339,8 +401,8 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         }
     ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
     if ran_sync:
-        return _app.get_status(run_id).deployment or dep_dict
-    return dep_dict
+        return _public_deployment(_app.get_status(run_id).deployment or dep_dict)
+    return _public_deployment(dep_dict)
 
 
 @router.delete("/v1/runs/{run_id}/deploy")
@@ -440,7 +502,9 @@ def deployments(key: Annotated[dict, Depends(require_key)]):
             "undeployed",
             "dry_run",
         ):
-            out.append(status.to_dict())
+            data = status.to_dict()
+            data["deployment"] = _public_deployment(data["deployment"])
+            out.append(data)
     return {"deployments": out}
 
 
