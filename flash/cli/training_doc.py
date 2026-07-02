@@ -39,7 +39,7 @@ flash gpus                           # managed GPU classes with estimated $/hr
 
 ```text
 environment.py          # the task: how to prompt the model and how to score it
-datasets/train.jsonl    # training rows, one JSON object per line: {"input": ..., "output": ...}
+dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "output": ...}
 configs/rl.toml         # a GRPO (RL) run config
 configs/sft.toml        # an SFT run config
 TRAINING.md             # this file
@@ -57,7 +57,7 @@ from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 class MyEnv(EnvironmentSingleTurn):
-    dataset = load_jsonl("datasets/train.jsonl")   # rows -> TaskExample(input=..., output=...)
+    dataset = load_jsonl("dataset/train.jsonl")   # rows -> TaskExample(input=..., output=...)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
         return [{"role": "user", "content": example.input}]
@@ -86,7 +86,7 @@ flash env list                       # local env sources you can push
 To train against an env someone else published, just set its slug as `[environment] id` —
 no separate step is needed. Paste the returned id into `[environment] id` in **both** configs.
 Re-push after any
-edit to `environment.py` or `datasets/` so the managed run uses your change.
+edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 ### 3. Configure the run (TOML)
 
@@ -466,7 +466,7 @@ on a beyond-noise improvement.
 ## Command reference
 
 ```bash
-flash env setup                       # scaffold environment.py, datasets/, configs/, this file
+flash env setup                       # scaffold environment.py, dataset/, configs/, this file
 flash env push --name my-env .        # publish the environment; paste the returned id into [environment]
 flash env pull your-org/my-env        # download a published environment into the current folder
 flash env delete your-org/my-env -y   # delete a published environment
