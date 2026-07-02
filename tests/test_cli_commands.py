@@ -376,8 +376,9 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert _run(["env", "setup"]) == 0
 
     assert (tmp_path / "environment.py").is_file()
-    dataset = tmp_path / "datasets/train.jsonl"
+    dataset = tmp_path / "dataset/train.jsonl"
     assert dataset.is_file()
+    assert not (tmp_path / "datasets").exists()
     assert '"input":"What is 2 + 2?"' in dataset.read_text()
     grpo = tmp_path / "configs/rl.toml"
     sft = tmp_path / "configs/sft.toml"
@@ -409,7 +410,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "runpod" not in training_text.lower()
     assert "lambda" not in training_text.lower()
     out = capsys.readouterr().out
-    assert "datasets/train.jsonl" in out
+    assert "dataset/train.jsonl" in out
     assert "configs/rl.toml" in out
     assert "TRAINING.md" in out
 

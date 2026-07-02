@@ -799,10 +799,19 @@ def _import_freesolo_environment_tools():
             "that includes the Freesolo SDK"
         ) from exc
 
+
 def _packaged_dataset_file(base_dir: Path, name: str) -> Path | None:
-    """First existing packaged dataset file for split `name`, in the canonical shapes:
-    datasets/<name>.jsonl, datasets/<name>.json, <name>.jsonl, <name>.json."""
-    for rel in (f"datasets/{name}.jsonl", f"datasets/{name}.json", f"{name}.jsonl", f"{name}.json"):
+    """First existing packaged dataset file for split `name`.
+
+    ``dataset/`` is canonical for new environments because a top-level ``datasets/``
+    directory shadows the Hugging Face ``datasets`` package in local scripts.
+    """
+    for rel in (
+        f"dataset/{name}.jsonl",
+        f"dataset/{name}.json",
+        f"{name}.jsonl",
+        f"{name}.json",
+    ):
         candidate = base_dir / rel
         if candidate.is_file():
             return candidate
@@ -836,7 +845,7 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         source = resolved_dataset_path
     # [environment.params] split selects which packaged dataset file Flash trains on. It used to
     # be forwarded to the SDK only, so SFT (and GRPO problem selection driven off dataset())
-    # SILENTLY trained on the default datasets/train.jsonl even when a side split was requested.
+    # SILENTLY trained on the default dataset/train.jsonl even when a side split was requested.
     split = params.get("split")
     split = split.strip() if isinstance(split, str) else None
     if split:
@@ -850,7 +859,7 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
             # all keep the SDK path, which may implement split itself.
             raise ValueError(
                 f"[environment.params] split={split!r} was requested but no "
-                f"datasets/{split}.jsonl (or {split}.json) exists in the environment; "
+                f"dataset/{split}.jsonl or {split}.json exists in the environment; "
                 "refusing to fall back to the default train split. Package the split file "
                 "or drop the split param."
             )

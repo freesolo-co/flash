@@ -642,7 +642,7 @@ def env_setup(paths: list[str]) -> str:
     """Confirmation + file tree for `flash env setup`."""
     labels = {
         "environment.py": "env entrypoint — edit the reward + prompt",
-        "datasets/train.jsonl": "starter training rows",
+        "dataset/train.jsonl": "starter training rows",
         "configs/rl.toml": "GRPO run config",
         "configs/sft.toml": "SFT run config",
         "TRAINING.md": "how to train well — read this first",
