@@ -148,13 +148,13 @@ def cmd_whoami(args) -> int:
 _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
-Edit datasets/train.jsonl and the reward code, then upload with
+Edit dataset/train.jsonl and the reward code, then upload with
 `flash env push --name my-env .`.
 
 A managed run should use the returned [environment] id from
 `flash env push --name my-env .`.
 
-This starter keeps a tiny smoke-test dataset in datasets/train.jsonl. Replace it
+This starter keeps a tiny smoke-test dataset in dataset/train.jsonl. Replace it
 with your real training rows before a real run.
 """
 
@@ -167,7 +167,7 @@ from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 
-DEFAULT_DATASET_PATH = Path(__file__).parent / "datasets" / "train.jsonl"
+DEFAULT_DATASET_PATH = Path(__file__).parent / "dataset" / "train.jsonl"
 
 
 def load_jsonl(path: str | Path):
@@ -211,8 +211,8 @@ _STARTER_DATASET_JSONL = """\
 
 def cmd_env_setup(args) -> int:
     Path("configs").mkdir(exist_ok=True)
-    Path("datasets").mkdir(exist_ok=True)
-    dataset = Path("datasets/train.jsonl")
+    Path("dataset").mkdir(exist_ok=True)
+    dataset = Path("dataset/train.jsonl")
     if not dataset.exists():
         dataset.write_text(_STARTER_DATASET_JSONL)
     starter_env = Path("environment.py")
@@ -257,7 +257,7 @@ def cmd_env_setup(args) -> int:
         training.write_text(TRAINING_MD, encoding="utf-8")
     scaffolded = [
         "environment.py",
-        "datasets/train.jsonl",
+        "dataset/train.jsonl",
         "configs/rl.toml",
         "configs/sft.toml",
         "TRAINING.md",
