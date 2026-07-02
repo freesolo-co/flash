@@ -69,6 +69,12 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
     return None
 
 
+def _deployment_gpu_name(status, spec: JobSpec) -> str:
+    remote = status.remote if isinstance(getattr(status, "remote", None), dict) else {}
+    allocated = remote.get("allocated_gpu") or remote.get("gpu")
+    return str(allocated or spec.gpu.type)
+
+
 def recover_deployments() -> int:
     """Clear deployment lifecycle records left busy by a control-plane restart."""
     recovered = 0
@@ -377,12 +383,13 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
+        deploy_gpu = _deployment_gpu_name(status, spec)
         deploy_kwargs = {
             "run_id": run_id,
             "model": spec.model,
             "hf_repo": spec.train.hf_repo,
             "adapter_prefix": deploy_prefix,
-            "gpu_name": spec.gpu.type,
+            "gpu_name": deploy_gpu,
             "dry_run": dry_run,
             "lora_rank": spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
@@ -414,7 +421,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 run_id=run_id,
                 model=spec.model,
                 adapter_prefix=deploy_prefix,
-                gpu_name=spec.gpu.type,
+                gpu_name=deploy_gpu,
                 state="deploying",
             ).to_dict()
         except ValueError as exc:
