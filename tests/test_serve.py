@@ -69,15 +69,15 @@ def test_deploy_9b_dry_run_is_not_rejected():
 def test_deploy_rejects_lora_rank_above_serving_cap():
     from flash.serve.deploy import deploy_adapter
 
-    with pytest.raises(ValueError, match="max_lora_rank=64"):
+    with pytest.raises(ValueError, match="max_lora_rank=32"):
         deploy_adapter(
-            run_id="r65",
+            run_id="r33",
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
-            adapter_prefix="sft/r65/seed0",
+            adapter_prefix="sft/r33/seed0",
             gpu_name="RTX 5090",
             dry_run=True,
-            lora_rank=65,
+            lora_rank=33,
         )
 
 
@@ -85,9 +85,9 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
     """Deploy validates the effective artifact rank, not only spec.train.lora_rank."""
     from flash.serve.deploy import deploy_adapter
 
-    seen = _stub_adapter_config(monkeypatch, tmp_path, rank=65)
+    seen = _stub_adapter_config(monkeypatch, tmp_path, rank=33)
 
-    with pytest.raises(ValueError, match="adapter artifact has rank 65"):
+    with pytest.raises(ValueError, match="adapter artifact has rank 33"):
         deploy_adapter(
             run_id="r-recombined",
             model="Qwen/Qwen3.5-4B",
@@ -95,7 +95,7 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
             adapter_prefix="grpo/r-recombined/seed0",
             gpu_name="RTX 5090",
             dry_run=False,
-            lora_rank=64,
+            lora_rank=32,
         )
     assert seen["repo_id"] == "org/repo"
     assert seen["filename"] == "grpo/r-recombined/seed0/adapter/adapter_config.json"
