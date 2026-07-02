@@ -387,10 +387,7 @@ def _resolve_init_from_adapter(
     ref = spec.train.init_from_adapter
     if not ref:
         return spec
-    from flash.schema import checkpoint_storage_ref, parse_adapter_storage_ref, parse_checkpoint_ref
-
-    if parse_adapter_storage_ref(ref) is not None:
-        return spec
+    from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
     parsed = parse_checkpoint_ref(ref)
     if parsed is None:
