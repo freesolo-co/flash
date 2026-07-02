@@ -594,10 +594,17 @@ def cmd_deploy(args) -> int:
             print(render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr)
     if dep.get("state") != "dry_run":
         state = dep.get("state", "deploying")
-        status_note = (
-            f"deployment state is {state!r}; run `flash deployments` to check progress "
-            "and use `flash chat` once it is ready."
-        )
+        if state == "failed":
+            detail = str(dep.get("error") or dep.get("detail") or "unknown error")
+            status_note = (
+                f"deployment failed: {detail}; run `flash deployments` for details and "
+                f"retry `flash deploy {args.run_id}` after fixing the error."
+            )
+        else:
+            status_note = (
+                f"deployment state is {state!r}; run `flash deployments` to check progress "
+                "and use `flash chat` once it is ready."
+            )
         print(
             render.arrow(status_note) if render.styled() else f"note: {status_note}",
             file=sys.stderr,

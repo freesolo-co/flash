@@ -537,4 +537,6 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
     )
 
     assert _run(["deploy", "flash-1"]) == 1
-    assert "deployment state is 'failed'" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "deployment failed: smoke generation failed" in err
+    assert "once it is ready" not in err

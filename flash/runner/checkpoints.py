@@ -123,4 +123,11 @@ def checkpoint_step_exists(spec: JobSpec, step: int) -> bool:
 
 def final_adapter_exists(spec: JobSpec) -> bool:
     """Authoritatively verify that the run-level final adapter exists in the artifact repo."""
-    return _adapter_folder_has_required_files(_repo_files(spec, strict=True), adapter_prefix(spec))
+    try:
+        files = _repo_files(spec, strict=True)
+    except CheckpointListingError as exc:
+        cause = exc.__cause__ or exc
+        raise CheckpointListingError(
+            f"could not verify final adapter for {spec.run_id}: {cause}"
+        ) from cause
+    return _adapter_folder_has_required_files(files, adapter_prefix(spec))

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.runner.checkpoints import (
+    CheckpointListingError,
     checkpoint_adapter_prefix,
     final_adapter_exists,
     list_checkpoints,
@@ -592,6 +593,26 @@ def test_final_adapter_exists_rejects_incomplete_or_nested_files(monkeypatch):
     )
 
     assert final_adapter_exists(_spec()) is False
+
+
+def test_final_adapter_exists_raises_final_adapter_listing_error(monkeypatch):
+    import huggingface_hub
+
+    class _Boom:
+        def __call__(self, *a, **k):
+            return self
+
+        def list_repo_files(self, *a, **k):
+            raise RuntimeError("hf down")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _Boom())
+
+    with pytest.raises(CheckpointListingError) as exc_info:
+        final_adapter_exists(_spec())
+
+    message = str(exc_info.value)
+    assert "could not verify final adapter for flash-ckpt-1: hf down" in message
+    assert "deployable checkpoints" not in message
 
 
 # --------------------------------------------------------------------------------------------
