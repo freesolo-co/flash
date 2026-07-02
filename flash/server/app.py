@@ -319,6 +319,7 @@ def create_app():
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
+        serving.recover_deployments()
         # Recover completion-time customer charges left pending/failed by a transient blip or a
         # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
         # `done`, so those would otherwise leak revenue; this startup sweep catches them promptly.
