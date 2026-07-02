@@ -59,6 +59,11 @@ def _write_safetensors(path: str, names: list[str]) -> None:
         f.write(data)
 
 
+def _write_torch_bin(path: str, names: list[str]) -> None:
+    torch = pytest.importorskip("torch")
+    torch.save({name: torch.zeros(1) for name in names}, path)
+
+
 # ---------------------------------------------------------------------------
 # Pure key remap (strip_language_model_infix — used by the recombine path)
 # ---------------------------------------------------------------------------
@@ -71,7 +76,9 @@ def test_strip_infix_leaves_non_language_model_keys_untouched():
     text_key = "base_model.model.model.layers.5.self_attn.k_proj.lora_A.default.weight"
     assert strip_language_model_infix(text_key) == text_key
     # And only the LM-vs-VL boundary infix is removed (a hypothetical second token is left alone).
-    assert strip_language_model_infix("a.language_model.b.language_model.c") == "a.b.language_model.c"
+    assert (
+        strip_language_model_infix("a.language_model.b.language_model.c") == "a.b.language_model.c"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +125,31 @@ def test_read_adapter_keys_corrupt_json_reraises_with_path(tmp_path):
     st = adir / "adapter_model.safetensors"
     body = b"this is not json{{{"
     st.write_bytes(struct.pack("<Q", len(body)) + body)
-    with pytest.raises(ValueError, match=r"adapter_model\.safetensors: safetensors header is not valid JSON"):
+    with pytest.raises(
+        ValueError, match=r"adapter_model\.safetensors: safetensors header is not valid JSON"
+    ):
+        lora._read_adapter_tensor_keys(str(adir))
+
+
+def test_read_adapter_keys_reads_legacy_bin_state_dict(tmp_path):
+    import flash.engine.worker.lora as lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    _write_torch_bin(str(adir / "adapter_model.bin"), VL_KEYS)
+
+    assert lora._read_adapter_tensor_keys(str(adir)) == VL_KEYS
+
+
+def test_read_adapter_keys_rejects_malformed_bin_state_dict(tmp_path):
+    torch = pytest.importorskip("torch")
+    import flash.engine.worker.lora as lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    torch.save({"metadata": "not a tensor"}, adir / "adapter_model.bin")
+
+    with pytest.raises(ValueError, match="non-tensor entries"):
         lora._read_adapter_tensor_keys(str(adir))
 
 
@@ -273,6 +304,18 @@ def test_adapter_is_vl_warmstart_trusts_adapter_evidence_over_failed_probe(monke
     assert lora.adapter_is_vl_warmstart(str(adir), "some/model") is True
 
 
+def test_adapter_is_vl_warmstart_trusts_bin_adapter_evidence_over_failed_probe(
+    monkeypatch, tmp_path
+):
+    from flash.engine.worker import lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    _write_torch_bin(str(adir / "adapter_model.bin"), VL_KEYS)
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
+    assert lora.adapter_is_vl_warmstart(str(adir), "some/model") is True
+
+
 def test_adapter_is_vl_warmstart_falls_back_to_probe_for_text_only(monkeypatch, tmp_path):
     from flash.engine.worker import lora
 
@@ -282,7 +325,9 @@ def test_adapter_is_vl_warmstart_falls_back_to_probe_for_text_only(monkeypatch, 
     monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
     assert lora.adapter_is_vl_warmstart(str(adir), "some/model") is False
     monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
-    assert lora.adapter_is_vl_warmstart(str(adir), "some/model") is True  # probe still authoritative
+    assert (
+        lora.adapter_is_vl_warmstart(str(adir), "some/model") is True
+    )  # probe still authoritative
 
 
 def test_adapter_is_vl_warmstart_missing_file_defers_to_probe(monkeypatch, tmp_path):

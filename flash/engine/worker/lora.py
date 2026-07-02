@@ -278,11 +278,22 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
         # OTHER per-token tensor shaped (B, T[, *]), it would stay full-length while the rest are
         # gathered to T' -> a shape mismatch or misaligned credit. Bail to the unmodified loss instead.
         # (Per-sequence ``advantages`` is (B,) and 2-D ``vllm_is_ratio`` is handled explicitly below.)
-        _known = {"attention_mask", "_input", "selected_token_ids", "old_per_token_logps",
-                  "ref_per_token_logps", "vllm_is_ratio"}
+        _known = {
+            "attention_mask",
+            "_input",
+            "selected_token_ids",
+            "old_per_token_logps",
+            "ref_per_token_logps",
+            "vllm_is_ratio",
+        }
         for _k, _v in kwargs.items():
-            if (_k not in _known and isinstance(_v, torch.Tensor) and _v.dim() >= 2
-                    and _v.size(0) == mask.size(0) and _v.size(1) == full_t):
+            if (
+                _k not in _known
+                and isinstance(_v, torch.Tensor)
+                and _v.dim() >= 2
+                and _v.size(0) == mask.size(0)
+                and _v.size(1) == full_t
+            ):
                 return orig(**kwargs)  # unknown per-token tensor -> don't risk a misaligned gather
         # One shared gather index: the unmasked positions first (stable argsort -> their original
         # order preserved), then the remaining masked positions in original order. Keep only the
@@ -402,9 +413,11 @@ _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
 
 def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
-    """Tensor key names in the downloaded adapter, read ONLY from the ``.safetensors`` JSON header
-    (pure stdlib, no tensor data — keeps this module CPU-importable). Returns ``None`` when no
-    ``adapter_model.safetensors`` exists in ``adir``.
+    """Tensor key names in the downloaded adapter.
+
+    For safetensors, read ONLY the JSON header (pure stdlib, no tensor data). For legacy PEFT
+    ``adapter_model.bin``, use Torch's weights-only loader and inspect the state-dict keys. Returns
+    ``None`` when no adapter weights exist in ``adir``.
     """
     import json
     import os
@@ -449,6 +462,24 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
                 "(corrupt or not a safetensors file)"
             )
         return [k for k in header if k != "__metadata__"]
+    bin_path = os.path.join(adir, "adapter_model.bin")
+    if os.path.isfile(bin_path):
+        import torch
+
+        state = torch.load(bin_path, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict):
+            raise ValueError(
+                f"{bin_path}: expected a tensor state dict, got {type(state).__name__}"
+            )
+        bad = [
+            k for k, v in state.items() if not isinstance(k, str) or not isinstance(v, torch.Tensor)
+        ]
+        if bad:
+            raise ValueError(
+                f"{bin_path}: contains non-tensor entries (e.g. {bad[:4]}); "
+                "expected a plain PEFT adapter state dict"
+            )
+        return list(state)
     return None
 
 
@@ -494,9 +525,7 @@ def adapter_lora_rank(adapter_dir: str) -> int:
             f"adapter rank preflight: {cfg_path!r} must contain a positive integer `r`"
         ) from exc
     if rank <= 0:
-        raise ValueError(
-            f"adapter rank preflight: {cfg_path!r} has non-positive rank r={rank}"
-        )
+        raise ValueError(f"adapter rank preflight: {cfg_path!r} has non-positive rank r={rank}")
     for key in ("rank_pattern", "alpha_pattern"):
         if cfg.get(key):
             raise ValueError(
@@ -516,7 +545,9 @@ def validate_recombined_lora_rank(
     try:
         grpo_rank = int(grpo_rank)
     except (TypeError, ValueError) as exc:
-        raise ValueError("VL warm-start rank preflight: GRPO train.lora_rank must be an integer") from exc
+        raise ValueError(
+            "VL warm-start rank preflight: GRPO train.lora_rank must be an integer"
+        ) from exc
     if grpo_rank <= 0:
         raise ValueError(
             f"VL warm-start rank preflight: GRPO train.lora_rank must be positive, got {grpo_rank}"
@@ -709,7 +740,9 @@ def recombine_lora_adapters(
     # lora_B with no paired lora_A would be silently DROPPED from the output (an incomplete adapter),
     # not caught by the equal-key-set check above. Fail loudly, like the A-without-B case.
     orphan_b = sorted(
-        bk for bk in sft_ab if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in sft_ab
+        bk
+        for bk in sft_ab
+        if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in sft_ab
     )
     if orphan_b:
         raise ValueError(
