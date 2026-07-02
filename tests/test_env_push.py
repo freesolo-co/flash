@@ -91,8 +91,8 @@ def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path
         "import helper\n\ndef load_environment(**k):\n    return helper.build()\n"
     )
     (env_dir / "helper.py").write_text("def build():\n    return None\n")
-    (env_dir / "datasets").mkdir()
-    (env_dir / "datasets" / "train.jsonl").write_text('{"input":"2+2","output":"4"}\n')
+    (env_dir / "dataset").mkdir()
+    (env_dir / "dataset" / "train.jsonl").write_text('{"input":"2+2","output":"4"}\n')
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
@@ -100,11 +100,23 @@ def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path
     files = _members(cap["package_b64"])
     assert "environment.py" in files
     assert "helper.py" in files
-    assert "datasets/train.jsonl" in files
+    assert "dataset/train.jsonl" in files
     assert cap["name"] == "math"
 
 
-def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
+def test_push_single_py_ships_sibling_dataset(monkeypatch, tmp_path):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "dataset").mkdir()
+    (tmp_path / "dataset" / "train.jsonl").write_text('{"x": 1}\n')
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    assert "dataset/train.jsonl" in _members(cap["package_b64"])
+
+
+def test_push_single_py_still_ships_legacy_sibling_datasets(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "datasets").mkdir()

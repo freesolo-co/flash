@@ -47,7 +47,7 @@ def cmd_env_pull(args) -> int:
     """Download a published Freesolo environment (or a single file from it) to local disk.
 
     Pulls via GitHub's tarball / raw media type rather than the JSON "contents" API, so files
-    larger than 1 MB (e.g. ``datasets/train.jsonl``) come back intact instead of empty.
+    larger than 1 MB (e.g. ``dataset/train.jsonl``) come back intact instead of empty.
     """
     from flash.envs.adapter import is_freesolo_environment_id
     from flash.envs.pull import (
@@ -168,7 +168,7 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         "source",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"datasets"})
+_ENV_PUSH_SIDECAR_DIRS = frozenset({"dataset", "datasets"})
 # ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
 # user-authored README/NOTES) travels with the env into the hub and back out through
 # ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
