@@ -14,8 +14,6 @@ import contextlib
 import os
 import sys
 
-# back-compat re-export from flash.engine.vram
-from flash.engine.vram import _LIGER_LONG_CTX_TOKENS, _LIGER_MIN_PARAMS_B
 from flash.engine.worker.perf.attn import (
     _attn_impl_for_capability,
     _flash_attn_3_available,
@@ -323,9 +321,7 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
 __all__ = [
     "RETRIABLE_INFRA_MARKER",
-    "_LIGER_LONG_CTX_TOKENS",
     "_LIGER_MIN_PARAMS",
-    "_LIGER_MIN_PARAMS_B",
     "_LONG_CONTEXT_TOKENS",
     "RetriableInfraError",
     "_GpuPeakSampler",
