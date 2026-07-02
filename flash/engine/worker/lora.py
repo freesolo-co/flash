@@ -575,16 +575,36 @@ def recombine_lora_adapters(
     import torch
     from safetensors.torch import load_file, save_file
 
+    from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
+
     def _load(d: str):
         cfg_path = os.path.join(d, "adapter_config.json")
         st_path = os.path.join(d, "adapter_model.safetensors")
+        bin_path = os.path.join(d, "adapter_model.bin")
         if os.path.isfile(st_path):
             sd = load_file(st_path)
+        elif os.path.isfile(bin_path):
+            sd = torch.load(bin_path, map_location="cpu", weights_only=True)
+            if not isinstance(sd, dict):
+                raise ValueError(
+                    f"recombine: {bin_path!r} did not contain a tensor state dict "
+                    f"(got {type(sd).__name__})"
+                )
+            bad = [
+                k
+                for k, v in sd.items()
+                if not isinstance(k, str) or not isinstance(v, torch.Tensor)
+            ]
+            if bad:
+                raise ValueError(
+                    f"recombine: {bin_path!r} contains non-tensor entries (e.g. {bad[:4]}); "
+                    "only plain adapter state dicts can be recombined"
+                )
         else:
             raise ValueError(
-                f"recombine: {d!r} has no adapter_model.safetensors "
+                f"recombine: {d!r} has no adapter weights ({', '.join(ADAPTER_WEIGHT_FILES)}) "
                 f"(dir contents: {sorted(os.listdir(d)) if os.path.isdir(d) else 'MISSING'}); "
-                "only safetensors LoRA adapters can be recombined"
+                "only PEFT LoRA adapter weights can be recombined"
             )
         if not os.path.isfile(cfg_path):
             raise ValueError(
