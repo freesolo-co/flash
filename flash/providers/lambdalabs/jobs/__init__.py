@@ -463,10 +463,11 @@ def poll_lambda_job(
             # must not reset the stall clock to now. ``fresh`` is False for prior-attempt leftover hbs.
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
             if fresh:
-                last_progress = max(last_progress, hb_ts)  # monotonic: never let progress regress
                 seen_fresh_hb = True
-                if is_training_heartbeat(stage, new_key[1]):
-                    seen_training_hb = True
+                if stage is not None:
+                    last_progress = max(last_progress, hb_ts)  # monotonic: never let progress regress
+                    if is_training_heartbeat(stage, new_key[1]):
+                        seen_training_hb = True
         if became_active:
             if (
                 not seen_fresh_hb

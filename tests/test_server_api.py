@@ -955,6 +955,36 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployments[0]["deployment"]["state"] == "deploying"
 
 
+def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    legacy_spec = {**SPEC, "gpu": {"type": "RTX A6000"}}
+    run_id = api.post(
+        "/v1/runs", json={"spec": legacy_spec, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.remote = {"provider": "runpod", "allocated_gpu": "RTX 5090"}
+    runner._save_status(status)
+
+    seen: dict = {}
+
+    def fake_start(target, **kwargs):
+        seen.update({"target": target, **kwargs})
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "deploying"
+    assert "gpu" not in resp.json()
+    assert "gpu_name" not in seen["deploy_kwargs"]
+
+
 def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -1060,7 +1090,7 @@ def test_recover_deployments_restores_previous_ready_record(api):
     assert "interrupted" in deployment["last_deploy_error"]
 
 
-def test_deploy_rejects_unsupported_stored_gpu_as_400(api, monkeypatch):
+def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
 
@@ -1072,15 +1102,19 @@ def test_deploy_rejects_unsupported_stored_gpu_as_400(api, monkeypatch):
     status.state = "done"
     status.spec["gpu"]["type"] = "Quantum TPU"
     runner._save_status(status)
-    monkeypatch.setattr(
-        app_mod,
-        "start_deployment_job",
-        lambda **_k: pytest.fail("invalid deployment must not enqueue"),
-    )
+    seen: dict = {}
+
+    def fake_start(target, **kwargs):
+        seen.update({"target": target, **kwargs})
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
 
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-    assert resp.status_code == 400, resp.text
-    assert "unsupported gpu" in resp.json()["detail"]
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "deploying"
+    assert "gpu" not in resp.json()
+    assert "gpu_name" not in seen["deploy_kwargs"]
 
 
 def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkeypatch):
@@ -1168,7 +1202,6 @@ def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
             run_id=run_id,
             model=kwargs["model"],
             adapter_hf_prefix="x/adapter",
-            gpu="RTX 5090",
             openai_model=run_id,
             endpoint_name="https://serve.example",
             state="ready",
@@ -1207,7 +1240,6 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
             run_id=run_id,
             model=kwargs["model"],
             adapter_hf_prefix="x/adapter",
-            gpu="RTX 5090",
             openai_model=run_id,
             endpoint_name="https://serve.example",
             state="ready",
