@@ -30,7 +30,7 @@ WORKER_DEPS = [
     "flashinfer-python==0.6.6",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
-    # >=0.2.52: includes robust JSONL loading and corrected package metadata.
+    # >=0.2.54: includes robust JSONL loading and corrected package metadata.
     FREESOLO_WORKER_SPEC,
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
