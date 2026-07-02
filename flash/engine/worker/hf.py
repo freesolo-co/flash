@@ -270,8 +270,9 @@ _CHECKPOINT_TRAINER_STATE = (
 )
 
 # The PEFT adapter weights file a checkpoint must carry to be loadable/servable. A step with
-# adapter_config.json but no weights is NOT deployable, so it's never published/listed.
-_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
+# adapter_config.json but no weights is NOT deployable, so it's never published/listed. Modern saves
+# use safetensors, but older PEFT/default settings may emit adapter_model.bin.
+_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
 
 
 def _has_deployable_adapter(ckpt_dir: str) -> bool:
@@ -392,7 +393,9 @@ class _UploadPump:
             busy = self.uploading
             self.queued = (step, ckpt_dir)
         if busy:
-            print(f"[ckpt] upload busy; queued step {step} (uploads when the in-flight one finishes)")
+            print(
+                f"[ckpt] upload busy; queued step {step} (uploads when the in-flight one finishes)"
+            )
         self.pump()
 
     def pump(self) -> None:
