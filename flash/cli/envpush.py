@@ -47,14 +47,18 @@ def _err(msg: str) -> int:
 def cmd_env_pull(args) -> int:
     """Download a published Freesolo environment (or a single file from it) to local disk.
 
-    Pulls via GitHub's tarball / raw media type rather than the JSON "contents" API, so files
-    larger than 1 MB (e.g. ``dataset/train.jsonl``) come back intact instead of empty.
+    Managed hub slugs pull package tarballs through the authenticated Freesolo backend. Explicit
+    GitHub refs still pull via GitHub's tarball / raw media type, so files larger than 1 MB
+    (e.g. ``datasets/train.jsonl``) come back intact instead of empty.
     """
-    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.client import ClientError, client_from_config
+    from flash.envs.adapter import is_freesolo_environment_id, is_managed_environment_slug
     from flash.envs.pull import (
         download_environment_file,
+        download_environment_file_from_archive,
         environment_local_dirname,
         pull_environment_package,
+        pull_environment_package_from_archive,
     )
 
     env_id = args.env_id
@@ -66,6 +70,7 @@ def cmd_env_pull(args) -> int:
         )
         return 1
     try:
+        managed = is_managed_environment_slug(env_id)
         if args.path:
             default_name = Path(args.path.replace("\\", "/")).name
             out = Path(args.output) if args.output else Path(default_name)
@@ -79,7 +84,11 @@ def cmd_env_pull(args) -> int:
             if (out.exists() or out.is_symlink()) and not args.force:
                 print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
                 return 1
-            data = download_environment_file(env_id, args.path)
+            if managed:
+                package = client_from_config().download_env_package(env_id)
+                data = download_environment_file_from_archive(package, args.path)
+            else:
+                data = download_environment_file(env_id, args.path)
             out.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(out, data)
             if render.styled():
@@ -88,7 +97,11 @@ def cmd_env_pull(args) -> int:
                 print(f"pulled {args.path} from {env_id} -> {out} ({len(data):,} bytes)")
         else:
             out = Path(args.output) if args.output else Path(environment_local_dirname(env_id))
-            pull_environment_package(env_id, out, overwrite=args.force)
+            if managed:
+                package = client_from_config().download_env_package(env_id)
+                pull_environment_package_from_archive(package, out, overwrite=args.force)
+            else:
+                pull_environment_package(env_id, out, overwrite=args.force)
             if render.styled():
                 print(render.env_pulled(f"{out}/", env_id))
             else:
@@ -100,6 +113,9 @@ def cmd_env_pull(args) -> int:
             "(pass --force)",
             file=sys.stderr,
         )
+        return 1
+    except ClientError as exc:
+        print(f"env pull failed: {exc}", file=sys.stderr)
         return 1
     except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
         print(f"env pull failed: {exc}", file=sys.stderr)

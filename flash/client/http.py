@@ -186,6 +186,34 @@ class ApiClient:
             raw = resp.read()
             return json.loads(raw) if raw else {}
 
+    def _request_freesolo_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: float | None = None,
+    ) -> bytes:
+        base = freesolo_base_url()
+        headers = {"Accept": "application/gzip"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{base}{path}",
+            method=method,
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise ClientError(
+                f"cannot reach the freesolo backend at {base} ({exc.reason}); "
+                "check your network connection and FREESOLO_BASE_URL"
+            ) from exc
+
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
 
@@ -219,6 +247,15 @@ class ApiClient:
         server's so the CLI doesn't time out while a destructive delete is still in progress."""
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request("DELETE", f"/v1/envs/{quoted}", timeout=1800.0)
+
+    def download_env_package(self, env_id: str) -> bytes:
+        """Download a managed environment package through the Freesolo backend."""
+        quoted = urllib.parse.quote(env_id, safe="/")
+        return self._request_freesolo_bytes(
+            "GET",
+            f"/api/flash/environments/{quoted}/package",
+            timeout=1800.0,
+        )
 
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
@@ -317,9 +354,7 @@ class ApiClient:
         body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
         if step is not None:
             body["step"] = step
-        return self._request(
-            "POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60
-        )
+        return self._request("POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60)
 
     def undeploy(self, run_id: str) -> dict:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
@@ -391,7 +426,7 @@ class ApiClient:
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" in content_type:
                 payload = json.loads(resp.read() or b"{}")
-                content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+                content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
                 if content:
                     yield str(content)
                 return

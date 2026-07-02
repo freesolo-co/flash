@@ -18,8 +18,10 @@ from flash.envs import loader as adapter
 from flash.envs import pull as env_pull
 from flash.envs.pull import (
     download_environment_file,
+    download_environment_file_from_archive,
     environment_local_dirname,
     pull_environment_package,
+    pull_environment_package_from_archive,
 )
 
 _TOP = "freesolo-co-environment-hub-deadbeef"
@@ -64,8 +66,29 @@ def _custom_entrypoint_tarball() -> bytes:
     )
 
 
+def _package_tarball(entries: dict[str, bytes] | None = None) -> bytes:
+    if entries is None:
+        entries = {
+            "environment.py": b"# env\n",
+            "datasets/train.jsonl": b'{"a":1}\n',
+            "README.md": b"# Read me\n",
+        }
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 def _args(**kw) -> Namespace:
-    base = {"env_id": "david-freesolo-co/stuff", "path": None, "output": None, "force": False}
+    base = {
+        "env_id": "github:freesolo-co/environment-hub@main:david-freesolo-co/stuff/environment.py",
+        "path": None,
+        "output": None,
+        "force": False,
+    }
     base.update(kw)
     return Namespace(**base)
 
@@ -348,6 +371,30 @@ def test_pull_environment_package_custom_entrypoint_ref(monkeypatch, tmp_path):
     assert (dest / "datasets" / "train.jsonl").is_file()
 
 
+def test_pull_environment_package_from_archive_copies_flat_package(tmp_path):
+    dest = tmp_path / "out"
+
+    out = pull_environment_package_from_archive(_package_tarball(), dest)
+
+    assert out == dest
+    assert (dest / "environment.py").read_text() == "# env\n"
+    assert (dest / "datasets" / "train.jsonl").read_bytes() == b'{"a":1}\n'
+
+
+def test_download_environment_file_from_archive_reads_one_file():
+    data = download_environment_file_from_archive(_package_tarball(), "datasets/train.jsonl")
+
+    assert data == b'{"a":1}\n'
+
+
+def test_package_archive_rejects_unsafe_path(tmp_path):
+    with pytest.raises(RuntimeError, match="unsafe path"):
+        pull_environment_package_from_archive(
+            _package_tarball({"../secret.txt": b"nope\n", "environment.py": b"# env\n"}),
+            tmp_path / "out",
+        )
+
+
 def test_pull_into_empty_cwd_populates_in_place(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_download_github_tarball", lambda ref: _hub_tarball())
     work = tmp_path / "work"
@@ -498,6 +545,63 @@ def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):
 
     assert rc == 0
     assert (dest / "datasets" / "train.jsonl").is_file()
+
+
+def test_cmd_env_pull_managed_whole_env_uses_authenticated_package(monkeypatch, tmp_path):
+    seen: dict[str, str] = {}
+
+    class _Client:
+        def download_env_package(self, env_id: str) -> bytes:
+            seen["env_id"] = env_id
+            return _package_tarball()
+
+    def fail_github(ref):
+        raise AssertionError("managed env pull should use the Freesolo backend")
+
+    monkeypatch.setattr("flash.client.client_from_config", lambda: _Client())
+    monkeypatch.setattr(adapter, "_download_github_tarball", fail_github)
+    dest = tmp_path / "stuff"
+
+    rc = cmd_env_pull(_args(env_id="david-freesolo-co/stuff", output=str(dest)))
+
+    assert rc == 0
+    assert seen == {"env_id": "david-freesolo-co/stuff"}
+    assert (dest / "environment.py").is_file()
+    assert (dest / "datasets" / "train.jsonl").is_file()
+
+
+def test_cmd_env_pull_managed_single_file_uses_authenticated_package(monkeypatch, tmp_path):
+    seen: dict[str, str] = {}
+
+    class _Client:
+        def download_env_package(self, env_id: str) -> bytes:
+            seen["env_id"] = env_id
+            return _package_tarball()
+
+    monkeypatch.setattr("flash.client.client_from_config", lambda: _Client())
+    out = tmp_path / "train.jsonl"
+
+    rc = cmd_env_pull(
+        _args(env_id="david-freesolo-co/stuff", path="datasets/train.jsonl", output=str(out))
+    )
+
+    assert rc == 0
+    assert seen == {"env_id": "david-freesolo-co/stuff"}
+    assert out.read_bytes() == b'{"a":1}\n'
+
+
+def test_cmd_env_pull_managed_auth_error(monkeypatch, tmp_path, capsys):
+    from flash.client import ClientError
+
+    def fail_client():
+        raise ClientError("not logged in")
+
+    monkeypatch.setattr("flash.client.client_from_config", fail_client)
+
+    rc = cmd_env_pull(_args(env_id="david-freesolo-co/stuff", output=str(tmp_path / "out")))
+
+    assert rc == 1
+    assert "not logged in" in capsys.readouterr().err
 
 
 def test_cmd_env_pull_token_hint_for_github_request_failure(monkeypatch, tmp_path, capsys):
