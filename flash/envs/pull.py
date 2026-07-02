@@ -9,8 +9,6 @@ import os
 import shutil
 import tarfile
 import tempfile
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 from flash.envs import loader as adapter
@@ -19,16 +17,6 @@ from flash.envs.archive_policy import (
     archive_stream_limit,
     tar_member_segments,
 )
-
-
-def _coerce_environment_github_ref(env_ref: str) -> adapter.GitHubEnvironmentRef:
-    candidate = env_ref
-    if adapter.is_managed_environment_slug(candidate):
-        candidate = adapter.managed_slug_to_github_ref(candidate)
-    parsed = adapter._parse_github_environment_ref(candidate)
-    if parsed is None:
-        raise ValueError(f"not a Freesolo or GitHub environment reference: {env_ref!r}")
-    return parsed
 
 
 def _safe_repo_relative_path(path: str) -> str:
@@ -41,49 +29,11 @@ def _safe_repo_relative_path(path: str) -> str:
     return "/".join(parts)
 
 
-def _environment_dir(env_path: str) -> str:
-    parts = [part for part in env_path.split("/") if part]
-    if parts and parts[-1].endswith(".py"):
-        parts = parts[:-1]
-    return "/".join(parts)
-
-
-def _environment_entrypoint(env_path: str) -> str:
-    parts = [part for part in env_path.split("/") if part]
-    if parts and parts[-1].endswith(".py"):
-        return parts[-1]
-    return adapter._DEFAULT_ENVIRONMENT_PATH
-
-
 def environment_local_dirname(env_ref: str) -> str:
     slug = adapter._parse_managed_environment_slug(env_ref)
-    if slug is not None:
-        return slug[1]
-    ref = _coerce_environment_github_ref(env_ref)
-    env_dir = _environment_dir(ref.path)
-    return env_dir.rsplit("/", 1)[-1] if env_dir else ref.repo
-
-
-def download_environment_file(env_ref: str, rel_path: str, *, timeout: float = 120.0) -> bytes:
-    """Download one file from an environment using GitHub's raw media type."""
-    ref = _coerce_environment_github_ref(env_ref)
-    safe_rel = _safe_repo_relative_path(rel_path)
-    env_dir = _environment_dir(ref.path)
-    full_path = f"{env_dir}/{safe_rel}" if env_dir else safe_rel
-    quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in full_path.split("/"))
-    url = (
-        f"https://api.github.com/repos/{ref.repo_full_name}/contents/{quoted_path}"
-        f"?ref={urllib.parse.quote(ref.ref, safe='')}"
-    )
-    headers = {"Accept": "application/vnd.github.raw", "User-Agent": "freesolo-flash"}
-    token = adapter._github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return adapter._urlopen(
-        urllib.request.Request(url, headers=headers),
-        timeout=timeout,
-        max_bytes=adapter._MAX_ARCHIVE_BYTES,
-    )
+    if slug is None:
+        raise ValueError(f"not a managed Freesolo environment slug: {env_ref!r}")
+    return slug[1]
 
 
 def _remove_path(path: Path) -> None:
@@ -303,39 +253,5 @@ def download_environment_file_from_archive(
         if not target.is_file():
             raise FileNotFoundError(f"environment file {safe_rel!r} not found in package")
         return target.read_bytes()
-    finally:
-        shutil.rmtree(tmp_parent, ignore_errors=True)
-
-
-def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool = False) -> Path:
-    """Download a published environment directory to ``dest``."""
-    ref = _coerce_environment_github_ref(env_ref)
-    env_dir = _environment_dir(ref.path)
-    if not env_dir and ref.repo_full_name.lower() == adapter._DEFAULT_MANAGED_ENV_REPO.lower():
-        raise ValueError(
-            f"refusing to pull the whole shared environment hub ({adapter._DEFAULT_MANAGED_ENV_REPO}); "
-            "specify a managed environment id (namespace/name) or a github ref to its subdirectory"
-        )
-
-    dest_path = ensure_environment_pull_destination_available(dest, overwrite=overwrite)
-
-    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
-    try:
-        extracted = adapter._extract_github_tarball(ref, tmp_parent, subdir=env_dir)
-        source = extracted / env_dir if env_dir else extracted
-        if not source.is_dir():
-            raise FileNotFoundError(
-                f"environment directory {env_dir or '.'!r} not found in {ref.repo_full_name}@{ref.ref}"
-            )
-
-        entrypoint = _environment_entrypoint(ref.path)
-        if not (source / entrypoint).is_file():
-            raise FileNotFoundError(
-                f"environment entrypoint {entrypoint!r} not found in "
-                f"{env_dir or '.'!r} of {ref.repo_full_name}@{ref.ref}"
-            )
-
-        _copy_environment_source(source, dest_path, overwrite=overwrite)
-        return dest_path
     finally:
         shutil.rmtree(tmp_parent, ignore_errors=True)
