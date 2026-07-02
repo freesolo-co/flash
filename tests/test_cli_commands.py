@@ -401,6 +401,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "## Common Flash issues and mitigations" in training_text
     assert "Trying to pin managed infrastructure" in training_text
     assert "response_text.thinking" in training_text
+    assert "Qwen3.5 thinking multi-turn SFT" in training_text
+    assert "longest shared token prefix" in training_text
     assert "flash env pull your-org/my-env" in training_text
     assert "private environment-scoped repo" in training_text
     assert "flash checkpoints <run-id>" in training_text
