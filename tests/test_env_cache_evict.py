@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 
-from flash.envs import adapter
+from flash.envs import loader as adapter
 
 
 def _make_entry(root: Path, name: str, *, size: int, age_seconds: float) -> Path:

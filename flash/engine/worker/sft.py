@@ -492,7 +492,7 @@ def run_sft():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-    # Ensure `flash deploy --step <final>` always resolves: save_steps may not align with the last step.
+    # Ensure `flash deploy RUN_ID/step-<final>` always resolves: save_steps may not align with the last step.
     _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
     if _final_step:
         _w.publish_deployable_checkpoint(adapter_dir, _final_step)

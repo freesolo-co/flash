@@ -443,7 +443,127 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
 
 
-def test_freesolo_adapter_preserves_missing_system_prompt(monkeypatch):
+def _split_env(tmp_path, extra_files):
+    env_file = tmp_path / "freesolo" / "environment.py"
+    env_file.parent.mkdir()
+    env_file.write_text("def load_environment(**kwargs): pass\n")
+    for rel, text in extra_files.items():
+        f = tmp_path / "freesolo" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    return env_file
+
+
+def test_freesolo_adapter_split_param_selects_split_dataset(monkeypatch, tmp_path):
+    """[environment.params] split must pick datasets/<split>.jsonl for Flash's own dataset()
+    (SFT targets AND GRPO problem selection), not silently train on the default train.jsonl."""
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "datasets/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+    assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
+
+
+def test_freesolo_adapter_missing_split_file_refuses_silent_train_fallback(
+    monkeypatch, tmp_path
+):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="split='oracle'"):
+        load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+
+
+def test_freesolo_adapter_rejects_unsafe_split_names(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="split must be a simple dataset name"):
+        load_freesolo_environment(str(env_file), split="../oracle", contract_text="c")
+
+
+def test_freesolo_adapter_split_train_uses_default_dataset(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="train", contract_text="c")
+    assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
+
+
+def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "datasets/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "datasets/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file),
+        dataset_path="datasets/train.jsonl",
+        split="oracle",
+        contract_text="c",
+    )
+    assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
+
+
+def test_freesolo_adapter_warns_on_dropped_record_keys(monkeypatch, tmp_path):
+    """Canonicalization keeps only input/output/id/metadata; extra top-level keys used to be
+    dropped silently — now a once-per-key warnings.warn names them (per environment instance,
+    not via a mutable module global checked per record)."""
+    import warnings
+
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "datasets/train.jsonl": (
+                '{"id":"t","input":"x","output":"y","initial_state":[1,2],'
+                '"metadata":{"kept":true}}\n'
+            )
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        rows = env.dataset()
+        assert rows == [{"id": "t", "input": "x", "output": "y", "metadata": {"kept": True}}]
+        texts = [str(w.message) for w in caught]
+        assert any("initial_state" in t and "dropped" in t for t in texts)
+        # Re-canonicalizing the same records must not warn again (once per key per instance).
+        before = len(caught)
+        env._canonical_record(rows[0] | {"initial_state": [1, 2]})
+        assert len(caught) == before
+
+
+def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
     class NoSystemEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
 
@@ -465,11 +585,12 @@ def test_freesolo_adapter_preserves_missing_system_prompt(monkeypatch):
     )
 
     assert env.prompt_messages({"input": "2+2?", "output": "4"}) == [
+        {"role": "system", "content": "follow the contract"},
         {"role": "user", "content": "2+2?"},
     ]
 
 
-def test_freesolo_adapter_preserves_blank_system_prompt(monkeypatch):
+def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
     class BlankSystemEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[dict]] = [{"input": "2+2?", "output": "4"}]
 
@@ -494,7 +615,7 @@ def test_freesolo_adapter_preserves_blank_system_prompt(monkeypatch):
     )
 
     expected = [
-        {"role": "system", "content": "   "},
+        {"role": "system", "content": "follow the contract"},
         {"role": "user", "content": "2+2?"},
     ]
     assert env.prompt_messages({"input": "2+2?", "output": "4"}) == expected
@@ -503,7 +624,7 @@ def test_freesolo_adapter_preserves_blank_system_prompt(monkeypatch):
     assert state["messages"] == expected
     assert state["messages"] is not state["prompt"]
     state["messages"][0]["content"] = "changed"
-    assert state["prompt"][0]["content"] == "   "
+    assert state["prompt"][0]["content"] == "follow the contract"
 
 
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
@@ -582,9 +703,11 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     )
     state = env.new_rollout_state({"input": "browse", "output": "done"})
     assert state["prompt"] == [
+        {"role": "system", "content": "contract"},
         {"role": "user", "content": "contract:browse"},
     ]
     assert state["messages"] == [
+        {"role": "system", "content": "contract"},
         {"role": "user", "content": "contract:browse"},
     ]
     env.record_model_turn(state, "click")
@@ -640,7 +763,7 @@ def test_github_environment_ref_parsing():
 
 
 def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(
@@ -665,7 +788,7 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
 
 
 def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -685,7 +808,7 @@ def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, 
 
 
 def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -710,7 +833,7 @@ def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path,
 
 
 def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -725,7 +848,7 @@ def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, mon
 
 
 def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
-    from flash.envs.adapter import _safe_extract_archive
+    from flash.envs.loader import _safe_extract_archive
 
     def make_members_tar(members: list[tuple[str, bytes | None]]):
         tar = io.BytesIO()
@@ -743,14 +866,14 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
 
     dest = tmp_path / "extract_many"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 0)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_MEMBERS", 0)
     with pytest.raises(RuntimeError, match="too many members"):
         _safe_extract_archive(make_members_tar([("a", b"")]), dest)
 
     dest = tmp_path / "extract_big"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 5)
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 1)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_MEMBERS", 5)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_BYTES", 1)
     with pytest.raises(RuntimeError, match="too large"):
         _safe_extract_archive(
             make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest
@@ -758,7 +881,7 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
 
     dest = tmp_path / "extract_pax"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 100)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_BYTES", 100)
     tar = io.BytesIO()
     with tarfile.open(fileobj=tar, mode="w:gz") as handle:
         pax = tarfile.TarInfo("pax_global_header")
@@ -779,7 +902,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
     # A GNU LONGNAME header payload is consumed inside tarfile.next() and never yielded, so per-member
     # accounting can't see it. A tiny gzip declaring a 400MB name must be rejected with memory bounded
     # near the limit, not OOM the worker.
-    from flash.envs.adapter import _safe_extract_archive
+    from flash.envs.loader import _safe_extract_archive
 
     def header(name: str, size: int, typeflag: str) -> bytes:
         h = bytearray(512)
