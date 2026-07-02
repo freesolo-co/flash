@@ -594,10 +594,17 @@ def cmd_deploy(args) -> int:
             print(render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr)
     if dep.get("state") != "dry_run":
         state = dep.get("state", "deploying")
-        status_note = (
-            f"deployment state is {state!r}; run `flash deployments` to check progress "
-            "and use `flash chat` once it is ready."
-        )
+        if state == "failed":
+            detail = str(dep.get("error") or dep.get("detail") or "unknown error")
+            status_note = (
+                f"deployment failed: {detail}; run `flash deployments` for details and "
+                f"retry `flash deploy {args.run_id}` after fixing the error."
+            )
+        else:
+            status_note = (
+                f"deployment state is {state!r}; run `flash deployments` to check progress "
+                "and use `flash chat` once it is ready."
+            )
         print(
             render.arrow(status_note) if render.styled() else f"note: {status_note}",
             file=sys.stderr,
@@ -608,7 +615,7 @@ def cmd_deploy(args) -> int:
                 render.arrow(skip_note) if render.styled() else f"note: {skip_note}",
                 file=sys.stderr,
             )
-    return 0
+    return 1 if dep.get("state") == "failed" else 0
 
 
 def cmd_export(args) -> int:
@@ -678,6 +685,17 @@ def cmd_deployments(args) -> int:
 
 
 def cmd_chat(args) -> int:
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(args.run_id)
+    if parsed is None:
+        print(
+            f"invalid run/checkpoint reference {args.run_id!r} "
+            "(expected <run_id> or <run_id>/step-N)",
+            file=sys.stderr,
+        )
+        return 1
+    base_run_id, _step = parsed
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
     system = getattr(args, "system", None)
@@ -689,7 +707,7 @@ def cmd_chat(args) -> int:
     if stream is not None:
         wrote = False
         for chunk in stream(
-            args.run_id,
+            base_run_id,
             messages=messages,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -701,7 +719,7 @@ def cmd_chat(args) -> int:
         return 0
 
     resp = client.chat(
-        args.run_id,
+        base_run_id,
         messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,

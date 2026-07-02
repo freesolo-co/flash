@@ -31,7 +31,7 @@ _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 # The ONE public checkpoint/adapter reference grammar: `<run_id>` (a run's trained adapter) or
 # `<run_id>/step-N` (a specific saved checkpoint listed by `flash checkpoints`). The control plane
 # resolves it to the internal storage reference below; users never see or write storage refs.
-_CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d+))?$")
+_CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
@@ -46,7 +46,12 @@ def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
     if match is None:
         return None
     step = match.group("step")
-    return match.group("run_id"), (int(step) if step is not None else None)
+    if step is None:
+        return match.group("run_id"), None
+    try:
+        return match.group("run_id"), int(step)
+    except ValueError:
+        return None
 
 
 def format_checkpoint_ref(run_id: str, step: int | None = None) -> str:

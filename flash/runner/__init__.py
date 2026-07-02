@@ -431,6 +431,25 @@ def _resolve_init_from_adapter(
                 f"train.init_from_adapter references {src_run_id}/step-{step}, but that "
                 "deployable checkpoint was not found"
             )
+    else:
+        if src_status.state not in {"done", "deployed"}:
+            raise ValueError(
+                f"train.init_from_adapter references run {src_run_id!r}, but that run is "
+                f"{src_status.state!r}; use a completed source run or a concrete "
+                f"{src_run_id}/step-N checkpoint"
+            )
+        from flash.runner.checkpoints import CheckpointListingError, final_adapter_exists
+
+        try:
+            exists = final_adapter_exists(src_spec)
+        except CheckpointListingError as exc:
+            raise ValueError(str(exc)) from exc
+        if not exists:
+            raise ValueError(
+                f"train.init_from_adapter references run {src_run_id!r}, but its final "
+                "adapter was not found; use a concrete checkpoint ref like "
+                f"{src_run_id}/step-N if one exists"
+            )
     storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
     return replace(spec, train=replace(spec.train, init_from_adapter=storage))
 
