@@ -90,7 +90,7 @@ class _FakeClient:
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
     def deployments(self) -> list[dict]:
-        return [{"run_id": "flash-1", "deployment": {"state": "ready", "gpu": "RTX 4090"}}]
+        return [{"run_id": "flash-1", "deployment": {"state": "ready"}}]
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))

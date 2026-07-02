@@ -37,12 +37,11 @@ def test_deploy_dry_run():
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/r1/seed0",
-        gpu_name="RTX 4090",
         dry_run=True,
     )
     d = dep.to_dict()
     assert d["state"] == "dry_run"
-    assert d["gpu"] == "RTX 4090"
+    assert "gpu" not in d
     # The adapter is addressed by its run_id on the freesolo serving app.
     assert d["openai_model"] == "r1"
     assert d["adapter_hf_prefix"] == "sft/r1/seed0/adapter"
@@ -60,7 +59,6 @@ def test_deploy_9b_dry_run_is_not_rejected():
         model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/q1/seed0",
-        gpu_name="RTX 5090",
         dry_run=True,
     )
     assert dep.to_dict()["state"] == "dry_run"
@@ -75,7 +73,6 @@ def test_deploy_rejects_lora_rank_above_serving_cap():
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
             adapter_prefix="sft/r33/seed0",
-            gpu_name="RTX 5090",
             dry_run=True,
             lora_rank=33,
         )
@@ -93,7 +90,6 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
             adapter_prefix="grpo/r-recombined/seed0",
-            gpu_name="RTX 5090",
             dry_run=False,
             lora_rank=32,
         )
@@ -113,7 +109,6 @@ def test_deploy_rejects_adapter_config_without_rank_metadata(monkeypatch, tmp_pa
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-missing-rank/seed0",
-            gpu_name="RTX 5090",
             dry_run=False,
             lora_rank=32,
         )
@@ -130,7 +125,6 @@ def test_deploy_rejects_falsey_invalid_rank_pattern(monkeypatch, tmp_path):
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-bad-pattern/seed0",
-            gpu_name="RTX 5090",
             dry_run=False,
             lora_rank=32,
         )
@@ -152,7 +146,6 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-hf-down/seed0",
-            gpu_name="RTX 5090",
             dry_run=False,
             lora_rank=32,
         )
@@ -181,32 +174,16 @@ def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-missing/seed0",
-            gpu_name="RTX 5090",
             dry_run=False,
             lora_rank=32,
         )
 
 
-def test_deploy_adapter_options_after_gpu_are_keyword_only():
+def test_deploy_adapter_options_are_keyword_only():
     from flash.serve.deploy import deploy_adapter
 
     with pytest.raises(TypeError):
-        deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", "RTX 4090", True)
-
-
-def test_deploy_rejects_unsupported_gpu():
-    from flash.providers.base import UnsupportedGpuError
-    from flash.serve.deploy import deploy_adapter
-
-    with pytest.raises(UnsupportedGpuError):
-        deploy_adapter(
-            run_id="r1",
-            model="Qwen/Qwen3.5-0.8B",
-            hf_repo="org/repo",
-            adapter_prefix="sft/r1/seed0",
-            gpu_name="TPU v5",  # junk still rejects
-            dry_run=True,
-        )
+        deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", True)
 
 
 def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serving_registry):
@@ -244,7 +221,6 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
-        gpu_name="RTX 5090",
     )
     assert seen["url"] == "https://serve.example/adapters"
     assert seen["json"] == {
@@ -300,7 +276,6 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
-        gpu_name="RTX 5090",
         org_id="org-xyz",
     )
     assert seen["json"]["orgId"] == "org-xyz"
@@ -311,7 +286,6 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
-        gpu_name="RTX 5090",
     )
     assert "orgId" not in seen["json"]
 
@@ -349,7 +323,6 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
-        gpu_name="RTX 5090",
         thinking=True,
     )
     assert seen["json"]["thinking"] is True
@@ -361,7 +334,6 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
-        gpu_name="RTX 5090",
         thinking=False,
     )
     assert seen["json"]["thinking"] is False
@@ -382,7 +354,7 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(d.httpx, "post", lambda *a, **k: _Resp())
     with pytest.raises(d.ServingError):
-        d.deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", "RTX 5090")
+        d.deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0")
 
 
 def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
