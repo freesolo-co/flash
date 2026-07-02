@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from io import BytesIO
 
+from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.runpod.train.deps import (  # noqa: F401
     DEFAULT_CHALK_SPEC,
     DEFAULT_EXECUTION_TIMEOUT_MS,
@@ -37,64 +36,14 @@ from flash.providers.runpod.train.endpoints import (  # noqa: F401
     terminate_endpoint,
 )
 
-_HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
-_HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
-_HF_RETRY_AFTER_MAX_S = 60.0
 _CODE_SNAPSHOT_COMPLETE = ".flash-code-snapshot-complete"
 
 
-def _hf_status_code(exc: BaseException) -> int | None:
-    response = getattr(exc, "response", None)
-    code = getattr(response, "status_code", None)
-    try:
-        return int(code)
-    except (TypeError, ValueError):
-        return None
-
-
-def _hf_retry_after(exc: BaseException) -> float | None:
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None) or {}
-    value = headers.get("retry-after") if hasattr(headers, "get") else None
-    if not value and hasattr(headers, "items"):
-        for key, candidate in headers.items():
-            if str(key).lower() == "retry-after":
-                value = candidate
-                break
-    if not value:
-        return None
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        try:
-            retry_at = parsedate_to_datetime(str(value))
-            if retry_at.tzinfo is None:
-                retry_at = retry_at.replace(tzinfo=UTC)
-            seconds = (retry_at - datetime.now(UTC)).total_seconds()
-        except (TypeError, ValueError):
-            return None
-    return min(_HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
+_hf_status_code = hf_status_code
 
 
 def _hf_call(call, label: str):
-    for attempt in range(len(_HF_RETRY_DELAYS_S) + 1):
-        try:
-            return call()
-        except Exception as exc:
-            if _hf_status_code(exc) not in _HF_TRANSIENT_STATUS_CODES or attempt >= len(
-                _HF_RETRY_DELAYS_S
-            ):
-                raise
-            retry_after = _hf_retry_after(exc)
-            delay = retry_after if retry_after is not None else _HF_RETRY_DELAYS_S[attempt]
-            logger.warning(
-                "%s transient Hugging Face error; retrying in %.0fs: %s",
-                label,
-                delay,
-                exc,
-            )
-            time.sleep(delay)
-    raise AssertionError("unreachable")
+    return hf_call(call, label, logger=logger, sleep=time.sleep)
 
 
 def _is_hf_not_found(exc: BaseException) -> bool:
