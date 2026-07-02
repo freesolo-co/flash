@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from flash.client import ApiClient, ApiError, ClientError
+from flash.client import ApiClient, ApiError, ClientError, RequestTimeoutError
 
 
 @pytest.fixture
@@ -292,6 +293,40 @@ def test_unreachable_server_is_actionable():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     with pytest.raises(ClientError, match="FLASH_API_URL"):
         client.health()
+
+
+def test_raw_read_timeout_maps_to_client_error(monkeypatch):
+    def timeout(req, timeout=None):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", timeout)
+
+    client = ApiClient("http://flash.example", "fslo-user-test", timeout=2)
+    with pytest.raises(RequestTimeoutError, match="timed out"):
+        client.health()
+
+
+def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
+    client = ApiClient("http://flash.example", "fslo-user-test")
+    calls: list[tuple[str, str, float | None]] = []
+
+    def request(method, path, body=None, timeout=None, progress=None):
+        calls.append((method, path, timeout))
+        if method == "POST":
+            raise RequestTimeoutError("cancel timed out")
+        if method == "GET" and path == "/v1/runs/r1":
+            return {"run_id": "r1", "state": "cancelled", "remote": {"gpu": "B200"}}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(client, "_request", request)
+
+    out = client.cancel_run("r1")
+
+    assert out["state"] == "cancelled"
+    assert calls == [
+        ("POST", "/v1/runs/r1/cancel", 60.0),
+        ("GET", "/v1/runs/r1", None),
+    ]
 
 
 def test_deploy_rejects_malformed_checkpoint_ref():
