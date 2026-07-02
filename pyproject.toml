@@ -53,10 +53,8 @@ gpu = [
 # ours, so `pip install freesolo-flash` gives an unambiguous `flash` command. huggingface-hub>=0.34:
 # upload_code()'s update_repo_settings(private=True) needs the visibility-via-settings API
 # (0.25.x only accepts `gated` and raises TypeError on `private`).
-# freesolo + datasets: the control plane CHARGES the run at submit (server/billing.charge_run_estimate),
-# and for an SFT run with no [train].max_examples cap that estimate loads/counts the env's real train
-# split (cost.spec.count_env_examples -> envs.load_environment -> the Freesolo adapter), so the server
-# needs the env-loading stack too -- not just the GPU worker.
+# SFT `flash train --cost` no longer imports Freesolo environments to count data. It requires
+# [train].max_examples to be set explicitly, so the estimate never guesses a hidden dataset size.
 server = [
     "fastapi",
     "uvicorn",

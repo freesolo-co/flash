@@ -44,14 +44,15 @@ def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> N
     assert cmd_env_setup(Namespace()) == 0
 
     env_module = tmp_path / "environment.py"
-    dataset = tmp_path / "datasets/train.jsonl"
+    dataset = tmp_path / "dataset/train.jsonl"
     assert env_module.is_file()
     assert dataset.is_file()
+    assert not (tmp_path / "datasets").exists()
     source = env_module.read_text(encoding="utf-8")
     # The scaffold must be a Freesolo SDK env, not the old BaseEnvironment subclass.
     assert "from freesolo.environments import EnvironmentSingleTurn" in source
     assert "class StarterEnv(EnvironmentSingleTurn)" in source
-    assert 'Path(__file__).parent / "datasets" / "train.jsonl"' in source
+    assert 'Path(__file__).parent / "dataset" / "train.jsonl"' in source
     assert "load_jsonl(DEFAULT_DATASET_PATH)" in source
     assert "BaseEnvironment" not in source
     # The scaffold must read TaskExample's REAL attributes (.input/.output), not the .task/

@@ -39,7 +39,7 @@ flash gpus                           # managed GPU classes with estimated $/hr
 
 ```text
 environment.py          # the task: how to prompt the model and how to score it
-datasets/train.jsonl    # training rows, one JSON object per line: {"input": ..., "output": ...}
+dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "output": ...}
 configs/rl.toml         # a GRPO (RL) run config
 configs/sft.toml        # an SFT run config
 TRAINING.md             # this file
@@ -57,7 +57,7 @@ from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 class MyEnv(EnvironmentSingleTurn):
-    dataset = load_jsonl("datasets/train.jsonl")   # rows -> TaskExample(input=..., output=...)
+    dataset = load_jsonl("dataset/train.jsonl")   # rows -> TaskExample(input=..., output=...)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
         return [{"role": "user", "content": example.input}]
@@ -86,7 +86,7 @@ flash env list                       # local env sources you can push
 To train against an env someone else published, just set its slug as `[environment] id` —
 no separate step is needed. Paste the returned id into `[environment] id` in **both** configs.
 Re-push after any
-edit to `environment.py` or `datasets/` so the managed run uses your change.
+edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 ### 3. Configure the run (TOML)
 
@@ -337,6 +337,16 @@ Pick SFT when you already have good answers and want the model to imitate them.
   `max_length` that plausibly fits prompt + completion, and only raise it when you see
   truncation (outputs cut off mid-thought, degraded loss). A bigger context just costs
   more.
+- **For Qwen3.5 thinking multi-turn SFT, put reasoning only in the final assistant
+  turn.** Qwen3.5's chat template strips literal `<think>` blocks from prior assistant
+  history and pre-opens `<think>\n` in the next generation prompt. If every assistant
+  turn in a gold multi-turn transcript includes `<think>...</think>`, training sees a
+  different tag layout than inference and can learn doubled or misplaced thinking
+  tags. Keep intermediate assistant turns as the actual code/tool/action text only;
+  put `<think>...</think>` plus the final answer in the final assistant target. Flash's
+  completion-only SFT masking uses the longest shared token prefix, so the template's
+  pre-opened `<think>\n` is treated as prompt text instead of training the model to
+  emit another opener.
 - **SFT is a great warm start for GRPO.** SFT first to teach the format and a competent
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
   model**. For text-only continued adapters, keep the same adapter shape. For VL
@@ -466,7 +476,7 @@ on a beyond-noise improvement.
 ## Command reference
 
 ```bash
-flash env setup                       # scaffold environment.py, datasets/, configs/, this file
+flash env setup                       # scaffold environment.py, dataset/, configs/, this file
 flash env push --name my-env .        # publish the environment; paste the returned id into [environment]
 flash env pull your-org/my-env        # download a published environment into the current folder
 flash env delete your-org/my-env -y   # delete a published environment

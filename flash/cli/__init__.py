@@ -259,7 +259,7 @@ def _build_parser() -> argparse.ArgumentParser:
     env_pull.add_argument(
         "path",
         nargs="?",
-        help="optional single file within the env to fetch, e.g. datasets/train.jsonl",
+        help="optional single file within the env to fetch, e.g. dataset/train.jsonl",
     )
     env_pull.add_argument(
         "-o",

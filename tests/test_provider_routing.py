@@ -17,7 +17,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"epochs": 1, "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
             "gpu": gpu,
         }
     )
@@ -562,7 +562,7 @@ def test_config_gpu_fields(monkeypatch):
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "train": {"epochs": 1, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
     spec = spec_from_dict(dict(base), run_id="x")
