@@ -355,7 +355,8 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
     assert key2 != key, "a liveness ping should advance the dedupe key"
     assert stage2 is None, "a liveness ping is not surfaced as progress"
     assert recorded == [live], "a liveness ping must still refresh visible run status"
-    assert lines and "liveness=true" in lines[-1]
+    assert lines
+    assert "liveness=true" in lines[-1]
     key3, stage3 = _poll.surface_heartbeat(lambda: live, key2, lines.append)
     assert key3 == key2
     assert stage3 is None
