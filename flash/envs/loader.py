@@ -26,6 +26,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from flash.envs.archive_policy import (
+    ARCHIVE_MEMBER_LIMIT,
+    ARCHIVE_SCAN_MEMBER_LIMIT,
+    TAR_METADATA_TYPES,
+    LimitedArchiveReader,
+    archive_stream_limit,
+    tar_member_segments,
+)
+
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
@@ -40,17 +49,12 @@ _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
 _MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
-_MAX_ARCHIVE_MEMBERS = 5000
-_MAX_ARCHIVE_SCAN_MEMBERS = 200_000
+_MAX_ARCHIVE_MEMBERS = ARCHIVE_MEMBER_LIMIT
+_MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_TAR_METADATA_TYPES = {
-    tarfile.XHDTYPE,
-    tarfile.XGLTYPE,
-    tarfile.GNUTYPE_LONGNAME,
-    tarfile.GNUTYPE_LONGLINK,
-}
+_TAR_METADATA_TYPES = TAR_METADATA_TYPES
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
 
@@ -547,24 +551,6 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
     return repo_root
 
 
-class _LimitedReader:
-    """Reader wrapper that caps decompressed tar bytes, including header payloads."""
-
-    def __init__(self, raw, limit: int):
-        self._raw = raw
-        self._remaining = limit
-
-    def read(self, size: int = -1) -> bytes:
-        want = self._remaining + 1 if size is None or size < 0 else min(size, self._remaining + 1)
-        chunk = self._raw.read(want)
-        self._remaining -= len(chunk)
-        if self._remaining < 0:
-            raise RuntimeError(
-                f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
-            )
-        return chunk
-
-
 def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path, subdir: str = "") -> Path:
     tarball = _download_github_tarball(ref)
     try:
@@ -596,8 +582,13 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     total = 0
     extracted = 0
     scanned = 0
-    stream_cap = _MAX_ARCHIVE_BYTES + _MAX_ARCHIVE_MEMBERS * 1024 + (1 << 20)
-    reader = _LimitedReader(gzip.GzipFile(fileobj=tar_file), stream_cap)
+    reader = LimitedArchiveReader(
+        gzip.GzipFile(fileobj=tar_file),
+        archive_stream_limit(_MAX_ARCHIVE_BYTES, _MAX_ARCHIVE_MEMBERS),
+        lambda: RuntimeError(
+            f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
+        ),
+    )
     with tarfile.open(fileobj=reader, mode="r|") as tar:
         for member in tar:
             scanned += 1
@@ -607,14 +598,17 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
                 )
             if member.type in _TAR_METADATA_TYPES:
                 continue
-            raw = [p for p in member.name.replace("\\", "/").split("/") if p and p != "."]
+            raw = tar_member_segments(
+                member.name,
+                unsafe_error=lambda name: RuntimeError(
+                    f"unsafe path in environment archive: {name!r}"
+                ),
+            )
             if not raw:
                 continue
             top_dirs.add(raw[0])
             if want and raw[1 : 1 + len(want)] != want:
                 continue
-            if ".." in raw:
-                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             normalized_name = "/".join(raw)
             target = (dest / normalized_name).resolve()
             if target != root and root not in target.parents:
