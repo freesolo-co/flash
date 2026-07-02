@@ -11,7 +11,7 @@ The allocator picks the cheapest validated managed GPU class that fits the run.
 - `flash checkpoints`, `flash deploy`, `flash chat` — serving for trained adapters,
   including deployable intermediate RL checkpoints.
 - **Freesolo SDK environments.** Every run names a Freesolo environment id.
-  Scaffold `environment.py` plus `datasets/train.jsonl`, upload `.` or another
+  Scaffold `environment.py` plus `dataset/train.jsonl`, upload `.` or another
   folder with `flash env push --name <name> <folder>`, then reference the
   returned id. The worker loads it through `freesolo.environments`. There are no
   built-in task environments. Single-turn and bounded multi-turn environments are
@@ -33,7 +33,7 @@ The allocator picks the cheapest validated managed GPU class that fits the run.
   (task-specific grading lives with its example, not in the engine)
 - `flash/envs/` — environment machinery: registry and the adapter that loads
   Freesolo SDK environments onto the worker's interface
-- `flash env setup` — scaffold a starter local Freesolo env, `datasets/train.jsonl`,
+- `flash env setup` — scaffold a starter local Freesolo env, `dataset/train.jsonl`,
   ready-to-run configs, and a `TRAINING.md` playbook with common failure modes and
   mitigations
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
