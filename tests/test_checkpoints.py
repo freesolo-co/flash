@@ -509,6 +509,7 @@ def test_on_save_skips_deployable_when_vl_recombine_fails(
 
 def test_recombined_warmstart_skips_stale_legacy_weights(tmp_path, monkeypatch):
     """The recombined deploy adapter writes fresh safetensors; do not copy stale raw .bin weights."""
+    import shutil
     from pathlib import Path
 
     import flash.engine.worker as worker
@@ -535,12 +536,17 @@ def test_recombined_warmstart_skips_stale_legacy_weights(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "_VL_WARMSTART_MODEL_ID", "Qwen/Qwen3.5-4B", raising=False)
     monkeypatch.setattr(worker_adapter, "recombine_lora_adapters", fake_recombine)
 
-    out = Path(worker_adapter.recombined_warmstart_adapter_dir(str(grpo)))
+    out_path = worker_adapter.recombined_warmstart_adapter_dir(str(grpo))
+    assert out_path is not None
+    out = Path(out_path)
 
-    assert (out / "adapter_model.safetensors").exists()
-    assert not (out / "adapter_model.bin").exists()
-    assert (out / "special_tokens_map.json").exists()
-    assert not (out / "optimizer.pt").exists()
+    try:
+        assert (out / "adapter_model.safetensors").exists()
+        assert not (out / "adapter_model.bin").exists()
+        assert (out / "special_tokens_map.json").exists()
+        assert not (out / "optimizer.pt").exists()
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------------------------
