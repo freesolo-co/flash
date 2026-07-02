@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from flash.envs.adapter import GitHubRateLimitError, _urlopen
+from flash.envs.loader import GitHubRateLimitError, _urlopen
 
 
 def _http_error(code: int, body: str) -> urllib.error.HTTPError:

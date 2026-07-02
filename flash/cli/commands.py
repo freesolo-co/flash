@@ -407,9 +407,12 @@ def cmd_train(args) -> int:
     return _follow_run(client, run_id)
 
 
-def _poll_logs(client: ApiClient, run_id: str, interval: float) -> str:
-    """Stream offset-paged logs until the run reaches a terminal state; return that state."""
+def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bool]:
+    """Stream offset-paged logs until the run reaches a terminal state.
+
+    Returns (terminal state, whether any log bytes were printed)."""
     offset = 0
+    printed_any = False
     spinner = _LogFollowSpinner(run_id)
     try:
         while True:
@@ -417,23 +420,25 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> str:
             if page["logs"]:
                 spinner.clear()
                 print(page["logs"], end="", flush=True)
+                printed_any = True
             offset = page["offset"]
             if page["state"] in _CLI_DONE_STATES:
                 spinner.clear()
-                return page["state"]
+                return page["state"], printed_any
             _sleep_with_spinner(interval, spinner, page["state"])
     finally:
         spinner.clear()
 
 
+def _render_status(status: dict) -> str:
+    """One rendering of a run status: themed panel on a TTY, indented JSON on the machine path."""
+    return render.run_status(status) if render.styled() else json.dumps(status, indent=2)
+
+
 def _follow_run(client: ApiClient, run_id: str) -> int:
     """Poll logs until the run reaches a terminal state, then print the final status."""
-    state = _poll_logs(client, run_id, interval=2.0)
-    status = client.get_run(run_id)
-    if render.styled():
-        print(render.run_status(status))
-    else:
-        print(json.dumps(status, indent=2))
+    state, _ = _poll_logs(client, run_id, interval=2.0)
+    print(_render_status(client.get_run(run_id)))
     return 0 if state in _OK_STATES else 1
 
 
@@ -442,7 +447,7 @@ def _follow_status(client: ApiClient, run_id: str, interval: float = 2.0) -> int
     last_rendered: str | None = None
     while True:
         status = client.get_run(run_id)
-        rendered = render.run_status(status) if render.styled() else json.dumps(status, indent=2)
+        rendered = _render_status(status)
         if rendered != last_rendered:
             print(rendered)
             last_rendered = rendered
@@ -450,21 +455,6 @@ def _follow_status(client: ApiClient, run_id: str, interval: float = 2.0) -> int
         if state in _CLI_DONE_STATES:
             return 0 if state in _OK_STATES else 1
         time.sleep(interval)
-
-
-def _print_log_text(text: str) -> bool:
-    if not text:
-        return False
-    print(text, end="")
-    if not text.endswith("\n"):
-        print()
-    return True
-
-
-def _print_log_snapshot(client: ApiClient, run_id: str) -> bool:
-    """Print a finite snapshot from the log endpoint without following new bytes."""
-    page = client.get_logs(run_id, offset=0)
-    return _print_log_text(str(page.get("logs") or ""))
 
 
 def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
@@ -484,11 +474,13 @@ def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = 
 def cmd_log(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
-        state = _poll_logs(client, args.run_id, interval=2.0)
-        _print_worker_output(client, args.run_id, printed_any=True)
+        state, printed_any = _poll_logs(client, args.run_id, interval=2.0)
+        _print_worker_output(client, args.run_id, printed_any=printed_any)
         return 0 if state in _OK_STATES else 1
-    printed_any = _print_log_snapshot(client, args.run_id)
-    _print_worker_output(client, args.run_id, printed_any=printed_any)
+    text = str(client.get_logs(args.run_id, offset=0).get("logs") or "")
+    if text:
+        print(text, end="" if text.endswith("\n") else "\n")
+    _print_worker_output(client, args.run_id, printed_any=bool(text))
     return 0
 
 
@@ -496,11 +488,7 @@ def cmd_status(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
         return _follow_status(client, args.run_id)
-    status = client.get_run(args.run_id)
-    if render.styled():
-        print(render.run_status(status))
-    else:
-        print(json.dumps(status, indent=2))
+    print(_render_status(client.get_run(args.run_id)))
     return 0
 
 
@@ -553,20 +541,37 @@ def cmd_checkpoints(args) -> int:
     if render.styled():
         print(render.checkpoints_table(args.run_id, checkpoints))
         return 0
+    from flash.schema import format_checkpoint_ref
+
     for c in checkpoints:
-        print(f"step {c['step']:>6}  {c['repo_id']}:{c['subfolder']}")
+        # single-space, unpadded columns so a plain `grep "step N"` / awk split works; the ref is
+        # the canonical short form, paste-able into train.init_from_adapter.
+        print(f"step {c['step']} {format_checkpoint_ref(args.run_id, c['step'])}")
     print(
-        f"\ndeploy one with `flash deploy {args.run_id} --step <STEP>`.",
+        f"\ndeploy one with `flash deploy {args.run_id}/step-<STEP>`.",
         file=sys.stderr,
     )
     return 0
 
 
 def cmd_deploy(args) -> int:
-    dep = client_from_config().deploy(
+    from flash.schema import parse_checkpoint_ref
+
+    # `flash deploy <run_id>/step-N` is the same checkpoint ref `flash checkpoints` prints.
+    parsed = parse_checkpoint_ref(args.run_id)
+    if parsed is None:
+        print(
+            f"invalid run/checkpoint reference {args.run_id!r} "
+            "(expected <run_id> or <run_id>/step-N)",
+            file=sys.stderr,
+        )
+        return 1
+    base_run_id, _step = parsed
+    client = client_from_config()
+    dep = client.deploy(
         args.run_id,
         dry_run=args.dry_run,
-        step=getattr(args, "step", None),
+        verify=not getattr(args, "no_verify", False),
     )
     if render.styled():
         print(render.deployed(dep))
@@ -574,12 +579,43 @@ def cmd_deploy(args) -> int:
         print(json.dumps(dep, indent=2))
     # a dry run creates no deployment, so the billing / undeploy hint would be misleading.
     if dep.get("state") != "dry_run":
+        endpoint = str(dep.get("endpoint_name") or "").rstrip("/")
+        openai_base = dep.get("url") or (f"{endpoint}/v1" if endpoint else "")
         note = (
-            f"serving is billed per token only; use `flash undeploy {args.run_id}` "
+            f"serving is billed per token only; use `flash undeploy {base_run_id}` "
             "to deregister the adapter."
         )
         print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
-    return 0
+        if openai_base:
+            url_note = (
+                f"OpenAI-compatible base URL: {openai_base} — point clients at this /v1 base, "
+                "not the bare endpoint (which 404s on /chat/completions)."
+            )
+            print(render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr)
+    if dep.get("state") != "dry_run":
+        state = dep.get("state", "deploying")
+        if state == "failed":
+            detail = str(dep.get("error") or dep.get("detail") or "unknown error")
+            status_note = (
+                f"deployment failed: {detail}; run `flash deployments` for details and "
+                f"retry `flash deploy {args.run_id}` after fixing the error."
+            )
+        else:
+            status_note = (
+                f"deployment state is {state!r}; run `flash deployments` to check progress "
+                "and use `flash chat` once it is ready."
+            )
+        print(
+            render.arrow(status_note) if render.styled() else f"note: {status_note}",
+            file=sys.stderr,
+        )
+        if getattr(args, "no_verify", False):
+            skip_note = "server-side smoke verification was skipped for this deployment."
+            print(
+                render.arrow(skip_note) if render.styled() else f"note: {skip_note}",
+                file=sys.stderr,
+            )
+    return 1 if dep.get("state") == "failed" else 0
 
 
 def cmd_export(args) -> int:
@@ -592,9 +628,8 @@ def cmd_export(args) -> int:
             "(export it in your shell or put it in a local .env / .env.local)"
         )
     client = client_from_config()
-    where = f" (step {args.step})" if args.step is not None else ""
     progress = (
-        f"exporting adapter {args.adapter_id}{where} to {args.repository} — "
+        f"exporting adapter {args.adapter_id} to {args.repository} — "
         "downloading then re-uploading; this can take a minute..."
     )
     print(render.note(progress) if render.styled() else progress, file=sys.stderr)
@@ -602,7 +637,6 @@ def cmd_export(args) -> int:
         args.adapter_id,
         repository=args.repository,
         hf_token=hf_token,
-        step=args.step,
         private=not args.public,
     )
     if render.styled():
@@ -639,23 +673,41 @@ def cmd_deployments(args) -> int:
     if render.styled():
         print(render.deployments_table(rows))
         return 0
-    print(f"{'RUN_ID':<32}  {'GPU':<9}  ENDPOINT")
+    print(f"{'RUN_ID':<32}  {'STATE':<10}  {'GPU':<9}  {'ENDPOINT':<32}  DETAIL")
     for r in rows:
         d = r.get("deployment") or {}
-        print(f"{r['run_id']:<32}  {d.get('gpu', '?'):<9}  {d.get('endpoint_name', '')}")
+        detail = str(d.get("error") or d.get("detail") or "")
+        print(
+            f"{r['run_id']:<32}  {d.get('state', '?'):<10}  "
+            f"{d.get('gpu', '?'):<9}  {d.get('endpoint_name', ''):<32}  {detail}"
+        )
     return 0
 
 
 def cmd_chat(args) -> int:
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(args.run_id)
+    if parsed is None:
+        print(
+            f"invalid run/checkpoint reference {args.run_id!r} "
+            "(expected <run_id> or <run_id>/step-N)",
+            file=sys.stderr,
+        )
+        return 1
+    base_run_id, _step = parsed
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
+    system = getattr(args, "system", None)
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
     if render.styled():
         print(render.chat_label())
     stream = getattr(client, "chat_stream", None)
     if stream is not None:
         wrote = False
         for chunk in stream(
-            args.run_id,
+            base_run_id,
             messages=messages,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -667,7 +719,7 @@ def cmd_chat(args) -> int:
         return 0
 
     resp = client.chat(
-        args.run_id,
+        base_run_id,
         messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,

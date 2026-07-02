@@ -75,7 +75,7 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
         _precheck_budget_or_block(spec, org_id)
     try:
         db.record_run(spec.run_id, key["id"])
-        submit_kwargs = {"dry_run": dry_run, "background": True}
+        submit_kwargs = {"dry_run": dry_run, "background": True, "owner_key_id": key["id"]}
         if runtime_secrets:
             submit_kwargs["runtime_secrets"] = runtime_secrets
         if billing_context:
