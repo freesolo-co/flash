@@ -14,11 +14,9 @@ from __future__ import annotations
 import os
 import re
 
+from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.runner import adapter_prefix
 from flash.spec import JobSpec
-
-# The PEFT weights file a step must carry (alongside adapter_config.json) to be servable.
-_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors"})
 
 
 class CheckpointListingError(RuntimeError):
@@ -43,9 +41,10 @@ def _adapter_folder_has_required_files(files: list[str], prefix: str) -> bool:
     names = {
         path.removeprefix(f"{prefix}/adapter/")
         for path in files
-        if path.startswith(f"{prefix}/adapter/") and "/" not in path.removeprefix(f"{prefix}/adapter/")
+        if path.startswith(f"{prefix}/adapter/")
+        and "/" not in path.removeprefix(f"{prefix}/adapter/")
     }
-    return "adapter_config.json" in names and not names.isdisjoint(_ADAPTER_WEIGHT_FILES)
+    return "adapter_config.json" in names and not names.isdisjoint(ADAPTER_WEIGHT_FILES)
 
 
 def _repo_files(spec: JobSpec, *, strict: bool) -> list[str]:
@@ -55,9 +54,7 @@ def _repo_files(spec: JobSpec, *, strict: bool) -> list[str]:
     try:
         from huggingface_hub import HfApi
 
-        return HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
-            repo, repo_type="dataset"
-        )
+        return HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(repo, repo_type="dataset")
     except Exception as exc:
         if strict:
             raise CheckpointListingError(
@@ -82,7 +79,7 @@ def _checkpoints_from_files(spec: JobSpec, files: list[str]) -> list[dict]:
     out: list[dict] = []
     for step in sorted(by_step):
         names = by_step[step]
-        if "adapter_config.json" not in names or names.isdisjoint(_ADAPTER_WEIGHT_FILES):
+        if "adapter_config.json" not in names or names.isdisjoint(ADAPTER_WEIGHT_FILES):
             continue
         prefix = checkpoint_adapter_prefix(spec, step)
         out.append(

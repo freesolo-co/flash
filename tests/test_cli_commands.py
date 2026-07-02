@@ -376,8 +376,9 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert _run(["env", "setup"]) == 0
 
     assert (tmp_path / "environment.py").is_file()
-    dataset = tmp_path / "datasets/train.jsonl"
+    dataset = tmp_path / "dataset/train.jsonl"
     assert dataset.is_file()
+    assert not (tmp_path / "datasets").exists()
     assert '"input":"What is 2 + 2?"' in dataset.read_text()
     grpo = tmp_path / "configs/rl.toml"
     sft = tmp_path / "configs/sft.toml"
@@ -400,6 +401,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "## Common Flash issues and mitigations" in training_text
     assert "Trying to pin managed infrastructure" in training_text
     assert "response_text.thinking" in training_text
+    assert "Qwen3.5 thinking multi-turn SFT" in training_text
+    assert "longest shared token prefix" in training_text
     assert "flash env pull your-org/my-env" in training_text
     assert "private environment-scoped repo" in training_text
     assert "flash checkpoints <run-id>" in training_text
@@ -409,7 +412,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "runpod" not in training_text.lower()
     assert "lambda" not in training_text.lower()
     out = capsys.readouterr().out
-    assert "datasets/train.jsonl" in out
+    assert "dataset/train.jsonl" in out
     assert "configs/rl.toml" in out
     assert "TRAINING.md" in out
 

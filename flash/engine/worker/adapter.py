@@ -199,6 +199,7 @@ def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
     import shutil
     import tempfile
 
+    from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
     from flash.engine.worker.hf import _CHECKPOINT_TRAINER_STATE
 
     out_dir = tempfile.mkdtemp(prefix="flash_recomb_adapter_")
@@ -214,7 +215,7 @@ def recombined_warmstart_adapter_dir(src_adapter_dir: str) -> str | None:
         # Skip trainer state — for the per-step path src is a `checkpoint-<n>` dir carrying optimizer/
         # scheduler state that the deployable adapter must not duplicate.
         for name in os.listdir(src_adapter_dir):
-            if name in ("adapter_model.safetensors", "adapter_config.json"):
+            if name == "adapter_config.json" or name in ADAPTER_WEIGHT_FILES:
                 continue
             if any(fnmatch.fnmatch(name, pat) for pat in _CHECKPOINT_TRAINER_STATE):
                 continue

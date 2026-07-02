@@ -153,25 +153,25 @@ cheapest validated RunPod class that fits the model, so you don&#x27;t pin a GPU
 <span style="color:#3a46c8">B200        </span>  <span style="color:#5b6472">180 GB</span>  <span style="color:#0e7490">$5.89</span>
 
 <span style="opacity:.62">Tip: GPU class selection is fully automatic — the submit-time allocator always picks the
-cheapest validated RunPod class that fits the model, so you don&#x27;t pin a GPU type.</span></pre></div></div></section><section class="card"><div class="head"><code>flash env setup</code><span class="sub">scaffold a starter environment</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>ensured environment.py, datasets/train.jsonl, configs/rl.toml, configs/sft.toml, TRAINING.md</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">env setup</span>  <span style="color:#8a93a8">starter Freesolo environment</span>
+cheapest validated RunPod class that fits the model, so you don&#x27;t pin a GPU type.</span></pre></div></div></section><section class="card"><div class="head"><code>flash env setup</code><span class="sub">scaffold a starter environment</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>ensured environment.py, dataset/train.jsonl, configs/rl.toml, configs/sft.toml, TRAINING.md</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">env setup</span>  <span style="color:#8a93a8">starter Freesolo environment</span>
 <span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
 <span style="color:#57ff8f;font-weight:700">✓</span> scaffold ready
 
-  <span style="color:#97a3ff">environment.py      </span>  <span style="opacity:.62">env entrypoint — edit the reward + prompt</span>
-  <span style="color:#97a3ff">datasets/train.jsonl</span>  <span style="opacity:.62">starter training rows</span>
-  <span style="color:#97a3ff">configs/rl.toml     </span>  <span style="opacity:.62">GRPO run config</span>
-  <span style="color:#97a3ff">configs/sft.toml    </span>  <span style="opacity:.62">SFT run config</span>
-  <span style="color:#97a3ff">TRAINING.md         </span>  <span style="opacity:.62">how to train well — read this first</span>
+  <span style="color:#97a3ff">environment.py     </span>  <span style="opacity:.62">env entrypoint — edit the reward + prompt</span>
+  <span style="color:#97a3ff">dataset/train.jsonl</span>  <span style="opacity:.62">starter training rows</span>
+  <span style="color:#97a3ff">configs/rl.toml    </span>  <span style="opacity:.62">GRPO run config</span>
+  <span style="color:#97a3ff">configs/sft.toml   </span>  <span style="opacity:.62">SFT run config</span>
+  <span style="color:#97a3ff">TRAINING.md        </span>  <span style="opacity:.62">how to train well — read this first</span>
 
 <span style="color:#97a3ff">→</span> <span style="opacity:.62">publish it: flash env push --name my-env .</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">env setup</span>  <span style="color:#5b6472">starter Freesolo environment</span>
 <span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
 <span style="color:#00695c;font-weight:700">✓</span> scaffold ready
 
-  <span style="color:#3a46c8">environment.py      </span>  <span style="opacity:.62">env entrypoint — edit the reward + prompt</span>
-  <span style="color:#3a46c8">datasets/train.jsonl</span>  <span style="opacity:.62">starter training rows</span>
-  <span style="color:#3a46c8">configs/rl.toml     </span>  <span style="opacity:.62">GRPO run config</span>
-  <span style="color:#3a46c8">configs/sft.toml    </span>  <span style="opacity:.62">SFT run config</span>
-  <span style="color:#3a46c8">TRAINING.md         </span>  <span style="opacity:.62">how to train well — read this first</span>
+  <span style="color:#3a46c8">environment.py     </span>  <span style="opacity:.62">env entrypoint — edit the reward + prompt</span>
+  <span style="color:#3a46c8">dataset/train.jsonl</span>  <span style="opacity:.62">starter training rows</span>
+  <span style="color:#3a46c8">configs/rl.toml    </span>  <span style="opacity:.62">GRPO run config</span>
+  <span style="color:#3a46c8">configs/sft.toml   </span>  <span style="opacity:.62">SFT run config</span>
+  <span style="color:#3a46c8">TRAINING.md        </span>  <span style="opacity:.62">how to train well — read this first</span>
 
 <span style="color:#3a46c8">→</span> <span style="opacity:.62">publish it: flash env push --name my-env .</span></pre></div></div></section><section class="card"><div class="head"><code>flash env list</code><span class="sub">local environment sources</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>local env sources (publish with `flash env push --name &lt;name&gt; &lt;path&gt;`):
   .
