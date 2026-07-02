@@ -332,7 +332,10 @@ def _registered_adapter(run_id: str) -> dict | None:
     if not isinstance(payload, dict):
         return None
     for record in payload.get("adapters") or []:
-        if isinstance(record, dict) and record.get("adapter_id", record.get("adapterId")) == run_id:
+        if not isinstance(record, dict):
+            continue
+        adapter_id = record.get("adapter_id") or record.get("adapterId")
+        if adapter_id == run_id:
             return record
     return None
 

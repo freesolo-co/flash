@@ -245,6 +245,31 @@ def test_deploy_reads_registry_back_before_ready(monkeypatch):
     assert gets == ["https://serve.example/adapters"]
 
 
+def test_deploy_registry_readback_falls_back_to_camel_adapter_id(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+
+    class _PostResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
+    monkeypatch.setattr(
+        deploy_mod.httpx,
+        "get",
+        lambda *a, **k: _registry_resp(
+            [{"adapter_id": None, "adapterId": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
+        ),
+    )
+
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert dep.state == "ready"
+
+
 def test_deploy_fails_when_adapter_never_appears_in_registry(monkeypatch):
     import flash.serve.deploy as deploy_mod
     from flash.serve.deploy import ServingError
