@@ -269,6 +269,18 @@ def test_download_env_package_percent_encodes_reserved_chars(stub, monkeypatch):
     assert seen["path"] == "/api/flash/environments/team/env%3Fx%3D1%23frag/package"
 
 
+def test_download_env_package_caps_response_body(stub, monkeypatch):
+    from flash.envs import loader as adapter
+
+    url, _seen = stub
+    monkeypatch.setenv("FREESOLO_BASE_URL", url)
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 5)
+    client = ApiClient("http://flash-control.test", "fslo-user-test")
+
+    with pytest.raises(ClientError, match="maximum allowed size"):
+        client.download_env_package("acme/my-env")
+
+
 def test_download_env_package_unreachable_backend_is_actionable(monkeypatch):
     monkeypatch.setenv("FREESOLO_BASE_URL", "http://127.0.0.1:1")
     client = ApiClient("http://flash-control.test", "fslo-user-test", timeout=2)

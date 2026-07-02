@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -56,21 +57,29 @@ def cmd_env_pull(args) -> int:
     from flash.envs.pull import (
         download_environment_file,
         download_environment_file_from_archive,
+        ensure_environment_pull_destination_available,
         environment_local_dirname,
         pull_environment_package,
         pull_environment_package_from_archive,
     )
 
-    env_id = args.env_id
+    env_id = str(args.env_id or "").strip()
     if not is_freesolo_environment_id(env_id):
         print(
             'env id must be a Freesolo environment id — a managed slug "your-name/your-env", '
-            f'a "github:owner/repo@ref:path" ref, or a github.com URL (got {env_id!r})',
+            f'a "github:owner/repo@ref:path" ref, or a github.com URL (got {args.env_id!r})',
             file=sys.stderr,
         )
         return 1
     try:
         managed = is_managed_environment_slug(env_id)
+        if managed and (
+            env_id != env_id.lower()
+            or not all(re.fullmatch(r"[a-z0-9._-]+", part) for part in env_id.split("/"))
+        ):
+            return _err(
+                f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
+            )
         if args.path:
             default_name = Path(args.path.replace("\\", "/")).name
             out = Path(args.output) if args.output else Path(default_name)
@@ -98,6 +107,7 @@ def cmd_env_pull(args) -> int:
         else:
             out = Path(args.output) if args.output else Path(environment_local_dirname(env_id))
             if managed:
+                ensure_environment_pull_destination_available(out, overwrite=args.force)
                 package = client_from_config().download_env_package(env_id)
                 pull_environment_package_from_archive(package, out, overwrite=args.force)
             else:

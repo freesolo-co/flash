@@ -570,6 +570,59 @@ def test_cmd_env_pull_managed_whole_env_uses_authenticated_package(monkeypatch, 
     assert (dest / "datasets" / "train.jsonl").is_file()
 
 
+def test_cmd_env_pull_managed_whole_env_strips_slug_before_request(monkeypatch, tmp_path):
+    seen: dict[str, str] = {}
+
+    class _Client:
+        def download_env_package(self, env_id: str) -> bytes:
+            seen["env_id"] = env_id
+            return _package_tarball()
+
+    monkeypatch.setattr("flash.client.client_from_config", lambda: _Client())
+    dest = tmp_path / "stuff"
+
+    rc = cmd_env_pull(_args(env_id="  david-freesolo-co/stuff  ", output=str(dest)))
+
+    assert rc == 0
+    assert seen == {"env_id": "david-freesolo-co/stuff"}
+
+
+def test_cmd_env_pull_managed_rejects_mixed_case_before_request(monkeypatch, tmp_path):
+    calls = {"n": 0}
+
+    class _Client:
+        def download_env_package(self, env_id: str) -> bytes:
+            calls["n"] += 1
+            return _package_tarball()
+
+    monkeypatch.setattr("flash.client.client_from_config", lambda: _Client())
+
+    rc = cmd_env_pull(_args(env_id="David-Freesolo-Co/stuff", output=str(tmp_path / "stuff")))
+
+    assert rc == 1
+    assert calls["n"] == 0
+
+
+def test_cmd_env_pull_managed_refuses_existing_dir_before_download(monkeypatch, tmp_path):
+    calls = {"n": 0}
+
+    class _Client:
+        def download_env_package(self, env_id: str) -> bytes:
+            calls["n"] += 1
+            return _package_tarball()
+
+    monkeypatch.setattr("flash.client.client_from_config", lambda: _Client())
+    dest = tmp_path / "stuff"
+    dest.mkdir()
+    (dest / "keep.txt").write_text("existing")
+
+    rc = cmd_env_pull(_args(env_id="david-freesolo-co/stuff", output=str(dest)))
+
+    assert rc == 1
+    assert calls["n"] == 0
+    assert (dest / "keep.txt").read_text() == "existing"
+
+
 def test_cmd_env_pull_managed_single_file_uses_authenticated_package(monkeypatch, tmp_path):
     seen: dict[str, str] = {}
 

@@ -163,11 +163,31 @@ def _replace_with_tree(source: Path, dest: Path) -> None:
             shutil.rmtree(staging_parent, ignore_errors=True)
 
 
-def _copy_environment_source(source: Path, dest_path: Path, *, overwrite: bool = False) -> None:
+def ensure_environment_pull_destination_available(
+    dest: str | Path,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    dest_path = Path(dest)
     if _path_occupied(dest_path) and not overwrite:
         raise FileExistsError(
             f"destination {dest_path} already exists (pass overwrite=True to replace)"
         )
+    if (
+        overwrite
+        and dest_path.is_dir()
+        and not dest_path.is_symlink()
+        and _cwd_is_inside(dest_path)
+    ):
+        raise RuntimeError(
+            f"refusing to overwrite {dest_path} because it contains the current working directory; "
+            "choose a separate output path"
+        )
+    return dest_path
+
+
+def _copy_environment_source(source: Path, dest_path: Path, *, overwrite: bool = False) -> None:
+    ensure_environment_pull_destination_available(dest_path, overwrite=overwrite)
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     dest_is_real_dir = dest_path.is_dir() and not dest_path.is_symlink()
@@ -255,11 +275,7 @@ def pull_environment_package_from_archive(
     overwrite: bool = False,
 ) -> Path:
     """Extract a backend-returned managed environment package to ``dest``."""
-    dest_path = Path(dest)
-    if _path_occupied(dest_path) and not overwrite:
-        raise FileExistsError(
-            f"destination {dest_path} already exists (pass overwrite=True to replace)"
-        )
+    dest_path = ensure_environment_pull_destination_available(dest, overwrite=overwrite)
 
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
     try:
@@ -301,11 +317,7 @@ def pull_environment_package(env_ref: str, dest: str | Path, *, overwrite: bool 
             "specify a managed environment id (namespace/name) or a github ref to its subdirectory"
         )
 
-    dest_path = Path(dest)
-    if _path_occupied(dest_path) and not overwrite:
-        raise FileExistsError(
-            f"destination {dest_path} already exists (pass overwrite=True to replace)"
-        )
+    dest_path = ensure_environment_pull_destination_available(dest, overwrite=overwrite)
 
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
     try:

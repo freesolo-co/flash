@@ -34,6 +34,7 @@ class ApiError(ClientError):
 
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 def freesolo_base_url(override: str | None = None) -> str:
@@ -50,6 +51,23 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> str:
     except (ValueError, AttributeError):
         detail = body.decode(errors="replace") if body else str(exc)
     return str(detail)
+
+
+def _read_capped_response(resp: object, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ClientError(
+                f"response body exceeded the maximum allowed size ({max_bytes} bytes); "
+                "download aborted"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
@@ -192,6 +210,7 @@ class ApiClient:
         path: str,
         *,
         timeout: float | None = None,
+        max_bytes: int | None = None,
     ) -> bytes:
         base = freesolo_base_url()
         headers = {"Accept": "application/gzip"}
@@ -204,6 +223,8 @@ class ApiClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                if max_bytes is not None:
+                    return _read_capped_response(resp, max_bytes)
                 return resp.read()
         except urllib.error.HTTPError as exc:
             detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
@@ -250,11 +271,14 @@ class ApiClient:
 
     def download_env_package(self, env_id: str) -> bytes:
         """Download a managed environment package through the Freesolo backend."""
+        from flash.envs import loader as adapter
+
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request_freesolo_bytes(
             "GET",
             f"/api/flash/environments/{quoted}/package",
             timeout=1800.0,
+            max_bytes=adapter._MAX_ARCHIVE_BYTES,
         )
 
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
