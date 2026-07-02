@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 import httpx
 
 from flash._logging import get_logger
+from flash.lora_rank import rank_from_adapter_config
 from flash.providers.base import canonical_gpu
 
 logger = get_logger(__name__)
@@ -138,25 +139,7 @@ def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str =
 
 
 def _rank_from_adapter_config(config: dict, *, source: str) -> int:
-    ranks: list[int] = []
-    try:
-        if config.get("r") is not None:
-            ranks.append(int(config["r"]))
-        if "rank_pattern" in config and config["rank_pattern"] is not None:
-            rank_pattern = config["rank_pattern"]
-            if not isinstance(rank_pattern, dict):
-                raise TypeError("rank_pattern is not a mapping")
-            ranks.extend(int(v) for v in rank_pattern.values())
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"could not verify adapter rank: {source} has invalid rank metadata"
-        ) from exc
-    if not ranks:
-        raise ValueError(f"could not verify adapter rank: {source} has no LoRA rank metadata")
-    rank = max(ranks)
-    if rank <= 0:
-        raise ValueError(f"could not verify adapter rank: {source} has non-positive rank {rank}")
-    return rank
+    return rank_from_adapter_config(config, source=source)
 
 
 def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:

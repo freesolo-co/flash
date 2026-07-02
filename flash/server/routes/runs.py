@@ -9,6 +9,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from flash.lora_rank import preflight_init_adapter_lora_rank
 from flash.runner import cancel_run, new_run_id, runs_file_path
 from flash.server import app as _app
 from flash.server import db
@@ -74,6 +75,7 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
         # gate BEFORE recording/submitting: reject an unaffordable run before any GPU is allocated.
         _precheck_budget_or_block(spec, org_id)
     try:
+        preflight_init_adapter_lora_rank(spec, token=os.environ.get("HF_TOKEN"))
         db.record_run(spec.run_id, key["id"])
         submit_kwargs = {"dry_run": dry_run, "background": True}
         if runtime_secrets:

@@ -231,6 +231,38 @@ def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkey
     assert not row.get("email")
 
 
+def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch):
+    import flash.server.routes.runs as runs_mod
+
+    def fail_preflight(spec, *, token=None):
+        raise ValueError("adapter is too high for serving")
+
+    def unexpected_submit(*args, **kwargs):
+        raise AssertionError("submit_job should not run after preflight failure")
+
+    monkeypatch.setattr(runs_mod, "preflight_init_adapter_lora_rank", fail_preflight)
+    monkeypatch.setattr(runs_mod._app, "submit_job", unexpected_submit)
+
+    key = _login()
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "init_from_adapter": "owner/runs:sft/sft-run",
+        },
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert resp.status_code == 400
+    assert "adapter is too high for serving" in resp.text
+    assert api.get("/v1/runs", headers=_bearer(key)).json()["runs"] == []
+
+
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # A freesolo key that verifies with the backend but whose db row was disabled (revoked)
     # must be rejected as 401 (authenticate -> None), not raise a 500.
