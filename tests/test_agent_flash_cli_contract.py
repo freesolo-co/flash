@@ -214,7 +214,5 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     assert get_status(rid).to_dict()["adapter_ref"] is None
 
     runner._save_status(RunStatus(run_id=rid, state="done", spec=spec.to_dict()))
-    assert (
-        get_status(rid).to_dict()["adapter_ref"]
-        == f"Freesolo-Co/flashrun-{rid}:sft/{rid}"
-    )
+    # the public short ref: exactly what train.init_from_adapter accepts
+    assert get_status(rid).to_dict()["adapter_ref"] == rid

@@ -31,7 +31,7 @@ def _patch_no_sleep(monkeypatch):
 
 
 def test_urlopen_raises_typed_error_on_429(monkeypatch):
-    from flash.envs.adapter import GitHubRateLimitError, _urlopen
+    from flash.envs.loader import GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
@@ -42,7 +42,7 @@ def test_urlopen_raises_typed_error_on_429(monkeypatch):
 
 
 def test_urlopen_raises_typed_error_on_rate_limit_403(monkeypatch):
-    from flash.envs.adapter import GitHubRateLimitError, _urlopen
+    from flash.envs.loader import GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     body = '{"message": "API rate limit exceeded for user ID 1"}'
@@ -56,7 +56,7 @@ def test_urlopen_raises_typed_error_on_rate_limit_403(monkeypatch):
 def test_urlopen_non_rate_limit_403_stays_plain_runtime_error(monkeypatch):
     # A 403 that is NOT a rate limit (auth failure, repo not found) must stay a plain RuntimeError
     # (non-retriable) so the run fails fast instead of looping on a fresh worker forever.
-    from flash.envs.adapter import GitHubRateLimitError, _urlopen
+    from flash.envs.loader import GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
@@ -70,7 +70,7 @@ def test_urlopen_non_rate_limit_403_stays_plain_runtime_error(monkeypatch):
 
 
 def test_urlopen_success_returns_bytes(monkeypatch):
-    from flash.envs.adapter import _urlopen
+    from flash.envs.loader import _urlopen
 
     class _Resp:
         def __enter__(self):
@@ -162,7 +162,7 @@ _GH_ENV = "github:owner/repo@main:env/environment.py"
 
 
 def test_assign_resolved_env_sha_pins_when_resolver_succeeds(monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
     from flash import runner
     from flash.spec import EnvironmentSpec, JobSpec
 
@@ -177,7 +177,7 @@ def test_assign_resolved_env_sha_pins_when_resolver_succeeds(monkeypatch):
 def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
     # The control-plane pin must never block run creation on GitHub retries: it resolves with a
     # short timeout and zero rate-limit retries (the worker keeps the full retry budget).
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
     from flash import runner
     from flash.spec import EnvironmentSpec, JobSpec
 
@@ -195,7 +195,7 @@ def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
 
 
 def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
     from flash import runner
     from flash.spec import EnvironmentSpec, JobSpec
 
@@ -209,7 +209,7 @@ def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
 
 
 def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
     from flash import runner
     from flash.spec import EnvironmentSpec, JobSpec
 

@@ -98,18 +98,6 @@ class _ProgressReader:
         return chunk
 
 
-def _validate_checkpoint_step(step: int | float) -> int:
-    """Validate a checkpoint step before the request: reject bool (int(True)==1) and fractional floats
-    (int(2.7)==2 would target the WRONG checkpoint), then return the int — fail fast before the server."""
-    if isinstance(step, bool):
-        raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
-    if isinstance(step, float) and not step.is_integer():
-        raise ClientError(
-            f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
-        )
-    return int(step)
-
-
 def _validate_chat_messages(messages: list[dict]) -> None:
     if not isinstance(messages, list):
         raise ClientError("chat messages must be a list")
@@ -233,31 +221,45 @@ class ApiClient:
         return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
-        return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
+        try:
+            return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
+        except ApiError as exc:
+            if exc.status == 404 and "not found" in str(exc).strip().lower():
+                return {}
+            raise
 
     def cancel_run(self, run_id: str) -> dict:
-        return self._request("POST", f"/v1/runs/{run_id}/cancel")
+        # Cancel blocks on synchronous provider teardown (worker stop + instance destroy +
+        # endpoint GC), which can far exceed the default 60s — timing out here left the CLI
+        # printing a traceback while the server went on to mark the run cancelled anyway.
+        return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=10 * 60)
 
     def checkpoints(self, run_id: str) -> list[dict]:
-        """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""
+        """Deployable per-step RL checkpoints for a run (serve one with `flash deploy RUN/step-N`)."""
         return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
 
     def deploy(
         self,
         run_id: str,
         dry_run: bool = False,
-        step: int | None = None,
+        verify: bool = True,
     ) -> dict:
-        # Deploy blocks on registration and serving warmup, which can take many minutes.
-        deploy_timeout = 30 * 60 if not dry_run else None
-        body: dict = {"dry_run": dry_run}
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
+                "for a saved checkpoint"
+            )
+        base_run_id, step = parsed
+        body: dict = {"dry_run": dry_run, "verify": verify}
         if step is not None:
-            body["step"] = _validate_checkpoint_step(step)
+            body["step"] = step
         return self._request(
             "POST",
-            f"/v1/runs/{run_id}/deploy",
+            f"/v1/runs/{base_run_id}/deploy",
             body=body,
-            timeout=deploy_timeout,
         )
 
     def export(
@@ -266,15 +268,23 @@ class ApiClient:
         *,
         repository: str,
         hf_token: str,
-        step: int | None = None,
         private: bool = True,
     ) -> dict:
         """Copy a run's adapter into a user-owned HuggingFace repo."""
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
+                "for a saved checkpoint"
+            )
+        base_run_id, step = parsed
         body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
         if step is not None:
-            body["step"] = _validate_checkpoint_step(step)
+            body["step"] = step
         return self._request(
-            "POST", f"/v1/runs/{run_id}/export", body=body, timeout=30 * 60
+            "POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60
         )
 
     def undeploy(self, run_id: str) -> dict:
@@ -289,13 +299,22 @@ class ApiClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 512,
+        timeout: float | None = None,
     ) -> dict:
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
+            )
+        base_run_id, _step = parsed
         _validate_chat_messages(messages)
         return self._request(
             "POST",
-            f"/v1/runs/{run_id}/chat",
+            f"/v1/runs/{base_run_id}/chat",
             body={"messages": messages, "temperature": temperature, "max_tokens": max_tokens},
-            timeout=30 * 60,
+            timeout=timeout if timeout is not None else 30 * 60,
         )
 
     def chat_stream(
@@ -305,12 +324,20 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
+            )
+        base_run_id, _step = parsed
         _validate_chat_messages(messages)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(
-            f"{self.api_url}/v1/runs/{run_id}/chat",
+            f"{self.api_url}/v1/runs/{base_run_id}/chat",
             method="POST",
             data=json.dumps(
                 {

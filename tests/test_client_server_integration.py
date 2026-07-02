@@ -94,6 +94,7 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
+    monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
     # runpod.keys caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
     import flash.providers.runpod.keys as runpod_keys
@@ -116,6 +117,11 @@ def make_client(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_k: {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]},
+    )
     # The Lambda key above (required by the startup preflight) also makes
     # configured_providers() treat it as live, so create_app()'s lifespan recover_runs() would
     # dispatch real sweep_orphans() list calls — and the urllib->TestClient shim below isn't installed
