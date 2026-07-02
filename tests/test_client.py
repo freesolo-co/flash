@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from flash.client import ApiClient, ApiError, ClientError
+from flash.client import ApiClient, ApiError, ClientError, RequestTimeoutError
 
 
 @pytest.fixture
@@ -24,10 +25,19 @@ def stub():
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_bytes(self, code: int, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             seen["auth"] = self.headers.get("Authorization")
             seen["path"] = self.path
-            if self.path == "/v1/runs/old-api/worker":
+            if self.path.startswith("/v1/envs/") and self.path.endswith("/package"):
+                self._send_bytes(200, b"package-bytes")
+            elif self.path == "/v1/runs/old-api/worker":
                 self._send(404, {"detail": "Not Found"})
             elif self.path == "/v1/runs/proxy-old-api/worker":
                 self.send_response(404)
@@ -237,6 +247,37 @@ def test_delete_env_percent_encodes_reserved_chars(stub):
     assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag"
 
 
+def test_download_env_package_uses_flash_control_plane(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    data = client.download_env_package("acme/my-env")
+
+    assert data == b"package-bytes"
+    assert seen["path"] == "/v1/envs/acme/my-env/package"
+    assert seen["auth"] == "Bearer fslo-user-test"
+
+
+def test_download_env_package_percent_encodes_reserved_chars(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    client.download_env_package("team/env?x=1#frag")
+
+    assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag/package"
+
+
+def test_download_env_package_caps_response_body(stub, monkeypatch):
+    from flash.envs import loader as adapter
+
+    url, _seen = stub
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 5)
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="maximum allowed size"):
+        client.download_env_package("acme/my-env")
+
+
 def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
     import flash.client.http as http_mod
 
@@ -292,6 +333,40 @@ def test_unreachable_server_is_actionable():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     with pytest.raises(ClientError, match="FLASH_API_URL"):
         client.health()
+
+
+def test_raw_read_timeout_maps_to_client_error(monkeypatch):
+    def timeout(req, timeout=None):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", timeout)
+
+    client = ApiClient("http://flash.example", "fslo-user-test", timeout=2)
+    with pytest.raises(RequestTimeoutError, match="timed out"):
+        client.health()
+
+
+def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
+    client = ApiClient("http://flash.example", "fslo-user-test")
+    calls: list[tuple[str, str, float | None]] = []
+
+    def request(method, path, body=None, timeout=None, progress=None):
+        calls.append((method, path, timeout))
+        if method == "POST":
+            raise RequestTimeoutError("cancel timed out")
+        if method == "GET" and path == "/v1/runs/r1":
+            return {"run_id": "r1", "state": "cancelled", "remote": {"gpu": "B200"}}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(client, "_request", request)
+
+    out = client.cancel_run("r1")
+
+    assert out["state"] == "cancelled"
+    assert calls == [
+        ("POST", "/v1/runs/r1/cancel", 60.0),
+        ("GET", "/v1/runs/r1", None),
+    ]
 
 
 def test_deploy_rejects_malformed_checkpoint_ref():

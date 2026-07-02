@@ -448,12 +448,11 @@ def deployments_table(rows: list[dict]) -> str:
             [
                 (r["run_id"], _ACCENT2),
                 (state, color),
-                (d.get("gpu", "?"), _GRAY),
                 (d.get("endpoint_name", ""), _GREEN),
                 (detail, _GRAY),
             ]
         )
-    table = _table(["RUN ID", "STATE", "GPU", "ENDPOINT", "DETAIL"], body)
+    table = _table(["RUN ID", "STATE", "ENDPOINT", "DETAIL"], body)
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
@@ -549,14 +548,13 @@ def cancelled(payload: dict) -> str:
 
 
 def deployed(dep: dict) -> str:
-    """`flash deploy`: the endpoint, gpu, and serving url as an aligned card (not a JSON dump)."""
+    """`flash deploy`: the endpoint and serving URL as an aligned card (not a JSON dump)."""
     endpoint = str(dep.get("endpoint_name") or "")
     # OpenAI clients need the /v1 base; older servers omit `url`, so derive it from the endpoint.
     url = dep.get("url") or (f"{endpoint.rstrip('/')}/v1" if endpoint else None)
     pairs = [
         ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
         ("endpoint", _paint(endpoint, _GREEN) if endpoint else None),
-        ("gpu", dep.get("gpu")),
         ("url", _paint(url, _ACCENT2) if url else None),
     ]
     state = dep.get("state", "deployed")

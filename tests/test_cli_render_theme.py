@@ -144,7 +144,7 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
         render.models_table([{"id": "acme/x"}]),
         render.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
         render.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
-        render.deployments_table([{"run_id": "r", "deployment": {"gpu": "RTX 4090"}}]),
+        render.deployments_table([{"run_id": "r", "deployment": {"state": "ready"}}]),
         render.env_setup(["environment.py", "dataset/train.jsonl", "configs/rl.toml"]),
         render.env_list([]),
         render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"),
@@ -218,14 +218,10 @@ def test_deploy_dry_run_is_not_a_false_success(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
     # a real deploy still confirms
-    live = render.deployed(
-        {"run_id": "flash-1", "state": "ready", "endpoint_name": "ep", "gpu": "A100"}
-    )
+    live = render.deployed({"run_id": "flash-1", "state": "ready", "endpoint_name": "ep"})
     assert "deploy" in live
     # a dry run is a neutral validation line, not a success confirmation
-    dry = render.deployed(
-        {"run_id": "flash-1", "state": "dry_run", "endpoint_name": "ep", "gpu": "A100"}
-    )
+    dry = render.deployed({"run_id": "flash-1", "state": "dry_run", "endpoint_name": "ep"})
     assert "dry run" in dry
     assert "nothing deployed" in dry
     assert "dry_run" not in dry

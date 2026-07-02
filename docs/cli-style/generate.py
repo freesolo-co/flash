@@ -127,7 +127,6 @@ class FakeClient:
             "mode": "dev",
             "openai_model": run_id,
             "endpoint_name": "https://api.freesolo.co/v1",
-            "gpu": "RTX 4090",
         }
 
     def undeploy(self, run_id):
@@ -137,7 +136,10 @@ class FakeClient:
         return [
             {
                 "run_id": "flash-1718900000-a1b2c3d4",
-                "deployment": {"gpu": "RTX 4090", "endpoint_name": "https://api.freesolo.co/v1"},
+                "deployment": {
+                    "state": "ready",
+                    "endpoint_name": "https://api.freesolo.co/v1",
+                },
             }
         ]
 
