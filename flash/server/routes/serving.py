@@ -84,6 +84,12 @@ def _finish_deployment_unlocked(
     verify: bool,
 ) -> None:
     spec = JobSpec.from_dict(spec_dict)
+    active = (_app.get_status(run_id).deployment or {})
+    if (
+        active.get("requested_at") != deployment.get("requested_at")
+        or active.get("state") not in _DEPLOYMENT_BUSY_STATES
+    ):
+        return
     current = _deployment_state(deployment, "registering", detail="registering adapter")
     mark_deployment_pending(run_id, current)
     try:
