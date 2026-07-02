@@ -1291,7 +1291,9 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
             }
         )
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        import flash.runner.checkpoints as checkpoints
         monkeypatch.setattr(db, "run_owner", lambda run_id: 7 if run_id == "source-run" else None)
+        monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1309,6 +1311,62 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         )
 
         assert status.state == "dry_run"
+
+
+def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(run_id="source-run", state="running", spec=source.to_dict())
+        )
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="concrete source-run/step-N checkpoint"):
+            orch.submit_job(spec, dry_run=True, background=False)
+
+
+def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.checkpoints as checkpoints
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: False)
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="final adapter was not found"):
+            orch.submit_job(spec, dry_run=True, background=False)
 
 
 def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
@@ -1497,9 +1555,10 @@ def test_attach_resolves_public_init_ref_before_recovery_launch(monkeypatch):
         )
 
 
-def test_attach_marks_failed_when_init_ref_resolution_errors(monkeypatch):
+def test_attach_polls_existing_job_before_resolving_init_ref(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
         from flash.spec import JobSpec
 
         base = _spec("warm-recover").to_dict()
@@ -1516,6 +1575,49 @@ def test_attach_marks_failed_when_init_ref_resolution_errors(monkeypatch):
                 spec=spec.to_dict(),
                 remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
             )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(True, metrics={"cost_usd": 0.1}),
+        )
+        monkeypatch.setattr(
+            orch,
+            "_resolve_init_from_adapter",
+            lambda *a, **k: (_ for _ in ()).throw(ValueError("hf listing down")),
+        )
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+
+        status = orch.attach_run("warm-recover", log_stream=sys.stderr)
+
+        assert status.state == "done"
+
+
+def test_attach_marks_failed_when_init_ref_resolution_errors(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        from flash.spec import JobSpec
+
+        base = _spec("warm-recover").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="warm-recover",
+                state="running",
+                spec=spec.to_dict(),
+                remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="stalled"),
         )
         monkeypatch.setattr(
             orch,

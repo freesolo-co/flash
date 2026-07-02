@@ -301,10 +301,18 @@ class ApiClient:
         max_tokens: int = 512,
         timeout: float | None = None,
     ) -> dict:
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
+            )
+        base_run_id, _step = parsed
         _validate_chat_messages(messages)
         return self._request(
             "POST",
-            f"/v1/runs/{run_id}/chat",
+            f"/v1/runs/{base_run_id}/chat",
             body={"messages": messages, "temperature": temperature, "max_tokens": max_tokens},
             timeout=timeout if timeout is not None else 30 * 60,
         )
@@ -316,12 +324,20 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
+            )
+        base_run_id, _step = parsed
         _validate_chat_messages(messages)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(
-            f"{self.api_url}/v1/runs/{run_id}/chat",
+            f"{self.api_url}/v1/runs/{base_run_id}/chat",
             method="POST",
             data=json.dumps(
                 {

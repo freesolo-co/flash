@@ -39,6 +39,15 @@ def _adapter_file_re(base: str) -> re.Pattern[str]:
     return re.compile(re.escape(base) + r"/checkpoints/step-(\d+)/adapter/([^/]+)$")
 
 
+def _adapter_folder_has_required_files(files: list[str], prefix: str) -> bool:
+    names = {
+        path.removeprefix(f"{prefix}/adapter/")
+        for path in files
+        if path.startswith(f"{prefix}/adapter/") and "/" not in path.removeprefix(f"{prefix}/adapter/")
+    }
+    return "adapter_config.json" in names and not names.isdisjoint(_ADAPTER_WEIGHT_FILES)
+
+
 def _repo_files(spec: JobSpec, *, strict: bool) -> list[str]:
     repo = spec.train.hf_repo
     if not repo:
@@ -110,3 +119,15 @@ def checkpoint_step_exists(spec: JobSpec, step: int) -> bool:
         int(item.get("step", -1)) == int(step)
         for item in _checkpoints_from_files(spec, _repo_files(spec, strict=True))
     )
+
+
+def final_adapter_exists(spec: JobSpec) -> bool:
+    """Authoritatively verify that the run-level final adapter exists in the artifact repo."""
+    try:
+        files = _repo_files(spec, strict=True)
+    except CheckpointListingError as exc:
+        cause = exc.__cause__ or exc
+        raise CheckpointListingError(
+            f"could not verify final adapter for {spec.run_id}: {cause}"
+        ) from cause
+    return _adapter_folder_has_required_files(files, adapter_prefix(spec))

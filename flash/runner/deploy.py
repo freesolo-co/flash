@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from flash.runner import RunStatus
 
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
+_RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
 
 
 def cancel_run(run_id: str) -> RunStatus:
@@ -121,22 +122,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     if not status.remote:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
-    spec = JobSpec.from_dict(status.spec)
+    public_spec = JobSpec.from_dict(status.spec)
     log = log_stream or sys.stderr
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
 
     try:
-        owner_key_id = None
-        with contextlib.suppress(Exception):
-            from flash.server import db
-
-            owner_key_id = db.run_owner(run_id)
-        spec = _resolve_init_from_adapter(
-            spec,
-            owner_org_id=_status_org_id(status),
-            owner_key_id=owner_key_id,
-        )
         remote = dict(status.remote)
         seed = int(remote.pop("seed", FIXED_SEED))
         code_prefix = remote.pop("code_prefix", None)
@@ -147,7 +138,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         allocated_gpu = remote.pop("allocated_gpu", None)
         handle = JobHandle.from_dict(remote)
         print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
-        res = get_provider(handle.provider).poll(handle, spec, seed, log=log)
+        res = get_provider(handle.provider).poll(handle, public_spec, seed, log=log)
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
@@ -159,43 +150,56 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 file=log,
             )
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(spec)
+                _gc_run_endpoints(public_spec)
             # Bail if the run was raced to terminal during the long poll above: _update's CAS
             # returns False, and resuming would submit paid work for a dead run.
             if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
+            owner_key_id = None
+            with contextlib.suppress(Exception):
+                from flash.server import db
+
+                owner_key_id = db.run_owner(run_id)
+            worker_spec = _resolve_init_from_adapter(
+                public_spec,
+                owner_org_id=_status_org_id(status),
+                owner_key_id=owner_key_id,
+            )
             if code_prefix is None:
                 from flash.providers.runpod.train import upload_code
                 from flash.runner import flash_code_prefix
 
                 code_prefix = flash_code_prefix()
-                upload_code(spec.train.hf_repo, code_prefix=code_prefix)
+                upload_code(worker_spec.train.hf_repo, code_prefix=code_prefix)
             _run_training(
-                spec, log, prior_cost=float(status.cost_usd or 0.0), code_prefix=code_prefix
+                worker_spec,
+                log,
+                prior_cost=float(status.cost_usd or 0.0),
+                code_prefix=code_prefix,
             )
             return get_status(run_id)
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
         # Add the recovered run's cost to any already booked before the restart so recovery
         # doesn't underreport spend.
-        measured = float(status.cost_usd or 0.0) + _persist_metrics(spec, res.metrics)
+        measured = float(status.cost_usd or 0.0) + _persist_metrics(public_spec, res.metrics)
         # Charge the QUOTE (flash.cost estimate for the planned steps), not the measured wall;
         # recovery doesn't change the quote. Falls back to measured only if the spec can't be priced.
-        charge_usd = charge_usd_for_spec(spec, fallback=measured)
+        charge_usd = charge_usd_for_spec(public_spec, fallback=measured)
         # A cancel can land while this thread persists the recovered metrics (after the late-cancel
         # check above). Re-read before the terminal "done" so a late worker success can't resurrect
         # a user-cancelled run. _RunCancelled is caught below, leaving the cancellation intact.
         if get_status(run_id).state == "cancelled":
             raise _RunCancelled(f"run {run_id} was cancelled")
-        _update(run_id, "done", cost_usd=charge_usd, artifacts_dir=artifacts_dir(spec))
+        _update(run_id, "done", cost_usd=charge_usd, artifacts_dir=artifacts_dir(public_spec))
     except _RunCancelled:
         pass  # cancel_run already wrote terminal `cancelled`
     except Exception as exc:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
     finally:
-        _gc_run_endpoints(spec)
+        _gc_run_endpoints(public_spec)
     return get_status(run_id)
 
 
@@ -282,7 +286,20 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
             and current.get("requested_at") != deployment.get("requested_at")
         ):
             return status
-        status.deployment = {**deployment, "state": "failed"}
+        previous = deployment.get("previous_deployment")
+        if (
+            isinstance(previous, dict)
+            and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES
+        ):
+            status.deployment = {
+                **previous,
+                "last_deploy_error": deployment.get("error") or "deployment failed",
+                "last_deploy_failed_at": time.time(),
+            }
+        else:
+            failed = dict(deployment)
+            failed.pop("previous_deployment", None)
+            status.deployment = {**failed, "state": "failed"}
         status.updated_at = time.time()
         _save_status(status)
         return status

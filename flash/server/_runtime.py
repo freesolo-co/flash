@@ -200,7 +200,9 @@ def recover_runs() -> None:
     a worker."""
     from flash.runner import (
         _gc_run_endpoints,
+        _resolve_init_from_adapter,
         _run_job_background,
+        _status_org_id,
         _update,
         attach_run,
         get_status,
@@ -259,6 +261,27 @@ def recover_runs() -> None:
                 continue
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
+            try:
+                owner_key_id = None
+                with contextlib.suppress(Exception):
+                    owner_key_id = db.run_owner(status.run_id)
+                spec = _resolve_init_from_adapter(
+                    spec,
+                    owner_org_id=_status_org_id(status),
+                    owner_key_id=owner_key_id,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "marking run %s failed: warm-start ref could not be resolved",
+                    status.run_id,
+                    exc_info=True,
+                )
+                detail = f"unrecoverable: train.init_from_adapter could not be resolved: {exc}"
+                with contextlib.suppress(Exception):
+                    _update(status.run_id, "failed", error=detail)
+                with contextlib.suppress(Exception):
+                    _append_run_log(status.run_id, detail)
+                continue
             resubmit.append(spec)
     # Reap orphaned per-run provider resources; each provider sweeps its own.
     from flash.providers import configured_providers
