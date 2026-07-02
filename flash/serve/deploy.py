@@ -12,7 +12,6 @@ import httpx
 
 from flash._logging import get_logger
 from flash.lora_rank import rank_from_adapter_config
-from flash.providers.base import canonical_gpu
 
 logger = get_logger(__name__)
 
@@ -124,7 +123,6 @@ class Deployment:
     run_id: str
     model: str
     adapter_hf_prefix: str
-    gpu: str
     openai_model: str
     endpoint_name: str
     state: str = "ready"
@@ -140,36 +138,20 @@ def deployment_record(
     run_id: str,
     model: str,
     adapter_prefix: str,
-    gpu_name: str = "RTX 5090",
     *,
     state: str = "ready",
 ) -> Deployment:
-    friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
     base = serving_base_url()
     return Deployment(
         run_id=run_id,
         model=model,
         adapter_hf_prefix=subfolder,
-        gpu=friendly,
         openai_model=run_id,
         endpoint_name=base,
         state=state,
         url=f"{base}/v1",
     )
-
-
-def servable_gpu(gpu_name: str) -> str:
-    """Resolve a canonical RunPod GPU class for the deployment record (informational)."""
-    from flash.providers.base import GPU_INFO, cheapest_gpu, get_gpu_info
-
-    friendly = canonical_gpu(gpu_name)
-    info = get_gpu_info(friendly)
-    # A directly servable class serves as-is; other managed classes map to the cheapest serving class
-    # that fits their VRAM.
-    if friendly in GPU_INFO and info.enum_member:
-        return friendly
-    return cheapest_gpu(info.vram_gb)
 
 
 def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str = "adapter") -> None:
@@ -230,7 +212,6 @@ def deploy_adapter(
     model: str,
     hf_repo: str,
     adapter_prefix: str,
-    gpu_name: str = "RTX 5090",
     *,
     dry_run: bool = False,
     lora_rank: int = 32,
@@ -246,9 +227,7 @@ def deploy_adapter(
             adapter_artifact_lora_rank(hf_repo, subfolder),
             rank_source="adapter artifact",
         )
-    dep = deployment_record(
-        run_id, model, adapter_prefix, gpu_name, state="dry_run" if dry_run else "ready"
-    )
+    dep = deployment_record(run_id, model, adapter_prefix, state="dry_run" if dry_run else "ready")
     if dry_run:
         return dep
     base = serving_base_url()
