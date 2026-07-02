@@ -3,19 +3,14 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from flash.catalog import serving_lora_rank_cap
-from flash.spec import JobSpec
 
-_OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
-_RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-_ADAPTER_STORAGE_REF_RE = re.compile(
-    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl)/"
-    rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
-)
+if TYPE_CHECKING:
+    from flash.spec import JobSpec
+
 _VL_WARMSTART_RECOMBINE_PREFIXES = ("Qwen/Qwen3.5-", "Qwen/Qwen3.6-")
 
 AdapterConfigLoader = Callable[[str, str | None], Mapping[str, Any]]
@@ -23,12 +18,9 @@ AdapterConfigLoader = Callable[[str, str | None], Mapping[str, Any]]
 
 def resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     """Resolve an internal storage ref into ``(repo, artifact_prefix)``."""
-    match = _ADAPTER_STORAGE_REF_RE.fullmatch((adapter_ref or "").strip())
-    if not match:
-        return None
-    repo = match.group("repo")
-    prefix = f"{match.group('phase')}/{match.group('run_id')}{match.group('checkpoint') or ''}"
-    return repo, prefix
+    from flash.schema import parse_adapter_storage_ref
+
+    return parse_adapter_storage_ref(adapter_ref)
 
 
 def adapter_config_path_from_ref(adapter_ref: str) -> tuple[str, str]:
@@ -89,9 +81,17 @@ def uniform_rank_from_adapter_config(config: Mapping[str, Any], *, source: str) 
         )
     rank = _positive_int(config["r"], source=source, field="r")
     for key in ("rank_pattern", "alpha_pattern"):
-        if config.get(key):
+        pattern = config.get(key)
+        if pattern is None:
+            continue
+        if not isinstance(pattern, Mapping):
             raise ValueError(
-                f"adapter rank preflight: {source} has non-empty {key}={config[key]!r}; "
+                f"adapter rank preflight: {source} has invalid {key}={pattern!r}; "
+                "VL warm-start recombine requires a uniform LoRA rank/alpha"
+            )
+        if pattern:
+            raise ValueError(
+                f"adapter rank preflight: {source} has non-empty {key}={pattern!r}; "
                 "VL warm-start recombine requires a uniform LoRA rank/alpha"
             )
     return rank

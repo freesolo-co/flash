@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from flash.lora_rank import preflight_init_adapter_lora_rank
+from flash.lora_rank import preflight_init_adapter_lora_rank, resolve_adapter_ref
 from flash.schema import spec_from_dict
 
 _ADAPTER_REF = "owner/runs:sft/sft-run"
@@ -52,6 +52,15 @@ def test_init_adapter_preflight_allows_vl_recombined_rank_at_serving_cap():
     preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 48}))
 
 
+def test_init_adapter_preflight_allows_empty_vl_patterns():
+    spec = _spec(rank=16)
+
+    preflight_init_adapter_lora_rank(
+        spec,
+        config_loader=_loader({"r": 48, "rank_pattern": {}, "alpha_pattern": {}}),
+    )
+
+
 def test_init_adapter_preflight_rejects_non_uniform_vl_rank_pattern():
     spec = _spec(rank=16)
 
@@ -62,8 +71,27 @@ def test_init_adapter_preflight_rejects_non_uniform_vl_rank_pattern():
         )
 
 
+@pytest.mark.parametrize("key", ["rank_pattern", "alpha_pattern"])
+@pytest.mark.parametrize("value", [0, "", [], False])
+def test_init_adapter_preflight_rejects_falsey_invalid_vl_patterns(key, value):
+    spec = _spec(rank=16)
+
+    with pytest.raises(ValueError, match=key):
+        preflight_init_adapter_lora_rank(
+            spec,
+            config_loader=_loader({"r": 16, key: value}),
+        )
+
+
 def test_init_adapter_preflight_checks_adapter_rank_for_sft_warm_start():
     spec = _spec(model="Qwen/Qwen3.5-0.8B", rank=32, algorithm="sft")
 
     with pytest.raises(ValueError, match=r"has rank 160.*serving max_lora_rank=128"):
         preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 160}))
+
+
+def test_lora_rank_uses_schema_adapter_storage_ref_parser():
+    assert resolve_adapter_ref("owner/runs:sft/source-run/checkpoints/step-40") == (
+        "owner/runs",
+        "sft/source-run/checkpoints/step-40",
+    )
