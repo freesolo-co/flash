@@ -15,9 +15,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +56,8 @@ _TAR_METADATA_TYPES = {
 }
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+_ENV_DEP_INSTALL_TIMEOUT_S = int(os.environ.get("FLASH_ENV_DEP_INSTALL_TIMEOUT_S", "900"))
+_INSTALLED_ENV_DEPS: set[tuple[str, ...]] = set()
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -805,6 +810,84 @@ def _import_freesolo_environment_tools():
             "that includes the Freesolo SDK"
         ) from exc
 
+
+def _pyproject_dependencies(pyproject_path: Path) -> list[str]:
+    if not pyproject_path.is_file():
+        return []
+    try:
+        pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(f"could not read environment pyproject.toml: {exc}") from exc
+    project = pyproject.get("project")
+    if not isinstance(project, dict):
+        return []
+    deps = project.get("dependencies")
+    if deps is None:
+        return []
+    if not isinstance(deps, list) or not all(isinstance(dep, str) for dep in deps):
+        raise RuntimeError(
+            "environment pyproject.toml [project].dependencies must be a list of strings"
+        )
+    return [dep.strip() for dep in deps if dep.strip()]
+
+
+def _dependency_source_key(
+    base_dir: Path, pyproject_path: Path, requirements_path: Path
+) -> tuple[str, ...]:
+    parts = [str(base_dir.resolve())]
+    for path in (pyproject_path, requirements_path):
+        try:
+            st = path.stat()
+        except OSError:
+            parts.append(f"{path.name}:missing")
+        else:
+            parts.append(f"{path.name}:{st.st_mtime_ns}:{st.st_size}")
+    return tuple(parts)
+
+
+def _run_dependency_install(base_dir: Path, args: list[str]) -> None:
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        *args,
+    ]
+    print(f"[env-deps] installing environment dependencies: {' '.join(args)}", flush=True)
+    try:
+        proc = subprocess.run(cmd, cwd=base_dir, timeout=_ENV_DEP_INSTALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "environment dependency install timed out "
+            f"after {_ENV_DEP_INSTALL_TIMEOUT_S}s: {' '.join(args)}"
+        ) from exc
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "environment dependency install failed "
+            f"(exit {proc.returncode}): {' '.join(args)}"
+        )
+
+
+def _install_environment_dependencies(base_dir: Path) -> None:
+    pyproject_path = base_dir / "pyproject.toml"
+    requirements_path = base_dir / "requirements.txt"
+    pyproject_deps = _pyproject_dependencies(pyproject_path)
+    has_requirements = requirements_path.is_file()
+    if not pyproject_deps and not has_requirements:
+        return
+
+    key = _dependency_source_key(base_dir, pyproject_path, requirements_path)
+    if key in _INSTALLED_ENV_DEPS:
+        return
+    if pyproject_deps:
+        _run_dependency_install(base_dir, pyproject_deps)
+    if has_requirements:
+        _run_dependency_install(base_dir, ["-r", str(requirements_path)])
+    _INSTALLED_ENV_DEPS.add(key)
+
+
 def _packaged_dataset_file(base_dir: Path, name: str) -> Path | None:
     """First existing packaged dataset file for split `name`, in the canonical shapes:
     datasets/<name>.jsonl, datasets/<name>.json, <name>.jsonl, <name>.json."""
@@ -828,10 +911,11 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     # pinned_sha is positional-only so user [environment.params] named "pinned_sha" goes to **kwargs, not here.
     from flash.envs.adapter import FreesoloEnvironment
 
-    tools = _import_freesolo_environment_tools()
     reference = _resolve_environment_reference(env_id, pinned_sha)
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
+    _install_environment_dependencies(base_dir)
+    tools = _import_freesolo_environment_tools()
 
     params = dict(kwargs)
     source = params.pop("records", None)

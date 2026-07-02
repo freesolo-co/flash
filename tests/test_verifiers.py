@@ -6,6 +6,7 @@ import gzip
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import tracemalloc
@@ -441,6 +442,73 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.reward("nope", train[0]) == 0.0
     assert env.scores_breakdown("the answer is 4", train[0]) == {"match": 1.0, "total": 1.0}
     assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
+
+
+def test_freesolo_loader_installs_packaged_env_dependencies(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "pyproject.toml": (
+                "[project]\n"
+                "name = 'env'\n"
+                "dependencies = ['numpy==1.26.4', 'requests>=2']\n"
+            ),
+            "requirements.txt": "pydantic==2.7.0\n",
+        },
+    )
+
+    from flash.envs import loader
+    from flash.envs.adapter import load_freesolo_environment
+
+    loader._INSTALLED_ENV_DEPS.clear()
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(loader.subprocess, "run", fake_run)
+
+    load_freesolo_environment(str(env_file), contract_text="c")
+    load_freesolo_environment(str(env_file), contract_text="c")
+
+    prefix = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+    ]
+    assert [cmd for cmd, _ in calls] == [
+        [*prefix, "numpy==1.26.4", "requests>=2"],
+        [*prefix, "-r", str(env_file.parent / "requirements.txt")],
+    ]
+    assert all(kwargs["cwd"] == env_file.parent for _, kwargs in calls)
+    assert all(kwargs["timeout"] == loader._ENV_DEP_INSTALL_TIMEOUT_S for _, kwargs in calls)
+
+
+def test_freesolo_loader_dependency_install_failure_blocks_env_load(monkeypatch, tmp_path):
+    seen = _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {"pyproject.toml": "[project]\nname = 'env'\ndependencies = ['missing-pkg==0']\n"},
+    )
+
+    from flash.envs import loader
+    from flash.envs.adapter import load_freesolo_environment
+
+    loader._INSTALLED_ENV_DEPS.clear()
+    monkeypatch.setattr(
+        loader.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 17),
+    )
+
+    with pytest.raises(RuntimeError, match="environment dependency install failed"):
+        load_freesolo_environment(str(env_file), contract_text="c")
+    assert "reference" not in seen
 
 
 def _split_env(tmp_path, extra_files):

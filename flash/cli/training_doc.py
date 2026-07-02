@@ -43,6 +43,8 @@ datasets/train.jsonl    # training rows, one JSON object per line: {"input": ...
 configs/rl.toml         # a GRPO (RL) run config
 configs/sft.toml        # an SFT run config
 TRAINING.md             # this file
+pyproject.toml          # optional: [project].dependencies installed on the worker before env load
+requirements.txt        # optional: pip requirements installed on the worker before env load
 ```
 
 ### 1. Author the environment
