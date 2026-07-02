@@ -615,7 +615,7 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "sft",
                 "environment": {"id": "github:o/r@main:env/environment.py"},
-                "train": {"epochs": 1},
+                "train": {"epochs": 1, "max_examples": 8},
                 "run_id": "flash-wc-1",
             }
         )
@@ -1312,7 +1312,7 @@ def test_warm_weight_cache_defaults_to_full_fleet_and_catalog(monkeypatch):
 def _preload_spec():
     return JobSpec.from_dict({
         "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": "flash-1700000000-abcd1234",
-        "train": {"epochs": 1, "hf_repo": "org/repo"},
+        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "org/repo"},
         "gpu": {"type": "A10", "max_wall_seconds": 3600,
                 "network_volume": "flash-weights", "network_volume_gb": 100},
     })
@@ -1350,7 +1350,7 @@ def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
 
     spec = JobSpec.from_dict({
         "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": "flash-1700000000-abcd1234",
-        "train": {"hf_repo": "org/repo"},
+        "train": {"max_examples": 8, "hf_repo": "org/repo"},
         "gpu": {"type": "A10", "max_wall_seconds": 3600, "network_volume": "flash-weights"},
         "worker_env": {"HF_HOME": "/custom/hf"},  # user-set override
     })
