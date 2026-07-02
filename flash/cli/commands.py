@@ -687,13 +687,13 @@ def cmd_deployments(args) -> int:
     if render.styled():
         print(render.deployments_table(rows))
         return 0
-    print(f"{'RUN_ID':<32}  {'STATE':<10}  {'GPU':<9}  {'ENDPOINT':<32}  DETAIL")
+    print(f"{'RUN_ID':<32}  {'STATE':<10}  {'ENDPOINT':<32}  DETAIL")
     for r in rows:
         d = r.get("deployment") or {}
         detail = str(d.get("error") or d.get("detail") or "")
         print(
             f"{r['run_id']:<32}  {d.get('state', '?'):<10}  "
-            f"{d.get('gpu', '?'):<9}  {d.get('endpoint_name', ''):<32}  {detail}"
+            f"{d.get('endpoint_name', ''):<32}  {detail}"
         )
     return 0
 
