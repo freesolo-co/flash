@@ -206,6 +206,7 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
             "model": "Qwen/Qwen3.5-2B",
             "train": {
                 "epochs": 1,
+                "max_examples": 8,
                 "hf_repo": f"Freesolo-Co/flashrun-{rid}",
             },
         }
