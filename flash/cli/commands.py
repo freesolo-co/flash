@@ -52,16 +52,16 @@ class _LogFollowSpinner(TtyStatusLine):
         self._run_id = run_id
         self._frame = 0
 
-    def render(self, state: str) -> None:
+    def render(self, progress: str) -> None:
         if not self._enabled:
             return
         frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
         self._frame += 1
-        message = f"{frame} following logs for {self._run_id} ({state})"
+        message = f"{frame} following logs for {self._run_id} ({progress})"
         self._write(message)
 
 
-def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, state: str) -> None:
+def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, progress: str) -> None:
     if interval <= 0:
         return
     if not spinner.enabled:
@@ -70,7 +70,7 @@ def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, state: str)
     ticks = max(1, int(interval / _SPINNER_TICK_SECONDS))
     sleep_for = interval / ticks
     for _ in range(ticks):
-        spinner.render(state)
+        spinner.render(progress)
         time.sleep(sleep_for)
 
 
@@ -390,12 +390,35 @@ def cmd_train(args) -> int:
     return _follow_run(client, run_id)
 
 
+def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str, str]:
+    """Return (authoritative state, compact progress) for the log-follow spinner."""
+    status = status or {}
+    state = str(status.get("state") or fallback_state or "unknown")
+    parts = [state]
+    heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
+    if isinstance(heartbeat, dict):
+        stage = heartbeat.get("stage")
+        if stage:
+            parts.append(f"stage={stage}")
+        step = heartbeat.get("step")
+        if step is not None:
+            parts.append(f"step={step}")
+    realized = status.get("realized_cost_usd")
+    if realized is not None:
+        if isinstance(realized, (int, float)):
+            parts.append(f"realized_cost=${realized:.4f}")
+        else:
+            parts.append(f"realized_cost={realized}")
+    return state, " ".join(parts)
+
+
 def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bool]:
     """Stream offset-paged logs until the run reaches a terminal state.
 
     Returns (terminal state, whether any log bytes were printed)."""
     offset = 0
     printed_any = False
+    last_progress: str | None = None
     spinner = _LogFollowSpinner(run_id)
     try:
         while True:
@@ -405,10 +428,18 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
                 print(page["logs"], end="", flush=True)
                 printed_any = True
             offset = page["offset"]
-            if page["state"] in _CLI_DONE_STATES:
+            # The log file can lag worker heartbeat/status updates, so lifecycle/progress must come
+            # from the run status endpoint. The log page's embedded state is only a fallback for
+            # older servers or test doubles.
+            status = client.get_run(run_id)
+            state, progress = _log_follow_progress(status, str(page.get("state") or ""))
+            if state in _CLI_DONE_STATES:
                 spinner.clear()
-                return page["state"], printed_any
-            _sleep_with_spinner(interval, spinner, page["state"])
+                return state, printed_any
+            if not spinner.enabled and progress != last_progress:
+                print(f"status: {progress}", file=sys.stderr, flush=True)
+                last_progress = progress
+            _sleep_with_spinner(interval, spinner, progress)
     finally:
         spinner.clear()
 
