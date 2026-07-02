@@ -485,6 +485,7 @@ def test_run_job_background_swallows_exception(monkeypatch):
         raise RuntimeError("seed 0 failed after retries: job_failed")
 
     # The wrapper dispatches through the package-level _run_job that tests patch.
+    monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
     monkeypatch.setattr(runner, "_run_job", boom)
     spec = type("S", (), {"run_id": "bg-run"})()
     # Must not raise — the wrapper swallows it (state already persisted by _run_job_inner).
@@ -512,6 +513,7 @@ def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch):
         def boom(spec):
             raise RuntimeError("crashed before persisting terminal state")
 
+        monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
         monkeypatch.setattr(runner, "_run_job", boom)
         spec = type("S", (), {"run_id": "bg-fail"})()
         runner._run_job_background(spec)  # must not raise
@@ -542,6 +544,7 @@ def test_run_job_background_does_not_clobber_persisted_failure(monkeypatch):
         def boom(spec):
             raise RuntimeError("generic wrapper-level error")
 
+        monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
         monkeypatch.setattr(runner, "_run_job", boom)
         spec = type("S", (), {"run_id": "bg-done"})()
         runner._run_job_background(spec)  # must not raise

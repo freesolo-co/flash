@@ -138,7 +138,8 @@ flash cancel <run-id>            # stop a run
 
 ```bash
 flash checkpoints <run-id>       # deployable per-step RL checkpoints
-flash deploy <run-id>            # serve the trained adapter (--step N for an intermediate checkpoint)
+flash deploy <run-id>            # serve the trained adapter
+flash deploy <run-id>/step-N     # serve an intermediate checkpoint
 flash chat <run-id> -m "hello"   # chat with the deployed adapter
 flash deployments                # active serving endpoints
 flash undeploy <run-id>          # tear the endpoint down
@@ -208,7 +209,7 @@ spending another GPU run:
 | Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_tokens` for GRPO rollouts or `max_length` for SFT only after seeing truncation. Oversizing them by default just burns memory/cost. |
 | Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash log <run-id>`, reduce footprint (`max_length`, `max_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
 | Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash log <run-id> --follow` to reattach, `flash log <run-id>` for the console/error output, or `flash cancel <run-id>` if you intentionally want to stop it. |
-| Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash checkpoints <run-id>`, deploy a specific step with `flash deploy <run-id> --step N`, and compare with held-out probes before exporting or relying on the final adapter. |
+| Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash checkpoints <run-id>`, deploy a specific step with `flash deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter. |
 | Export fails before upload | CLI says no HuggingFace token | Pass `flash export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`. |
 | SFT loss improves but quality does not | Train loss falls while held-out behavior stalls or degrades | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes. |
 | Cost surprises | A quick experiment uses more GPU time than intended | Start with `--dry-run` and `--cost`, cap steps/epochs for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time. |
@@ -350,9 +351,9 @@ Pick SFT when you already have good answers and want the model to imitate them.
 algorithm = "grpo"
 
 [train]
-# paste the full adapter_ref `flash status <sft-run-id>` prints, verbatim
-# (shape: <owner>/<repo>:sft/<run-id> — the owner/repo prefix is required)
-init_from_adapter = "your-org/your-repo:sft/<sft-run-id>"
+# the SFT run id (as printed by `flash status`); add /step-N to warm-start from a
+# specific checkpoint listed by `flash checkpoints <run-id>`
+init_from_adapter = "<sft-run-id>"
 lora_rank = 16     # for VL warm-starts, SFT rank + GRPO rank must fit the effective serving cap
 lora_alpha = 32
 ```
@@ -479,12 +480,12 @@ flash runs                            # list your runs and their state/cost
 flash cancel <run-id>                 # stop a live run
 flash checkpoints <run-id>            # list deployable RL checkpoints
 flash deploy <run-id>                 # serve the trained adapter
-flash deploy <run-id> --step N        # serve a specific RL checkpoint
+flash deploy <run-id>/step-N          # serve a specific RL checkpoint
 flash chat <run-id> -m "probe"        # stream a reply from the deployed adapter
 flash deployments                     # list active serving deployments
 flash undeploy <run-id>               # tear down an active deployment
 flash export --adapter-id <run-id> --repository <you>/<repo>  # export final adapter
-flash export --adapter-id <run-id> --repository <you>/<repo> --step N  # export a checkpoint
+flash export --adapter-id <run-id>/step-N --repository <you>/<repo>  # export a checkpoint
 ```
 
 See the full reference at https://freesolo.co/docs.
