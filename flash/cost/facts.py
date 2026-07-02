@@ -7,6 +7,8 @@ from flash.catalog import MODELS
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
+    # A10: 125 TFLOPS dense bf16 tensor (NVIDIA spec); Lambda-only 24 GB class, else defaults to 100.
+    "A10": 125.0,
     "RTX 4090": 165.0,
     "RTX 5090": 210.0,
     "A100 PCIe": 312.0,

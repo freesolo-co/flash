@@ -35,6 +35,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_env_setup,
     cmd_export,
     cmd_gpus,
+    cmd_log,
     cmd_login,
     cmd_models,
     cmd_runs,
@@ -83,7 +84,8 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         "training",
         [
             ("train", "submit a managed run from a TOML config"),
-            ("status", "show a run's status, logs, or live follow"),
+            ("status", "show a run's current status"),
+            ("log", "print or follow a run's logs"),
             ("runs", "list runs with their state and cost"),
             ("checkpoints", "list a run's deployable RL checkpoints"),
             ("cancel", "cancel a running job"),
@@ -251,13 +253,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_pull.add_argument(
         "env_id",
-        help='the Freesolo environment id: a managed slug "your-name/your-env", a '
-        '"github:owner/repo@ref:path" ref, or a github.com URL',
+        help='the managed Freesolo environment slug "your-name/your-env"',
     )
     env_pull.add_argument(
         "path",
         nargs="?",
-        help="optional single file within the env to fetch, e.g. datasets/train.jsonl",
+        help="optional single file within the env to fetch, e.g. dataset/train.jsonl",
     )
     env_pull.add_argument(
         "-o",
@@ -309,21 +310,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     train.set_defaults(func=cmd_train)
 
-    status = sub.add_parser("status", help="show a run's status, logs, or follow logs")
+    status = sub.add_parser("status", help="show a run's current status")
     status.add_argument("run_id")
-    status.add_argument(
-        "--logs",
-        action="store_true",
-        help="print current logs before status — the orchestrator log plus the train-subprocess "
-        "stdout + traceback (console_/error_<phase>.txt) fetched from the run's HF artifact repo",
-    )
     status.add_argument(
         "-f",
         "--follow",
         action="store_true",
-        help="stream logs until the run ends, then print final status",
+        help="poll status until the run ends without replaying logs",
     )
     status.set_defaults(func=cmd_status)
+
+    log = sub.add_parser(
+        "log",
+        help="print a run's full logs, including worker console/error artifacts",
+    )
+    log.add_argument("run_id")
+    log.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="stream logs until the run reaches a terminal state",
+    )
+    log.set_defaults(func=cmd_log)
 
     runs = sub.add_parser("runs", help="list runs and their state/cost")
     runs.set_defaults(func=cmd_runs)
@@ -339,14 +347,17 @@ def _build_parser() -> argparse.ArgumentParser:
     checkpoints.set_defaults(func=cmd_checkpoints)
 
     deploy = sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
-    deploy.add_argument("run_id")
+    deploy.add_argument(
+        "run_id",
+        metavar="RUN_ID[/step-N]",
+        help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
+    )
     deploy.add_argument("--dry-run", action="store_true")
     deploy.add_argument(
-        "--step",
-        type=int,
-        default=None,
-        help="deploy a specific intermediate checkpoint (see `flash checkpoints <run_id>`) "
-        "instead of the run's final adapter; works even for a run cancelled mid-RL",
+        "--no-verify",
+        action="store_true",
+        help="skip the server-side post-deploy smoke generation (registration alone does NOT "
+        "guarantee the adapter serves; only ready deployments should be scored by evals)",
     )
     deploy.set_defaults(func=cmd_deploy)
 
@@ -359,7 +370,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--adapter-id",
         dest="adapter_id",
         required=True,
-        help="the Freesolo adapter id (the run id) to export",
+        metavar="RUN_ID[/step-N]",
+        help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
     )
     export.add_argument(
         "--repository",
@@ -370,13 +382,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--api-key",
         help="HuggingFace token with write access to --repository "
         "(default: HF_TOKEN from your shell or a local .env / .env.local)",
-    )
-    export.add_argument(
-        "--step",
-        type=int,
-        default=None,
-        help="export a specific intermediate checkpoint (see `flash checkpoints <adapter-id>`) "
-        "instead of the run's final adapter; works even for a run cancelled mid-RL",
     )
     export.add_argument(
         "--public",
@@ -391,6 +396,12 @@ def _build_parser() -> argparse.ArgumentParser:
     chat = sub.add_parser("chat", help="chat with a deployed adapter")
     chat.add_argument("run_id")
     chat.add_argument("-m", "--message", required=True)
+    chat.add_argument(
+        "--system",
+        default=None,
+        help="optional system prompt sent ahead of the user message "
+        "(training-prompt parity for evals)",
+    )
     chat.add_argument("--max-tokens", type=int, default=512)
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)

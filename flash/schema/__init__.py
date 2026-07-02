@@ -28,10 +28,63 @@ from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-_ADAPTER_REF_RE = re.compile(
+# The ONE public checkpoint/adapter reference grammar: `<run_id>` (a run's trained adapter) or
+# `<run_id>/step-N` (a specific saved checkpoint listed by `flash checkpoints`). The control plane
+# resolves it to the internal storage reference below; users never see or write storage refs.
+_CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
+# INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
+# the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
+_ADAPTER_STORAGE_REF_RE = re.compile(
     rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl)/"
-    rf"(?P<run_id>{_RUN_ID_RE})$"
+    rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
 )
+
+
+def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
+    """Parse the canonical short reference: `<run_id>` or `<run_id>/step-N` -> (run_id, step|None)."""
+    match = _CHECKPOINT_REF_RE.fullmatch(str(text or "").strip())
+    if match is None:
+        return None
+    step = match.group("step")
+    if step is None:
+        return match.group("run_id"), None
+    try:
+        return match.group("run_id"), int(step)
+    except ValueError:
+        return None
+
+
+def format_checkpoint_ref(run_id: str, step: int | None = None) -> str:
+    """Format the canonical short reference: `<run_id>` or `<run_id>/step-N`."""
+    return f"{run_id}/step-{int(step)}" if step is not None else str(run_id)
+
+
+def checkpoint_storage_ref(hf_repo: str, phase: str, run_id: str, step: int | None = None) -> str:
+    """Internal storage reference for a run's adapter (or one saved step) on the artifact store."""
+    suffix = f"/checkpoints/step-{int(step)}" if step is not None else ""
+    return f"{hf_repo}:{phase}/{run_id}{suffix}"
+
+
+def parse_adapter_storage_ref(text: str) -> tuple[str, str] | None:
+    """Parse an internal storage reference -> (hf_repo, artifact prefix), or None."""
+    match = _ADAPTER_STORAGE_REF_RE.fullmatch(str(text or "").strip())
+    if match is None:
+        return None
+    repo, phase, run_id, checkpoint = match.groups()
+    return repo, f"{phase}/{run_id}{checkpoint or ''}"
+
+
+def normalize_env_name_segment(value: str) -> str | None:
+    """Normalize one env-name segment to the shared grammar ``[a-z0-9][a-z0-9._-]*``.
+
+    Lowercases, collapses runs of other characters to ``-``, strips edge dashes. Returns None
+    when nothing usable remains (empty, ``.``/``..``, or no alphanumeric). Shared by the CLI's
+    pre-publish name normalization and the server's authoritative publish-slug validation.
+    """
+    segment = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").lower()).strip("-")
+    if segment in {"", ".", ".."} or not re.search(r"[a-z0-9]", segment):
+        return None
+    return segment
 
 
 def load_toml(path: str) -> dict[str, Any]:
@@ -94,11 +147,11 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     ref = ref_raw.strip()
     if not ref:
         return ""
-    if _ADAPTER_REF_RE.match(ref):
+    if parse_checkpoint_ref(ref) is not None:
         return ref
     raise ConfigError(
-        "train.init_from_adapter must be the full adapter_ref emitted by `flash status` "
-        "(<owner>/<repo>:<phase>/<run_id>)"
+        "train.init_from_adapter must be `<run_id>` (continue that run's trained adapter) or "
+        "`<run_id>/step-N` (warm-start from a checkpoint listed by `flash checkpoints`)"
     )
 
 
@@ -142,6 +195,8 @@ _TRAIN_KEYS = frozenset(
         "max_examples",
     }
 )
+
+
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
@@ -306,6 +361,11 @@ def _validate_spec(spec: JobSpec) -> None:
         raise ConfigError("train.steps must be positive for GRPO")
     if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
+    if spec.algorithm == "sft" and int(spec.train.max_examples or 0) <= 0:
+        raise ConfigError(
+            "train.max_examples must be set to a positive row count for SFT "
+            "(use the full dataset row count for an uncapped run)"
+        )
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "

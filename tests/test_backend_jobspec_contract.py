@@ -104,13 +104,14 @@ def test_sft_backend_config_maps_to_jobspec() -> None:
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:my-env/environment.py"},
-        "train": {"hf_repo": "owner/my-runs", "epochs": 3, "batch_size": 8},
+        "train": {"hf_repo": "owner/my-runs", "epochs": 3, "max_examples": 64, "batch_size": 8},
         "gpu": {"type": "RTX 5090"},
     }
     spec = spec_from_dict(config, run_id="flash-sft-1")
     assert spec.algorithm == "sft"
     assert spec.phase == "sft"
     assert spec.train.epochs == 3
+    assert spec.train.max_examples == 64
     assert spec.train.batch_size == 8
 
 

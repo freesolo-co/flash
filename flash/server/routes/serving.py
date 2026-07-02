@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import math
 import re
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -18,10 +19,12 @@ from flash.runner import (
     adapter_prefix,
     mark_checkpoint_deployed,
     mark_deployed,
+    mark_deployment_failed,
+    mark_deployment_pending,
     mark_undeployed,
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
-from flash.serve.deploy import ServingError
+from flash.serve.deploy import AdapterConfigMissing, ServingError
 from flash.server import app as _app
 from flash.server import db
 from flash.server._deps import _require_bool, owned_run, require_key
@@ -29,6 +32,239 @@ from flash.server._internal_client import run_org_id
 from flash.spec import JobSpec
 
 router = APIRouter()
+
+_DEPLOYMENT_BUSY_STATES = {"deploying", "registering", "verifying"}
+_DEPLOYMENT_READY_STATES = {"ready", "deployed"}
+_DEPLOYMENT_STALE_SECONDS = 30 * 60
+_SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
+
+
+def _deployment_state(deployment: dict, state: str, **fields) -> dict:
+    return {**deployment, **fields, "state": state, "updated_at": time.time()}
+
+
+def _public_deployment(deployment: dict) -> dict:
+    out = dict(deployment)
+    out.pop("previous_deployment", None)
+    return out
+
+
+def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) -> bool:
+    if deployment.get("state") not in _DEPLOYMENT_BUSY_STATES:
+        return False
+    raw = deployment.get("updated_at") or deployment.get("requested_at")
+    try:
+        stamp = float(raw)
+    except (TypeError, ValueError):
+        return True
+    return (time.time() if now is None else now) - stamp >= _DEPLOYMENT_STALE_SECONDS
+
+
+def _previous_ready_deployment(deployment: dict) -> dict | None:
+    if deployment.get("state") in _DEPLOYMENT_READY_STATES:
+        return dict(deployment)
+    previous = deployment.get("previous_deployment")
+    if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
+        return dict(previous)
+    return None
+
+
+def recover_deployments() -> int:
+    """Clear deployment lifecycle records left busy by a control-plane restart."""
+    recovered = 0
+    for row in db.all_runs():
+        try:
+            status = _app.get_status(row["run_id"])
+        except FileNotFoundError:
+            continue
+        deployment = status.deployment or {}
+        if not _deployment_attempt_is_stale(deployment):
+            continue
+        failed = _deployment_state(
+            deployment,
+            "failed",
+            error="deployment lifecycle interrupted by control-plane restart",
+            detail="deployment interrupted; retry `flash deploy`",
+            recovered_at=time.time(),
+        )
+        mark_deployment_failed(status.run_id, failed)
+        recovered += 1
+    return recovered
+
+
+def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
+    started = time.monotonic()
+    result = _app.serve_chat(
+        run_id=run_id,
+        messages=[{"role": "user", "content": _SMOKE_PROMPT}],
+        temperature=0.0,
+        max_tokens=256,
+        thinking=spec.thinking,
+    )
+    latency = time.monotonic() - started
+    choice = (result.get("choices") or [{}])[0]
+    content = str((choice.get("message") or {}).get("content") or "")
+    finish = choice.get("finish_reason")
+    if not content.strip():
+        raise ServingError(
+            "smoke generation returned no content "
+            f"(finish_reason={finish!r}) after {latency:.1f}s"
+        )
+    return {
+        "verified_at": time.time(),
+        "verify_latency_s": latency,
+        "verify_finish_reason": finish,
+        "thinking_tag": "<think>" in content or "</think>" in content,
+        "verify_sample": content.strip()[:160],
+    }
+
+
+def _deployment_cas_lost(run_id: str, state_guard: str | None) -> bool:
+    return state_guard is not None and _app.get_status(run_id).state != state_guard
+
+
+def _adapter_prefix_from_deployment(deployment: dict) -> str:
+    subfolder = deployment.get("adapter_hf_prefix")
+    if not isinstance(subfolder, str) or not subfolder.endswith("/adapter"):
+        raise ServingError(
+            "previous deployment record is missing adapter_hf_prefix; "
+            "cannot restore serving registry"
+        )
+    return subfolder[: -len("/adapter")]
+
+
+def _rollback_registered_deployment(
+    *, run_id: str, deploy_kwargs: dict, previous_deployment: dict | None
+) -> None:
+    if isinstance(previous_deployment, dict):
+        _app.deploy_adapter(
+            **{
+                **deploy_kwargs,
+                "adapter_prefix": _adapter_prefix_from_deployment(previous_deployment),
+                "dry_run": False,
+            }
+        )
+    else:
+        _app.undeploy_adapter(run_id)
+
+
+def _finish_deployment_unlocked(
+    *,
+    run_id: str,
+    spec_dict: dict,
+    checkpoint_step: int | None,
+    is_checkpoint: bool,
+    deploy_kwargs: dict,
+    deployment: dict,
+    prev_state: str,
+    verify: bool,
+) -> None:
+    spec = JobSpec.from_dict(spec_dict)
+    active = (_app.get_status(run_id).deployment or {})
+    if (
+        active.get("requested_at") != deployment.get("requested_at")
+        or active.get("state") not in _DEPLOYMENT_BUSY_STATES
+    ):
+        return
+    current = _deployment_state(deployment, "registering", detail="registering adapter")
+    mark_deployment_pending(run_id, current)
+    registered = False
+    try:
+        dep = _app.deploy_adapter(**deploy_kwargs)
+        registered = True
+        previous_deployment = deployment.get("previous_deployment")
+        current = dep.to_dict()
+        if previous_deployment:
+            current["previous_deployment"] = previous_deployment
+        if checkpoint_step is not None:
+            current["checkpoint_step"] = checkpoint_step
+        current["verify"] = verify
+        state_guard = prev_state
+        if is_checkpoint:
+            state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
+        if _deployment_cas_lost(run_id, state_guard):
+            with contextlib.suppress(Exception):
+                _app.undeploy_adapter(run_id)
+            return
+        if verify:
+            current = _deployment_state(current, "verifying", detail="running smoke generation")
+            mark_deployment_pending(run_id, current)
+            current = _deployment_state(current, "ready", **_run_deployment_smoke(run_id, spec))
+        else:
+            current = _deployment_state(current, "ready", detail="registered; smoke skipped")
+        current = _public_deployment(current)
+
+        if is_checkpoint:
+            marked = mark_checkpoint_deployed(run_id, current, expect_state=state_guard)
+        else:
+            marked = mark_deployed(run_id, current, expect_state=prev_state)
+        cas_failed = (
+            marked.deployment != current if is_checkpoint else marked.state != "deployed"
+        )
+        if state_guard is not None and cas_failed:
+            with contextlib.suppress(Exception):
+                _app.undeploy_adapter(run_id)
+            return
+    except Exception as exc:
+        error = str(exc)
+        if not is_checkpoint and isinstance(exc, AdapterConfigMissing):
+            steps = [c["step"] for c in _app.list_checkpoints(spec)]
+            if steps:
+                error = (
+                    f"run {run_id} has no run-level adapter at "
+                    f"{deployment.get('adapter_hf_prefix')} (the run likely never finalized); "
+                    f"deploy a saved checkpoint instead, e.g. `flash deploy "
+                    f"{run_id}/step-{steps[-1]}` (available steps: "
+                    f"{', '.join(str(s) for s in steps)})"
+                )
+        failed = _deployment_state(
+            current,
+            "failed",
+            error=error,
+            detail="deployment failed; retry `flash deploy` after fixing the error",
+        )
+        if registered:
+            previous_deployment = deployment.get("previous_deployment")
+            rollback_error = None
+            try:
+                _rollback_registered_deployment(
+                    run_id=run_id,
+                    deploy_kwargs=deploy_kwargs,
+                    previous_deployment=previous_deployment,
+                )
+            except Exception as rollback_exc:
+                rollback_error = str(rollback_exc)
+            if rollback_error:
+                failed.pop("previous_deployment", None)
+                failed["rollback_error"] = rollback_error
+                failed["detail"] = (
+                    "deployment failed and serving rollback failed; "
+                    "operator cleanup required"
+                )
+            elif isinstance(previous_deployment, dict):
+                failed["detail"] = "deployment failed; restored previous deployment"
+            else:
+                failed["detail"] = "deployment failed; deregistered adapter"
+        mark_deployment_failed(run_id, failed)
+
+
+def _finish_deployment(**kwargs) -> None:
+    with _app._deploy_lock(kwargs["run_id"]):
+        _finish_deployment_unlocked(**kwargs)
+
+def _chat_messages_from_payload(payload: dict) -> list[dict]:
+    raw = payload.get("messages")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="messages must be a list")
+    for index, message in enumerate(raw):
+        if not isinstance(message, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"messages[{index}] must be a chat message object",
+            )
+    return raw
 
 
 def _validate_hf_repo_id(repository: str) -> None:
@@ -110,6 +346,21 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
         dry_run = _require_bool(payload, "dry_run", False)
+        verify = _require_bool(payload, "verify", True)
+        current_deployment = status.deployment or {}
+        if (
+            not dry_run
+            and current_deployment.get("state") in _DEPLOYMENT_BUSY_STATES
+            and not _deployment_attempt_is_stale(current_deployment)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run_id} already has a deployment in "
+                    f"{current_deployment.get('state')} state; run `flash deployments` "
+                    "to check progress"
+                ),
+            )
         checkpoint_step, is_checkpoint, deploy_prefix = _resolve_deployable_target(
             run_id, spec, status, payload.get("step"), action="deploy", enforce_state=not dry_run
         )
@@ -126,47 +377,79 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
+        deploy_kwargs = {
+            "run_id": run_id,
+            "model": spec.model,
+            "hf_repo": spec.train.hf_repo,
+            "adapter_prefix": deploy_prefix,
+            "dry_run": dry_run,
+            "lora_rank": spec.train.lora_rank,
+            # a run trained with thinking serves with thinking (per-run parity)
+            "thinking": spec.thinking,
+            "org_id": deploy_org_id,
+        }
+        if dry_run:
+            try:
+                dep = _app.deploy_adapter(**deploy_kwargs)
+            except Exception as exc:
+                if isinstance(exc, ValueError):
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise
+            return dep.to_dict()
+
+        # Validate the cheap configured-rank part synchronously so obvious spec errors return 400
+        # instead of becoming background deployment failures.
         try:
-            dep = _app.deploy_adapter(
+            from flash.serve.deploy import validate_serving_lora_rank
+
+            validate_serving_lora_rank(
+                spec.model, spec.train.lora_rank, rank_source="configured train.lora_rank"
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            dep_dict = _app.deployment_record(
                 run_id=run_id,
                 model=spec.model,
-                hf_repo=spec.train.hf_repo,
                 adapter_prefix=deploy_prefix,
-                gpu_name=spec.gpu.type,
-                dry_run=dry_run,
-                lora_rank=spec.train.lora_rank,
-                # a run trained with thinking serves with thinking (per-run parity)
-                thinking=spec.thinking,
-                org_id=deploy_org_id,
-            )
-        except ServingError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        except Exception as exc:
-            if isinstance(exc, ValueError):
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            raise
-        dep_dict = dep.to_dict()
+                state="deploying",
+            ).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        dep_dict = _deployment_state(
+            dep_dict,
+            "deploying",
+            detail="deployment queued",
+            verify=verify,
+            requested_at=time.time(),
+        )
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
-        if not dry_run:
-            state_guard = prev_state
-            if is_checkpoint:
-                state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
-                marked = mark_checkpoint_deployed(run_id, dep_dict, expect_state=state_guard)
-            else:
-                marked = mark_deployed(run_id, dep_dict, expect_state=prev_state)
-            # CAS: if /cancel or /undeploy raced us, the adapter is orphaned — deregister and 409.
-            cas_failed = (
-                marked.deployment != dep_dict if is_checkpoint else marked.state != "deployed"
+        previous_deployment = _previous_ready_deployment(current_deployment)
+        if previous_deployment:
+            dep_dict["previous_deployment"] = previous_deployment
+        marked = mark_deployment_pending(run_id, dep_dict, expect_state=prev_state)
+        if marked.deployment != dep_dict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
             )
-            if state_guard is not None and cas_failed:
-                with contextlib.suppress(Exception):
-                    _app.undeploy_adapter(run_id)
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
-                )
-        return dep_dict
+
+        job_kwargs = {
+            "run_id": run_id,
+            "spec_dict": status.spec,
+            "checkpoint_step": checkpoint_step,
+            "is_checkpoint": is_checkpoint,
+            "deploy_kwargs": deploy_kwargs,
+            "deployment": dep_dict,
+            "prev_state": prev_state,
+            "verify": verify,
+        }
+    ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
+    if ran_sync:
+        return _public_deployment(_app.get_status(run_id).deployment or dep_dict)
+    return _public_deployment(dep_dict)
 
 
 @router.delete("/v1/runs/{run_id}/deploy")
@@ -180,7 +463,13 @@ def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
         # Idempotent: clear local record even if serving side already had no adapter.
         if status.deployment:
             mark_undeployed(run_id)
-        return {"run_id": run_id, "deleted_endpoints": deleted}
+        # serving_deregistered=False means serving had nothing to delete (already gone or never
+        # actually registered) — the record teardown above still happened either way.
+        return {
+            "run_id": run_id,
+            "deleted_endpoints": deleted,
+            "serving_deregistered": bool(deleted),
+        }
 
 
 @router.post("/v1/runs/{run_id}/export")
@@ -260,26 +549,45 @@ def deployments(key: Annotated[dict, Depends(require_key)]):
             "undeployed",
             "dry_run",
         ):
-            out.append(status.to_dict())
+            data = status.to_dict()
+            data["deployment"] = _public_deployment(data["deployment"])
+            out.append(data)
     return {"deployments": out}
 
 
 @router.post("/v1/runs/{run_id}/chat")
 def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)]):
+    messages = _chat_messages_from_payload(payload)
     status = owned_run(run_id, key)
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
-    has_active_deploy = deployment.get("state") not in (None, "undeployed", "dry_run")
+    deployment_state = deployment.get("state")
+    has_ready_deploy = deployment_state in {"ready", "deployed"}
     # A cancelled run can still serve a per-step checkpoint it deployed: checkpoint deploy records
     # a live adapter that /v1/deployments lists as active without requiring a final adapter.
     # Only block chat when there's no active deployment to serve.
-    if status.state == "cancelled" and not has_active_deploy:
-        raise HTTPException(
-            status_code=409,
-            detail=f"run {run_id} was cancelled; deploy a checkpoint with "
-            f"`flash deploy {run_id} --step <N>` first",
-        )
-    if not has_active_deploy:
+    if not has_ready_deploy:
+        if deployment_state in _DEPLOYMENT_BUSY_STATES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run_id} deployment is {deployment_state}; run "
+                    "`flash deployments` to check progress"
+                ),
+            )
+        if deployment_state == "failed":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run_id} deployment failed: {deployment.get('error') or 'unknown error'}"
+                ),
+            )
+        if status.state == "cancelled":
+            raise HTTPException(
+                status_code=409,
+                detail=f"run {run_id} was cancelled; deploy a checkpoint with "
+                f"`flash deploy {run_id}/step-<N>` first",
+            )
         raise HTTPException(
             status_code=409,
             detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
@@ -315,7 +623,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             return StreamingResponse(
                 _app.serve_chat_stream(
                     run_id=run_id,
-                    messages=payload.get("messages") or [],
+                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     thinking=spec.thinking,
@@ -324,7 +632,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             )
         return _app.serve_chat(
             run_id=run_id,
-            messages=payload.get("messages") or [],
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             thinking=spec.thinking,

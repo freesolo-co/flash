@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
 from flash._logging import get_logger
 from flash.server._deps import require_key
@@ -36,6 +36,26 @@ def publish_env(payload: dict, key: Annotated[dict, Depends(require_key)]):
     except Exception as exc:
         logger.warning("record_published_environment failed (non-fatal): %s", exc, exc_info=True)
     return {"id": slug}
+
+
+@router.get("/v1/envs/{env_id:path}/package")
+def download_env_package(env_id: str, key: Annotated[dict, Depends(require_key)]):
+    """Download a managed Freesolo environment package from the GitHub-backed hub."""
+    from flash.server import envs
+
+    try:
+        env_id = envs.canonical_env_id(env_id)
+        package = envs.download_package(slug=env_id, key=key)
+    except envs.EnvPublishError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return Response(
+        content=package,
+        media_type="application/gzip",
+        headers={
+            "Content-Disposition": 'attachment; filename="package.tar.gz"',
+            "Content-Length": str(len(package)),
+        },
+    )
 
 
 @router.delete("/v1/envs/{env_id:path}")

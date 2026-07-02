@@ -11,7 +11,7 @@ def raw_spec(model: str = "Qwen/Qwen3.5-0.8B", **kw) -> dict:
     d = {
         "model": model,
         "algorithm": "sft",
-        "train": {"epochs": 1, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
     d.update(kw)

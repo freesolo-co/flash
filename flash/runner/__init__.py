@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from flash.catalog import ModelInfo, resolve_model
 from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
@@ -36,17 +36,22 @@ def adapter_prefix(spec: JobSpec) -> str:
 
 
 def adapter_ref(spec: JobSpec) -> str | None:
-    """Full init_from_adapter reference for a run's trained adapter."""
+    """INTERNAL storage reference for a run's trained adapter (artifact registration only)."""
     if not spec.train.hf_repo:
         return None
     return f"{spec.train.hf_repo}:{adapter_prefix(spec)}"
 
 
 def _adapter_ref_from_status_spec(raw: dict) -> str | None:
+    """The public short adapter reference (`<run_id>`) shown by `flash status` — exactly what
+    users paste into train.init_from_adapter; `<run_id>/step-N` targets a saved checkpoint."""
     try:
-        return adapter_ref(JobSpec.from_dict(raw))
+        spec = JobSpec.from_dict(raw)
     except Exception:
         return None
+    if not spec.train.hf_repo:
+        return None
+    return spec.run_id
 
 
 def _gpu_rate(gpu_type: str) -> float:
@@ -59,6 +64,81 @@ def _gpu_rate(gpu_type: str) -> float:
         return 0.80
 
 
+def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0) -> float:
+    """The customer charge for a run: the flash.cost estimate (training-only steps x sec/step x $/hr).
+
+    This is the price the run was QUOTED at submit. ``steps=None`` prices the spec's planned steps
+    (a completed run is charged exactly its quote); pass the actual steps that ran to re-price a
+    CANCELLED run at how far it got. Returns ``fallback`` if the spec can't be priced (so a charge is
+    never blocked by a pricing failure)."""
+    try:
+        from flash.cost.analytical import estimate_cost
+        from flash.cost.spec import estimate_for_spec, runconfig_from_spec
+
+        if steps is None:
+            return float(estimate_for_spec(spec).total_usd)
+        n = max(0, int(steps))
+        if n == 0:
+            return 0.0  # cancelled before any training step -> nothing to charge
+        from dataclasses import replace
+
+        cfg = runconfig_from_spec(spec)
+        planned = int(cfg.steps or 0)
+        if planned > 0:
+            n = min(n, planned)
+        # SFT is priced from train_tokens (not steps), so lowering steps ALONE wouldn't prorate a
+        # cancel -- estimate_cost would still charge the full-run token estimate. Scale the token
+        # count to the fraction of steps that ran so a mid-training SFT cancel is charged its share,
+        # mirroring GRPO's steps-based proration.
+        if not cfg.is_grpo and cfg.train_tokens and planned > 0:
+            scaled_tokens = max(1, int(cfg.train_tokens * n / planned))
+            cfg = replace(cfg, steps=n, train_tokens=scaled_tokens)
+        else:
+            cfg = replace(cfg, steps=n)
+        return float(estimate_cost(cfg).total_usd)
+    except Exception:
+        return float(fallback)
+
+
+def _require_priced_sft_examples(spec: JobSpec) -> None:
+    if spec.algorithm == "sft" and int(spec.train.max_examples or 0) <= 0:
+        raise ValueError(
+            "train.max_examples must be set to a positive row count for SFT "
+            "(use the full dataset row count for an uncapped run)"
+        )
+
+
+def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
+    quote = getattr(status, "estimated_cost_usd", None)
+    if quote is not None:
+        return float(quote)
+    return charge_usd_for_spec(spec, fallback=fallback)
+
+
+# Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
+# `step` field is 1-indexed and only appears once a step COMPLETES, so the expensive first step (a
+# GRPO rollout can be ~17 min) streams one of these stages with NO step yet -- still real GPU time.
+_TRAINING_STAGES = frozenset({"rl_step", "sft_step"})
+
+
+def actual_steps_run(status: RunStatus) -> int:
+    """How many optimizer steps to bill a (cancelled) run for.
+
+    The worker streams a per-step heartbeat whose ``step`` field is the last COMPLETED optimizer step
+    (1-indexed; the last one we persisted is the furthest it reached). Cancelled after N steps -> N.
+    The first step reports no ``step`` until it completes, so a cancel mid-first-step would look like
+    0 steps despite real GPU time -- we floor to 1 whenever a training-stage heartbeat is present.
+    Returns 0 only when no training heartbeat was seen (cancelled during cold-start/setup) -> $0."""
+    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
+    step = hb.get("step")
+    if isinstance(step, (int, float)) and step > 0:
+        return int(step)
+    # Training started (rl_step/sft_step) but no completed step yet -> mid-first-step -> bill 1.
+    if hb.get("stage") in _TRAINING_STAGES:
+        return 1
+    return 0
+
+
 @dataclass
 class RunStatus:
     run_id: str
@@ -67,6 +147,9 @@ class RunStatus:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     cost_usd: float = 0.0
+    # Submit-time flash.cost quote. Successful runs copy this into cost_usd at completion so the
+    # customer is charged exactly what was estimated before paid work started.
+    estimated_cost_usd: float | None = None
     error: str | None = None
     artifacts_dir: str | None = None
     adapter_ref: str | None = None
@@ -80,9 +163,9 @@ class RunStatus:
     submitted_instance_providers: list[str] | None = None
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
     # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
-    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the wall x $/hr
-    # PROJECTION); ``reconciled_at`` marks that the realized pull has happened so it isn't
-    # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
+    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the flash.cost ESTIMATE
+    # we charge the customer); ``reconciled_at`` marks that the realized pull has happened so it
+    # isn't re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
@@ -205,7 +288,7 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     if not env_id or spec.environment.resolved_sha:
         return spec
     try:
-        from flash.envs.adapter import (
+        from flash.envs.loader import (
             _parse_github_environment_ref,
             _resolve_ref_sha,
             is_managed_environment_slug,
@@ -240,7 +323,9 @@ _WEIGHT_CACHE_PEAK_FACTOR = 2.0
 def _fits_weight_cache(info: ModelInfo) -> bool:
     """Whether the model's peak download footprint fits the shared weight-cache volume."""
     if not info.params_b:
-        return True  # unknown size -> keep the (attach) default; curated catalog models always set it
+        return (
+            True  # unknown size -> keep the (attach) default; curated catalog models always set it
+        )
     download_gb = info.params_b * 2.0  # bf16: 2 bytes/param (mirrors cost.facts.download_weight_gb)
     return _WEIGHT_CACHE_PEAK_FACTOR * download_gb <= WEIGHT_CACHE_VOLUME_GB
 
@@ -294,6 +379,102 @@ def _run_job_background(
         logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
 
 
+def _context_org_id(context: dict | None) -> str:
+    if not isinstance(context, dict):
+        return ""
+    return str(context.get("org_id") or "").strip()
+
+
+def _status_org_id(status: RunStatus) -> str:
+    return _context_org_id(status.billing_context) or _context_org_id(status.platform_context)
+
+
+def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
+    if owner_key_id is None:
+        return False
+    try:
+        from flash.server import db
+
+        return db.run_owner(src_run_id) == owner_key_id
+    except Exception:
+        return False
+
+
+def _resolve_init_from_adapter(
+    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
+) -> JobSpec:
+    """Resolve the public `<run_id>[/step-N]` warm-start ref into the internal storage reference.
+
+    The control plane owns run metadata, so the short ref is resolved HERE (never on the worker):
+    the source run's hf_repo + phase key the artifact location the worker downloads from.
+    """
+    ref = spec.train.init_from_adapter
+    if not ref:
+        return spec
+    from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(ref)
+    if parsed is None:
+        raise ValueError(
+            "train.init_from_adapter must be `<run_id>` or `<run_id>/step-N` "
+            f"(a checkpoint listed by `flash checkpoints`); got {ref!r}"
+        )
+    src_run_id, step = parsed
+    try:
+        src_status = get_status(src_run_id)
+    except FileNotFoundError:
+        raise ValueError(f"train.init_from_adapter references unknown run {src_run_id!r}") from None
+    owner_org_id = owner_org_id.strip()
+    if owner_org_id:
+        src_org_id = _status_org_id(src_status)
+        if src_org_id:
+            owner_ok = src_org_id == owner_org_id
+        else:
+            owner_ok = _source_owned_by_key(src_run_id, owner_key_id)
+        if not owner_ok:
+            raise ValueError(
+                "train.init_from_adapter source run must belong to the same Freesolo org"
+            )
+    src_spec = JobSpec.from_dict(src_status.spec)
+    if not src_spec.train.hf_repo:
+        raise ValueError(
+            f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
+        )
+    if step is not None:
+        from flash.runner.checkpoints import CheckpointListingError, checkpoint_step_exists
+
+        try:
+            exists = checkpoint_step_exists(src_spec, step)
+        except CheckpointListingError as exc:
+            raise ValueError(str(exc)) from exc
+        if not exists:
+            raise ValueError(
+                f"train.init_from_adapter references {src_run_id}/step-{step}, but that "
+                "deployable checkpoint was not found"
+            )
+    else:
+        if src_status.state not in {"done", "deployed"}:
+            raise ValueError(
+                f"train.init_from_adapter references run {src_run_id!r}, but that run is "
+                f"{src_status.state!r}; use a completed source run or a concrete "
+                f"{src_run_id}/step-N checkpoint"
+            )
+        from flash.runner.checkpoints import CheckpointListingError, final_adapter_exists
+
+        try:
+            exists = final_adapter_exists(src_spec)
+        except CheckpointListingError as exc:
+            raise ValueError(str(exc)) from exc
+        if not exists:
+            raise ValueError(
+                f"train.init_from_adapter references run {src_run_id!r}, but its final "
+                "adapter was not found; use a concrete checkpoint ref like "
+                f"{src_run_id}/step-N if one exists"
+            )
+    storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
+    return replace(spec, train=replace(spec.train, init_from_adapter=storage))
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -301,9 +482,11 @@ def submit_job(
     runtime_secrets: dict[str, str] | None = None,
     billing_context: dict | None = None,
     platform_context: dict | None = None,
+    owner_key_id: int | None = None,
 ) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     that fits the run; dry-run only records state."""
+    _require_priced_sft_examples(spec)
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
     # "local" is the JobSpec placeholder; treat it as unset so programmatic callers get unique ids.
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
@@ -312,11 +495,28 @@ def submit_job(
     spec = _assign_weight_cache_volume(spec, info)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
+    public_spec = spec
+    estimated_cost_usd: float | None = None
+    if not dry_run:
+        from flash.cost.spec import estimate_for_spec
+
+        estimated_cost_usd = float(estimate_for_spec(public_spec).total_usd)
+    owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
+    worker_spec = _resolve_init_from_adapter(
+        public_spec,
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+    )
+    if not dry_run:
+        from flash.lora_rank import preflight_init_adapter_lora_rank
+
+        preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
     # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
     status = RunStatus(
-        run_id=spec.run_id,
+        run_id=public_spec.run_id,
         state="queued",
-        spec=spec.to_dict(),
+        spec=public_spec.to_dict(),
+        estimated_cost_usd=estimated_cost_usd,
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
         platform_context=platform_context,
@@ -337,17 +537,17 @@ def submit_job(
     if background:
         threading.Thread(
             target=_run_job_background,
-            args=(spec, runtime_secrets or {}),
+            args=(worker_spec, runtime_secrets or {}),
             kwargs={"resolve_env_sha": True},
             daemon=True,
         ).start()
-        return get_status(spec.run_id)
-    spec = _assign_resolved_env_sha(spec)
+        return get_status(public_spec.run_id)
+    worker_spec = _assign_resolved_env_sha(worker_spec)
     if runtime_secrets:
-        _run_job(spec, runtime_secrets=runtime_secrets)
+        _run_job(worker_spec, runtime_secrets=runtime_secrets)
     else:
-        _run_job(spec)
-    return get_status(spec.run_id)
+        _run_job(worker_spec)
+    return get_status(public_spec.run_id)
 
 
 def _runstatus_from_json(d: dict) -> RunStatus:
@@ -573,6 +773,8 @@ from flash.runner.deploy import (  # noqa: E402,F401
     cancel_run,
     mark_checkpoint_deployed,
     mark_deployed,
+    mark_deployment_failed,
+    mark_deployment_pending,
     mark_deployment_undeployed,
     mark_undeployed,
 )

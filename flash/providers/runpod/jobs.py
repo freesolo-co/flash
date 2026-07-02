@@ -612,28 +612,29 @@ def poll_job(
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
-            hb_ts = new_key[2] if new_key else None
-            hb_step = new_key[1] if new_key else None
-            hb_attempt = _attempt_int(new_key[3]) if new_key else None
-            is_training_hb = is_training_heartbeat(stage, hb_step)
-            if current_attempt is not None and hb_attempt != current_attempt:
-                # Non-current heartbeat: ignore so stale progress never tightens the stall window.
-                pass
-            elif hb_attempt is not None and hb_attempt > last_hb_attempt:
-                # Fresh attempt: reset ts baseline and re-derive seen_heartbeat so cold-start grace rearms.
-                last_hb_attempt = hb_attempt
-                last_hb_ts = hb_ts or 0.0
-                last_progress = time.time()
-                seen_heartbeat = is_training_hb
-            elif (hb_attempt is None or hb_attempt == last_hb_attempt) and (
-                hb_ts is None or hb_ts > last_hb_ts
-            ):
-                # Gate progress on ts advancing — a stale late upload must not buy a fresh stall window.
-                if hb_ts is not None:
-                    last_hb_ts = hb_ts
-                last_progress = time.time()
-                if is_training_hb:
-                    seen_heartbeat = True
+            if stage is not None:
+                hb_ts = new_key[2] if new_key else None
+                hb_step = new_key[1] if new_key else None
+                hb_attempt = _attempt_int(new_key[3]) if new_key else None
+                is_training_hb = is_training_heartbeat(stage, hb_step)
+                if current_attempt is not None and hb_attempt != current_attempt:
+                    # Non-current heartbeat: ignore so stale progress never tightens the stall window.
+                    pass
+                elif hb_attempt is not None and hb_attempt > last_hb_attempt:
+                    # Fresh attempt: reset ts baseline and re-derive seen_heartbeat so cold-start grace rearms.
+                    last_hb_attempt = hb_attempt
+                    last_hb_ts = hb_ts or 0.0
+                    last_progress = time.time()
+                    seen_heartbeat = is_training_hb
+                elif (hb_attempt is None or hb_attempt == last_hb_attempt) and (
+                    hb_ts is None or hb_ts > last_hb_ts
+                ):
+                    # Gate progress on ts advancing — a stale late upload must not buy a fresh stall window.
+                    if hb_ts is not None:
+                        last_hb_ts = hb_ts
+                    last_progress = time.time()
+                    if is_training_hb:
+                        seen_heartbeat = True
         in_setup = heartbeat_reader is not None and not seen_heartbeat
         stall_limit = setup_grace_s if in_setup else stall_after_s
         if time.time() - last_progress > stall_limit:
