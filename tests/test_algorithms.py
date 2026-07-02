@@ -48,7 +48,7 @@ def test_grpo_capability_still_enforced():
                 "model": "test/sft-only",
                 "algorithm": "sft",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"epochs": 1, "hf_repo": "owner/runs"},
+                "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
             },
             run_id="x",
         )

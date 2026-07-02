@@ -11,15 +11,18 @@ _ADAPTER_REF = "owner/runs:sft/sft-run"
 
 
 def _spec(*, model: str = "Qwen/Qwen3.5-4B", rank: int = 16, algorithm: str = "grpo"):
+    train = {
+        "steps": 1,
+        "lora_rank": rank,
+    }
+    if algorithm == "sft":
+        train["max_examples"] = 8
     spec = spec_from_dict(
         {
             "model": model,
             "algorithm": algorithm,
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-            "train": {
-                "steps": 1,
-                "lora_rank": rank,
-            },
+            "train": train,
         }
     )
     return replace(spec, train=replace(spec.train, init_from_adapter=_ADAPTER_REF))
