@@ -27,6 +27,7 @@ from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
 from . import render
+from ._tty import TtyStatusLine
 from .training_doc import TRAINING_MD
 
 logger = get_logger("flash.cli")
@@ -45,17 +46,11 @@ _SPINNER_FRAMES = "|/-\\"
 _SPINNER_TICK_SECONDS = 0.1
 
 
-class _LogFollowSpinner:
+class _LogFollowSpinner(TtyStatusLine):
     def __init__(self, run_id: str):
+        super().__init__()
         self._run_id = run_id
         self._frame = 0
-        self._last_len = 0
-        self._active = False
-        self._enabled = sys.stderr.isatty()
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
 
     def render(self, state: str) -> None:
         if not self._enabled:
@@ -63,18 +58,7 @@ class _LogFollowSpinner:
         frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
         self._frame += 1
         message = f"{frame} following logs for {self._run_id} ({state})"
-        padding = " " * max(0, self._last_len - len(message))
-        sys.stderr.write(f"\r{message}{padding}")
-        sys.stderr.flush()
-        self._last_len = len(message)
-        self._active = True
-
-    def clear(self) -> None:
-        if not (self._enabled and self._active):
-            return
-        sys.stderr.write(f"\r{' ' * self._last_len}\r")
-        sys.stderr.flush()
-        self._active = False
+        self._write(message)
 
 
 def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, state: str) -> None:
@@ -148,13 +132,13 @@ def cmd_whoami(args) -> int:
 _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
-Edit datasets/train.jsonl and the reward code, then upload with
+Edit dataset/train.jsonl and the reward code, then upload with
 `flash env push --name my-env .`.
 
 A managed run should use the returned [environment] id from
 `flash env push --name my-env .`.
 
-This starter keeps a tiny smoke-test dataset in datasets/train.jsonl. Replace it
+This starter keeps a tiny smoke-test dataset in dataset/train.jsonl. Replace it
 with your real training rows before a real run.
 """
 
@@ -167,7 +151,7 @@ from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 
-DEFAULT_DATASET_PATH = Path(__file__).parent / "datasets" / "train.jsonl"
+DEFAULT_DATASET_PATH = Path(__file__).parent / "dataset" / "train.jsonl"
 
 
 def load_jsonl(path: str | Path):
@@ -211,8 +195,8 @@ _STARTER_DATASET_JSONL = """\
 
 def cmd_env_setup(args) -> int:
     Path("configs").mkdir(exist_ok=True)
-    Path("datasets").mkdir(exist_ok=True)
-    dataset = Path("datasets/train.jsonl")
+    Path("dataset").mkdir(exist_ok=True)
+    dataset = Path("dataset/train.jsonl")
     if not dataset.exists():
         dataset.write_text(_STARTER_DATASET_JSONL)
     starter_env = Path("environment.py")
@@ -257,7 +241,7 @@ def cmd_env_setup(args) -> int:
         training.write_text(TRAINING_MD, encoding="utf-8")
     scaffolded = [
         "environment.py",
-        "datasets/train.jsonl",
+        "dataset/train.jsonl",
         "configs/rl.toml",
         "configs/sft.toml",
         "TRAINING.md",
@@ -340,9 +324,8 @@ def cmd_env_list(args) -> int:
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Catalog-only and deterministic; SFT uses the actual local training-token count when the env
-    and tokenizer are importable. An uncapped SFT run must be able to count the env's train split,
-    otherwise it errors instead of guessing a dataset size."""
+    Catalog-only and deterministic. SFT cost never imports the environment; it requires a positive
+    [train].max_examples row count instead of guessing or locally counting a dataset."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(

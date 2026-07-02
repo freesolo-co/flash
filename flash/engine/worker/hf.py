@@ -13,6 +13,7 @@ import shutil
 import threading
 import time
 
+from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
 
@@ -269,15 +270,11 @@ _CHECKPOINT_TRAINER_STATE = (
     "zero_to_fp32.py",
 )
 
-# The PEFT adapter weights file a checkpoint must carry to be loadable/servable. A step with
-# adapter_config.json but no weights is NOT deployable, so it's never published/listed.
-_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
-
 
 def _has_deployable_adapter(ckpt_dir: str) -> bool:
     """Return True if ckpt_dir has a loadable LoRA adapter (config + weights)."""
     return os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")) and any(
-        os.path.isfile(os.path.join(ckpt_dir, w)) for w in _ADAPTER_WEIGHT_FILES
+        os.path.isfile(os.path.join(ckpt_dir, w)) for w in ADAPTER_WEIGHT_FILES
     )
 
 
@@ -392,7 +389,9 @@ class _UploadPump:
             busy = self.uploading
             self.queued = (step, ckpt_dir)
         if busy:
-            print(f"[ckpt] upload busy; queued step {step} (uploads when the in-flight one finishes)")
+            print(
+                f"[ckpt] upload busy; queued step {step} (uploads when the in-flight one finishes)"
+            )
         self.pump()
 
     def pump(self) -> None:

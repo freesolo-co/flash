@@ -73,16 +73,60 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
         assert "old" in {r.run_id for r in runner.list_runs()}
 
 
+def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_path):
+    import flash.runner as runner
+    from flash.cost.spec import estimate_for_spec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: spec)
+
+    seen: dict[str, float] = {}
+
+    def fake_run(spec, runtime_secrets=None):
+        status = runner.get_status(spec.run_id)
+        priced_spec = JobSpec.from_dict(status.spec)
+        seen["estimate"] = float(status.estimated_cost_usd)
+        seen["expected"] = float(estimate_for_spec(priced_spec).total_usd)
+        runner._update(
+            spec.run_id,
+            "done",
+            cost_usd=runner._status_estimated_charge(status, priced_spec, fallback=0.01),
+        )
+
+    monkeypatch.setattr(runner, "_run_job", fake_run)
+
+    status = runner.submit_job(
+        JobSpec(
+            run_id="quoted",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="grpo",
+            train=TrainSpec(steps=2),
+            gpu=GpuSpec(type="RTX 4090"),
+        )
+    )
+
+    assert seen["estimate"] == pytest.approx(seen["expected"])
+    assert status.estimated_cost_usd == pytest.approx(seen["expected"])
+    assert status.cost_usd == pytest.approx(seen["expected"])
+
+
 def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         import flash.runner as runner
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.spec import JobSpec
+        from flash.spec import JobSpec, TrainSpec
 
         status = runner.submit_job(
-            JobSpec(run_id="hb", model="Qwen/Qwen3.5-4B", algorithm="sft"),
+            JobSpec(
+                run_id="hb",
+                model="Qwen/Qwen3.5-4B",
+                algorithm="sft",
+                train=TrainSpec(max_examples=8),
+            ),
             dry_run=True,
         )
         status.state = "running"
@@ -264,6 +308,48 @@ def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
             on_disk = json.load(f)
         assert on_disk["cost_usd"] == pytest.approx(10.0)
         assert on_disk["setup_seconds"] == pytest.approx(590.0)
+
+
+def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner as runner
+    from flash.runner import lifecycle
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(
+        run_id="quote",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=2),
+        gpu=GpuSpec(type="RTX 4090"),
+    )
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            estimated_cost_usd=7.77,
+        )
+    )
+    monkeypatch.setattr(
+        runner,
+        "_submit_seed_supervised",
+        lambda *a, **k: {"wall_seconds": 1.0, "cost_usd": 0.01},
+    )
+    monkeypatch.setattr(
+        runner,
+        "charge_usd_for_spec",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must use submit quote")),
+    )
+
+    lifecycle._run_training(spec, io.StringIO(), prior_cost=0.0)
+
+    st = runner.get_status(spec.run_id)
+    assert st.state == "done"
+    assert st.cost_usd == pytest.approx(7.77)
 
 
 def test_run_training_bails_when_running_cas_rejects(monkeypatch):

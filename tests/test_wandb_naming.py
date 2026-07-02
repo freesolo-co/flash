@@ -21,7 +21,7 @@ def _base(**extra: object) -> dict:
         "model": "openbmb/MiniCPM5-1B",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:some-env/environment.py"},
-        "train": {"hf_repo": "me/repo"},
+        "train": {"hf_repo": "me/repo", "max_examples": 8},
     }
     cfg.update(extra)
     return cfg
@@ -105,6 +105,7 @@ def _toml(tmp_path) -> str:
         "[environment]\n"
         'id = "github:owner/repo@main:some-env/environment.py"\n'
         "[train]\n"
+        "max_examples = 8\n"
         'hf_repo = "me/repo"\n'
     )
     return str(cfg)

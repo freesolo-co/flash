@@ -361,6 +361,11 @@ def _validate_spec(spec: JobSpec) -> None:
         raise ConfigError("train.steps must be positive for GRPO")
     if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
+    if spec.algorithm == "sft" and int(spec.train.max_examples or 0) <= 0:
+        raise ConfigError(
+            "train.max_examples must be set to a positive row count for SFT "
+            "(use the full dataset row count for an uncapped run)"
+        )
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
