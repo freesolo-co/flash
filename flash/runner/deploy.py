@@ -105,8 +105,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         TERMINAL_STATES,
         _gc_run_endpoints,
         _persist_metrics,
+        _resolve_init_from_adapter,
         _run_training,
         _RunCancelled,
+        _status_org_id,
         _update,
         artifacts_dir,
         charge_usd_for_spec,
@@ -119,7 +121,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     if not status.remote:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
-    spec = JobSpec.from_dict(status.spec)
+    spec = _resolve_init_from_adapter(
+        JobSpec.from_dict(status.spec),
+        owner_org_id=_status_org_id(status),
+    )
     remote = dict(status.remote)
     seed = int(remote.pop("seed", FIXED_SEED))
     code_prefix = remote.pop("code_prefix", None)

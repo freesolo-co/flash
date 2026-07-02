@@ -335,13 +335,14 @@ def _run_job_background(
     spec: JobSpec,
     runtime_secrets: dict[str, str] | None = None,
     *,
+    owner_org_id: str = "",
     resolve_env_sha: bool = False,
 ) -> None:
     """Daemon-thread entrypoint: swallows exceptions to suppress noisy thread tracebacks."""
     import logging
 
     try:
-        spec = _resolve_init_from_adapter(spec)
+        spec = _resolve_init_from_adapter(spec, owner_org_id=owner_org_id)
         if resolve_env_sha:
             with contextlib.suppress(Exception):
                 spec = _assign_resolved_env_sha(spec)
@@ -356,7 +357,17 @@ def _run_job_background(
         logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
 
 
-def _resolve_init_from_adapter(spec: JobSpec) -> JobSpec:
+def _context_org_id(context: dict | None) -> str:
+    if not isinstance(context, dict):
+        return ""
+    return str(context.get("org_id") or "").strip()
+
+
+def _status_org_id(status: RunStatus) -> str:
+    return _context_org_id(status.billing_context) or _context_org_id(status.platform_context)
+
+
+def _resolve_init_from_adapter(spec: JobSpec, *, owner_org_id: str = "") -> JobSpec:
     """Resolve the public `<run_id>[/step-N]` warm-start ref into the internal storage reference.
 
     The control plane owns run metadata, so the short ref is resolved HERE (never on the worker):
@@ -381,11 +392,26 @@ def _resolve_init_from_adapter(spec: JobSpec) -> JobSpec:
         src_status = get_status(src_run_id)
     except FileNotFoundError:
         raise ValueError(f"train.init_from_adapter references unknown run {src_run_id!r}") from None
+    owner_org_id = owner_org_id.strip()
+    if owner_org_id:
+        src_org_id = _status_org_id(src_status)
+        if src_org_id != owner_org_id:
+            raise ValueError(
+                "train.init_from_adapter source run must belong to the same Freesolo org"
+            )
     src_spec = JobSpec.from_dict(src_status.spec)
     if not src_spec.train.hf_repo:
         raise ValueError(
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
         )
+    if step is not None:
+        from flash.runner.checkpoints import list_checkpoints
+
+        if not any(int(item.get("step", -1)) == int(step) for item in list_checkpoints(src_spec)):
+            raise ValueError(
+                f"train.init_from_adapter references {src_run_id}/step-{step}, but that "
+                "deployable checkpoint was not found"
+            )
     storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
     return replace(spec, train=replace(spec.train, init_from_adapter=storage))
 
@@ -407,7 +433,8 @@ def submit_job(
     spec = _assign_managed_hf_repo(spec)
     spec = _assign_weight_cache_volume(spec, info)
     public_spec = spec
-    worker_spec = _resolve_init_from_adapter(public_spec)
+    owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
+    worker_spec = _resolve_init_from_adapter(public_spec, owner_org_id=owner_org_id)
     # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
     status = RunStatus(
         run_id=public_spec.run_id,
@@ -428,7 +455,7 @@ def submit_job(
         threading.Thread(
             target=_run_job_background,
             args=(worker_spec, runtime_secrets or {}),
-            kwargs={"resolve_env_sha": True},
+            kwargs={"owner_org_id": owner_org_id, "resolve_env_sha": True},
             daemon=True,
         ).start()
         return get_status(public_spec.run_id)

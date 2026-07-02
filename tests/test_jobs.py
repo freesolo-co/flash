@@ -1205,6 +1205,13 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
             }
         )
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        import flash.runner.checkpoints as checkpoints
+
+        monkeypatch.setattr(
+            checkpoints,
+            "list_checkpoints",
+            lambda spec: [{"step": 40, "adapter_prefix": "rl/source-run/checkpoints/step-40"}],
+        )
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1232,6 +1239,150 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
         assert (
             launched["init_from_adapter"]
             == "Freesolo-Co/flashrun-source-env:rl/source-run/checkpoints/step-40"
+        )
+
+
+def test_submit_rejects_cross_org_init_ref(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                billing_context={"org_id": "org-a"},
+            )
+        )
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="same Freesolo org"):
+            orch.submit_job(
+                spec,
+                dry_run=True,
+                background=False,
+                billing_context={"org_id": "org-b"},
+            )
+
+
+def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.checkpoints as checkpoints
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                billing_context={"org_id": "org-a"},
+            )
+        )
+        monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec: [{"step": 10}])
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="deployable checkpoint was not found"):
+            orch.submit_job(
+                spec,
+                dry_run=True,
+                background=False,
+                billing_context={"org_id": "org-a"},
+            )
+
+
+def test_attach_resolves_public_init_ref_before_recovery_launch(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        import flash.runner.checkpoints as checkpoints
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                billing_context={"org_id": "org-a"},
+            )
+        )
+        monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec: [{"step": 40}])
+        base = _spec("warm-recover").to_dict()
+        spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="warm-recover",
+                state="running",
+                spec=spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
+            )
+        )
+        launched: dict[str, str] = {}
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="stalled"),
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        monkeypatch.setattr(flash_train, "upload_code", lambda *a, **k: "repo")
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orch,
+            "_run_training",
+            lambda spec, *a, **k: launched.setdefault(
+                "init_from_adapter", spec.train.init_from_adapter
+            ),
+        )
+
+        orch.attach_run("warm-recover", log_stream=sys.stderr)
+
+        assert (
+            launched["init_from_adapter"]
+            == "Freesolo-Co/source:rl/source-run/checkpoints/step-40"
         )
 
 

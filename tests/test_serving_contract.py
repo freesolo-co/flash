@@ -242,7 +242,7 @@ def test_deploy_reads_registry_back_before_ready(monkeypatch):
 
     dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
     assert dep.state == "ready"
-    assert gets == ["https://serve.example/adapters"]
+    assert gets == ["https://serve.example/adapters", "https://serve.example/adapters"]
 
 
 def test_deploy_registry_readback_falls_back_to_camel_adapter_id(monkeypatch):
@@ -344,8 +344,8 @@ def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatc
     assert dep.state == "ready"
 
 
-def test_deploy_5xx_recovers_when_registry_record_omits_subfolder(monkeypatch):
-    """Older serving builds omit subfolder; during ambiguous POST recovery, presence is enough."""
+def test_deploy_5xx_recovers_when_new_registry_record_omits_subfolder(monkeypatch):
+    """Older serving builds omit subfolder; accept it only when there was no prior deployment."""
     import httpx
 
     import flash.serve.deploy as deploy_mod
@@ -355,14 +355,36 @@ def test_deploy_5xx_recovers_when_registry_record_omits_subfolder(monkeypatch):
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(502, text="bad gateway", request=req)
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
-    monkeypatch.setattr(
-        deploy_mod.httpx,
-        "get",
-        lambda *a, **k: _registry_resp([{"adapter_id": "flash-1-abc"}]),
-    )
+    responses = iter([_registry_resp([]), _registry_resp([{"adapter_id": "flash-1-abc"}])])
+    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
 
     dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
     assert dep.state == "ready"
+
+
+def test_deploy_5xx_rejects_subfolderless_record_after_prior_deployment(monkeypatch):
+    """A checkpoint swap must not accept a subfolder-less record after an ambiguous POST failure."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(502, text="bad gateway", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    responses = iter(
+        [
+            _registry_resp([{"adapter_id": "flash-1-abc"}]),
+            _registry_resp([{"adapter_id": "flash-1-abc"}]),
+        ]
+    )
+    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert "cannot confirm" in str(ei.value)
 
 
 def test_deployment_dict_carries_openai_v1_url(monkeypatch):

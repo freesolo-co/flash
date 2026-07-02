@@ -295,13 +295,16 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        dep_dict = _app.deployment_record(
-            run_id=run_id,
-            model=spec.model,
-            adapter_prefix=deploy_prefix,
-            gpu_name=spec.gpu.type,
-            state="deploying",
-        ).to_dict()
+        try:
+            dep_dict = _app.deployment_record(
+                run_id=run_id,
+                model=spec.model,
+                adapter_prefix=deploy_prefix,
+                gpu_name=spec.gpu.type,
+                state="deploying",
+            ).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         dep_dict = _deployment_state(
             dep_dict,
             "deploying",

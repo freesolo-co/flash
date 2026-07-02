@@ -283,6 +283,7 @@ def deploy_adapter(
     normalized_org_id = (org_id or "").strip()
     if normalized_org_id:
         body["orgId"] = normalized_org_id
+    previous_record = _registered_adapter(run_id)
     try:
         _post_adapter_or_raise(f"{base}/adapters", body)
     except ServingError as exc:
@@ -293,13 +294,28 @@ def deploy_adapter(
             raise
         record = _registered_adapter(run_id)
         recorded = _record_subfolder(record)
-        if record is not None and recorded in (None, subfolder):
+        if record is not None and recorded == subfolder:
             logger.warning(
                 "POST /adapters for %s failed (%s) but the serving registry shows the adapter "
                 "registered; continuing",
                 run_id,
                 exc,
             )
+        elif record is not None and recorded is None and previous_record is None:
+            logger.warning(
+                "POST /adapters for %s failed (%s) but the serving registry shows a new adapter "
+                "record without subfolder details; continuing because no prior deployment was "
+                "registered",
+                run_id,
+                exc,
+            )
+        elif record is not None and recorded is None:
+            raise ServingError(
+                f"{exc} — the serving registry returned adapter {run_id} without a subfolder, "
+                f"so it cannot confirm that requested checkpoint {subfolder!r} replaced the "
+                "previous deployment. Retry `flash deploy` once serving recovers",
+                status_code=exc.status_code,
+            ) from exc
         elif recorded is not None:
             raise ServingError(
                 f"{exc} — the serving registry still shows adapter {run_id} at the previously "

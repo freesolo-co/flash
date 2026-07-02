@@ -918,6 +918,29 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployments[0]["deployment"]["state"] == "deploying"
 
 
+def test_deploy_rejects_unsupported_stored_gpu_as_400(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.spec["gpu"]["type"] = "Quantum TPU"
+    runner._save_status(status)
+    monkeypatch.setattr(
+        app_mod,
+        "start_deployment_job",
+        lambda **_k: pytest.fail("invalid deployment must not enqueue"),
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 400, resp.text
+    assert "unsupported gpu" in resp.json()["detail"]
+
+
 def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkeypatch):
     """A run whose finalize never published the run-level <prefix>/adapter (but which streamed
     per-step deployable checkpoints) must not fail run-level deploy with an opaque 502 rank
