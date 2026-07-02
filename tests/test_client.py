@@ -25,10 +25,19 @@ def stub():
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_bytes(self, code: int, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             seen["auth"] = self.headers.get("Authorization")
             seen["path"] = self.path
-            if self.path == "/v1/runs/old-api/worker":
+            if self.path.startswith("/v1/envs/") and self.path.endswith("/package"):
+                self._send_bytes(200, b"package-bytes")
+            elif self.path == "/v1/runs/old-api/worker":
                 self._send(404, {"detail": "Not Found"})
             elif self.path == "/v1/runs/proxy-old-api/worker":
                 self.send_response(404)
@@ -236,6 +245,37 @@ def test_delete_env_percent_encodes_reserved_chars(stub):
     client.delete_env("team/env?x=1#frag")
     assert seen["method"] == "DELETE"
     assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag"
+
+
+def test_download_env_package_uses_flash_control_plane(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    data = client.download_env_package("acme/my-env")
+
+    assert data == b"package-bytes"
+    assert seen["path"] == "/v1/envs/acme/my-env/package"
+    assert seen["auth"] == "Bearer fslo-user-test"
+
+
+def test_download_env_package_percent_encodes_reserved_chars(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    client.download_env_package("team/env?x=1#frag")
+
+    assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag/package"
+
+
+def test_download_env_package_caps_response_body(stub, monkeypatch):
+    from flash.envs import loader as adapter
+
+    url, _seen = stub
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 5)
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="maximum allowed size"):
+        client.download_env_package("acme/my-env")
 
 
 def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
