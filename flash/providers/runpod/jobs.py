@@ -148,6 +148,8 @@ class JobHandle:
     job_id: str
     # Attempts share the seed's HF heartbeat path, so poll_job needs this to reject prior-attempt leftovers.
     attempt: int = 0
+    # Submit timestamp used to date shared heartbeat artifacts across retries. 0.0 = legacy/unknown.
+    started_ts: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -156,15 +158,21 @@ class JobHandle:
             "endpoint_name": self.endpoint_name,
             "job_id": self.job_id,
             "attempt": self.attempt,
+            "started_ts": self.started_ts,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> JobHandle:
+        try:
+            started_ts = float(d.get("started_ts") or 0.0)
+        except (TypeError, ValueError):
+            started_ts = 0.0
         return cls(
             d["endpoint_id"],
             d.get("endpoint_name", ""),
             d["job_id"],
             _attempt_int(d.get("attempt")) or 0,
+            started_ts,
         )
 
 
@@ -492,6 +500,7 @@ def poll_job(
     poll_errors = PollErrorTracker(say, interval_s)
 
     start = time.time()
+    launch_ts = handle.started_ts or 0.0
     last_status = None
     last_hb_key = None
     last_hb_ts = 0.0
@@ -522,7 +531,7 @@ def poll_job(
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:
                 last_hb_key, retriable, oom = surfaced_worker_flags(
-                    heartbeat_reader, last_hb_key, say, current_attempt
+                    heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
                 )
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
@@ -540,7 +549,7 @@ def poll_job(
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
             last_hb_key, retriable, oom = surfaced_worker_flags(
-                heartbeat_reader, last_hb_key, say, current_attempt
+                heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
             )
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
@@ -680,6 +689,7 @@ def submit_run(
         "extra_pip": extra_pip,
         "code_prefix": code_prefix or flash_code_prefix(),
     }
+    submitted_ts = time.time()
     try:
         job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
     except Exception:
@@ -687,7 +697,7 @@ def submit_run(
         with contextlib.suppress(Exception):
             runpod_api.delete_endpoint(endpoint_id)
         raise
-    handle = JobHandle(endpoint_id, name, job_id, int(attempt))
+    handle = JobHandle(endpoint_id, name, job_id, int(attempt), submitted_ts)
     if log is not None:
         print(
             f"submitted job: endpoint={name} ({endpoint_id}) job={job_id} "
@@ -787,19 +797,93 @@ def make_hf_failure_detail_reader(
     return read
 
 
-def worker_flagged_retriable(heartbeat_reader) -> bool:
-    """True if the worker stamped ``retriable`` in its last heartbeat (forces a fresh read)."""
+def _heartbeat_is_prior_attempt(hb: dict, launch_ts: float | None, current_attempt) -> bool:
+    """Positively attribute a heartbeat to a PRIOR (earlier) attempt: an explicit ``attempt`` differing
+    from ``current_attempt`` (definitive provenance — a MATCH proves THIS launch, so a lagging worker-host
+    clock cannot demote it), else a parseable ``ts`` predating this attempt's launch. Un-dateable (no
+    attempt AND no usable ts) -> False: mere absence of proof is never treated as a leftover. Truthy
+    ``launch_ts`` only (0.0 = unknown launch, uncomparable). Shared decision core of
+    ``worker_flagged_retriable`` (honor the retriable flag iff NOT prior) and
+    ``heartbeat_is_stale_prior_attempt`` (stale iff prior) — one edit site instead of two lockstep copies."""
+    hb_attempt = _attempt_int(hb.get("attempt"))
+    cur_attempt = _attempt_int(current_attempt)
+    if hb_attempt is not None and cur_attempt is not None:
+        return hb_attempt != cur_attempt
+    if launch_ts:
+        try:
+            ts = float(hb.get("ts"))
+        except (TypeError, ValueError):
+            ts = None
+        if ts is not None and ts < float(launch_ts):
+            return True
+    return False
+
+
+def worker_flagged_retriable(
+    heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
+) -> bool:
+    """True if the worker stamped ``retriable`` (a RetriableInfraError) in its last heartbeat — the
+    structured worker<->poller contract that replaces failure-detail parsing: ``retriable`` means
+    retry on a fresh worker. Forces a fresh read past the rate limit.
+
+    ``launch_ts`` / ``current_attempt``, when supplied, gate the flag to THIS attempt. The seed
+    heartbeat path is shared across retries, so a leftover ``retriable=True`` from attempt N-1 must
+    NOT override attempt N's own (non-retriable) failure marker — otherwise a deterministic
+    bootstrap/config error that fails BEFORE this attempt's worker emits any heartbeat would be
+    reported job_preempted and burn GPUs on an endless retry instead of failing fast. Only positive
+    prior-attempt evidence gates the flag: a ts that predates launch OR an explicit attempt mismatch.
+    With NEITHER arg the flag is honored ungated (back-compat for callers that don't date heartbeats)."""
     if heartbeat_reader is None:
         return False
     hb = heartbeat_reader(force=True)
     if not isinstance(hb, dict):
         return False
-    return bool(hb.get("retriable"))
+    if not bool(hb.get("retriable")):
+        return False
+    if launch_ts is None and current_attempt is None:
+        return True  # ungated: caller can't date the heartbeat -> preserve prior behavior
+    # Honor the retriable flag unless the heartbeat provably belongs to a PRIOR attempt.
+    return not _heartbeat_is_prior_attempt(hb, launch_ts, current_attempt)
 
 
-def surfaced_worker_flags(heartbeat_reader, last_hb_key, say, current_attempt: int | None = None) -> tuple:
+def heartbeat_is_stale_prior_attempt(
+    heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
+) -> bool:
+    """True ONLY when a heartbeat can be POSITIVELY attributed to a PRIOR (earlier) attempt — either it
+    carries an explicit ``attempt`` that differs from ``current_attempt``, OR a parseable ``ts`` that
+    predates THIS attempt's launch. Everything else returns False: no heartbeat, an empty/uninformative
+    heartbeat (no ts AND no attempt — e.g. ``{}``), a heartbeat matching this attempt, or one that
+    cannot be dated. The asymmetry is deliberate — we suppress a crash classification only on PROOF of
+    a leftover, never on mere absence of proof (an un-dateable heartbeat is NOT evidence of a prior run
+    and must not mask THIS attempt's deterministic crash).
+
+    The seed heartbeat path AND the seed-scoped ``error_<phase>.txt`` crash artifact are BOTH shared
+    across this seed's retries, so a prior attempt can leave either behind. When the latest heartbeat
+    provably belongs to an earlier attempt, the co-located error file is presumed leftover too — so a
+    dead-host poll on attempt N must NOT read that stale crash file as THIS attempt's DETERMINISTIC
+    failure (which would fail-fast a genuine host LOSS instead of retrying it on a fresh host). Gating
+    requires BOTH ``launch_ts`` and ``current_attempt``; without them a heartbeat cannot be dated, so
+    it is never called stale (conservative — keep the caller's existing classification)."""
+    if heartbeat_reader is None:
+        return False
+    hb = heartbeat_reader(force=True)
+    if not isinstance(hb, dict) or launch_ts is None or current_attempt is None:
+        return False
+    return _heartbeat_is_prior_attempt(hb, launch_ts, current_attempt)
+
+
+def surfaced_worker_flags(
+    heartbeat_reader,
+    last_hb_key,
+    say,
+    current_attempt: int | None = None,
+    *,
+    launch_ts: float | None = None,
+) -> tuple:
     """Read once for heartbeat surfacing plus structured retriable/OOM flags."""
     hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
     last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
-    retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
+    retriable = worker_flagged_retriable(
+        lambda force=False: hb, launch_ts=launch_ts, current_attempt=current_attempt
+    )
     return last_hb_key, retriable, heartbeat_oom_for_attempt(hb, current_attempt)

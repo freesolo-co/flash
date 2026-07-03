@@ -12,6 +12,7 @@ from flash.providers._instance import (
 )
 from flash.providers._instance import (
     instance_label,
+    label_matches_run,
     run_label_prefix,
 )
 
@@ -21,6 +22,7 @@ __all__ = [
     "build_payload",
     "build_user_data",
     "instance_label",
+    "label_matches_run",
     "lambda_image",
     "run_label_prefix",
 ]

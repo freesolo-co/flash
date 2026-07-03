@@ -359,6 +359,8 @@ def _color_json(obj, depth: int) -> str:
 
 def _hide_provider_metadata(obj):
     """Styled CLI details are for humans; keep backend provider names out of that view."""
+    from flash.providers import PROVIDER_NAMES
+
     if isinstance(obj, dict):
         return {
             k: _hide_provider_metadata(v)
@@ -367,7 +369,7 @@ def _hide_provider_metadata(obj):
         }
     if isinstance(obj, list):
         return [_hide_provider_metadata(v) for v in obj]
-    if isinstance(obj, str) and obj.lower() in {"runpod", "lambda"}:
+    if isinstance(obj, str) and obj.lower() in PROVIDER_NAMES:
         return "managed"
     return obj
 

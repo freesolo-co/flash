@@ -155,6 +155,12 @@ class RunStatus:
     adapter_ref: str | None = None
     deployment: dict | None = None
     remote: dict | None = None
+    # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
+    # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
+    # closed for any of these that is no longer configurable (so it can't ENUMERATE to prove clear),
+    # scoped here so a plane that never configured Vast never blocks a handle-less recovery on it. None
+    # for runs created outside submit() / pre-feature records.
+    submitted_instance_providers: list[str] | None = None
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
     # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
     # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the flash.cost ESTIMATE
@@ -487,6 +493,8 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     spec = _assign_managed_hf_repo(spec)
     spec = _assign_weight_cache_volume(spec, info)
+    from flash.providers import INSTANCE_PROVIDERS, available_providers
+
     public_spec = spec
     estimated_cost_usd: float | None = None
     if not dry_run:
@@ -512,6 +520,12 @@ def submit_job(
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
         platform_context=platform_context,
+        # Snapshot the instance providers available at submit so a later handle-less recovery can fail
+        # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
+        # Creds-only check (available_providers -> is_configured), no network on the create path.
+        submitted_instance_providers=[
+            n for n in available_providers() if n in INSTANCE_PROVIDERS
+        ],
     )
     _save_status(status)
     _report_status(status)
