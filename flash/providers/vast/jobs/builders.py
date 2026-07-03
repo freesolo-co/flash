@@ -15,8 +15,10 @@ import base64
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 from flash.providers._instance import (
+    InstanceJobHandle,
     _spill_large_spec_to_hf,
     instance_label,
     label_matches_run,
@@ -57,53 +59,39 @@ class VastOffer:
 
 
 @dataclass
-class VastJobHandle:
-    """Persisted in RunStatus.remote so any process can reattach/cancel (cf. base.JobHandle)."""
+class VastJobHandle(InstanceJobHandle):
+    """Persisted in RunStatus.remote so any process can reattach/cancel (cf. base.JobHandle).
 
-    instance_id: int
+    Extends the shared ``InstanceJobHandle`` with Vast's offer/machine locator fields; the common
+    fields + (de)serialization live on the base.
+    """
+
     offer_id: int
     machine_id: int
     label: str
-    gpu: str
-    hourly_usd: float
-    attempt: int
-    started_ts: float
 
-    def to_dict(self) -> dict:
+    provider: ClassVar[str] = "vast"
+
+    @staticmethod
+    def _coerce_instance_id(raw) -> int:
+        # A Vast instance_id is numeric; the base guard turns a missing/non-numeric one into a clear
+        # "corrupt vast handle" error rather than a bare KeyError/ValueError that crashes recovery.
+        return int(raw)
+
+    def _extra_to_dict(self) -> dict:
         return {
-            "provider": "vast",
-            "instance_id": self.instance_id,
             "offer_id": self.offer_id,
             "machine_id": self.machine_id,
             "label": self.label,
-            "gpu": self.gpu,
-            "hourly_usd": self.hourly_usd,
-            "attempt": self.attempt,
-            "started_ts": self.started_ts,
         }
 
-    @classmethod
-    def from_dict(cls, d: dict) -> VastJobHandle:
-        # instance_id identifies the box (poll/destroy target), so unlike the other fields it has no safe
-        # default — a 0/None would point teardown at a non-existent instance. A corrupt/partial persisted
-        # handle must fail with a clear, actionable error, not a bare KeyError/ValueError.
-        try:
-            instance_id = int(d["instance_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"corrupt vast handle: missing/non-numeric instance_id "
-                f"({d.get('instance_id')!r}) in persisted handle {d!r}"
-            ) from exc
-        return cls(
-            instance_id=instance_id,
-            offer_id=int(d.get("offer_id") or 0),
-            machine_id=int(d.get("machine_id") or 0),
-            label=str(d.get("label") or ""),
-            gpu=str(d.get("gpu") or ""),
-            hourly_usd=float(d.get("hourly_usd") or 0),
-            attempt=int(d.get("attempt") or 0),
-            started_ts=float(d.get("started_ts") or 0),
-        )
+    @staticmethod
+    def _extra_from_dict(d: dict) -> dict:
+        return {
+            "offer_id": int(d.get("offer_id") or 0),
+            "machine_id": int(d.get("machine_id") or 0),
+            "label": str(d.get("label") or ""),
+        }
 
 
 def vast_image(gpu: str | None = None) -> str:
@@ -112,7 +100,7 @@ def vast_image(gpu: str | None = None) -> str:
     (``FLASH_WORKER_IMAGE`` and the per-SM kernel-cache image). Vast runs the worker via its own onstart,
     so the image's CMD is irrelevant — only the baked deps/cache matter. The Blackwell driver floor lives
     in the ``cuda_max_good`` offer filter, not the image."""
-    from flash.providers.runpod.train.deps import WORKER_IMAGE, worker_image_for_gpu
+    from flash.providers._worker import WORKER_IMAGE, worker_image_for_gpu
 
     return worker_image_for_gpu(gpu) or WORKER_IMAGE
 

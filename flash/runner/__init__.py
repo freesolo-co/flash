@@ -57,9 +57,9 @@ def _adapter_ref_from_status_spec(raw: dict) -> str | None:
 def _gpu_rate(gpu_type: str) -> float:
     """Static representative $/hr for cost projection."""
     try:
-        from flash.providers.runpod.pricing import hourly_rate
+        from flash.providers import get_provider
 
-        return hourly_rate(gpu_type)
+        return get_provider("runpod").hourly_rate(gpu_type)
     except Exception:
         return 0.80
 

@@ -143,13 +143,13 @@ def collect_inputs(
 
     Each value comes from where the IMAGE actually gets it:
       * pins / FROM / causal-conv1d from Dockerfile.worker (what the image is built from),
-      * default chalk spec textually from deps.py (what the bake warms),
+      * default chalk spec textually from _worker.py (what the bake warms),
       * FA2/FA3 from worker-image.yml's build-args (overridable via fa2_spec/fa3_spec for the
         resolved-build-arg case), and file hashes for the warmup/handler sources.
     base_inputs_partial does NOT yet include fp_cache; compute_fingerprints folds it in.
     """
     dockerfile = (root / "Dockerfile.worker").read_text()
-    deps = (root / "flash" / "providers" / "runpod" / "train" / "deps.py").read_text()
+    worker_pkg = (root / "flash" / "providers" / "_worker.py").read_text()
     worker_image_yml = (root / ".github" / "workflows" / "worker-image.yml").read_text()
 
     specs = _pip_stack_specs(dockerfile)
@@ -168,7 +168,9 @@ def collect_inputs(
         raise ValueError(
             "kernel_fingerprint: fla spec missing or not pinned to a 40-char commit sha"
         )
-    chalk = _python_string_constant(deps, "DEFAULT_CHALK_SPEC", "deps.py DEFAULT_CHALK_SPEC")
+    chalk = _python_string_constant(
+        worker_pkg, "DEFAULT_CHALK_SPEC", "_worker.py DEFAULT_CHALK_SPEC"
+    )
 
     cache_inputs = {
         "from_image": from_image,
