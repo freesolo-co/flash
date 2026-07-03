@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import UTC, datetime
@@ -196,6 +197,39 @@ def build_worker_env(payload: dict) -> dict:
     code_dir = _code_dir(payload)
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
+
+
+def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    askpass = None
+    if env.get("GITHUB_TOKEN"):
+        fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
+        with os.fdopen(fd, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                'case "$1" in\n'
+                '*Username*) printf "%s\\n" "x-access-token" ;;\n'
+                '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
+                "esac\n"
+            )
+        os.chmod(askpass, 0o700)
+        env["GIT_ASKPASS"] = askpass
+    return env, askpass
+
+
+def install_extra_pip(payload: dict) -> None:
+    extra_pip = payload.get("extra_pip") or []
+    if not extra_pip:
+        return
+    env, askpass = _extra_pip_env(payload)
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True, env=env)
+    finally:
+        if askpass:
+            with contextlib.suppress(OSError):
+                os.remove(askpass)
 
 
 def fetch_code(payload: dict) -> None:
@@ -437,9 +471,7 @@ def main() -> int:
             ok = not result.get("error") and not result.get("failed")
             error = result.get("error") or (f"models failed: {sorted(result.get('failed') or {})}" if result.get("failed") else "")
             return 0 if ok else 1
-        extra_pip = payload.get("extra_pip") or []
-        if extra_pip:
-            subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
+        install_extra_pip(payload)
         # Pre-worker HF fetch of the run's own code (control plane uploaded it before submit), same
         # infra-shaped class as fetch_spec_from_hf above: a transient HF blip must retry, not fail.
         try:

@@ -402,7 +402,7 @@ def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
 
 
 def test_rl_per_device_fused_logits_lifts_budget(monkeypatch) -> None:
-    """When the fused GRPO loss is on (use_liger_kernel, unconditional on the GRPO path) the fp32
+    """When a fused GRPO loss is on, the fp32
     [pd, completion, vocab] logits are NEVER materialized, so the 6 GB logits budget should NOT bind
     — it models a tensor that doesn't exist. ``fused_logits=True`` drops the budget term so the
     ceiling / activation cap binds instead. The biggest beneficiary is a long multi-turn transcript,
@@ -415,7 +415,8 @@ def test_rl_per_device_fused_logits_lifts_budget(monkeypatch) -> None:
     assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True) == 1
     # Fused: the 6 GB term is dropped -> the offline default (8) binds, NOT the phantom-logits cap.
     assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, fused_logits=True) == 8
-    # Default is unfused (the safety net stays in force for the non-liger fallback path).
+    # Default is unfused (the safety net stays in force for the chalk standalone path until chalk has
+    # a GRPO fused-logprob replacement).
     assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, fused_logits=False) == 1
 
 
@@ -815,15 +816,10 @@ def test_run_rl_threads_prompt_opened_thinking_to_grading_and_penalty() -> None:
         )
 
 
-def test_run_rl_fused_logits_keeps_cap_when_vllm_importance_sampling_runs() -> None:
-    """Codex MtcPF: TRL's colocated-vLLM path runs a SEPARATE old_per_token_logps forward for its
-    importance-sampling (TIS) correction whenever vllm_importance_sampling_correction is on — TRL's
-    default, which run_rl only tunes (mode/clip) and never disables — even at mu==1. That unfused
-    [pd, completion, vocab] forward still materializes full logits, so the 6 GB cap must stay; dropping
-    it (fused_logits=True) sizes per_device too large and OOMs the IS forward on long completions. So
-    the fused_logits gate must ALSO require the vLLM IS forward to be off (``_vllm_is_logprob_forward``),
-    resolved BEFORE the sizer and from the correction's effective state + use_vllm. AST-based so it
-    survives reformatting (mirrors the resolved-mu wiring test above)."""
+def test_run_rl_keeps_logits_cap_without_chalk_grpo_fused_loss() -> None:
+    """Chalk standalone replaces the model-layer/SFT kernels, but it does not yet ship a GRPO
+    fused-logprob loss. run_rl must therefore pass fused_logits=False so per-device sizing keeps the
+    6 GB full-logits cap instead of inheriting the old Liger fused-loss assumption."""
     import ast
     import inspect
 
@@ -841,35 +837,15 @@ def test_run_rl_fused_logits_keeps_cap_when_vllm_importance_sampling_runs() -> N
     assert sizer is not None, "run_rl no longer calls rl_per_device_comps"
     fused_kw = next((k for k in sizer.keywords if k.arg == "fused_logits"), None)
     assert fused_kw is not None, "rl_per_device_comps call no longer passes fused_logits"
-
-    names = {n.id for n in ast.walk(fused_kw.value) if isinstance(n, ast.Name)}
-    assert "_vllm_is_logprob_forward" in names, (
-        "fused_logits must keep the 6 GB cap when TRL's vLLM importance-sampling correction runs an "
-        "old_per_token_logps forward (on by default even at mu==1) — gate on _vllm_is_logprob_forward"
-    )
-
-    gate_line = min(
-        (
-            t.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            for t in node.targets
-            if isinstance(t, ast.Name) and t.id == "_vllm_is_logprob_forward"
-        ),
-        default=None,
-    )
-    assert gate_line is not None, "run_rl no longer assigns _vllm_is_logprob_forward"
-    assert gate_line < sizer.lineno, (
-        "_vllm_is_logprob_forward must be resolved BEFORE the rl_per_device_comps call"
-    )
-    # The gate must reflect BOTH the vLLM rollout path and the correction's effective state — the only
-    # vLLM path runs the forward, and the field name is what TRL keys the correction off of.
-    assert "use_vllm" in {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}, (
-        "the TIS gate must consider use_vllm (only the vLLM rollout path runs the IS forward)"
-    )
-    assert "vllm_importance_sampling_correction" in src, (
-        "run_rl must detect TRL's vllm_importance_sampling_correction state to gate the logits cap"
-    )
+    # Merge note (chalk-standalone x dev): the merged run_rl keeps fused_logits a constant False
+    # (chalk ships no GRPO fused-logprob loss yet), which is strictly MORE conservative than dev's
+    # `_vllm_is_logprob_forward` gate — it always keeps the 6 GB cap, so the gate's protection is
+    # subsumed. Assert the conservative constant + that Liger is disabled (chalk-standalone). When
+    # chalk's GRPO fused-logprob path lands and fused_logits is re-enabled, restore dev's TIS gate.
+    assert isinstance(fused_kw.value, ast.Constant)
+    assert fused_kw.value.value is False
+    assert 'grpo_kwargs["use_liger_kernel"] = False' in src
+    assert '"use_liger_kernel": True' not in src
 
 
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:
