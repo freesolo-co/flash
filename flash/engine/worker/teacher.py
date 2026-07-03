@@ -118,6 +118,18 @@ class TeacherClient:
             raise TeacherError(
                 f"teacher echo response missing logprobs: {e}", permanent=True
             ) from e
+        # The length checks and index loop below assume these are sequences. A malformed 200 with
+        # token_logprobs=null or a scalar text_offset would make len()/indexing raise TypeError HERE,
+        # OUTSIDE the guard above — _train_one then swallows it as a generic (transient) skipped sample
+        # without setting last_teacher_status, so a consistently malformed teacher burns every OPD step
+        # before the no-signal failure. Reject non-list fields up front as a PERMANENT contract break.
+        if not all(isinstance(v, list) for v in (tokens, token_logprobs, offsets)):
+            raise TeacherError(
+                "teacher echo response logprobs fields are not all lists "
+                f"(tokens={type(tokens).__name__}, token_logprobs={type(token_logprobs).__name__}, "
+                f"text_offset={type(offsets).__name__})",
+                permanent=True,
+            )
         n = len(tokens)
         # A well-formed echo response returns tokens / token_logprobs / text_offset of EQUAL length.
         # The loop below indexes token_logprobs[i] and offsets[i] for every i, so a short array (a

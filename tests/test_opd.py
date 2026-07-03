@@ -710,6 +710,19 @@ def test_opd_emits_progress_heartbeat_while_filtering_prompts(monkeypatch):
     assert filt[0][1]() >= 1  # progress advanced as prompts were scanned
 
 
+def test_opd_filtering_stage_is_setup_not_training():
+    """Regression (codex[bot], _poll.py): opd_filtering_prompts emits REAL progress heartbeats, so
+    is_training_heartbeat would classify it as TRAINING (the tight, sticky stall window) mid-setup
+    unless it's registered as a setup stage. It must be treated as cold-start setup."""
+    from flash.providers._poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+
+    assert "opd_filtering_prompts" in SETUP_HEARTBEAT_STAGES
+    assert is_training_heartbeat("opd_filtering_prompts", 0) is False
+    assert (
+        is_training_heartbeat("opd_filtering_prompts", 5) is False
+    )  # progress count doesn't flip it
+
+
 def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     """Regression (codex[bot], opd.py): _student_model builds the LoRA via get_peft_model, which
     samples the LoRA A matrix (init_lora_weights=True) from the torch default generator. run_opd must
@@ -1219,6 +1232,33 @@ def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
     with pytest.raises(TeacherError) as ei:
         client.score("P", "hi")
     assert ei.value.permanent is False
+
+
+def test_teacher_score_rejects_non_list_logprob_fields_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py:130): the length check assumes tokens/token_logprobs/
+    text_offset are sequences. A malformed 200 with token_logprobs=null (or a scalar text_offset) makes
+    len()/indexing raise TypeError OUTSIDE TeacherError -> _train_one swallows it as a generic
+    (transient) skip without setting last_teacher_status, so a consistently malformed teacher burns
+    every OPD step. Non-list fields must raise a PERMANENT TeacherError up front."""
+    from flash.engine.worker.teacher import TeacherError
+
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["a", "b"],
+                    "token_logprobs": None,  # malformed: null instead of a list
+                    "text_offset": [0, 1],
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(TeacherError) as ei:
+        client.score("", "ab")
+    assert ei.value.permanent is True
+    assert "not all lists" in str(ei.value)
 
 
 def test_teacher_malformed_200_body_is_transient_teacher_error(monkeypatch):

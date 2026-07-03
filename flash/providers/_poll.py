@@ -12,7 +12,9 @@ from typing import Any
 PRELOAD_REAP_GRACE_S = 1800.0
 
 
-def preload_instance_run_id(provider: str, region: str, reap_deadline_epoch: int, suffix: str) -> str:
+def preload_instance_run_id(
+    provider: str, region: str, reap_deadline_epoch: int, suffix: str
+) -> str:
     """Build a ``flash-preload-*`` run id embedding its wall-clock reap deadline.
 
     Epoch placed right after ``flash-preload-`` so ``run_label_prefix`` tail-truncation never drops it.
@@ -231,10 +233,14 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "rl_train_start",
         "sft_initializing",
         "rl_initializing",
-        # OPD cold-start stages (emitted before the first opd_step): wait-for-GPU, model load, and
-        # LoRA/warm-start init. Without these a slow OPD cold start is judged by the tight training
-        # stall window and retried as "stalled" instead of getting the setup grace.
+        # OPD cold-start stages (emitted before the first opd_step): prompt-budget filtering,
+        # wait-for-GPU, model load, and LoRA/warm-start init. Without these a slow OPD cold start is
+        # judged by the tight training stall window and retried as "stalled" instead of getting the
+        # setup grace. opd_filtering_prompts emits REAL progress heartbeats while it renders+tokenizes
+        # the split, so it must be listed here or is_training_heartbeat would (stickily) flip the run
+        # into the training window mid-setup.
         "opd_start",
+        "opd_filtering_prompts",
         "opd_model_load",
         "opd_initializing",
     }
@@ -317,10 +323,14 @@ def heartbeat_progress_ts(
         ts = float(ts)
     except (TypeError, ValueError):
         return now, False
-    lo = float(launch_ts) if launch_ts else 0.0  # unknown launch -> floor 0.0 (all heartbeats fresh)
+    lo = (
+        float(launch_ts) if launch_ts else 0.0
+    )  # unknown launch -> floor 0.0 (all heartbeats fresh)
     fresh = ts >= lo
     # Worker stamps attempt as a str env var, poller passes int; coerce both before comparing.
-    hb_attempt = _attempt_int(hb_key[3]) if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
+    hb_attempt = (
+        _attempt_int(hb_key[3]) if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
+    )
     cur_attempt = _attempt_int(current_attempt)
     if fresh and cur_attempt is not None and hb_attempt != cur_attempt:
         fresh = False
