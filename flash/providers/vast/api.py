@@ -69,7 +69,6 @@ def search_offers(
     min_reliability: float = 0.95,
     min_duration_seconds: float = 0,
     limit: int = 64,
-    extra_q: dict | None = None,
 ) -> list[dict]:
     """Rentable single-GPU offers from verified datacenter hosts, cheapest first.
 
@@ -91,11 +90,9 @@ def search_offers(
     }
     if min_disk_gb:
         q["disk_space"] = {"gte": float(min_disk_gb)}
-    if min_duration_seconds and min_duration_seconds > 0:
+    if min_duration_seconds > 0:
         # Keep only offers Vast says are available for at least the run's deadline.
         q["duration"] = {"gte": float(min_duration_seconds)}
-    if extra_q:
-        q.update(extra_q)
     out = request_with_retries("/v0/search/asks/", method="PUT", body={"q": q})
     offers = out.get("offers") if isinstance(out, dict) else None
     return offers if isinstance(offers, list) else []
@@ -112,12 +109,11 @@ def create_instance(
     env: dict[str, str],
     onstart: str,
     label: str,
-    runtype: str = "args",
 ) -> int:
     """Rent an offer -> instance id. Raises VastApiError on rejection (offer taken).
 
-    Default ``args`` runtype: the script is the container command (``bash -c``), so no SSH
-    key is needed and the container lifecycle == the job lifecycle. ``ssh`` needs a key.
+    ``args`` runtype: the script is the container command (``bash -c``), so no SSH key is
+    needed and the container lifecycle == the job lifecycle.
     """
     body = {
         "client_id": "me",
@@ -125,13 +121,10 @@ def create_instance(
         "disk": float(disk_gb),
         "env": dict(env),
         "label": label,
-        "runtype": runtype,
+        "runtype": "args",
+        # Worker image is public: no docker-login / pull token shipped to the untrusted host.
+        "args": ["bash", "-c", onstart],
     }
-    # Worker image is public: no docker-login / pull token shipped to the untrusted host.
-    if runtype == "args":
-        body["args"] = ["bash", "-c", onstart]
-    else:
-        body["onstart"] = onstart
     # NON-IDEMPOTENT: PUT /asks/{id} rents a new instance on every success, so never retried
     # (blind retry on a lost response = double-provision + double-bill).
     try:

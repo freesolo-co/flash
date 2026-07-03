@@ -282,7 +282,6 @@ def deploy_and_submit(
                 env={},
                 onstart=onstart,
                 label=label,
-                runtype="args",
             )
         except vast_api.VastApiError as e:
             last_err = e
