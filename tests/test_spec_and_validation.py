@@ -120,18 +120,21 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     assert spec_from_dict(raw).train.hf_repo == ""
 
 
-def test_lora_rank_allows_rank64_for_small_serving_models() -> None:
-    assert spec_from_dict(_raw(**{"train.lora_rank": 64})).train.lora_rank == 64
+def test_lora_rank_allows_rank128_for_small_serving_models() -> None:
+    # The small dense tiers (default model Qwen3.5-0.8B) now serve rank-128 LoRA buffers.
+    assert spec_from_dict(_raw(**{"train.lora_rank": 128})).train.lora_rank == 128
 
 
 def test_lora_rank_must_fit_small_serving_cap() -> None:
-    with pytest.raises(ConfigError, match="serving max_lora_rank=64"):
-        spec_from_dict(_raw(**{"train.lora_rank": 65}))
+    # Small-tier serving cap doubled 64 -> 128; rank 129 exceeds it.
+    with pytest.raises(ConfigError, match="serving max_lora_rank=128"):
+        spec_from_dict(_raw(**{"train.lora_rank": 129}))
 
 
 def test_lora_rank_must_fit_large_serving_cap() -> None:
-    with pytest.raises(ConfigError, match="serving max_lora_rank=32"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", **{"train.lora_rank": 33}))
+    # The 4B tier serving cap doubled 32 -> 64; rank 65 exceeds it.
+    with pytest.raises(ConfigError, match="serving max_lora_rank=64"):
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", **{"train.lora_rank": 65}))
 
 
 def test_bare_environment_id_is_rejected() -> None:

@@ -1,7 +1,7 @@
 # Thin per-arch kernel-cache layer.
 #
 # Bakes a warmup-produced mega-cache ON TOP of the EXACT base image the warmup ran inside, so the
-# cache's toolchain (torch/triton/fla/liger) is guaranteed to match the image it ships in. Rebuilding
+# cache's toolchain (torch/triton/fla/chalk) is guaranteed to match the image it ships in. Rebuilding
 # the full Dockerfile.worker from the checkout instead could drift from the published base and bake a
 # cache that silently won't load (cold-JIT fallback) -- this avoids that by construction.
 #

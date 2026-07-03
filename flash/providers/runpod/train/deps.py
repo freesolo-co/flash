@@ -36,7 +36,6 @@ WORKER_DEPS = [
     "accelerate>=1.4",
     # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
     "wandb>=0.17",
-    "liger-kernel>=0.5",
     # fla from git: PyPI wheel is a broken stub missing fla.modules. SHA-pinned for reproducibility;
     # keep in lockstep with Dockerfile.worker. fla kept on ALL arches — worker ensures tilelang
     # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper).
@@ -66,7 +65,7 @@ def _append_tag_suffix(image: str, suffix: str) -> str:
     slash = image.rfind("/")
     colon = image.rfind(":")
     if colon > slash:
-        return f"{image[:colon]}:{image[colon + 1:]}-{suffix}"
+        return f"{image[:colon]}:{image[colon + 1 :]}-{suffix}"
     return f"{image}-{suffix}"
 
 
@@ -105,7 +104,15 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
     return eff
 
 
-DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.1.0,<0.2.0"
+# Chalk is published to PUBLIC PyPI on every version bump (chalk .github/workflows/publish.yml).
+# Pin the exact PUBLIC version so worker + kernel-cache-bake pods install with NO GitHub auth — the
+# chalk repo is INTERNAL, so a git+https default made installs fail wherever GITHUB_TOKEN is absent
+# (bake pod, tokenless workers). freesolo-chalk 0.5.0 = chalk PR #21 fafe167 (standalone, Liger fully
+# replaced, + GRPO op + LoRA grad-gate). Bump DEFAULT_CHALK_VERSION when the merged kernel surface moves.
+DEFAULT_CHALK_VERSION = "0.5.0"
+DEFAULT_CHALK_SPEC = f"freesolo-chalk=={DEFAULT_CHALK_VERSION}"
+# Provenance only (kernel-cache fingerprint / traceability): the chalk commit this version was cut from.
+LATEST_CHALK_MAIN_SHA = "fafe167158eb3b7c947e7182ea4eddc351e4ca7d"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
