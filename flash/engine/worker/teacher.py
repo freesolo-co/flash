@@ -12,6 +12,7 @@ All heavy work is inside methods; importing this module is CPU/offline-safe.
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -74,6 +75,15 @@ class TeacherClient:
                     raise last_err from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = TeacherError(f"teacher transport error on {path}: {e}")
+            except http.client.IncompleteRead as e:
+                # The server sent an HTTP 200 header but the body was truncated mid-read() (dropped
+                # connection / short Content-Length). IncompleteRead is an http.client.HTTPException,
+                # NOT an OSError, so without this clause it escapes the retry loop and _train_one
+                # swallows it as an unclassified skipped sample (last_teacher_status stays None) -- a
+                # stream of truncated 200s then burns every OPD step and fails as a permanent no-signal
+                # run instead of retrying. Classify as TRANSIENT teacher infra, like the unparseable-
+                # body case below (codex[bot]).
+                last_err = TeacherError(f"teacher HTTP 200 body truncated mid-read on {path}: {e}")
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 # HTTP 200 with a malformed / non-JSON body (a flaky proxy or gateway returning an
                 # error page under a 200, a truncated read). The teacher contract is 200 => JSON, so

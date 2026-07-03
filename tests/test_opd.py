@@ -1500,6 +1500,86 @@ def test_teacher_malformed_200_body_is_transient_teacher_error(monkeypatch):
     assert "unparseable" in str(ei.value).lower()
 
 
+def test_teacher_incomplete_read_body_is_transient_teacher_error(monkeypatch):
+    """Regression (codex[bot], teacher.py:65): an HTTP 200 whose body is truncated mid-read() raises
+    http.client.IncompleteRead — an HTTPException, NOT an OSError — so without an explicit clause it
+    escapes _post's retry loop and _train_one swallows it as an unclassified skip (last_teacher_status
+    stays None), failing a truncated-200 run as permanent no-signal instead of retrying as infra."""
+    import http.client
+
+    import flash.engine.worker.teacher as tm
+    from flash.engine.worker.teacher import TeacherError
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"half", 100)  # body truncated mid-read
+
+    monkeypatch.setattr(tm.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+    monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff sleeps
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hi")
+    assert ei.value.permanent is False  # transient -> retried as infra, not permanent no-signal
+    assert "truncated" in str(ei.value).lower()
+
+
+def test_train_one_refreshes_stall_clock_between_generation_and_scoring():
+    """Regression (codex[bot], opd.py:491): _train_one must call on_generated() AFTER generation and
+    BEFORE teacher scoring — both block for a long time and the caller's per-sample ping only fires
+    after scoring returns, so a slow generation + teacher outage could otherwise span the poller's
+    ~1200s stall window with no heartbeat. Assert the callback fires exactly once, before scoring."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    order: list[str] = []
+    completion_ids = [2, 3]
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "h", 3: "i"}[int(x)] for x in ids)
+
+    class _Teacher:
+        def score(self, prompt, completion):
+            order.append("score")
+            return [TeacherToken(text="hi", logprob=-1.0, start=0, end=2)]
+
+    class _GenLM(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=1 + len(completion_ids), V=8)
+            self.config = SimpleNamespace(use_cache=True)
+            self._c = torch.tensor([completion_ids])
+
+        def eval(self):
+            return self
+
+        def train(self):
+            return self
+
+        def generate(self, prompt_tensor, **cfg):
+            return torch.cat([prompt_tensor, self._c], dim=1)
+
+    opd_mod._train_one(
+        model=_GenLM(),
+        tok=_Tok(),
+        teacher=_Teacher(),
+        device="cpu",
+        prompt_ids=[1],
+        prompt_tensor=torch.tensor([[1]]),
+        prompt_messages=[{"role": "user", "content": "hi"}],
+        gen_cfg={},
+        knobs={"kl_coef": 1.0, "stop_sequences": ()},
+        torch=torch,
+        on_generated=lambda: order.append("heartbeat"),
+    )
+    assert order == ["heartbeat", "score"], f"heartbeat must precede teacher scoring; got {order}"
+
+
 def test_gkd_loss_skips_empty_student_group_without_crashing():
     # A group with an empty student-index list (a teacher-only span) must be skipped, not divide by
     # zero in the per-span coefficient (len(s_idx) == 0).

@@ -570,6 +570,14 @@ def run_opd():
                         knobs=knobs,
                         torch=torch,
                         thinking_prefill=thinking_prefill,
+                        # Refresh the stall clock between generation and teacher scoring (see
+                        # _train_one): opt_steps step-gates the ping so it keeps the wide setup grace
+                        # during the first step and tightens correctly once a real update lands.
+                        # Bind opt_steps/nseq as defaults (called synchronously inside this iteration,
+                        # so the current values are the right ones) to satisfy the loop-var-capture lint.
+                        on_generated=lambda s=opt_steps, n=nseq: _w.heartbeat(
+                            "opd_step", step=s, samples_done=n
+                        ),
                     )
                     samples_seen += 1  # advances the liveness-thread progress signal
                     _t_status = getattr(_train_one, "last_teacher_status", None)
@@ -729,11 +737,17 @@ def _train_one(
     knobs,
     torch,
     thinking_prefill="",
+    on_generated=None,
 ):
     """Sample one student completion on-policy, score it with the teacher, and return the groupwise
     reverse-KL loss (or None). Side-channels per-sequence stats on function attributes to keep the
     caller compact. ``thinking_prefill`` is appended to the teacher prompt so it conditions on the
-    same trailing context the student sampled after in thinking mode."""
+    same trailing context the student sampled after in thinking mode. ``on_generated`` (optional) is
+    called AFTER generation and BEFORE teacher scoring to refresh the stall clock: both the
+    max_time-bounded generate and the retrying teacher call block for a long time and the caller's
+    per-sample progress ping only fires AFTER scoring returns, so without a mid-sample refresh a slow
+    generation followed by a teacher outage can span >1200s with no non-liveness heartbeat and be
+    reaped as stalled before the transient-teacher handling runs."""
     _train_one.last_coverage = 0.0
     _train_one.last_gen_tokens = 0
     _train_one.last_teacher_tokens = 0
@@ -760,6 +774,14 @@ def _train_one(
     _train_one.last_gen_tokens = len(completion_ids)
     if not completion_text.strip():
         return None
+
+    # Refresh the stall clock between the (gen_cfg.max_time-bounded, up to ~900s) generation and the
+    # retrying teacher call (up to four ~90s timeouts): both block, and the caller only emits its
+    # per-sample opd_step ping AFTER scoring returns, so a slow generation + a teacher outage could
+    # otherwise span >1200s with no non-liveness heartbeat and be reaped as stalled once opt_steps>=1
+    # (codex[bot]). Splitting the gap here keeps each blocking phase under the training stall window.
+    if on_generated is not None:
+        on_generated()
 
     teacher_prompt = _teacher_prompt_text(prompt_messages, thinking_prefill)
     try:
