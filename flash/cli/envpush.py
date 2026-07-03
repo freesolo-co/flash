@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 from . import render
+from ._tty import TtyStatusLine
 
 if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
@@ -43,27 +45,51 @@ def _err(msg: str) -> int:
     return 1
 
 
+_MANAGED_HUB_ID_PART_RE = re.compile(r"[a-z0-9._-]+")
+_ManagedHubIdError: TypeAlias = Literal["not-managed", "not-canonical"]
+
+
+def _normalize_managed_hub_id(raw: object) -> tuple[str | None, _ManagedHubIdError | None]:
+    from flash.envs.adapter import is_managed_environment_slug
+
+    env_id = str(raw or "").strip()
+    if not is_managed_environment_slug(env_id):
+        return None, "not-managed"
+    if env_id != env_id.lower() or not all(
+        _MANAGED_HUB_ID_PART_RE.fullmatch(part) for part in env_id.split("/")
+    ):
+        return None, "not-canonical"
+    return env_id, None
+
+
 def cmd_env_pull(args) -> int:
     """Download a published Freesolo environment (or a single file from it) to local disk.
 
-    Pulls via GitHub's tarball / raw media type rather than the JSON "contents" API, so files
-    larger than 1 MB (e.g. ``datasets/train.jsonl``) come back intact instead of empty.
+    Environments are addressed by their managed hub slug ``namespace/name`` and pulled as package
+    tarballs through the authenticated Flash control plane.
     """
-    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.client import ClientError, client_from_config
     from flash.envs.pull import (
-        download_environment_file,
+        download_environment_file_from_archive,
+        ensure_environment_pull_destination_available,
         environment_local_dirname,
-        pull_environment_package,
+        pull_environment_package_from_archive,
     )
 
-    env_id = args.env_id
-    if not is_freesolo_environment_id(env_id):
+    env_id = str(args.env_id or "").strip()
+    managed_env_id, managed_error = _normalize_managed_hub_id(env_id)
+    if managed_error == "not-canonical":
+        return _err(
+            f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
+        )
+    if managed_env_id is None:
         print(
-            'env id must be a Freesolo environment id — a managed slug "your-name/your-env", '
-            f'a "github:owner/repo@ref:path" ref, or a github.com URL (got {env_id!r})',
+            'env id must be a managed Freesolo hub slug "your-name/your-env" '
+            f"(got {args.env_id!r})",
             file=sys.stderr,
         )
         return 1
+    env_id = managed_env_id
     try:
         if args.path:
             default_name = Path(args.path.replace("\\", "/")).name
@@ -78,7 +104,8 @@ def cmd_env_pull(args) -> int:
             if (out.exists() or out.is_symlink()) and not args.force:
                 print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
                 return 1
-            data = download_environment_file(env_id, args.path)
+            package = client_from_config().download_env_package(env_id)
+            data = download_environment_file_from_archive(package, args.path)
             out.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(out, data)
             if render.styled():
@@ -87,7 +114,9 @@ def cmd_env_pull(args) -> int:
                 print(f"pulled {args.path} from {env_id} -> {out} ({len(data):,} bytes)")
         else:
             out = Path(args.output) if args.output else Path(environment_local_dirname(env_id))
-            pull_environment_package(env_id, out, overwrite=args.force)
+            ensure_environment_pull_destination_available(out, overwrite=args.force)
+            package = client_from_config().download_env_package(env_id)
+            pull_environment_package_from_archive(package, out, overwrite=args.force)
             if render.styled():
                 print(render.env_pulled(f"{out}/", env_id))
             else:
@@ -100,36 +129,28 @@ def cmd_env_pull(args) -> int:
             file=sys.stderr,
         )
         return 1
+    except ClientError as exc:
+        print(f"env pull failed: {exc}", file=sys.stderr)
+        return 1
     except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
         print(f"env pull failed: {exc}", file=sys.stderr)
-        if "GitHub environment request failed" in str(exc) and not os.environ.get("GITHUB_TOKEN"):
-            print(
-                "hint: private/internal environments need a GitHub token; set GITHUB_TOKEN "
-                "(e.g. `export GITHUB_TOKEN=$(gh auth token)`).",
-                file=sys.stderr,
-            )
         return 1
 
 
 def cmd_env_delete(args) -> int:
-    import re
-
     from flash.client import ClientError, client_from_config
-    from flash.envs.adapter import is_managed_environment_slug
 
     # Delete only targets MANAGED hub ids ("namespace/name") — not github: refs or local paths, which
     # don't live on the hub. And enforce the hub's canonical form (lowercase, no surrounding
     # whitespace) BEFORE the network call: the server's slug validator is lowercase-only, so a
     # mixed-case / padded id would otherwise make a pointless request and return a confusing 400.
-    env_id = (args.env_id or "").strip()
-    if not is_managed_environment_slug(env_id):
+    env_id, validation_error = _normalize_managed_hub_id(args.env_id)
+    if validation_error == "not-managed":
         return _err(
             f'env id must be a managed Freesolo hub id "namespace/name" (got {args.env_id!r}); '
             "github refs and local paths can't be deleted from the hub"
         )
-    if env_id != env_id.lower() or not all(
-        re.fullmatch(r"[a-z0-9._-]+", part) for part in env_id.split("/")
-    ):
+    if validation_error == "not-canonical" or env_id is None:
         return _err(
             f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
         )
@@ -146,9 +167,7 @@ def cmd_env_delete(args) -> int:
         result = client_from_config().delete_env(env_id)
     except ClientError as exc:
         return _err(str(exc))
-    # A missing env deletes to `deleted: false` (idempotent); default True so an older server that
-    # omits the field still reads as success.
-    deleted = bool(result.get("deleted", True))
+    deleted = bool(result["deleted"])
     msg = f"deleted {env_id}" if deleted else f"{env_id} was not found on the hub (already deleted)"
     print(render.ok(msg) if render.styled() else msg)
     return 0
@@ -168,7 +187,7 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         "source",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"datasets"})
+_ENV_PUSH_SIDECAR_DIRS = frozenset({"dataset"})
 # ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
 # user-authored README/NOTES) travels with the env into the hub and back out through
 # ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
@@ -188,10 +207,23 @@ _ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
 
 
 def _normalize_env_name(raw: str) -> str | None:
-    import re
+    """Normalize only the NAME segment; a namespace prefix is passed through verbatim.
 
-    name = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
-    return name or None
+    The server is the sole authority on namespace grammar and ownership — rewriting the
+    namespace client-side would silently target a different (possibly forbidden) slug.
+    """
+    from flash.schema import normalize_env_name_segment
+
+    text = str(raw or "").strip()
+    if "/" not in text:
+        return normalize_env_name_segment(text)
+    parts = [part.strip() for part in text.split("/")]
+    if len(parts) != 2 or not all(parts):
+        return None
+    name = normalize_env_name_segment(parts[1])
+    if name is None:
+        return None
+    return f"{parts[0]}/{name}"
 
 
 def _with_syspath_bootstrap(env_source: str) -> str:
@@ -288,21 +320,15 @@ def _human_bytes(n: int) -> str:
     return f"{size:.1f} GB"
 
 
-class _UploadProgress:
+class _UploadProgress(TtyStatusLine):
     """Carriage-return upload progress bar on stderr; no-op off a TTY."""
 
     _BAR_WIDTH = 24
 
     def __init__(self, name: str):
+        super().__init__()
         self._name = name
-        self._enabled = sys.stderr.isatty()
-        self._last_len = 0
-        self._active = False
         self._last_pct = -1
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
 
     @property
     def callback(self) -> ProgressCallback | None:
@@ -327,20 +353,6 @@ class _UploadProgress:
         self._write(
             f"uploading {self._name} [{bar}] {pct:3d}% {_human_bytes(sent)}/{_human_bytes(total)}"
         )
-
-    def _write(self, message: str) -> None:
-        padding = " " * max(0, self._last_len - len(message))
-        sys.stderr.write(f"\r{message}{padding}")
-        sys.stderr.flush()
-        self._last_len = len(message)
-        self._active = True
-
-    def clear(self) -> None:
-        if not (self._enabled and self._active):
-            return
-        sys.stderr.write(f"\r{' ' * self._last_len}\r")
-        sys.stderr.flush()
-        self._active = False
 
 
 def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | None = None) -> int:

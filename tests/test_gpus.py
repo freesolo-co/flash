@@ -102,7 +102,7 @@ def test_config_cheapest_policy_validated_pool(monkeypatch):
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-        "train": {"epochs": 1, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
@@ -143,7 +143,7 @@ def test_config_defaults_gpu_from_model():
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-        "train": {"epochs": 1, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
     # 9B is bf16 (QLoRA dropped): bf16 SFT needs ~29 GB, so the cheapest validated class that fits
@@ -165,3 +165,21 @@ def test_build_worker_env():
     assert env["RUN_ID"] == "r1"
     assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-4B"
     assert env["RL_STEPS"] == "20"
+
+
+def test_grpo_kv_floor_escalates_large_group_long_context():
+    """vLLM KV-cache init preflight: a rollout whose concurrent-group KV cannot fit under the
+    colocate utilization cap on a small card must size onto a bigger one — previously such runs
+    passed preflight and died at vLLM init with 'No available memory for the cache blocks'."""
+    from flash.engine.vram import grpo_kv_floor_gb, model_required_vram_gb
+
+    # 4B, group 16, 4k rollout context: half-group KV (16 GB) + the 8 GB weight copy cannot
+    # live under 0.45 x 32 GB, so the requirement must exceed the RTX 5090 class.
+    assert grpo_kv_floor_gb(4.0, 4096, 16) > 32
+    need = model_required_vram_gb(
+        "Qwen/Qwen3.5-4B", "grpo", train={"group_size": 16, "max_length": 4096}
+    )
+    assert need >= grpo_kv_floor_gb(4.0, 4096, 16)
+
+    # The validated lean default (group 8, short context) stays on the 32 GB tier.
+    assert model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"group_size": 8}) <= 36

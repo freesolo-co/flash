@@ -6,6 +6,7 @@ import codecs
 import contextlib
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +22,10 @@ class ClientError(RuntimeError):
     """Expected client-side errors (no key, unreachable server) — printed cleanly."""
 
 
+class RequestTimeoutError(ClientError):
+    """A request timed out before the control plane returned a response."""
+
+
 class ApiError(ClientError):
     def __init__(self, status: int, message: str):
         super().__init__(message)
@@ -29,6 +34,7 @@ class ApiError(ClientError):
 
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 def freesolo_base_url(override: str | None = None) -> str:
@@ -45,6 +51,23 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> str:
     except (ValueError, AttributeError):
         detail = body.decode(errors="replace") if body else str(exc)
     return str(detail)
+
+
+def _read_capped_response(resp: object, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(_DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ClientError(
+                f"response body exceeded the maximum allowed size ({max_bytes} bytes); "
+                "download aborted"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
@@ -98,16 +121,12 @@ class _ProgressReader:
         return chunk
 
 
-def _validate_checkpoint_step(step: int | float) -> int:
-    """Validate a checkpoint step before the request: reject bool (int(True)==1) and fractional floats
-    (int(2.7)==2 would target the WRONG checkpoint), then return the int — fail fast before the server."""
-    if isinstance(step, bool):
-        raise ClientError(f"invalid checkpoint step: {step!r} (must be an integer)")
-    if isinstance(step, float) and not step.is_integer():
-        raise ClientError(
-            f"invalid checkpoint step: {step!r} (must be a whole number, not fractional)"
-        )
-    return int(step)
+def _validate_chat_messages(messages: list[dict]) -> None:
+    if not isinstance(messages, list):
+        raise ClientError("chat messages must be a list")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ClientError(f"chat messages[{index}] must be an object")
 
 
 class ApiClient:
@@ -140,8 +159,18 @@ class ApiClient:
             detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
             raise ApiError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
+            if isinstance(getattr(exc, "reason", None), TimeoutError):
+                raise RequestTimeoutError(
+                    f"request to the Flash service at {self.api_url} timed out; "
+                    "check your network connection and FLASH_API_URL"
+                ) from exc
             raise ClientError(
                 f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
+                "check your network connection and FLASH_API_URL"
+            ) from exc
+        except TimeoutError as exc:
+            raise RequestTimeoutError(
+                f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
@@ -174,6 +203,30 @@ class ApiClient:
         ):
             raw = resp.read()
             return json.loads(raw) if raw else {}
+
+    def _request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: float | None = None,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        headers = {"Accept": "application/gzip"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{self.api_url}{path}",
+            method=method,
+            headers=headers,
+        )
+        with (
+            self._translate_http_errors(),
+            urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
+        ):
+            if max_bytes is not None:
+                return _read_capped_response(resp, max_bytes)
+            return resp.read()
 
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
@@ -209,6 +262,18 @@ class ApiClient:
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request("DELETE", f"/v1/envs/{quoted}", timeout=1800.0)
 
+    def download_env_package(self, env_id: str) -> bytes:
+        """Download a managed environment package through the Flash control plane."""
+        from flash.envs import loader as adapter
+
+        quoted = urllib.parse.quote(env_id, safe="/")
+        return self._request_bytes(
+            "GET",
+            f"/v1/envs/{quoted}/package",
+            timeout=1800.0,
+            max_bytes=adapter._MAX_ARCHIVE_BYTES,
+        )
+
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
         if runtime_secrets:
@@ -225,38 +290,64 @@ class ApiClient:
         return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
 
     def get_worker_output(self, run_id: str) -> dict[str, str]:
-        # Tolerate servers that predate /worker: FastAPI returns bare 404 "Not Found" for unknown
-        # paths; real run-not-found 404s carry "unknown run_id: ..." so we can distinguish them.
         try:
             return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
         except ApiError as exc:
-            if exc.status == 404 and str(exc).strip().lower() == "not found":
+            if exc.status == 404 and "not found" in str(exc).strip().lower():
                 return {}
             raise
 
     def cancel_run(self, run_id: str) -> dict:
-        return self._request("POST", f"/v1/runs/{run_id}/cancel")
+        # Cancel can block inside synchronous provider teardown. A read timeout is ambiguous: the
+        # server may still have accepted the cancel and later persisted a terminal state. Resolve
+        # that by polling the authoritative run status instead of surfacing a raw timeout.
+        try:
+            return self._request("POST", f"/v1/runs/{run_id}/cancel", timeout=60.0)
+        except RequestTimeoutError as exc:
+            return self._poll_cancel_status(run_id, cause=exc)
+
+    def _poll_cancel_status(self, run_id: str, *, cause: RequestTimeoutError) -> dict:
+        deadline = time.monotonic() + 120.0
+        last_state = "unknown"
+        while True:
+            with contextlib.suppress(ClientError):
+                status = self.get_run(run_id)
+                last_state = str(status.get("state") or "unknown")
+                if last_state in {"cancelled", "done", "failed", "dry_run"}:
+                    return status
+            if time.monotonic() >= deadline:
+                raise ClientError(
+                    f"cancel request timed out before confirmation; latest state={last_state!r}. "
+                    f"Run `flash status {run_id}` to check the authoritative state before retrying."
+                ) from cause
+            time.sleep(2.0)
 
     def checkpoints(self, run_id: str) -> list[dict]:
-        """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""
+        """Deployable per-step RL checkpoints for a run (serve one with `flash deploy RUN/step-N`)."""
         return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
 
     def deploy(
         self,
         run_id: str,
         dry_run: bool = False,
-        step: int | None = None,
+        verify: bool = True,
     ) -> dict:
-        # Deploy blocks on registration and serving warmup, which can take many minutes.
-        deploy_timeout = 30 * 60 if not dry_run else None
-        body: dict = {"dry_run": dry_run}
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
+                "for a saved checkpoint"
+            )
+        base_run_id, step = parsed
+        body: dict = {"dry_run": dry_run, "verify": verify}
         if step is not None:
-            body["step"] = _validate_checkpoint_step(step)
+            body["step"] = step
         return self._request(
             "POST",
-            f"/v1/runs/{run_id}/deploy",
+            f"/v1/runs/{base_run_id}/deploy",
             body=body,
-            timeout=deploy_timeout,
         )
 
     def export(
@@ -265,15 +356,23 @@ class ApiClient:
         *,
         repository: str,
         hf_token: str,
-        step: int | None = None,
         private: bool = True,
     ) -> dict:
         """Copy a run's adapter into a user-owned HuggingFace repo."""
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
+                "for a saved checkpoint"
+            )
+        base_run_id, step = parsed
         body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
         if step is not None:
-            body["step"] = _validate_checkpoint_step(step)
+            body["step"] = step
         return self._request(
-            "POST", f"/v1/runs/{run_id}/export", body=body, timeout=30 * 60
+            "POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60
         )
 
     def undeploy(self, run_id: str) -> dict:
@@ -288,12 +387,22 @@ class ApiClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 512,
+        timeout: float | None = None,
     ) -> dict:
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
+            )
+        base_run_id, _step = parsed
+        _validate_chat_messages(messages)
         return self._request(
             "POST",
-            f"/v1/runs/{run_id}/chat",
+            f"/v1/runs/{base_run_id}/chat",
             body={"messages": messages, "temperature": temperature, "max_tokens": max_tokens},
-            timeout=30 * 60,
+            timeout=timeout if timeout is not None else 30 * 60,
         )
 
     def chat_stream(
@@ -303,11 +412,20 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
+        from flash.schema import parse_checkpoint_ref
+
+        parsed = parse_checkpoint_ref(run_id)
+        if parsed is None:
+            raise ClientError(
+                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
+            )
+        base_run_id, _step = parsed
+        _validate_chat_messages(messages)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(
-            f"{self.api_url}/v1/runs/{run_id}/chat",
+            f"{self.api_url}/v1/runs/{base_run_id}/chat",
             method="POST",
             data=json.dumps(
                 {

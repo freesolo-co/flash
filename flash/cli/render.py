@@ -381,7 +381,7 @@ def version(value: str) -> str:
 def submitted(run_id: str) -> str:
     """The `flash train` hand-off note (printed to stderr before logs start streaming)."""
     head = ok(f"run {_paint(run_id, _ACCENT2)} submitted")
-    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash status {run_id} --follow`")
+    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash log {run_id} --follow`")
     return _safe(f"{head}\n{hint}")
 
 
@@ -439,28 +439,36 @@ def deployments_table(rows: list[dict]) -> str:
     body = []
     for r in rows:
         d = r.get("deployment") or {}
+        state = str(d.get("state") or "?")
+        color = _GREEN if state in {"ready", "deployed"} else _RED if state == "failed" else _AMBER
+        detail = str(d.get("error") or d.get("detail") or "")
+        if len(detail) > 64:
+            detail = detail[:61] + "..."
         body.append(
             [
                 (r["run_id"], _ACCENT2),
-                (d.get("gpu", "?"), _GRAY),
+                (state, color),
                 (d.get("endpoint_name", ""), _GREEN),
+                (detail, _GRAY),
             ]
         )
-    table = _table(["RUN ID", "GPU", "ENDPOINT"], body)
+    table = _table(["RUN ID", "STATE", "ENDPOINT", "DETAIL"], body)
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
 def checkpoints_table(run_id: str, rows: list[dict]) -> str:
-    """Deployable per-step RL checkpoints: the step number + the stable repo path it lives at."""
+    """Deployable per-step RL checkpoints: step number + the canonical `<run_id>/step-N` ref."""
+    from flash.schema import format_checkpoint_ref
+
     body = [
         [
             (str(c.get("step", "")), _TEAL),
-            (f"{c.get('repo_id', '')}:{c.get('subfolder', '')}", _ACCENT2),
+            (format_checkpoint_ref(run_id, c.get("step", 0)), _ACCENT2),
         ]
         for c in sorted(rows, key=lambda c: c.get("step", 0))
     ]
     table = _table(["STEP", "CHECKPOINT"], body, aligns=["r", "l"])
-    foot = arrow(f"deploy one with: flash deploy {run_id} --step <STEP>")
+    foot = arrow(f"deploy one with: flash deploy {run_id}/step-<STEP>")
     return _safe(f"{header('checkpoints', f'{len(rows)} deployable')}\n{table}\n\n{foot}")
 
 
@@ -540,12 +548,14 @@ def cancelled(payload: dict) -> str:
 
 
 def deployed(dep: dict) -> str:
-    """`flash deploy`: the endpoint, gpu, and serving url as an aligned card (not a JSON dump)."""
+    """`flash deploy`: the endpoint and serving URL as an aligned card (not a JSON dump)."""
+    endpoint = str(dep.get("endpoint_name") or "")
+    # OpenAI clients need the /v1 base; older servers omit `url`, so derive it from the endpoint.
+    url = dep.get("url") or (f"{endpoint.rstrip('/')}/v1" if endpoint else None)
     pairs = [
         ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
-        ("endpoint", _paint(dep["endpoint_name"], _GREEN) if dep.get("endpoint_name") else None),
-        ("gpu", dep.get("gpu")),
-        ("url", _paint(dep["url"], _ACCENT2) if dep.get("url") else None),
+        ("endpoint", _paint(endpoint, _GREEN) if endpoint else None),
+        ("url", _paint(url, _ACCENT2) if url else None),
     ]
     state = dep.get("state", "deployed")
     if state == "dry_run":
@@ -571,6 +581,10 @@ def undeployed(result: dict) -> str:
     line = ok(f"torn down {rid}")
     if deleted:
         line += "\n" + _dim(f"  deregistered {', '.join(deleted)}")
+    else:
+        line += "\n" + _dim(
+            "  serving had no registered adapter to deregister (already gone or never registered)"
+        )
     return _safe(line)
 
 
@@ -626,7 +640,7 @@ def env_setup(paths: list[str]) -> str:
     """Confirmation + file tree for `flash env setup`."""
     labels = {
         "environment.py": "env entrypoint — edit the reward + prompt",
-        "datasets/train.jsonl": "starter training rows",
+        "dataset/train.jsonl": "starter training rows",
         "configs/rl.toml": "GRPO run config",
         "configs/sft.toml": "SFT run config",
         "TRAINING.md": "how to train well — read this first",
@@ -659,7 +673,7 @@ def chat_label() -> str:
 
 
 def log_section(name: str) -> str:
-    """A themed divider above a passthrough worker-log section in `flash status --logs` — the same
+    """A themed divider above a passthrough worker-log section in `flash log` — the same
     idiom as chat_label sitting above a raw chat reply (the log body stays raw). The machine path
     keeps the plain ``----- name -----`` divider that scripts and tests match on."""
     rule = _paint(_glyph("─", "-") * 3, _FAINT)

@@ -39,7 +39,7 @@ flash gpus                           # managed GPU classes with estimated $/hr
 
 ```text
 environment.py          # the task: how to prompt the model and how to score it
-datasets/train.jsonl    # training rows, one JSON object per line: {"input": ..., "output": ...}
+dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "output": ...}
 configs/rl.toml         # a GRPO (RL) run config
 configs/sft.toml        # an SFT run config
 TRAINING.md             # this file
@@ -57,7 +57,7 @@ from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 class MyEnv(EnvironmentSingleTurn):
-    dataset = load_jsonl("datasets/train.jsonl")   # rows -> TaskExample(input=..., output=...)
+    dataset = load_jsonl("dataset/train.jsonl")   # rows -> TaskExample(input=..., output=...)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
         return [{"role": "user", "content": example.input}]
@@ -86,7 +86,7 @@ flash env list                       # local env sources you can push
 To train against an env someone else published, just set its slug as `[environment] id` —
 no separate step is needed. Paste the returned id into `[environment] id` in **both** configs.
 Re-push after any
-edit to `environment.py` or `datasets/` so the managed run uses your change.
+edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 ### 3. Configure the run (TOML)
 
@@ -127,8 +127,9 @@ flash train configs/rl.toml --background  # submit and return immediately
 
 ```bash
 flash status <run-id>            # state + accrued cost
-flash status <run-id> --logs     # reward/loss trend + worker console/error logs + any traceback
-flash status <run-id> --follow   # stream a live run to completion
+flash log <run-id>               # reward/loss trend + worker console/error logs + any traceback
+flash log <run-id> --follow      # stream a live run to completion
+flash status <run-id>            # current run state, cost, and deployment info
 flash runs                       # all your runs and their state/cost
 flash cancel <run-id>            # stop a run
 ```
@@ -137,7 +138,8 @@ flash cancel <run-id>            # stop a run
 
 ```bash
 flash checkpoints <run-id>       # deployable per-step RL checkpoints
-flash deploy <run-id>            # serve the trained adapter (--step N for an intermediate checkpoint)
+flash deploy <run-id>            # serve the trained adapter
+flash deploy <run-id>/step-N     # serve an intermediate checkpoint
 flash chat <run-id> -m "hello"   # chat with the deployed adapter
 flash deployments                # active serving endpoints
 flash undeploy <run-id>          # tear the endpoint down
@@ -205,9 +207,9 @@ spending another GPU run:
 | All-zero or flat GRPO reward | `reward_mean` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
 | Reward rises but behavior is worse | Short, templated, malformed, or reward-hacked outputs score well | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string. |
 | Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_tokens` for GRPO rollouts or `max_length` for SFT only after seeing truncation. Oversizing them by default just burns memory/cost. |
-| Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash status <run-id> --logs`, reduce footprint (`max_length`, `max_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
-| Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash status <run-id> --follow` to reattach, `--logs` for the console/error tail, or `flash cancel <run-id>` if you intentionally want to stop it. |
-| Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash checkpoints <run-id>`, deploy a specific step with `flash deploy <run-id> --step N`, and compare with held-out probes before exporting or relying on the final adapter. |
+| Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash log <run-id>`, reduce footprint (`max_length`, `max_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
+| Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash log <run-id> --follow` to reattach, `flash log <run-id>` for the console/error output, or `flash cancel <run-id>` if you intentionally want to stop it. |
+| Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash checkpoints <run-id>`, deploy a specific step with `flash deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter. |
 | Export fails before upload | CLI says no HuggingFace token | Pass `flash export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`. |
 | SFT loss improves but quality does not | Train loss falls while held-out behavior stalls or degrades | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes. |
 | Cost surprises | A quick experiment uses more GPU time than intended | Start with `--dry-run` and `--cost`, cap steps/epochs for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time. |
@@ -222,15 +224,15 @@ spending another GPU run:
 - **Read the model's outputs, not just the metrics.** A rising reward can come from
   reward-hacking or a degenerate output the reward still credits — metrics alone never
   establish that the model got better. Flash does not expose training-time rollouts
-  through the CLI (`--logs` gives you the metric trend and the worker's console/error
+  through the CLI (`flash log` gives you the metric trend and the worker's console/error
   logs, not the sampled generations), so to read real outputs **deploy the adapter and
   probe it**: `flash deploy <run-id>` then `flash chat <run-id> -m "..."` on at least a
   few real inputs, including ones it should get wrong.
 
   ```bash
   flash status <run-id>            # state + accrued cost
-  flash status <run-id> --logs     # metric trend + worker console/error logs (+ traceback)
-  flash status <run-id> --follow   # stream a live run until completion
+  flash log <run-id>               # metric trend + worker console/error logs (+ traceback)
+  flash log <run-id> --follow      # stream a live run until completion
   flash deploy <run-id>            # serve the adapter, then `flash chat` it to read real outputs
   ```
 
@@ -335,6 +337,16 @@ Pick SFT when you already have good answers and want the model to imitate them.
   `max_length` that plausibly fits prompt + completion, and only raise it when you see
   truncation (outputs cut off mid-thought, degraded loss). A bigger context just costs
   more.
+- **For Qwen3.5 thinking multi-turn SFT, put reasoning only in the final assistant
+  turn.** Qwen3.5's chat template strips literal `<think>` blocks from prior assistant
+  history and pre-opens `<think>\n` in the next generation prompt. If every assistant
+  turn in a gold multi-turn transcript includes `<think>...</think>`, training sees a
+  different tag layout than inference and can learn doubled or misplaced thinking
+  tags. Keep intermediate assistant turns as the actual code/tool/action text only;
+  put `<think>...</think>` plus the final answer in the final assistant target. Flash's
+  completion-only SFT masking uses the longest shared token prefix, so the template's
+  pre-opened `<think>\n` is treated as prompt text instead of training the model to
+  emit another opener.
 - **SFT is a great warm start for GRPO.** SFT first to teach the format and a competent
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
   model**. For text-only continued adapters, keep the same adapter shape. For VL
@@ -349,9 +361,9 @@ Pick SFT when you already have good answers and want the model to imitate them.
 algorithm = "grpo"
 
 [train]
-# paste the full adapter_ref `flash status <sft-run-id>` prints, verbatim
-# (shape: <owner>/<repo>:sft/<run-id> — the owner/repo prefix is required)
-init_from_adapter = "your-org/your-repo:sft/<sft-run-id>"
+# the SFT run id (as printed by `flash status`); add /step-N to warm-start from a
+# specific checkpoint listed by `flash checkpoints <run-id>`
+init_from_adapter = "<sft-run-id>"
 lora_rank = 16     # for VL warm-starts, SFT rank + GRPO rank must fit the effective serving cap
 lora_alpha = 32
 ```
@@ -464,7 +476,7 @@ on a beyond-noise improvement.
 ## Command reference
 
 ```bash
-flash env setup                       # scaffold environment.py, datasets/, configs/, this file
+flash env setup                       # scaffold environment.py, dataset/, configs/, this file
 flash env push --name my-env .        # publish the environment; paste the returned id into [environment]
 flash env pull your-org/my-env        # download a published environment into the current folder
 flash env delete your-org/my-env -y   # delete a published environment
@@ -472,18 +484,18 @@ flash train configs/rl.toml --dry-run # validate the config locally (no GPU, no 
 flash train configs/rl.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/rl.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
 flash status <run-id>                 # state + accrued cost
-flash status <run-id> --logs          # reward/loss trend + worker console/error logs
-flash status <run-id> --follow        # stream a live run to completion
+flash log <run-id>                    # reward/loss trend + worker console/error logs
+flash log <run-id> --follow           # stream a live run to completion
 flash runs                            # list your runs and their state/cost
 flash cancel <run-id>                 # stop a live run
 flash checkpoints <run-id>            # list deployable RL checkpoints
 flash deploy <run-id>                 # serve the trained adapter
-flash deploy <run-id> --step N        # serve a specific RL checkpoint
+flash deploy <run-id>/step-N          # serve a specific RL checkpoint
 flash chat <run-id> -m "probe"        # stream a reply from the deployed adapter
 flash deployments                     # list active serving deployments
 flash undeploy <run-id>               # tear down an active deployment
 flash export --adapter-id <run-id> --repository <you>/<repo>  # export final adapter
-flash export --adapter-id <run-id> --repository <you>/<repo> --step N  # export a checkpoint
+flash export --adapter-id <run-id>/step-N --repository <you>/<repo>  # export a checkpoint
 ```
 
 See the full reference at https://freesolo.co/docs.

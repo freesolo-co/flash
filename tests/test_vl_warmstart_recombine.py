@@ -85,6 +85,14 @@ def _delta(adir, module):
     return _scale(cfg) * (B @ A)
 
 
+def _convert_adapter_to_bin(adir: str):
+    st_path = os.path.join(adir, "adapter_model.safetensors")
+    sd = load_file(st_path)
+    torch.save(sd, os.path.join(adir, "adapter_model.bin"))
+    os.remove(st_path)
+    return sd
+
+
 @pytest.mark.parametrize(
     ("r_sft", "a_sft", "rs_sft", "r_grpo", "a_grpo", "rs_grpo"),
     [
@@ -196,6 +204,7 @@ def test_recombine_allows_rank64_for_model_with_serving_cap64(tmp_path):
     out = str(tmp_path / "out")
     _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
     _write_adapter(grpo, modules=TEXT_MODULES, r=32, alpha=64, seed=2)
+    _set_base(sft, "Qwen/Qwen3.5-2B")
 
     assert recombine_lora_adapters(sft, grpo, out) == 64
     assert _read_cfg(out)["r"] == 64
@@ -375,8 +384,28 @@ def test_recombine_missing_safetensors_raises(tmp_path):
     os.makedirs(grpo)
     with open(os.path.join(grpo, "adapter_config.json"), "w") as f:
         json.dump({"r": 4, "lora_alpha": 8}, f)
-    with pytest.raises(ValueError, match=r"no adapter_model\.safetensors"):
+    with pytest.raises(ValueError, match=r"no adapter weights"):
         recombine_lora_adapters(sft, grpo, out)
+
+
+def test_recombine_accepts_legacy_bin_adapter_weights(tmp_path):
+    sft = str(tmp_path / "sft")
+    grpo = str(tmp_path / "grpo")
+    out = str(tmp_path / "out")
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    expected = {
+        m_sft: _delta(sft, m_sft) + _delta(grpo, m_text)
+        for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True)
+    }
+    _convert_adapter_to_bin(sft)
+    _convert_adapter_to_bin(grpo)
+
+    assert recombine_lora_adapters(sft, grpo, out) == 8
+    assert os.path.isfile(os.path.join(out, "adapter_model.safetensors"))
+    assert not os.path.exists(os.path.join(out, "adapter_model.bin"))
+    for m_sft in MODULES:
+        assert torch.allclose(_delta(out, m_sft), expected[m_sft], atol=1e-6, rtol=1e-5)
 
 
 def test_recombine_missing_adapter_config_raises(tmp_path):

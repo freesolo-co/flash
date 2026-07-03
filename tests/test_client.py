@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from flash.client import ApiClient, ApiError, ClientError
+from flash.client import ApiClient, ApiError, ClientError, RequestTimeoutError
 
 
 @pytest.fixture
@@ -24,10 +25,24 @@ def stub():
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_bytes(self, code: int, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             seen["auth"] = self.headers.get("Authorization")
             seen["path"] = self.path
-            if self.path.startswith("/v1/runs/authfail"):
+            if self.path.startswith("/v1/envs/") and self.path.endswith("/package"):
+                self._send_bytes(200, b"package-bytes")
+            elif self.path == "/v1/runs/old-api/worker":
+                self._send(404, {"detail": "Not Found"})
+            elif self.path == "/v1/runs/proxy-old-api/worker":
+                self.send_response(404)
+                self.end_headers()
+            elif self.path.startswith("/v1/runs/authfail"):
                 self._send(401, {"detail": "invalid or missing API key"})
             elif self.path.startswith("/v1/runs/missing"):
                 self._send(404, {"detail": "unknown run_id: missing"})
@@ -109,28 +124,6 @@ def test_api_error_carries_server_detail(stub):
     assert "unknown run_id: missing" in str(excinfo.value)
 
 
-def test_get_worker_output_tolerates_missing_route(monkeypatch):
-    """A managed server predating the /worker route returns a bare 404 'Not Found' -> get_worker_output
-    yields {} so a CLI upgraded ahead of the rollout doesn't hard-fail. Real 404s (unknown run_id) and
-    other errors still propagate."""
-    client = ApiClient("http://127.0.0.1:1", "fslo-user-test")
-
-    def _raise(status, msg):
-        def _req(method, path, **kw):
-            raise ApiError(status, msg)
-
-        return _req
-
-    monkeypatch.setattr(client, "_request", _raise(404, "Not Found"))
-    assert client.get_worker_output("r1") == {}  # route absent -> graceful empty
-    monkeypatch.setattr(client, "_request", _raise(404, "unknown run_id: r1"))
-    with pytest.raises(ApiError):  # a real 404 still surfaces
-        client.get_worker_output("r1")
-    monkeypatch.setattr(client, "_request", _raise(500, "boom"))
-    with pytest.raises(ApiError):  # non-404 propagates
-        client.get_worker_output("r1")
-
-
 def test_api_error_mentions_env_override(stub):
     url, _ = stub
     client = ApiClient(url, "fslo-user-test", key_source="FREESOLO_API_KEY")
@@ -150,12 +143,50 @@ def test_logs_offset_in_query(stub):
     assert seen["path"].endswith("/v1/runs/r1/logs?offset=3")
 
 
+def test_get_worker_output_tolerates_missing_optional_route(stub):
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+    assert client.get_worker_output("old-api") == {}
+    assert client.get_worker_output("proxy-old-api") == {}
+
+
+def test_get_worker_output_preserves_unknown_run_404(stub):
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+    with pytest.raises(ApiError) as excinfo:
+        client.get_worker_output("missing")
+    assert excinfo.value.status == 404
+    assert "unknown run_id: missing" in str(excinfo.value)
+
+
 def test_chat_omits_thinking_template_controls(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
     client.chat("json-chat", messages=[{"role": "user", "content": "hi"}])
     assert seen["body"] == {
         "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.0,
+        "max_tokens": 512,
+    }
+
+
+def test_chat_sends_user_supplied_system_prompt(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    client.chat(
+        "json-chat",
+        messages=[
+            {"role": "system", "content": "stay terse"},
+            {"role": "user", "content": "hi"},
+        ],
+    )
+
+    assert seen["body"] == {
+        "messages": [
+            {"role": "system", "content": "stay terse"},
+            {"role": "user", "content": "hi"},
+        ],
         "temperature": 0.0,
         "max_tokens": 512,
     }
@@ -216,6 +247,37 @@ def test_delete_env_percent_encodes_reserved_chars(stub):
     assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag"
 
 
+def test_download_env_package_uses_flash_control_plane(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    data = client.download_env_package("acme/my-env")
+
+    assert data == b"package-bytes"
+    assert seen["path"] == "/v1/envs/acme/my-env/package"
+    assert seen["auth"] == "Bearer fslo-user-test"
+
+
+def test_download_env_package_percent_encodes_reserved_chars(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    client.download_env_package("team/env?x=1#frag")
+
+    assert seen["path"] == "/v1/envs/team/env%3Fx%3D1%23frag/package"
+
+
+def test_download_env_package_caps_response_body(stub, monkeypatch):
+    from flash.envs import loader as adapter
+
+    url, _seen = stub
+    monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 5)
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="maximum allowed size"):
+        client.download_env_package("acme/my-env")
+
+
 def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
     import flash.client.http as http_mod
 
@@ -273,49 +335,70 @@ def test_unreachable_server_is_actionable():
         client.health()
 
 
-def test_deploy_rejects_bool_step():
-    """#176: a bool step must be rejected client-side (the server guard treats a bool as invalid).
-    `int(True)`/`int(False)` would silently coerce to step 1/0, so reject before that — without ever
-    reaching the network (a 127.0.0.1:1 target would error if it did)."""
+def test_raw_read_timeout_maps_to_client_error(monkeypatch):
+    def timeout(req, timeout=None):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", timeout)
+
+    client = ApiClient("http://flash.example", "fslo-user-test", timeout=2)
+    with pytest.raises(RequestTimeoutError, match="timed out"):
+        client.health()
+
+
+def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
+    client = ApiClient("http://flash.example", "fslo-user-test")
+    calls: list[tuple[str, str, float | None]] = []
+
+    def request(method, path, body=None, timeout=None, progress=None):
+        calls.append((method, path, timeout))
+        if method == "POST":
+            raise RequestTimeoutError("cancel timed out")
+        if method == "GET" and path == "/v1/runs/r1":
+            return {"run_id": "r1", "state": "cancelled", "remote": {"gpu": "B200"}}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(client, "_request", request)
+
+    out = client.cancel_run("r1")
+
+    assert out["state"] == "cancelled"
+    assert calls == [
+        ("POST", "/v1/runs/r1/cancel", 60.0),
+        ("GET", "/v1/runs/r1", None),
+    ]
+
+
+def test_deploy_rejects_malformed_checkpoint_ref():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in (True, False):
-        with pytest.raises(ClientError, match="invalid checkpoint step"):
-            client.deploy("flash-run", step=bad)
+    for bad in ("flash-run/step-", "flash-run/checkpoints/step-4", "flash-run/step-4/adapter"):
+        with pytest.raises(ClientError, match="invalid adapter id"):
+            client.deploy(bad)
 
 
-def test_deploy_passes_integer_step(stub):
-    """A genuine integer step is forwarded as an int in the body (the bool guard doesn't block it)."""
+def test_deploy_checkpoint_ref_posts_step(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.deploy("flash-run", step=40)
+    client.deploy("flash-run/step-40")
     assert seen["path"] == "/v1/runs/flash-run/deploy"
     assert seen["body"]["step"] == 40
     assert seen["body"]["dry_run"] is False
+    assert seen["body"]["verify"] is True
 
 
-def test_deploy_rejects_fractional_step():
-    """A fractional step would int-truncate (2.7 -> 2) and deploy the WRONG checkpoint, so reject it
-    client-side (mirrors export's guard)."""
-    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in (2.5, 0.1, 3.9):
-        with pytest.raises(ClientError, match="invalid checkpoint step"):
-            client.deploy("flash-run", step=bad)
-
-
-def test_deploy_passes_whole_float_step(stub):
-    """A float that is a whole number (40.0) passes the guard and forwards as an int."""
+def test_deploy_final_ref_omits_step(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.deploy("flash-run", step=40.0)
-    assert seen["body"]["step"] == 40
-    assert isinstance(seen["body"]["step"], int)
+    client.deploy("flash-run")
+    assert seen["path"] == "/v1/runs/flash-run/deploy"
+    assert seen["body"] == {"dry_run": False, "verify": True}
 
 
-def test_export_sends_repository_token_and_step(stub):
-    """`flash export` posts the destination repo, the user's HF token, and an optional step."""
+def test_export_sends_repository_token_and_checkpoint_ref(stub):
+    """`flash export` posts the destination repo, the user's HF token, and parsed checkpoint step."""
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.export("r1", repository="me/adapters", hf_token="hf_secret", step=40, private=False)
+    client.export("r1/step-40", repository="me/adapters", hf_token="hf_secret", private=False)
     assert seen["path"] == "/v1/runs/r1/export"
     assert seen["auth"] == "Bearer fslo-user-test"
     assert seen["body"] == {
@@ -338,18 +421,8 @@ def test_export_omits_step_when_unset_and_defaults_private(stub):
     assert "step" not in seen["body"]
 
 
-def test_export_rejects_bool_step():
-    """A bool step would int-coerce to 0/1 server-side, so fail fast client-side (mirrors deploy)."""
+def test_export_rejects_malformed_checkpoint_ref():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in (True, False):
-        with pytest.raises(ClientError, match="invalid checkpoint step"):
-            client.export("r1", repository="me/a", hf_token="hf", step=bad)
-
-
-def test_export_rejects_fractional_step():
-    """A fractional step would int-truncate (2.7 -> 2) and export the WRONG checkpoint, so reject it
-    client-side."""
-    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in (2.5, 0.1, 3.9):
-        with pytest.raises(ClientError, match="invalid checkpoint step"):
-            client.export("r1", repository="me/a", hf_token="hf", step=bad)
+    for bad in ("r1/step-", "r1/checkpoints/step-4", "r1/step-4/adapter"):
+        with pytest.raises(ClientError, match="invalid adapter id"):
+            client.export(bad, repository="me/a", hf_token="hf")

@@ -11,8 +11,6 @@ exercised by the live smokes).
 
 from __future__ import annotations
 
-import sys
-
 import pytest
 
 from flash.schema import ConfigError, spec_from_dict
@@ -39,7 +37,7 @@ def test_think_token_count_counts_the_think_span() -> None:
     # prompt-opened hybrid thinking: the chat template appended <think> to the PROMPT, so the
     # completion starts mid-reasoning with only the closing </think>. The reasoning is everything
     # before that close (without this the penalty no-ops on the common enable_thinking=true path).
-    assert w.think_token_count("a b c d</think>{\"x\": 1}", tok) == 4
+    assert w.think_token_count('a b c d</think>{"x": 1}', tok) == 4
     assert w.think_token_count("</think>just the answer", tok) == 0
     # case 3: prompt-opened thinking that NEVER closes (ran out of max_tokens) — no tags at all. With
     # prompt_opened_thinking the WHOLE completion is unterminated reasoning and is counted, so the
@@ -104,7 +102,9 @@ def test_graded_text_hides_tagless_prompt_opened_reasoning(monkeypatch) -> None:
     # tagless text is a normal answer and is graded as-is.
     assert w.graded_text("the answer is 42", prompt_opened_thinking=False) == "the answer is 42"
     # A normally-tagged thinking completion is unaffected: strip to the post-</think> answer.
-    assert w.graded_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True) == "\\boxed{5}"
+    assert (
+        w.graded_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True) == "\\boxed{5}"
+    )
     # Echoed <think> while still unterminated (no </think>): the WHOLE thing is reasoning -> hidden,
     # NOT just the text before the echoed opener (which a raw-text fallback could otherwise reward).
     assert w.graded_text("reason 42 <think> still going", prompt_opened_thinking=True) == ""
@@ -140,7 +140,10 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "github:owner/repo@main:env/environment.py", "params": {"grpo_config": knobs}},
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "params": {"grpo_config": knobs},
+            },
             "train": {},
         }
     )
@@ -238,113 +241,52 @@ def test_opt_int_float_reject_bools() -> None:
         )
 
 
-def test_freesolo_adapter_forwards_env_kwargs(monkeypatch, tmp_path) -> None:
-    # environment.params is forwarded to freesolo.environments.load_environment, while
-    # Flash-consumed dataset/contract source helpers are handled by the adapter.
-    import types
-
-    captured = {}
-
-    def fake_load_environment(reference, **kwargs):
-        captured["reference"] = reference
-        captured["kwargs"] = kwargs
-        return object()
-
-    fake_records = types.SimpleNamespace(
-        load_task_examples=lambda source: [],
-        task_example_from_record=lambda record: record,
-    )
-    fake_envs = types.SimpleNamespace(
-        load_environment=fake_load_environment,
-        EnvironmentEpisode=type("EnvironmentEpisode", (), {}),
-        EnvironmentMultiTurn=type("EnvironmentMultiTurn", (), {}),
-        EnvironmentSingleTurn=type("EnvironmentSingleTurn", (), {}),
-        EnvironmentTurn=type("EnvironmentTurn", (), {}),
-    )
-    monkeypatch.setitem(sys.modules, "freesolo", types.ModuleType("freesolo"))
-    monkeypatch.setitem(sys.modules, "freesolo.datasets", types.ModuleType("freesolo.datasets"))
-    monkeypatch.setitem(sys.modules, "freesolo.datasets.records", fake_records)
-    monkeypatch.setitem(sys.modules, "freesolo.environments", fake_envs)
-
-    env_file = tmp_path / "environment.py"
-    env_file.write_text("def load_environment(**kwargs): pass\n")
-
-    from flash.envs.adapter import load_freesolo_environment
-
-    load_freesolo_environment(
-        str(env_file),
-        difficulty="hard",
-        mode="train",
-        records=[{"task": "x"}],
-        contract_text="contract",
-    )
-    assert captured["reference"] == str(env_file)
-    assert captured["kwargs"] == {
-        "contract_path": str(tmp_path / "TRAINING_CONTRACT.md"),
-        "difficulty": "hard",
-        "mode": "train",
-    }
-    for forbidden in ("records", "contract_text"):
-        assert forbidden not in captured["kwargs"]
-
-
-def test_init_from_adapter_parses_and_roundtrips() -> None:
-    raw = {
+def _spec_raw(ref: str) -> dict:
+    return {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
-        "train": {
-            "steps": 10,
-            "hf_repo": "owner/runs",
-            "init_from_adapter": "Freesolo-Co/flashrun-run-x:sft/run-x",
-        },
+        "train": {"steps": 10, "hf_repo": "owner/runs", "init_from_adapter": ref},
     }
-    spec = spec_from_dict(raw, run_id="grpo-x")
-    assert spec.train.init_from_adapter == "Freesolo-Co/flashrun-run-x:sft/run-x"
-    # survives the JSON round-trip the worker reconstructs from
-    assert (
-        JobSpec.from_dict(spec.to_dict()).train.init_from_adapter
-        == "Freesolo-Co/flashrun-run-x:sft/run-x"
-    )
+
+
+def test_init_from_adapter_parses_and_roundtrips() -> None:
+    """The canonical short ref (`<run_id>`) is accepted and survives the JSON round-trip."""
+    spec = spec_from_dict(_spec_raw("run-x"), run_id="grpo-x")
+    assert spec.train.init_from_adapter == "run-x"
+    assert JobSpec.from_dict(spec.to_dict()).train.init_from_adapter == "run-x"
     # absent -> empty string (train fresh from base)
+    raw = _spec_raw("run-x")
     raw["train"].pop("init_from_adapter")
     assert spec_from_dict(raw, run_id="grpo-y").train.init_from_adapter == ""
 
 
-def test_init_from_adapter_rejects_repo_without_status_prefix() -> None:
-    raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
-        "algorithm": "grpo",
-        "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "gpu": {"type": "cheapest"},
-        "train": {
-            "steps": 10,
-            "init_from_adapter": "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff",
-        },
-    }
-    with pytest.raises(ConfigError, match="full adapter_ref emitted by `flash status`"):
-        spec_from_dict(raw, run_id="grpo-x")
+def test_init_from_adapter_accepts_checkpoint_step_ref() -> None:
+    """`<run_id>/step-N` (exactly what `flash checkpoints` lists) warm-starts from that saved
+    step instead of the run-level adapter — e.g. continuing GRPO from the best checkpoint."""
+    spec = spec_from_dict(_spec_raw("run-x/step-40"), run_id="grpo-x")
+    assert spec.train.init_from_adapter == "run-x/step-40"
+    assert JobSpec.from_dict(spec.to_dict()).train.init_from_adapter == "run-x/step-40"
 
 
 @pytest.mark.parametrize(
-    "bad_adapter_ref",
+    "bad_ref",
     [
-        "owner:evil/flashrun-run:sft/seed0",
-        "Freesolo-Co/flashrun-sftX:sft/../seed0",
+        "Freesolo-Co/flashrun-run-x:sft/run-x",  # legacy long storage form: no longer accepted
+        "Freesolo-Co/flashrun-run-x:rl/run-x/checkpoints/step-40",
+        "run-x/step-",  # no step number
+        "run-x/step-1111111111111111111",  # too many digits to be a bounded step
+        "run-x/step-4/adapter",  # trailing path
+        "run-x/checkpoints/step-4",  # storage-layout spelling
+        "run-x/../other",  # traversal
+        "run x/step-4",  # bad run id
     ],
 )
-def test_init_from_adapter_rejects_invalid_shape_or_path_traversal_ref(bad_adapter_ref: str) -> None:
-    raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
-        "algorithm": "grpo",
-        "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "gpu": {"type": "cheapest"},
-        "train": {"steps": 10, "init_from_adapter": bad_adapter_ref},
-    }
-    with pytest.raises(ConfigError, match="full adapter_ref emitted by `flash status`"):
-        spec_from_dict(raw, run_id="grpo-x")
+def test_init_from_adapter_rejects_non_short_refs(bad_ref: str) -> None:
+    with pytest.raises(ConfigError, match="run_id"):
+        spec_from_dict(_spec_raw(bad_ref), run_id="grpo-x")
 
 
 @pytest.mark.parametrize(
@@ -352,7 +294,7 @@ def test_init_from_adapter_rejects_invalid_shape_or_path_traversal_ref(bad_adapt
     [
         123,
         False,
-        ["owner/repo:sft/run/seed0"],
+        ["run-x/step-4"],
     ],
 )
 def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
@@ -421,9 +363,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         assert s.train.max_tokens == 512
         assert s.train.stop_sequences == ("</answer>", "\n\n")
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
-    bare = spec_from_dict(
-        {**raw, "train": {"hf_repo": "owner/runs"}}, run_id="grpo-w"
-    )
+    bare = spec_from_dict({**raw, "train": {"hf_repo": "owner/runs"}}, run_id="grpo-w")
     assert bare.train.learning_rate is None
     assert bare.train.batch_size is None
     assert bare.train.stop_sequences == ()
@@ -530,7 +470,9 @@ def test_rl_per_device_grows_to_plateau_ceiling_on_roomy_card(monkeypatch) -> No
 
     monkeypatch.setattr(w, "THINKING", False, raising=False)
     _fake_cuda(monkeypatch, 79.3)
-    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
+    assert (
+        w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
+    )
 
 
 def test_rl_per_device_moe_active_params_aware(monkeypatch) -> None:
@@ -557,7 +499,9 @@ def test_rl_per_device_moe_active_params_aware(monkeypatch) -> None:
     )
     # Dense (no active_params_b) is byte-unaffected: falls back to params_b.
     assert (
-        w.rl_per_device_comps(384, vocab=248_320, use_vllm=True, params_b=35.0, active_params_b=None, seq_len=2368)
+        w.rl_per_device_comps(
+            384, vocab=248_320, use_vllm=True, params_b=35.0, active_params_b=None, seq_len=2368
+        )
         == 5
     )
 
@@ -590,7 +534,9 @@ def test_rl_per_device_no_change_at_or_above_ref_seq(monkeypatch) -> None:
     # Roomy 80 GB: at seq 1024 it would grow to 16, but at seq>=ref the gate holds it at the old
     # default 8 (NO unvalidated long-seq growth — the regression is in tokens-in-flight = pd x seq).
     _fake_cuda(monkeypatch, 79.3)
-    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
+    assert (
+        w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
+    )
     assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=2048) == 8
     assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=8192) == 8
 
@@ -614,7 +560,9 @@ def test_rl_per_device_logits_budget_bounds_growth(monkeypatch) -> None:
     monkeypatch.setattr(w, "THINKING", False, raising=False)
     _fake_cuda(monkeypatch, 80)  # roomy A100 -> VRAM cap is large
     # completion 4096 @ 248k vocab: 6e9/(4096*248320*4) ~ 1.4 -> logits budget binds at 1.
-    assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 1
+    assert (
+        w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 1
+    )
 
 
 def test_rl_per_device_never_exceeds_hard_max(monkeypatch) -> None:
@@ -791,9 +739,7 @@ def test_run_rl_wires_mask_truncated_completions_to_the_gating_helper() -> None:
             return value
         return None
 
-    grpo_dict = next(
-        (d for node in ast.walk(tree) if (d := _grpo_dict(node)) is not None), None
-    )
+    grpo_dict = next((d for node in ast.walk(tree) if (d := _grpo_dict(node)) is not None), None)
     assert grpo_dict is not None, "run_rl no longer builds a grpo_kwargs dict literal"
 
     value = next(
@@ -891,6 +837,11 @@ def test_run_rl_keeps_logits_cap_without_chalk_grpo_fused_loss() -> None:
     assert sizer is not None, "run_rl no longer calls rl_per_device_comps"
     fused_kw = next((k for k in sizer.keywords if k.arg == "fused_logits"), None)
     assert fused_kw is not None, "rl_per_device_comps call no longer passes fused_logits"
+    # Merge note (chalk-standalone x dev): the merged run_rl keeps fused_logits a constant False
+    # (chalk ships no GRPO fused-logprob loss yet), which is strictly MORE conservative than dev's
+    # `_vllm_is_logprob_forward` gate — it always keeps the 6 GB cap, so the gate's protection is
+    # subsumed. Assert the conservative constant + that Liger is disabled (chalk-standalone). When
+    # chalk's GRPO fused-logprob path lands and fused_logits is re-enabled, restore dev's TIS gate.
     assert isinstance(fused_kw.value, ast.Constant)
     assert fused_kw.value.value is False
     assert 'grpo_kwargs["use_liger_kernel"] = False' in src

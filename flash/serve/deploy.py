@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 
 import httpx
 
 from flash._logging import get_logger
-from flash.providers.base import canonical_gpu
+from flash.lora_rank import rank_from_adapter_config
 
 logger = get_logger(__name__)
 
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
+
+# Read-back verification: after POST /adapters, poll the serving registry until the adapter is
+# visible at the requested checkpoint, so "ready" is a registry-backed claim rather than an
+# assumption (see _verify_adapter_registered).
+READBACK_ATTEMPTS = 5
+READBACK_DELAY_SECONDS = 2.0
 
 
 class ServingError(RuntimeError):
@@ -23,6 +30,31 @@ class ServingError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class AdapterConfigMissing(ServingError):
+    """The adapter's adapter_config.json could not be read from HF (artifact likely absent)."""
+
+
+def _is_hf_not_found_error(exc: Exception) -> bool:
+    try:
+        import huggingface_hub.errors as hf_errors  # type: ignore[import-not-found]
+
+        not_found_types = tuple(
+            cls
+            for name in (
+                "EntryNotFoundError",
+                "LocalEntryNotFoundError",
+                "RepositoryNotFoundError",
+                "RevisionNotFoundError",
+            )
+            if isinstance((cls := getattr(hf_errors, name, None)), type)
+        )
+        if not_found_types and isinstance(exc, not_found_types):
+            return True
+    except Exception:
+        pass
+    return getattr(getattr(exc, "response", None), "status_code", None) == 404
 
 
 def _serving_request(
@@ -91,26 +123,35 @@ class Deployment:
     run_id: str
     model: str
     adapter_hf_prefix: str
-    gpu: str
     openai_model: str
     endpoint_name: str
     state: str = "ready"
+    # The OpenAI-compatible base URL. endpoint_name is the bare serving root; OpenAI clients must
+    # be pointed at {endpoint_name}/v1 or their /chat/completions calls 404.
+    url: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def servable_gpu(gpu_name: str) -> str:
-    """Resolve a canonical RunPod GPU class for the deployment record (informational)."""
-    from flash.providers.base import GPU_INFO, cheapest_gpu, get_gpu_info
-
-    friendly = canonical_gpu(gpu_name)
-    info = get_gpu_info(friendly)
-    # A directly servable class serves as-is; other managed classes map to the cheapest serving class
-    # that fits their VRAM.
-    if friendly in GPU_INFO and info.enum_member:
-        return friendly
-    return cheapest_gpu(info.vram_gb)
+def deployment_record(
+    run_id: str,
+    model: str,
+    adapter_prefix: str,
+    *,
+    state: str = "ready",
+) -> Deployment:
+    subfolder = f"{adapter_prefix}/adapter"
+    base = serving_base_url()
+    return Deployment(
+        run_id=run_id,
+        model=model,
+        adapter_hf_prefix=subfolder,
+        openai_model=run_id,
+        endpoint_name=base,
+        state=state,
+        url=f"{base}/v1",
+    )
 
 
 def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str = "adapter") -> None:
@@ -128,25 +169,7 @@ def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str =
 
 
 def _rank_from_adapter_config(config: dict, *, source: str) -> int:
-    ranks: list[int] = []
-    try:
-        if config.get("r") is not None:
-            ranks.append(int(config["r"]))
-        if "rank_pattern" in config and config["rank_pattern"] is not None:
-            rank_pattern = config["rank_pattern"]
-            if not isinstance(rank_pattern, dict):
-                raise TypeError("rank_pattern is not a mapping")
-            ranks.extend(int(v) for v in rank_pattern.values())
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"could not verify adapter rank: {source} has invalid rank metadata"
-        ) from exc
-    if not ranks:
-        raise ValueError(f"could not verify adapter rank: {source} has no LoRA rank metadata")
-    rank = max(ranks)
-    if rank <= 0:
-        raise ValueError(f"could not verify adapter rank: {source} has non-positive rank {rank}")
-    return rank
+    return rank_from_adapter_config(config, source=source)
 
 
 def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
@@ -166,9 +189,10 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
             token=os.environ.get("HF_TOKEN"),
         )
     except Exception as exc:
-        raise ServingError(
-            f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
-        ) from exc
+        message = f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
+        if _is_hf_not_found_error(exc):
+            raise AdapterConfigMissing(message) from exc
+        raise ServingError(message) from exc
     try:
         with open(local, encoding="utf-8") as f:
             config = json.load(f)
@@ -188,7 +212,6 @@ def deploy_adapter(
     model: str,
     hf_repo: str,
     adapter_prefix: str,
-    gpu_name: str = "RTX 5090",
     *,
     dry_run: bool = False,
     lora_rank: int = 32,
@@ -197,7 +220,6 @@ def deploy_adapter(
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app."""
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
-    friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
     if not dry_run:
         validate_serving_lora_rank(
@@ -205,15 +227,7 @@ def deploy_adapter(
             adapter_artifact_lora_rank(hf_repo, subfolder),
             rank_source="adapter artifact",
         )
-    dep = Deployment(
-        run_id=run_id,
-        model=model,
-        adapter_hf_prefix=subfolder,
-        gpu=friendly,
-        openai_model=run_id,
-        endpoint_name=serving_base_url(),
-        state="dry_run" if dry_run else "ready",
-    )
+    dep = deployment_record(run_id, model, adapter_prefix, state="dry_run" if dry_run else "ready")
     if dry_run:
         return dep
     base = serving_base_url()
@@ -231,9 +245,111 @@ def deploy_adapter(
     normalized_org_id = (org_id or "").strip()
     if normalized_org_id:
         body["orgId"] = normalized_org_id
-    _post_adapter_or_raise(f"{base}/adapters", body)
+    previous_record = _registered_adapter(run_id)
+    try:
+        _post_adapter_or_raise(f"{base}/adapters", body)
+    except ServingError as exc:
+        # A 4xx means serving rejected the request outright and nothing changed. Anything else
+        # (5xx, timeout, unreachable) is ambiguous: the registry may or may not have switched to
+        # the new checkpoint. Read it back and report the actual state instead of guessing.
+        if exc.status_code is not None and exc.status_code < 500:
+            raise
+        record = _registered_adapter(run_id)
+        recorded = _record_subfolder(record)
+        if record is not None and recorded == subfolder:
+            logger.warning(
+                "POST /adapters for %s failed (%s) but the serving registry shows the adapter "
+                "registered; continuing",
+                run_id,
+                exc,
+            )
+        elif record is not None and recorded is None and previous_record is None:
+            logger.warning(
+                "POST /adapters for %s failed (%s) but the serving registry shows a new adapter "
+                "record without subfolder details; continuing because no prior deployment was "
+                "registered",
+                run_id,
+                exc,
+            )
+        elif record is not None and recorded is None:
+            raise ServingError(
+                f"{exc} — the serving registry returned adapter {run_id} without a subfolder, "
+                f"so it cannot confirm that requested checkpoint {subfolder!r} replaced the "
+                "previous deployment. Retry `flash deploy` once serving recovers",
+                status_code=exc.status_code,
+            ) from exc
+        elif recorded is not None:
+            raise ServingError(
+                f"{exc} — the serving registry still shows adapter {run_id} at the previously "
+                f"deployed checkpoint ({recorded!r}, requested {subfolder!r}), so the OLD "
+                "checkpoint remains active. Retry `flash deploy` once serving recovers",
+                status_code=exc.status_code,
+            ) from exc
+        else:
+            raise
+    else:
+        _verify_adapter_registered(run_id, subfolder)
     logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
+
+
+def _record_subfolder(record: dict | None) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    value = record.get("subfolder")
+    return str(value) if value is not None else None
+
+
+def _registered_adapter(run_id: str) -> dict | None:
+    """The adapter's record in the serving registry, or None when absent or unreadable."""
+    try:
+        resp = _serving_request("GET", f"{serving_base_url()}/adapters")
+        payload = resp.json()
+    except (ServingError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for record in payload.get("adapters") or []:
+        if not isinstance(record, dict):
+            continue
+        adapter_id = record.get("adapter_id") or record.get("adapterId")
+        if adapter_id == run_id:
+            return record
+    return None
+
+
+def _verify_adapter_registered(run_id: str, subfolder: str) -> None:
+    """Poll the serving registry until the adapter is visible at the requested checkpoint.
+
+    A 2xx from POST /adapters only proves the registration request was accepted. If the record
+    never lands in the registry, /v1/chat/completions 404s with "Unknown adapter id" even though
+    the deployment record claims ready. Polling here makes "ready" a registry-backed claim.
+    """
+    recorded: str | None = None
+    seen = False
+    for attempt in range(READBACK_ATTEMPTS):
+        if attempt:
+            time.sleep(READBACK_DELAY_SECONDS * attempt)
+        record = _registered_adapter(run_id)
+        if record is None:
+            continue
+        seen = True
+        recorded = _record_subfolder(record)
+        # Older serving builds may omit subfolder from the record; presence then has to count.
+        if recorded is None or recorded == subfolder:
+            return
+    if seen:
+        raise ServingError(
+            f"adapter {run_id} is registered at checkpoint {recorded!r} instead of the requested "
+            f"{subfolder!r}; the previously deployed checkpoint is still active — retry "
+            "`flash deploy`"
+        )
+    raise ServingError(
+        f"adapter {run_id} was accepted by serving but never appeared in its registry; chat "
+        "requests would fail with HTTP 404 'Unknown adapter id'. The deployment was not marked "
+        "ready — retry `flash deploy`, and if this persists an operator must check the freesolo "
+        "serving app"
+    )
 
 
 def undeploy_adapter(run_id: str) -> list[str]:
@@ -243,6 +359,12 @@ def undeploy_adapter(run_id: str) -> list[str]:
     resp = _serving_request("DELETE", url, ok_statuses=(404,))
     if resp.status_code == 404:
         return []
+    if _registered_adapter(run_id) is not None:
+        logger.warning(
+            "adapter %s still appears in the serving registry after DELETE; a stale router may "
+            "keep serving it until its next reload",
+            run_id,
+        )
     logger.info("deregistered adapter %s from freesolo serving (%s)", run_id, base)
     return [run_id]
 

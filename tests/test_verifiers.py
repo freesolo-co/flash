@@ -272,7 +272,7 @@ def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
     raw = "<think>4</think> 5"
     state = {"completion": " 5", "thinking": "4", "raw": raw}
 
-    breakdown = env.scores_breakdown(" 5", {"input": "q", "output": "4"}, state)
+    breakdown = env.scores_breakdown(" 5", {"id": "q", "input": "q", "output": "4"}, state)
 
     assert breakdown["legacy_answer_match"] == 0.0
     assert breakdown["thinking"] == 1.0
@@ -309,14 +309,14 @@ def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
     env = FreesoloEnvironment(
         _BudgetMultiTurnEnv(),
         "owner/env",
-        source=[{"input": "go", "output": ""}],
+        source=[{"id": "go", "input": "go", "output": ""}],
         contract_text="",
     )
     # max_turns is now the dataset-wide max_episode_turns (15), not the old hardcoded 8 —
     # otherwise the rollout loop would truncate this 15-turn scenario at turn 8.
     assert env.max_turns == 15
 
-    state = env.new_rollout_state({"input": "go", "output": ""})
+    state = env.new_rollout_state({"id": "go", "input": "go", "output": ""})
     assert state["max_episode_turns"] == 15
     # rollout_done honors THIS rollout's budget even when the batch cap is larger, and even
     # though the env never sets done=True.
@@ -412,7 +412,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     env_file = tmp_path / "freesolo" / "environment.py"
     env_file.parent.mkdir()
     env_file.write_text("def load_environment(**kwargs): pass\n")
-    dataset = tmp_path / "freesolo" / "datasets" / "train.jsonl"
+    dataset = tmp_path / "freesolo" / "dataset" / "train.jsonl"
     dataset.parent.mkdir()
     dataset.write_text('{"id":"row-1","input":"2+2?","output":"4"}\n')
 
@@ -420,7 +420,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
 
     env = load_freesolo_environment(
         str(env_file),
-        dataset_path="datasets/train.jsonl",
+        dataset_path="dataset/train.jsonl",
         contract_text="be brief",
         difficulty="hard",
     )
@@ -443,6 +443,223 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
 
 
+def _split_env(tmp_path, extra_files):
+    env_file = tmp_path / "freesolo" / "environment.py"
+    env_file.parent.mkdir()
+    env_file.write_text("def load_environment(**kwargs): pass\n")
+    for rel, text in extra_files.items():
+        f = tmp_path / "freesolo" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    return env_file
+
+
+def test_freesolo_adapter_split_param_selects_split_dataset(monkeypatch, tmp_path):
+    """[environment.params] split must pick dataset/<split>.jsonl for Flash's own dataset()
+    (SFT targets AND GRPO problem selection), not silently train on the default train.jsonl."""
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+    assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
+
+
+def test_freesolo_adapter_missing_split_file_refuses_silent_train_fallback(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="split='oracle'"):
+        load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
+
+
+def test_freesolo_adapter_rejects_unsafe_split_names(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    with pytest.raises(ValueError, match="split must be a simple dataset name"):
+        load_freesolo_environment(str(env_file), split="../oracle", contract_text="c")
+
+
+def test_freesolo_adapter_split_train_uses_default_dataset(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path, {"dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="train", contract_text="c")
+    assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
+
+
+def test_freesolo_adapter_does_not_auto_load_datasets_dir(monkeypatch, tmp_path):
+    sdk_env = _FakeSingleTurnEnv()
+    sdk_env.dataset = [{"id": "sdk", "input": "sdk?", "output": "sdk"}]
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+    env_file = _split_env(
+        tmp_path, {"datasets/train.jsonl": '{"id":"legacy","input":"old?","output":"old"}\n'}
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), split="train", contract_text="c")
+    assert env.dataset() == [{"id": "sdk", "input": "sdk?", "output": "sdk"}]
+
+
+def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n',
+            "dataset/oracle.jsonl": '{"id":"o","input":"2+2?","output":"4"}\n',
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file),
+        dataset_path="dataset/train.jsonl",
+        split="oracle",
+        contract_text="c",
+    )
+    assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
+
+
+def test_freesolo_adapter_preserves_top_level_record_keys(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"id":"t","input":"x","output":"y","initial_state":[1,2],'
+                '"metadata":{"kept":true}}\n'
+            )
+        },
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    rows = env.dataset()
+    assert rows == [
+        {
+            "id": "t",
+            "input": "x",
+            "output": "y",
+            "initial_state": [1, 2],
+            "metadata": {"kept": True},
+        }
+    ]
+
+
+def test_freesolo_adapter_requires_explicit_record_id(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
+
+    with pytest.raises(ValueError, match="id field"):
+        env._canonical_record({"input": "x"})
+    with pytest.raises(ValueError, match="id field"):
+        env._canonical_record({"id": "   ", "input": "x"})
+
+
+def test_freesolo_adapter_allows_missing_output(monkeypatch, tmp_path):
+    _install_fake_freesolo(monkeypatch)
+    env_file = _split_env(
+        tmp_path,
+        {"dataset/train.jsonl": '{"id":"t","input":"x","difficulty":"easy"}\n'},
+    )
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(str(env_file), contract_text="c")
+    assert env.dataset() == [{"id": "t", "input": "x", "difficulty": "easy"}]
+
+
+def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
+    class NoSystemEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[dict]] = [{"id": "math", "input": "2+2?", "output": "4"}]
+
+        def start_episode(self, example, prompt_text):
+            return [{"role": "user", "content": example.input}]
+
+        def score_responses(self, example, response_texts):
+            return [_RewardResult(score=0.0) for _ in response_texts]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=NoSystemEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        NoSystemEnv(),
+        "owner/env",
+        source=None,
+        contract_text="follow the contract",
+    )
+
+    assert env.prompt_messages({"id": "math", "input": "2+2?", "output": "4"}) == [
+        {"role": "system", "content": "follow the contract"},
+        {"role": "user", "content": "2+2?"},
+    ]
+
+
+def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
+    class BlankSystemEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[dict]] = [{"id": "math", "input": "2+2?", "output": "4"}]
+
+        def start_episode(self, example, prompt_text):
+            return [
+                {"role": "system", "content": "   "},
+                {"role": "user", "content": example.input},
+            ]
+
+        def score_responses(self, example, response_texts):
+            return [_RewardResult(score=0.0) for _ in response_texts]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=BlankSystemEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        BlankSystemEnv(),
+        "owner/env",
+        source=None,
+        contract_text="follow the contract",
+    )
+
+    expected = [
+        {"role": "system", "content": "follow the contract"},
+        {"role": "user", "content": "2+2?"},
+    ]
+    assert env.prompt_messages({"id": "math", "input": "2+2?", "output": "4"}) == expected
+    state = env.new_rollout_state({"id": "math", "input": "2+2?", "output": "4"})
+    assert state["prompt"] == expected
+    assert state["messages"] == expected
+    assert state["messages"] is not state["prompt"]
+    state["messages"][0]["content"] = "changed"
+    assert state["prompt"][0]["content"] == "follow the contract"
+
+
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
@@ -461,7 +678,7 @@ def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
     class SdkExampleEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[_TaskExample]] = [
             _TaskExample(
-                record={},
+                record={"id": "ex-1", "input": "2+2?"},
                 input="2+2?",
                 id="ex-1",
                 output="4",
@@ -484,9 +701,23 @@ def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
             "input": "2+2?",
             "output": "4",
             "id": "ex-1",
-            "metadata": {"split": "train"},
         }
     ]
+
+
+def test_freesolo_adapter_does_not_synthesize_record_id(monkeypatch):
+    class SdkExampleEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[_TaskExample]] = [
+            _TaskExample(record={"input": "2+2?"}, input="2+2?", id="ex-1", output="4")
+        ]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=SdkExampleEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(SdkExampleEnv(), "owner/env", source=None, contract_text="")
+    with pytest.raises(ValueError, match="id field"):
+        env.dataset()
 
 
 def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
@@ -514,23 +745,29 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     env = FreesoloEnvironment(
         _FakeMultiTurnEnv(),
         "github:owner/repo@main:env/environment.py",
-        source=[{"input": "browse", "output": "done"}],
+        source=[{"id": "browse", "input": "browse", "output": "done"}],
         contract_text="contract",
     )
-    state = env.new_rollout_state({"input": "browse", "output": "done"})
-    assert state["prompt"] == [{"role": "user", "content": "contract:browse"}]
-    assert state["messages"] == [{"role": "user", "content": "contract:browse"}]
+    state = env.new_rollout_state({"id": "browse", "input": "browse", "output": "done"})
+    assert state["prompt"] == [
+        {"role": "system", "content": "contract"},
+        {"role": "user", "content": "contract:browse"},
+    ]
+    assert state["messages"] == [
+        {"role": "system", "content": "contract"},
+        {"role": "user", "content": "contract:browse"},
+    ]
     env.record_model_turn(state, "click")
     replies = env.env_reply(state["messages"], state)
     assert replies == [{"role": "user", "content": "observed click"}]
     assert state["done"] is True
     assert env.rollout_done(state) is True
-    assert env.reward("ignored", {"input": "browse", "output": "done"}, state) == 0.5
-    assert env.grade("ignored", {"input": "browse", "output": "done"}, state) is True
+    assert env.reward("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) == 0.5
+    assert env.grade("ignored", {"id": "browse", "input": "browse", "output": "done"}, state) is True
     assert (
         env.reward_from_messages(
             [{"role": "assistant", "content": "final"}],
-            {"input": "browse", "output": "done"},
+            {"id": "browse", "input": "browse", "output": "done"},
             [{"role": "user", "content": "contract:browse"}],
         )
         == 0.5
@@ -573,7 +810,7 @@ def test_github_environment_ref_parsing():
 
 
 def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(
@@ -598,7 +835,7 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
 
 
 def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -618,7 +855,7 @@ def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, 
 
 
 def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -643,7 +880,7 @@ def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path,
 
 
 def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
-    import flash.envs.adapter as adapter
+    import flash.envs.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -658,7 +895,7 @@ def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, mon
 
 
 def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
-    from flash.envs.adapter import _safe_extract_archive
+    from flash.envs.loader import _safe_extract_archive
 
     def make_members_tar(members: list[tuple[str, bytes | None]]):
         tar = io.BytesIO()
@@ -676,14 +913,14 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
 
     dest = tmp_path / "extract_many"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 0)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_MEMBERS", 0)
     with pytest.raises(RuntimeError, match="too many members"):
         _safe_extract_archive(make_members_tar([("a", b"")]), dest)
 
     dest = tmp_path / "extract_big"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 5)
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 1)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_MEMBERS", 5)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_BYTES", 1)
     with pytest.raises(RuntimeError, match="too large"):
         _safe_extract_archive(
             make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest
@@ -691,7 +928,7 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
 
     dest = tmp_path / "extract_pax"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 100)
+    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_BYTES", 100)
     tar = io.BytesIO()
     with tarfile.open(fileobj=tar, mode="w:gz") as handle:
         pax = tarfile.TarInfo("pax_global_header")
@@ -712,7 +949,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
     # A GNU LONGNAME header payload is consumed inside tarfile.next() and never yielded, so per-member
     # accounting can't see it. A tiny gzip declaring a 400MB name must be rejected with memory bounded
     # near the limit, not OOM the worker.
-    from flash.envs.adapter import _safe_extract_archive
+    from flash.envs.loader import _safe_extract_archive
 
     def header(name: str, size: int, typeflag: str) -> bytes:
         h = bytearray(512)
@@ -766,4 +1003,4 @@ def test_worker_deps():
     import flash.envs.registry as registry
 
     env_id = "github:owner/repo@main:env/environment.py"
-    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.2.52"]
+    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.2.54"]

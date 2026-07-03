@@ -13,6 +13,7 @@ import shutil
 import threading
 import time
 
+from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
 
@@ -269,15 +270,11 @@ _CHECKPOINT_TRAINER_STATE = (
     "zero_to_fp32.py",
 )
 
-# The PEFT adapter weights file a checkpoint must carry to be loadable/servable. A step with
-# adapter_config.json but no weights is NOT deployable, so it's never published/listed.
-_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
-
 
 def _has_deployable_adapter(ckpt_dir: str) -> bool:
     """Return True if ckpt_dir has a loadable LoRA adapter (config + weights)."""
     return os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")) and any(
-        os.path.isfile(os.path.join(ckpt_dir, w)) for w in _ADAPTER_WEIGHT_FILES
+        os.path.isfile(os.path.join(ckpt_dir, w)) for w in ADAPTER_WEIGHT_FILES
     )
 
 
@@ -371,15 +368,74 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
             api.delete_folder(path_in_repo=folder, repo_id=_w.HF_REPO, repo_type="dataset")
 
 
+class _UploadPump:
+    """Coalescing single-slot upload queue: at most one upload in flight, at most one queued.
+
+    ONE lock guards two fields — ``uploading`` and ``queued`` (newest wins). Every producer path
+    is enqueue-then-pump and the upload thread's finally is done()-then-pump, so a save that
+    lands while the in-flight upload is draining can never be lost (no check-then-set window
+    between separate locks).
+    """
+
+    def __init__(self, start_upload) -> None:
+        self._cond = threading.Condition()
+        self._start_upload = start_upload  # (step, ckpt_dir) -> spawns thread; must call done()
+        self.uploading = False
+        self.queued: tuple[int, str] | None = None
+
+    def enqueue(self, step: int, ckpt_dir: str) -> None:
+        """Queue `step` (replacing any older queued step) and start it if idle."""
+        with self._cond:
+            busy = self.uploading
+            self.queued = (step, ckpt_dir)
+        if busy:
+            print(
+                f"[ckpt] upload busy; queued step {step} (uploads when the in-flight one finishes)"
+            )
+        self.pump()
+
+    def pump(self) -> None:
+        """Atomically start the queued upload iff nothing is in flight."""
+        with self._cond:
+            if self.uploading or self.queued is None:
+                return
+            step, ckpt_dir = self.queued
+            self.queued = None
+            gone = not os.path.isdir(ckpt_dir)
+            if not gone:
+                self.uploading = True
+        if gone:  # pruned by the trainer's save_total_limit meanwhile
+            print(f"[ckpt] queued step {step} checkpoint dir is gone; dropping")
+            return
+        self._start_upload(step, ckpt_dir)
+
+    def done(self) -> None:
+        """Mark the in-flight upload finished, then pump any queued step."""
+        with self._cond:
+            self.uploading = False
+            self._cond.notify_all()
+        self.pump()
+
+    def take_queued(self) -> tuple[int, str] | None:
+        """Remove and return the queued step, if any (for a synchronous train-end flush)."""
+        with self._cond:
+            queued, self.queued = self.queued, None
+            return queued
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for the in-flight upload (if any) to finish."""
+        with self._cond:
+            return self._cond.wait_for(lambda: not self.uploading, timeout)
+
+
 def make_checkpoint_upload_callback():
     """Return a TrainerCallback that streams each save to HF and publishes deployable per-step adapters.
 
-    Uploads run in a background daemon thread; if one is in-flight when the next save fires, that
-    save is skipped. on_train_end flushes the final deployable synchronously before exit.
+    Uploads run in a background daemon thread; a save that fires while one is in flight is queued
+    (newest wins) and uploaded next. on_train_end flushes the queue and the final deployable
+    synchronously before exit.
     """
     from transformers import TrainerCallback
-
-    lock = threading.Lock()
 
     def _publish_deployable_recombined(
         ckpt_dir: str, step: int, *, with_retry: bool = False
@@ -420,6 +476,41 @@ def make_checkpoint_upload_callback():
             if recombined:
                 shutil.rmtree(recombined, ignore_errors=True)
 
+    def _upload_once(step: int, ckpt_dir: str) -> None:
+        # Deployable per-step adapter FIRST: it's small, kept-forever, and the only
+        # artifact that makes a cancelled/preempted run deployable from this step, so
+        # it must land before the larger resume checkpoint (best-effort, latest-only).
+        _publish_deployable_recombined(ckpt_dir, step)
+        _w.hf_api().upload_folder(
+            folder_path=ckpt_dir,
+            path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
+            repo_id=_w.HF_REPO,
+            repo_type="dataset",
+        )
+        # Prune older step dirs only after the new one is safely up (latest-only resume).
+        _prune_stale_resume_checkpoints(step)
+        _w.heartbeat("checkpoint_uploaded", step=step)
+
+    def _start_upload(step: int, ckpt_dir: str) -> None:
+        """Upload `step` in a background thread; the pump is marked done (and re-pumped) after."""
+
+        def _upload():
+            try:
+                _upload_once(step, ckpt_dir)
+            except Exception as e:
+                print("ckpt upload warn:", e)
+            finally:
+                pump.done()
+
+        threading.Thread(target=_upload, daemon=True).start()
+
+    # `save_every` must not be advisory: a save that fires while a prior upload is still in
+    # flight is QUEUED (newest wins) and uploaded as soon as the in-flight one finishes, instead
+    # of being dropped with "upload busy; skipping step N". Coalescing to the newest pending step
+    # keeps at most one waiter, so a slow uplink can't pile up threads, while the registered step
+    # list stays as dense as the uplink allows.
+    pump = _UploadPump(_start_upload)
+
     class _CheckpointUpload(TrainerCallback):
         def on_save(self, args, state, control, **kwargs):
             if not _w.HF_REPO:
@@ -428,49 +519,43 @@ def make_checkpoint_upload_callback():
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
             if not os.path.isdir(ckpt_dir):
                 return
-            if not lock.acquire(blocking=False):
-                print(f"[ckpt] upload busy; skipping step {step}")
-                return
-
-            def _upload():
-                try:
-                    # Deployable per-step adapter FIRST: it's small, kept-forever, and the only
-                    # artifact that makes a cancelled/preempted run deployable from this step, so
-                    # it must land before the larger resume checkpoint (best-effort, latest-only).
-                    _publish_deployable_recombined(ckpt_dir, step)
-                    _w.hf_api().upload_folder(
-                        folder_path=ckpt_dir,
-                        path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
-                        repo_id=_w.HF_REPO,
-                        repo_type="dataset",
-                    )
-                    # Prune older step dirs only after the new one is safely up (latest-only resume).
-                    _prune_stale_resume_checkpoints(step)
-                    _w.heartbeat("checkpoint_uploaded", step=step)
-                except Exception as e:
-                    print("ckpt upload warn:", e)
-                finally:
-                    lock.release()
-
-            threading.Thread(target=_upload, daemon=True).start()
+            pump.enqueue(step, ckpt_dir)
 
         def on_train_end(self, args, state, control, **kwargs):
-            # Daemon threads are killed on exit; flush the final deployable synchronously here.
+            # Daemon threads are killed on exit; flush synchronously here.
             if not _w.HF_REPO:
                 return
             latest = _latest_checkpoint_dir(args.output_dir)
             if latest is None:
                 return
             step, ckpt_dir = latest
-            if lock.acquire(timeout=_CKPT_FLUSH_TIMEOUT_S):
-                try:
-                    _publish_deployable_recombined(ckpt_dir, step)
-                finally:
-                    lock.release()
+            # A queued save the pump never started must not be silently dropped: take it out
+            # of the pump (so a racing done()->pump() can't double-start it) and run it here.
+            queued = pump.take_queued()
+            idle = pump.wait_idle(_CKPT_FLUSH_TIMEOUT_S)
+            if queued is not None and os.path.isdir(queued[1]):
+                q_step, q_dir = queued
+                if idle:
+                    try:
+                        _upload_once(q_step, q_dir)
+                    except Exception as e:
+                        print("ckpt upload warn:", e)
+                else:
+                    # Another upload is still pruning latest-only resume checkpoints. Publish only
+                    # the durable per-step adapter here so concurrent prune passes cannot delete a
+                    # newer resume checkpoint while it is being flushed.
+                    try:
+                        _publish_deployable_recombined(q_dir, q_step, with_retry=True)
+                    except Exception as e:
+                        print("ckpt deployable flush warn:", e)
+                if q_step == step:
+                    return  # the queued flush already published the final deployable
+            if idle:
+                _publish_deployable_recombined(ckpt_dir, step)
             else:
                 print(
-                    f"[ckpt] flush lock busy after {_CKPT_FLUSH_TIMEOUT_S:.0f}s; publishing final "
-                    f"deployable (step {step}) without it"
+                    f"[ckpt] upload still in flight after {_CKPT_FLUSH_TIMEOUT_S:.0f}s; publishing "
+                    f"final deployable (step {step}) alongside it"
                 )
                 _publish_deployable_recombined(ckpt_dir, step, with_retry=True)
 

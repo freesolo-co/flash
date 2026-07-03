@@ -247,11 +247,50 @@ def test_sft_step_liveness_upload_is_throttled(monkeypatch):
     assert len(uploads) == 1, "sft_step uploads must be throttled to one per _HB_MIN_INTERVAL_S"
 
 
+def test_setup_liveness_upload_uses_shorter_interval(monkeypatch):
+    """Setup liveness must refresh public status before a 300s external frozen-heartbeat watchdog,
+    while training-step liveness stays under the normal shared-repo throttle."""
+    import json
+
+    import flash.engine.worker as ne
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    now = {"t": 1000.0}
+    uploads: list[dict] = []
+
+    def _capture(local, *a, **k):
+        with open(local) as f:
+            uploads.append(json.load(f))
+
+    monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
+    monkeypatch.setattr(ne, "hf_upload_file", _capture)
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_SETUP_LIVENESS_INTERVAL_S", 240.0)
+
+    ne._HB_LAST_UPLOAD = 1000.0
+    now["t"] = 1239.0
+    ne.heartbeat("sft_initializing", liveness=True)
+    assert uploads == []
+
+    now["t"] = 1241.0
+    ne.heartbeat("sft_initializing", liveness=True)
+    assert uploads[-1]["stage"] == "sft_initializing"
+    assert uploads[-1]["liveness"] is True
+
+    uploads.clear()
+    ne._HB_LAST_UPLOAD = 1000.0
+    now["t"] = 1241.0
+    ne.heartbeat("sft_step", liveness=True, step=0)
+    assert uploads == [], "training-step liveness must stay on _HB_MIN_INTERVAL_S"
+
+
 def test_default_heartbeat_interval_fits_shared_environment_repos():
     import flash.engine.worker as ne
 
     assert ne._HB_MIN_INTERVAL_S >= 900.0
     assert ne._HB_MIN_INTERVAL_S < 1200.0
+    assert 180.0 <= ne._HB_SETUP_LIVENESS_INTERVAL_S < 300.0
 
 
 # --------------------------------------------------------------------------------------------
@@ -301,17 +340,27 @@ def test_is_training_heartbeat_gates_setup_vs_training():
     assert is_training_heartbeat("sft_train_done", None) is True
 
 
-def test_provider_surface_heartbeat_skips_liveness_pings():
-    from flash.providers._poll import surface_heartbeat
+def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatch):
+    from flash.providers import _poll
 
     real = {"stage": "rl_initializing", "step": 0, "ts": 100.0, "attempt": "1"}
-    key, stage = surface_heartbeat(lambda: real, None, lambda _m: None)
+    key, stage = _poll.surface_heartbeat(lambda: real, None, lambda _m: None)
     assert key is not None
     assert stage == "rl_initializing"
     live = {"stage": "rl_initializing", "step": 0, "ts": 200.0, "attempt": "1", "liveness": True}
-    key2, stage2 = surface_heartbeat(lambda: live, key, lambda _m: None)
-    assert key2 == key, "a liveness ping must not advance the stall key"
+    recorded = []
+    lines = []
+    monkeypatch.setattr(_poll, "_record_heartbeat", recorded.append)
+    key2, stage2 = _poll.surface_heartbeat(lambda: live, key, lines.append)
+    assert key2 != key, "a liveness ping should advance the dedupe key"
     assert stage2 is None, "a liveness ping is not surfaced as progress"
+    assert recorded == [live], "a liveness ping must still refresh visible run status"
+    assert lines
+    assert "liveness=true" in lines[-1]
+    key3, stage3 = _poll.surface_heartbeat(lambda: live, key2, lines.append)
+    assert key3 == key2
+    assert stage3 is None
+    assert recorded == [live], "duplicate liveness JSON must not be recorded repeatedly"
 
 
 # --------------------------------------------------------------------------------------------

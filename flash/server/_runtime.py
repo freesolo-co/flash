@@ -105,7 +105,7 @@ async def _charge_retry_loop() -> None:
 
 
 def _append_run_log(run_id: str, message: str) -> None:
-    """Append a timestamped note to a run's log so it surfaces in `flash status --logs`."""
+    """Append a timestamped note to a run's log so it surfaces in `flash log`."""
     import time
 
     with open(runs_file_path(run_id, ".log"), "a") as f:
@@ -158,7 +158,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
     truncated tail of the worker console). The full ``console_<phase>.txt`` / ``error_<phase>.txt``
     the worker streams to HF are the real train stdout/traceback — but the repo is PRIVATE, so a
     user's own HF token 404s. We fetch them here with the OPERATOR ``HF_TOKEN`` (the control plane
-    already holds it) so ``flash status --logs`` shows the real worker output regardless of run
+    already holds it) so ``flash log`` shows the real worker output regardless of run
     state and without the user needing repo access. Best-effort: a missing file / no repo yields {}.
     """
     repo = getattr(getattr(spec, "train", None), "hf_repo", None)
@@ -200,7 +200,9 @@ def recover_runs() -> None:
     a worker."""
     from flash.runner import (
         _gc_run_endpoints,
+        _resolve_init_from_adapter,
         _run_job_background,
+        _status_org_id,
         _update,
         attach_run,
         get_status,
@@ -259,6 +261,27 @@ def recover_runs() -> None:
                 continue
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
+            try:
+                owner_key_id = None
+                with contextlib.suppress(Exception):
+                    owner_key_id = db.run_owner(status.run_id)
+                spec = _resolve_init_from_adapter(
+                    spec,
+                    owner_org_id=_status_org_id(status),
+                    owner_key_id=owner_key_id,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "marking run %s failed: warm-start ref could not be resolved",
+                    status.run_id,
+                    exc_info=True,
+                )
+                detail = f"unrecoverable: train.init_from_adapter could not be resolved: {exc}"
+                with contextlib.suppress(Exception):
+                    _update(status.run_id, "failed", error=detail)
+                with contextlib.suppress(Exception):
+                    _append_run_log(status.run_id, detail)
+                continue
             resubmit.append(spec)
     # Reap orphaned per-run provider resources; each provider sweeps its own.
     from flash.providers import configured_providers

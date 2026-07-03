@@ -144,8 +144,8 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
         render.models_table([{"id": "acme/x"}]),
         render.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
         render.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
-        render.deployments_table([{"run_id": "r", "deployment": {"gpu": "RTX 4090"}}]),
-        render.env_setup(["environment.py", "datasets/train.jsonl", "configs/rl.toml"]),
+        render.deployments_table([{"run_id": "r", "deployment": {"state": "ready"}}]),
+        render.env_setup(["environment.py", "dataset/train.jsonl", "configs/rl.toml"]),
         render.env_list([]),
         render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"),
         render.submitted("flash-xyz"),
@@ -178,7 +178,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     # themed header + table, not a bare `step N` list
     assert "checkpoints" in ck
     assert "STEP" in ck
-    assert "acme/x:grpo/step-8" in ck
+    assert "flash-1/step-8" in ck  # the canonical short checkpoint ref
 
     dep = render.deployed(
         {"run_id": "flash-1", "state": "deployed", "endpoint_name": "ep", "url": "https://x"}
@@ -218,14 +218,10 @@ def test_deploy_dry_run_is_not_a_false_success(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
     # a real deploy still confirms
-    live = render.deployed(
-        {"run_id": "flash-1", "state": "ready", "endpoint_name": "ep", "gpu": "A100"}
-    )
+    live = render.deployed({"run_id": "flash-1", "state": "ready", "endpoint_name": "ep"})
     assert "deploy" in live
     # a dry run is a neutral validation line, not a success confirmation
-    dry = render.deployed(
-        {"run_id": "flash-1", "state": "dry_run", "endpoint_name": "ep", "gpu": "A100"}
-    )
+    dry = render.deployed({"run_id": "flash-1", "state": "dry_run", "endpoint_name": "ep"})
     assert "dry run" in dry
     assert "nothing deployed" in dry
     assert "dry_run" not in dry
@@ -256,7 +252,7 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     import flash.client.runtime_secrets as runtime_secrets
 
     class _ExportClient:
-        def export(self, adapter_id, *, repository, hf_token, step, private):
+        def export(self, adapter_id, *, repository, hf_token, private):
             # mirror the real server response shape, which has NO `private` key
             return {
                 "run_id": adapter_id,
@@ -272,9 +268,7 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _ExportClient())
 
     # default export (no --public) is private; the card must say so, not "public"
-    args = argparse.Namespace(
-        adapter_id="flash-1", repository="acme/x", step=None, public=False, api_key=None
-    )
+    args = argparse.Namespace(adapter_id="flash-1", repository="acme/x", public=False, api_key=None)
     assert cli.commands.cmd_export(args) == 0
     out = capsys.readouterr().out
     assert "private" in out

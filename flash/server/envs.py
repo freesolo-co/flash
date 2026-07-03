@@ -15,10 +15,20 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from flash.envs.archive_policy import (
+    ARCHIVE_MEMBER_LIMIT,
+    ARCHIVE_SCAN_MEMBER_LIMIT,
+    TAR_METADATA_TYPES,
+    LimitedArchiveReader,
+    archive_stream_limit,
+    tar_member_segments,
+)
+
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
-_MAX_MEMBERS = 5000
-_MAX_SCAN_MEMBERS = 200_000
+_MAX_DOWNLOAD_BYTES = _MAX_UNCOMPRESSED_BYTES
+_MAX_MEMBERS = ARCHIVE_MEMBER_LIMIT
+_MAX_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
@@ -36,14 +46,10 @@ _REPO_CONTROL_TOP_LEVEL_PATHS = {
 # NOT a repo-control namespace, so the delete validator must reject only
 # `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
 _BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
-_TAR_METADATA_TYPES = {
-    tarfile.XHDTYPE,
-    tarfile.XGLTYPE,
-    tarfile.GNUTYPE_LONGNAME,
-    tarfile.GNUTYPE_LONGLINK,
-}
+_TAR_METADATA_TYPES = TAR_METADATA_TYPES
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+_NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
 def _human_mb(n: int) -> str:
@@ -65,47 +71,48 @@ def namespace_for(key: dict) -> str:
             "authenticated Freesolo key must include an org slug (used to derive the hub namespace) — "
             "publish with a key created at https://freesolo.co/sign-in (`flash login`)"
         )
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", slug):
+    if not _NAMESPACE_RE.fullmatch(slug):
         raise EnvPublishError("authenticated Freesolo key has an invalid org slug")
     return slug
 
 
 def _sanitize_name(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")
-    if slug in {".", ".."} or not re.search(r"[a-z0-9]", slug):
-        return "env"
-    return slug or "env"
+    from flash.schema import normalize_env_name_segment
+
+    return normalize_env_name_segment(name) or "env"
 
 
-class _LimitedReader:
-    """Bounds total bytes read from a *decompressed* tar stream. A GNU LONGNAME/LONGLINK or PAX header
-    payload is consumed inside ``tarfile.next()`` and never yielded as a member, so per-member size
-    accounting can't see it — a tiny gzip can declare a multi-GB header and OOM the process. Reads are
-    clamped to the remaining budget so a single oversized header read allocates at most the limit, then
-    raises ``EnvPublishError``."""
-
-    def __init__(self, raw, limit: int):
-        self._raw = raw
-        self._remaining = limit
-
-    def read(self, size: int = -1) -> bytes:
-        want = self._remaining + 1 if size is None or size < 0 else min(size, self._remaining + 1)
-        chunk = self._raw.read(want)
-        self._remaining -= len(chunk)
-        if self._remaining < 0:
-            raise EnvPublishError(
-                f"env package is too large uncompressed (limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})"
-            )
-        return chunk
+def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
+    caller_namespace = namespace_for(key)
+    raw = str(name or "").strip()
+    if "/" not in raw:
+        return caller_namespace, _sanitize_name(raw)
+    parts = [part.strip() for part in raw.split("/")]
+    if len(parts) != 2 or not all(parts):
+        raise EnvPublishError("env name with namespace must be 'namespace/name'")
+    namespace = parts[0]
+    if not _NAMESPACE_RE.fullmatch(namespace):
+        raise EnvPublishError("env namespace must match [a-z0-9][a-z0-9._-]*")
+    clean = _sanitize_name(parts[1])
+    if namespace != caller_namespace:
+        raise EnvPublishError(
+            "env namespace must match your Freesolo org namespace "
+            f"({caller_namespace}/...); got {namespace}/{clean}",
+            status=403,
+        )
+    return namespace, clean
 
 
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     root = dest.resolve()
-    # Stream backstop > the per-member content cap by the max header+padding overhead (<=1KB/member),
-    # so it never false-rejects a legitimate package but still bounds an oversized header payload.
-    stream_cap = _MAX_UNCOMPRESSED_BYTES + _MAX_MEMBERS * 1024 + (1 << 20)
     try:
-        reader = _LimitedReader(gzip.GzipFile(fileobj=io.BytesIO(tar_bytes)), stream_cap)
+        reader = LimitedArchiveReader(
+            gzip.GzipFile(fileobj=io.BytesIO(tar_bytes)),
+            archive_stream_limit(_MAX_UNCOMPRESSED_BYTES, _MAX_MEMBERS),
+            lambda: EnvPublishError(
+                f"env package is too large uncompressed (limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})"
+            ),
+        )
         with tarfile.open(fileobj=reader, mode="r|") as tar:
             total = 0
             scanned = 0
@@ -118,13 +125,12 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     )
                 if member.type in _TAR_METADATA_TYPES:
                     continue
-                segments: list[str] = []
-                for segment in member.name.replace("\\", "/").split("/"):
-                    if not segment or segment == ".":
-                        continue
-                    if segment == "..":
-                        raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
-                    segments.append(segment)
+                segments = tar_member_segments(
+                    member.name,
+                    unsafe_error=lambda name: EnvPublishError(
+                        f"unsafe path in env package: {name!r}"
+                    ),
+                )
                 if not segments:
                     continue
                 normalized_name = "/".join(segments)
@@ -178,6 +184,19 @@ def _credentialed_repo_url(repo: str, token: str) -> str:
     return f"https://x-access-token:{quoted}@github.com/{repo}.git"
 
 
+def _operation_direction(operation: str) -> str:
+    return "from" if operation in {"delete", "download"} else "to"
+
+
+def _checkout_child(checkout: Path, publish_root: str, *, operation: str) -> Path:
+    target = checkout / publish_root
+    checkout_root = checkout.resolve()
+    target_root = target.resolve()
+    if target_root != checkout_root and checkout_root not in target_root.parents:
+        raise EnvPublishError(f"unsafe environment {operation} path")
+    return target
+
+
 def _run_git(
     cwd: Path, args: list[str], *, token: str, operation: str = "upload"
 ) -> subprocess.CompletedProcess[str]:
@@ -197,7 +216,7 @@ def _run_git(
             timeout=_GIT_TIMEOUT_S,
         )
     except FileNotFoundError as exc:
-        direction = "from" if operation == "delete" else "to"
+        direction = _operation_direction(operation)
         raise EnvPublishError(
             f"git is required to {operation} environments {direction} Freesolo", status=503
         ) from exc
@@ -247,11 +266,7 @@ def _is_retryable_git_publish_error(message: str) -> bool:
 
 
 def _copy_package_to_checkout(*, source: Path, checkout: Path, publish_root: str) -> None:
-    target = checkout / publish_root
-    checkout_root = checkout.resolve()
-    target_root = target.resolve()
-    if target_root != checkout_root and checkout_root not in target_root.parents:
-        raise EnvPublishError("unsafe environment publish path")
+    target = _checkout_child(checkout, publish_root, operation="publish")
     shutil.rmtree(target, ignore_errors=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
@@ -362,8 +377,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
             status=503,
         )
     repo = _DEFAULT_GITHUB_REPO
-    ns = namespace_for(key)
-    clean = _sanitize_name(name)
+    ns, clean = _publish_slug_for_name(name, key)
     publish_root = f"{ns}/{clean}"
     if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
         raise EnvPublishError("env package must contain environment.py")
@@ -473,6 +487,111 @@ def canonical_env_id(slug: str) -> str:
     return f"{namespace}/{name}"
 
 
+def _require_namespace_access(canonical: str, key: dict, *, action: str) -> None:
+    namespace = canonical.split("/", 1)[0]
+    caller_namespace = None if key.get("auth_kind") == "internal" else namespace_for(key)
+    if caller_namespace is not None and namespace != caller_namespace:
+        raise EnvPublishError(
+            f"you can only {action} environments in your own namespace "
+            f"({caller_namespace}/...); got {canonical!r}",
+            status=403,
+        )
+
+
+def _package_checkout_directory(source: Path) -> bytes:
+    if not (source / _DEFAULT_ENVIRONMENT_FILE).is_file():
+        raise EnvPublishError("environment package not found", status=404)
+
+    total = 0
+    members = 0
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for path in sorted(source.rglob("*")):
+            rel = path.relative_to(source).as_posix()
+            if rel.split("/", 1)[0] in _BLOCKED_TOP_LEVEL_PATHS:
+                raise EnvPublishError(
+                    "env packages must not contain repo-control or source top-level paths",
+                    status=502,
+                )
+            if path.is_symlink():
+                raise EnvPublishError(f"links are not allowed in env packages: {rel!r}", status=502)
+            if path.is_file():
+                total += path.stat().st_size
+                if total > _MAX_UNCOMPRESSED_BYTES:
+                    raise EnvPublishError(
+                        "env package is too large uncompressed "
+                        f"(limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})",
+                        status=413,
+                    )
+            elif not path.is_dir():
+                raise EnvPublishError(
+                    f"only regular files and directories are allowed in env packages, "
+                    f"but {rel!r} is a special file",
+                    status=502,
+                )
+
+            members += 1
+            if members > _MAX_MEMBERS:
+                raise EnvPublishError(f"env package has too many members (limit {_MAX_MEMBERS})")
+            tar.add(path, arcname=rel, recursive=False)
+            if buf.tell() > _MAX_DOWNLOAD_BYTES:
+                raise EnvPublishError(
+                    f"env package download is too large (limit {_human_mb(_MAX_DOWNLOAD_BYTES)})",
+                    status=413,
+                )
+
+    data = buf.getvalue()
+    if len(data) > _MAX_DOWNLOAD_BYTES:
+        raise EnvPublishError(
+            f"env package download is too large (limit {_human_mb(_MAX_DOWNLOAD_BYTES)})",
+            status=413,
+        )
+    return data
+
+
+def _github_download_once(*, repo: str, token: str, publish_root: str) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
+        tmp_path = Path(tmp)
+        checkout = tmp_path / "environment-hub"
+        _run_git(
+            tmp_path,
+            [
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                _GITHUB_BRANCH,
+                "--single-branch",
+                _credentialed_repo_url(repo, token),
+                str(checkout),
+            ],
+            token=token,
+            operation="download",
+        )
+        target = _checkout_child(checkout, publish_root, operation="download")
+        if not target.is_dir():
+            raise EnvPublishError("environment package not found", status=404)
+        return _package_checkout_directory(target)
+
+
+def _github_download(slug: str, *, token: str) -> bytes:
+    return _github_download_once(repo=_DEFAULT_GITHUB_REPO, token=token, publish_root=slug)
+
+
+def download_package(*, slug: str, key: dict) -> bytes:
+    """Return a tar.gz package for a published environment from the GitHub hub."""
+    namespace, name = _validate_slug(slug)
+    canonical = f"{namespace}/{name}"
+    _require_namespace_access(canonical, key, action="download")
+    token = _github_token()
+    if not token:
+        raise EnvPublishError(
+            "Flash control plane is missing its GitHub environment-hub credential",
+            status=503,
+        )
+    return _github_download(canonical, token=token)
+
+
 def _staged_has_changes(checkout: Path) -> bool:
     try:
         proc = subprocess.run(
@@ -520,11 +639,7 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
             token=token,
             operation="delete",
         )
-        target = checkout / publish_root
-        checkout_root = checkout.resolve()
-        target_root = target.resolve()
-        if target_root != checkout_root and checkout_root not in target_root.parents:
-            raise EnvPublishError("unsafe environment delete path")
+        target = _checkout_child(checkout, publish_root, operation="delete")
         if not target.exists():
             # Idempotent: nothing published under this slug, so there is nothing to remove.
             #
@@ -566,9 +681,7 @@ def _github_delete(slug: str, *, token: str) -> bool:
         if attempt:
             time.sleep(_GIT_PUSH_RETRY_DELAYS_SECONDS[attempt - 1])
         try:
-            return _github_delete_once(
-                repo=repo, token=token, publish_root=slug, message=message
-            )
+            return _github_delete_once(repo=repo, token=token, publish_root=slug, message=message)
         except EnvPublishError as exc:
             last_error = exc
             if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
@@ -587,13 +700,7 @@ def delete_package(*, slug: str, key: dict) -> bool:
     """
     namespace, name = _validate_slug(slug)
     canonical = f"{namespace}/{name}"
-    caller_namespace = None if key.get("auth_kind") == "internal" else namespace_for(key)
-    if caller_namespace is not None and namespace != caller_namespace:
-        raise EnvPublishError(
-            "you can only delete environments in your own namespace "
-            f"({caller_namespace}/…); got {canonical!r}",
-            status=403,
-        )
+    _require_namespace_access(canonical, key, action="delete")
     token = _github_token()
     if not token:
         raise EnvPublishError(

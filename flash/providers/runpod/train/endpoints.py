@@ -38,6 +38,28 @@ _ACQUIRED_LOCK = threading.Lock()
 _ENDPOINT_CACHE: dict[str, Any] = {}
 
 
+def _reset_flash_resource_manager(rm_module) -> None:
+    """Drop runpod_flash's in-memory ResourceManager state after switching state files."""
+    manager = getattr(rm_module, "ResourceManager", None)
+    if manager is None:
+        return
+
+    instances = getattr(manager, "_instances", None)
+    instance = instances.get(manager) if isinstance(instances, dict) else None
+    for target in (manager, instance):
+        if target is None:
+            continue
+        for attr in ("_resources", "_resource_configs", "_deployment_locks"):
+            state = getattr(target, attr, None)
+            if isinstance(state, dict):
+                state.clear()
+            elif state is not None:
+                with contextlib.suppress(Exception):
+                    setattr(target, attr, {})
+    with contextlib.suppress(Exception):
+        manager._resources_initialized = False
+
+
 def _acquire_local_slot(name: str) -> None:
     """Claim an in-process semaphore slot."""
     if not _LOCAL_SLOTS.acquire(blocking=False):
@@ -496,8 +518,13 @@ def isolate_flash_state(scope: str | None = None) -> None:
         scope = scope or f"pid{os.getpid()}"
         state_dir = Path.home() / ".flash" / "flash-state" / scope
         state_dir.mkdir(parents=True, exist_ok=True)
+        previous_state_file = getattr(rm, "RESOURCE_STATE_FILE", None)
         rm.FLASH_STATE_DIR = state_dir
         rm.RESOURCE_STATE_FILE = state_dir / "resources.pkl"
+        if hasattr(rm, "RUNPOD_FLASH_DIR"):
+            rm.RUNPOD_FLASH_DIR = state_dir
+        if previous_state_file != rm.RESOURCE_STATE_FILE:
+            _reset_flash_resource_manager(rm)
     except Exception as exc:
         logger.warning("flash state isolation skipped: %s", exc)
 
@@ -576,40 +603,48 @@ def get_train_endpoint(
 
     ensure_auth()
     _patch_runpod_backoff()
-    isolate_flash_state(name_suffix)
 
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
-    if name in _ENDPOINT_CACHE:
-        return _ENDPOINT_CACHE[name]
+    cache_handler = name_suffix is None
+    with FLASH_SDK_LOCK:
+        isolate_flash_state(name_suffix)
+        if cache_handler and name in _ENDPOINT_CACHE:
+            return _ENDPOINT_CACHE[name]
+
     _acquire_endpoint_slot(name)
     try:
-        kwargs = {
-            "name": name,
-            "gpu": flash_gpu(friendly),
-            "gpu_count": 1,
-            "min_cuda_version": min_cuda_for(friendly),
-            "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-            "workers": (0, 1),
-        }
-        image = worker_image_for_gpu(friendly, allow_default=False)
-        if image:
-            kwargs["image"] = image
-        else:
-            kwargs["dependencies"] = resolve_worker_deps()
-            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-        # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
-        from flash.providers.runpod.jobs import weight_cache_endpoint_kwargs
+        with FLASH_SDK_LOCK:
+            isolate_flash_state(name_suffix)
+            if cache_handler and name in _ENDPOINT_CACHE:
+                return _ENDPOINT_CACHE[name]
+            kwargs = {
+                "name": name,
+                "gpu": flash_gpu(friendly),
+                "gpu_count": 1,
+                "min_cuda_version": min_cuda_for(friendly),
+                "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+                "workers": (0, 1),
+            }
+            image = worker_image_for_gpu(friendly, allow_default=False)
+            if image:
+                kwargs["image"] = image
+            else:
+                kwargs["dependencies"] = resolve_worker_deps()
+                kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+            # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
+            from flash.providers.runpod.jobs import weight_cache_endpoint_kwargs
 
-        kwargs.update(weight_cache_endpoint_kwargs(spec))
-        ep = Endpoint(**kwargs)
-        handler = ep(_train_body)
-        from flash.providers.runpod.jobs import apply_disk_gb
+            kwargs.update(weight_cache_endpoint_kwargs(spec))
+            ep = Endpoint(**kwargs)
+            handler = ep(_train_body)
+            from flash.providers.runpod.jobs import apply_disk_gb
 
-        cfg = ep._build_resource_config()
-        apply_disk_gb(cfg, disk_gb)
-        _ENDPOINT_CACHE[name] = handler
-        return handler
+            cfg = ep._build_resource_config()
+            apply_disk_gb(cfg, disk_gb)
+            if cache_handler:
+                _ENDPOINT_CACHE[name] = handler
+            return handler
     except Exception:
         _release_endpoint_slot(name)
         raise
