@@ -529,6 +529,12 @@ def run_sft():
             )
             trainer.args.per_device_train_batch_size = safe_pd
             trainer.args.gradient_accumulation_steps = safe_ga
+            # HF Trainer caches _train_batch_size at init and the TRAIN DATALOADER reads THAT, not
+            # args.per_device_train_batch_size — so lowering the arg alone leaves the dataloader on the
+            # old (larger) batch and can still OOM the very case this fallback exists to avoid. Refresh
+            # the cache to the reduced size (args.train_batch_size = per_device * n_gpu).
+            if hasattr(trainer, "_train_batch_size"):
+                trainer._train_batch_size = trainer.args.train_batch_size
             per_device_bs, grad_accum = safe_pd, safe_ga
         if not _grad_ckpt:
             _grad_ckpt = True

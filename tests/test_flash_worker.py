@@ -154,18 +154,19 @@ def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
 
 
 def test_chalk_extra_pip_defaults_to_latest_main_without_spec(monkeypatch):
-    """With FLASH_CHALK_SPEC unset, flash auto-installs the latest chalk main SHA by default.
-    The commit pin is reproducible and guarantees the worker sees the expected kernel surface."""
+    """With FLASH_CHALK_SPEC unset, flash auto-installs the pinned PUBLIC PyPI chalk version by
+    default. A public version pin (not a git+https SHA against the INTERNAL chalk repo) lets
+    tokenless bake/worker pods install it, while still pinning the exact kernel surface."""
     from flash.providers.runpod.train import (
         DEFAULT_CHALK_SPEC,
-        LATEST_CHALK_MAIN_SHA,
         chalk_extra_pip,
     )
 
     _clear_chalk_flags(monkeypatch)
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    assert DEFAULT_CHALK_SPEC.startswith("git+https://github.com/freesolo-co/chalk.git@")
-    assert DEFAULT_CHALK_SPEC.endswith(LATEST_CHALK_MAIN_SHA)
+    # public PyPI pin so tokenless bake/worker pods can pip-install (chalk repo is internal)
+    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk==")
+    assert DEFAULT_CHALK_SPEC == "freesolo-chalk==0.5.0"
 
 
 def test_chalk_extra_pip_adds_spec_when_set(monkeypatch):

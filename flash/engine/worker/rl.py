@@ -268,9 +268,12 @@ def run_rl():
     # Multi-turn accumulates a full transcript up to the engine context, so size the fp32 logits
     # cap against the worst-case (engine context), not the per-turn _max_completion, or it OOMs.
     _cap_completion_len = vllm_max_len if is_multi_turn else _max_completion
-    # Chalk does not yet provide a GRPO fused-logprob loss, so every GRPO path keeps the 6 GB logits
-    # cap for safety. Feature-detect GRPOConfig fields once here; the TIS and num_iterations knobs are
-    # set later even when use_vllm is False, so this must stay outside the vLLM-only block.
+    # chalk 0.5.0 ships a GRPO fused-logprob op (chalk.ops.grpo) that streams selected-token logprobs
+    # without materializing [B,T,V]; WIRING it to flip fused_logits=True is a tracked follow-up (needs a
+    # GRPO end-to-end A/B first). Until then every GRPO path keeps the conservative full-logits budget
+    # cap (fused_logits=False below), so long completions are BUDGETED to fit — slower than the old Liger
+    # fused loss, but not an OOM. Feature-detect GRPOConfig fields once here; the TIS and num_iterations
+    # knobs are set later even when use_vllm is False, so this must stay outside the vLLM-only block.
     _grpo_fields = set(getattr(GRPOConfig, "__dataclass_fields__", {}))
     _grpo_has_num_iter = "num_iterations" in _grpo_fields
     per_device_comps = _w.rl_per_device_comps(
@@ -280,7 +283,8 @@ def run_rl():
         params_b=_params_b,
         active_params_b=(float(getattr(_info, "active_params_b", 0.0) or 0.0) or None),
         seq_len=vllm_max_len,
-        # Chalk has no GRPO fused-logprob replacement yet, so keep the 6 GB full-logits cap.
+        # Conservative until chalk's GRPO fused-logprob op (chalk 0.5.0, chalk.ops.grpo) is wired in:
+        # keep the full-logits budget cap so the unfused path is BUDGETED to fit, never OOMs.
         fused_logits=False,
     )
     if is_multi_turn and _cap_completion_len != _max_completion:
