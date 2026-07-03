@@ -104,9 +104,10 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
     return eff
 
 
-# Chalk latest main as of this change: freesolo-chalk 0.4.12.
+# Chalk pinned to freesolo-chalk 0.5.0 (chalk PR #21 fafe167: standalone, Liger fully
+# replaced, + GRPO op + LoRA grad-gate). Repoint to the main merge SHA once #21 lands.
 # Pin the exact commit so worker installs cannot lag behind the merged kernel surface.
-LATEST_CHALK_MAIN_SHA = "ad1a9345fdfe175b7916e344fd8fb23ba89c89c0"
+LATEST_CHALK_MAIN_SHA = "fafe167158eb3b7c947e7182ea4eddc351e4ca7d"
 DEFAULT_CHALK_SPEC = f"git+https://github.com/freesolo-co/chalk.git@{LATEST_CHALK_MAIN_SHA}"
 
 
