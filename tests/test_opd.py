@@ -480,6 +480,8 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: None,
+        wandb_report_to=lambda: [],  # W&B off by default in unit tests
+        wandb_run_info=lambda: {},
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     # Deterministic knobs: 1 step / 1 prompt / group 1 -> a single sample, forced to skip.
@@ -580,6 +582,8 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: None,
+        wandb_report_to=lambda: [],  # W&B off by default in unit tests
+        wandb_run_info=lambda: {},
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -935,6 +939,112 @@ def test_opd_installs_chalk_kernels_on_student(monkeypatch):
     assert captured["model"] is not None
 
 
+def test_opd_wraps_training_loop_in_sdpa_cudnn_ctx(monkeypatch):
+    """Regression (codex[bot], opd.py): on Blackwell (sm10x/sm120) optimal_attn_impl() returns 'sdpa';
+    sft/rl wrap their forwards in _sdpa_cudnn_ctx(_attn) (rl.py:596) but opd only set attn_implementation
+    at LOAD, so both the on-policy generate and the gkd loss forward ran under the default SDPA dispatch
+    and silently lost the cuDNN kernel. run_opd must ENTER _sdpa_cudnn_ctx with the resolved _attn around
+    the training loop."""
+    import contextlib as _cl
+
+    entered = {}
+
+    @_cl.contextmanager
+    def _rec_ctx(attn_impl):
+        entered["attn"] = attn_impl
+        yield
+
+    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None)
+    # Force the Blackwell branch and record what the loop wraps itself in.
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: "sdpa")
+    monkeypatch.setattr(opd_mod, "_sdpa_cudnn_ctx", _rec_ctx)
+    with pytest.raises(RuntimeError):  # all-skip -> no trained step, but the ctx wrapped the loop first
+        opd_mod.run_opd()
+    assert entered.get("attn") == "sdpa", (
+        "run_opd must wrap the training loop in _sdpa_cudnn_ctx(_attn) so the cuDNN SDPA backend is "
+        "used on Blackwell (parity with sft/rl)"
+    )
+
+
+def test_opd_initializes_and_logs_to_wandb_when_configured(monkeypatch):
+    """Regression (codex[bot], opd.py): sft/rl init W&B by passing report_to into the HF Trainer; opd's
+    custom loop has no Trainer, so it must call wandb_report_to() (which CREATES the run) and log per
+    optimizer step -- else wandb.run stays None (no dashboard) and the wandb_run_info() threaded into
+    train_meta is empty. With W&B on, each landed optimizer step must log opd/loss + opd/coverage keyed
+    by opt_steps."""
+    import sys
+    import types
+
+    torch = pytest.importorskip("torch")
+
+    logs = []
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.log = lambda data, step=None: logs.append((dict(data), step))
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    state = {"n": 0}
+
+    def _one_update_then_skip(*, model, **k):
+        state["n"] += 1
+        _one_update_then_skip.last_teacher_status = "ok"
+        _one_update_then_skip.last_coverage = 1.0
+        _one_update_then_skip.last_gen_tokens = 1
+        _one_update_then_skip.last_teacher_tokens = 1
+        if state["n"] == 1:  # one real optimizer step lands (W&B logs it), then the run shortfalls
+            return model.w.float().sum() * 1e-6
+        return None
+
+    from flash.engine.worker.perf import RetriableInfraError
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, steps=3, group=1)
+    # Turn W&B ON for this run (harness defaults it off): wandb_report_to() truthy -> _wandb_on.
+    monkeypatch.setattr(opd_mod._w, "wandb_report_to", lambda: ["wandb"])
+    with pytest.raises(RetriableInfraError):  # 1/3 updates -> retry, after logging the one that landed
+        opd_mod.run_opd()
+    assert logs, "W&B on -> run_opd must call wandb.log for each landed optimizer step"
+    data, step = logs[0]
+    assert "opd/loss" in data
+    assert "opd/coverage" in data
+    assert step == 1, "wandb.log must be keyed by opt_steps (1 after the single update)"
+
+
+def test_opd_skips_wandb_logging_when_not_configured(monkeypatch):
+    """W&B OFF (no WANDB_API_KEY -> wandb_report_to() returns []): run_opd must NOT import/log to wandb,
+    so a run completes its optimizer steps without touching the (here, exploding) wandb module."""
+    import sys
+    import types
+
+    pytest.importorskip("torch")
+
+    boom = types.ModuleType("wandb")
+
+    def _explode(*a, **k):
+        raise AssertionError("wandb.log must not be called when W&B is not configured")
+
+    boom.log = _explode
+    monkeypatch.setitem(sys.modules, "wandb", boom)
+
+    state = {"n": 0}
+
+    def _one_update_then_skip(*, model, **k):
+        state["n"] += 1
+        _one_update_then_skip.last_teacher_status = "ok"
+        _one_update_then_skip.last_coverage = 1.0
+        _one_update_then_skip.last_gen_tokens = 1
+        _one_update_then_skip.last_teacher_tokens = 1
+        if state["n"] == 1:
+            return model.w.float().sum() * 1e-6
+        return None
+
+    from flash.engine.worker.perf import RetriableInfraError
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, steps=3, group=1)
+    # Harness default wandb_report_to -> [] (off). The suppress(Exception) around wandb.log would hide a
+    # raise, so the guard here is _wandb_on being False (wandb.log never reached), which _explode proves.
+    with pytest.raises(RetriableInfraError):
+        opd_mod.run_opd()
+
+
 def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     """Regression (codex[bot], opd.py): _student_model builds the LoRA via get_peft_model, which
     samples the LoRA A matrix (init_lora_weights=True) from the torch default generator. run_opd must
@@ -980,6 +1090,8 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: None,
+        wandb_report_to=lambda: [],  # W&B off by default in unit tests
+        wandb_run_info=lambda: {},
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -1581,10 +1693,12 @@ def test_train_one_refreshes_stall_clock_between_generation_and_scoring():
 
 
 def test_teacher_score_rejects_non_numeric_or_unordered_offsets_as_permanent(monkeypatch):
-    """Regression (codex[bot], teacher.py:161): a malformed 200 can put a non-numeric (null / string)
-    or out-of-order value in text_offset that passes the list/length guards; int(offsets[i]) would then
-    raise TypeError/ValueError OUTSIDE TeacherError and _train_one swallows it as an unclassified skip,
-    burning every OPD step on a broken teacher. Validate offsets up front and reject as PERMANENT."""
+    """Regression (codex[bot], teacher.py): a malformed 200 can put a value in text_offset that passes
+    the list/length guards yet corrupts the alignment: non-numeric (null/string) or out-of-order (as
+    before), and also non-finite (int(NaN) RAISES outside TeacherError -> unclassified skip), fractional
+    (int() silently truncates to a wrong char index), or out-of-[0, len(full)] (a span outside the
+    completion region). All must be rejected up front as PERMANENT so the worker aborts, not skip-burns.
+    full = 'P' + 'hi' = 'Phi', len 3."""
     from flash.engine.worker.teacher import TeacherError
 
     def _payload(offsets):
@@ -1600,13 +1714,62 @@ def test_teacher_score_rejects_non_numeric_or_unordered_offsets_as_permanent(mon
             ]
         }
 
-    for bad, needle in (([0, None], "non-numeric"), ([0, "x"], "non-numeric"), ([5, 1], "non-decreasing")):
+    for bad, needle in (
+        ([0, None], "non-numeric"),
+        ([0, "x"], "non-numeric"),
+        ([2, 1], "non-decreasing"),  # both in-range so the order check (not range) is what fires
+        ([0, 1.5], "not an integer"),  # fractional -> int() truncates to a wrong index
+        ([0, float("nan")], "not finite"),  # NaN -> int(NaN) raises outside TeacherError
+        ([0, 9], "outside"),  # 9 > len('Phi')=3 -> span past the string
+        ([-1, 0], "outside"),  # negative start -> span before the completion
+    ):
         _mock_urlopen(monkeypatch, _payload(bad))
         client = TeacherClient("k", "https://api.example/v1", "glm")
         with pytest.raises(TeacherError) as ei:
             client.score("P", "hi")
         assert ei.value.permanent is True, f"{bad!r} must be PERMANENT"
-        assert needle in str(ei.value).lower()
+        assert needle in str(ei.value).lower(), f"{bad!r}: expected {needle!r} in {ei.value}"
+
+
+def test_teacher_score_rejects_non_numeric_or_nonfinite_logprobs_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): token_logprobs[i] is coerced with float(...) below (None ->
+    0.0 for a null realized logprob). A malformed 200 can still carry a non-numeric value (float() raises
+    ValueError OUTSIDE TeacherError -> _train_one swallows it as an unclassified skip and burns every OPD
+    step) or a non-finite NaN/inf (feeds a poisoned gradient straight into the gkd loss). Both must be
+    rejected up front as PERMANENT; a null logprob stays allowed (handled as 0.0)."""
+    from flash.engine.worker.teacher import TeacherError
+
+    def _payload(logprobs):
+        return {
+            "choices": [
+                {
+                    "logprobs": {
+                        "tokens": ["P", "hi"],
+                        "token_logprobs": logprobs,
+                        "text_offset": [0, 1],
+                    }
+                }
+            ]
+        }
+
+    for bad, needle in (
+        ([0.0, "x"], "non-numeric"),
+        ([0.0, float("nan")], "non-finite"),
+        ([0.0, float("inf")], "non-finite"),
+    ):
+        _mock_urlopen(monkeypatch, _payload(bad))
+        client = TeacherClient("k", "https://api.example/v1", "glm")
+        with pytest.raises(TeacherError) as ei:
+            client.score("P", "hi")
+        assert ei.value.permanent is True, f"{bad!r} must be PERMANENT"
+        assert needle in str(ei.value).lower(), f"{bad!r}: expected {needle!r} in {ei.value}"
+
+    # A NULL realized logprob (first token) is legitimate and must NOT raise -> it becomes 0.0.
+    _mock_urlopen(monkeypatch, _payload([None, -0.5]))
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    toks = client.score("P", "hi")
+    assert toks  # completion token survives; null prompt logprob dropped
+    assert toks[0].logprob == -0.5
 
 
 def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkeypatch):

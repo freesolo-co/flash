@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -170,10 +171,31 @@ class TeacherClient:
         # (codex[bot]). Validate the offsets are numeric (bools excluded) and non-decreasing up front
         # and reject as a PERMANENT contract break. token_logprobs[i] may still be null (handled below).
         prev_off = None
+        full_len = len(full)
         for o in offsets[:n]:
             if isinstance(o, bool) or not isinstance(o, (int, float)):
                 raise TeacherError(
                     f"teacher echo response text_offset has a non-numeric value: {o!r}",
+                    permanent=True,
+                )
+            # int(offsets[i]) below coerces each offset to a character index into `full`. A value that
+            # is merely numeric still corrupts the alignment three ways that the check above misses:
+            # NaN/inf makes int() RAISE (outside any TeacherError -> _train_one swallows it as an
+            # unclassified skip); a fractional float silently TRUNCATES to a wrong index; an offset
+            # outside [0, len(full)] yields a token span that starts before the completion or overshoots
+            # it. Require a FINITE INTEGER within range up front and reject as PERMANENT (codex[bot]).
+            # isfinite() must precede int() -- int(NaN) raises -- so the order here is load-bearing.
+            if not math.isfinite(o):
+                raise TeacherError(
+                    f"teacher echo response text_offset is not finite: {o!r}", permanent=True
+                )
+            if o != int(o):
+                raise TeacherError(
+                    f"teacher echo response text_offset is not an integer: {o!r}", permanent=True
+                )
+            if o < 0 or o > full_len:
+                raise TeacherError(
+                    f"teacher echo response text_offset {o!r} is outside [0, {full_len}]",
                     permanent=True,
                 )
             if prev_off is not None and o < prev_off:
@@ -182,6 +204,26 @@ class TeacherClient:
                     permanent=True,
                 )
             prev_off = o
+        # token_logprobs[i] is coerced with float(...) below (None -> 0.0 for a null realized logprob,
+        # e.g. the first token). A malformed 200 can still put a non-numeric value (e.g. a "NaN" string)
+        # or a non-finite float (NaN/inf) here that passes the list/length guards: a non-numeric value
+        # makes float() RAISE ValueError OUTSIDE any TeacherError (-> _train_one swallows it as an
+        # unclassified skip), and a NaN/inf feeds straight into the gkd teacher_logsum and poisons the
+        # loss with a non-finite gradient. Validate up front and reject as PERMANENT (codex[bot]); None
+        # stays allowed (handled as 0.0 below).
+        for lp in token_logprobs[:n]:
+            if lp is None:
+                continue
+            if isinstance(lp, bool) or not isinstance(lp, (int, float)):
+                raise TeacherError(
+                    f"teacher echo response token_logprobs has a non-numeric value: {lp!r}",
+                    permanent=True,
+                )
+            if not math.isfinite(lp):
+                raise TeacherError(
+                    f"teacher echo response token_logprobs has a non-finite value: {lp!r}",
+                    permanent=True,
+                )
         out: list[TeacherToken] = []
         for i in range(n):
             start = int(offsets[i])

@@ -31,6 +31,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.perf import (
     RetriableInfraError,
+    _sdpa_cudnn_ctx,
     free_gpu,
     gpu_diagnostics,
     grad_checkpointing_on,
@@ -476,6 +477,13 @@ def run_opd():
         [p for p in model.parameters() if p.requires_grad], lr=knobs["learning_rate"]
     )
 
+    # Initialize W&B if configured ([wandb] config + WANDB_API_KEY). wandb_report_to() CREATES the run
+    # as a side effect -- sft/rl get this for free by passing report_to into the HF Trainer, but opd's
+    # custom loop has no Trainer, so without an explicit init here wandb.run stays None: no dashboard,
+    # and the wandb_run_info() already threaded into train_meta below returns {} (codex[bot]). We log
+    # loss/coverage per optimizer step; the worker exit path (__init__.py) calls wandb_finish.
+    _wandb_on = bool(_w.wandb_report_to())
+
     resume_ckpt = _w.hf_resume_checkpoint()
     if resume_ckpt:
         print("[opd] resume-from-checkpoint is not yet supported for opd; starting fresh")
@@ -539,8 +547,16 @@ def run_opd():
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
     # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
-    with liveness_heartbeat(
-        "opd_step", progress=lambda: samples_seen, fields=lambda: {"step": opt_steps}
+    # _sdpa_cudnn_ctx(_attn) forces the cuDNN SDPA backend on Blackwell (sm10x/sm120), where
+    # optimal_attn_impl() returns "sdpa": sft/rl wrap their forwards the same way (sft.py, rl.py:596),
+    # but opd only set attn_implementation at LOAD, so both the on-policy generate and the gkd loss
+    # forward ran under the default SDPA dispatch and silently lost the cuDNN kernel (codex[bot]).
+    # No-op (nullcontext) on non-Blackwell GPUs / when _attn isn't "sdpa".
+    with (
+        liveness_heartbeat(
+            "opd_step", progress=lambda: samples_seen, fields=lambda: {"step": opt_steps}
+        ),
+        _sdpa_cudnn_ctx(_attn),
     ):
         while opt_steps < steps and step < max_iters:
             it = step  # data-slice + display index for THIS iteration
@@ -649,6 +665,12 @@ def run_opd():
                 coverage=avg_cov,
                 gpu=gpu_diagnostics(include_torch=False),
             )
+            if _wandb_on:
+                # Best-effort: a W&B network hiccup must never abort a paid training run.
+                with contextlib.suppress(Exception):
+                    import wandb
+
+                    wandb.log({"opd/loss": avg_loss, "opd/coverage": avg_cov}, step=opt_steps)
             if it % 10 == 0:
                 print(
                     f"[opd] step {it + 1}/{steps} loss={avg_loss:.4f} "
