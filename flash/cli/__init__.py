@@ -253,8 +253,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     env_pull.add_argument(
         "env_id",
-        help='the Freesolo environment id: a managed slug "your-name/your-env", a '
-        '"github:owner/repo@ref:path" ref, or a github.com URL',
+        help='the managed Freesolo environment slug "your-name/your-env"',
     )
     env_pull.add_argument(
         "path",

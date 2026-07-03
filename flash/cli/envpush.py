@@ -65,38 +65,32 @@ def _normalize_managed_hub_id(raw: object) -> tuple[str | None, _ManagedHubIdErr
 def cmd_env_pull(args) -> int:
     """Download a published Freesolo environment (or a single file from it) to local disk.
 
-    Managed hub slugs pull package tarballs through the authenticated Flash control plane. Explicit
-    GitHub refs still pull via GitHub's tarball / raw media type, so files larger than 1 MB
-    (e.g. ``datasets/train.jsonl``) come back intact instead of empty.
+    Environments are addressed by their managed hub slug ``namespace/name`` and pulled as package
+    tarballs through the authenticated Flash control plane.
     """
     from flash.client import ClientError, client_from_config
-    from flash.envs.adapter import is_freesolo_environment_id
     from flash.envs.pull import (
-        download_environment_file,
         download_environment_file_from_archive,
         ensure_environment_pull_destination_available,
         environment_local_dirname,
-        pull_environment_package,
         pull_environment_package_from_archive,
     )
 
     env_id = str(args.env_id or "").strip()
-    if not is_freesolo_environment_id(env_id):
+    managed_env_id, managed_error = _normalize_managed_hub_id(env_id)
+    if managed_error == "not-canonical":
+        return _err(
+            f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
+        )
+    if managed_env_id is None:
         print(
-            'env id must be a Freesolo environment id — a managed slug "your-name/your-env", '
-            f'a "github:owner/repo@ref:path" ref, or a github.com URL (got {args.env_id!r})',
+            'env id must be a managed Freesolo hub slug "your-name/your-env" '
+            f"(got {args.env_id!r})",
             file=sys.stderr,
         )
         return 1
+    env_id = managed_env_id
     try:
-        managed_env_id, managed_error = _normalize_managed_hub_id(env_id)
-        if managed_error == "not-canonical":
-            return _err(
-                f'env id must be lowercase "namespace/name" with no spaces (got {args.env_id!r})'
-            )
-        managed = managed_env_id is not None
-        if managed:
-            env_id = managed_env_id
         if args.path:
             default_name = Path(args.path.replace("\\", "/")).name
             out = Path(args.output) if args.output else Path(default_name)
@@ -110,11 +104,8 @@ def cmd_env_pull(args) -> int:
             if (out.exists() or out.is_symlink()) and not args.force:
                 print(f"refusing to overwrite {out} (pass --force)", file=sys.stderr)
                 return 1
-            if managed:
-                package = client_from_config().download_env_package(env_id)
-                data = download_environment_file_from_archive(package, args.path)
-            else:
-                data = download_environment_file(env_id, args.path)
+            package = client_from_config().download_env_package(env_id)
+            data = download_environment_file_from_archive(package, args.path)
             out.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(out, data)
             if render.styled():
@@ -123,12 +114,9 @@ def cmd_env_pull(args) -> int:
                 print(f"pulled {args.path} from {env_id} -> {out} ({len(data):,} bytes)")
         else:
             out = Path(args.output) if args.output else Path(environment_local_dirname(env_id))
-            if managed:
-                ensure_environment_pull_destination_available(out, overwrite=args.force)
-                package = client_from_config().download_env_package(env_id)
-                pull_environment_package_from_archive(package, out, overwrite=args.force)
-            else:
-                pull_environment_package(env_id, out, overwrite=args.force)
+            ensure_environment_pull_destination_available(out, overwrite=args.force)
+            package = client_from_config().download_env_package(env_id)
+            pull_environment_package_from_archive(package, out, overwrite=args.force)
             if render.styled():
                 print(render.env_pulled(f"{out}/", env_id))
             else:
@@ -146,12 +134,6 @@ def cmd_env_pull(args) -> int:
         return 1
     except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
         print(f"env pull failed: {exc}", file=sys.stderr)
-        if "GitHub environment request failed" in str(exc) and not os.environ.get("GITHUB_TOKEN"):
-            print(
-                "hint: private/internal environments need a GitHub token; set GITHUB_TOKEN "
-                "(e.g. `export GITHUB_TOKEN=$(gh auth token)`).",
-                file=sys.stderr,
-            )
         return 1
 
 
