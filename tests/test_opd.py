@@ -153,6 +153,26 @@ def test_student_tokens_share_span_for_split_multibyte_char():
     assert (toks[2].start, toks[2].end) == (1, 2)
 
 
+def test_student_tokens_do_not_over_merge_a_genuine_replacement_char():
+    """Regression (cursor[bot], opd.py:120-126): the U+FFFD merge heuristic must NOT fire when a token
+    LEGITIMATELY decodes to the replacement glyph (the model actually emitted U+FFFD as content). Such
+    a token is already reflected in completion_text, so decode(prefix) is a prefix of it — the loop
+    must stop and keep it as its own span instead of swallowing the following token."""
+    from flash.engine.worker.opd import student_tokens_with_offsets
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            m = {20: "�", 21: "y"}  # id 20 IS a genuine U+FFFD content token
+            return "".join(m[int(x)] for x in ids)
+
+    # completion "�y": the genuine replacement char (id 20) and 'y' (id 21) are SEPARATE tokens.
+    ids, toks = student_tokens_with_offsets(_Tok(), [20, 21], "�y")
+    assert ids == [20, 21]
+    # not over-merged: distinct spans (the buggy heuristic gave both [0, 2)).
+    assert (toks[0].start, toks[0].end) == (0, 1)
+    assert (toks[1].start, toks[1].end) == (1, 2)
+
+
 def test_trim_trailing_stop_drops_delimiter_from_ids_and_text():
     from flash.engine.worker.opd import _trim_trailing_stop
 

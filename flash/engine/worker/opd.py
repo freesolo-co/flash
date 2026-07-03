@@ -116,11 +116,16 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     i = 0
     while i < len(ids):
         j = i
-        # Extend over consecutive byte-ids whose combined decode is still mid-multi-byte-char
-        # (trailing U+FFFD): they only form a real char together, so they must share one span.
-        while j + 1 < len(ids) and tok.decode(ids[: j + 1], skip_special_tokens=True).endswith(
-            "\ufffd"
-        ):
+        # Extend over consecutive byte-ids whose combined decode is still mid-multi-byte-char: a
+        # byte-level tokenizer renders an INCOMPLETE char as a trailing U+FFFD that is NOT yet present
+        # in completion_text (which already holds the fully-decoded chars), so the bytes only form a
+        # real char once the next id arrives. A token that LEGITIMATELY decodes to U+FFFD (the model
+        # actually emitted the replacement glyph) is already reflected in completion_text -- decode(...)
+        # is a prefix of it -- so we must NOT over-merge the following token into this span (cursor[bot]).
+        while j + 1 < len(ids):
+            dec = tok.decode(ids[: j + 1], skip_special_tokens=True)
+            if not dec.endswith("\ufffd") or completion_text.startswith(dec):
+                break
             j += 1
         end = min(n, max(prev, len(tok.decode(ids[: j + 1], skip_special_tokens=True))))
         toks.extend(StudentToken(token_id=ids[k], start=prev, end=end) for k in range(i, j + 1))
