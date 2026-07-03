@@ -1808,6 +1808,70 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     assert runner.get_status("unconf-1").state != "failed", "deferred, not failed (later restart retries)"
 
 
+def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypatch, tmp_path):
+    # Codex: a run still `queued` never reached lifecycle's `provisioning` transition, so no provider
+    # create (Vast's non-idempotent PUT /asks) was ever attempted and no phantom can exist. The phantom
+    # guard (_confirm_run_clear) must be SKIPPED for it — otherwise a purely-queued run whose VAST_API_KEY
+    # was dropped after submit fails closed on the unenumerable recorded Vast and defers forever. This is
+    # identical to test_recover_runs_defers_when_recorded_provider_unconfigurable EXCEPT the state is
+    # `queued` (never created) instead of `provisioning` (could have created) -> resubmit, not defer.
+    import threading
+
+    import flash.runner as runner
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+
+    spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "queued-1",
+    }
+    runner._save_status(
+        runner.RunStatus(
+            run_id="queued-1",
+            state="queued",  # never provisioned -> no create attempted -> no phantom possible
+            spec=spec,
+            remote=None,
+            submitted_instance_providers=["vast"],  # Vast configured at submit, creds now gone
+        )
+    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "queued-1"}])
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+
+    resubmitted = []
+    done = threading.Event()
+
+    def fake_run_job(s):
+        resubmitted.append(s.run_id)
+        done.set()
+
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
+
+    import flash.providers as providers_mod
+    import flash.server._runtime as rt
+
+    # Vast unconfigurable now: the OLD unconditional guard would fail closed here and defer forever. A
+    # queued run must resubmit anyway, because it provably never created the phantom the guard protects
+    # against. _confirm_run_clear must not even be consulted (Vast enumeration would raise/defer).
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+    monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_MAX_RETRIES", 0)
+
+    app_mod.recover_runs()
+
+    assert done.wait(timeout=5), "queued run must launch a resubmit thread, not defer on a phantom check"
+    assert resubmitted == ["queued-1"], "a never-provisioned queued run resubmits despite unconfigurable Vast"
+    assert runner.get_status("queued-1").state != "failed"
+
+
 def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch, tmp_path):
     # The fail-closed must stay SCOPED: a handle-less run on a plane that never configured Vast records
     # no Vast in submitted_instance_providers, so it can't have left a Vast phantom and must still

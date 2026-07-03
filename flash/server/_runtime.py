@@ -330,7 +330,7 @@ def recover_runs() -> None:
     known: set[str] = set()
     # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
     # attempt is reaped without racing the resubmit's fresh allocation.
-    resubmit: list[JobSpec] = []
+    resubmit: list[tuple[JobSpec, str]] = []
     for row in db.all_runs():
         known.add(row["run_id"])
         try:
@@ -402,7 +402,7 @@ def recover_runs() -> None:
                 with contextlib.suppress(Exception):
                     _append_run_log(status.run_id, detail)
                 continue
-            resubmit.append(spec)
+            resubmit.append((spec, status.state))
     # Reap orphaned per-run provider resources; each provider sweeps its own.
     from flash.providers import configured_providers
 
@@ -410,7 +410,7 @@ def recover_runs() -> None:
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active, known_labels=known)
 
-    for spec in resubmit:
+    for spec, prior_state in resubmit:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
         # create (Vast's PUT /asks) may have been accepted while the response/handle was lost — a
@@ -419,7 +419,13 @@ def recover_runs() -> None:
         # run's label across the instance providers RIGHT BEFORE relaunching and verifies nothing for the
         # run remains, so a phantom that surfaced in the sweep->resubmit gap (Vast's instance list is
         # eventually consistent) can't get a SECOND worker writing the same seed-scoped artifacts.
-        if _confirm_run_clear(spec):
+        # A run still `queued` never reached that window: the runner enqueues as `queued` and lifecycle's
+        # `_update(..., "provisioning")` fires BEFORE any `provider.submit_run`, and nothing regresses
+        # `provisioning`->`queued`, so a `queued` run made no create and can't have left a phantom. Skip
+        # the guard for it — else a purely-queued run whose VAST_API_KEY was dropped after submit would
+        # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
+        # still runs for `provisioning`/`running`, the states that could have attempted a create.
+        if prior_state == "queued" or _confirm_run_clear(spec):
             _start_resubmit(spec)
             continue
         # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer, and
