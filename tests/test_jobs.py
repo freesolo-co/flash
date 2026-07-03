@@ -342,6 +342,35 @@ def test_worker_flagged_retriable_gates_stale_prior_attempt_heartbeat():
     # No retriable flag -> False regardless of gating.
     no_flag = {"ts": 10_500.0, "attempt": 1}
     assert worker_flagged_retriable(reader(no_flag), launch_ts=10_000.0, current_attempt=1) is False
+    # Codex clock-skew: a lagging worker host stamps a THIS-attempt heartbeat with a ts BEFORE launch.
+    # The explicit attempt match proves provenance -> the retriable flag is still honored; a ts-only
+    # staleness check would wrongly discard it and misclassify a same-attempt infra loss as job_failed.
+    clock_skew_match = {"stage": "rl_step", "step": 5, "ts": 9_000.0, "attempt": 1, "retriable": True}
+    assert worker_flagged_retriable(reader(clock_skew_match), launch_ts=10_000.0, current_attempt=1) is True
+
+
+def test_heartbeat_is_stale_prior_attempt_trusts_explicit_attempt_over_clock():
+    """Sibling of worker_flagged_retriable's gating: the explicit attempt field is definitive provenance.
+    A MATCHING attempt is THIS attempt (never stale) even when a lagging worker-host clock puts ts before
+    launch; a MISMATCH is a prior attempt; only with no attempt present do we date by ts."""
+    from flash.providers.runpod.jobs import heartbeat_is_stale_prior_attempt
+
+    def reader(hb):
+        return lambda force=False: hb
+
+    # Matching attempt but clock-skewed ts (before launch) -> NOT stale (the fix: trust the attempt).
+    skew_match = {"stage": "rl_step", "ts": 9_000.0, "attempt": 1}
+    assert heartbeat_is_stale_prior_attempt(reader(skew_match), launch_ts=10_000.0, current_attempt=1) is False
+    # A different attempt (even with a fresh, post-launch ts) -> stale prior.
+    late_prior = {"stage": "rl_step", "ts": 10_500.0, "attempt": 0}
+    assert heartbeat_is_stale_prior_attempt(reader(late_prior), launch_ts=10_000.0, current_attempt=1) is True
+    # No attempt field -> date by ts: predates launch is stale, after launch is current.
+    stale_no_attempt = {"stage": "rl_step", "ts": 9_000.0}
+    assert heartbeat_is_stale_prior_attempt(reader(stale_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
+    fresh_no_attempt = {"stage": "rl_step", "ts": 10_500.0}
+    assert heartbeat_is_stale_prior_attempt(reader(fresh_no_attempt), launch_ts=10_000.0, current_attempt=1) is False
+    # Ungated (missing launch/attempt) -> conservative: never called stale.
+    assert heartbeat_is_stale_prior_attempt(reader(stale_no_attempt)) is False
 
 
 def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):

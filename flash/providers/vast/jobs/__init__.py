@@ -548,8 +548,20 @@ def poll_vast_job(
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             # A recovered run can blow a launch-anchored deadline on the first reattach tick (the outage
-            # lasted past max_wall+grace).
-            return stalled_unless_terminal("client-side deadline exceeded")
+            # lasted past max_wall+grace). The worker may also have just finished / self-destructed AT the
+            # wall cap with its DONE/marker not yet visible on HF (read-after-write lag), so do the BOUNDED
+            # terminal-artifact wait (not a single read) before declaring stalled — else the retry re-rents
+            # a GPU for the same seed while the completed attempt's artifacts surface moments later.
+            terminal = _read_with_retries(
+                terminal_artifact_result,
+                tries=_TERMINAL_AFTER_DEAD_RETRIES,
+                wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+                say=say,
+                message="deadline reached; waiting for HF to expose any terminal DONE/marker before giving up",
+            )
+            if terminal is not None:
+                return terminal
+            return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
         try:
             inst = vast_api.get_instance(handle.instance_id)
             poll_errors.reset()
@@ -564,6 +576,13 @@ def poll_vast_job(
             # transients, so these escape get_instance raw. Treat them like any transient poll error:
             # count against the budget and keep polling (else a read blip looks like a gone instance).
             if poll_errors.record(e):
+                # The status endpoint is down, but the worker may have COMPLETED during the outage and
+                # written its terminal DONE/marker to HF (a different endpoint). Force-read them before
+                # giving up: poll_error tears the box down and the retry can otherwise relaunch a second
+                # worker for an attempt that already finished (duplicate work + double-bill).
+                terminal = terminal_artifact_result()
+                if terminal is not None:
+                    return terminal
                 return PollResult(False, failure="poll_error", detail=str(e))
             continue
         # The instance-detail route transiently answers {"instances": null} for healthy (and brand-new)

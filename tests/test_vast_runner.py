@@ -505,6 +505,54 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
     assert res.failure == "poll_error"  # decode failure caught as a poll error, not escaped raw
 
 
+def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
+    """Codex: when the Vast status endpoint keeps raising and the poll-error budget is spent, the poller
+    force-reads the worker's terminal DONE/marker BEFORE returning poll_error. A worker that COMPLETED
+    during the outage (DONE on HF, a different endpoint) is finished, not abandoned to a duplicate retry
+    that re-rents a GPU for an attempt that already succeeded."""
+    from flash.providers import _poll
+    from flash.providers.vast import api as vast_api
+
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done="10500.0",  # worker wrote DONE during the status-API outage
+        metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
+    )
+    monkeypatch.setattr(_poll.time, "sleep", lambda s: None)  # PollErrorTracker.record backoff
+
+    def always_raise(instance_id):
+        raise vast_api.VastApiError("status endpoint 503 (simulated outage)")
+
+    monkeypatch.setattr(vast_api, "get_instance", always_raise)
+    res = vast.poll_vast_job(_handle(started_ts=10_000.0), _spec(), seed=0, interval_s=0)
+    assert res.ok  # finished from the terminal DONE, not a poll_error abandonment
+    assert res.metrics["train_tokens"] == 4096
+
+
+def test_poll_deadline_waits_for_late_terminal_artifacts(monkeypatch):
+    """Codex: at the launch-relative deadline the worker may have just finished / self-destructed at the
+    wall cap with DONE not yet visible on HF (read-after-write lag). The deadline path does a BOUNDED
+    terminal-artifact wait, so a DONE that surfaces a moment later finishes the run instead of a false
+    'stalled' that re-rents a GPU for the same seed."""
+    done_seq = {"n": 0}
+
+    def late_done():
+        done_seq["n"] += 1
+        return None if done_seq["n"] <= 2 else "10500.0"  # invisible on the first reads, then surfaces
+
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done=late_done,
+        metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
+    )
+    # deadline (1s) fires on the first tick (elapsed 1000s); the bounded wait then catches the late DONE.
+    res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0, deadline_s=1.0)
+    assert res.ok  # finished from the just-surfaced DONE, not a false 'stalled'
+    assert res.metrics["train_tokens"] == 4096
+
+
 def test_poll_stale_done_is_ignored(monkeypatch):
     """A DONE from a PRIOR attempt (ts < this launch - skew) is not this attempt's completion; the
     instance later dies as a host loss -> job_preempted, NOT a false success."""

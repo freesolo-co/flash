@@ -822,9 +822,14 @@ def worker_flagged_retriable(
         return True  # ungated: caller can't date the heartbeat -> preserve prior behavior
     hb_attempt = _attempt_int(hb.get("attempt"))
     cur_attempt = _attempt_int(current_attempt)
-    if hb_attempt is not None and cur_attempt is not None and hb_attempt != cur_attempt:
-        return False
+    if hb_attempt is not None and cur_attempt is not None:
+        # Explicit attempt is definitive provenance: honor/deny by it ALONE. A MATCH proves the heartbeat
+        # belongs to THIS launch, so a lagging worker-host clock (ts < launch_ts) must NOT discard its
+        # retriable flag; a MISMATCH is a prior attempt whose flag doesn't apply here.
+        return hb_attempt == cur_attempt
     if launch_ts:
+        # No explicit attempt to disambiguate -> date by ts: a heartbeat written before this attempt's
+        # launch is a leftover prior attempt, so its retriable flag doesn't count for us.
         try:
             ts = float(hb.get("ts"))
         except (TypeError, ValueError):
@@ -857,14 +862,16 @@ def heartbeat_is_stale_prior_attempt(
     hb = heartbeat_reader(force=True)
     if not isinstance(hb, dict) or launch_ts is None or current_attempt is None:
         return False
-    # (1) An explicit attempt number that differs is definitive: a heartbeat from a DIFFERENT attempt.
+    # (1) Explicit attempt is definitive provenance: a MISMATCH is a heartbeat from a DIFFERENT attempt
+    # (stale prior); a MATCH is THIS attempt and is never stale, even if a lagging worker-host clock puts
+    # its ts before launch. Decide by attempt alone when both sides carry one.
     hb_attempt = _attempt_int(hb.get("attempt"))
     cur_attempt = _attempt_int(current_attempt)
-    if hb_attempt is not None and cur_attempt is not None and hb_attempt != cur_attempt:
-        return True
-    # (2) A parseable ts that predates THIS attempt's launch was written before we booted -> leftover.
-    # Truthy ``launch_ts`` only: 0.0 means "unknown launch" (instance handles coerce a missing
-    # started_ts to 0.0), and we cannot date a heartbeat against an unknown launch.
+    if hb_attempt is not None and cur_attempt is not None:
+        return hb_attempt != cur_attempt
+    # (2) No explicit attempt -> date by ts: a parseable ts that predates THIS attempt's launch was
+    # written before we booted -> leftover. Truthy ``launch_ts`` only: 0.0 means "unknown launch"
+    # (instance handles coerce a missing started_ts to 0.0), and we cannot date against an unknown launch.
     if launch_ts:
         try:
             ts = float(hb.get("ts"))
