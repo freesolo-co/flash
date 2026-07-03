@@ -91,7 +91,7 @@ def pick_gpu(
     if (provider or "").strip().lower() == "vast":
         from flash.providers.vast.pricing import live_offer_rates
 
-        live = live_offer_rates(max_wall_seconds=max_wall_seconds)
+        live = live_offer_rates(max_wall_seconds=max_wall_seconds, min_vram_gb=required_vram_gb)
         rentable = [g for g in candidates if g.name in live] if live else []
         if rentable:
             candidates = rentable

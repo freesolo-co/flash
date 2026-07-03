@@ -51,17 +51,24 @@ def live_candidate_rates(
     return rates
 
 
-def _fetch_offer_rates(max_wall_seconds: float) -> dict[str, float]:
+def _fetch_offer_rates(max_wall_seconds: float, min_vram_gb: int = 0) -> dict[str, float]:
     """Friendly-name -> cheapest LIVE $/hr for the managed classes with a usable offer (NO static
-    merge). Raises on fetch failure; assumes ``VAST_API_KEY`` is set (callers gate on it)."""
+    merge). Raises on fetch failure; assumes ``VAST_API_KEY`` is set (callers gate on it).
+
+    ``min_vram_gb`` (>0) raises the market-search floor to the caller's required VRAM. The page is
+    price-sorted and LIMITED, so flooring a high-VRAM job at the smallest managed class lets cheap
+    small-card offers fill the page and crowd the big classes off it — omitting exactly the classes that
+    job needs. Flooring at the required VRAM (parity with the launch allocator, which searches at the
+    smallest FITTING class) keeps them on the page. Defaults to the smallest managed class.
+    """
     from flash.providers.base import GPU_INFO
 
     # Floor the market query at the smallest managed class's VRAM, not 0: min_vram_gb=0 returns the
     # cheapest offers across ALL sizes, so a flood of tiny unmanaged low-VRAM cards fills the price-sorted
     # page and crowds managed classes off it. No managed class is smaller than the floor, so none is
-    # excluded; 0 if nothing is managed.
+    # excluded; 0 if nothing is managed. A caller-supplied ``min_vram_gb`` raises it further.
     vram_floor = int(min((i.vram_gb for i in GPU_INFO.values() if i.vast_name), default=0))
-    return live_candidate_rates(vram_floor, max_wall_seconds=max_wall_seconds)
+    return live_candidate_rates(max(vram_floor, int(min_vram_gb)), max_wall_seconds=max_wall_seconds)
 
 
 def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str, float]:
@@ -97,7 +104,7 @@ def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str
     return merged
 
 
-def live_offer_rates(max_wall_seconds: float = 0.0) -> dict[str, float]:
+def live_offer_rates(max_wall_seconds: float = 0.0, min_vram_gb: int = 0) -> dict[str, float]:
     """Friendly-name -> cheapest live $/hr for ONLY classes with a rentable offer (NO static merge);
     ``{}`` offline / without ``VAST_API_KEY`` / on any fetch failure.
 
@@ -105,11 +112,14 @@ def live_offer_rates(max_wall_seconds: float = 0.0) -> dict[str, float]:
     returns just the classes a launch could ACTUALLY rent under the wall cap. GPU selection uses it so a
     cheaper class with no surviving offer isn't chosen — and quoted — on its static (RunPod) rate. Never
     cached: selection always reflects the current market.
+
+    ``min_vram_gb`` floors the market search at the job's required VRAM so a high-VRAM selection isn't
+    crowded off the price-sorted page by cheaper small-card offers (parity with the launch allocator).
     """
     if not os.environ.get("VAST_API_KEY"):
         return {}
     try:
-        return _fetch_offer_rates(max_wall_seconds)
+        return _fetch_offer_rates(max_wall_seconds, min_vram_gb=min_vram_gb)
     except Exception as exc:
         logger.warning("live vast offer rates unavailable (%s)", exc)
         return {}

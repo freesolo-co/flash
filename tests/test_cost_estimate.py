@@ -164,6 +164,29 @@ def test_pick_gpu_vast_skips_classes_without_a_live_offer(monkeypatch):
     assert gpu == "A100 SXM"  # the only class with a rentable offer, NOT the cheaper-static 4090
 
 
+def test_pick_gpu_vast_floors_market_search_at_required_vram(monkeypatch):
+    # Codex: the live Vast offer map for a HIGH-VRAM job must be searched at the job's required VRAM, not
+    # the smallest managed class. The market page is price-sorted + LIMITED, so a small-class floor lets
+    # cheap 24-40 GB offers crowd the 80 GB classes off it -> they'd be omitted and the quote would fall
+    # back to static pricing. pick_gpu must thread required_vram_gb into the search floor (allocator parity).
+    from types import SimpleNamespace
+
+    from flash.cost.facts import pick_gpu
+    from flash.providers.vast import jobs as vast
+
+    seen = {}
+
+    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
+        seen["floor"] = min_vram_gb
+        return [SimpleNamespace(gpu="A100 SXM", dph_total=1.20)]
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    pick_gpu(80, provider="vast", max_wall_seconds=7200.0)
+    # Old behavior floored at the smallest managed class (~24 GB); the fix floors at the required 80 GB.
+    assert seen["floor"] == 80
+
+
 def test_a100_sxm_40gb_has_real_tflops_not_default():
     # Codex: the 40 GB A100 SXM4 class (selectable for Lambda/Vast) must carry a real TFLOPS entry, or
     # gpu_tflops() falls to the 100-default and inflates its seconds_per_step / quoted cost ~3x. It has
