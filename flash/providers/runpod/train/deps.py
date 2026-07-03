@@ -36,7 +36,6 @@ WORKER_DEPS = [
     "accelerate>=1.4",
     # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
     "wandb>=0.17",
-    "liger-kernel>=0.5",
     # fla from git: PyPI wheel is a broken stub missing fla.modules. SHA-pinned for reproducibility;
     # keep in lockstep with Dockerfile.worker. fla kept on ALL arches — worker ensures tilelang
     # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper).
@@ -66,7 +65,7 @@ def _append_tag_suffix(image: str, suffix: str) -> str:
     slash = image.rfind("/")
     colon = image.rfind(":")
     if colon > slash:
-        return f"{image[:colon]}:{image[colon + 1:]}-{suffix}"
+        return f"{image[:colon]}:{image[colon + 1 :]}-{suffix}"
     return f"{image}-{suffix}"
 
 
@@ -105,7 +104,10 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
     return eff
 
 
-DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.1.0,<0.2.0"
+# Chalk latest main as of this change: freesolo-chalk 0.4.12.
+# Pin the exact commit so worker installs cannot lag behind the merged kernel surface.
+LATEST_CHALK_MAIN_SHA = "ad1a9345fdfe175b7916e344fd8fb23ba89c89c0"
+DEFAULT_CHALK_SPEC = f"git+https://github.com/freesolo-co/chalk.git@{LATEST_CHALK_MAIN_SHA}"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
