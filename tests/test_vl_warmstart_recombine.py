@@ -153,20 +153,23 @@ def test_recombine_normalizes_language_model_infix(tmp_path):
 
 
 def test_recombined_rank_preflight_allows_sum_at_serving_cap(tmp_path):
+    # 4B serving cap is now 64: SFT rank 48 + GRPO rank 16 = 64 lands exactly at the cap and is allowed.
     sft = str(tmp_path / "sft")
-    _write_adapter(sft, modules=MODULES, r=16, alpha=32, seed=1)
+    _write_adapter(sft, modules=MODULES, r=48, alpha=96, seed=1)
     max_rank = serving_lora_rank_cap("Qwen/Qwen3.5-4B")
 
-    assert validate_recombined_lora_rank(sft, 16, max_rank=max_rank) == (16, 16, max_rank)
+    assert max_rank == 64
+    assert validate_recombined_lora_rank(sft, 16, max_rank=max_rank) == (48, 16, max_rank)
 
 
-def test_recombined_rank_preflight_allows_model_specific_rank64_cap(tmp_path):
+def test_recombined_rank_preflight_allows_model_specific_rank128_cap(tmp_path):
+    # The small dense tiers (Qwen3.5-2B) now serve a rank-128 cap: SFT 64 + GRPO 64 = 128 is allowed.
     sft = str(tmp_path / "sft")
-    _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
+    _write_adapter(sft, modules=MODULES, r=64, alpha=128, seed=1)
     max_rank = serving_lora_rank_cap("Qwen/Qwen3.5-2B")
 
-    assert max_rank == 64
-    assert validate_recombined_lora_rank(sft, 32, max_rank=max_rank) == (32, 32, 64)
+    assert max_rank == 128
+    assert validate_recombined_lora_rank(sft, 64, max_rank=max_rank) == (64, 64, 128)
 
 
 def test_recombined_rank_preflight_does_not_apply_rank32_fallback_without_serving_cap(tmp_path):
@@ -178,8 +181,9 @@ def test_recombined_rank_preflight_does_not_apply_rank32_fallback_without_servin
 
 
 def test_recombined_rank_preflight_rejects_undeployable_sum(tmp_path):
+    # 4B cap is 64: SFT rank 56 + GRPO rank 16 = 72 > 64, so it is rejected (allowed GRPO = 64 - 56 = 8).
     sft = str(tmp_path / "sft")
-    _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
+    _write_adapter(sft, modules=MODULES, r=56, alpha=112, seed=1)
     max_rank = serving_lora_rank_cap("Qwen/Qwen3.5-4B")
 
     with pytest.raises(ValueError, match=r"set GRPO train\.lora_rank <= 8"):
@@ -187,27 +191,29 @@ def test_recombined_rank_preflight_rejects_undeployable_sum(tmp_path):
 
 
 def test_recombine_rejects_rank_above_serving_cap(tmp_path):
+    # 4B cap is now 64: SFT rank 56 + GRPO rank 16 = 72 > 64 is rejected by the recombine.
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
-    _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
+    _write_adapter(sft, modules=MODULES, r=56, alpha=112, seed=1)
     _write_adapter(grpo, modules=MODULES, r=16, alpha=32, seed=2)
     _set_base(sft, "Qwen/Qwen3.5-4B")
 
-    with pytest.raises(ValueError, match=r"rank-stacked SFT\+GRPO adapter would be rank 40"):
+    with pytest.raises(ValueError, match=r"rank-stacked SFT\+GRPO adapter would be rank 72"):
         recombine_lora_adapters(sft, grpo, out)
 
 
-def test_recombine_allows_rank64_for_model_with_serving_cap64(tmp_path):
+def test_recombine_allows_rank128_for_model_with_serving_cap128(tmp_path):
+    # Small dense tiers (Qwen3.5-2B) now serve a rank-128 cap: SFT 64 + GRPO 64 = 128 recombines cleanly.
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
-    _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=32, alpha=64, seed=2)
+    _write_adapter(sft, modules=MODULES, r=64, alpha=128, seed=1)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=64, alpha=128, seed=2)
     _set_base(sft, "Qwen/Qwen3.5-2B")
 
-    assert recombine_lora_adapters(sft, grpo, out) == 64
-    assert _read_cfg(out)["r"] == 64
+    assert recombine_lora_adapters(sft, grpo, out) == 128
+    assert _read_cfg(out)["r"] == 128
 
 
 def test_init_adapter_model_preflights_vl_recombined_rank_before_model_load(tmp_path, monkeypatch):
