@@ -67,14 +67,15 @@ def test_deploy_9b_dry_run_is_not_rejected():
 def test_deploy_rejects_lora_rank_above_serving_cap():
     from flash.serve.deploy import deploy_adapter
 
-    with pytest.raises(ValueError, match="max_lora_rank=32"):
+    # Qwen3.5-4B serving cap is now max_lora_rank=64 (doubled from 32); a rank-65 adapter exceeds it.
+    with pytest.raises(ValueError, match="max_lora_rank=64"):
         deploy_adapter(
-            run_id="r33",
+            run_id="r65",
             model="Qwen/Qwen3.5-4B",
             hf_repo="org/repo",
-            adapter_prefix="sft/r33/seed0",
+            adapter_prefix="sft/r65/seed0",
             dry_run=True,
-            lora_rank=33,
+            lora_rank=65,
         )
 
 
@@ -82,9 +83,11 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
     """Deploy validates the effective artifact rank, not only spec.train.lora_rank."""
     from flash.serve.deploy import deploy_adapter
 
-    seen = _stub_adapter_config(monkeypatch, tmp_path, rank=33)
+    # 4B serving cap is now 64; the artifact's effective rank 65 exceeds it even though spec
+    # lora_rank (32) fits — deploy must catch the artifact rank, not just the spec rank.
+    seen = _stub_adapter_config(monkeypatch, tmp_path, rank=65)
 
-    with pytest.raises(ValueError, match="adapter artifact has rank 33"):
+    with pytest.raises(ValueError, match="adapter artifact has rank 65"):
         deploy_adapter(
             run_id="r-recombined",
             model="Qwen/Qwen3.5-4B",
