@@ -232,6 +232,20 @@ def get_gpu_info(name: str) -> GpuClass:
     return _GPU_INFO_ALL[canonical_gpu(name)]
 
 
+def gpu_classes_for(identity_attr: str) -> list[GpuClass]:
+    """Managed GPU classes a provider can provision: those whose per-provider identity field is set
+    (``enum_member`` for RunPod, ``lambda_name`` for Lambda, ``vast_name`` for Vast). One catalog query
+    shared by every provider's ``gpu_classes()`` so the "which classes do I offer" rule can't drift."""
+    return [g for g in GPU_INFO.values() if getattr(g, identity_attr)]
+
+
+def static_rates_for(identity_attr: str) -> dict[str, float]:
+    """Friendly GPU name -> static ``GpuClass.hourly_usd`` for the classes a provider offers (keyed by
+    the same per-provider identity field). The offline/fallback rate snapshot for RunPod and Vast;
+    Lambda keeps its own list-price map because its prices differ from this RunPod-snapshot field."""
+    return {name: info.hourly_usd for name, info in GPU_INFO.items() if getattr(info, identity_attr)}
+
+
 # Slack between a board's REPORTED VRAM and its class nominal (boards under-report: an A100 SXM4 40 GB
 # reports ~40960 MB, an A40 ~46068 MB / 48 GB). vast_gpu_for_offer allows a class whose nominal is at
 # most this far ABOVE the offer's reported RAM, so a real board still matches its class.

@@ -13,6 +13,6 @@ __all__ = ["gpu_classes"]
 
 def gpu_classes() -> list[GpuClass]:
     """The GPU classes Vast can provision (those with a ``vast_name``)."""
-    from flash.providers.base import GPU_INFO
+    from flash.providers.base import gpu_classes_for
 
-    return [g for g in GPU_INFO.values() if g.vast_name]
+    return gpu_classes_for("vast_name")
