@@ -337,7 +337,21 @@ def estimate_vram_gb(
         # are SINGLE-sequence — NOT sft_per_device(batch_size). The batch-size activation term
         # over-budgeted opd and bumped the GPU tier unnecessarily (reported by codex[bot]).
         activations = _ACT_COEF * (seq_len / 1024.0) * width
-        logits = (seq_len * 2 + completion * 4) * vocab / 1e9
+        # Dense-logit peak spans BOTH the forward and the loss BACKWARD (gkd_loss has no fused CE):
+        #   - forward:  bf16 full-sequence logits [seq, vocab]        (seq * 2)
+        #               fp32 completion rows [completion, vocab] for logsumexp, saved for backward
+        #                                                             (completion * 4)
+        #   - backward: fp32 gradient of those completion rows [completion, vocab]
+        #                                                             (completion * 4)
+        #               bf16 gradient scattered back into the full logits [seq, vocab] to reach lm_head
+        #                                                             (seq * 2)
+        # All four coexist at the backward peak. The old formula counted only the two FORWARD buffers,
+        # so a long-completion / large-vocab (248k) opd job under-budgeted the loss backward by
+        # ~(completion*4 + seq*2)*vocab bytes and could route to a GPU that OOMs in gkd_loss.backward
+        # (codex[bot]). Mirror the SFT dense-logit sizing by budgeting the backward buffers too.
+        logits_fwd = (seq_len * 2 + completion * 4) * vocab
+        logits_bwd = (seq_len * 2 + completion * 4) * vocab
+        logits = (logits_fwd + logits_bwd) / 1e9
         return base + activations + logits
     fused = sft_logits_fused(params_b, seq_len) if sft_fused_ce is None else bool(sft_fused_ce)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)

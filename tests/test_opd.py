@@ -1368,8 +1368,30 @@ def test_opd_vram_reserves_dense_logits_unlike_fused_sft():
 
     kw = {"seq_len": 9216, "max_tokens": 8192, "vocab": 248_320, "lora_rank": 16}
     sft = estimate_vram_gb(4.0, "sft", "bf16", **kw)  # >=3B fuses CE -> 0 logits budgeted
-    opd = estimate_vram_gb(4.0, "opd", "bf16", **kw)  # dense logits reserved
-    assert opd > sft + 10  # ~12.7 GB of dense logits for opd vs 0 for fused SFT
+    opd = estimate_vram_gb(4.0, "opd", "bf16", **kw)  # dense logits reserved (fwd + bwd)
+    assert opd > sft + 10  # dense logits for opd vs 0 for fused SFT
+
+
+def test_opd_vram_budgets_dense_logit_backward_buffers():
+    """Regression (codex[bot], vram.py): gkd_loss has no fused CE and, at the loss BACKWARD peak, holds
+    the fp32 completion rows + their fp32 gradient AND the bf16 full-sequence logits + their bf16
+    gradient. The estimate must budget the backward buffers too, not only the two forward ones — else a
+    long-completion / large-vocab (248k) opd job under-budgets gkd_loss.backward and routes to a GPU
+    that OOMs. Isolate the logit term via a vocab delta (base + activations are vocab-independent): it
+    must equal the FORWARD+BACKWARD size, i.e. 2x the forward-only (seq*2 + completion*4)*vocab."""
+    from flash.engine.vram import estimate_vram_gb
+
+    seq, comp = 9216, 8192
+    kw = {"seq_len": seq, "max_tokens": comp, "lora_rank": 16}
+    v1, v2 = 100_000, 248_320
+    delta = estimate_vram_gb(4.0, "opd", "bf16", vocab=v2, **kw) - estimate_vram_gb(
+        4.0, "opd", "bf16", vocab=v1, **kw
+    )
+    forward_only = (seq * 2 + comp * 4) * (v2 - v1) / 1e9  # what the old fwd-only formula would grow by
+    assert delta == pytest.approx(2 * forward_only, rel=1e-9), (
+        "opd dense-logit budget must include the backward buffers (2x the forward-only reservation); "
+        f"got delta={delta} GB, forward-only would be {forward_only} GB"
+    )
 
 
 def test_opd_vram_thinking_completion_default_not_underbudgeted():
@@ -1514,23 +1536,77 @@ def test_teacher_score_treats_mismatched_array_lengths_as_permanent(monkeypatch)
     fails with "no trained step". A length mismatch is a broken contract -> PERMANENT (abort now)."""
     from flash.engine.worker.teacher import TeacherError
 
-    payload = {
+    def _payload(tokens, logprobs, offsets):
+        return {
+            "choices": [
+                {"logprobs": {"tokens": tokens, "token_logprobs": logprobs, "text_offset": offsets}}
+            ]
+        }
+
+    # Both directions of length disagreement are a broken contract and must abort PERMANENTLY:
+    #  - logprobs SHORTER than tokens -> the per-token loop IndexErrors.
+    #  - logprobs/offsets LONGER than tokens -> n=len(tokens) silently ignores the tail AND the last
+    #    token (i==n-1) takes end=len(full), reinterpreting a mid-string token as spanning the whole
+    #    completion and training on the wrong logprob (codex[bot]). `!=` (not `< n`) catches both.
+    cases = [
+        (["a", "b", "c"], [0.0, -1.0], [0, 1, 2]),  # 2 logprobs < 3 tokens
+        (["a", "b"], [0.0, -1.0, -2.0], [0, 1]),  # 3 logprobs > 2 tokens (tail ignored)
+        (["a", "b"], [0.0, -1.0], [0, 1, 2]),  # 3 offsets > 2 tokens
+    ]
+    for tokens, logprobs, offsets in cases:
+        _mock_urlopen(monkeypatch, _payload(tokens, logprobs, offsets))
+        client = TeacherClient("k", "https://api.example/v1", "glm")
+        with pytest.raises(TeacherError) as ei:
+            client.score("", "".join(tokens))
+        assert ei.value.permanent is True, f"{(tokens, logprobs, offsets)} must be PERMANENT"
+        assert "length" in str(ei.value).lower()
+
+
+def test_teacher_score_rejects_null_logprob_on_completion_token_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): a null (None) realized logprob is legitimate ONLY for
+    unscored PROMPT context. A None on a token that overlaps the COMPLETION (the ones score() keeps)
+    means the teacher did not score it; coercing it to 0.0 (log-prob 1.0 == full confidence) would
+    train the gkd loss on fabricated teacher confidence, so it must abort like the other contract
+    violations. A prompt-context null (dropped anyway) must NOT trip it."""
+    from flash.engine.worker.teacher import TeacherError
+
+    # prompt "P" (plen=1) + completion "hi". Token "hi" spans [1,3) (end>plen -> KEPT) with a null
+    # logprob -> reject as permanent.
+    bad = {
         "choices": [
             {
                 "logprobs": {
-                    "tokens": ["a", "b", "c"],  # 3 tokens ...
-                    "token_logprobs": [0.0, -1.0],  # ... but only 2 logprobs (malformed)
-                    "text_offset": [0, 1, 2],
+                    "tokens": ["P", "hi"],
+                    "token_logprobs": [0.0, None],  # completion token "hi" unscored -> abort
+                    "text_offset": [0, 1],
                 }
             }
         ]
     }
-    _mock_urlopen(monkeypatch, payload)
+    _mock_urlopen(monkeypatch, bad)
     client = TeacherClient("k", "https://api.example/v1", "glm")
     with pytest.raises(TeacherError) as ei:
-        client.score("", "abc")
+        client.score("P", "hi")
     assert ei.value.permanent is True
-    assert "length" in str(ei.value).lower()
+    assert "null" in str(ei.value).lower()
+
+    # A PROMPT-context null (token entirely in the prompt, end<=plen) is fine: it's dropped, not kept.
+    ok = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", "hi"],
+                    "token_logprobs": [None, -0.5],  # prompt token "P" null (dropped); "hi" scored
+                    "text_offset": [0, 1],
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, ok)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    toks = client.score("P", "hi")
+    assert toks
+    assert toks[0].logprob == -0.5
 
 
 def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):

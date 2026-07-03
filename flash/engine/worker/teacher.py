@@ -150,15 +150,15 @@ class TeacherClient:
                 permanent=True,
             )
         n = len(tokens)
-        # A well-formed echo response returns tokens / token_logprobs / text_offset of EQUAL length.
-        # The loop below indexes token_logprobs[i] and offsets[i] for every i, so a short array (a
-        # malformed 200) would raise IndexError there — and, unlike the KeyError/TypeError guarded
-        # above, that IndexError escapes the method as a generic (non-TeacherError) exception. In
-        # _train_one that is caught by the broad `except Exception` and treated as a TRANSIENT skipped
-        # sample, so a teacher that consistently returns malformed arrays would burn every remaining
-        # OPD step before the run fails with "no trained step". Treat the length mismatch as PERMANENT
-        # (a broken teacher-response contract will not fix itself on retry) so the worker aborts now.
-        if len(token_logprobs) < n or len(offsets) < n:
+        # A well-formed echo response returns tokens / token_logprobs / text_offset of EQUAL length,
+        # so require EXACT equality (not merely "not shorter than tokens"). A SHORTER logprobs/offsets
+        # array makes the loop below IndexError (escapes as a generic exception _train_one swallows as a
+        # transient skip). A LONGER one is just as broken: `n = len(tokens)` would then silently ignore
+        # the offsets/logprobs tail, and the last token (i == n-1) takes `end = len(full)` (the i+1<n
+        # fallback), reinterpreting a token that should end mid-string as spanning through the whole
+        # completion and training on the wrong logprob. Both are a broken teacher contract that won't
+        # fix itself on retry, so reject any length disagreement as PERMANENT and abort now (codex[bot]).
+        if len(token_logprobs) != n or len(offsets) != n:
             raise TeacherError(
                 f"teacher echo response arrays disagree in length: tokens={n}, "
                 f"token_logprobs={len(token_logprobs)}, text_offset={len(offsets)}",
@@ -209,8 +209,9 @@ class TeacherClient:
         # or a non-finite float (NaN/inf) here that passes the list/length guards: a non-numeric value
         # makes float() RAISE ValueError OUTSIDE any TeacherError (-> _train_one swallows it as an
         # unclassified skip), and a NaN/inf feeds straight into the gkd teacher_logsum and poisons the
-        # loss with a non-finite gradient. Validate up front and reject as PERMANENT (codex[bot]); None
-        # stays allowed (handled as 0.0 below).
+        # loss with a non-finite gradient. Validate up front and reject as PERMANENT (codex[bot]). None
+        # is allowed HERE (prompt-context tokens legitimately carry a null realized logprob); a null on
+        # a token we actually KEEP (a completion token) is rejected in the emit loop below.
         for lp in token_logprobs[:n]:
             if lp is None:
                 continue
@@ -238,7 +239,19 @@ class TeacherClient:
             # preferable to losing the token (and, for short completions, the entire sample).
             if end <= plen:
                 continue
-            logprob = float(token_logprobs[i]) if token_logprobs[i] is not None else 0.0
+            # A null (None) realized logprob is legitimate ONLY for unscored prompt context; a token we
+            # KEEP here overlaps the completion (end > plen), so a null means the teacher did not score
+            # this completion token. Coercing it to 0.0 (log-prob 1.0 == full confidence) would train the
+            # gkd loss on bogus teacher confidence, so abort like the other teacher-contract violations
+            # rather than distil a fabricated signal (codex[bot]). Prompt-context nulls (end <= plen) are
+            # already skipped above and never reach this check.
+            if token_logprobs[i] is None:
+                raise TeacherError(
+                    f"teacher echo response has a null token_logprob for a completion token "
+                    f"(index {i}, char offset {start}); the teacher did not score it",
+                    permanent=True,
+                )
+            logprob = float(token_logprobs[i])
             out.append(
                 TeacherToken(
                     text=tokens[i],
