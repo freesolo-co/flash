@@ -629,7 +629,12 @@ def model_required_vram_gb(
     params_b = fetch_hf_params_b(model_id)
     if params_b is None:
         return 24
-    need = _need(params_b, "grpo", vocab=model_vocab)
+    # Size the uncataloged (model_policy="allow") fallback with the ACTUAL algorithm, not a hardcoded
+    # "grpo". An open-model OPD run was quoted/allocated as a colocated-vLLM GRPO job, so the new OPD
+    # dense-logit estimator (estimate_vram_gb's is_opd path) was never applied -- rejecting fitting runs
+    # or routing them to pricier GPUs. The cataloged path above already threads `algorithm` through
+    # _need; do the same here (codex[bot]). The grpo-only escalations below stay gated on is_grpo.
+    need = _need(params_b, algorithm, vocab=model_vocab)
     if is_grpo:
         need += grpo_seq_escalation_gb(params_b, seq_len)
         need = max(need, grpo_kv_floor_gb(params_b, seq_len, group_size))

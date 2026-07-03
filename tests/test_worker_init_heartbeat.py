@@ -247,6 +247,26 @@ def test_sft_step_liveness_upload_is_throttled(monkeypatch):
     assert len(uploads) == 1, "sft_step uploads must be throttled to one per _HB_MIN_INTERVAL_S"
 
 
+def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
+    """Regression (codex[bot], heartbeat.py/opd.py): a mid-step opd_step progress ping (carrying the
+    PREVIOUS opt_steps) can claim the throttle slot immediately before the post-update ping (the
+    incremented step). Without force the stepped commit is throttled out, so a cancellation is billed
+    from the STALE step even though the update landed. heartbeat(force=True) must upload within the
+    throttle interval; a NON-forced opd_step in the same window is still throttled."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    ne.heartbeat("opd_step", step=5, samples_done=1)  # mid-step ping claims the slot (stale step 5)
+    assert len(uploads) == 1
+    ne.heartbeat("opd_step", step=6, samples_done=2)  # normal ping within 60s -> throttled out
+    assert len(uploads) == 1, "a non-forced opd_step within the interval must be throttled"
+    ne.heartbeat("opd_step", step=6, loss=0.1, coverage=1.0, force=True)  # post-update forces through
+    assert len(uploads) == 2, "force=True must commit the stepped post-update ping despite the throttle"
+
+
 def test_setup_liveness_upload_uses_shorter_interval(monkeypatch):
     """Setup liveness must refresh public status before a 300s external frozen-heartbeat watchdog,
     while training-step liveness stays under the normal shared-repo throttle."""

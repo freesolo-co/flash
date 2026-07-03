@@ -130,8 +130,25 @@ def _thinking_prefill_text(tok) -> str:
         think = tok.apply_chat_template(
             probe, tokenize=False, add_generation_prompt=True, enable_thinking=True
         )
-        if think.startswith(base) and len(think) > len(base):
-            return think[len(base) :]
+        if think == base:
+            return ""  # template ignores enable_thinking -> plain "Assistant: " already matches
+        # The thinking render inserts a reasoning-block opener the non-thinking render lacks, but it is
+        # NOT always a pure suffix (the old think.startswith(base) test). A HYBRID template disables
+        # thinking by APPENDING a closed empty block to base (base = "...<think></think>...") or inserts
+        # the opener BEFORE shared trailing template text, so base is not a prefix of think and the old
+        # test returned "" -- leaving the teacher prompt without the opener the student pre-filled, so
+        # every reasoning token is scored against the wrong prefix (codex[bot]). Extract the opener as
+        # the think render's UNIQUE MIDDLE: the text between the longest common PREFIX and longest common
+        # SUFFIX of the two renders. "" when the thinking render adds nothing unique (the model opens
+        # <think> itself inside the completion, so the plain "Assistant: " prefix is already correct).
+        p = 0
+        m = min(len(base), len(think))
+        while p < m and base[p] == think[p]:
+            p += 1
+        s = 0
+        while s < len(base) - p and s < len(think) - p and base[-1 - s] == think[-1 - s]:
+            s += 1
+        return think[p : len(think) - s]
     return ""
 
 
@@ -666,11 +683,15 @@ def run_opd():
                 "opd_step",
                 # opt_steps (just incremented) == optimizer updates applied, so it is >=1 here: this
                 # POST-update ping tightens the stall window (step-gated in the poller) and matches
-                # the opt_steps-based checkpoint naming below.
+                # the opt_steps-based checkpoint naming below. force=True so it is NOT throttled away by
+                # a mid-step progress ping (carrying the PREVIOUS opt_steps) that just claimed the
+                # opd_step upload slot -- otherwise a cancellation here would be billed from the stale
+                # pre-update step even though this update landed (codex[bot]).
                 step=opt_steps,
                 loss=avg_loss,
                 coverage=avg_cov,
                 gpu=gpu_diagnostics(include_torch=False),
+                force=True,
             )
             if _wandb_on:
                 # Best-effort: a W&B network hiccup must never abort a paid training run.

@@ -839,6 +839,25 @@ def test_thinking_prefill_text_is_template_delta(monkeypatch):
     assert opd_mod._thinking_prefill_text(_NoThinkTok()) == ""
 
 
+def test_thinking_prefill_derives_opener_from_hybrid_template(monkeypatch):
+    """Regression (codex[bot], opd.py): _thinking_prefill_text must handle a HYBRID template where the
+    thinking render is NOT a prefix-extension of the non-thinking render — the opener is inserted BEFORE
+    shared trailing template text, so base is not a prefix of think. The old think.startswith(base) test
+    returned "", dropping the opener the student pre-fills so the teacher scored reasoning tokens against
+    the wrong prefix. The common prefix/suffix derivation must recover the opener from think's unique
+    middle."""
+    from flash.engine.worker import opd as opd_mod
+
+    class _HybridTok:
+        # non-thinking: no opener; thinking: inserts "<think>\n" BEFORE the shared "END" suffix, so
+        # "A:\nEND" is NOT a prefix of "A:\n<think>\nEND".
+        def apply_chat_template(self, messages, *, enable_thinking, **kw):
+            return "A:\n<think>\nEND" if enable_thinking else "A:\nEND"
+
+    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    assert opd_mod._thinking_prefill_text(_HybridTok()) == "<think>\n"
+
+
 def test_opd_loop_drives_by_optimizer_updates_and_retries_on_shortfall(monkeypatch):
     """Regression (codex[bot], opd.py:467): the loop must be driven by optimizer UPDATES, not raw
     iterations -- a no-signal iteration skips optimizer.step(), so `for step in range(steps)` could
@@ -1880,6 +1899,33 @@ def test_teacher_score_rejects_truncated_echo_as_permanent(monkeypatch):
         client.score("P", "hello")
     assert ei.value.permanent is True
     assert "truncated" in str(ei.value).lower()
+
+
+def test_teacher_score_rejects_interior_tiling_gap_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): the coverage guard must validate EVERY token boundary, not
+    only the final one. An INTERIOR gap/overlap — offsets[i+1] != offsets[i] + len(tokens[i]) — makes the
+    emit loop use offsets[i+1] as token i's end, assigning token i's logprob to text the teacher never
+    scored (a fabricated completion span when the gap straddles plen). full 'P'+'hiyo' = 'Phiyo' (len 5);
+    a mid-sequence offset jump (token 1 'h' ends at char 2 but the next offset is 3) must be PERMANENT."""
+    from flash.engine.worker.teacher import TeacherError
+
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", "h", "yo"],
+                    "token_logprobs": [0.0, -0.3, -0.5],
+                    "text_offset": [0, 1, 3],  # token 1 'h' ends at 2 but next offset is 3 -> gap at 2
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hiyo")
+    assert ei.value.permanent is True
+    assert "gap/overlap" in str(ei.value).lower()
 
 
 def test_teacher_score_rejects_echo_with_no_completion_tokens_as_permanent(monkeypatch):

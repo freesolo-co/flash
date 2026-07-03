@@ -300,6 +300,28 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     assert e(2.0, "sft", seq_len=4096, max_tokens=256) == e(2.0, "sft", seq_len=4096, max_tokens=8192)
 
 
+def test_open_model_opd_uses_opd_sizing_not_grpo(monkeypatch):
+    """Regression (codex[bot], vram.py): for an uncataloged (model_policy='allow') model the open-model
+    fallback hardcoded ``_need(params_b, 'grpo', ...)``, so an OPD run was sized as a colocated-vLLM GRPO
+    job and never used the OPD dense-logit estimator — rejecting fitting runs or routing them to pricier
+    GPUs. The fallback must thread the REAL algorithm through, so open-model OPD sizing diverges from the
+    GRPO sizing it was previously (wrongly) identical to."""
+    from flash.catalog import MODELS
+    from flash.engine import vram
+    from flash.engine.vram import model_required_vram_gb
+
+    fake_id = "test-org/uncataloged-7b"
+    assert fake_id not in MODELS  # ensure it takes the open-model (info is None) fallback
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 7.0)
+    train = {"max_length": 8192, "max_tokens": 8192, "lora_rank": 16}
+    opd_need = model_required_vram_gb(fake_id, "opd", train=train)
+    grpo_need = model_required_vram_gb(fake_id, "grpo", train=train)
+    # Before the fix these were IDENTICAL (opd fell through to the hardcoded grpo sizing); now opd uses
+    # its own dense-logit / no-colocated-vLLM estimator, so the two diverge.
+    assert opd_need != grpo_need, "open-model OPD must use OPD sizing, not the GRPO colocate path"
+    assert opd_need > 0
+
+
 def test_vram_headroom_consistent_across_sizing_paths():
     """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree (PR #176 review)."""

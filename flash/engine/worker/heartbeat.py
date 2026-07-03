@@ -86,7 +86,7 @@ def _rollback_throttle_slot(my_claim: int, prev_last_upload: float) -> None:
             _w._HB_LAST_UPLOAD = prev_last_upload
 
 
-def heartbeat(stage: str, *, liveness: bool = False, **kw):
+def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
     global _HB_CLAIM_SEQ
     ts = time.time()
     # liveness pings don't count as progress; provider stall detection skips them.
@@ -120,7 +120,12 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
             interval_s = _w._HB_MIN_INTERVAL_S
             if stage in _HB_SETUP_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
-            upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
+            # ``force`` bypasses the per-stage throttle (but not TERMINAL_ONLY mode, handled above): a
+            # caller uses it when THIS heartbeat's payload must be the one on record and a throttled
+            # drop would leave a STALE value committed. opd's post-optimizer-step ping forces so a
+            # mid-step progress ping (carrying the previous opt_steps) that just claimed the throttle
+            # slot can't suppress the stepped commit -- otherwise a cancel is billed from the stale step.
+            upload_due = force or not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
         prev_last_upload = _w._HB_LAST_UPLOAD
         if upload_due:
             _HB_CLAIM_SEQ += 1
