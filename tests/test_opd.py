@@ -1972,6 +1972,34 @@ def test_teacher_score_rejects_interior_tiling_gap_as_permanent(monkeypatch):
     assert "does not tile" in str(ei.value).lower()
 
 
+def test_teacher_score_rejects_echo_not_starting_at_offset_0_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): the tiling guard proves coverage of full[offsets[0]:] only —
+    it never requires offsets[0] == 0. A malformed 200 that DROPS a prompt prefix and echoes a cleanly-
+    tiling SUFFIX passes every offset/tiling check, but its completion logprobs were computed over a
+    TRUNCATED prompt, so the gkd signal is scored against context the student never saw. full 'AB'+'cd' =
+    'ABcd' (len 4); an echo of ['B','cd'] at offsets [1,2] tiles full[1:4] cleanly yet omits 'A' — the
+    first offset is 1, not 0, and must be rejected as PERMANENT."""
+    from flash.engine.worker.teacher import TeacherError
+
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["B", "cd"],  # tiles full[1:4]=='Bcd' cleanly, but drops the 'A' prefix
+                    "token_logprobs": [0.0, -0.5],
+                    "text_offset": [1, 2],  # starts at 1, not 0
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(TeacherError) as ei:
+        client.score("AB", "cd")
+    assert ei.value.permanent is True
+    assert "offset 0" in str(ei.value).lower()
+
+
 def test_teacher_score_rejects_echo_with_no_completion_tokens_as_permanent(monkeypatch):
     """Regression (codex[bot], teacher.py): an echo that yields NO completion-region token for a
     non-empty completion (here the degenerate empty-arrays 200) scored nothing to distil; score() must

@@ -204,6 +204,17 @@ class TeacherClient:
                     permanent=True,
                 )
             prev_off = o
+        # Tiling from offsets[0] only proves coverage of full[offsets[0]:], so the echo must START at 0.
+        # A malformed 200 that DROPS a prompt prefix and echoes a clean-tiling SUFFIX (offsets[0] > 0)
+        # passes every offset/tiling check, but its completion logprobs were computed by the teacher over a
+        # TRUNCATED prompt -- the gkd signal would be scored against context the student never saw. Require
+        # the first offset to be 0 for a non-empty echo and reject a dropped prefix as PERMANENT (codex[bot]).
+        if n and int(offsets[0]) != 0:
+            raise TeacherError(
+                f"teacher echo does not start at offset 0 (first text_offset={int(offsets[0])}); it "
+                "dropped a prompt prefix, so every completion logprob is conditioned on a truncated prompt.",
+                permanent=True,
+            )
         # token_logprobs[i] is coerced with float(...) below (None -> 0.0 for a null realized logprob,
         # e.g. the first token). A malformed 200 can still put a non-numeric value (e.g. a "NaN" string)
         # or a non-finite float (NaN/inf) here that passes the list/length guards: a non-numeric value
