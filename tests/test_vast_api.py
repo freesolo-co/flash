@@ -290,7 +290,8 @@ def test_create_error_is_ambiguous_classification():
     assert vast_api.create_error_is_ambiguous(err(http(503))) is True
     assert vast_api.create_error_is_ambiguous(err(http(429))) is True  # Cursor MsA6e: rate-limit
     assert vast_api.create_error_is_ambiguous(err(urllib.error.URLError("timed out"))) is True
-    assert vast_api.create_error_is_ambiguous(err(msg="...: no instance id in response: {}")) is True
+    # a create that couldn't return a usable id raises VastAmbiguousCreate -> classified by type
+    assert vast_api.create_error_is_ambiguous(vast_api.VastAmbiguousCreate("no instance id")) is True
     # Codex MtrgJ: json.loads on bytes with invalid UTF-8 raises UnicodeDecodeError (a SIBLING of
     # JSONDecodeError under ValueError, NOT caught by the JSONDecodeError clause) — an unreadable
     # response on the non-idempotent create, so it MUST be ambiguous (else the contract leaks).

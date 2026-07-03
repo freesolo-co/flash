@@ -76,38 +76,27 @@ def _vast_candidates(need: int, disk_gb: float = 0.0, max_wall_seconds: float = 
     smallest fitting class's VRAM and bucket the returned offers by class. A capacity-lookup failure
     (no key / network blip) degrades to the other providers — non-fatal as long as another can supply.
 
-    ``disk_gb`` is the run's requested disk; the capacity search uses the SAME effective floor
-    (``max(disk_gb, MIN_DISK_GB)``) the submit path provisions with, so a high-disk run isn't advertised
-    Vast capacity that only exists at the 60 GB floor and then fails to rent (an impossible attempt that
-    a max_retries=0 run never escapes). ``max_wall_seconds`` is likewise threaded into the SAME duration
-    floor the submit path uses, so a long run isn't advertised short-lived offers that expire mid-run.
+    ``disk_gb`` and ``max_wall_seconds`` are the run's requested disk and wall cap; the Vast package
+    prices against the SAME effective disk/duration floors the submit path provisions with, so a
+    high-disk or long run isn't advertised capacity it couldn't actually rent (an impossible attempt a
+    max_retries=0 run never escapes).
     """
-    from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
+    from flash.providers.vast.pricing import live_candidate_rates
 
     provider = get_provider("vast")
     fitting = [g for g in provider.gpu_classes() if g.vram_gb >= need]
     if not fitting:
         return []
     try:
-        # Search once at the smallest fitting class's VRAM floor; usable_offers returns every managed
-        # class at/above it, which we then restrict to the fitting set.
-        floor = min(g.vram_gb for g in fitting)
-        offers = usable_offers(
-            floor,
-            max(float(disk_gb or 0.0), MIN_DISK_GB),
-            max_wall_seconds=float(max_wall_seconds or 0.0),
-        )
+        # Search once at the smallest fitting class's VRAM; the market covers every class at/above it.
+        rates = live_candidate_rates(min(g.vram_gb for g in fitting), disk_gb, max_wall_seconds)
     except Exception as exc:
         logger.warning("vast capacity lookup failed (%s); allocating without vast", exc)
         return []
-    # Cheapest live offer per class (offers are price-sorted, so the first seen per class is cheapest).
-    cheapest: dict[str, float] = {}
-    for o in offers:
-        cheapest.setdefault(o.gpu, o.dph_total)
     fitting_names = {g.name: g.vram_gb for g in fitting}
     return [
         Candidate("vast", name, rate, fitting_names[name])
-        for name, rate in cheapest.items()
+        for name, rate in rates.items()
         if name in fitting_names
     ]
 

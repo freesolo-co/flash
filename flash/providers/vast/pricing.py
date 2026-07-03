@@ -31,24 +31,37 @@ def _static_rates() -> dict[str, float]:
     return {name: info.hourly_usd for name, info in GPU_INFO.items() if info.vast_name}
 
 
-def _fetch_offer_rates(max_wall_seconds: float) -> dict[str, float]:
-    """Friendly-name -> cheapest LIVE verified-datacenter $/hr for ONLY classes with a usable offer
-    (NO static merge). Raises on fetch failure; assumes ``VAST_API_KEY`` is set (callers gate on it)."""
-    from flash.providers.base import GPU_INFO
+def live_candidate_rates(
+    min_vram_gb: int, disk_gb: float = 0.0, max_wall_seconds: float = 0.0
+) -> dict[str, float]:
+    """Friendly-name -> cheapest LIVE verified-datacenter $/hr per managed class that currently has a
+    rentable offer at/above ``min_vram_gb``, using the SAME effective disk floor
+    (``max(disk_gb, MIN_DISK_GB)``) and duration floor the submit path provisions with — so a class is
+    only priced/advertised when a launch could actually rent it. ONE market search; offers are
+    price-sorted so the first seen per class is cheapest. Raises on a fetch failure (callers decide the
+    fallback); assumes ``VAST_API_KEY`` is set (callers gate on it). Shared by the ``flash gpus`` /
+    cost-estimate pricing path and the allocator's capacity check."""
     from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
 
     rates: dict[str, float] = {}
+    for offer in usable_offers(
+        min_vram_gb, max(float(disk_gb or 0.0), MIN_DISK_GB), max_wall_seconds=max_wall_seconds
+    ):
+        rates.setdefault(offer.gpu, offer.dph_total)  # price-sorted, first seen per class is cheapest
+    return rates
+
+
+def _fetch_offer_rates(max_wall_seconds: float) -> dict[str, float]:
+    """Friendly-name -> cheapest LIVE $/hr for the managed classes with a usable offer (NO static
+    merge). Raises on fetch failure; assumes ``VAST_API_KEY`` is set (callers gate on it)."""
+    from flash.providers.base import GPU_INFO
+
     # Floor the market query at the smallest managed class's VRAM, not 0: min_vram_gb=0 returns the
     # cheapest offers across ALL sizes, so a flood of tiny unmanaged low-VRAM cards fills the price-sorted
     # page and crowds managed classes off it. No managed class is smaller than the floor, so none is
     # excluded; 0 if nothing is managed.
     vram_floor = int(min((i.vram_gb for i in GPU_INFO.values() if i.vast_name), default=0))
-    # Gate on MIN_DISK_GB (what create() enforces): disk_gb=0 would price off "cheapest" offers that
-    # aren't provisionable, inconsistent with the allocator/submit paths. Thread the wall cap so
-    # duration-bound estimates match the offers a launch would accept.
-    for offer in usable_offers(vram_floor, MIN_DISK_GB, max_wall_seconds=max_wall_seconds):
-        rates.setdefault(offer.gpu, offer.dph_total)  # offers are price-sorted, cheapest first
-    return rates
+    return live_candidate_rates(vram_floor, max_wall_seconds=max_wall_seconds)
 
 
 def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str, float]:
@@ -110,4 +123,6 @@ def hourly_rate(gpu_name: str, max_wall_seconds: float = 0.0) -> float:
     from flash.providers.base import canonical_gpu
 
     name = canonical_gpu(gpu_name)
-    return live_rates(max_wall_seconds=max_wall_seconds).get(name) or _static_rates().get(name, 0.0)
+    # live_rates already merges the static snapshot (and returns it wholesale offline), so every
+    # vast_name class is present on every return path — no second static lookup needed.
+    return live_rates(max_wall_seconds=max_wall_seconds).get(name) or 0.0

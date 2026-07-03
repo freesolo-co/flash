@@ -363,6 +363,19 @@ def _failure_detail(
     return "\n".join(parts) or "vast worker terminated without a DONE sentinel"
 
 
+def _read_with_retries(read, *, tries: int, wait_s: float, say, message: str):
+    """Call ``read()`` (a zero-arg reader), re-reading up to ``tries`` times ``wait_s`` apart while it
+    returns None — for HF read-after-write lag (metrics.json after DONE; terminal artifacts after a box
+    self-destructs). ``time.sleep`` is mocked in tests, so this adds no test wall-time."""
+    value = read()
+    while value is None and tries > 0:
+        say(message)
+        time.sleep(wait_s)
+        value = read()
+        tries -= 1
+    return value
+
+
 def poll_vast_job(
     handle: VastJobHandle,
     spec,
@@ -402,35 +415,27 @@ def poll_vast_job(
 
     def finish_ok(done_content: str | None = None, fallback_end_ts: float | None = None) -> PollResult:
         # metrics.json is written before DONE but HF read-after-write lags: re-read a few times before
-        # failing a DONE-without-metrics. time.sleep is mocked in tests, so this adds no test wall-time.
-        raw = metrics_reader(force=True)
-        attempts_left = _METRICS_AFTER_DONE_RETRIES
-        while raw is None and attempts_left > 0:
-            say("DONE seen but metrics.json not visible yet; waiting for HF read-after-write")
-            time.sleep(_METRICS_AFTER_DONE_WAIT_S)
-            raw = metrics_reader(force=True)
-            attempts_left -= 1
+        # failing a DONE-without-metrics.
+        raw = _read_with_retries(
+            lambda: metrics_reader(force=True),
+            tries=_METRICS_AFTER_DONE_RETRIES,
+            wait_s=_METRICS_AFTER_DONE_WAIT_S,
+            say=say,
+            message="DONE seen but metrics.json not visible yet; waiting for HF read-after-write",
+        )
         if raw is None:
             return PollResult(False, failure="job_failed", detail="DONE without metrics.json")
         metrics = json.loads(raw)
-        # Prefer the worker's DONE timestamp (sane range) for the instance wall note; else fall back to
-        # the ok-marker's completion ts (so delayed recovery isn't measured as runtime); else now. The
+        # Instance wall note anchors to the worker's DONE ts, else the ok-marker's completion ts (so a
+        # delayed recovery isn't measured as runtime), else now; adopt only if in [launch, now]. The
         # customer-facing cost below uses the worker training wall only.
         end_ts = time.time()
-        if done_content:
-            try:
-                done_ts = float(done_content.strip())
-                if launch_ts <= done_ts <= end_ts:
-                    end_ts = done_ts
-            except ValueError:
-                pass
-        elif fallback_end_ts is not None:
-            try:
-                ts = float(fallback_end_ts)
+        candidate = done_content.strip() if done_content else fallback_end_ts
+        if candidate is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                ts = float(candidate)
                 if launch_ts <= ts <= end_ts:
                     end_ts = ts
-            except (TypeError, ValueError):
-                pass
         instance_wall_s = max(0.0, end_ts - launch_ts)
         try:
             train_wall_s = max(0.0, float(metrics.get("wall_seconds") or 0.0))
@@ -496,6 +501,11 @@ def poll_vast_job(
                 return fail_from_marker(m)
         return None
 
+    def stalled_unless_terminal(detail: str) -> PollResult:
+        # A stall exit still reads the terminal artifacts once — the worker may have just finished.
+        terminal = terminal_artifact_result()
+        return terminal if terminal is not None else PollResult(False, failure="stalled", detail=detail)
+
     poll_errors = PollErrorTracker(say, interval_s)
     # Seed the load/stall clocks from LAUNCH, not this poll's start: a delayed reattach has been billing
     # since launch, so a still-loading box that already blew LOAD_TIMEOUT_S fails over now.
@@ -521,12 +531,9 @@ def poll_vast_job(
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
-            # A recovered run can blow a launch-anchored deadline on the first reattach tick (the
-            # outage lasted past max_wall+grace). Read terminal artifacts once before giving up.
-            terminal = terminal_artifact_result()
-            if terminal is not None:
-                return terminal
-            return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
+            # A recovered run can blow a launch-anchored deadline on the first reattach tick (the outage
+            # lasted past max_wall+grace).
+            return stalled_unless_terminal("client-side deadline exceeded")
         try:
             inst = vast_api.get_instance(handle.instance_id)
             poll_errors.reset()
@@ -578,14 +585,14 @@ def poll_vast_job(
         if dead:
             # The worker may have finished just before the box self-destroyed, with its DONE/marker not
             # yet visible on HF (read-after-write lag). Re-read terminal artifacts a bounded number of
-            # times before concluding loss. time.sleep is mocked in tests, so this adds no test wall-time.
-            terminal = terminal_artifact_result()
-            _terminal_tries = _TERMINAL_AFTER_DEAD_RETRIES
-            while terminal is None and _terminal_tries > 0:
-                say("instance gone; waiting for HF to expose any terminal DONE/marker before failover")
-                time.sleep(_TERMINAL_AFTER_DEAD_WAIT_S)
-                terminal = terminal_artifact_result()
-                _terminal_tries -= 1
+            # times before concluding loss.
+            terminal = _read_with_retries(
+                terminal_artifact_result,
+                tries=_TERMINAL_AFTER_DEAD_RETRIES,
+                wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+                say=say,
+                message="instance gone; waiting for HF to expose any terminal DONE/marker before failover",
+            )
             if terminal is not None:
                 return terminal
             # Dead host, no ok-marker/DONE. Distinguish genuine host LOSS (retry on a fresh host) from a
@@ -666,30 +673,20 @@ def poll_vast_job(
                     # A lone empty read can be a transient log-API error -> require BOOT_LOG_ABSENT_POLLS.
                     console_log_absent_polls += 1
                     if console_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
-                        terminal = terminal_artifact_result()
-                        if terminal is not None:
-                            return terminal
-                        return PollResult(
-                            False,
-                            failure="stalled",
-                            detail=f"no worker heartbeat AND no container-log output for "
+                        return stalled_unless_terminal(
+                            f"no worker heartbeat AND no container-log output for "
                             f"{int(time.time() - running_since)}s after the container started "
-                            f"(worker never came up; limit {int(first_liveness_s)}s)",
+                            f"(worker never came up; limit {int(first_liveness_s)}s)"
                         )
                 else:
                     # Bootstrap is producing output -> healthy slow cold start; setup/stall below backstop.
                     console_log_seen = True
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
-                terminal = terminal_artifact_result()
-                if terminal is not None:
-                    return terminal
                 phase = "training" if seen_training_hb else "setup (pre-training)"
-                return PollResult(
-                    False,
-                    failure="stalled",
-                    detail=f"no worker progress for {int(time.time() - last_progress)}s during "
-                    f"{phase} (instance status {status}, limit {int(limit)}s)",
+                return stalled_unless_terminal(
+                    f"no worker progress for {int(time.time() - last_progress)}s during "
+                    f"{phase} (instance status {status}, limit {int(limit)}s)"
                 )
         time.sleep(interval_s)
 
@@ -725,11 +722,8 @@ def submit_run_vast(
         )
         if o.gpu == spec.gpu.type
     ]
-    deploy_kwargs = {
-        "attempt": attempt,
-        "log": log,
-        "runtime_secrets": runtime_secrets,
-    }
+    # code_prefix is passed only when set so test doubles for deploy_and_submit can omit the kwarg.
+    deploy_kwargs = {"attempt": attempt, "log": log, "runtime_secrets": runtime_secrets}
     if code_prefix is not None:
         deploy_kwargs["code_prefix"] = code_prefix
     handle = deploy_and_submit(spec, seed, offers, **deploy_kwargs)

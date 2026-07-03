@@ -26,6 +26,13 @@ class VastApiError(RuntimeError):
     pass
 
 
+class VastAmbiguousCreate(VastApiError):
+    """A ``create_instance`` failure that MIGHT have left a billed contract behind — the non-idempotent
+    PUT /asks may have been accepted while the response was lost or carried no usable id. Raised so
+    ``create_error_is_ambiguous`` classifies it by TYPE (not a message substring), and the caller
+    reconciles by label instead of renting a duplicate offer."""
+
+
 # Env-only key (like RUNPOD_API_KEY): never written to config files or shipped to workers.
 _CLIENT = RestClient(
     env_var="VAST_API_KEY",
@@ -132,31 +139,29 @@ def create_instance(
     except VastApiError as e:
         cause = getattr(e, "__cause__", None)
         if isinstance(cause, (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException)):
-            raise VastApiError(
+            raise VastAmbiguousCreate(
                 f"create_instance({offer_id}) response unreadable (possible billed contract): {cause}"
             ) from cause
         raise
     except (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException) as e:
         # Unreadable 200 body on this non-idempotent create may mean Vast billed a contract while
         # the response leg failed. These decode errors aren't OSErrors so _http doesn't wrap them;
-        # re-raise as VastApiError so create_error_is_ambiguous classifies it AMBIGUOUS and reconcile
-        # runs, rather than letting a raw decode error escape and leak the contract.
-        raise VastApiError(
+        # surface as VastAmbiguousCreate so the caller reconciles rather than leaking the contract.
+        raise VastAmbiguousCreate(
             f"create_instance({offer_id}) response unreadable (possible billed contract): {e}"
         ) from e
     if not isinstance(out, dict) or not out.get("success"):
         raise VastApiError(f"create_instance({offer_id}) rejected: {out}")
     instance_id = out.get("new_contract")
     if not instance_id:
-        raise VastApiError(f"create_instance({offer_id}): no instance id in response: {out}")
+        raise VastAmbiguousCreate(f"create_instance({offer_id}): no instance id in response: {out}")
     try:
         return int(instance_id)
     except (TypeError, ValueError) as e:
         # Truthy but non-numeric new_contract: Vast accepted the create (a contract may be billing)
-        # but gave an unusable id. Surface as VastApiError with "no instance id" so
-        # create_error_is_ambiguous classifies it AMBIGUOUS and reconcile runs, rather than letting
-        # int()'s ValueError escape and leak the contract.
-        raise VastApiError(
+        # but gave an unusable id. Surface as VastAmbiguousCreate so the caller reconciles by label,
+        # rather than letting int()'s ValueError escape and leak the contract.
+        raise VastAmbiguousCreate(
             f"create_instance({offer_id}): no instance id usable in response "
             f"(unparseable new_contract {instance_id!r}, possible billed contract): {out}"
         ) from e
@@ -175,18 +180,19 @@ def create_error_is_ambiguous(err: Exception) -> bool:
     off ``URLError`` alone would leak the instance). ``HTTPError`` is checked first so 4xx stays
     definitive.
     """
+    # Our create path raises VastAmbiguousCreate for every case a contract may have billed (no usable
+    # id in a success body; unreadable response) — classify by TYPE, not a message substring.
+    if isinstance(err, VastAmbiguousCreate):
+        return True
     cause = getattr(err, "__cause__", None)
     if isinstance(cause, urllib.error.HTTPError):  # subclass of OSError -> check first (4xx stays False)
         return cause.code >= 500 or cause.code == 429
     if isinstance(cause, OSError):  # URLError / TimeoutError / ConnectionError + any other socket error
         return True
-    # Unreadable 200 body (truncated / non-JSON / invalid UTF-8) on the non-idempotent create: a
-    # contract may have billed while the response was lost, so ambiguous. These decode errors aren't
-    # OSErrors so they miss the branches above; match both the wrapped and a bare cause.
+    # Defensive: a bare / plain-wrapped decode error (truncated / non-JSON / invalid UTF-8) is also an
+    # unreadable body -> ambiguous. These aren't OSErrors, so they miss the branch above.
     _unreadable = (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException)
-    if isinstance(err, _unreadable) or isinstance(cause, _unreadable):
-        return True
-    return "no instance id" in str(err)  # success body with no / an unparseable contract id -> may be billing
+    return isinstance(err, _unreadable) or isinstance(cause, _unreadable)
 
 
 def get_instance(instance_id: int) -> dict | None:
