@@ -162,6 +162,32 @@ def test_opd_rejects_unpriced_teacher_model_but_accepts_priced():
         _spec("accounts/fireworks/models/mystery-9000")  # unpriced override -> reject at parse
 
 
+def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
+    """max_length <= max_tokens leaves no prompt budget; opd must reject it at spec-parse time
+    (before a paid worker is provisioned), not only inside run_opd after GPU setup."""
+    from flash.schema import ConfigError, spec_from_dict
+
+    def _spec(train_extra):
+        return spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opd",
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"steps": 5, "hf_repo": "owner/runs", **train_extra},
+            },
+            run_id="x",
+        )
+
+    # max_length leaves room after an explicit max_tokens -> ok.
+    _spec({"max_length": 2048, "max_tokens": 512})
+    # max_length <= max_tokens -> no prompt budget -> reject at parse.
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_length": 400, "max_tokens": 512})
+    # max_tokens omitted -> resolves to the opd recipe default (512); max_length below it -> reject.
+    with pytest.raises(ConfigError, match="prompt budget"):
+        _spec({"max_length": 256})
+
+
 def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
     """Exercise the PRODUCTION caller _train_one end-to-end (the direct-call unit test above can't
     catch a broken call site). The completion ends in a zero-width eos, so this also pins the
@@ -378,11 +404,13 @@ def test_teacher_score_returns_completion_region_with_rebased_offsets_and_logpro
     assert capture["body"]["logprobs"] == 1
 
 
-def test_teacher_score_drops_prompt_completion_boundary_token(monkeypatch):
+def test_teacher_score_keeps_boundary_crossing_token_clamped_to_completion(monkeypatch):
     # Prompt ends in whitespace ("P: ", plen=3); the teacher emits a leading-space merge token
-    # " hi" that starts at char 2 (inside the prompt) and ends at 5 (inside the completion). Its
-    # logprob is contaminated by prompt text, so score() must DROP it (start < plen), keeping only
-    # tokens that lie entirely in the completion.
+    # " hi" that starts at char 2 (inside the prompt) and ends at 5 (inside the completion). Rather
+    # than DROP it — which for a one-token completion would leave zero teacher tokens and skip the
+    # sample — score() KEEPS it with its completion span clamped to [0, end-plen) so the first
+    # completion token still carries a teacher logprob. Only tokens ENTIRELY in the prompt (end<=plen)
+    # are dropped.
     payload = {
         "choices": [
             {
@@ -397,9 +425,12 @@ def test_teacher_score_drops_prompt_completion_boundary_token(monkeypatch):
     _mock_urlopen(monkeypatch, payload)
     client = TeacherClient("k", "https://api.example/v1", "glm")
     toks = client.score("P: ", "hi!")
-    # only "!" survives (starts at char 5 >= plen); the boundary-crossing " hi" is dropped.
-    assert [t.text for t in toks] == ["!"]
-    assert toks[0].start == 2  # 5 - plen(3)
+    # "P" and ":" lie entirely in the prompt (end <= plen=3) -> dropped. The boundary-crossing " hi"
+    # is kept, clamped to completion span [0, 2); "!" keeps [2, 3). "hi!" is fully covered.
+    assert [t.text for t in toks] == [" hi", "!"]
+    assert (toks[0].start, toks[0].end) == (0, 2)  # max(0, 2-3)=0 ; 5-3=2
+    assert (toks[1].start, toks[1].end) == (2, 3)  # 5-3=2 ; 6-3=3
+    assert toks[0].logprob == -0.5  # the merged token's realized logprob is preserved
 
 
 def test_teacher_score_raises_on_malformed_response(monkeypatch):

@@ -395,6 +395,28 @@ def _validate_spec(spec: JobSpec) -> None:
         # key (FIREWORKS_API_KEY) is auto-declared as a required secret in spec_from_dict, so a
         # keyless opd run already fails fast in the client/server runtime-secret gate.
         raise ConfigError("train.steps must be positive for opd")
+    if spec.algorithm == "opd" and spec.train.max_length:
+        # Mirror run_opd's prompt-budget guard at PARSE time: a max_length that leaves no room for
+        # any prompt after the completion budget is rejected here, BEFORE a paid worker is
+        # provisioned (wait_for_gpu + model prefetch + tokenizer/adapter load), instead of failing
+        # deterministically only after GPU setup. max_completion resolves exactly as the worker does:
+        # explicit [train] max_tokens, else the recipe thinking/non-thinking default.
+        from flash.engine.recipe import RECIPE
+
+        max_completion = int(
+            spec.train.max_tokens
+            or (
+                RECIPE.opd.max_completion_len_thinking
+                if spec.thinking
+                else RECIPE.opd.max_completion_len
+            )
+        )
+        if spec.train.max_length - max_completion < 1:
+            raise ConfigError(
+                f"[train] max_length ({spec.train.max_length}) leaves no prompt budget after "
+                f"max_tokens ({max_completion}) for opd; set max_length > max_tokens. Rejected at "
+                f"parse time so an invalid budget fails before a GPU worker is provisioned."
+            )
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "

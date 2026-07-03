@@ -112,19 +112,22 @@ class TeacherClient:
         for i in range(n):
             start = int(offsets[i])
             end = int(offsets[i + 1]) if i + 1 < n else len(full)
-            # Keep only tokens that lie ENTIRELY in the completion (start >= plen). This drops
-            # prompt-only tokens AND boundary-crossers: when the prompt ends in whitespace
-            # (``Assistant: ``), a leading-space merge token can span start<plen<end; its logprob
-            # includes fixed prompt text, so it is not a clean completion-token signal. The tiny
-            # sliver it would have covered is absorbed by gkd's student-only-span merge.
-            if start < plen:
+            # Drop tokens that lie ENTIRELY in the prompt (end <= plen). KEEP a token that CROSSES
+            # the prompt/completion boundary (start < plen < end): when the prompt ends in whitespace
+            # (``Assistant: ``), a leading-space teacher tokenizer merges that trailing space with the
+            # first completion word into one token. Dropping it (the old start<plen rule) would strip
+            # the first completion token's signal — and for a ONE-token completion that leaves zero
+            # teacher tokens and the whole sample is skipped. Clamp such a token's completion span to
+            # [0, end-plen); its logprob carries a small fixed prompt-whitespace contribution, far
+            # preferable to losing the token (and, for short completions, the entire sample).
+            if end <= plen:
                 continue
             logprob = float(token_logprobs[i]) if token_logprobs[i] is not None else 0.0
             out.append(
                 TeacherToken(
                     text=tokens[i],
                     logprob=logprob,
-                    start=start - plen,
+                    start=max(0, start - plen),
                     end=end - plen,
                 )
             )
