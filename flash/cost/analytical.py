@@ -124,7 +124,6 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     )  # ceil: a partial wave still costs one latency
     return gen_s + reward_s + update_s
 
-
 def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> float:
     """SFT steady-state wall time for an actual token count on ``gpu``."""
     n = config.normalized()
@@ -134,7 +133,7 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     return flops / (peak * MFU_SFT_TRAIN)
 
 
-def select_gpu(config: RunConfig) -> tuple[str, int]:
+def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str, int]:
     """(chosen GPU class, required VRAM GB): the cheapest fitting class for the cost.
 
     Uses ``pick_gpu``, which (unlike the submit-time allocator) intentionally stays gate-free —
@@ -150,7 +149,7 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
         train=config.train_knobs(),
         thinking=config.thinking,
     )
-    gpu = pick_gpu(need, provider=config.provider)
+    gpu = pick_gpu(need, provider=config.provider, max_wall_seconds=max_wall_seconds)
     return gpu, need
 
 
@@ -191,13 +190,25 @@ def _notes(
 
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost calculation."""
-    gpu, need = select_gpu(config)
-    hourly = gpu_hourly_usd(gpu, provider=config.provider)
-    # Mirror the runner's max(60, max_wall_seconds) floor so elapsed wall time is not undercounted.
-    cap_s = (
-        max(60.0, float(config.max_wall_seconds))
-        if config.max_wall_seconds is not None
-        else wall_cap_s
+    # Billing cap: mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
+    cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
+    # Vast market duration filter: price against offers that outlast the run, using the SAME semantics
+    # ``usable_offers`` applies at LAUNCH (not the 60s-floored billing cap_s) — a non-positive wall means
+    # NO filter, a positive one is floored at 60s by usable_offers itself:
+    #   None -> the 24h spec default the run runs under (== DEFAULT_WALL_CAP_S);
+    #   > 0  -> that wall;   <= 0 -> 0.0 (no filter, exactly like launch).
+    if config.max_wall_seconds is None:
+        market_wall_s = wall_cap_s
+    elif config.max_wall_seconds > 0:
+        market_wall_s = float(config.max_wall_seconds)
+    else:
+        market_wall_s = 0.0
+    gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
+    # Quote the SAME VRAM-floored Vast market pick_gpu selected under (min_vram_gb=need): without the
+    # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
+    # crowd a high-VRAM selection off the limited page -> it silently falls back to the static rate.
+    hourly = gpu_hourly_usd(
+        gpu, provider=config.provider, max_wall_seconds=market_wall_s, min_vram_gb=need
     )
 
     setup = setup_seconds(config)

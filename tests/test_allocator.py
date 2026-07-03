@@ -127,6 +127,70 @@ def test_nothing_fits_names_constraint(monkeypatch):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
 
 
+def _raise_capacity_blip(*a, **k):
+    from flash.providers.base import CapacityLookupError
+
+    raise CapacityLookupError("vast live capacity lookup failed") from RuntimeError("market blip")
+
+
+def _stub_alloc(monkeypatch, *, runpod, lambda_, vast):
+    from flash.providers import allocator
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
+    monkeypatch.setattr(allocator, "_runpod_candidates", runpod)
+    monkeypatch.setattr(allocator, "_lambda_candidates", lambda_)
+    monkeypatch.setattr(allocator, "_vast_candidates", vast)
+
+
+def test_transient_capacity_blip_is_retryable_not_terminal(monkeypatch):
+    """A live capacity-lookup outage that is the SOLE reason nothing fits raises the RETRYABLE
+    CapacityLookupError, NOT the terminal UnsupportedGpuError — so the runner infra-retries the blip
+    (isinstance check must stay False, since lifecycle terminal-fails only on UnsupportedGpuError)."""
+    from flash.providers import allocator
+    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+
+    _stub_alloc(
+        monkeypatch,
+        runpod=lambda need: [],  # no RunPod class fits
+        lambda_=lambda need: [],
+        vast=_raise_capacity_blip,  # Vast (the only possible source) blipped
+    )
+    with pytest.raises(CapacityLookupError) as ei:
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    assert not isinstance(ei.value, UnsupportedGpuError)
+
+
+def test_capacity_blip_degrades_to_fitting_provider(monkeypatch):
+    """A Vast blip must NOT abort allocation when another provider has a fitting class — degrade to it."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    _stub_alloc(
+        monkeypatch,
+        runpod=lambda need: [Candidate("runpod", "RTX 4090", 0.69, 24)],
+        lambda_=lambda need: [],
+        vast=_raise_capacity_blip,
+    )
+    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    assert a.provider == "runpod"  # degraded past the blip, no error
+
+
+def test_genuine_no_fit_without_blip_stays_terminal(monkeypatch):
+    """No blip, just nothing fits -> terminal UnsupportedGpuError (unchanged contract)."""
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
+
+    _stub_alloc(
+        monkeypatch,
+        runpod=lambda need: [],
+        lambda_=lambda need: [],
+        vast=lambda need, disk_gb=0.0, max_wall_seconds=0.0: [],
+    )
+    with pytest.raises(UnsupportedGpuError):
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+
+
 def test_estimator_matches_measured_seq_boundaries():
     """The raw VRAM physics reproduces the MEASURED RunPod capacity sweep: each anchor
     is a real train/OOM boundary observed on a pinned card (the calibration ground truth).
@@ -474,3 +538,46 @@ def test_sft_estimate_includes_capped_logits_term():
     fused_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8)
     fused_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8)
     assert abs(fused_big - fused_small) < 1e-6
+
+
+def test_vast_candidates_searches_at_effective_disk(monkeypatch):
+    # Codex Mslml: the allocator's Vast capacity search must use the SAME effective disk floor
+    # (max(disk_gb, MIN_DISK_GB)) the submit path provisions with — else a high-disk run is advertised
+    # Vast capacity that only exists at the 60 GB floor and then can't actually rent (an impossible
+    # attempt a max_retries=0 run never escapes).
+    from flash.providers import allocator
+    from flash.providers.vast import jobs as vast_jobs
+
+    captured = {}
+
+    def fake_usable(vram_floor, disk_gb, *a, **k):
+        captured["disk_gb"] = disk_gb
+        return []
+
+    monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
+    allocator._vast_candidates(16)  # default -> floored at MIN_DISK_GB
+    assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB
+    allocator._vast_candidates(16, disk_gb=200.0)  # high-disk run searches at the request
+    assert captured["disk_gb"] == 200.0
+    allocator._vast_candidates(16, disk_gb=10.0)  # below the floor still clamps up
+    assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB
+
+
+def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
+    # Codex Msvb0: the allocator's Vast capacity search must thread the run's wall cap so usable_offers
+    # applies the duration floor — else the allocator advertises Vast classes whose only live offers
+    # expire before the run finishes (fatal for a max_retries=0 run).
+    from flash.providers import allocator
+    from flash.providers.vast import jobs as vast_jobs
+
+    captured = {}
+
+    def fake_usable(vram_floor, disk_gb, *a, **k):
+        captured["max_wall_seconds"] = k.get("max_wall_seconds")
+        return []
+
+    monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
+    allocator._vast_candidates(16)  # default -> no deadline threaded (0 = duration filter off)
+    assert captured["max_wall_seconds"] == 0.0
+    allocator._vast_candidates(16, max_wall_seconds=7200.0)  # long run threads its wall cap
+    assert captured["max_wall_seconds"] == 7200.0
