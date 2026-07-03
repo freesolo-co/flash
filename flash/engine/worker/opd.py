@@ -94,6 +94,19 @@ def _teacher_prompt_text(prompt_messages: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _to_cpu_ids(completion_ids):
+    """Move the sampled ids off the GPU in ONE transfer and reuse the CPU list for decode/trim/offsets.
+
+    ``model.generate`` returns the ids on-device; iterating that tensor and calling ``int(t)`` per token
+    does one scalar CUDA->CPU sync per token -- thousands of tiny syncs per sample once ``[train]
+    .max_tokens`` is raised (reported by codex[bot]). A single ``detach().cpu().tolist()`` collapses that
+    to one bulk copy. Falls back to a plain-list normalization when handed a list (tests / the already-
+    trimmed path re-pass a list)."""
+    if hasattr(completion_ids, "detach"):
+        return completion_ids.detach().cpu().tolist()
+    return [int(t) for t in completion_ids]
+
+
 def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     """Char spans for the ORIGINAL sampled token ids, indexed into ``completion_text`` (the exact
     string the teacher echo-scored). Using the sampled ids — not a re-tokenization of the decoded
@@ -345,9 +358,17 @@ def run_opd():
     # dropped — burning the GPU allocation with no trained step. Filtering the pool here (before the
     # student is even loaded) guarantees every visited prompt fits and fails fast otherwise. One
     # tokenize per prompt, once, at startup.
-    examples = [
-        ex for ex in train if len(_render_prompt_ids(env.prompt_messages(ex))) <= prompt_budget
-    ]
+    # Rendering+tokenizing a large train split runs AFTER the last setup heartbeat and BEFORE the
+    # model-load liveness starts. Pollers reset setup grace only on NON-liveness (progress) heartbeats,
+    # so a healthy worker scanning a big split could exceed the grace and be reaped as stalled
+    # (codex[bot]). Drive a real progress heartbeat off a monotonic scan counter while filtering.
+    _scanned = 0
+    with liveness_heartbeat("opd_filtering_prompts", progress=lambda: _scanned):
+        examples = []
+        for ex in train:
+            if len(_render_prompt_ids(env.prompt_messages(ex))) <= prompt_budget:
+                examples.append(ex)
+            _scanned += 1
     n_over_budget = len(train) - len(examples)
     if not examples:
         raise RuntimeError(
@@ -638,7 +659,9 @@ def _train_one(
     model.config.use_cache = True
     with torch.no_grad():
         gen = model.generate(prompt_tensor, **gen_cfg)
-    completion_ids = gen[0, prompt_tensor.shape[1] :]
+    completion_ids = _to_cpu_ids(
+        gen[0, prompt_tensor.shape[1] :]
+    )  # one GPU->CPU copy, reused below
     completion_text = tok.decode(completion_ids, skip_special_tokens=True)
     # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter
     # before stopping — trim it from BOTH ids and text (token-level) so the teacher scores/distils

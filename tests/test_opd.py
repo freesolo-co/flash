@@ -286,6 +286,40 @@ def test_trim_trailing_stop_scans_from_end_not_quadratically():
     )
 
 
+def test_opd_sampled_ids_moved_off_gpu_in_one_transfer():
+    """Regression (codex[bot], opd.py:113): model.generate returns the sampled ids on the GPU;
+    _to_cpu_ids must do ONE detach().cpu().tolist() bulk copy, not a per-token int(t) CUDA->CPU scalar
+    sync (thousands of tiny syncs per sample once [train].max_tokens is raised)."""
+    from flash.engine.worker.opd import _to_cpu_ids
+
+    class _FakeGpuTensor:
+        def __init__(self, data):
+            self.data = list(data)
+            self.detach_calls = 0
+            self.iterated = 0
+
+        def detach(self):
+            self.detach_calls += 1
+            return self
+
+        def cpu(self):
+            return self
+
+        def tolist(self):
+            return list(self.data)
+
+        def __iter__(self):
+            self.iterated += 1  # element-wise iteration == the per-token CUDA-sync path to avoid
+            return iter(self.data)
+
+    t = _FakeGpuTensor([5, 6, 7])
+    assert _to_cpu_ids(t) == [5, 6, 7]
+    assert t.detach_calls == 1  # single bulk transfer
+    assert t.iterated == 0  # never iterated element-by-element
+    # a plain list (the already-trimmed path re-passes a list) is normalized, not treated as a tensor:
+    assert _to_cpu_ids([1, 2, 3]) == [1, 2, 3]
+
+
 def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     # OPD generates on-policy (loss forward runs model(prompt+completion)), so allocator sizing must
     # use the prompt+completion budget, not the SFT 1024 default — else a raised max_tokens OOMs an
@@ -650,6 +684,30 @@ def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
         opd_mod.run_opd()
     assert not isinstance(ei.value, RetriableInfraError)
     assert "no trained step" in str(ei.value)
+
+
+def test_opd_emits_progress_heartbeat_while_filtering_prompts(monkeypatch):
+    """Regression (codex[bot], opd.py:350): the prompt-budget filter scan runs after the last setup
+    heartbeat and before model-load liveness; on a large split it can outlast the poller's setup grace.
+    Pure-liveness pings don't reset that grace -- only progress heartbeats do -- so the scan must run
+    under a liveness_heartbeat WITH a progress callback. Confirm an 'opd_filtering_prompts' stage is
+    entered with a callable progress that advances."""
+    import contextlib
+
+    calls = []
+
+    @contextlib.contextmanager
+    def _fake_liveness(stage, progress=None):
+        calls.append((stage, progress))
+        yield
+
+    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None, liveness=_fake_liveness)
+    with pytest.raises(RuntimeError):  # all-skip -> no trained step, but filtering ran first
+        opd_mod.run_opd()
+    filt = [(s, p) for (s, p) in calls if s == "opd_filtering_prompts"]
+    assert filt, f"filter scan must run under a liveness heartbeat; saw {[s for s, _ in calls]}"
+    assert callable(filt[0][1]), "filter heartbeat needs a progress callback, not pure liveness"
+    assert filt[0][1]() >= 1  # progress advanced as prompts were scanned
 
 
 def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
@@ -1161,6 +1219,33 @@ def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
     with pytest.raises(TeacherError) as ei:
         client.score("P", "hi")
     assert ei.value.permanent is False
+
+
+def test_teacher_malformed_200_body_is_transient_teacher_error(monkeypatch):
+    """Regression (codex[bot], teacher.py:65): an HTTP 200 with a non-JSON body must surface as a
+    TRANSIENT TeacherError, not a raw json.JSONDecodeError. A raw decode error escapes _post's except
+    clauses, and _train_one swallows it as an unclassified skip (last_teacher_status stays None), so a
+    run hammered by malformed 200s fails as permanent no-signal instead of retrying as teacher infra."""
+    import flash.engine.worker.teacher as tm
+    from flash.engine.worker.teacher import TeacherError
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"<html>502 Bad Gateway</html>"  # HTTP 200 status, non-JSON body
+
+    monkeypatch.setattr(tm.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+    monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff sleeps
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hi")
+    assert ei.value.permanent is False  # transient -> retried as infra, not permanent no-signal
+    assert "unparseable" in str(ei.value).lower()
 
 
 def test_gkd_loss_skips_empty_student_group_without_crashing():

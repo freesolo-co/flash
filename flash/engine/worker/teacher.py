@@ -74,6 +74,17 @@ class TeacherClient:
                     raise last_err from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = TeacherError(f"teacher transport error on {path}: {e}")
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # HTTP 200 with a malformed / non-JSON body (a flaky proxy or gateway returning an
+                # error page under a 200, a truncated read). The teacher contract is 200 => JSON, so
+                # classify this as TRANSIENT teacher infra: retry in the loop, and if it persists the
+                # exhausted last_err surfaces as a TeacherError -- NOT a raw JSONDecodeError, which
+                # _train_one would swallow as an unclassified skip (last_teacher_status stays None) and
+                # a run hammered by malformed 200s would then fail as permanent no-signal instead of
+                # being retried as teacher infra.
+                last_err = TeacherError(
+                    f"teacher returned HTTP 200 with unparseable body on {path}: {e}"
+                )
             time.sleep(min(2.0 * (2**attempt), 20.0))
         raise last_err or TeacherError(f"teacher call to {path} failed")
 
