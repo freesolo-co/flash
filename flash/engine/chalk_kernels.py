@@ -22,7 +22,6 @@ _KERNELS: list[tuple[str, bool]] = [
     ("trainable_attn_epilogue", True),
     ("fused_embedding", True),
     ("gdn", True),
-    ("fused_mlp", False),  # off: eval-only bf16 MLP forward, not the training activation path
     ("attn_epilogue", False),  # off (eval-only; needs q/k/v out of LoRA)
     ("fp8_frozen_base", False),  # off by default: speed/memory tradeoff, enable only after run A/B
 ]
