@@ -522,8 +522,17 @@ def poll_vast_job(
         return None
 
     def stalled_unless_terminal(detail: str) -> PollResult:
-        # A stall exit still reads the terminal artifacts once — the worker may have just finished.
-        terminal = terminal_artifact_result()
+        # A stall exit still checks for terminal artifacts — the worker may have finished right at the
+        # boundary. Use the BOUNDED read (like the deadline / dead-host / poll-error paths) so a fresh
+        # DONE/marker not yet visible under HF read-after-write lag isn't missed and mis-classified stalled
+        # (which would fail a max_retries=0 run that actually completed, or rent a second box for the seed).
+        terminal = _read_with_retries(
+            terminal_artifact_result,
+            tries=_TERMINAL_AFTER_DEAD_RETRIES,
+            wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+            say=say,
+            message="stall boundary; waiting for HF to expose any terminal DONE/marker before stalled",
+        )
         return terminal if terminal is not None else PollResult(False, failure="stalled", detail=detail)
 
     poll_errors = PollErrorTracker(say, interval_s)
