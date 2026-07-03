@@ -714,9 +714,11 @@ def test_poll_done_waits_for_eventually_consistent_metrics(monkeypatch):
     assert seq["n"] >= 3  # re-read past the initial misses
 
 
-def test_poll_done_without_metrics_eventually_fails(monkeypatch):
-    """The complement: if metrics.json NEVER surfaces (a genuine DONE-without-metrics), the retries are
-    bounded and the poll still classifies job_failed rather than spinning forever."""
+def test_poll_done_without_metrics_is_infra_retryable(monkeypatch):
+    """The complement: if metrics.json NEVER surfaces after the bounded in-line retries, DONE still means
+    the worker SIGNALLED SUCCESS, so the transient HF read gap must NOT hard-fail it as job_failed. It
+    returns the infra-retryable poll_error (mirrors Lambda's finish_ok) — bounded by infra_retries, so it
+    never spins forever, but a successful run gets its infra budget instead of a false terminal failure."""
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
@@ -725,14 +727,15 @@ def test_poll_done_without_metrics_eventually_fails(monkeypatch):
     )
     res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
     assert not res.ok
-    assert res.failure == "job_failed"
+    assert res.failure == "poll_error"  # infra-retryable, not a fast-fail job_failed on a DONE success
     assert "DONE without metrics.json" in res.detail
 
 
 def test_poll_done_with_corrupt_metrics_is_controlled_failure(monkeypatch):
     """A present-but-unparseable metrics.json (a truncated read-after-write / corrupt upload) after DONE
     must NOT escape poll_vast_job as a raw JSONDecodeError — that would abort the run past the teardown
-    finally. It is classified as a controlled job_failed instead (Cursor)."""
+    finally. It is classified as a controlled failure instead (Cursor). Like the DONE-without-metrics
+    case, it is the infra-retryable poll_error (a transient read gap on a DONE success), not job_failed."""
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
@@ -741,7 +744,7 @@ def test_poll_done_with_corrupt_metrics_is_controlled_failure(monkeypatch):
     )
     res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
     assert not res.ok
-    assert res.failure == "job_failed"
+    assert res.failure == "poll_error"  # controlled + infra-retryable, not a raw crash or fast-fail
     assert "unparseable metrics.json" in res.detail
 
 

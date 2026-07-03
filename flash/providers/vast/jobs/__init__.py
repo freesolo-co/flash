@@ -94,7 +94,8 @@ MIN_DISK_GB = 60.0
 _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 
 # A fresh DONE can precede the separately-uploaded metrics.json (HF read-after-write lag). Re-read
-# metrics a few times before failing a DONE-without-metrics, so a success isn't failed on a read gap.
+# metrics a few times before falling back to the infra-retryable poll_error, so a DONE-signalled
+# success isn't hard-failed on a transient read gap (mirrors Lambda's finish_ok behavior).
 _METRICS_AFTER_DONE_RETRIES = 6
 _METRICS_AFTER_DONE_WAIT_S = 5.0
 
@@ -414,7 +415,7 @@ def poll_vast_job(
 
     def finish_ok(done_content: str | None = None, fallback_end_ts: float | None = None) -> PollResult:
         # metrics.json is written before DONE but HF read-after-write lags: re-read a few times before
-        # failing a DONE-without-metrics.
+        # falling back to the poll_error retry on a DONE-without-metrics.
         raw = _read_with_retries(
             lambda: metrics_reader(force=True),
             tries=_METRICS_AFTER_DONE_RETRIES,
@@ -423,14 +424,24 @@ def poll_vast_job(
             message="DONE seen but metrics.json not visible yet; waiting for HF read-after-write",
         )
         if raw is None:
-            return PollResult(False, failure="job_failed", detail="DONE without metrics.json")
+            # DONE means the worker SIGNALLED SUCCESS; an unreadable metrics.json after the in-line
+            # retries is a transient HF read-after-write gap, not a worker error. Mirror Lambda
+            # (lambdalabs finish_ok -> poll_error): don't fast-fail a successful run as job_failed —
+            # return the infra-retryable poll_error so it gets its bounded infra budget (never a
+            # forever-spin: poll_error is capped by infra_retries) instead of a hard terminal failure.
+            return PollResult(
+                False, failure="poll_error", detail="DONE without metrics.json (transient HF read)"
+            )
         try:
             metrics = json.loads(raw)
         except ValueError:
             # A present-but-unparseable metrics.json (truncated read-after-write / corrupt) must NOT
-            # escape the poll loop as a raw JSONDecodeError and abort the run — classify it like a
-            # DONE-without-metrics so the teardown finally still runs.
-            return PollResult(False, failure="job_failed", detail="DONE with unparseable metrics.json")
+            # escape the poll loop as a raw JSONDecodeError and abort the run past the teardown finally.
+            # It is the same transient read-after-write gap on a DONE-signalled success, so classify it
+            # exactly like the DONE-without-metrics case above: infra-retryable poll_error, not job_failed.
+            return PollResult(
+                False, failure="poll_error", detail="DONE with unparseable metrics.json (transient HF read)"
+            )
         # Instance wall note anchors to the worker's DONE ts, else the ok-marker's completion ts (so a
         # delayed recovery isn't measured as runtime), else now; adopt only if in [launch, now]. The
         # customer-facing cost below uses the worker training wall only.
