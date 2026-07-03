@@ -20,6 +20,10 @@ from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
     FIRST_LIVENESS_S,
+    LOAD_TIMEOUT_S,
+    PROVISION_GRACE_S,
+    SETUP_GRACE_S,
+    STALL_AFTER_S,
     PollErrorTracker,
     heartbeat_progress_ts,
     is_training_heartbeat,
@@ -41,11 +45,9 @@ from flash.providers.lambdalabs.jobs.builders import (
 
 logger = get_logger(__name__)
 
-LOAD_TIMEOUT_S = 900.0
-# Setup grace covers Docker pull + pip + model download (no heartbeat until training starts).
-SETUP_GRACE_S = 3000.0
-STALL_AFTER_S = 1500.0
-PROVISION_GRACE_S = 3000.0
+# LOAD_TIMEOUT_S / SETUP_GRACE_S / STALL_AFTER_S / PROVISION_GRACE_S are the shared instance-poll timing
+# defaults imported from ``_poll`` above (setup grace covers Docker pull + pip + model download, before
+# any heartbeat). Kept as module globals here so ``monkeypatch.setattr(jobs, …)`` still takes effect.
 
 _METRICS_READ_RETRIES = 3
 _METRICS_READ_BACKOFF_S = 2.0

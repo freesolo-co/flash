@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
+from flash.providers._instance import (
+    InstanceJobHandle,
+    instance_label,
+    label_matches_run,
+    run_label_prefix,
+)
 from flash.providers._instance import (
     build_payload as _shared_build_payload,
 )
 from flash.providers._instance import (
     build_user_data as _shared_build_user_data,
-)
-from flash.providers._instance import (
-    instance_label,
-    label_matches_run,
-    run_label_prefix,
 )
 
 __all__ = [
@@ -40,43 +42,39 @@ class LambdaInstance:
 
 
 @dataclass
-class LambdaJobHandle:
-    """Persisted in RunStatus.remote so any process can reattach/cancel (cf. base.JobHandle)."""
+class LambdaJobHandle(InstanceJobHandle):
+    """Persisted in RunStatus.remote so any process can reattach/cancel (cf. base.JobHandle).
 
-    instance_id: str
+    Extends the shared ``InstanceJobHandle`` with Lambda's region/instance-type locator fields; the
+    common fields + (de)serialization live on the base.
+    """
+
     instance_type: str
     region: str
     name: str
-    gpu: str
-    hourly_usd: float
-    attempt: int
-    started_ts: float
 
-    def to_dict(self) -> dict:
+    provider: ClassVar[str] = "lambda"
+
+    @staticmethod
+    def _coerce_instance_id(raw) -> str:
+        # A Lambda instance_id is an opaque string; the base guard still turns a MISSING one into a
+        # clear "corrupt lambda handle" error rather than a bare KeyError that crashes recovery.
+        return str(raw)
+
+    def _extra_to_dict(self) -> dict:
         return {
-            "provider": "lambda",
-            "instance_id": self.instance_id,
             "instance_type": self.instance_type,
             "region": self.region,
             "name": self.name,
-            "gpu": self.gpu,
-            "hourly_usd": self.hourly_usd,
-            "attempt": self.attempt,
-            "started_ts": self.started_ts,
         }
 
-    @classmethod
-    def from_dict(cls, d: dict) -> LambdaJobHandle:
-        return cls(
-            instance_id=str(d["instance_id"]),
-            instance_type=str(d.get("instance_type") or ""),
-            region=str(d.get("region") or ""),
-            name=str(d.get("name") or ""),
-            gpu=str(d.get("gpu") or ""),
-            hourly_usd=float(d.get("hourly_usd") or 0),
-            attempt=int(d.get("attempt") or 0),
-            started_ts=float(d.get("started_ts") or 0),
-        )
+    @staticmethod
+    def _extra_from_dict(d: dict) -> dict:
+        return {
+            "instance_type": str(d.get("instance_type") or ""),
+            "region": str(d.get("region") or ""),
+            "name": str(d.get("name") or ""),
+        }
 
 
 def lambda_image(gpu: str | None = None) -> str:

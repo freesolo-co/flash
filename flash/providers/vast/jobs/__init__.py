@@ -36,6 +36,10 @@ from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
     FIRST_LIVENESS_S,
+    LOAD_TIMEOUT_S,
+    PROVISION_GRACE_S,
+    SETUP_GRACE_S,
+    STALL_AFTER_S,
     PollErrorTracker,
     heartbeat_progress_ts,
     is_training_heartbeat,
@@ -67,18 +71,10 @@ logger = get_logger(__name__)
 # host-uptime score: 0.995 (~1-in-200) nearly eliminates mid-run host deaths while keeping supply usable.
 RELIABILITY_FLOOR = 0.995
 MIN_INET_MBPS = 200.0
-# How long an instance may sit in a non-running state (image pull) before we give up and retry.
-LOAD_TIMEOUT_S = 900.0
-# No-progress window once the container is running. The cold start (per-run pip install + base-model
-# download) emits no TRAINING heartbeat, so until one arrives we allow the larger SETUP_GRACE_S; after
-# it, the tight STALL_AFTER_S. This staged grace is the fix for the historical "Vast box dies every
-# ~25-30 min": the old provider used one flat 1500s window that fired mid cold-start and tore down
-# healthy boxes.
-SETUP_GRACE_S = 3000.0
-STALL_AFTER_S = 1500.0
-# Provision + cold-start grace added to the run's wall cap for the client-side poll deadline (Vast has
-# no server-side execution timeout). Matches Lambda's instance grace.
-PROVISION_GRACE_S = 3000.0
+# LOAD_TIMEOUT_S / SETUP_GRACE_S / STALL_AFTER_S / PROVISION_GRACE_S are the shared instance-poll timing
+# defaults imported from ``_poll`` above. The staged setup-vs-training grace is the fix for the historical
+# "Vast box dies every ~25-30 min": the old provider used one flat 1500s window that fired mid cold-start
+# and tore down healthy boxes. Kept as module globals here so ``monkeypatch.setattr(jobs, …)`` still bites.
 # Boards under-report VRAM vs class nominal (L4 23034/24GB, A40 46068/48GB ≈ 0.938). The server-side
 # gpu_ram filter gets this slack; the class gate (vast_gpu_for_offer) stays exact.
 _SEARCH_VRAM_SLACK = 0.92
