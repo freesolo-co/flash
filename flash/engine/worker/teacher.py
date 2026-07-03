@@ -225,6 +225,24 @@ class TeacherClient:
                     f"teacher echo response token_logprobs has a non-finite value: {lp!r}",
                     permanent=True,
                 )
+        # The echoed tokens must TILE the whole input string. The final token (i == n-1) has no
+        # successor offset, so the emit loop below falls its end back to len(full). If the echo is
+        # TRUNCATED -- a malformed 200 whose equal-length arrays omit a SUFFIX of `full` -- that fallback
+        # stretches the last RETURNED token across text the teacher never echoed, assigning its logprob
+        # to a fabricated span (and, when that last token actually sits in the prompt, dragging it across
+        # the prompt/completion boundary so it is KEPT with a bogus completion span). The token text is
+        # the literal echoed substring, so offsets[n-1] + len(tokens[n-1]) is where the echo really ends;
+        # if that is short of len(full), the echo did not cover the input -- reject as PERMANENT before
+        # the fallback fabricates a span (codex[bot]).
+        if tokens:
+            last_end = int(offsets[n - 1]) + len(str(tokens[n - 1]))
+            if last_end < full_len:
+                raise TeacherError(
+                    f"teacher echo is truncated: the last echoed token ends at char {last_end} but "
+                    f"the input is {full_len} chars — the echo did not cover the full "
+                    "prompt+completion, so the final-token span would be fabricated.",
+                    permanent=True,
+                )
         out: list[TeacherToken] = []
         for i in range(n):
             start = int(offsets[i])
@@ -259,5 +277,19 @@ class TeacherClient:
                     start=max(0, start - plen),
                     end=end - plen,
                 )
+            )
+        # A non-empty completion must produce at least one completion-region teacher token. An empty
+        # `out` means every returned token fell ENTIRELY in the prompt (end <= plen) -- a prompt-only /
+        # no-completion-token echo. The caller (_train_one) would otherwise mark this teacher call "ok"
+        # (it returned without error) yet get no gkd signal from it, so a persistently prompt-only teacher
+        # burns every OPD step before the generic no-signal failure instead of aborting on the first bad
+        # echo. Reject as a PERMANENT contract break (codex[bot]). This is the downstream backstop to the
+        # tiling check above: a covering echo of a non-empty completion always yields a completion token,
+        # so in practice the truncation guard fires first, but this keeps the invariant explicit.
+        if completion_text.strip() and not out:
+            raise TeacherError(
+                "teacher echo returned no completion-region tokens for a non-empty completion "
+                f"({len(completion_text)} chars); the echo scored only prompt context.",
+                permanent=True,
             )
         return out

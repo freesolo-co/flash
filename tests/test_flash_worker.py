@@ -51,6 +51,29 @@ def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
+def test_build_worker_env_opd_uses_expandable_allocator(monkeypatch):
+    """Regression (codex[bot]): OPD has NO vLLM sleep engine (that's GRPO-only) and allocates large HF
+    generate/logit tensors like SFT, so it must get the anti-fragmentation expandable allocator — NOT
+    the sleep-safe non-expandable RL conf. OPD was previously lumped with RL (`not in ("sft",)`) and
+    fragmented / OOM'd on a GPU the VRAM estimate said would fit. GRPO stays non-expandable."""
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
+
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    opd_spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(steps=10, hf_repo="owner/runs"),
+    )
+    env = build_worker_env(opd_spec, 0)
+    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+    # GRPO still ships the sleep-safe non-expandable conf (unchanged by this fix).
+    grpo_env = build_worker_env(_spec(), 0)
+    assert "expandable_segments" not in grpo_env["PYTORCH_CUDA_ALLOC_CONF"]
+
+
 def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
     """flash is fully managed: reward-judge creds and the judge-model id are NOT hardcoded
     control-plane forwards. An env that needs a judge provider key declares it as an

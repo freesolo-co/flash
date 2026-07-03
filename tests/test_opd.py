@@ -1154,9 +1154,11 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
 
 def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     """Regression (codex[bot], opd.py): when every prompt exceeds the context budget the run fails
-    deterministically — and that guard must fire BEFORE _student_model, which for a VL warm-start
-    downloads the base and MERGES the SFT into it. Otherwise a misconfigured dataset pays for a full
-    model load before failing. Trip if _student_model is reached."""
+    deterministically — and that guard must fire BEFORE _student_model (which for a VL warm-start
+    downloads the base and MERGES the SFT into it) AND before prefetch_model (the tens-of-GB base
+    snapshot download), which is now deferred until after the pool is confirmed non-empty. Otherwise a
+    misconfigured dataset pays for a full download + model load before failing. Trip if _student_model
+    is reached, and assert prefetch_model was never called."""
     pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
 
@@ -1175,6 +1177,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         dataset=lambda: [{"q": "a"}, {"q": "b"}],
         prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
     )
+    prefetched: list = []
     fake_w = SimpleNamespace(
         require_active_env=lambda: env,
         JOB_SPEC=SimpleNamespace(
@@ -1185,7 +1188,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         THINKING=False,
         SEED=0,
         heartbeat=lambda stage, **kw: None,
-        prefetch_model=lambda mid: 0.0,
+        prefetch_model=lambda mid: (prefetched.append(mid), 0.0)[1],
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -1229,6 +1232,9 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     # escape pytest.raises(RuntimeError) and fail the test (its "before the fix" behavior).
     with pytest.raises(RuntimeError, match="every prompt exceeds"):
         opd_mod.run_opd()
+    # ...and the base-weight prefetch must have been deferred: an all-over-budget dataset fails without
+    # paying for the tens-of-GB snapshot download (codex[bot]).
+    assert prefetched == [], "prefetch_model must not run when every prompt is over budget"
 
 
 def test_student_model_accepts_vl_warmstart_without_raising(monkeypatch):
@@ -1846,6 +1852,50 @@ def test_teacher_score_rejects_non_numeric_or_nonfinite_logprobs_as_permanent(mo
     toks = client.score("P", "hi")
     assert toks  # completion token survives; null prompt logprob dropped
     assert toks[0].logprob == -0.5
+
+
+def test_teacher_score_rejects_truncated_echo_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): a malformed 200 with equal-length arrays can still OMIT a
+    suffix of `full`. The final token's end falls back to len(full), so a truncated echo stretches the
+    last returned token across text the teacher never scored (and, if that token sits in the prompt,
+    drags it across the boundary into the completion) — a fabricated span. The echoed tokens must tile
+    the whole input, so a last token whose own text ends short of len(full) is rejected as PERMANENT.
+    prompt 'P' (plen 1) + 'hello' = 'Phello' (len 6); an echo of only ['P','h'] ends at char 2."""
+    from flash.engine.worker.teacher import TeacherError
+
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", "h"],  # covers only "Ph"; omits "ello"
+                    "token_logprobs": [0.0, -0.5],
+                    "text_offset": [0, 1],
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hello")
+    assert ei.value.permanent is True
+    assert "truncated" in str(ei.value).lower()
+
+
+def test_teacher_score_rejects_echo_with_no_completion_tokens_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): an echo that yields NO completion-region token for a
+    non-empty completion (here the degenerate empty-arrays 200) scored nothing to distil; score() must
+    reject it as PERMANENT instead of returning an empty list that _train_one marks "ok" and then burns
+    every OPD step on no signal before the generic no-trained-step failure."""
+    from flash.engine.worker.teacher import TeacherError
+
+    payload = {"choices": [{"logprobs": {"tokens": [], "token_logprobs": [], "text_offset": []}}]}
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hi")
+    assert ei.value.permanent is True
+    assert "no completion-region tokens" in str(ei.value).lower()
 
 
 def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkeypatch):

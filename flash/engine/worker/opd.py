@@ -354,7 +354,9 @@ def run_opd():
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    download_seconds = _w.prefetch_model(model_id)
+    # Tokenizer only (a few small files) up front -- the prompt-budget filter below needs it. The FULL
+    # base-weight prefetch (tens of GB) is deferred until AFTER the filter confirms a non-empty pool, so
+    # a dataset whose every prompt is over-budget fails fast without paying for the download (codex[bot]).
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -439,6 +441,11 @@ def run_opd():
             f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
             f"{prompt_budget}-token budget; pool = {len(examples)}"
         )
+
+    # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
+    # setup so an all-over-budget dataset fails before this download). Still inside the setup phase
+    # (opt_steps==0 -> wide poller grace), same as when it ran earlier.
+    download_seconds = _w.prefetch_model(model_id)
 
     # Seed torch/CUDA BEFORE constructing the student LoRA: get_peft_model samples the LoRA A matrix
     # (init_lora_weights=True) from the torch default generator, so seeding must precede _student_model

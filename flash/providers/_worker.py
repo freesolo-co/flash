@@ -193,12 +193,16 @@ def build_worker_env(
     runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
     """Per-run env passed to the worker (platform creds + recipe overrides)."""
-    # RL uses a non-expandable alloc conf: expandable_segments crashes GRPO vLLM sleep mode.
-    # Worker upgrades to expandable when it resolves sleep=OFF (finalize_alloc_conf_for_sleep).
-    _is_rl = str(getattr(spec, "algorithm", "")).lower() not in ("sft",)
+    # GRPO uses a non-expandable alloc conf: expandable_segments crashes the vLLM sleep-mode engine.
+    # The worker upgrades RL to expandable when it resolves sleep=OFF (finalize_alloc_conf_for_sleep).
+    # SFT and OPD have NO vLLM sleep engine and allocate large HF generate/logit tensors, so both take
+    # the anti-fragmentation expandable allocator up front: OPD was previously lumped in with RL here
+    # (`not in ("sft",)`) and ran non-expandable despite having no sleep engine, so a long-completion /
+    # large-vocab OPD job fragmented and OOM'd on a GPU the VRAM estimate said would fit (codex[bot]).
+    _needs_nonexpandable = str(getattr(spec, "algorithm", "")).lower() not in ("sft", "opd")
     _alloc_conf = (
         "garbage_collection_threshold:0.8,max_split_size_mb:256"
-        if _is_rl
+        if _needs_nonexpandable
         else "expandable_segments:True"
     )
     env: dict[str, str] = {
