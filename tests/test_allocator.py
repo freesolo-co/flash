@@ -324,6 +324,41 @@ def test_required_vram_sft_small_model_includes_big_vocab_logits():
     assert n_fused < n_short  # the fused CE removes the logits term at >= 2048 ctx
 
 
+def test_required_vram_sft_uses_chalk_model_support_gate():
+    import math
+
+    from flash.catalog import MODELS, vocab_size_for
+    from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
+
+    mid = "openbmb/MiniCPM5-1B"
+    info = MODELS[mid]
+    train = {"max_length": 4096, "batch_size": 4}
+    need = model_required_vram_gb(mid, "sft", train=train, headroom=1.0)
+    unfused = math.ceil(
+        estimate_vram_gb(
+            info.params_b,
+            "sft",
+            seq_len=train["max_length"],
+            batch_size=train["batch_size"],
+            vocab=vocab_size_for(mid),
+            sft_fused_ce=False,
+        )
+    )
+    fused = math.ceil(
+        estimate_vram_gb(
+            info.params_b,
+            "sft",
+            seq_len=train["max_length"],
+            batch_size=train["batch_size"],
+            vocab=vocab_size_for(mid),
+            sft_fused_ce=True,
+        )
+    )
+
+    assert need == unfused
+    assert need > fused
+
+
 def test_sft_equation_covers_honest_peak_across_seq_boundary():
     """Boundary regression: for EVERY catalog SFT model across the seq grid (straddling the 2048
     Liger threshold) x batch x rank, the equation must reserve >= the INDEPENDENT honest peak (incl.
