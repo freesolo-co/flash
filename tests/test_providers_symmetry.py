@@ -1,8 +1,15 @@
 """Provider registry + ``base.Provider`` interface coverage (CPU-only, offline).
 
 RunPod (always on) and the instance-based complements — Lambda (opt-in via LAMBDA_API_KEY) and
-Vast (opt-in via VAST_API_KEY) — all implement the SAME ``base.Provider`` interface
-behind the SAME module layout, so the orchestrator/allocator treat them interchangeably."""
+Vast (opt-in via VAST_API_KEY) — all implement the SAME ``base.Provider`` interface, so the
+orchestrator/allocator treat them interchangeably.
+
+Every provider carries the universal per-substrate surface below (``PROVIDER_MODULES``). Modules
+that only SOME providers need are divergence-driven, not part of the contract: ``gpus`` exists only
+where a provider translates friendly names to substrate ids (RunPod validated classes, Lambda's
+``instance_type_for``) — instance providers otherwise draw ``gpu_classes`` from the shared
+``base.gpu_classes_for``; ``train`` exists only for RunPod's serverless endpoint-deploy machinery
+(instance providers submit through ``jobs`` directly)."""
 
 from __future__ import annotations
 
@@ -10,7 +17,9 @@ import importlib
 
 import pytest
 
-PROVIDER_MODULES = ("api", "auth", "pricing", "gpus", "jobs", "train", "preflight")
+# The universal per-provider surface: concerns every substrate must implement itself (no shared
+# default fits). ``gpus``/``train`` are intentionally NOT here — they're per-provider by necessity.
+PROVIDER_MODULES = ("api", "auth", "pricing", "jobs", "preflight")
 PROVIDER_METHODS = (
     "is_configured",
     "preflight",
