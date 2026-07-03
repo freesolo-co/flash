@@ -115,9 +115,16 @@ class ModelInfo:
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
+# The pre-quantized FP8 checkpoint each base model's serving engine LOADS (mirrors serving's
+# ``src.prequant_config``). Every dense model now serves a Freesolo-OWNED FP8_DYNAMIC checkpoint (no
+# community-repo dependence); the 35B VL MoE serves the OFFICIAL Qwen FP8 (it preserves the full
+# vision-language model). Informational for the catalog mirror — deploy gating reads only max_lora_rank.
 SERVING_FP8_MODEL_REPOS: dict[str, str] = {
-    "Qwen/Qwen3.5-4B": "lovedheart/Qwen3.5-4B-FP8",
-    "Qwen/Qwen3.5-9B": "lovedheart/Qwen3.5-9B-FP8",
+    "openbmb/MiniCPM5-1B": "Freesolo-Co/MiniCPM5-1B-FP8",
+    "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
+    "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
+    "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
+    "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B-FP8",
 }
 
@@ -133,9 +140,10 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
             gpu="L4",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["openbmb/MiniCPM5-1B"],
             max_loras=16,
-            max_lora_rank=64,
-            max_model_len=32768,
+            max_lora_rank=128,
+            max_model_len=8192,
         ),
         thinking="hybrid",
         notes="On-device class SLM (131k ctx); standard Llama architecture.",
@@ -151,9 +159,10 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
             gpu="L4",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-0.8B"],
             max_loras=16,
-            max_lora_rank=64,
-            max_model_len=32768,
+            max_lora_rank=128,
+            max_model_len=8192,
         ),
         thinking="hybrid",
         notes="Smallest Qwen3.5; cheap smoke/dev runs with the modern arch.",
@@ -169,9 +178,10 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
             gpu="L4",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-2B"],
             max_loras=16,
-            max_lora_rank=64,
-            max_model_len=32768,
+            max_lora_rank=128,
+            max_model_len=8192,
         ),
         thinking="hybrid",
     ),
@@ -187,8 +197,8 @@ MODELS: dict[str, ModelInfo] = {
         serving=ServingCapacity(
             gpu="L4",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-4B"],
-            max_loras=64,
-            max_lora_rank=32,
+            max_loras=16,
+            max_lora_rank=64,
             max_model_len=8192,
             max_num_seqs=8,
             gpu_memory_utilization=0.98,
@@ -212,8 +222,8 @@ MODELS: dict[str, ModelInfo] = {
         serving=ServingCapacity(
             gpu="L4",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-9B"],
-            max_loras=44,
-            max_lora_rank=32,
+            max_loras=16,
+            max_lora_rank=64,
             max_model_len=8192,
             max_num_seqs=8,
             gpu_memory_utilization=0.98,
@@ -250,8 +260,11 @@ MODELS: dict[str, ModelInfo] = {
         serving=ServingCapacity(
             gpu="A100-80GB",
             serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
-            max_loras=12,
-            max_lora_rank=32,
+            # rank-64 at only 6 hot slots: the fused-MoE LoRA buffer scales with
+            # max_loras x rank x num_experts, so the A100-80GB ceiling is ~max_loras x rank = 384
+            # (6 x 64 fits at 99.3% util; 16 x 64 OOMs on every single/multi GPU). Serving-validated.
+            max_loras=6,
+            max_lora_rank=64,
             max_model_len=8192,
             max_num_seqs=8,
             max_num_batched_tokens=4096,
