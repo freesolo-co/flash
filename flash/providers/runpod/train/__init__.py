@@ -10,6 +10,7 @@ from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.runpod.train.deps import (  # noqa: F401
     DEFAULT_CHALK_SPEC,
     DEFAULT_EXECUTION_TIMEOUT_MS,
+    LATEST_CHALK_MAIN_SHA,
     WORKER_DEPS,
     WORKER_IMAGE,
     WORKER_SYSTEM_DEPS,

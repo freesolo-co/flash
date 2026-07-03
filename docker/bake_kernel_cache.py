@@ -100,16 +100,16 @@ def main() -> int:
     entry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bake_pod_entry.py")
     allowed_cuda = [v.strip() for v in args.allowed_cuda.split(",") if v.strip()] or None
 
-    # the chalk install spec the production worker uses (so the bake warms chalk's kernels too);
-    # FLASH_CHALK_SPEC overrides, else the source-of-truth DEFAULT_CHALK_SPEC, else a safe literal.
+    # The chalk install spec the production worker uses, so the bake warms the same kernels. Keep the
+    # default import fail-loud: a stale hidden fallback would silently bake against the wrong chalk SHA.
     chalk_spec = os.environ.get("FLASH_CHALK_SPEC", "").strip()
     if not chalk_spec:
         try:
             from flash.providers.runpod.train.deps import DEFAULT_CHALK_SPEC
 
             chalk_spec = DEFAULT_CHALK_SPEC
-        except Exception:
-            chalk_spec = "freesolo-chalk>=0.1.0,<0.2.0"
+        except Exception as exc:
+            raise RuntimeError("could not import DEFAULT_CHALK_SPEC for kernel-cache bake") from exc
 
     _upload_flash_code(api, repo, token)
 
