@@ -452,6 +452,157 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     )
 
 
+def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, group=1):
+    """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
+    loop and install the caller's _train_one stub. Returns the opd module."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+        pad_token_id = 0
+
+        def apply_chat_template(self, messages, **kw):
+            return "PROMPT"
+
+        def __call__(self, text, add_special_tokens=False):
+            return SimpleNamespace(input_ids=[1, 2])
+
+    class _Model(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=4, V=8)
+            self.config = SimpleNamespace(use_cache=False)
+
+    env = SimpleNamespace(
+        dataset=lambda: [{"q": "a"}],
+        prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
+    )
+    fake_w = SimpleNamespace(
+        require_active_env=lambda: env,
+        JOB_SPEC=SimpleNamespace(
+            train=SimpleNamespace(init_from_adapter=""),
+            model="fake/model",
+            gpu=SimpleNamespace(type=None),
+        ),
+        THINKING=False,
+        SEED=0,
+        heartbeat=(
+            (lambda stage, **kw: beats.append((stage, kw)))
+            if beats is not None
+            else (lambda stage, **kw: None)
+        ),
+        prefetch_model=lambda mid: 0.0,
+        hf_resume_checkpoint=lambda: "",
+        publish_deployable_checkpoint=lambda *a, **k: None,
+        hf_upload_folder=lambda *a, **k: None,
+        write_train_meta=lambda **k: None,
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: {
+            "teacher_model": "accounts/fireworks/models/glm-5p2",
+            "teacher_base_url": "http://teacher.invalid",
+            "steps": steps,
+            "learning_rate": 1e-4,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "max_completion": 8,
+            "prompts_per_step": 1,
+            "group_size": group,
+            "kl_coef": 1.0,
+            "save_every": 0,
+            "max_length": 0,
+            "stop_sequences": (),
+        },
+    )
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: _Model())
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(opd_mod, "_train_one", train_one)
+    if liveness is not None:
+        monkeypatch.setattr(opd_mod, "liveness_heartbeat", liveness)
+    import transformers
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok())
+    import flash.engine.worker.teacher as tmod
+
+    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
+    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+    return opd_mod
+
+
+def test_opd_rejects_multi_turn_and_tool_environments(monkeypatch):
+    """Regression (codex[bot], opd.py): opd samples one completion per prompt and cannot drive the
+    turn/tool loop, so it must fail fast on a multi-turn or tool-calling env instead of silently
+    distilling only the first assistant turn."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from flash.engine.worker import opd as opd_mod
+
+    for attr in ("multi_turn", "is_tool_env"):
+        env = SimpleNamespace(**{attr: True})
+        monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(require_active_env=lambda e=env: e))
+        with pytest.raises(RuntimeError, match="multi-turn or tool"):
+            opd_mod.run_opd()
+
+
+def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
+    """Regression (codex[bot], opd.py): opd must hand liveness_heartbeat a progress callback (parity
+    with sft/rl) so its thread emits REAL progress on sample advance instead of pure liveness=true
+    pings that share — and can starve — the opd_step upload throttle. Confirm the progress arg is a
+    callable that reflects the monotonic sample count."""
+    import contextlib
+
+    captured = {}
+
+    @contextlib.contextmanager
+    def _fake_liveness(stage, progress=None):
+        captured["stage"] = stage
+        captured["progress"] = progress
+        yield
+
+    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None, liveness=_fake_liveness)
+    with pytest.raises(RuntimeError):  # all-skip -> no trained step
+        opd_mod.run_opd()
+    assert captured["stage"] == "opd_step"
+    assert callable(captured["progress"]), "opd must pass a progress callback to liveness_heartbeat"
+    # 1 step x 1 prompt x 1 group = 1 _train_one call -> samples_seen advanced to 1.
+    assert captured["progress"]() == 1
+
+
+def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
+    """Regression (codex[bot], opd.py): a run where EVERY teacher.score fails transiently (a Fireworks
+    outage spanning the run) and none succeed must raise a RetriableInfraError so the supervisor
+    retries — not a plain RuntimeError, which it treats as permanent. A no-signal run where the
+    teacher DID respond (but alignment yielded nothing) stays a permanent RuntimeError."""
+    from flash.engine.worker.perf import RetriableInfraError
+
+    def _all_transient(**k):
+        _all_transient.last_teacher_status = "transient"
+        return
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_all_transient)
+    with pytest.raises(RetriableInfraError, match="failed transiently"):
+        opd_mod.run_opd()
+
+    # contrast: teacher responded ("ok") but no loss -> permanent RuntimeError, NOT retriable.
+    def _ok_no_align(**k):
+        _ok_no_align.last_teacher_status = "ok"
+        return
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_ok_no_align)
+    with pytest.raises(RuntimeError) as ei:
+        opd_mod.run_opd()
+    assert not isinstance(ei.value, RetriableInfraError)
+    assert "no trained step" in str(ei.value)
+
+
 def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     """Regression (codex[bot], opd.py): _student_model builds the LoRA via get_peft_model, which
     samples the LoRA A matrix (init_lora_weights=True) from the torch default generator. run_opd must

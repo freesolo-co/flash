@@ -28,6 +28,7 @@ from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.perf import (
+    RetriableInfraError,
     free_gpu,
     gpu_diagnostics,
     grad_checkpointing_on,
@@ -117,7 +118,7 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     while i < len(ids):
         j = i
         # Grow the window over a split multi-byte char, decoding ONLY the window from the current
-        # boundary (ids[i:j+1]) \u2014 never the whole prefix ids[:j+1] \u2014 so total decoding is O(len), not
+        # boundary (ids[i:j+1]) -- never the whole prefix ids[:j+1] -- so total decoding is O(len), not
         # O(len^2) (reported by codex[bot]; the quadratic bites once max_tokens raises completions to
         # 1000s of tokens). A byte-level tokenizer renders an INCOMPLETE char as a trailing U+FFFD that
         # is NOT the real char at completion_text[prev:]; a genuine U+FFFD the model emitted DOES match
@@ -247,6 +248,17 @@ def run_opd():
     from flash.engine.worker.teacher import TeacherClient
 
     env = _w.require_active_env()
+    if getattr(env, "multi_turn", False) or getattr(env, "is_tool_env", False):
+        # opd distills a SINGLE model.generate() over env.prompt_messages() and never drives the
+        # turn loop (env.new_rollout_state / env.env_reply) or hands tool schemas to generation — GRPO
+        # does, in rl.py. On a multi-turn / tool-calling env opd would silently distill only the FIRST
+        # assistant turn, so fail fast at setup (before any GPU work) rather than train a wrong
+        # objective. (Reported by codex[bot]; drop this guard once opd implements the rollout path.)
+        raise RuntimeError(
+            "opd does not support multi-turn or tool-calling environments yet: it samples one "
+            "completion per prompt and cannot drive the turn/tool loop, so it would distill only "
+            "the first assistant turn. Use grpo for this environment, or a single-turn env for opd."
+        )
     t_start = time.time()
     _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     knobs = _resolve_opd_knobs()
@@ -408,8 +420,19 @@ def run_opd():
     if _reset_peak:
         _reset_peak()
 
+    # Monotonic count of student samples ATTEMPTED (generate+score), across all steps. Fed to
+    # liveness_heartbeat as its progress signal so the liveness thread emits a REAL (non-liveness)
+    # opd_step heartbeat whenever a sample advances — parity with sft/rl. Without a progress callback
+    # opd's liveness thread emitted only liveness=True pings that share the opd_step upload-throttle
+    # slot and could suppress the main thread's per-sample progress uploads (codex[bot]).
+    samples_seen = 0
+    # No-signal accounting: distinguish a run that trained nothing because the TEACHER was down
+    # (transient) from one where scoring succeeded but never aligned — the former is retriable infra.
+    teacher_ok = 0
+    teacher_transient = 0
+
     t_train = time.time()
-    with liveness_heartbeat("opd_step"):
+    with liveness_heartbeat("opd_step", progress=lambda: samples_seen):
         for step in range(steps):
             batch = [examples[(step * ppl_step + i) % len(examples)] for i in range(ppl_step)]
             accum_target = max(1, ppl_step * group)
@@ -446,6 +469,12 @@ def run_opd():
                         knobs=knobs,
                         torch=torch,
                     )
+                    samples_seen += 1  # advances the liveness-thread progress signal
+                    _t_status = getattr(_train_one, "last_teacher_status", None)
+                    if _t_status == "ok":
+                        teacher_ok += 1
+                    elif _t_status == "transient":
+                        teacher_transient += 1
                     if loss is None:
                         # Refresh the stall clock even when a sample yields no teacher signal. The
                         # success ping below is the only NON-liveness opd_step heartbeat, so a step
@@ -516,6 +545,16 @@ def run_opd():
 
     train_wall = time.time() - t_train
     if not loss_curve:
+        if teacher_ok == 0 and teacher_transient > 0:
+            # No sample ever got a teacher score and every failure was a RETRYABLE outage (5xx /
+            # timeout / rate-limit): a Fireworks outage that happened to span the whole run. Raise a
+            # retriable infra error so the supervisor RETRIES (the run isn't broken), instead of the
+            # plain RuntimeError below, which it treats as permanent (codex[bot]).
+            raise RetriableInfraError(
+                f"opd produced no trained step: all {teacher_transient} teacher scoring calls "
+                "failed transiently (0 succeeded) — a Fireworks outage/rate-limit spanning the run. "
+                "Retrying."
+            )
         raise RuntimeError(
             "opd produced no trained step — every teacher scoring call failed or aligned to "
             "zero positions. Check FIREWORKS_API_KEY and the teacher model id. Failing loudly "
@@ -580,6 +619,9 @@ def _train_one(
     _train_one.last_coverage = 0.0
     _train_one.last_gen_tokens = 0
     _train_one.last_teacher_tokens = 0
+    # "ok" once teacher.score returns, "transient" on a retryable teacher outage, else None (teacher
+    # not reached). run_opd uses this to decide whether a no-signal run is a retriable infra failure.
+    _train_one.last_teacher_status = None
 
     # On-policy: the student samples; the teacher echo-scores that exact completion.
     model.eval()
@@ -605,11 +647,15 @@ def _train_one(
     except TeacherError as e:
         if e.permanent:  # bad key / model id / malformed -> abort now, don't burn the whole run
             raise
+        _train_one.last_teacher_status = (
+            "transient"  # retryable outage -> may make the run retriable
+        )
         print(f"[opd] teacher score failed (transient, skipping sample): {e}")
         return None
     except Exception as e:
         print(f"[opd] teacher score failed (skipping sample): {e}")
         return None
+    _train_one.last_teacher_status = "ok"
     _train_one.last_teacher_tokens = len(prompt_ids) + _train_one.last_gen_tokens
 
     student_ids, student_toks = student_tokens_with_offsets(tok, completion_ids, completion_text)
