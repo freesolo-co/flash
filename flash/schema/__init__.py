@@ -8,7 +8,6 @@ import tomllib
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
-from flash.engine.recipe import OPD_ALIGNMENTS
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -197,8 +196,6 @@ _TRAIN_KEYS = frozenset(
         "max_examples",
         # on-policy distillation (algorithm="opd")
         "teacher_model",
-        "tokenizer_alignment",
-        "teacher_top_logprobs",
     }
 )
 
@@ -354,10 +351,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
             teacher_model=_train_str(train_raw, "teacher_model"),
-            tokenizer_alignment=_train_str(
-                train_raw, "tokenizer_alignment", choices=OPD_ALIGNMENTS
-            ),
-            teacher_top_logprobs=_train_int(train_raw, "teacher_top_logprobs", minimum=1),
         ),
         gpu=GpuSpec(type=gpu_type),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set

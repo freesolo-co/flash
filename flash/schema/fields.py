@@ -52,21 +52,14 @@ def _train_float(
     return v
 
 
-def _train_str(train_raw: dict, key: str, *, choices: tuple[str, ...] | None = None) -> str:
-    """Validate an optional string [train] knob -> ConfigError. Missing/None -> "" (worker default).
-
-    An empty string is treated as unset (deferred to the recipe default), so a `choices` gate only
-    fires on a non-empty value.
-    """
+def _train_str(train_raw: dict, key: str) -> str:
+    """Validate an optional string [train] knob -> ConfigError. Missing/None -> "" (worker default)."""
     v = train_raw.get(key)
     if v is None:
         return ""
     if not isinstance(v, str):
         raise ConfigError(f"train.{key} must be a string")
-    v = v.strip()
-    if v and choices is not None and v not in choices:
-        raise ConfigError(f"train.{key} must be one of {', '.join(choices)} (got {v!r})")
-    return v
+    return v.strip()
 
 
 def _train_stops(train_raw: dict) -> tuple[str, ...]:

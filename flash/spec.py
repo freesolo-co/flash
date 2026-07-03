@@ -126,9 +126,6 @@ class TrainSpec:
     stop_sequences: tuple[str, ...] = ()
     # On-policy distillation (algorithm="opd"). None/"" => worker resolves the recipe default.
     teacher_model: str = ""
-    # align | seqkd | uld — cross-tokenizer strategy (see docs/on-policy-distillation.md).
-    tokenizer_alignment: str = ""
-    teacher_top_logprobs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -216,8 +213,6 @@ class JobSpec:
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 teacher_model=str(train.get("teacher_model") or ""),
-                tokenizer_alignment=str(train.get("tokenizer_alignment") or ""),
-                teacher_top_logprobs=_opt_int(train.get("teacher_top_logprobs")),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

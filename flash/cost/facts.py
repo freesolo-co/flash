@@ -112,9 +112,8 @@ def reward_seconds_per_completion(override: float | None = None) -> float:
 
 # Approximate Fireworks serverless pricing for the on-policy-distillation GLM teacher, $/1M tokens
 # as (input, output). Static like gpu_hourly_usd so cost estimation is deterministic/offline and
-# needs NO FIREWORKS_API_KEY. Update from https://fireworks.ai/pricing. The default opd strategy
-# (align) scores completions via echo (max_tokens=0) so only INPUT tokens are billed; seqkd also
-# generates teacher targets (output tokens).
+# needs NO FIREWORKS_API_KEY. Update from https://fireworks.ai/pricing. opd echo-scores completions
+# (max_tokens=0), so only INPUT tokens are billed (the teacher never generates).
 TEACHER_USD_PER_1M: dict[str, tuple[float, float]] = {
     "accounts/fireworks/models/glm-5p2": (0.90, 0.90),
     "accounts/fireworks/models/glm-5p1": (0.90, 0.90),

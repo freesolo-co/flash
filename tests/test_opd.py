@@ -1,4 +1,5 @@
-"""On-policy distillation: alignment strategies, teacher client, spec/cost plumbing, loss math.
+"""On-policy distillation (opd): groupwise reverse-KL (gkd) cross-tokenizer alignment, the teacher
+client, spec/cost plumbing, and the loss math.
 
 All CPU-only. The loss-math tests need torch and are skipped where it is unavailable (they run in
 CI, which has the training stack).
@@ -11,88 +12,28 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.teacher import TeacherClient, strip_reasoning
+from flash.engine.worker.teacher import TeacherClient
 from flash.engine.worker.tokenizer_align import (
     StudentToken,
     TeacherToken,
-    align_targets,
-    coverage,
     groupwise_alignment,
     groupwise_coverage,
-    uld_targets,
 )
 
 
-def _teacher(spans):
-    """TeacherToken list from (start, end) spans; logprob = -(index+1), no top-k needed for gkd."""
-    return [
-        TeacherToken(text="", logprob=-(i + 1.0), top=(), start=a, end=b)
-        for i, (a, b) in enumerate(spans)
-    ]
-
-
-# --------------------------------------------------------------------------------------------------
-# tokenizer alignment (the align/uld character-boundary strategies)
-# --------------------------------------------------------------------------------------------------
 def _student(spans):
     return [StudentToken(token_id=i, start=a, end=b) for i, (a, b) in enumerate(spans)]
 
 
-def test_align_projects_teacher_topk_onto_student_vocab():
-    # Student tokens at char 0 and 5; teacher tokens start at the same boundaries -> both align.
-    student = _student([(0, 5), (5, 10)])
-    teacher = [
-        TeacherToken("hello", -0.1, (("hello", -0.1), (" hi", -1.6)), 0, 5),
-        TeacherToken("world", -0.2, (("world", -0.2),), 5, 10),
+def _teacher(spans):
+    """TeacherToken list from (start, end) spans; logprob = -(index+1)."""
+    return [
+        TeacherToken(text="", logprob=-(i + 1.0), start=a, end=b) for i, (a, b) in enumerate(spans)
     ]
-    vocab = {"hello": 100, " hi": 101, "world": 200}
-    tgts = align_targets(student, teacher, lambda s: vocab.get(s))
-    assert coverage(tgts) == 1.0
-    # position 0: two candidates, softmax-weighted and renormalized over the mapped ids.
-    assert set(tgts[0]) == {100, 101}
-    assert tgts[0][100] > tgts[0][101]  # 'hello' had the higher logprob
-    assert abs(sum(tgts[0].values()) - 1.0) < 1e-9
-    assert tgts[1] == {200: 1.0}
-
-
-def test_align_masks_positions_without_a_coincident_teacher_boundary():
-    # Student boundary at char 3 has no teacher token starting there -> masked (None).
-    student = _student([(0, 3), (3, 7)])
-    teacher = [TeacherToken("hello", -0.1, (("hello", -0.1),), 0, 5)]
-    tgts = align_targets(student, teacher, lambda s: {"hello": 1}.get(s))
-    assert tgts[0] is not None  # boundary 0 aligns
-    assert tgts[1] is None  # boundary 3 does not
-    assert coverage(tgts) == 0.5
-
-
-def test_align_masks_when_no_candidate_maps_into_student_vocab():
-    student = _student([(0, 5)])
-    teacher = [TeacherToken("xx", -0.1, (("xx", -0.1),), 0, 5)]
-    tgts = align_targets(student, teacher, lambda s: None)  # nothing maps
-    assert tgts == [None]
-
-
-def test_uld_returns_sorted_normalized_teacher_probs_no_identity():
-    student = _student([(0, 5)])
-    teacher = [TeacherToken("w", -0.2, (("a", -2.0), ("b", -0.1), ("c", -3.0)), 0, 5)]
-    tgts = uld_targets(student, teacher)
-    assert len(tgts) == 1
-    vec = tgts[0]
-    assert vec == sorted(vec, reverse=True)  # descending
-    assert abs(sum(vec) - 1.0) < 1e-9  # normalized over the top-k
-
-
-def test_kd_temperature_flattens_the_target_distribution():
-    student = _student([(0, 5)])
-    teacher = [TeacherToken("w", -0.1, (("a", -0.1), ("b", -2.0)), 0, 5)]
-    sharp = align_targets(student, teacher, lambda s: {"a": 1, "b": 2}.get(s), kd_temperature=1.0)
-    flat = align_targets(student, teacher, lambda s: {"a": 1, "b": 2}.get(s), kd_temperature=5.0)
-    # Higher temperature -> the low-prob candidate gets relatively more mass.
-    assert flat[0][2] > sharp[0][2]
 
 
 # --------------------------------------------------------------------------------------------------
-# gkd groupwise alignment (the default: coarsest common refinement of the two tokenizations)
+# gkd groupwise alignment — the coarsest common refinement of the two tokenizations
 # --------------------------------------------------------------------------------------------------
 def test_gkd_groups_are_one_per_shared_boundary_when_tokenizers_agree():
     # Both tokenizers segment identically -> every student token is its own group.
@@ -114,7 +55,7 @@ def test_gkd_span_grows_across_disagreement_and_covers_every_token():
     assert len(groups) == 1
     assert groups[0][0] == [0, 1]  # both student tokens grouped together
     assert groups[0][1] == -1.0
-    assert groupwise_coverage(groups, len(student)) == 1.0  # NO masking, unlike align/uld
+    assert groupwise_coverage(groups, len(student)) == 1.0  # NO masking
 
 
 def test_gkd_partial_agreement_splits_at_shared_boundaries_only():
@@ -126,10 +67,97 @@ def test_gkd_partial_agreement_splits_at_shared_boundaries_only():
     assert groupwise_coverage(groups, len(student)) == 1.0
 
 
+def test_gkd_merges_leading_student_only_span_so_no_token_is_dropped():
+    # Student starts at char 0 but the first teacher token starts at char 2, so [0,2) is a
+    # student-only span. Those tokens must NOT be dropped — they merge into the first teacher-bearing
+    # group (coverage stays 100%).
+    student = _student([(0, 1), (1, 2), (2, 5)])
+    teacher = _teacher([(2, 5)])
+    groups = groupwise_alignment(student, teacher)
+    assert len(groups) == 1
+    assert groups[0][0] == [0, 1, 2]  # all three student tokens covered
+    assert groupwise_coverage(groups, len(student)) == 1.0
+
+
 def test_gkd_empty_inputs_yield_no_groups():
     assert groupwise_alignment([], _teacher([(0, 1)])) == []
     assert groupwise_alignment(_student([(0, 1)]), []) == []
     assert groupwise_coverage([], 3) == 0.0
+
+
+# --------------------------------------------------------------------------------------------------
+# student tokenization: the loss trains the SAMPLED ids (not a re-tokenization of decoded text)
+# --------------------------------------------------------------------------------------------------
+def test_student_tokens_use_sampled_ids_with_offsets_into_completion_text():
+    from flash.engine.worker.opd import student_tokens_with_offsets
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            # id 1 -> 'h', id 2 -> 'i', id 3 -> a special token that decodes to nothing.
+            m = {1: "h", 2: "i", 3: ""}
+            return "".join(m[i] for i in ids)
+
+    ids, toks = student_tokens_with_offsets(_Tok(), [1, 2, 3], "hi")
+    assert ids == [1, 2, 3]  # SAMPLED ids preserved verbatim — no lossy re-tokenization
+    assert (toks[0].start, toks[0].end) == (0, 1)  # 'h'
+    assert (toks[1].start, toks[1].end) == (1, 2)  # 'i'
+    assert (toks[2].start, toks[2].end) == (2, 2)  # special token -> zero-width span (excluded)
+
+
+def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
+    """Exercise the PRODUCTION caller _train_one end-to-end (the direct-call unit test above can't
+    catch a broken call site). The completion ends in a zero-width eos, so this also pins the
+    coverage denominator: 2 alignable tokens fully covered -> 100%, not 2/3."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    completion_ids = [2, 3, 5]  # 2->'h', 3->'i', 5->eos (in-vocab id, decodes to '')
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            m = {2: "h", 3: "i", 5: ""}
+            return "".join(m[int(x)] for x in ids)
+
+    class _Teacher:
+        def score(self, prompt, completion):  # one teacher token spanning all of "hi"
+            return [TeacherToken(text="hi", logprob=-1.0, start=0, end=2)]
+
+    class _GenLM(_TinyLM):
+        def __init__(self, torch, prompt_len, completion_ids, V):
+            super().__init__(torch, T=prompt_len + len(completion_ids), V=V)
+            self.config = SimpleNamespace(use_cache=True)
+            self._completion = torch.tensor([completion_ids])
+
+        def eval(self):
+            return self
+
+        def train(self):
+            return self
+
+        def generate(self, prompt_tensor, **cfg):
+            return torch.cat([prompt_tensor, self._completion], dim=1)
+
+    model = _GenLM(torch, prompt_len=1, completion_ids=completion_ids, V=8)
+    loss = opd_mod._train_one(
+        model=model,
+        tok=_Tok(),
+        teacher=_Teacher(),
+        device="cpu",
+        prompt_ids=[1],
+        prompt_tensor=torch.tensor([[1]]),
+        prompt_messages=[{"role": "user", "content": "say hi"}],
+        gen_cfg={},
+        knobs={"kl_coef": 1.0},
+        torch=torch,
+    )
+    assert loss is not None
+    assert loss.requires_grad
+    loss.backward()  # the sampled ids reached gkd_loss and produce a real gradient
+    assert model.w.grad is not None
+    assert model.w.grad.abs().sum() > 0
+    # eos is zero-width and joins no group; coverage is over the 2 alignable tokens -> 100%.
+    assert opd_mod._train_one.last_coverage == 1.0
+    assert opd_mod._train_one.last_gen_tokens == 3
 
 
 # --------------------------------------------------------------------------------------------------
@@ -161,7 +189,7 @@ def _mock_urlopen(monkeypatch, payload, capture=None):
     monkeypatch.setattr(tm.urllib.request, "urlopen", fake_urlopen)
 
 
-def test_teacher_score_returns_completion_region_with_rebased_offsets(monkeypatch):
+def test_teacher_score_returns_completion_region_with_rebased_offsets_and_logprobs(monkeypatch):
     # prompt "P: " (len 3) + completion "hi" ; teacher tokens: "P", ":", " ", "hi".
     payload = {
         "choices": [
@@ -170,61 +198,32 @@ def test_teacher_score_returns_completion_region_with_rebased_offsets(monkeypatc
                     "tokens": ["P", ":", " ", "hi"],
                     "token_logprobs": [0.0, -1.0, -2.0, -0.5],
                     "text_offset": [0, 1, 2, 3],
-                    "top_logprobs": [None, None, None, {"hi": -0.5, "hello": -1.2}],
                 }
             }
         ]
     }
     capture = {}
     _mock_urlopen(monkeypatch, payload, capture)
-    client = TeacherClient("k", "https://api.example/v1", "glm", top_logprobs=5)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
     toks = client.score("P: ", "hi")
     # only the completion token survives; offset rebased to the completion (start 0).
     assert len(toks) == 1
     assert toks[0].text == "hi"
     assert toks[0].start == 0
-    assert dict(toks[0].top) == {"hi": -0.5, "hello": -1.2}
-    # scoring must not pay for generation.
+    assert toks[0].logprob == -0.5  # the realized-token logprob gkd consumes
+    # scoring must not pay for generation, and asks for the minimal logprobs that return token_logprobs.
     assert capture["body"]["max_tokens"] == 0
     assert capture["body"]["echo"] is True
+    assert capture["body"]["logprobs"] == 1
 
 
-def test_teacher_score_injects_realized_token_when_missing_from_topk(monkeypatch):
-    payload = {
-        "choices": [
-            {
-                "logprobs": {
-                    "tokens": ["", "hi"],
-                    "token_logprobs": [0.0, -0.5],
-                    "text_offset": [0, 0],  # prompt is empty here
-                    "top_logprobs": [None, {"other": -0.1}],  # realized 'hi' absent
-                }
-            }
-        ]
-    }
-    _mock_urlopen(monkeypatch, payload)
+def test_teacher_score_raises_on_malformed_response(monkeypatch):
+    from flash.engine.worker.teacher import TeacherError
+
+    _mock_urlopen(monkeypatch, {"choices": [{"logprobs": {}}]})
     client = TeacherClient("k", "https://api.example/v1", "glm")
-    toks = client.score("", "hi")
-    assert any(s == "hi" for s, _ in toks[-1].top), "realized token must always be represented"
-
-
-def test_teacher_score_clamps_logprobs_to_fireworks_cap(monkeypatch):
-    # Fireworks' /completions echo endpoint rejects logprobs > 5; the client must clamp.
-    payload = {
-        "choices": [{"logprobs": {"tokens": ["hi"], "token_logprobs": [-0.5], "text_offset": [0]}}]
-    }
-    capture = {}
-    _mock_urlopen(monkeypatch, payload, capture)
-    client = TeacherClient("k", "https://api.example/v1", "glm", top_logprobs=20)
-    client.score("", "hi")
-    assert capture["body"]["logprobs"] == 5
-
-
-def test_teacher_generate_strips_reasoning(monkeypatch):
-    payload = {"choices": [{"message": {"content": "think think </think>  Final."}}]}
-    _mock_urlopen(monkeypatch, payload)
-    client = TeacherClient("k", "https://api.example/v1", "glm")
-    assert client.generate([{"role": "user", "content": "x"}], max_tokens=8) == "Final."
+    with pytest.raises(TeacherError):
+        client.score("", "hi")
 
 
 def test_teacher_client_requires_key():
@@ -232,12 +231,6 @@ def test_teacher_client_requires_key():
 
     with pytest.raises(TeacherError):
         TeacherClient("", "https://api.example/v1", "glm")
-
-
-def test_strip_reasoning_variants():
-    assert strip_reasoning("no markers here") == "no markers here"
-    assert strip_reasoning("a</think>b</think>c") == "c"  # last marker wins
-    assert strip_reasoning("") == ""
 
 
 # --------------------------------------------------------------------------------------------------
@@ -254,8 +247,7 @@ def test_opd_spec_json_round_trip():
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {
                 "steps": 25,
-                "tokenizer_alignment": "uld",
-                "teacher_top_logprobs": 12,
+                "teacher_model": "accounts/fireworks/models/glm-5p1",
                 "hf_repo": "owner/runs",
             },
         },
@@ -264,8 +256,9 @@ def test_opd_spec_json_round_trip():
     restored = JobSpec.from_json(spec.to_json())
     assert restored == spec
     assert restored.phase == "opd"
-    assert restored.train.tokenizer_alignment == "uld"
-    assert restored.train.teacher_top_logprobs == 12
+    assert restored.train.teacher_model == "accounts/fireworks/models/glm-5p1"
+    # FIREWORKS_API_KEY is auto-declared a required secret for opd.
+    assert "FIREWORKS_API_KEY" in restored.environment.secrets
 
 
 def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
@@ -351,66 +344,3 @@ def test_gkd_loss_coefficient_tracks_student_minus_teacher_logprob():
     # loss = coeff * student_logprob, student_logprob < 0, and coeff = (s_det - teacher)/1.
     # teacher=-5.0 -> larger coeff -> more-negative loss than teacher=-0.5.
     assert float(hi.detach()) < float(lo.detach())
-
-
-def test_align_loss_is_differentiable_only_at_aligned_positions():
-    torch = pytest.importorskip("torch")
-    from flash.engine.worker.opd import align_loss
-
-    V = 8
-    prompt_ids = [1, 2]
-    student_ids = [3, 4, 5]  # 3 completion tokens
-    model = _TinyLM(torch, T=len(prompt_ids) + len(student_ids), V=V)
-    # target only at completion position 0 (predicted by logits at index P-1 = 1).
-    targets = [{3: 1.0}, None, None]
-    loss = align_loss(model, prompt_ids, student_ids, targets, device="cpu")
-    assert loss is not None
-    assert loss.requires_grad
-    loss.backward()
-    grad = model.w.grad
-    assert grad[1].abs().sum() > 0  # aligned position got a gradient
-    assert grad[3].abs().sum() == 0  # a non-target position did not
-
-
-def test_align_loss_none_when_all_masked():
-    torch = pytest.importorskip("torch")
-    from flash.engine.worker.opd import align_loss
-
-    model = _TinyLM(torch, T=3, V=4)
-    assert align_loss(model, [1], [2, 3], [None, None], device="cpu") is None
-
-
-def test_uld_loss_runs_and_backpropagates():
-    torch = pytest.importorskip("torch")
-    from flash.engine.worker.opd import uld_loss
-
-    V = 8
-    prompt_ids = [1]
-    student_ids = [2, 3]
-    model = _TinyLM(torch, T=3, V=V)
-    tgts = [[0.7, 0.3], None]
-    loss = uld_loss(model, prompt_ids, student_ids, tgts, device="cpu", top_k=2)
-    assert loss is not None
-    assert loss.requires_grad
-    loss.backward()
-    assert model.w.grad.abs().sum() > 0
-
-
-def test_seqkd_loss_matches_cross_entropy_on_completion():
-    torch = pytest.importorskip("torch")
-    import torch.nn.functional as F
-
-    from flash.engine.worker.opd import seqkd_loss
-
-    V = 6
-    prompt_ids = [1, 2]
-    target_ids = [3, 4]
-    model = _TinyLM(torch, T=len(prompt_ids) + len(target_ids), V=V)
-    loss = seqkd_loss(model, prompt_ids, target_ids, device="cpu")
-    assert loss is not None
-    assert loss.requires_grad
-    # Reference: CE over the two completion positions (logits at indices 1 and 2 predict 3 and 4).
-    logits = model.w[:-1]
-    labels = torch.tensor([-100, 3, 4])
-    ref = F.cross_entropy(logits, labels, ignore_index=-100)
-    assert torch.allclose(loss, ref, atol=1e-5)

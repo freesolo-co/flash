@@ -1,15 +1,17 @@
 """On-policy distillation training path (algorithm="opd") for the fine-tuning worker.
 
-The student (a Qwen catalog model) samples completions on-policy; a Fireworks-hosted GLM teacher
-scores those completions token-by-token over the API; a per-token distillation loss is
-backpropagated through the student LoRA. Four cross-tokenizer strategies bridge the teacher/student
-vocabulary mismatch (see ``tokenizer_align`` and docs/on-policy-distillation.md):
+The student (a Qwen3.5 / MiniCPM catalog model) samples completions on-policy; a Fireworks-hosted
+GLM-5.2 teacher scores those completions token-by-token over the API; a groupwise reverse-KL loss is
+backpropagated through the student LoRA.
 
-- ``gkd`` (default): groupwise reverse-KL over shared decoded-text spans (the collinear-ai *spider* /
-  Tinker method) — uses only realized-token logprobs, so it covers every token exactly.
-- ``align``: sparse top-k forward-KL, teacher candidates projected onto the student vocab.
-- ``uld``: sorted-distribution (optimal-transport) matching, vocabulary-agnostic.
-- ``seqkd``: off-policy sequence KD — the teacher generates targets, student trains with CE.
+Cross-tokenizer bridge (teacher GLM vocab != student Qwen3.5 / MiniCPM vocab): the teacher and student
+tokenize the same completion string differently, so their per-token distributions can't be compared
+directly. We align by SHARED DECODED-TEXT SPANS — the coarsest common refinement of the two
+tokenizations (a group boundary is any character offset that begins a token in BOTH tokenizers) — and
+apply reverse-KL per span using only the REALIZED-token logprobs on each side (the collinear-ai
+*spider* / Tinker method). No top-k candidates, no surface->vocab projection, so it is exact across
+arbitrary tokenizer mismatch and covers every student token. See ``tokenizer_align`` and
+docs/on-policy-distillation.md.
 
 There is NO local reference model and NO colocated vLLM engine: sampling is HF ``generate`` on the
 resident student (so the VRAM profile matches SFT), and the teacher lives behind the API. All heavy
@@ -18,7 +20,6 @@ imports (torch/transformers/peft) are inside functions, so importing this module
 
 from __future__ import annotations
 
-import functools
 import os
 import random
 import time
@@ -36,11 +37,8 @@ from flash.engine.worker.perf import (
 )
 from flash.engine.worker.tokenizer_align import (
     StudentToken,
-    align_targets,
-    coverage,
     groupwise_alignment,
     groupwise_coverage,
-    uld_targets,
 )
 
 
@@ -53,15 +51,16 @@ def _resolve_opd_knobs():
         v = getattr(t, name, None) if t else None
         return v if v is not None else default
 
-    strategy = (opt("tokenizer_alignment", "") or d.tokenizer_alignment).lower()
     max_completion = int(
         opt("max_tokens", 0)
         or (d.max_completion_len_thinking if _w.THINKING else d.max_completion_len)
     )
+    # Honor an explicit kl_penalty_coef=0.0 (a plain `or` would treat 0.0 as unset).
+    _kl = opt("kl_penalty_coef", None)
+    kl_coef = float(_kl if _kl is not None else d.kl_coef)
     return {
         "teacher_model": opt("teacher_model", "") or d.teacher_model,
         "teacher_base_url": d.teacher_base_url,
-        "strategy": strategy,
         "steps": int(opt("steps", 0) or d.num_steps),
         "learning_rate": float(opt("learning_rate", 0) or d.learning_rate),
         "temperature": float(
@@ -73,10 +72,8 @@ def _resolve_opd_knobs():
         "max_completion": max_completion,
         "prompts_per_step": int(opt("batch_size", 0) or d.prompts_per_step),
         "group_size": int(opt("group_size", 0) or d.group_size),
-        "top_logprobs": int(opt("teacher_top_logprobs", 0) or d.teacher_top_logprobs),
-        "kd_temperature": d.kd_temperature,
         # gkd reverse-KL scale; reuses the existing [train] kl_penalty_coef knob (default 1.0).
-        "kl_coef": float(opt("kl_penalty_coef", None) or d.kl_coef),
+        "kl_coef": kl_coef,
         "save_every": int(opt("save_every", 0) or 20),
         "max_length": int(opt("max_length", 0) or 0),
     }
@@ -92,16 +89,21 @@ def _teacher_prompt_text(prompt_messages: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def student_tokens_with_offsets(tok, completion_text: str):
-    """Tokenize the completion with character offsets. Returns ``(ids, [StudentToken, ...])`` sharing
-    the SAME token sequence used for the loss forward, so student offsets and ids stay consistent."""
-    enc = tok(completion_text, add_special_tokens=False, return_offsets_mapping=True)
-    ids = list(enc["input_ids"])
-    offsets = enc["offset_mapping"]
-    toks = [
-        StudentToken(token_id=i, start=int(a), end=int(b))
-        for i, (a, b) in zip(ids, offsets, strict=True)
-    ]
+def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
+    """Char spans for the ORIGINAL sampled token ids, indexed into ``completion_text`` (the exact
+    string the teacher echo-scored). Using the sampled ids — not a re-tokenization of the decoded
+    text — keeps the loss on the true on-policy tokens. Offsets are built by incrementally decoding
+    the id prefix and measuring its length (clamped monotonic in ``[0, len]``, so a byte-level token
+    that splits a multi-byte char never yields a negative/backward span); a special token (e.g. eos)
+    decodes to nothing, so it gets a zero-width span and is naturally excluded from the alignment."""
+    ids = [int(t) for t in completion_ids]
+    toks: list[StudentToken] = []
+    prev = 0
+    n = len(completion_text)
+    for i in range(len(ids)):
+        end = min(n, max(prev, len(tok.decode(ids[: i + 1], skip_special_tokens=True))))
+        toks.append(StudentToken(token_id=ids[i], start=prev, end=end))
+        prev = end
     return ids, toks
 
 
@@ -144,75 +146,35 @@ def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     return torch.stack(terms).mean()
 
 
-def align_loss(model, prompt_ids, student_ids, targets, device):
-    """Sparse top-k forward-KL: at each aligned position push the student toward the teacher's
-    projected candidate distribution. Returns a scalar loss (grad) or None if nothing aligned."""
-    import torch
+def _student_model(model_id, mik, device):
+    """Build the trainable student LoRA. Warm-starts from ``train.init_from_adapter`` when set —
+    continuing a prior run's adapter (e.g. an SFT checkpoint), the same path GRPO uses via
+    ``_init_adapter_model`` — otherwise a fresh LoRA on the base. This makes an SFT->opd pipeline a
+    genuine continuation (the opd stage keeps the SFT behavior) rather than silently restarting from
+    base. VL merge-warm-start (which needs SFT (+) opd recombination before deploy) is not yet wired
+    for opd, so it is refused loudly instead of shipping a broken deploy."""
+    init_model, init_peft = _w._init_adapter_model(model_id)
+    if init_peft is None:
+        # init_model is already a trainable PeftModel continuing the prior (e.g. SFT) adapter.
+        return init_model.to(device)
+    if getattr(_w, "_VL_WARMSTART_SFT_DIR", None) is not None:
+        raise RuntimeError(
+            "opd warm-start from a VL SFT adapter is not yet supported (the saved adapter would need "
+            "SFT+opd recombination before deploy). Use a text-model SFT adapter, or omit "
+            "train.init_from_adapter to train a fresh LoRA on the base."
+        )
+    from peft import get_peft_model
+    from transformers import AutoModelForCausalLM
 
-    if not student_ids or not any(t for t in targets):
-        return None
-    input_ids = torch.tensor([prompt_ids + student_ids], device=device)
-    logp = _forward_logprobs(model, input_ids)  # [T, V]
-    P = len(prompt_ids)
-    terms = []
-    for j, target in enumerate(targets):
-        if not target:
-            continue
-        pos = P + j - 1  # logits at pos predict the (P+j)-th token = the j-th completion token
-        ids = torch.tensor(list(target.keys()), device=device)
-        w = torch.tensor(list(target.values()), device=device, dtype=logp.dtype)
-        terms.append(-(w * logp[pos].index_select(0, ids)).sum())
-    if not terms:
-        return None
-    return torch.stack(terms).mean()
-
-
-def uld_loss(model, prompt_ids, student_ids, uld_tgts, device, top_k):
-    """Universal Logit Distillation: L1 between the sorted teacher top-k and the student's own sorted
-    top-k probabilities at each aligned position (no token identity). Scalar loss or None."""
-    import torch
-
-    if not student_ids or not any(t for t in uld_tgts):
-        return None
-    input_ids = torch.tensor([prompt_ids + student_ids], device=device)
-    out = model(input_ids)
-    probs = torch.softmax(out.logits[0].float(), dim=-1)  # [T, V]
-    P = len(prompt_ids)
-    terms = []
-    for j, tvec in enumerate(uld_tgts):
-        if not tvec:
-            continue
-        pos = P + j - 1
-        k = max(len(tvec), top_k)
-        s_top = torch.topk(probs[pos], min(k, probs.shape[-1])).values  # sorted desc, grad-carrying
-        s_top = s_top / (s_top.sum() + 1e-8)
-        t_top = torch.tensor(tvec, device=device, dtype=s_top.dtype)
-        m = max(s_top.shape[0], t_top.shape[0])
-        s_pad = torch.nn.functional.pad(s_top, (0, m - s_top.shape[0]))
-        t_pad = torch.nn.functional.pad(t_top, (0, m - t_top.shape[0]))
-        terms.append((s_pad - t_pad).abs().sum())
-    if not terms:
-        return None
-    return torch.stack(terms).mean()
-
-
-def seqkd_loss(model, prompt_ids, target_ids, device):
-    """Off-policy sequence KD: completion-only cross-entropy on the teacher-generated target."""
-    import torch
-
-    if not target_ids:
-        return None
-    input_ids = torch.tensor([prompt_ids + target_ids], device=device)
-    out = model(input_ids)
-    logits = out.logits[0][:-1].float()  # predict tokens [1:]
-    labels = torch.tensor([-100] * len(prompt_ids) + list(target_ids), device=device)[1:]
-    return torch.nn.functional.cross_entropy(logits, labels, ignore_index=-100)
+    base = AutoModelForCausalLM.from_pretrained(init_model, trust_remote_code=True, **mik).to(
+        device
+    )
+    return get_peft_model(base, init_peft)
 
 
 def run_opd():
     import torch
-    from peft import get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     from flash.engine.worker.teacher import TeacherClient
 
@@ -220,8 +182,11 @@ def run_opd():
     t_start = time.time()
     _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     knobs = _resolve_opd_knobs()
-    strategy = knobs["strategy"]
-    print(f"[opd] strategy={strategy} teacher={knobs['teacher_model']} steps={knobs['steps']}")
+    warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
+    print(
+        f"[opd] gkd (groupwise reverse-KL) teacher={knobs['teacher_model']} "
+        f"steps={knobs['steps']} warm_start={warm_start or 'none'}"
+    )
 
     api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
     if not api_key:
@@ -229,12 +194,7 @@ def run_opd():
             "opd requires the FIREWORKS_API_KEY runtime secret (the GLM teacher); it was not "
             "delivered to the worker. Declare it under [environment] secrets and export it locally."
         )
-    teacher = TeacherClient(
-        api_key,
-        knobs["teacher_base_url"],
-        knobs["teacher_model"],
-        top_logprobs=knobs["top_logprobs"],
-    )
+    teacher = TeacherClient(api_key, knobs["teacher_base_url"], knobs["teacher_model"])
 
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
@@ -252,8 +212,7 @@ def run_opd():
     setup_seconds = time.time() - t_start
     _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
     with liveness_heartbeat("opd_initializing"):
-        base = AutoModelForCausalLM.from_pretrained(model_id, **mik).to(device)
-        model = get_peft_model(base, _w.make_lora(model_id))
+        model = _student_model(model_id, mik, device)
         # Engine length gates whether gradient checkpointing is needed for the loss forward.
         seq_cap = knobs["max_length"] or (RECIPE.opd.max_prompt_len + knobs["max_completion"])
         if grad_checkpointing_on(model_id, seq_cap):
@@ -266,16 +225,14 @@ def run_opd():
 
     # Build the on-policy prompt pool from the environment (same rendering as GRPO).
     train = env.dataset()
+    if not train:
+        raise RuntimeError(
+            "opd: the environment dataset is empty — no prompts to sample on-policy. Check the "
+            "environment's dataset()/train split before provisioning a GPU."
+        )
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
     examples = train
-
-    @functools.lru_cache(maxsize=65536)
-    def first_token_id(surface: str):
-        if not surface:
-            return None
-        ids = tok(surface, add_special_tokens=False).input_ids
-        return int(ids[0]) if ids else None
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=knobs["learning_rate"]
@@ -319,20 +276,22 @@ def run_opd():
                 prompt_messages = env.prompt_messages(ex)
                 prompt_text = _w.render_prompt(tok, ex)
                 prompt_ids = tok(prompt_text, add_special_tokens=False).input_ids
+                # Bound the prompt to the recipe budget (keep the tail so the generation-prompt
+                # suffix survives) to cap VRAM on pathologically long prompts.
+                if len(prompt_ids) > RECIPE.opd.max_prompt_len:
+                    prompt_ids = prompt_ids[-RECIPE.opd.max_prompt_len :]
                 prompt_tensor = torch.tensor([prompt_ids], device=device)
                 for _g in range(group):
                     loss = _train_one(
                         model=model,
                         tok=tok,
                         teacher=teacher,
-                        strategy=strategy,
                         device=device,
                         prompt_ids=prompt_ids,
                         prompt_tensor=prompt_tensor,
                         prompt_messages=prompt_messages,
                         gen_cfg=gen_cfg,
                         knobs=knobs,
-                        first_token_id=first_token_id,
                         torch=torch,
                     )
                     if loss is None:
@@ -346,6 +305,14 @@ def run_opd():
             if nseq == 0:
                 print(f"[opd] step {step}: no usable teacher signal this step (skipped)")
                 continue
+            # Each seq's grad was scaled by 1/accum_target; if some seqs were skipped (teacher call
+            # failed / empty completion), rescale to a true 1/nseq mean so a partial step isn't a
+            # silently smaller update.
+            if nseq != accum_target:
+                scale = accum_target / nseq
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             optimizer.step()
             avg_loss = step_loss / nseq
@@ -372,8 +339,8 @@ def run_opd():
     if not loss_curve:
         raise RuntimeError(
             "opd produced no trained step — every teacher scoring call failed or aligned to "
-            "zero positions. Check FIREWORKS_API_KEY, the teacher model id, and the tokenizer "
-            "alignment strategy. Failing loudly instead of reporting a no-op run as done."
+            "zero positions. Check FIREWORKS_API_KEY and the teacher model id. Failing loudly "
+            "instead of reporting a no-op run as done."
         )
 
     _save_adapter(model, tok, adapter_dir)
@@ -391,7 +358,8 @@ def run_opd():
         generated_tokens=generated_tokens,
         notes={
             "steps": steps,
-            "strategy": strategy,
+            "method": "gkd",
+            "init_from_adapter": warm_start or None,
             "teacher_model": knobs["teacher_model"],
             "download_seconds": download_seconds,
             "thinking": _w.THINKING,
@@ -413,40 +381,22 @@ def _train_one(
     model,
     tok,
     teacher,
-    strategy,
     device,
     prompt_ids,
     prompt_tensor,
     prompt_messages,
     gen_cfg,
     knobs,
-    first_token_id,
     torch,
 ):
-    """Sample one student completion, score it with the teacher, and return the strategy's loss (or
-    None). Side-channels per-sequence stats on function attributes to keep the caller compact."""
+    """Sample one student completion on-policy, score it with the teacher, and return the groupwise
+    reverse-KL loss (or None). Side-channels per-sequence stats on function attributes to keep the
+    caller compact."""
     _train_one.last_coverage = 0.0
     _train_one.last_gen_tokens = 0
     _train_one.last_teacher_tokens = 0
 
-    if strategy == "seqkd":
-        # Off-policy: the teacher generates the target; the student imitates it.
-        try:
-            target_text = teacher.generate(
-                prompt_messages, max_tokens=knobs["max_completion"], temperature=0.7
-            )
-        except Exception as e:
-            print(f"[opd] teacher generate failed: {e}")
-            return None
-        target_ids = tok(target_text, add_special_tokens=False).input_ids
-        if not target_ids:
-            return None
-        _train_one.last_teacher_tokens = len(target_ids)
-        model.train()
-        model.config.use_cache = False
-        return seqkd_loss(model, prompt_ids, target_ids, device)
-
-    # On-policy: the student samples; the teacher scores that completion.
+    # On-policy: the student samples; the teacher echo-scores that exact completion.
     model.eval()
     model.config.use_cache = True
     with torch.no_grad():
@@ -465,25 +415,18 @@ def _train_one(
         return None
     _train_one.last_teacher_tokens = len(prompt_ids) + _train_one.last_gen_tokens
 
-    student_ids, student_toks = student_tokens_with_offsets(tok, completion_text)
+    student_ids, student_toks = student_tokens_with_offsets(tok, completion_ids, completion_text)
     if not student_ids:
         return None
 
     model.train()
     model.config.use_cache = False
-    if strategy == "align":
-        tgts = align_targets(
-            student_toks, teacher_toks, first_token_id, kd_temperature=knobs["kd_temperature"]
-        )
-        _train_one.last_coverage = coverage(tgts)
-        return align_loss(model, prompt_ids, student_ids, tgts, device)
-    if strategy == "uld":
-        tgts = uld_targets(student_toks, teacher_toks, kd_temperature=knobs["kd_temperature"])
-        _train_one.last_coverage = coverage(tgts)
-        return uld_loss(model, prompt_ids, student_ids, tgts, device, knobs["top_logprobs"])
-    # default: gkd — groupwise reverse-KL (spider/Tinker), covers every token from realized logprobs.
+    # gkd — groupwise reverse-KL (spider/Tinker); covers every token from the realized logprobs.
     groups = groupwise_alignment(student_toks, teacher_toks)
-    _train_one.last_coverage = groupwise_coverage(groups, len(student_ids))
+    # Coverage is over alignable (non-zero-width) student tokens; a trailing zero-width eos joins no
+    # group and would otherwise deflate the metric below the documented 100% invariant.
+    n_alignable = sum(1 for st in student_toks if st.end > st.start)
+    _train_one.last_coverage = groupwise_coverage(groups, n_alignable)
     return gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs["kl_coef"])
 
 
