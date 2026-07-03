@@ -86,9 +86,20 @@ def groupwise_alignment(
     return groups
 
 
-def groupwise_coverage(groups: list[tuple[list[int], float]], n_student_tokens: int) -> float:
-    """Fraction of student completion tokens that landed in a valid (both-sided) alignment group."""
-    if not n_student_tokens:
+def groupwise_coverage(
+    groups: list[tuple[list[int], float]], student_toks: list[StudentToken]
+) -> float:
+    """Fraction of ALIGNABLE student tokens that landed in an alignment group.
+
+    "Alignable" = non-zero-width (has decoded text). Zero-width tokens (special/eos or partial-byte
+    fragments) carry no text to align; they may still ride along inside a group so the span's student
+    logprob sum stays complete, but they are neither numerator nor denominator here — counting them
+    in the numerator (grouped) but not the denominator is what produced coverage > 100%.
+    """
+    alignable = {i for i, st in enumerate(student_toks) if st.end > st.start}
+    if not alignable:
         return 0.0
-    covered = sum(len(s_idx) for s_idx, _ in groups)
-    return covered / n_student_tokens
+    grouped: set[int] = set()
+    for s_idx, _ in groups:
+        grouped.update(s_idx)
+    return len(alignable & grouped) / len(alignable)

@@ -472,10 +472,10 @@ def _train_one(
     model.config.use_cache = False
     # gkd — groupwise reverse-KL (spider/Tinker); covers every token from the realized logprobs.
     groups = groupwise_alignment(student_toks, teacher_toks)
-    # Coverage is over alignable (non-zero-width) student tokens; a trailing zero-width eos joins no
-    # group and would otherwise deflate the metric below the documented 100% invariant.
-    n_alignable = sum(1 for st in student_toks if st.end > st.start)
-    _train_one.last_coverage = groupwise_coverage(groups, n_alignable)
+    # Coverage = alignable (non-zero-width) student tokens that landed in a group / alignable total,
+    # so it stays in [0, 1] (a zero-width eos/partial-byte token riding along in a group no longer
+    # inflates it past 100%).
+    _train_one.last_coverage = groupwise_coverage(groups, student_toks)
     return gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs["kl_coef"])
 
 

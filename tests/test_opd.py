@@ -43,7 +43,7 @@ def test_gkd_groups_are_one_per_shared_boundary_when_tokenizers_agree():
     assert [s_idx for s_idx, _ in groups] == [[0], [1]]
     assert groups[0][1] == -1.0  # teacher logprob of the first span
     assert groups[1][1] == -2.0
-    assert groupwise_coverage(groups, len(student)) == 1.0
+    assert groupwise_coverage(groups, student) == 1.0
 
 
 def test_gkd_span_grows_across_disagreement_and_covers_every_token():
@@ -55,7 +55,7 @@ def test_gkd_span_grows_across_disagreement_and_covers_every_token():
     assert len(groups) == 1
     assert groups[0][0] == [0, 1]  # both student tokens grouped together
     assert groups[0][1] == -1.0
-    assert groupwise_coverage(groups, len(student)) == 1.0  # NO masking
+    assert groupwise_coverage(groups, student) == 1.0  # NO masking
 
 
 def test_gkd_partial_agreement_splits_at_shared_boundaries_only():
@@ -64,7 +64,7 @@ def test_gkd_partial_agreement_splits_at_shared_boundaries_only():
     teacher = _teacher([(0, 2), (2, 6)])
     groups = groupwise_alignment(student, teacher)
     assert [s_idx for s_idx, _ in groups] == [[0], [1, 2]]
-    assert groupwise_coverage(groups, len(student)) == 1.0
+    assert groupwise_coverage(groups, student) == 1.0
 
 
 def test_gkd_merges_leading_student_only_span_so_no_token_is_dropped():
@@ -76,13 +76,25 @@ def test_gkd_merges_leading_student_only_span_so_no_token_is_dropped():
     groups = groupwise_alignment(student, teacher)
     assert len(groups) == 1
     assert groups[0][0] == [0, 1, 2]  # all three student tokens covered
-    assert groupwise_coverage(groups, len(student)) == 1.0
+    assert groupwise_coverage(groups, student) == 1.0
 
 
 def test_gkd_empty_inputs_yield_no_groups():
     assert groupwise_alignment([], _teacher([(0, 1)])) == []
     assert groupwise_alignment(_student([(0, 1)]), []) == []
-    assert groupwise_coverage([], 3) == 0.0
+    assert groupwise_coverage([], []) == 0.0
+
+
+def test_gkd_coverage_never_exceeds_100pct_with_in_span_zero_width_token():
+    # A zero-width student token (partial-byte fragment / mid-completion special) at char 2 rides
+    # ALONG inside the group (so the span's student logprob sum stays complete) but must NOT be
+    # counted as covered: 2 alignable tokens, both grouped -> exactly 100%, not 150% (the real-run
+    # bug the probe surfaced).
+    student = _student([(0, 2), (2, 2), (2, 5)])  # middle token is zero-width
+    teacher = _teacher([(0, 5)])
+    groups = groupwise_alignment(student, teacher)
+    assert groups[0][0] == [0, 1, 2]  # all three ride in the group (logprob sum stays whole)
+    assert groupwise_coverage(groups, student) == 1.0
 
 
 # --------------------------------------------------------------------------------------------------
