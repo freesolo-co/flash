@@ -327,11 +327,14 @@ def test_is_training_heartbeat_gates_setup_vs_training():
     # the silent cold first step keeps setup grace.
     assert is_training_heartbeat("rl_step", 0) is False
     assert is_training_heartbeat("sft_step", 0) is False
+    assert is_training_heartbeat("opd_step", 0) is False  # opd first-step in-progress ping (opt_steps==0)
     assert is_training_heartbeat("rl_step", 1) is True
     assert is_training_heartbeat("sft_step", 3) is True
+    assert is_training_heartbeat("opd_step", 1) is True  # tightens once a real optimizer update lands
     # A malformed/missing step on a per-step stage is treated as 0 (must not raise) -> stays setup.
     assert is_training_heartbeat("rl_step", None) is False
     assert is_training_heartbeat("sft_step", "not-a-number") is False
+    assert is_training_heartbeat("opd_step", None) is False
     # POST-training stages carry NO step but mean training is DONE -> tighten so a hung teardown/DONE
     # upload falls under the tight window, not the wide setup grace (the MqsTh fix).
     assert is_training_heartbeat("rl_trained", None) is True

@@ -240,8 +240,11 @@ SETUP_HEARTBEAT_STAGES = frozenset(
     }
 )
 
-# step=0 is emitted throughout the silent first rollout — only step>=1 tightens the stall window.
-STEP_GATED_STAGES = frozenset({"rl_step", "sft_step"})
+# step=0 is emitted throughout the silent first step — only step>=1 tightens the stall window. opd_step
+# is gated too: its progress pings report opt_steps (0 until the FIRST optimizer update lands), so a
+# long teacher-bound first step keeps the wide setup grace instead of the tight training window — the
+# mid-step ping must not prematurely flip a still-running first step out of setup grace.
+STEP_GATED_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
 
 
 def is_training_heartbeat(stage: str | None, step: Any) -> bool:

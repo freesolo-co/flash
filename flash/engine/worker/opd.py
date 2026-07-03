@@ -388,8 +388,13 @@ def run_opd():
                     # Non-liveness progress ping WITHIN the step: the pollers ignore liveness
                     # heartbeats, so a long teacher-bound step (serial scoring of a large
                     # batch/group, or slow/retrying Fireworks) would otherwise trip the training
-                    # stall window. The opd_step throttle bounds the actual HF upload rate.
-                    _w.heartbeat("opd_step", step=step + 1, samples_done=nseq)
+                    # stall window. Report opt_steps (optimizer updates COMPLETED so far), not the
+                    # loop index: opd_step is step-gated in the poller (_poll.STEP_GATED_STAGES), so
+                    # while the FIRST optimizer step is still accumulating (opt_steps==0) these pings
+                    # keep the WIDE setup grace — they must not flip a still-running first step into
+                    # the tight training window. Once a real update has landed (opt_steps>=1) the
+                    # pings tighten it as intended, and the opd_step throttle bounds the HF upload rate.
+                    _w.heartbeat("opd_step", step=opt_steps, samples_done=nseq)
             if nseq == 0:
                 print(f"[opd] step {step}: no usable teacher signal this step (skipped)")
                 continue
@@ -410,7 +415,10 @@ def run_opd():
             coverage_curve.append(avg_cov)
             _w.heartbeat(
                 "opd_step",
-                step=step + 1,
+                # opt_steps (just incremented) == optimizer updates applied, so it is >=1 here: this
+                # POST-update ping tightens the stall window (step-gated in the poller) and matches
+                # the opt_steps-based checkpoint naming below.
+                step=opt_steps,
                 loss=avg_loss,
                 coverage=avg_cov,
                 gpu=gpu_diagnostics(include_torch=False),

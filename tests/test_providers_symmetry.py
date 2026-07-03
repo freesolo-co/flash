@@ -97,9 +97,13 @@ def test_setup_vs_training_gate_is_the_one_canonical_helper(provider):
         assert stage in SETUP_HEARTBEAT_STAGES, f"{stage} must be treated as setup, not training"
         assert is_training_heartbeat(stage, 9) is False
     # Per-step training heartbeats are step-gated: NOT setup, but only flip the window at step >= 1.
-    assert sorted(STEP_GATED_STAGES) == ["rl_step", "sft_step"]
+    assert sorted(STEP_GATED_STAGES) == ["opd_step", "rl_step", "sft_step"]
     assert is_training_heartbeat("rl_step", 0) is False  # cold first step keeps setup grace
     assert is_training_heartbeat("rl_step", 1) is True
+    # opd_step is gated the same way: its mid-step ping reports opt_steps (0 during the first
+    # optimizer step), which must keep setup grace, not trip the tight training window.
+    assert is_training_heartbeat("opd_step", 0) is False
+    assert is_training_heartbeat("opd_step", 1) is True
     # Post-training stages flip to the tight window even without a step field.
     assert is_training_heartbeat("sft_trained", None) is True
 
