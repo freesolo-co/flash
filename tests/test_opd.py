@@ -488,6 +488,18 @@ def test_opd_vram_reserves_dense_logits_unlike_fused_sft():
     assert opd > sft + 10  # ~12.7 GB of dense logits for opd vs 0 for fused SFT
 
 
+def test_opd_vram_thinking_completion_default_not_underbudgeted():
+    """With max_tokens unset, opd's logits term must use the OPD recipe completion default (thinking
+    = max_completion_len_thinking, 1536), not the GRPO-style min(seq_len, 1024) fallback — else a
+    thinking opd job is under-budgeted and can OOM."""
+    from flash.engine.vram import estimate_vram_gb
+
+    kw = {"seq_len": 4096, "vocab": 248_320, "lora_rank": 16}  # seq high so min(seq,1024)=1024
+    non_think = estimate_vram_gb(4.0, "opd", "bf16", thinking=False, **kw)  # completion=512
+    think = estimate_vram_gb(4.0, "opd", "bf16", thinking=True, **kw)  # completion=1536, not 1024
+    assert think > non_think  # thinking's longer completion budgets strictly more logits
+
+
 def test_opd_teacher_rate_matches_fireworks_glm5p2_input_price():
     """glm-5p2 (and the omitted-teacher default) price at Fireworks' $1.40/M input, not the old $0.90
     — opd echo-scoring bills input tokens from the submit-time quote."""

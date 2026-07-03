@@ -321,7 +321,14 @@ def estimate_vram_gb(
         # vocab logits for >=3B models, so a long-completion opd job (e.g. max_tokens=8192) would be
         # sized for an under-capacity card and OOM. Reserve both tensors (opd runs ONE sequence per
         # forward, so this is per-sequence, not per-device-batch).
-        completion = max_tokens if max_tokens else min(seq_len, 1024)
+        from flash.engine.recipe import RECIPE
+
+        # Mirror opd_rollout_seq_len / run_opd's completion resolution: explicit max_tokens, else the
+        # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
+        # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
+        completion = max_tokens or (
+            RECIPE.opd.max_completion_len_thinking if thinking else RECIPE.opd.max_completion_len
+        )
         logits = (seq_len * 2 + completion * 4) * vocab / 1e9
         return base + activations + logits
     # Don't clamp to budget: pd=1 is irreducible and the logits can exceed the budget at near-2048 ctx.
