@@ -166,7 +166,12 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     else:
         market_wall_s = 0.0
     gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
-    hourly = gpu_hourly_usd(gpu, provider=config.provider, max_wall_seconds=market_wall_s)
+    # Quote the SAME VRAM-floored Vast market pick_gpu selected under (min_vram_gb=need): without the
+    # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
+    # crowd a high-VRAM selection off the limited page -> it silently falls back to the static rate.
+    hourly = gpu_hourly_usd(
+        gpu, provider=config.provider, max_wall_seconds=market_wall_s, min_vram_gb=need
+    )
 
     setup = setup_seconds(config)
     sps = seconds_per_step(config, gpu)

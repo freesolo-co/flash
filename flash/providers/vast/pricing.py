@@ -125,14 +125,23 @@ def live_offer_rates(max_wall_seconds: float = 0.0, min_vram_gb: int = 0) -> dic
         return {}
 
 
-def hourly_rate(gpu_name: str, max_wall_seconds: float = 0.0) -> float:
+def hourly_rate(gpu_name: str, max_wall_seconds: float = 0.0, min_vram_gb: int = 0) -> float:
     """$/hr for one friendly GPU name (cheapest live offer if available, else static).
 
     ``max_wall_seconds`` (>0) prices against offers that outlast the run's wall cap (see ``live_rates``)
-    so a long run is not underquoted by a short-lived offer that won't survive to launch."""
+    so a long run is not underquoted by a short-lived offer that won't survive to launch.
+
+    ``min_vram_gb`` (>0) floors the market search at the caller's required VRAM (selection parity): the
+    price-sorted page is LIMITED, so searching from the smallest managed class lets cheap small-card
+    offers crowd a high-VRAM class off it — it'd miss the live map and be misquoted on the static
+    fallback. Only when the class has no rentable offer at that floor do we fall back to ``live_rates``."""
     from flash.providers.base import canonical_gpu
 
     name = canonical_gpu(gpu_name)
+    if min_vram_gb > 0:
+        floored = live_offer_rates(max_wall_seconds=max_wall_seconds, min_vram_gb=min_vram_gb)
+        if name in floored:
+            return floored[name]
     # live_rates already merges the static snapshot (and returns it wholesale offline), so every
     # vast_name class is present on every return path — no second static lookup needed.
     return live_rates(max_wall_seconds=max_wall_seconds).get(name) or 0.0

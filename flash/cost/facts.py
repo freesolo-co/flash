@@ -31,7 +31,9 @@ def gpu_tflops(name: str) -> float:
     return GPU_COMPUTE_TFLOPS.get(name, _DEFAULT_TFLOPS)
 
 
-def gpu_hourly_usd(name: str, provider: str | None = None, max_wall_seconds: float = 0.0) -> float:
+def gpu_hourly_usd(
+    name: str, provider: str | None = None, max_wall_seconds: float = 0.0, min_vram_gb: int = 0
+) -> float:
     """Representative $/hr for a class, on ``provider`` when given.
 
     When ``provider`` is ``lambda`` or ``vast`` and the class is offered there, price it through that
@@ -39,6 +41,10 @@ def gpu_hourly_usd(name: str, provider: str | None = None, max_wall_seconds: flo
 
     ``max_wall_seconds`` (>0) is threaded into the Vast live market so a duration-bound quote prices
     against offers that outlast the run, not a short-lived one filtered out at launch.
+
+    ``min_vram_gb`` (>0) floors the Vast market search at the job's required VRAM — the SAME floor
+    ``pick_gpu`` selected under — so a high-VRAM class isn't crowded off the price-sorted page and
+    misquoted on the static fallback (selection/quote parity).
     """
     info = GPU_INFO.get(name)
     if info is None:
@@ -53,7 +59,7 @@ def gpu_hourly_usd(name: str, provider: str | None = None, max_wall_seconds: flo
         # provider="vast" quote through the Vast pricing module (live + static fallback).
         from flash.providers.vast.pricing import hourly_rate
 
-        return hourly_rate(name, max_wall_seconds=max_wall_seconds)
+        return hourly_rate(name, max_wall_seconds=max_wall_seconds, min_vram_gb=min_vram_gb)
     return info.hourly_usd
 
 
