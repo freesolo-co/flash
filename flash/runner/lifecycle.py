@@ -55,7 +55,7 @@ class _RetryBudget:
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     # Lazy import: dry-run / unit tests never construct a Flash endpoint.
-    from flash.providers.runpod.train import upload_code
+    from flash.providers._worker import upload_code
     from flash.runner import (
         RUNS_DIR,
         TERMINAL_STATES,
@@ -180,11 +180,13 @@ def _submit_seed_supervised(
     def _gc_seen_endpoints() -> None:
         if not seen_endpoints:
             return
-        from flash.providers.runpod import api as runpod_api
+        from flash.providers import get_provider
+        from flash.providers.base import JobHandle
 
+        rp = get_provider("runpod")
         for eid in seen_endpoints:
             with contextlib.suppress(Exception):
-                runpod_api.delete_endpoint(eid)
+                rp.destroy(JobHandle.from_dict({"endpoint_id": eid}))
 
     def _cancel() -> _RunCancelled:
         """Reap this seed's tracked endpoints before unwinding on cancel — a handle whose `running`
@@ -218,10 +220,13 @@ def _submit_seed_supervised(
             teardown_confirmed = True
             if last_handle.get("endpoint_id"):
                 try:
-                    from flash.providers.runpod import api as runpod_api
+                    from flash.providers import get_provider
+                    from flash.providers.base import JobHandle
 
-                    runpod_api.cancel_job(last_handle["endpoint_id"], last_handle["job_id"])
-                    runpod_api.delete_endpoint(last_handle["endpoint_id"])
+                    rp = get_provider("runpod")
+                    rp_handle = JobHandle.from_dict(last_handle)
+                    rp.cancel(rp_handle)  # cancel_job (stop the running job)
+                    rp.destroy(rp_handle)  # delete_endpoint (drop the throttled/sick host)
                     print(
                         f"retry {attempt}: deleted endpoint {last_handle['endpoint_id']} "
                         "(escaping throttled/sick host)",
@@ -326,7 +331,7 @@ def _submit_seed_supervised(
                 started_with_shared_cache
                 and not drop_weight_cache
                 and chosen is not None
-                and chosen.provider == "runpod"
+                and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
             )
             on_last_gpu = len(untried) <= 1 or (
                 retry_budget.infra_exhausted(cache_fallback_available=cache_fallback_available)
@@ -389,7 +394,7 @@ def _submit_seed_supervised(
             pass
         run_had_cache = bool(
             chosen is not None
-            and chosen.provider == "runpod"
+            and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
             and getattr(run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
         )
         first_cache_drop = (

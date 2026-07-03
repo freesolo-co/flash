@@ -1,4 +1,4 @@
-"""Shared building blocks for the instance-based providers (e.g. Lambda)."""
+"""Shared building blocks for the instance-based providers (Lambda, Vast)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import base64
 import hashlib
 import io
 import json
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, ClassVar
 
 # Bounded so the name is never truncated at launch — truncation desyncs the sweep-matched prefix.
 _MAX_NAME = 60
@@ -51,6 +53,70 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
     attempt_s = attempt_s[: max(1, min(len(attempt_s), max(1, digit_budget - 1)))]
     seed_s = seed_s[: max(0, digit_budget - len(attempt_s))]
     return f"{run_label_prefix(run_id)}-s{seed_s}-a{attempt_s}"
+
+
+@dataclass
+class InstanceJobHandle:
+    """Fields + (de)serialization common to every rent-a-box provider handle (Lambda, Vast).
+
+    Persisted in ``RunStatus.remote`` so any process can reattach/cancel (cf. ``base.JobHandle``). Each
+    provider subclass tags its ``provider`` and adds its own locator fields (via ``_extra_to_dict`` /
+    ``_extra_from_dict``); the shared ``to_dict``/``from_dict`` carry the common set so the serialized
+    shape stays byte-identical across providers. ``instance_id`` is the poll/destroy target, so unlike
+    every other field it has NO safe default — a missing/uncoercible one is a corrupt handle that must
+    fail with a clear, actionable error (not a bare KeyError/ValueError that crashes reattach/recovery).
+    """
+
+    instance_id: int | str
+    gpu: str
+    hourly_usd: float
+    attempt: int
+    started_ts: float
+
+    provider: ClassVar[str] = "instance"
+
+    @staticmethod
+    def _coerce_instance_id(raw: Any) -> Any:
+        """Provider-specific instance_id coercion (Vast=int, Lambda=str). Overridden per subclass."""
+        return raw
+
+    def _extra_to_dict(self) -> dict:
+        """Provider-specific fields, serialized between ``instance_id`` and the shared tail."""
+        return {}
+
+    @staticmethod
+    def _extra_from_dict(d: dict) -> dict:
+        """Provider-specific fields, parsed from a persisted handle dict (kwargs for the constructor)."""
+        return {}
+
+    def to_dict(self) -> dict:
+        return {
+            "provider": self.provider,
+            "instance_id": self.instance_id,
+            **self._extra_to_dict(),
+            "gpu": self.gpu,
+            "hourly_usd": self.hourly_usd,
+            "attempt": self.attempt,
+            "started_ts": self.started_ts,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> InstanceJobHandle:
+        try:
+            instance_id = cls._coerce_instance_id(d["instance_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"corrupt {cls.provider} handle: missing/non-numeric instance_id "
+                f"({d.get('instance_id')!r}) in persisted handle {d!r}"
+            ) from exc
+        return cls(
+            instance_id=instance_id,
+            gpu=str(d.get("gpu") or ""),
+            hourly_usd=float(d.get("hourly_usd") or 0),
+            attempt=int(d.get("attempt") or 0),
+            started_ts=float(d.get("started_ts") or 0),
+            **cls._extra_from_dict(d),
+        )
 
 
 # Fixed container path the per-region cache is bind-mounted at (host mount differs per provider).
@@ -139,7 +205,7 @@ def build_payload(
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
     ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
     from flash.envs.registry import worker_pip_for_env
-    from flash.providers.runpod.train import (
+    from flash.providers._worker import (
         build_worker_env,
         chalk_extra_pip,
         strip_runpod_volume_env,
