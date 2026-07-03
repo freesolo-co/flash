@@ -27,25 +27,23 @@ from collections.abc import Callable
 
 from flash._logging import get_logger
 from flash.providers._hf_artifacts import (
-    heartbeat_is_stale_prior_attempt,
     make_hf_heartbeat_reader,
     make_hf_text_reader,
-    worker_flagged_retriable,
 )
+from flash.providers._instance_poll import InstancePollAdapter, poll_instance_job
 from flash.providers._poll import (
-    BOOT_LOG_ABSENT_POLLS,
-    FIRST_LIVENESS_OBSERVED_FLOOR_S,
     FIRST_LIVENESS_S,
     LOAD_TIMEOUT_S,
     PROVISION_GRACE_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
-    PollErrorTracker,
-    heartbeat_progress_ts,
-    is_training_heartbeat,
     make_say,
-    surface_heartbeat,
 )
+
+# Re-exported (unused here) so the cross-provider symmetry guard can assert every rent-a-box jobs module
+# draws the setup-vs-training stall boundary from the ONE canonical helper (the shared poll driver uses
+# it); keeps the rule from drifting between providers.
+from flash.providers._poll import is_training_heartbeat as is_training_heartbeat
 from flash.providers.base import (
     GPU_INFO,
     PollResult,
@@ -89,18 +87,6 @@ MIN_DISK_GB = 60.0
 # yet emits no DONE/heartbeat, so classify it dead for fast failover. Unlike ``unknown`` it is never
 # this poller's no-status fallback, so it needs no ``became_running`` gate.
 _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
-
-# A fresh DONE can precede the separately-uploaded metrics.json (HF read-after-write lag). Re-read
-# metrics a few times before falling back to the infra-retryable poll_error, so a DONE-signalled
-# success isn't hard-failed on a transient read gap (mirrors Lambda's finish_ok behavior).
-_METRICS_AFTER_DONE_RETRIES = 6
-_METRICS_AFTER_DONE_WAIT_S = 5.0
-
-# A successful container self-destroys the instant it finishes — often before HF exposes its DONE /
-# attempt marker. Re-read terminal artifacts a few times before concluding host loss, so a
-# finished-then-gone seed isn't mis-retried against its own artifacts.
-_TERMINAL_AFTER_DEAD_RETRIES = 6
-_TERMINAL_AFTER_DEAD_WAIT_S = 5.0
 
 
 def _effective_disk_gb(spec) -> float:
@@ -360,19 +346,6 @@ def _failure_detail(
     return "\n".join(parts) or "vast worker terminated without a DONE sentinel"
 
 
-def _read_with_retries(read, *, tries: int, wait_s: float, say, message: str):
-    """Call ``read()`` (a zero-arg reader), re-reading up to ``tries`` times ``wait_s`` apart while it
-    returns None — for HF read-after-write lag (metrics.json after DONE; terminal artifacts after a box
-    self-destructs). ``time.sleep`` is mocked in tests, so this adds no test wall-time."""
-    value = read()
-    while value is None and tries > 0:
-        say(message)
-        time.sleep(wait_s)
-        value = read()
-        tries -= 1
-    return value
-
-
 def poll_vast_job(
     handle: VastJobHandle,
     spec,
@@ -387,69 +360,20 @@ def poll_vast_job(
 ) -> PollResult:
     """Poll instance status + HF artifacts to a terminal state (cf. lambdalabs.jobs.poll_lambda_job).
 
-    COMPLETED     fresh DONE sentinel on HF -> metrics.json (cost stamped from the offer's real $/hr).
-    job_failed    attempt marker with ok=false (a real worker error; fails fast unless flagged retriable).
-    job_preempted instance died without DONE/marker (host loss) -> infra-shaped, retried.
-    stalled       never left loading within LOAD_TIMEOUT_S; OR running but emitted NO heartbeat within
-                  ``first_liveness_s``; OR heartbeat frozen past the setup/stall window; OR deadline passed.
+    A thin wrapper that builds the Vast :class:`InstancePollAdapter` and defers to the shared
+    ``poll_instance_job`` kernel — Vast IS that kernel's baseline, so its behavior is unchanged. Vast
+    stamps the customer cost from the worker TRAINING wall (metrics.wall_seconds), notes the provider
+    offer + instance wall, reads early-liveness from the container-log API, and — having no host console
+    file — assembles failure detail from HF artifacts + the live instance log tail. ``LOAD_TIMEOUT_S`` is
+    read here (a module global) so ``monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", ...)`` still bites.
     """
-    say = make_say(log)
-
-    # started_ts is 0.0 for an old/corrupt handle -> fall back to now for the load/stall clocks + cost.
-    launch_ts = handle.started_ts or time.time()
-    # Heartbeat attempt-DATING must use the TRUE launch (0.0 == unknown), NOT the now() fallback: a now()
-    # anchor makes a normal heartbeat's ts look prior-to-launch, mis-dating a same-attempt crash as a
-    # prior-attempt leftover. launch_ts (now-floored) is only for elapsed-time math.
-    _dating_launch = handle.started_ts or 0.0
-
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}"
-    done_reader = _make_hf_file_reader(hf_repo, f"{prefix}/DONE")
-    marker_reader = _make_hf_file_reader(
-        hf_repo, f"{prefix}/vast_attempt{handle.attempt}.json", min_interval_s=60.0
-    )
-    metrics_reader = _make_hf_file_reader(hf_repo, f"{prefix}/metrics.json")
+    err_name = f"error_{spec.phase}_attempt{int(handle.attempt or 0)}.txt"
 
-    def finish_ok(end_ts_hint: float | str | None = None) -> PollResult:
-        # metrics.json is written before DONE but HF read-after-write lags: re-read a few times before
-        # falling back to the poll_error retry on a DONE-without-metrics.
-        raw = _read_with_retries(
-            lambda: metrics_reader(force=True),
-            tries=_METRICS_AFTER_DONE_RETRIES,
-            wait_s=_METRICS_AFTER_DONE_WAIT_S,
-            say=say,
-            message="DONE seen but metrics.json not visible yet; waiting for HF read-after-write",
-        )
-        if raw is None:
-            # DONE means the worker SIGNALLED SUCCESS; an unreadable metrics.json after the in-line
-            # retries is a transient HF read-after-write gap, not a worker error. Mirror Lambda
-            # (lambdalabs finish_ok -> poll_error): don't fast-fail a successful run as job_failed —
-            # return the infra-retryable poll_error so it gets its bounded infra budget (never a
-            # forever-spin: poll_error is capped by infra_retries) instead of a hard terminal failure.
-            return PollResult(
-                False, failure="poll_error", detail="DONE without metrics.json (transient HF read)"
-            )
-        try:
-            metrics = json.loads(raw)
-        except ValueError:
-            # A present-but-unparseable metrics.json (truncated read-after-write / corrupt) must NOT
-            # escape the poll loop as a raw JSONDecodeError and abort the run past the teardown finally.
-            # It is the same transient read-after-write gap on a DONE-signalled success, so classify it
-            # exactly like the DONE-without-metrics case above: infra-retryable poll_error, not job_failed.
-            return PollResult(
-                False, failure="poll_error", detail="DONE with unparseable metrics.json (transient HF read)"
-            )
-        # Instance wall note anchors to the worker's DONE ts, else the ok-marker's completion ts (so a
-        # delayed recovery isn't measured as runtime), else now; adopt only if in [launch, now]. The
-        # customer-facing cost below uses the worker training wall only.
-        end_ts = time.time()
-        # end_ts_hint is the worker's completion time — the DONE sentinel's payload (a str) or an ok
-        # marker's ts (a float). float() tolerates surrounding whitespace, so no pre-strip is needed.
-        if end_ts_hint is not None:
-            with contextlib.suppress(TypeError, ValueError):
-                ts = float(end_ts_hint)
-                if launch_ts <= ts <= end_ts:
-                    end_ts = ts
+    def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
+        # Customer cost is the worker TRAIN wall x the offer's live $/hr; the instance-wall note anchors
+        # to the worker's DONE / ok-marker ts (already resolved into ``end_ts``), else now.
         instance_wall_s = max(0.0, end_ts - launch_ts)
         try:
             train_wall_s = max(0.0, float(metrics.get("wall_seconds") or 0.0))
@@ -467,282 +391,63 @@ def poll_vast_job(
             }
         )
         metrics["notes"] = notes
-        return PollResult(True, metrics=metrics)
 
-    def done_is_fresh(content: str) -> bool:
-        # DONE carries the worker's time.time(); 120 s of clock-skew grace. Anything older predates
-        # this attempt (leftover from a prior attempt's resume).
-        try:
-            return float(content.strip()) > launch_ts - 120.0
-        except ValueError:
-            return False
-
-    def finish_from_ok_marker(marker: dict | None = None) -> PollResult:
-        # An ok marker means the worker finished (metrics.json was written first), even if DONE is stale.
-        # Pass DONE only when fresh; else use the marker's own completion ts for the wall note.
-        d = done_reader(force=True)
-        fresh = d is not None and done_is_fresh(d)
-        marker_ts = marker.get("ts") if isinstance(marker, dict) else None
-        return finish_ok(d if fresh else marker_ts)
-
-    def fail_from_marker(marker: dict | None) -> PollResult:
-        # A real worker error fails fast UNLESS flagged retriable (in the marker, or the worker's
-        # heartbeat for a RetriableInfraError). Gate the heartbeat flag to THIS attempt so a stale
-        # retriable=True from a prior attempt can't turn a fast-fail into a GPU-burning retry loop.
-        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(
-            heartbeat_reader, launch_ts=_dating_launch, current_attempt=handle.attempt
-        )
-        return PollResult(
-            False,
-            failure="job_preempted" if retriable else "job_failed",
-            detail=_failure_detail(
-                hf_repo, prefix, spec.phase, marker, handle.instance_id, attempt=handle.attempt
-            ),
-        )
-
-    def terminal_artifact_result(force: bool = True) -> PollResult | None:
-        # The worker's terminal HF artifacts (DONE / attempt marker) -> a terminal PollResult when it
-        # definitively finished or errored, else None. The SINGLE terminal detector shared by the poll
-        # loop and every give-up path. ``force`` bypasses the read cache: True for the one-shot give-up
-        # reads; False for the per-iteration loop poll, which already paces its own reads.
-        d = done_reader(force=force)
-        if d is not None and done_is_fresh(d):
-            return finish_ok(d)
-        raw = marker_reader(force=force)
-        if raw:
-            with contextlib.suppress(ValueError):
-                m = json.loads(raw)
-                if m.get("ok"):
-                    return finish_from_ok_marker(m)
-                return fail_from_marker(m)
-        return None
-
-    def stalled_unless_terminal(detail: str) -> PollResult:
-        # A stall exit still checks for terminal artifacts — the worker may have finished right at the
-        # boundary. Use the BOUNDED read (like the deadline / dead-host / poll-error paths) so a fresh
-        # DONE/marker not yet visible under HF read-after-write lag isn't missed and mis-classified stalled
-        # (which would fail a max_retries=0 run that actually completed, or rent a second box for the seed).
-        terminal = _read_with_retries(
-            terminal_artifact_result,
-            tries=_TERMINAL_AFTER_DEAD_RETRIES,
-            wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
-            say=say,
-            message="stall boundary; waiting for HF to expose any terminal DONE/marker before stalled",
-        )
-        return terminal if terminal is not None else PollResult(False, failure="stalled", detail=detail)
-
-    poll_errors = PollErrorTracker(say, interval_s)
-    # Seed the load/stall clocks from LAUNCH, not this poll's start: a delayed reattach has been billing
-    # since launch, so a still-loading box that already blew LOAD_TIMEOUT_S fails over now.
-    start = launch_ts
-    last_status = None
-    last_hb_key = None
-    last_progress = start
-    became_running = False
-    # Anchored to launch so a reattach already-running measures first-liveness from the original launch.
-    running_since = start
-    # Wall-clock THIS session first saw it running (set once) — "how long WE have watched it", so a
-    # reattach doesn't fast-fail a box that just came up.
-    observed_running_since = None
-    seen_training_hb = False
-    # Any FRESH heartbeat from this attempt proves the worker started -> clears the first-liveness
-    # deadline (distinct from seen_training_hb, which gates the tighter training window).
-    seen_fresh_hb = False
-    # Lambda-parity for boot.log liveness: a non-empty CONTAINER LOG tail proves the bootstrap is alive
-    # (pip/code fetch can outlast first_liveness_s before the first heartbeat), so we don't fast-fail a
-    # healthy cold start. Require silence across BOOT_LOG_ABSENT_POLLS so a log-API blip can't burn a retry.
-    console_log_seen = False
-    console_log_absent_polls = 0
-    missing_streak = 0
-    while True:
-        if deadline_s is not None and time.time() - start > deadline_s:
-            # A recovered run can blow a launch-anchored deadline on the first reattach tick (the outage
-            # lasted past max_wall+grace). The worker may also have just finished / self-destructed AT the
-            # wall cap with its DONE/marker not yet visible on HF (read-after-write lag), so do the BOUNDED
-            # terminal-artifact wait (not a single read) before declaring stalled — else the retry re-rents
-            # a GPU for the same seed while the completed attempt's artifacts surface moments later.
-            terminal = _read_with_retries(
-                terminal_artifact_result,
-                tries=_TERMINAL_AFTER_DEAD_RETRIES,
-                wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
-                say=say,
-                message="deadline reached; waiting for HF to expose any terminal DONE/marker before giving up",
-            )
-            if terminal is not None:
-                return terminal
-            return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
-        try:
-            inst = vast_api.get_instance(handle.instance_id)
-            poll_errors.reset()
-        except (
+    adapter = InstancePollAdapter(
+        provider="vast",
+        instance_id=handle.instance_id,
+        current_attempt=handle.attempt,
+        # started_ts is 0.0 for an old/corrupt handle -> fall back to now for the load/stall clocks + cost.
+        # The heartbeat attempt-DATING uses the TRUE launch (0.0 == unknown), NOT the now() fallback: a
+        # now() anchor makes a normal heartbeat's ts look prior-to-launch, mis-dating a same-attempt crash
+        # as a prior-attempt leftover.
+        launch_ts=handle.started_ts or time.time(),
+        dating_launch=handle.started_ts or 0.0,
+        done_reader=_make_hf_file_reader(hf_repo, f"{prefix}/DONE"),
+        marker_reader=_make_hf_file_reader(
+            hf_repo, f"{prefix}/vast_attempt{handle.attempt}.json", min_interval_s=60.0
+        ),
+        metrics_reader=_make_hf_file_reader(hf_repo, f"{prefix}/metrics.json"),
+        # Resolve get_instance / instance_logs on the api MODULE at call time so a monkeypatch bites.
+        fetch_instance=lambda: vast_api.get_instance(handle.instance_id),
+        # A malformed 200 body (truncated / non-JSON / invalid-UTF8) makes RestClient raise a decode /
+        # incomplete-read error, NOT a VastApiError — the _http retry wrapper only catches OSError
+        # transients, so these escape get_instance raw. Treat them like any transient poll error.
+        poll_error_exceptions=(
             vast_api.VastApiError,
             json.JSONDecodeError,
             UnicodeDecodeError,
             http.client.HTTPException,
-        ) as e:
-            # A malformed 200 body (truncated / non-JSON / invalid-UTF8) makes RestClient raise a decode
-            # / incomplete-read error, NOT a VastApiError — the _http retry wrapper only catches OSError
-            # transients, so these escape get_instance raw. Treat them like any transient poll error:
-            # count against the budget and keep polling (else a read blip looks like a gone instance).
-            if poll_errors.record(e):
-                # The status endpoint is down, but the worker may have COMPLETED during the outage and
-                # written its terminal DONE/marker to HF (a different endpoint). Do the BOUNDED terminal
-                # read (same as the deadline / dead-host paths) before giving up: a prolonged outage can
-                # end right as the worker finishes, so a single read can miss the just-written artifact
-                # under HF read-after-write lag. Else poll_error tears the box down and the retry relaunches
-                # a second worker for an attempt that already finished (duplicate work + double-bill).
-                terminal = _read_with_retries(
-                    terminal_artifact_result,
-                    tries=_TERMINAL_AFTER_DEAD_RETRIES,
-                    wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
-                    say=say,
-                    message="status-poll outage; waiting for HF to expose any terminal DONE/marker before poll_error",
-                )
-                if terminal is not None:
-                    return terminal
-                return PollResult(False, failure="poll_error", detail=str(e))
-            continue
-        # The instance-detail route transiently answers {"instances": null} for healthy (and brand-new)
-        # instances. One missing read means nothing — only a sustained streak is a real disappearance.
-        missing_streak = missing_streak + 1 if inst is None else 0
-
-        status = (inst or {}).get("actual_status") or ("missing" if inst is None else "unknown")
-        if status != last_status:
-            say(f"instance {handle.instance_id}: {status}")
-            # Count a status TRANSITION as progress, but NOT the first observation (last_status starts
-            # None, so the first read always "changes" — crediting it would hand a silent-since-launch
-            # worker a fresh setup grace after every restart).
-            if last_status is not None:
-                last_progress = time.time()
-                if status == "running":
-                    running_since = time.time()  # genuine ->running: start the liveness clock
-            last_status = status
-        if status == "running":
-            became_running = True
-            if observed_running_since is None:
-                observed_running_since = time.time()
-
-        # Per-iteration terminal check: the SAME detector every give-up path uses (force=False — the loop
-        # paces its own reads). Folds the DONE and ok/err-marker checks into one call.
-        terminal = terminal_artifact_result(force=False)
-        if terminal is not None:
-            return terminal
-
-        # ``unknown`` = "host has no recent heartbeat and won't progress" (host loss) -> dead for fast
-        # failover. Gate on ``became_running`` because ``unknown`` is ALSO this poller's no-status
-        # fallback during provisioning; only a box that WAS running then goes unknown is genuine loss.
-        dead = (
-            missing_streak >= 4
-            or status in _DEAD_STATES
-            or (became_running and status == "unknown")
-        )
-        if dead:
-            # The worker may have finished just before the box self-destroyed, with its DONE/marker not
-            # yet visible on HF (read-after-write lag). Re-read terminal artifacts a bounded number of
-            # times before concluding loss.
-            terminal = _read_with_retries(
-                terminal_artifact_result,
-                tries=_TERMINAL_AFTER_DEAD_RETRIES,
-                wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
-                say=say,
-                message="instance gone; waiting for HF to expose any terminal DONE/marker before failover",
-            )
-            if terminal is not None:
-                return terminal
-            # Dead host, no ok-marker/DONE. Distinguish genuine host LOSS (retry on a fresh host) from a
-            # worker that RAN and CRASHED early leaving error_{phase}_attempt<N>.txt (bad env/config/OOM):
-            # that is DETERMINISTIC -> fail FAST. A crash the worker flagged retriable still retries.
-            err_name = f"error_{spec.phase}_attempt{int(handle.attempt or 0)}.txt"
-            err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
-            # Error files are attempt-scoped but the heartbeat is run-scoped: gate the crash evidence on
-            # heartbeat provenance (dated by _dating_launch, the TRUE launch) so a stale prior-attempt
-            # heartbeat can't flip a genuine host-loss retry into a fast-fail job_failed.
-            crash_evidence_is_current = not heartbeat_is_stale_prior_attempt(
-                heartbeat_reader, launch_ts=_dating_launch, current_attempt=handle.attempt
-            )
-            worker_crashed = (
-                bool(err and err.strip())
-                and crash_evidence_is_current
-                and not worker_flagged_retriable(
-                    heartbeat_reader, launch_ts=_dating_launch, current_attempt=handle.attempt
-                )
-            )
-            return PollResult(
-                False,
-                failure="job_failed" if worker_crashed else "job_preempted",
-                detail=_failure_detail(
-                    hf_repo, prefix, spec.phase, None, handle.instance_id, attempt=handle.attempt
-                ),
-            )
-
-        new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
-        if new_key != last_hb_key:
-            last_hb_key = new_key
-            # Credit the heartbeat's OWN ts (clamped to [launch, now]) so a pre-restart-stale heartbeat
-            # buys no fresh window. ``fresh`` is False for a leftover prior-attempt heartbeat.
-            hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
-            if fresh:
-                seen_fresh_hb = True  # any fresh hb (incl. a bare liveness ping) disarms first-liveness
-                # Advance the stall clock ONLY on a STAGED heartbeat (stage is not None): a bare liveness
-                # ping must not let a wedged worker keep resetting the setup/training stall window
-                # (mirrors the Lambda poller). MONOTONIC: never regress on an out-of-order upload.
-                if stage is not None:
-                    last_progress = max(last_progress, hb_ts)
-                    # Tighten setup_grace -> stall only once training genuinely begins (the shared helper
-                    # keeps cold-start pings, incl. the silent step=0 first rollout, under setup grace).
-                    if is_training_heartbeat(stage, new_key[1]):
-                        seen_training_hb = True
-
-        # Load timeout: a box that never left loading/unknown within LOAD_TIMEOUT_S never started.
-        # But a fresh heartbeat PROVES the worker booted even while the detail API lags in
-        # loading/unknown (never flipping to 'running'), so it disarms this — else a healthy,
-        # heartbeating box is torn down at 15m on a lagging status feed. deadline_s (+ the finally
-        # destroy and periodic sweep) stays the ultimate spend backstop once this is disarmed.
-        # ORDER MATTERS: this runs AFTER the heartbeat read above, so THIS tick's first fresh heartbeat
-        # (which sets seen_fresh_hb) disarms the timeout on the very iteration it arrives — a heartbeat
-        # landing exactly at the 15m mark must not be raced by a stale seen_fresh_hb from the prior tick.
-        if not became_running and not seen_fresh_hb and time.time() - start > LOAD_TIMEOUT_S:
-            return PollResult(
-                False,
-                failure="stalled",
-                detail=f"instance stuck in '{status}' for {int(time.time() - start)}s "
-                f"(never started; image pull / host issue)",
-            )
-
-        if became_running:
-            # Fast-failover: a box that reached 'running' but emitted NO heartbeat past first_liveness_s
-            # might be wedged -> 'stalled'. But a healthy slow cold start (pip install / code fetch) also
-            # has no heartbeat yet, so before failing over consult the container-log API: a non-empty tail
-            # means the bootstrap is alive (latch, let setup_grace_s govern); only a container SILENT
-            # across BOOT_LOG_ABSENT_POLLS is the wedged host. The observed-running floor keeps a reattach
-            # from fast-failing a box that just came up. Mirrors Lambda's boot.log path.
-            if (
-                not seen_fresh_hb
-                and not console_log_seen
-                and time.time() - running_since > first_liveness_s
-                and observed_running_since is not None
-                and time.time() - observed_running_since > FIRST_LIVENESS_OBSERVED_FLOOR_S
-            ):
-                if not vast_api.instance_logs(handle.instance_id):
-                    # A lone empty read can be a transient log-API error -> require BOOT_LOG_ABSENT_POLLS.
-                    console_log_absent_polls += 1
-                    if console_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
-                        return stalled_unless_terminal(
-                            f"no worker heartbeat AND no container-log output for "
-                            f"{int(time.time() - running_since)}s after the container started "
-                            f"(worker never came up; limit {int(first_liveness_s)}s)"
-                        )
-                else:
-                    # Bootstrap is producing output -> healthy slow cold start; setup/stall below backstop.
-                    console_log_seen = True
-            limit = stall_after_s if seen_training_hb else setup_grace_s
-            if time.time() - last_progress > limit:
-                phase = "training" if seen_training_hb else "setup (pre-training)"
-                return stalled_unless_terminal(
-                    f"no worker progress for {int(time.time() - last_progress)}s during "
-                    f"{phase} (instance status {status}, limit {int(limit)}s)"
-                )
-        time.sleep(interval_s)
+        ),
+        status_field="actual_status",
+        running_status="running",
+        dead_states=_DEAD_STATES,
+        missing_dead_threshold=4,
+        # A non-empty CONTAINER LOG tail proves the bootstrap is alive during a slow cold start.
+        early_liveness_alive=lambda: bool(vast_api.instance_logs(handle.instance_id)),
+        read_current_error=lambda: _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True),
+        stamp_cost_and_notes=stamp_cost_and_notes,
+        failure_detail=lambda marker: _failure_detail(
+            hf_repo, prefix, spec.phase, marker, handle.instance_id, attempt=handle.attempt
+        ),
+        load_timeout_detail=lambda status, elapsed: (
+            f"instance stuck in '{status}' for {int(elapsed)}s (never started; image pull / host issue)"
+        ),
+        first_liveness_detail=lambda elapsed, fl: (
+            f"no worker heartbeat AND no container-log output for {int(elapsed)}s after the container "
+            f"started (worker never came up; limit {int(fl)}s)"
+        ),
+    )
+    return poll_instance_job(
+        adapter,
+        log=log,
+        interval_s=interval_s,
+        heartbeat_reader=heartbeat_reader,
+        setup_grace_s=setup_grace_s,
+        stall_after_s=stall_after_s,
+        first_liveness_s=first_liveness_s,
+        load_timeout_s=LOAD_TIMEOUT_S,
+        deadline_s=deadline_s,
+    )
 
 
 def submit_run_vast(
