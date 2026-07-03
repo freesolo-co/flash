@@ -679,7 +679,12 @@ def poll_vast_job(
                 ),
             )
 
-        if not became_running and time.time() - start > LOAD_TIMEOUT_S:
+        # Load timeout: a box that never left loading/unknown within LOAD_TIMEOUT_S never started.
+        # But a fresh heartbeat PROVES the worker booted even while the detail API lags in
+        # loading/unknown (never flipping to 'running'), so it disarms this — else a healthy,
+        # heartbeating box is torn down at 15m on a lagging status feed. deadline_s (+ the finally
+        # destroy and periodic sweep) stays the ultimate spend backstop once this is disarmed.
+        if not became_running and not seen_fresh_hb and time.time() - start > LOAD_TIMEOUT_S:
             return PollResult(
                 False,
                 failure="stalled",

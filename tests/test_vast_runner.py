@@ -505,6 +505,37 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
     assert res.failure == "poll_error"  # decode failure caught as a poll error, not escaped raw
 
 
+def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
+    # Codex 3519040492: when Vast's detail API lags in 'loading'/'unknown' and never flips to
+    # 'running', a worker that HAS booted still uploads fresh heartbeats to HF. Those prove it
+    # started, so they disarm the load timeout — else a healthy, heartbeating box is torn down at
+    # LOAD_TIMEOUT_S (15m) on a stale status feed (deadline_s + the finally destroy stay the spend
+    # backstop). Status stays 'loading' the whole run; without the disarm the poller returns
+    # 'stalled' at LOAD_TIMEOUT_S; with it the box survives to see its (late) DONE and completes.
+    clock = {"t": 10_000.0}
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "loading"}],  # never flips to running -> became_running False
+        done=lambda: "12000.0" if clock["t"] >= 12_000 else None,  # surfaces only past LOAD_TIMEOUT
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+    )
+    # Override _wire_poll's itertools clock with a sleep-advances model so "elapsed since launch"
+    # is fully controlled: each poll iteration advances 500s, and LOAD_TIMEOUT_S (900s) is first
+    # exceeded at t=11_000 — 1000s before DONE surfaces at t=12_000.
+    monkeypatch.setattr(vast.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(vast.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + 500.0))
+
+    fresh_hb = {"stage": "sft_model_load", "step": 0, "ts": 10_100.0, "attempt": 0}
+    res = vast.poll_vast_job(
+        _handle(started_ts=10_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: fresh_hb,
+    )
+    assert res.ok  # survived past LOAD_TIMEOUT_S because the fresh heartbeat disarmed the load timeout
+
+
 def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
     """Codex/Cursor: when the Vast status endpoint keeps raising and the poll-error budget is spent, the
     poller does a BOUNDED terminal DONE/marker read (same as the deadline / dead-host paths) BEFORE

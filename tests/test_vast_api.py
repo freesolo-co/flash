@@ -268,6 +268,31 @@ def test_get_instance_reraises_non_404_with_404ish_body(monkeypatch):
         vast_api.get_instance(4040)
 
 
+def test_get_instance_raises_on_success_false_envelope(monkeypatch):
+    # Codex 3519040494: a 200 body that is a success:false error envelope (no "instances" key) must
+    # NOT be returned as instance detail — the poller would read it as a live-but-"unknown" instance
+    # (.get("actual_status") is None) and RESET its missing-streak, masking a real disappearance. It
+    # raises so the poll loop counts it as a bounded, retryable poll_error instead of a false read.
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [{"success": False, "msg": "no such instance"}])
+    with pytest.raises(vast_api.VastApiError):
+        vast_api.get_instance(4040)
+
+
+def test_get_instance_returns_dict_and_gone_signal(monkeypatch):
+    # The success:false raise is narrow: a real {"instances": {...}} detail still returns the inst,
+    # and the {"instances": null} "gone" signal still returns None (not an error).
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [{"instances": {"id": 5, "actual_status": "running"}}])
+    assert vast_api.get_instance(5) == {"id": 5, "actual_status": "running"}
+    _capture_urlopen(monkeypatch, [{"instances": None}])
+    assert vast_api.get_instance(5) is None
+
+
 def test_create_error_is_ambiguous_classification():
     # Codex Mr72L: classify create_instance failures so the walk only reconciles-by-label on the
     # AMBIGUOUS ones (a billed contract may exist), and walks straight past DEFINITIVE rejections.

@@ -206,6 +206,12 @@ def get_instance(instance_id: int) -> dict | None:
         if "instances" in out:
             inst = out["instances"]
             return inst if isinstance(inst, dict) else None
+        # A dict WITHOUT "instances" that carries success:false is an error envelope, not instance
+        # detail. Returning it would read as a live-but-"unknown" instance (its .get("actual_status")
+        # is None), silently RESETTING the missing streak and masking a real disappearance. Raise so
+        # the poller counts it as a bounded, retryable poll_error instead of a false healthy read.
+        if out.get("success") is False:
+            raise VastApiError(f"vast instance-detail error envelope for {int(instance_id)}: {out}")
         return out
     return None
 
