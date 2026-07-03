@@ -729,6 +729,22 @@ def test_poll_done_without_metrics_eventually_fails(monkeypatch):
     assert "DONE without metrics.json" in res.detail
 
 
+def test_poll_done_with_corrupt_metrics_is_controlled_failure(monkeypatch):
+    """A present-but-unparseable metrics.json (a truncated read-after-write / corrupt upload) after DONE
+    must NOT escape poll_vast_job as a raw JSONDecodeError — that would abort the run past the teardown
+    finally. It is classified as a controlled job_failed instead (Cursor)."""
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done="10500.0",
+        metrics="{ truncated json",  # present but unparseable
+    )
+    res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert "unparseable metrics.json" in res.detail
+
+
 def test_poll_loading_timeout(monkeypatch):
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "loading"}], step=100.0)
     monkeypatch.setattr(vast, "LOAD_TIMEOUT_S", 300.0)

@@ -425,7 +425,13 @@ def poll_vast_job(
         )
         if raw is None:
             return PollResult(False, failure="job_failed", detail="DONE without metrics.json")
-        metrics = json.loads(raw)
+        try:
+            metrics = json.loads(raw)
+        except ValueError:
+            # A present-but-unparseable metrics.json (truncated read-after-write / corrupt) must NOT
+            # escape the poll loop as a raw JSONDecodeError and abort the run — classify it like a
+            # DONE-without-metrics so the teardown finally still runs.
+            return PollResult(False, failure="job_failed", detail="DONE with unparseable metrics.json")
         # Instance wall note anchors to the worker's DONE ts, else the ok-marker's completion ts (so a
         # delayed recovery isn't measured as runtime), else now; adopt only if in [launch, now]. The
         # customer-facing cost below uses the worker training wall only.
@@ -647,14 +653,16 @@ def poll_vast_job(
             # buys no fresh window. ``fresh`` is False for a leftover prior-attempt heartbeat.
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
             if fresh:
-                # MONOTONIC: an older heartbeat.json can land after a newer one (eventual consistency);
-                # a backwards step would fire the stall timer early and tear down a healthy box.
-                last_progress = max(last_progress, hb_ts)
-                seen_fresh_hb = True
-                # Tighten setup_grace -> stall only once training genuinely begins (the shared helper
-                # keeps cold-start pings, incl. the silent step=0 first rollout, under setup grace).
-                if is_training_heartbeat(stage, new_key[1]):
-                    seen_training_hb = True
+                seen_fresh_hb = True  # any fresh hb (incl. a bare liveness ping) disarms first-liveness
+                # Advance the stall clock ONLY on a STAGED heartbeat (stage is not None): a bare liveness
+                # ping must not let a wedged worker keep resetting the setup/training stall window
+                # (mirrors the Lambda poller). MONOTONIC: never regress on an out-of-order upload.
+                if stage is not None:
+                    last_progress = max(last_progress, hb_ts)
+                    # Tighten setup_grace -> stall only once training genuinely begins (the shared helper
+                    # keeps cold-start pings, incl. the silent step=0 first rollout, under setup grace).
+                    if is_training_heartbeat(stage, new_key[1]):
+                        seen_training_hb = True
         if became_running:
             # Fast-failover: a box that reached 'running' but emitted NO heartbeat past first_liveness_s
             # might be wedged -> 'stalled'. But a healthy slow cold start (pip install / code fetch) also
