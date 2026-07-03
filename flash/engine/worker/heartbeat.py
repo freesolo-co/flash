@@ -25,6 +25,12 @@ _HB_THROTTLED_STAGES = frozenset(
         "opd_step",
         "model_prefetching",
         "sft_pretokenizing",
+        # opd_filtering_prompts renders+tokenizes the whole train split from a 30s liveness thread
+        # WITH a progress callback, so it emits a REAL (non-liveness) heartbeat every time the scan
+        # counter advances. Unthrottled that is one HF commit per tick — ~120/hr on a large split
+        # before model load, blowing the 128/hr commit cap. Throttle it exactly like its SFT analogue
+        # sft_pretokenizing (codex[bot]).
+        "opd_filtering_prompts",
         "sft_initializing",
         "rl_initializing",
         "opd_initializing",
@@ -34,6 +40,10 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
     {
         "model_prefetching",
         "sft_pretokenizing",
+        # Setup-phase filtering: keep the tighter setup-liveness upload cadence (parity with
+        # sft_pretokenizing) so the stall detector stays fed while the split is scanned, without
+        # exceeding the commit cap now that the stage is throttled above.
+        "opd_filtering_prompts",
         "sft_initializing",
         "rl_initializing",
         "opd_initializing",
@@ -218,10 +228,16 @@ _STALL_DUMP_S = 1200.0
 
 
 @contextlib.contextmanager
-def liveness_heartbeat(stage, progress=None):
+def liveness_heartbeat(stage, progress=None, fields=None):
     """Emit liveness pings for ``stage`` while the wrapped block runs on the main thread.
 
     ``progress``: optional ``() -> float | None`` monotonic counter; advances emit a REAL heartbeat.
+    ``fields``: optional ``() -> dict`` of EXTRA payload fields merged into every emission (liveness
+    and progress alike). Use it to carry the billing/stall ``step`` on a stage the poller step-gates:
+    without it this thread emits ``stage=<stage>`` with NO ``step``, and because it shares the
+    ``opd_step`` upload-throttle slot it can win the slot and overwrite the main thread's stepped
+    heartbeat -- ``actual_steps_run`` then sees a training-stage heartbeat with no step and floors a
+    cancelled run to 1 step, mis-billing it (codex[bot]).
     Uses nvidia-smi-only diagnostics (main thread holds CUDA/allocator locks).
     """
     done = threading.Event()
@@ -239,7 +255,11 @@ def liveness_heartbeat(stage, progress=None):
             gpu = gpu_diagnostics(include_torch=False)
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
-            _w.heartbeat(stage, liveness=not made_progress, gpu=gpu)
+            extra = {}
+            if fields is not None:
+                with contextlib.suppress(Exception):
+                    extra = fields() or {}
+            _w.heartbeat(stage, liveness=not made_progress, gpu=gpu, **extra)
             last_progress = float(getattr(_w, "_HB_LAST_PROGRESS_TS", 0.0) or 0.0)
             if not dumped and last_progress and (time.time() - last_progress) > _STALL_DUMP_S:
                 _dump_thread_stacks(f"{stage}: no progress for >{_STALL_DUMP_S:.0f}s")

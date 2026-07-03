@@ -20,6 +20,7 @@ imports (torch/transformers/peft) are inside functions, so importing this module
 
 from __future__ import annotations
 
+import contextlib
 import os
 import random
 import time
@@ -84,14 +85,42 @@ def _resolve_opd_knobs():
     }
 
 
-def _teacher_prompt_text(prompt_messages: list[dict]) -> str:
-    """Render the prompt for the teacher's scoring context (template-agnostic; ends at 'Assistant: ')."""
+def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = "") -> str:
+    """Render the prompt for the teacher's scoring context (template-agnostic; ends at 'Assistant: ').
+
+    ``thinking_prefill`` is the extra trailing text a thinking-mode student template opens after the
+    generation prompt (e.g. Qwen's ``<think>\\n``). The student samples its on-policy completion AFTER
+    that prefill, so the teacher must condition on the SAME trailing context; otherwise every
+    thinking-mode token is scored against a prompt that never opened the reasoning block, and the gkd
+    logprobs are conditioned on a different prefix than the sampled tokens (codex[bot]). Empty (the
+    default) when thinking is off or the template ignores it -- the plain ``Assistant: `` already
+    matches."""
     parts = []
     for m in prompt_messages:
         role = str(m.get("role", "user")).capitalize()
         parts.append(f"{role}: {m.get('content', '')!s}")
-    parts.append("Assistant: ")
+    parts.append("Assistant: " + thinking_prefill)
     return "\n".join(parts)
+
+
+def _thinking_prefill_text(tok) -> str:
+    """The trailing text a thinking-mode chat template opens after the generation prompt (Qwen's
+    ``<think>\\n``), i.e. the delta between the enable_thinking=True and =False renders. Returns "" when
+    thinking is off or the template ignores enable_thinking (the two renders match), so callers can
+    unconditionally append it to the teacher prompt for student/teacher conditioning parity."""
+    if not _w.THINKING:
+        return ""
+    probe = [{"role": "user", "content": ""}]
+    with contextlib.suppress(Exception):
+        base = tok.apply_chat_template(
+            probe, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        think = tok.apply_chat_template(
+            probe, tokenize=False, add_generation_prompt=True, enable_thinking=True
+        )
+        if think.startswith(base) and len(think) > len(base):
+            return think[len(base) :]
+    return ""
 
 
 def _to_cpu_ids(completion_ids):
@@ -306,6 +335,10 @@ def run_opd():
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    # Thinking-mode student prompts open a reasoning block (e.g. Qwen's <think>) after the generation
+    # prompt; the teacher must condition on the SAME prefill or its logprobs score a different prefix
+    # than the sampled tokens (see _thinking_prefill_text). Compute once — the template is fixed.
+    thinking_prefill = _thinking_prefill_text(tok)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _attn = optimal_attn_impl()
@@ -463,9 +496,25 @@ def run_opd():
     teacher_transient = 0
 
     t_train = time.time()
-    with liveness_heartbeat("opd_step", progress=lambda: samples_seen):
-        for step in range(steps):
-            batch = [examples[(step * ppl_step + i) % len(examples)] for i in range(ppl_step)]
+    # Drive the loop by optimizer UPDATES, not raw iterations. A no-signal iteration (empty
+    # completions / a flaky teacher) skips optimizer.step() below, so `for step in range(steps)` could
+    # exit with opt_steps < steps -- shipping an under-trained adapter as the served DEFAULT while the
+    # run is billed the full submit-time `steps` quote (codex[bot]). Loop until `steps` real updates
+    # land, visiting a fresh data slice each iteration (`it` advances on a skip so a bad batch is not
+    # re-tried). Bound the iterations so a persistently degraded teacher cannot spin unboundedly --
+    # the post-loop guard then turns a shortfall into a RETRY, not a silent under-trained publish.
+    step = 0
+    max_iters = 2 * steps + 10
+    # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
+    # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
+    # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
+    with liveness_heartbeat(
+        "opd_step", progress=lambda: samples_seen, fields=lambda: {"step": opt_steps}
+    ):
+        while opt_steps < steps and step < max_iters:
+            it = step  # data-slice + display index for THIS iteration
+            step += 1  # advance up front so the nseq==0 `continue` below can't spin the while loop
+            batch = [examples[(it * ppl_step + i) % len(examples)] for i in range(ppl_step)]
             accum_target = max(1, ppl_step * group)
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
@@ -499,6 +548,7 @@ def run_opd():
                         gen_cfg=gen_cfg,
                         knobs=knobs,
                         torch=torch,
+                        thinking_prefill=thinking_prefill,
                     )
                     samples_seen += 1  # advances the liveness-thread progress signal
                     _t_status = getattr(_train_one, "last_teacher_status", None)
@@ -533,7 +583,7 @@ def run_opd():
                     # pings tighten it as intended, and the opd_step throttle bounds the HF upload rate.
                     _w.heartbeat("opd_step", step=opt_steps, samples_done=nseq)
             if nseq == 0:
-                print(f"[opd] step {step}: no usable teacher signal this step (skipped)")
+                print(f"[opd] step {it}: no usable teacher signal this step (skipped)")
                 continue
             # Each seq's grad was scaled by 1/accum_target; if some seqs were skipped (teacher call
             # failed / empty completion), rescale to a true 1/nseq mean so a partial step isn't a
@@ -560,9 +610,9 @@ def run_opd():
                 coverage=avg_cov,
                 gpu=gpu_diagnostics(include_torch=False),
             )
-            if step % 10 == 0:
+            if it % 10 == 0:
                 print(
-                    f"[opd] step {step + 1}/{steps} loss={avg_loss:.4f} "
+                    f"[opd] step {it + 1}/{steps} loss={avg_loss:.4f} "
                     f"coverage={avg_cov:.0%} seqs={nseq}"
                 )
             # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
@@ -590,6 +640,19 @@ def run_opd():
             "opd produced no trained step — every teacher scoring call failed or aligned to "
             "zero positions. Check FIREWORKS_API_KEY and the teacher model id. Failing loudly "
             "instead of reporting a no-op run as done."
+        )
+
+    if opt_steps < steps:
+        # Real updates landed, but skips (over-budget prompts / empty completions / an intermittent
+        # teacher) kept the loop from reaching the requested `steps` optimizer updates within the
+        # iteration budget. Publishing now would serve an under-trained adapter as the DEFAULT while
+        # billing the full `steps` quote, so RETRY (a healthier teacher / less degenerate sampling may
+        # complete it next attempt) rather than silently shipping short (codex[bot]). The intermediate
+        # non-default checkpoints already published stay available; only the served default is gated.
+        raise RetriableInfraError(
+            f"opd reached only {opt_steps}/{steps} optimizer updates within {max_iters} iterations "
+            f"({dropped_long} prompts dropped over budget, {teacher_transient} transient teacher "
+            "failures) — retrying rather than publishing an under-trained adapter billed as full steps."
         )
 
     _save_adapter(model, tok, adapter_dir)
@@ -643,10 +706,12 @@ def _train_one(
     gen_cfg,
     knobs,
     torch,
+    thinking_prefill="",
 ):
     """Sample one student completion on-policy, score it with the teacher, and return the groupwise
     reverse-KL loss (or None). Side-channels per-sequence stats on function attributes to keep the
-    caller compact."""
+    caller compact. ``thinking_prefill`` is appended to the teacher prompt so it conditions on the
+    same trailing context the student sampled after in thinking mode."""
     _train_one.last_coverage = 0.0
     _train_one.last_gen_tokens = 0
     _train_one.last_teacher_tokens = 0
@@ -674,7 +739,7 @@ def _train_one(
     if not completion_text.strip():
         return None
 
-    teacher_prompt = _teacher_prompt_text(prompt_messages)
+    teacher_prompt = _teacher_prompt_text(prompt_messages, thinking_prefill)
     try:
         teacher_toks = teacher.score(teacher_prompt, completion_text)
     except TeacherError as e:

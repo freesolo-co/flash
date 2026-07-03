@@ -645,7 +645,7 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
     captured = {}
 
     @contextlib.contextmanager
-    def _fake_liveness(stage, progress=None):
+    def _fake_liveness(stage, progress=None, fields=None):
         captured["stage"] = stage
         captured["progress"] = progress
         yield
@@ -697,7 +697,7 @@ def test_opd_emits_progress_heartbeat_while_filtering_prompts(monkeypatch):
     calls = []
 
     @contextlib.contextmanager
-    def _fake_liveness(stage, progress=None):
+    def _fake_liveness(stage, progress=None, fields=None):
         calls.append((stage, progress))
         yield
 
@@ -721,6 +721,151 @@ def test_opd_filtering_stage_is_setup_not_training():
     assert (
         is_training_heartbeat("opd_filtering_prompts", 5) is False
     )  # progress count doesn't flip it
+
+
+def test_opd_filtering_prompts_is_throttled_like_sft_pretokenizing():
+    """Regression (codex[bot], heartbeat.py): opd_filtering_prompts emits a REAL progress heartbeat
+    per liveness tick while it renders+tokenizes the whole split. Unthrottled that is one HF commit
+    per tick -- ~120/hr on a large split before model load, blowing the 128/hr commit cap. It must be
+    registered in BOTH heartbeat sets its SFT analogue sft_pretokenizing lives in: the throttle set
+    (bounds commit rate) and the setup-liveness set (keeps the tighter cold-start upload cadence)."""
+    from flash.engine.worker.heartbeat import _HB_SETUP_LIVENESS_STAGES, _HB_THROTTLED_STAGES
+
+    assert "opd_filtering_prompts" in _HB_THROTTLED_STAGES
+    assert "opd_filtering_prompts" in _HB_SETUP_LIVENESS_STAGES
+    # parity with the SFT pre-tokenize stage this mirrors (same dual membership).
+    assert "sft_pretokenizing" in _HB_THROTTLED_STAGES
+    assert "sft_pretokenizing" in _HB_SETUP_LIVENESS_STAGES
+
+
+def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):
+    """Regression (codex[bot], heartbeat.py): the liveness thread emits stage=<stage> with NO step,
+    and because it shares the opd_step upload-throttle slot it can win the slot and overwrite the
+    main thread's stepped heartbeat -- actual_steps_run then sees a training-stage heartbeat with no
+    step and floors a cancelled run to 1 step. A `fields` callback must be merged into every emission
+    so the step rides along on the liveness pings too."""
+    import importlib
+    import time
+
+    # The worker package re-exports the `heartbeat` FUNCTION, shadowing the submodule name, so import
+    # the module object explicitly rather than via attribute access.
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+
+    emitted: list[tuple[str, dict]] = []
+    fake_w = SimpleNamespace(
+        heartbeat=lambda stage, **kw: emitted.append((stage, kw)),
+        _HB_LAST_PROGRESS_TS=0.0,
+    )
+    monkeypatch.setattr(hb, "_w", fake_w)
+    monkeypatch.setattr(hb, "gpu_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(hb, "_LIVENESS_TICK_S", 0.001)
+
+    with hb.liveness_heartbeat("opd_step", progress=lambda: 1, fields=lambda: {"step": 7}):
+        deadline = time.time() + 2.0
+        while not emitted and time.time() < deadline:
+            time.sleep(0.005)
+    assert emitted, "liveness thread never emitted a heartbeat"
+    assert any(kw.get("step") == 7 for (s, kw) in emitted if s == "opd_step"), (
+        f"fields must stamp the step onto opd_step liveness emissions; saw {emitted}"
+    )
+
+
+def test_opd_step_liveness_heartbeat_carries_opt_steps_in_fields(monkeypatch):
+    """Regression (codex[bot], opd.py): opd must hand the opd_step liveness_heartbeat a `fields`
+    callback that stamps the current opt_steps, so its (throttle-sharing) pings carry the billing step
+    instead of overwriting the main thread's stepped heartbeat with a stepless one."""
+    import contextlib
+
+    captured = {}
+
+    @contextlib.contextmanager
+    def _fake_liveness(stage, progress=None, fields=None):
+        if stage == "opd_step":
+            captured["fields"] = fields
+        yield
+
+    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None, liveness=_fake_liveness)
+    with pytest.raises(RuntimeError):  # all-skip -> no trained step
+        opd_mod.run_opd()
+    assert callable(captured.get("fields")), (
+        "opd_step liveness needs a fields callback carrying the current opt_steps"
+    )
+    out = captured["fields"]()
+    assert isinstance(out, dict), f"fields callback must return a dict, got {out!r}"
+    assert "step" in out, f"fields must carry the step, got {out}"
+    # all-skip run reached 0 optimizer updates -> step is a real 0, not an absent/stale value.
+    assert out["step"] == 0
+
+
+def test_opd_teacher_prompt_includes_thinking_prefill():
+    """Regression (codex[bot], opd.py:93): in thinking mode the student template opens a reasoning
+    block (e.g. <think>) AFTER the generation prompt and samples its completion after it. The teacher
+    must condition on that SAME trailing prefill; the plain 'Assistant: ' prompt (empty prefill) would
+    score every thinking-mode logprob against a prefix that never opened the block."""
+    from flash.engine.worker import opd as opd_mod
+
+    msgs = [{"role": "user", "content": "hi"}]
+    # default (thinking off / no prefill) -> ends at the plain generation boundary.
+    assert opd_mod._teacher_prompt_text(msgs).endswith("Assistant: ")
+    # with a prefill -> the teacher conditions on the exact text the student sampled after.
+    assert opd_mod._teacher_prompt_text(msgs, "<think>\n").endswith("Assistant: <think>\n")
+
+
+def test_thinking_prefill_text_is_template_delta(monkeypatch):
+    """Regression (codex[bot], opd.py): the thinking prefill is the DELTA a thinking-mode chat template
+    opens after the generation prompt (enable_thinking True vs False). Empty when thinking is off (the
+    plain teacher prompt already matches) or the template ignores enable_thinking."""
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+        ):
+            return "<|im_start|>assistant\n" + ("<think>\n" if enable_thinking else "")
+
+    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=False))
+    assert opd_mod._thinking_prefill_text(_Tok()) == ""  # thinking off -> no prefill
+    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    assert opd_mod._thinking_prefill_text(_Tok()) == "<think>\n"  # exact opened delta
+
+    class _NoThinkTok:  # template that ignores enable_thinking -> renders identically -> empty delta
+        def apply_chat_template(self, messages, **kw):
+            return "<|im_start|>assistant\n"
+
+    assert opd_mod._thinking_prefill_text(_NoThinkTok()) == ""
+
+
+def test_opd_loop_drives_by_optimizer_updates_and_retries_on_shortfall(monkeypatch):
+    """Regression (codex[bot], opd.py:467): the loop must be driven by optimizer UPDATES, not raw
+    iterations -- a no-signal iteration skips optimizer.step(), so `for step in range(steps)` could
+    exit with opt_steps < steps and publish an under-trained adapter as the default while billing the
+    full `steps` quote. A run that lands SOME updates but cannot reach `steps` within the bounded
+    iteration budget must raise RetriableInfraError (retry), not ship short."""
+    from flash.engine.worker.perf import RetriableInfraError
+
+    torch = pytest.importorskip("torch")
+
+    state = {"n": 0}
+
+    def _one_update_then_skip(*, model, **k):
+        state["n"] += 1
+        _one_update_then_skip.last_teacher_status = "ok"
+        _one_update_then_skip.last_coverage = 1.0
+        _one_update_then_skip.last_gen_tokens = 1
+        _one_update_then_skip.last_teacher_tokens = 1
+        if state["n"] == 1:  # exactly one real, backward-able update, then every sample skips
+            return model.w.float().sum() * 1e-6
+        return None
+
+    # steps=3 but only ONE optimizer update can ever land -> the bounded loop exhausts its iteration
+    # budget at opt_steps=1 and the post-loop guard must retry rather than publish 1/3.
+    opd_mod = _opd_harness(
+        monkeypatch, train_one=_one_update_then_skip, steps=3, group=1
+    )
+    with pytest.raises(RetriableInfraError, match="optimizer updates"):
+        opd_mod.run_opd()
+    # The loop is BOUNDED: it did not spin forever waiting for updates that never come.
+    assert state["n"] <= 2 * 3 + 10
 
 
 def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
