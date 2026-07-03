@@ -259,8 +259,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         # OPD cannot run without the teacher key, so make it a REQUIRED declared secret: the
         # client (runtime_secrets_from_local_env) and server (_runtime_secrets) both raise on a
         # missing required secret, so a keyless opd run fails fast before any GPU is provisioned.
-        # It is a name-only declaration (value stays out-of-band); FIREWORKS_API_KEY is also a
-        # default runtime secret so it is collected/allowed on every arm.
+        # It is a name-only declaration (value stays out-of-band). This declaration is how the key
+        # is collected/allowed for opd — each gate unions the spec's declared secrets on top of the
+        # global default, which no longer carries FIREWORKS_API_KEY (so SFT/GRPO don't receive it).
         environment_secrets = (*environment_secrets, "FIREWORKS_API_KEY")
     train_raw = raw.get("train")
     if train_raw is None:

@@ -22,10 +22,12 @@ _HB_THROTTLED_STAGES = frozenset(
     {
         "rl_step",
         "sft_step",
+        "opd_step",
         "model_prefetching",
         "sft_pretokenizing",
         "sft_initializing",
         "rl_initializing",
+        "opd_initializing",
     }
 )
 _HB_SETUP_LIVENESS_STAGES = frozenset(
@@ -34,6 +36,7 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         "sft_pretokenizing",
         "sft_initializing",
         "rl_initializing",
+        "opd_initializing",
     }
 )
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})

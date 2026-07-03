@@ -246,8 +246,57 @@ def test_teacher_score_raises_on_malformed_response(monkeypatch):
 
     _mock_urlopen(monkeypatch, {"choices": [{"logprobs": {}}]})
     client = TeacherClient("k", "https://api.example/v1", "glm")
-    with pytest.raises(TeacherError):
+    with pytest.raises(TeacherError) as ei:
         client.score("", "hi")
+    assert ei.value.permanent is True  # malformed response -> abort the run, not skip-and-burn
+
+
+def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
+    import urllib.error
+
+    import flash.engine.worker.teacher as tm
+    from flash.engine.worker.teacher import TeacherError
+
+    def raise_http(code):
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, code, f"HTTP {code}", {}, None)
+
+        monkeypatch.setattr(tm.urllib.request, "urlopen", fake_urlopen)
+
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
+    # 401 (bad key) is permanent -> raised immediately so the worker aborts, not burns every step.
+    raise_http(401)
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hi")
+    assert ei.value.permanent is True
+    # 503 is transient -> retries exhaust to a non-permanent error (a skipped sample, run continues).
+    raise_http(503)
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hi")
+    assert ei.value.permanent is False
+
+
+def test_gkd_loss_skips_empty_student_group_without_crashing():
+    # A group with an empty student-index list (a teacher-only span) must be skipped, not divide by
+    # zero in the per-span coefficient (len(s_idx) == 0).
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import gkd_loss
+
+    model = _TinyLM(torch, T=2, V=8)
+    loss = gkd_loss(model, [1], [2], [([], -1.0), ([0], -2.0)], device="cpu", kl_coef=1.0)
+    assert loss is not None  # the empty group is ignored; the real group still trains
+    loss.backward()
+    assert model.w.grad[0].abs().sum() > 0
+
+
+def test_groupwise_alignment_emits_no_empty_student_group():
+    # Teacher covers [0,2) but the student's first token starts at char 2 (teacher-only leading
+    # span). No group may have an empty student-index list.
+    student = _student([(2, 3), (3, 5)])
+    teacher = _teacher([(0, 2), (2, 5)])
+    groups = groupwise_alignment(student, teacher)
+    assert all(s_idx for s_idx, _ in groups)  # every group has >= 1 student token
+    assert [s_idx for s_idx, _ in groups] == [[0, 1]]
 
 
 def test_teacher_client_requires_key():

@@ -21,7 +21,13 @@ from flash.engine.worker.tokenizer_align import TeacherToken
 
 
 class TeacherError(RuntimeError):
-    """Teacher API call failed after retries."""
+    """Teacher API call failed. ``permanent`` marks non-retryable causes (bad key / model id /
+    malformed request/response) so the worker aborts the run immediately instead of skipping every
+    remaining sample and burning the whole paid GPU allocation before failing."""
+
+    def __init__(self, *args, permanent: bool = False) -> None:
+        super().__init__(*args)
+        self.permanent = permanent
 
 
 class TeacherClient:
@@ -35,7 +41,9 @@ class TeacherClient:
         max_retries: int = 4,
     ) -> None:
         if not api_key:
-            raise TeacherError("no teacher API key (FIREWORKS_API_KEY) available on the worker")
+            raise TeacherError(
+                "no teacher API key (FIREWORKS_API_KEY) available on the worker", permanent=True
+            )
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -58,8 +66,11 @@ class TeacherClient:
             except urllib.error.HTTPError as e:
                 # Retry transient server/rate-limit errors; fail fast on 4xx client errors.
                 body_txt = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
-                last_err = TeacherError(f"teacher HTTP {e.code} on {path}: {body_txt}")
-                if e.code not in (408, 409, 425, 429, 500, 502, 503, 504):
+                retryable = e.code in (408, 409, 425, 429, 500, 502, 503, 504)
+                last_err = TeacherError(
+                    f"teacher HTTP {e.code} on {path}: {body_txt}", permanent=not retryable
+                )
+                if not retryable:  # bad key (401/403) / model id (404) / bad request (400)
                     raise last_err from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = TeacherError(f"teacher transport error on {path}: {e}")
@@ -93,7 +104,9 @@ class TeacherClient:
             token_logprobs = lp["token_logprobs"]
             offsets = lp["text_offset"]
         except (KeyError, IndexError, TypeError) as e:
-            raise TeacherError(f"teacher echo response missing logprobs: {e}") from e
+            raise TeacherError(
+                f"teacher echo response missing logprobs: {e}", permanent=True
+            ) from e
         n = len(tokens)
         out: list[TeacherToken] = []
         for i in range(n):

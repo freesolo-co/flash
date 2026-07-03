@@ -35,6 +35,7 @@ from flash.engine.worker.perf import (
     setup_perf_backends,
     wait_for_gpu,
 )
+from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import (
     StudentToken,
     groupwise_alignment,
@@ -110,14 +111,6 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     return ids, toks
 
 
-def _forward_logprobs(model, input_ids):
-    """Log-softmax over the vocab at every position (fp32 for stability). ``input_ids``: [1, T]."""
-    import torch
-
-    out = model(input_ids)
-    return torch.log_softmax(out.logits[0].float(), dim=-1)  # [T, V]
-
-
 def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     """Groupwise reverse-KL on-policy distillation (the collinear-ai *spider* / Tinker method).
 
@@ -133,12 +126,22 @@ def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     if not student_ids or not groups:
         return None
     input_ids = torch.tensor([prompt_ids + student_ids], device=device)
-    logp = _forward_logprobs(model, input_ids)  # [T, V]
+    logits = model(input_ids).logits[0]  # [T, V], model dtype
     P = len(prompt_ids)
-    # Differentiable student logprob of each REALIZED completion token: logits at P+j-1 predict token j.
-    sp = [logp[P + j - 1, student_ids[j]] for j in range(len(student_ids))]
+    # Differentiable student logprob of each REALIZED completion token (logits at P+j-1 predict token
+    # j), computed WITHOUT materializing a full [T, V] fp32 log_softmax: we select only the C
+    # completion rows, cast those to fp32, and use logit_realized - logsumexp. This keeps the
+    # vocab-projection memory at [C, V] instead of an extra [T, V] fp32 buffer (avoids OOM on tight
+    # placements with large-vocab students).
+    pos = torch.arange(P - 1, P - 1 + len(student_ids), device=logits.device)
+    ids_t = torch.tensor(student_ids, device=logits.device)
+    rows = logits.index_select(0, pos).float()  # [C, V]
+    sp_t = rows.gather(1, ids_t.unsqueeze(1)).squeeze(1) - torch.logsumexp(rows, dim=-1)  # [C]
+    sp = [sp_t[j] for j in range(len(student_ids))]
     terms = []
     for s_idx, teacher_logsum in groups:
+        if not s_idx:  # defensive: a teacher-only span carries no student token to supervise
+            continue
         student_logsum_det = float(sum(sp[j].detach() for j in s_idx))
         # coeff > 0 where the student is MORE confident than the teacher on the span (push down);
         # coeff < 0 where the teacher is more confident (push up). Gradient = reverse-KL gradient.
@@ -236,6 +239,12 @@ def run_opd():
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
     examples = train
+    # Seed torch/CUDA too (not just the Python shuffle RNG): the student samples via
+    # model.generate(do_sample=True), so the fixed Flash seed must reproduce the same completions
+    # (and therefore the same trained adapter) run-to-run.
+    torch.manual_seed(_w.SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_w.SEED)
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=knobs["learning_rate"]
@@ -243,6 +252,16 @@ def run_opd():
     steps = knobs["steps"]
     ppl_step = knobs["prompts_per_step"]
     group = knobs["group_size"]
+    # Prompt budget mirrors GRPO: DROP (not truncate) prompts over the context budget, so the student
+    # never conditions on a truncated prompt the teacher didn't see. Use the configured max_length
+    # when set, else the recipe prompt cap.
+    prompt_budget = max(
+        1,
+        (knobs["max_length"] - knobs["max_completion"])
+        if knobs["max_length"]
+        else RECIPE.opd.max_prompt_len,
+    )
+    dropped_long = 0
     resume_ckpt = _w.hf_resume_checkpoint()
     if resume_ckpt:
         print("[opd] resume-from-checkpoint is not yet supported for opd; starting fresh")
@@ -282,12 +301,21 @@ def run_opd():
             nseq = 0
             for ex in batch:
                 prompt_messages = env.prompt_messages(ex)
-                prompt_text = _w.render_prompt(tok, ex)
+                # Render the student prompt from the SAME messages the teacher conditions on;
+                # env.prompt_messages can be stateful/randomized, so re-deriving it via render_prompt
+                # (which calls prompt_messages again) would desync sampling from teacher scoring.
+                prompt_text = tok.apply_chat_template(
+                    prompt_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=_w.THINKING,
+                )
                 prompt_ids = tok(prompt_text, add_special_tokens=False).input_ids
-                # Bound the prompt to the recipe budget (keep the tail so the generation-prompt
-                # suffix survives) to cap VRAM on pathologically long prompts.
-                if len(prompt_ids) > RECIPE.opd.max_prompt_len:
-                    prompt_ids = prompt_ids[-RECIPE.opd.max_prompt_len :]
+                # Drop over-budget prompts (like GRPO) rather than truncating: a truncated student
+                # prompt would no longer match the teacher's full-prompt conditioning.
+                if len(prompt_ids) > prompt_budget:
+                    dropped_long += 1
+                    continue
                 prompt_tensor = torch.tensor([prompt_ids], device=device)
                 for _g in range(group):
                     loss = _train_one(
@@ -370,6 +398,7 @@ def run_opd():
             # Optimizer steps actually applied; < steps if any iteration had no usable teacher
             # signal (skipped). loss_curve length == opt_steps, so reporting stays honest.
             "opt_steps": opt_steps,
+            "dropped_long_prompts": dropped_long,  # prompts skipped for exceeding the context budget
             "method": "gkd",
             "init_from_adapter": warm_start or None,
             "teacher_model": knobs["teacher_model"],
@@ -416,21 +445,22 @@ def _train_one(
     completion_ids = gen[0, prompt_tensor.shape[1] :]
     completion_text = tok.decode(completion_ids, skip_special_tokens=True)
     _train_one.last_gen_tokens = int(completion_ids.shape[0])
-    # HF includes the matched stop string in the output; drop a single trailing delimiter so the
-    # teacher scores only the answer (mirrors GRPO's vLLM `stop`, which excludes it). The sampled
-    # ids are left intact; the char-offset alignment simply won't reach into the trimmed tail.
-    for _stop in knobs["stop_sequences"]:
-        if _stop and completion_text.endswith(_stop):
-            completion_text = completion_text[: -len(_stop)]
-            break
     if not completion_text.strip():
         return None
+    # NB: `stop_sequences` are wired into `generate` (gen_cfg.stop_strings), so the student halts at
+    # the delimiter on-policy. We score the completion the student actually produced verbatim —
+    # ids and text stay consistent (no post-hoc trimming that would desync gkd_loss / token counts).
 
     teacher_prompt = _teacher_prompt_text(prompt_messages)
     try:
         teacher_toks = teacher.score(teacher_prompt, completion_text)
+    except TeacherError as e:
+        if e.permanent:  # bad key / model id / malformed -> abort now, don't burn the whole run
+            raise
+        print(f"[opd] teacher score failed (transient, skipping sample): {e}")
+        return None
     except Exception as e:
-        print(f"[opd] teacher score failed: {e}")
+        print(f"[opd] teacher score failed (skipping sample): {e}")
         return None
     _train_one.last_teacher_tokens = len(prompt_ids) + _train_one.last_gen_tokens
 

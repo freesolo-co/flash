@@ -73,8 +73,11 @@ def groupwise_alignment(
         s_idx = [i for i, st in enumerate(student_toks) if lo <= st.start < hi]
         t_lp = [tt.logprob for tt in teacher_toks if lo <= tt.start < hi]
         if t_lp:  # a teacher-bearing span closes the group, absorbing any carried student tokens
-            groups.append((pending + s_idx, float(sum(t_lp))))
-            pending = []
+            if pending or s_idx:  # ...but only if there ARE student tokens to carry the signal
+                groups.append((pending + s_idx, float(sum(t_lp))))
+                pending = []
+            # else: a teacher-only span with no student token to supervise -> emit no group (an
+            # empty student-index group would divide-by-zero in the per-span loss coefficient).
         else:  # student-only span: carry its tokens to the next teacher-bearing span (never dropped)
             pending += s_idx
     if pending and groups:  # trailing student-only tokens attach to the last group
