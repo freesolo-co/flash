@@ -21,6 +21,7 @@ import abc
 from collections.abc import Callable
 from typing import Any
 
+from flash.providers._instance import InstanceJobHandle
 from flash.providers.base import GpuClass, JobHandle, PollResult
 
 
@@ -37,8 +38,8 @@ class InstanceProvider(abc.ABC):
 
     @property
     @abc.abstractmethod
-    def _handle_cls(self) -> type[JobHandle]:
-        """The substrate's ``JobHandle`` subclass (lazy: a property so importing it stays deferred)."""
+    def _handle_cls(self) -> type[InstanceJobHandle]:
+        """The substrate's ``InstanceJobHandle`` subclass (lazy: a property so importing it stays deferred)."""
 
     @abc.abstractmethod
     def _load_api_key(self) -> Any: ...
@@ -134,11 +135,9 @@ class InstanceProvider(abc.ABC):
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
         import contextlib
 
-        from flash.providers._hf_artifacts import make_hf_heartbeat_reader
+        from flash.providers._hf_artifacts import heartbeat_reader_for
 
-        hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}"
-        reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
+        reader = heartbeat_reader_for(spec)
         h = self._handle_cls.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: {self.name} instance={h.instance_id}", file=log, flush=True)

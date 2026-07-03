@@ -63,6 +63,17 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
     return read
 
 
+def heartbeat_reader_for(spec):
+    """The HF heartbeat reader for a run's spec (None when the run has no hf_repo)."""
+    hf_repo = spec.train.hf_repo
+    return make_hf_heartbeat_reader(hf_repo, f"{spec.phase}/{spec.run_id}") if hf_repo else None
+
+
+def error_artifact_name(phase: str, attempt) -> str:
+    """Worker error-artifact filename for a phase+attempt (mirrors the worker's error_artifact_name)."""
+    return f"error_{phase}_attempt{int(attempt or 0)}.txt"
+
+
 def make_hf_failure_detail_reader(
     hf_repo: str,
     prefix: str,
@@ -72,7 +83,7 @@ def make_hf_failure_detail_reader(
 ):
     """Reader for worker-uploaded failure artifacts on HF (error/console txt); force-read after terminal failure."""
     # Attempt-scoped to match the worker's error_artifact_name(mode, attempt).
-    err_name = f"error_{phase}_attempt{int(attempt or 0)}.txt"
+    err_name = error_artifact_name(phase, attempt)
     error_reader = make_hf_text_reader(hf_repo, f"{prefix}/{err_name}", min_interval_s)
     console_reader = make_hf_text_reader(
         hf_repo, f"{prefix}/console_{phase}.txt", min_interval_s

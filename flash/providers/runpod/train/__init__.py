@@ -23,7 +23,6 @@ from flash.providers.runpod.train.endpoints import (  # noqa: F401
     _select_endpoint_resources,
     _train_body,
     endpoint_name,
-    get_train_endpoint,
     isolate_flash_state,
     min_cuda_for,
     terminate_endpoint,

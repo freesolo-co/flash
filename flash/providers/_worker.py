@@ -73,7 +73,7 @@ def _append_tag_suffix(image: str, suffix: str) -> str:
 
 
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
-    """Return the RunPod worker image for a GPU class, respecting FLASH_WORKER_IMAGE override."""
+    """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base), respecting the FLASH_WORKER_IMAGE override."""
     override = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
     if override:
         return override

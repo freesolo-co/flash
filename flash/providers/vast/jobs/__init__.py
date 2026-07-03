@@ -27,7 +27,8 @@ from collections.abc import Callable
 
 from flash._logging import get_logger
 from flash.providers._hf_artifacts import (
-    make_hf_heartbeat_reader,
+    error_artifact_name,
+    heartbeat_reader_for,
     make_hf_text_reader,
 )
 from flash.providers._instance_poll import InstancePollAdapter, poll_instance_job
@@ -69,19 +70,18 @@ logger = get_logger(__name__)
 # host-uptime score: 0.995 (~1-in-200) nearly eliminates mid-run host deaths while keeping supply usable.
 RELIABILITY_FLOOR = 0.995
 MIN_INET_MBPS = 200.0
-# LOAD_TIMEOUT_S / SETUP_GRACE_S / STALL_AFTER_S / PROVISION_GRACE_S are the shared instance-poll timing
-# defaults imported from ``_poll`` above. The staged setup-vs-training grace is the fix for the historical
-# "Vast box dies every ~25-30 min": the old provider used one flat 1500s window that fired mid cold-start
-# and tore down healthy boxes. Kept as module globals here so ``monkeypatch.setattr(jobs, …)`` still bites.
+# The shared instance-poll timing defaults imported from ``_poll`` above. The staged setup-vs-training
+# grace is the fix for the historical "Vast box dies every ~25-30 min": the old provider used one flat
+# 1500s window that fired mid cold-start and tore down healthy boxes. LOAD_TIMEOUT_S and PROVISION_GRACE_S
+# are read at call time so ``monkeypatch.setattr(jobs, …)`` takes effect; SETUP_GRACE_S / STALL_AFTER_S /
+# FIRST_LIVENESS_S are supplied as ``poll_vast_job`` defaults (override by passing the kwarg, not by
+# patching the global).
 # Boards under-report VRAM vs class nominal (L4 23034/24GB, A40 46068/48GB ≈ 0.938). The server-side
 # gpu_ram filter gets this slack; the class gate (vast_gpu_for_offer) stays exact.
 _SEARCH_VRAM_SLACK = 0.92
 # Minimum disk every instance is provisioned with (bootstrap + worker + weights need headroom). The
 # offer search MUST use the same floor so a thin-disk offer can't pass search then fail at create.
 MIN_DISK_GB = 60.0
-
-# The setup-vs-training stall boundary is the shared ``_poll.is_training_heartbeat`` (same one runpod +
-# lambdalabs use) so the cold-start grace rule can't drift between providers.
 
 # Vast states meaning "the container is gone / won't progress". ``frozen`` is paused-but-still-billing
 # yet emits no DONE/heartbeat, so classify it dead for fast failover. Unlike ``unknown`` it is never
@@ -335,7 +335,7 @@ def _failure_detail(
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
-    err_name = f"error_{phase}_attempt{int(attempt or 0)}.txt"
+    err_name = error_artifact_name(phase, attempt)
     content = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
     if content:
         parts.append(f"--- {err_name} ---\n{content[-2000:]}")
@@ -369,7 +369,7 @@ def poll_vast_job(
     """
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}"
-    err_name = f"error_{spec.phase}_attempt{int(handle.attempt or 0)}.txt"
+    err_name = error_artifact_name(spec.phase, handle.attempt)
 
     def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
         # Customer cost is the worker TRAIN wall x the offer's live $/hr; the instance-wall note anchors
@@ -393,7 +393,6 @@ def poll_vast_job(
         metrics["notes"] = notes
 
     adapter = InstancePollAdapter(
-        provider="vast",
         instance_id=handle.instance_id,
         current_attempt=handle.attempt,
         # started_ts is 0.0 for an old/corrupt handle -> fall back to now for the load/stall clocks + cost.
@@ -490,9 +489,7 @@ def submit_run_vast(
     try:
         if on_handle is not None:
             on_handle(handle.to_dict())
-        hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}"
-        reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
+        reader = heartbeat_reader_for(spec)
         # Wall cap + provision/cold-start grace; Vast has no server-side execution timeout, so the
         # client deadline (and the bootstrap's own cap) bound spend.
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S

@@ -75,7 +75,6 @@ class InstancePollAdapter:
     hands it to the shared driver. Everything NOT here is identical across providers and lives in the
     driver, baselined on Vast."""
 
-    provider: str
     instance_id: object
     current_attempt: int
     launch_ts: float  # now-floored; 0.0 launch means "unknown" -> falls back to now (elapsed math + cost)

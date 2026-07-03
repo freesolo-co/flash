@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from flash.providers._instance import InstanceJobHandle
 from flash.providers._instance_provider import InstanceProvider
 from flash.providers.base import (
     AllocationConstraints,
@@ -22,7 +23,7 @@ class LambdaProvider(InstanceProvider):
     _gpu_identity_attr = "lambda_name"
 
     @property
-    def _handle_cls(self) -> type[JobHandle]:
+    def _handle_cls(self) -> type[InstanceJobHandle]:
         from flash.providers.lambdalabs.jobs import LambdaJobHandle
 
         return LambdaJobHandle

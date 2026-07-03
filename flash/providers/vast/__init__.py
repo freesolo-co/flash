@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from flash.providers._instance import InstanceJobHandle
 from flash.providers._instance_provider import InstanceProvider
 from flash.providers.base import (
     AllocationConstraints,
@@ -27,7 +28,7 @@ class VastProvider(InstanceProvider):
     _gpu_identity_attr = "vast_name"
 
     @property
-    def _handle_cls(self) -> type[JobHandle]:
+    def _handle_cls(self) -> type[InstanceJobHandle]:
         from flash.providers.vast.jobs import VastJobHandle
 
         return VastJobHandle

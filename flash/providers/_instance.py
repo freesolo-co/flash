@@ -1,4 +1,4 @@
-"""Shared building blocks for the instance-based providers (e.g. Lambda)."""
+"""Shared building blocks for the instance-based providers (Lambda, Vast)."""
 
 from __future__ import annotations
 

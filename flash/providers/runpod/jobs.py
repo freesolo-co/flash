@@ -732,9 +732,9 @@ def submit_run(
 
 
 # make_hf_text_reader / make_hf_heartbeat_reader / make_hf_failure_detail_reader and the heartbeat-
-# provenance predicates (worker_flagged_retriable / heartbeat_is_stale_prior_attempt) are provider-
-# neutral and now live in flash.providers._hf_artifacts; re-exported at the top of this module for
-# back-compat (preload + tests still reference runpod.jobs.<name>).
+# provenance predicate worker_flagged_retriable are provider-neutral and now live in
+# flash.providers._hf_artifacts; re-exported at the top of this module for back-compat (preload +
+# tests still reference runpod.jobs.<name>).
 
 
 def surfaced_worker_flags(

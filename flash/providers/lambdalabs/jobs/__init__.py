@@ -14,7 +14,11 @@ import time
 from collections.abc import Callable
 
 from flash._logging import get_logger
-from flash.providers._hf_artifacts import make_hf_heartbeat_reader, make_hf_text_reader
+from flash.providers._hf_artifacts import (
+    error_artifact_name,
+    heartbeat_reader_for,
+    make_hf_text_reader,
+)
 from flash.providers._instance_poll import InstancePollAdapter, poll_instance_job
 from flash.providers._poll import (
     FIRST_LIVENESS_S,
@@ -44,9 +48,10 @@ from flash.providers.lambdalabs.jobs.builders import (
 
 logger = get_logger(__name__)
 
-# LOAD_TIMEOUT_S / SETUP_GRACE_S / STALL_AFTER_S / PROVISION_GRACE_S are the shared instance-poll timing
-# defaults imported from ``_poll`` above (setup grace covers Docker pull + pip + model download, before
-# any heartbeat). Kept as module globals here so ``monkeypatch.setattr(jobs, …)`` still takes effect.
+# The shared instance-poll timing defaults imported from ``_poll`` above (setup grace covers Docker pull
+# + pip + model download, before any heartbeat). LOAD_TIMEOUT_S and PROVISION_GRACE_S are read at call
+# time so ``monkeypatch.setattr(jobs, …)`` takes effect; SETUP_GRACE_S / STALL_AFTER_S / FIRST_LIVENESS_S
+# are supplied as ``poll_lambda_job`` defaults (override by passing the kwarg, not by patching the global).
 
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
 
@@ -254,7 +259,7 @@ def _failure_detail(hf_repo: str, prefix: str, phase: str, marker: dict | None, 
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
-    err_name = f"error_{phase}_attempt{int(attempt or 0)}.txt"  # matches worker error_artifact_name
+    err_name = error_artifact_name(phase, attempt)
     err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
     if err:
         parts.append(f"--- {err_name} ---\n{err[-2000:]}")
@@ -286,7 +291,7 @@ def poll_lambda_job(
     """
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}"
-    err_name = f"error_{spec.phase}_attempt{int(handle.attempt or 0)}.txt"
+    err_name = error_artifact_name(spec.phase, handle.attempt)
     # Absence of boot.log while active = cloud-init never ran (sick region / stuck host).
     boot_log_reader = _make_hf_file_reader(
         hf_repo, f"{prefix}/lambda_attempt{handle.attempt}_boot.log", min_interval_s=60.0
@@ -309,7 +314,6 @@ def poll_lambda_job(
         metrics["notes"] = notes
 
     adapter = InstancePollAdapter(
-        provider="lambda",
         instance_id=handle.instance_id,
         current_attempt=handle.attempt,
         # 0.0 = corrupt/missing handle -> anchor elapsed/cost to now (avoid billing from the 1970 epoch);
@@ -384,9 +388,7 @@ def submit_run_lambda(
     try:
         if on_handle is not None:
             on_handle(handle.to_dict())
-        hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}"
-        reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
+        reader = heartbeat_reader_for(spec)
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
         return poll_lambda_job(
             handle,
