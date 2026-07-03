@@ -196,6 +196,15 @@ class UnsupportedGpuError(ValueError):
     pass
 
 
+class CapacityLookupError(RuntimeError):
+    """A provider's LIVE capacity/offer lookup failed transiently (network / API blip / rate limit) —
+    distinct from ``UnsupportedGpuError`` ("no GPU class fits this job"). A per-provider failure degrades
+    to the other providers; only when it was the SOLE reason NO candidate was found does ``allocate``
+    re-raise it. Because it is NOT an ``UnsupportedGpuError``, the runner treats it as infra-retryable
+    (poll_error) rather than terminal — so a run whose only fitting capacity a transient outage hid is
+    retried on its infra budget instead of being killed."""
+
+
 class UnreconciledCreateError(RuntimeError):
     """A non-idempotent provider create (e.g. Vast's ``PUT /asks``) failed AMBIGUOUSLY and could NOT be
     reconciled: the possibly-created resource is not visible yet (object-store / API eventual

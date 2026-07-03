@@ -7,6 +7,7 @@ from flash.providers import available_providers, get_provider
 from flash.providers.base import (
     Allocation,
     Candidate,
+    CapacityLookupError,
     UnsupportedGpuError,
 )
 
@@ -49,7 +50,8 @@ def _runpod_candidates(need: int) -> list[Candidate]:
 def _lambda_candidates(need: int) -> list[Candidate]:
     """Lambda classes with live regional capacity fitting the VRAM requirement.
 
-    Capacity-lookup failure degrades gracefully (returns []) so other providers still run.
+    A capacity-lookup failure raises ``CapacityLookupError``; ``allocate`` degrades to the other
+    providers, failing the run retryably only if this was the sole fitting source.
     """
     from flash.providers.lambdalabs.jobs import usable_instances
 
@@ -62,8 +64,9 @@ def _lambda_candidates(need: int) -> list[Candidate]:
             if usable_instances(g.name):
                 out.append(Candidate("lambda", g.name, provider.hourly_rate(g.name), g.vram_gb))
     except Exception as exc:
-        logger.warning("lambda capacity lookup failed (%s); allocating without lambda", exc)
-        return []
+        # Transient capacity-lookup blip -> signal allocate() so it degrades to the other providers but
+        # can still tell "no fit" from "outage" if this was the only fitting source (see CapacityLookupError).
+        raise CapacityLookupError("lambda live capacity lookup failed") from exc
     return out
 
 
@@ -74,7 +77,8 @@ def _vast_candidates(need: int, disk_gb: float = 0.0, max_wall_seconds: float = 
     so the allocator never hands the runner a Vast class that would immediately fail to rent. ONE market
     search covers every class (offers carry their own gpu_name -> class), so we search once at the
     smallest fitting class's VRAM and bucket the returned offers by class. A capacity-lookup failure
-    (no key / network blip) degrades to the other providers — non-fatal as long as another can supply.
+    (market/API blip) raises ``CapacityLookupError`` -> ``allocate`` degrades to the other providers,
+    failing the run retryably (not terminally) only if Vast was the sole fitting source.
 
     ``disk_gb`` and ``max_wall_seconds`` are the run's requested disk and wall cap; the Vast package
     prices against the SAME effective disk/duration floors the submit path provisions with, so a
@@ -91,8 +95,9 @@ def _vast_candidates(need: int, disk_gb: float = 0.0, max_wall_seconds: float = 
         # Search once at the smallest fitting class's VRAM; the market covers every class at/above it.
         rates = live_candidate_rates(min(g.vram_gb for g in fitting), disk_gb, max_wall_seconds)
     except Exception as exc:
-        logger.warning("vast capacity lookup failed (%s); allocating without vast", exc)
-        return []
+        # Transient market/API blip -> signal allocate() (see CapacityLookupError): a Vast-only run must
+        # infra-retry the outage, not terminally fail as if no GPU fit.
+        raise CapacityLookupError("vast live capacity lookup failed") from exc
     fitting_names = {g.name: g.vram_gb for g in fitting}
     return [
         Candidate("vast", name, rate, fitting_names[name])
@@ -114,13 +119,32 @@ def allocate(
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     available = available_providers()
     candidates: list[Candidate] = []
+    lookup_failed = False
+    # RunPod prices off a static table (no live lookup), so it never blips; Lambda/Vast query live
+    # capacity and can. A per-provider blip degrades to the others (we just skip it), but we remember it
+    # so an EMPTY result can be told apart from a genuine no-fit below.
     if "runpod" in available:
         candidates += _runpod_candidates(need)
-    if "lambda" in available:
-        candidates += _lambda_candidates(need)
-    if "vast" in available:
-        candidates += _vast_candidates(need, disk_gb, max_wall_seconds)
+    for name, produce in (
+        ("lambda", lambda: _lambda_candidates(need)),
+        ("vast", lambda: _vast_candidates(need, disk_gb, max_wall_seconds)),
+    ):
+        if name not in available:
+            continue
+        try:
+            candidates += produce()
+        except CapacityLookupError as exc:
+            lookup_failed = True
+            logger.warning("%s capacity lookup failed (%s); allocating without it", name, exc.__cause__)
     if not candidates:
+        if lookup_failed:
+            # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
+            # -> retryable, NOT terminal: a Vast/Lambda-only run must ride out a market/API outage on its
+            # infra budget instead of dying as if the job exceeds every GPU class.
+            raise CapacityLookupError(
+                f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
+                f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"
+            )
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
             f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
