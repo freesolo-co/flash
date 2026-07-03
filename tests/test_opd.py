@@ -868,6 +868,73 @@ def test_opd_loop_drives_by_optimizer_updates_and_retries_on_shortfall(monkeypat
     assert state["n"] <= 2 * 3 + 10
 
 
+def test_student_tokens_absorb_dropped_leading_space_sentencepiece():
+    """Regression (codex[bot], opd.py:175): a SentencePiece/LLaMA tokenizer decodes a mid-completion
+    word token IN ISOLATION without its leading word-boundary space (decode([▁world]) == 'world', not
+    ' world'). prev + len(decode(window)) would then undercount that span by one char and drift every
+    following offset, misassigning teacher spans to the wrong sampled ids. Offsets must be anchored to
+    completion_text so the dropped space is absorbed into the token's start and spans stay contiguous
+    and exact."""
+    from flash.engine.worker.opd import student_tokens_with_offsets
+
+    class _SPTok:  # decode of token 11 in isolation drops the leading space (SentencePiece behavior)
+        def decode(self, ids, skip_special_tokens=True):
+            m = {10: "hi", 11: "world"}  # 11 standalone -> "world", NOT " world"
+            return "".join(m[int(x)] for x in ids)
+
+    completion_text = "hi world"  # the ground-truth full decode (space at index 2)
+    ids, toks = student_tokens_with_offsets(_SPTok(), [10, 11], completion_text)
+    assert ids == [10, 11]
+    assert (toks[0].start, toks[0].end) == (0, 2)  # "hi"
+    # token 11 spans " world" [2,8): start pinned at prev (the dropped space is absorbed), not [2,7).
+    assert (toks[1].start, toks[1].end) == (2, 8), (
+        f"dropped leading space must be absorbed into the span; got {(toks[1].start, toks[1].end)}"
+    )
+    assert toks[-1].end == len(completion_text)  # no drift: spans cover the whole completion
+
+
+def test_groupwise_alignment_cursor_walk_groups_denser_student_span():
+    """Regression (codex[bot], tokenizer_align.py:73): the cursor walk that replaced the per-boundary
+    rescan (O(C^2) -> O(S+T+B)) must still produce the coarsest common refinement — carrying a span's
+    extra student tokens into the teacher-bearing span that closes it. Here the student tokenizes
+    [0,3)+[3,6) where the teacher has one [0,6) token, so both student indices group under that
+    teacher logprob; the tail [6,9) aligns 1:1."""
+    from flash.engine.worker.tokenizer_align import groupwise_alignment
+
+    student = [
+        StudentToken(token_id=0, start=0, end=3),
+        StudentToken(token_id=1, start=3, end=6),
+        StudentToken(token_id=2, start=6, end=9),
+    ]
+    teacher = [
+        TeacherToken(text="", logprob=-1.0, start=0, end=6),
+        TeacherToken(text="", logprob=-2.0, start=6, end=9),
+    ]
+    assert groupwise_alignment(student, teacher) == [([0, 1], -1.0), ([2], -2.0)]
+
+
+def test_opd_installs_chalk_kernels_on_student(monkeypatch):
+    """Regression (codex[bot], opd.py:433): the OPD student drives BOTH on-policy generation and the
+    loss forward, so it must get chalk kernels like sft/rl build after their trainer — else the default
+    Qwen catalog model silently runs eager and the distillation is much slower. Assert run_opd calls
+    install_chalk_kernels on the built student model."""
+    from flash.engine.worker import opd as _opd
+
+    captured = {}
+
+    def _fake_install(model=None):
+        captured["model"] = model
+        return {"rms_norm": {"applied": True}}
+
+    monkeypatch.setattr(_opd, "install_chalk_kernels", _fake_install)
+    monkeypatch.setattr(_opd, "active_kernels", lambda report: ["rms_norm"] if report else [])
+    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None)
+    with pytest.raises(RuntimeError):  # all-skip -> no trained step, but init (chalk) ran first
+        opd_mod.run_opd()
+    assert "model" in captured, "run_opd must call install_chalk_kernels on the student"
+    assert captured["model"] is not None
+
+
 def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     """Regression (codex[bot], opd.py): _student_model builds the LoRA via get_peft_model, which
     samples the LoRA A matrix (init_lora_weights=True) from the torch default generator. run_opd must

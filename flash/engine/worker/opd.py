@@ -25,6 +25,7 @@ import os
 import random
 import time
 
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -170,9 +171,20 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
             if not dec.endswith("\ufffd") or completion_text.startswith(dec, prev):
                 break
             j += 1
-        # end = the boundary offset prev + the char length of THIS window's decode (equals
-        # len(decode(ids[:j+1])) because the window starts at a committed char boundary).
-        end = min(n, max(prev, prev + len(tok.decode(ids[i : j + 1], skip_special_tokens=True))))
+        # end = where THIS window's decoded text ends in completion_text. Anchor to completion_text
+        # (the ground-truth full decode) via find() from prev rather than prev + len(decode(window)):
+        # a SentencePiece/LLaMA tokenizer decodes a word token IN ISOLATION without its leading
+        # word-boundary space (decode([▁world]) == "world", not " world"), so prev + len(window) would
+        # undercount the span by one char and drift EVERY following offset -- misaligning teacher spans
+        # onto the wrong sampled ids (codex[bot]). find() locates where the window text actually sits
+        # (skipping any dropped leading whitespace, which is absorbed into this token's start) and the
+        # start stays pinned at prev so the spans remain contiguous. For a byte-level tokenizer (Qwen,
+        # GPT) the window already carries its space, find() returns prev, and end == the old value. An
+        # empty decode (special/eos) -> find() returns prev -> zero-width span, unchanged.
+        window_text = tok.decode(ids[i : j + 1], skip_special_tokens=True)
+        hit = completion_text.find(window_text, prev)
+        end = (hit + len(window_text)) if hit != -1 else prev + len(window_text)
+        end = min(n, max(prev, end))
         toks.extend(StudentToken(token_id=ids[k], start=prev, end=end) for k in range(i, j + 1))
         prev = end
         i = j + 1
@@ -431,6 +443,15 @@ def run_opd():
     _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
     with liveness_heartbeat("opd_initializing"):
         model = _student_model(model_id, mik, device)
+        # Apply chalk standalone kernels to the student, exactly as sft/rl do after building their
+        # trainer. The student drives BOTH on-policy generation and the loss forward, so without this
+        # the default Qwen3.5/3.6 catalog model silently falls back to eager GDN/RMSNorm/RoPE/LoRA
+        # kernels and a long distillation runs much slower than the rest of the stack (codex[bot]).
+        # No-op ({}) when freesolo-chalk isn't installed or the arch is unsupported.
+        _chalk_report = install_chalk_kernels(model)
+        _chalk_active = active_kernels(_chalk_report)
+        if _chalk_active:
+            print(f"[opd] chalk kernels active: {', '.join(_chalk_active)}")
         # Engine length gates whether gradient checkpointing is needed for the loss forward.
         seq_cap = knobs["max_length"] or (RECIPE.opd.max_prompt_len + knobs["max_completion"])
         if grad_checkpointing_on(model_id, seq_cap):
@@ -680,6 +701,7 @@ def run_opd():
             "init_from_adapter": warm_start or None,
             "teacher_model": knobs["teacher_model"],
             "download_seconds": download_seconds,
+            "chalk_kernels": _chalk_active or None,
             "thinking": _w.THINKING,
             "loss_curve": loss_curve,
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,

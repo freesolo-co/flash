@@ -68,10 +68,24 @@ def groupwise_alignment(
     edges = [*boundaries, end]
     groups: list[tuple[list[int], float]] = []
     pending: list[int] = []  # student tokens whose span had no teacher token yet
+    # Walk both token lists with monotonic cursors instead of rescanning the WHOLE list per boundary.
+    # Both are sorted by .start (student_tokens_with_offsets emits non-decreasing starts; teacher
+    # offsets arrive in order) and the boundary intervals [edges[k], edges[k+1]) are consecutive and
+    # ascending, so every token falls in exactly one interval and is visited once -- O(S+T+B), not the
+    # O(C^2) a per-boundary rescan costs once max_tokens raises completions to thousands of mostly-
+    # matching tokens (codex[bot]). The cursor position IS the lower bound: everything with start <
+    # edges[k] was consumed by an earlier interval, so `start < hi` alone selects [edges[k], hi).
+    si = ti = 0
     for k in range(len(boundaries)):
-        lo, hi = edges[k], edges[k + 1]
-        s_idx = [i for i, st in enumerate(student_toks) if lo <= st.start < hi]
-        t_lp = [tt.logprob for tt in teacher_toks if lo <= tt.start < hi]
+        hi = edges[k + 1]
+        s_idx: list[int] = []
+        while si < len(student_toks) and student_toks[si].start < hi:
+            s_idx.append(si)
+            si += 1
+        t_lp: list[float] = []
+        while ti < len(teacher_toks) and teacher_toks[ti].start < hi:
+            t_lp.append(teacher_toks[ti].logprob)
+            ti += 1
         if t_lp:  # a teacher-bearing span closes the group, absorbing any carried student tokens
             if pending or s_idx:  # ...but only if there ARE student tokens to carry the signal
                 groups.append((pending + s_idx, float(sum(t_lp))))
