@@ -5,7 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from flash.providers.base import GpuClass, JobHandle, PollResult, Provider
+from flash.providers.base import (
+    AllocationConstraints,
+    Candidate,
+    CapacityLookupError,
+    GpuClass,
+    JobHandle,
+    PollResult,
+    Provider,
+)
 
 
 class LambdaProvider:
@@ -32,6 +40,30 @@ class LambdaProvider:
         from flash.providers.lambdalabs.pricing import hourly_rate
 
         return hourly_rate(gpu)
+
+    def live_candidates(
+        self, need_vram_gb: int, constraints: AllocationConstraints
+    ) -> list[Candidate]:
+        """Lambda classes with live regional capacity fitting the VRAM requirement.
+
+        A capacity-lookup failure raises ``CapacityLookupError``; ``allocate`` degrades to the other
+        providers, failing the run retryably only if this was the sole fitting source. Lambda's
+        capacity check needs neither disk nor wall, so ``constraints`` is ignored.
+        """
+        from flash.providers.lambdalabs.jobs import usable_instances
+
+        out: list[Candidate] = []
+        try:
+            for g in self.gpu_classes():
+                if g.vram_gb < need_vram_gb:
+                    continue
+                if usable_instances(g.name):
+                    out.append(Candidate("lambda", g.name, self.hourly_rate(g.name), g.vram_gb))
+        except Exception as exc:
+            # Transient capacity-lookup blip -> signal allocate() so it degrades to the other providers but
+            # can still tell "no fit" from "outage" if this was the only fitting source (see CapacityLookupError).
+            raise CapacityLookupError("lambda live capacity lookup failed") from exc
+        return out
 
     def submit_run(
         self,

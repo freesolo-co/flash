@@ -371,6 +371,16 @@ class Allocation:
     candidates: tuple[Candidate, ...]  # full ranked list; retry walks this
 
 
+@dataclass(frozen=True)
+class AllocationConstraints:
+    """Run-scoped extras a capacity/market-aware provider's ``live_candidates`` needs (Vast prices
+    against the run's disk/duration floors) — carried here so they don't leak into ``allocate``'s
+    signature per-provider. RunPod/Lambda ignore them."""
+
+    disk_gb: float = 0.0
+    max_wall_seconds: float = 0.0
+
+
 @runtime_checkable
 class Provider(Protocol):
     """GPU-substrate interface implemented by each provider."""
@@ -391,6 +401,15 @@ class Provider(Protocol):
 
     def hourly_rate(self, gpu: str) -> float:
         """Static $/hr for one friendly GPU name."""
+        ...
+
+    def live_candidates(
+        self, need_vram_gb: int, constraints: AllocationConstraints
+    ) -> list[Candidate]:
+        """GPU-class candidates this provider can actually provision right now for a run needing >=
+        need_vram_gb VRAM. RunPod filters its static table and never raises; capacity/market-aware
+        providers (Lambda/Vast) query live availability and raise CapacityLookupError on a transient
+        lookup blip so allocate() can degrade to the others yet still tell 'no fit' from 'outage'."""
         ...
 
     def submit_run(

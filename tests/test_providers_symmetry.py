@@ -166,16 +166,25 @@ def test_allocator_picks_runpod_candidate(monkeypatch):
 
 def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
     """Pin allocate()'s three provider candidate lists so ranking can be tested in isolation."""
-    from flash.providers import allocator
+    from flash.providers import allocator, get_provider
     from flash.providers.base import Candidate
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
-    monkeypatch.setattr(allocator, "_runpod_candidates", lambda need: [Candidate(*c) for c in runpod])
-    monkeypatch.setattr(allocator, "_lambda_candidates", lambda need: [Candidate(*c) for c in lambda_])
+    # allocate() sources candidates via provider.live_candidates(need, constraints); pin each provider's.
     monkeypatch.setattr(
-        allocator,
-        "_vast_candidates",
-        lambda need, disk_gb=0.0, max_wall_seconds=0.0: [Candidate(*c) for c in vast],
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: [Candidate(*c) for c in runpod],
+    )
+    monkeypatch.setattr(
+        get_provider("lambda"),
+        "live_candidates",
+        lambda need, constraints: [Candidate(*c) for c in lambda_],
+    )
+    monkeypatch.setattr(
+        get_provider("vast"),
+        "live_candidates",
+        lambda need, constraints: [Candidate(*c) for c in vast],
     )
 
 
