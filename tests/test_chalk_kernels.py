@@ -1,23 +1,31 @@
 """flash <-> chalk wiring (CPU-safe).
 
-flash applies chalk via chalk's Liger-style ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)``
-on the POST-build pass (chalk patches the live module). Kernel selection is FIXED — the gap-fillers
-(rope/lora/embedding) are ON and the overlap/situational kernels (mlp/qkv/fp8) are OFF, with NO env
-override. These tests verify: the fixed kwargs are passed; the selection ignores any FLASH_* env
-var; the pre-build pass (model=None) is a no-op; the no-op when chalk is absent; and that a chalk
-apply error never aborts training.
+flash applies chalk standalone via ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)`` on the
+POST-build pass (chalk patches the live module). Kernel selection is FIXED: training kernels are ON,
+eval-only / opt-in tradeoff kernels are OFF, with NO env override. These tests verify: the fixed
+kwargs are passed; the selection ignores any FLASH_* env var; the pre-build pass (model=None) is a
+no-op; the no-op when chalk is absent; and that a chalk apply error never aborts training.
 """
 
 import sys
 import types
 
-from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
+from flash.engine.chalk_kernels import (
+    active_kernels,
+    chalk_fused_ce_available,
+    install_chalk_kernels,
+)
 
 # The apply kwargs flash always passes (gap-fillers on, overlap/situational off) — fixed, no env.
 _FIXED_KWARGS = {
     "rope": True,
+    "rmsnorm": True,
+    "swiglu": True,
+    "fused_linear_cross_entropy": True,
     "fused_lora_delta": True,
+    "trainable_attn_epilogue": True,
     "fused_embedding": True,
+    "gdn": True,
     "fused_mlp": False,
     "attn_epilogue": False,
     "fp8_frozen_base": False,
@@ -42,8 +50,7 @@ def _install_fake_chalk(monkeypatch, calls, *, raise_in_apply=False, report=None
 
 
 def test_applies_fixed_gap_fillers(monkeypatch):
-    """Post-build -> apply is called once with liger=False and the fixed kwargs (gap-fillers ON,
-    the overlap/situational kernels OFF)."""
+    """Post-build -> apply is called once with liger=False and the fixed standalone kwargs."""
     calls = []
     _install_fake_chalk(monkeypatch, calls)
     model = object()
@@ -51,7 +58,7 @@ def test_applies_fixed_gap_fillers(monkeypatch):
     assert len(calls) == 1
     got_model, kwargs = calls[0]
     assert got_model is model
-    assert kwargs.pop("liger") is False  # TRL owns Liger; chalk composes on top
+    assert kwargs.pop("liger") is False  # chalk standalone; TRL must not apply Liger first
     assert kwargs == _FIXED_KWARGS
 
 
@@ -80,8 +87,22 @@ def test_pre_build_pass_is_noop(monkeypatch):
 
 def test_noop_when_chalk_absent(monkeypatch):
     """If freesolo-chalk isn't installed -> no-op (returns {})."""
-    monkeypatch.setitem(sys.modules, "chalk", None)  # force ImportError on `from chalk.transformers ...`
+    monkeypatch.setitem(
+        sys.modules, "chalk", None
+    )  # force ImportError on `from chalk.transformers ...`
     assert install_chalk_kernels(object()) == {}
+
+
+def test_chalk_fused_ce_available_requires_import_and_supported_model(monkeypatch):
+    """SFT batch sizing can assume fused CE only for supported models with chalk importable."""
+    monkeypatch.setitem(sys.modules, "chalk", None)
+    assert chalk_fused_ce_available("Qwen/Qwen3.5-4B") is False
+
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    assert chalk_fused_ce_available("Qwen/Qwen3.5-4B") is True
+    assert chalk_fused_ce_available("Qwen/Qwen3.6-35B-A3B") is True
+    assert chalk_fused_ce_available("openbmb/MiniCPM5-1B") is False
 
 
 def test_apply_error_is_swallowed(monkeypatch):
@@ -103,11 +124,11 @@ def test_returns_chalk_report(monkeypatch):
 def test_active_kernels_filters_report():
     """active_kernels keeps only the kernels that ENGAGED (truthy, non-error) and drops liger."""
     rep = {
-        "liger": False,  # TRL owns Liger — excluded
+        "liger": False,  # excluded when present in chalk's report
         "rope": True,
         "fused_lora_delta": 12,  # a count is "engaged"
         "fused_embedding": False,  # fell back
-        "fused_mlp": {"error": "boom"},  # errored
+        "fp8_frozen_base": {"error": "boom"},  # errored
     }
     assert active_kernels(rep) == ["fused_lora_delta", "rope"]
     assert active_kernels({}) == []
