@@ -198,6 +198,7 @@ def _train_body(input_data: dict) -> dict:
     import os
     import subprocess
     import sys
+    import tempfile
     import threading
     import time
     from datetime import UTC, datetime
@@ -261,11 +262,40 @@ def _train_body(input_data: dict) -> dict:
             "hf_home": os.environ.get("HF_HOME"),
         }
 
+    overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+
+    def _extra_pip_env() -> tuple[dict[str, str], str | None]:
+        env = dict(os.environ)
+        env.update(overrides)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        askpass = None
+        if env.get("GITHUB_TOKEN"):
+            fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'case "$1" in\n'
+                    '*Username*) printf "%s\\n" "x-access-token" ;;\n'
+                    '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
+                    "esac\n"
+                )
+            os.chmod(askpass, 0o700)
+            env["GIT_ASKPASS"] = askpass
+        return env, askpass
+
     extra_pip = input_data.get("extra_pip") or []
     if extra_pip:
-        subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
-
-    overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+        extra_env, askpass = _extra_pip_env()
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", *extra_pip],
+                check=True,
+                env=extra_env,
+            )
+        finally:
+            if askpass:
+                with contextlib.suppress(OSError):
+                    os.remove(askpass)
 
     def _code_prefix() -> str:
         raw = input_data.get("code_prefix")

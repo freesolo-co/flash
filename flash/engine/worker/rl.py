@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import random
 import time
@@ -14,9 +13,7 @@ from flash.engine.worker.grpo import resolve_grpo_sleep_mode
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
-    disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
-    patch_grpo_mask_aware_lm_head,
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
 )
@@ -30,7 +27,6 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
-    liger_on,
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -49,13 +45,13 @@ def run_rl():
     is_multi_turn = getattr(env, "multi_turn", False)
     conversational = is_multi_turn
     if is_multi_turn:
-        # Liger fused GRPO loss torch.compiles; on variable-length multi-turn completions its
-        # dynamo guard trips a torch 2.10 symbol_to_source crash — fall back to eager, don't raise.
+        # Multi-turn completions are variable-length; keep dynamo failures non-fatal for any compiled
+        # helper path that sees those dynamic shapes.
         try:
             import torch._dynamo
 
             torch._dynamo.config.suppress_errors = True
-            print("[rl] multi-turn: torch._dynamo suppress_errors=True (Liger loss falls back to eager on dynamic shapes)")
+            print("[rl] multi-turn: torch._dynamo suppress_errors=True (dynamic-shape compiled helpers fall back)")
         except Exception as exc:
             print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
@@ -272,48 +268,14 @@ def run_rl():
     # Multi-turn accumulates a full transcript up to the engine context, so size the fp32 logits
     # cap against the worst-case (engine context), not the per-turn _max_completion, or it OOMs.
     _cap_completion_len = vllm_max_len if is_multi_turn else _max_completion
-    # num_iterations / KL decide whether the trainer runs EXTRA unfused logprob forwards beyond the
-    # Liger-fused loss: num_iterations>1 caches old_per_token_logps via a separate full-logits forward,
-    # and kl_penalty_coef>0 adds a ref_per_token_logps forward. Liger fuses only the LOSS, so those
-    # passes still materialize [pd, completion, vocab] logits and the 6 GB logits cap must bind for
-    # them. So the fused loss is the SOLE logits pass (cap safe to drop) only when the RESOLVED mu == 1
-    # (no old_per_token_logps forward) AND KL is off. The full GRPOConfig field set is feature-
-    # detected ONCE here at function scope (not inside the vLLM-only block below) because the TIS
-    # rollout-correction knobs read it unconditionally -- they run even when use_vllm is False, so a
-    # vLLM-gated definition would NameError on the CPU/non-vLLM path. getattr(__dataclass_fields__)
-    # is safe on any class (-> empty set on a non-dataclass TRL, so num_iterations stays 1 and every
-    # feature-gated kwarg is simply skipped).
+    # chalk 0.5.0 ships a GRPO fused-logprob op (chalk.ops.grpo) that streams selected-token logprobs
+    # without materializing [B,T,V]; WIRING it to flip fused_logits=True is a tracked follow-up (needs a
+    # GRPO end-to-end A/B first). Until then every GRPO path keeps the conservative full-logits budget
+    # cap (fused_logits=False below), so long completions are BUDGETED to fit — slower than the old Liger
+    # fused loss, but not an OOM. Feature-detect GRPOConfig fields once here; the TIS and num_iterations
+    # knobs are set later even when use_vllm is False, so this must stay outside the vLLM-only block.
     _grpo_fields = set(getattr(GRPOConfig, "__dataclass_fields__", {}))
     _grpo_has_num_iter = "num_iterations" in _grpo_fields
-    # mu (num_iterations) is fixed at 2 when the field exists (the standard GRPO config -- reuse each
-    # rollout for 2 optimizer steps; set at the canonical block below). So mu==1 only when the field is
-    # ABSENT (old / non-dataclass TRL -> implicit 1): that is the one case the Liger-fused loss can be
-    # the sole logits pass, so the cap-drop keys off field existence.
-    _mu_one = not _grpo_has_num_iter
-    # ...but TRL's COLOCATED-vLLM path ALSO runs a separate old_per_token_logps forward for its
-    # importance-sampling (TIS) correction whenever vllm_importance_sampling_correction is enabled —
-    # TRL's DEFAULT, which we only tune (mode/clip, below) and never disable — even at mu==1. That
-    # unfused [pd, completion, vocab] forward materializes full logits the 6 GB cap must still bound
-    # (else a long-completion / multi-turn run sized to a larger per-device batch OOMs in it). Detect
-    # whether it runs: prefer the explicit correction field's DECLARED DEFAULT (we never set it in
-    # grpo_kwargs, so the default IS the effective value); fall back to the presence of the TIS
-    # mode/clip fields (older TRL where the correction is implicitly on for the vLLM path). Only the
-    # vLLM rollout path runs this forward, so gate on use_vllm too.
-    _corr_field = getattr(GRPOConfig, "__dataclass_fields__", {}).get(
-        "vllm_importance_sampling_correction"
-    )
-    if _corr_field is not None and _corr_field.default is not dataclasses.MISSING:
-        _tis_correction_on = bool(_corr_field.default)
-    else:
-        _tis_correction_on = any(
-            f in _grpo_fields
-            for f in (
-                "vllm_importance_sampling_mode",
-                "vllm_importance_sampling_clip_max",
-                "vllm_importance_sampling_cap",
-            )
-        )
-    _vllm_is_logprob_forward = use_vllm and _tis_correction_on
     per_device_comps = _w.rl_per_device_comps(
         _cap_completion_len,
         vocab=vocab_size_for(model_id),
@@ -321,17 +283,9 @@ def run_rl():
         params_b=_params_b,
         active_params_b=(float(getattr(_info, "active_params_b", 0.0) or 0.0) or None),
         seq_len=vllm_max_len,
-        # The 6 GB logits cap is droppable only when the Liger-fused loss is the SOLE logits-
-        # materializing pass: liger fuses the LOSS, but num_iterations>1 (old_per_token_logps), kl>0
-        # (ref_per_token_logps), AND TRL's vLLM TIS correction (a per-step old_per_token_logps forward,
-        # on by default even at mu==1) each add an unfused full-logits forward the cap must still bound
-        # (else a long multi-turn transcript OOMs that forward at pd>1). mu is fixed at 2 (>1) whenever
-        # the field exists, so _mu_one is only True on an old TRL with no num_iterations field; combined
-        # with _vllm_is_logprob_forward (TIS on by default), the cap is in practice always kept on the
-        # colocated-vLLM path. liger_on (True) is also False off-GPU/without the liger wheel -> cap stays.
-        fused_logits=(
-            liger_on(True) and _mu_one and _kl_beta == 0 and not _vllm_is_logprob_forward
-        ),
+        # Conservative until chalk's GRPO fused-logprob op (chalk 0.5.0, chalk.ops.grpo) is wired in:
+        # keep the full-logits budget cap so the unfused path is BUDGETED to fit, never OOMs.
+        fused_logits=False,
     )
     if is_multi_turn and _cap_completion_len != _max_completion:
         print(
@@ -415,11 +369,8 @@ def run_rl():
         # 8-bit paged AdamW: colocated GRPO is memory-tight, so int8 state paged to host RAM.
         "optim": fused_optim_name(),
     }
-    # Liger fused GRPO loss: fuses lm_head + logprob so the fp32 248k-vocab logits never
-    # materialize. DEFAULT ON regardless of size — without it even 0.8B OOMs a 24 GB card.
-    if liger_on(True):
-        grpo_kwargs["use_liger_kernel"] = True
-        print("[rl] liger fused GRPO loss enabled")
+    if "use_liger_kernel" in _grpo_fields:
+        grpo_kwargs["use_liger_kernel"] = False
     if use_vllm:
         # sm120: pin a PTX-independent vLLM attention backend before TRL builds the engine, else
         # the rollout can silently produce no completions (flash-attn PTX JIT failure).
@@ -629,29 +580,8 @@ def run_rl():
             callbacks=[hb_cb, _w.make_checkpoint_upload_callback()],
             **extra_trainer_kwargs,
         )
-    # Apply chalk's gap-filling kernels on trainer.model (the authoritative target).
+    # Apply chalk's standalone kernels on trainer.model (the authoritative target).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
-    # Collapse the Liger fused-loss chunk_size to one invocation over the whole micro-batch
-    # (TRL's default 1 runs the cycle once per sequence). Numerically identical. Must run BEFORE
-    # the mask-aware wrap below, which replaces liger_grpo_loss with a chunk_size-less closure.
-    _liger_loss = getattr(trainer, "liger_grpo_loss", None)
-    if _liger_loss is not None and hasattr(_liger_loss, "chunk_size"):
-        _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
-        if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
-            _liger_loss.chunk_size = _cs
-            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
-    # Run Liger's fused loss eager: drop only its torch.compile (broken on torch 2.10), keep the
-    # chunked memory path. Must run BEFORE the mask-aware wrap below.
-    if disable_liger_grpo_torch_compile(trainer):
-        print(
-            "[rl] liger GRPO loss: torch.compile DISABLED (eager loss math; chunked memory path "
-            "retained) — dodges the torch 2.10 dynamo guard-gen crash (symbol_to_source IndexError)"
-        )
-    # Mask-aware lm_head: skip the 248k-vocab projection at masked completion positions (loss-
-    # preserving; no-op when nothing is masked).
-    if grpo_kwargs.get("use_liger_kernel") and patch_grpo_mask_aware_lm_head(trainer):
-        _masked_kind = "env + padding" if use_rollout_func else "padding"
-        print(f"[rl] mask-aware lm_head: skipping masked ({_masked_kind}) positions in the GRPO loss")
     # Activate the weight-sync remap only now, after the initial checkpoint load is built.
     if use_vllm:
         _LM_SYNC_REMAP_ON["on"] = True
