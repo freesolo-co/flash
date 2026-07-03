@@ -55,6 +55,25 @@ def test_init_adapter_preflight_allows_vl_recombined_rank_at_serving_cap():
     preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 16}))
 
 
+def test_init_adapter_preflight_rejects_opd_vl_recombined_rank_before_training():
+    # opd VL warm-start ALSO stacks SFT⊕opd at deploy (recombined_warmstart_adapter_dir), so the
+    # recombined rank must fit the serving cap — same preflight as GRPO, worded for opd.
+    spec = _spec(rank=16, algorithm="opd")
+
+    with pytest.raises(
+        ValueError,
+        match=r"SFT\+OPD adapter would be rank 40 \(SFT rank 24 \+ OPD rank 16\).*"
+        r"set OPD train\.lora_rank <= 8",
+    ):
+        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 24}))
+
+
+def test_init_adapter_preflight_allows_opd_vl_recombined_rank_at_serving_cap():
+    spec = _spec(rank=16, algorithm="opd")
+
+    preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 16}))  # 16+16=32=cap
+
+
 def test_init_adapter_preflight_allows_empty_vl_patterns():
     spec = _spec(rank=16)
 

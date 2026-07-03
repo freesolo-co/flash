@@ -177,21 +177,26 @@ def _student_model(model_id, mik, device):
     continuing a prior run's adapter (e.g. an SFT checkpoint), the same path GRPO uses via
     ``_init_adapter_model`` — otherwise a fresh LoRA on the base. This makes an SFT->opd pipeline a
     genuine continuation (the opd stage keeps the SFT behavior) rather than silently restarting from
-    base. VL merge-warm-start (which needs SFT (+) opd recombination before deploy) is not yet wired
-    for opd, so it is refused loudly instead of shipping a broken deploy."""
+    base.
+
+    Two warm-start shapes, both from ``_init_adapter_model`` (parity with GRPO):
+      - non-VL (e.g. MiniCPM): a trainable PeftModel that CONTINUES the SFT adapter in place
+        (``init_peft is None``); the saved adapter already carries the SFT.
+      - VL (Qwen3.5/3.6): ``_init_adapter_model`` MERGES the SFT into the base and returns the merged
+        dir + a FRESH LoRA config. We train that fresh LoRA on the merged base; ``run_opd`` then
+        recombines SFT⊕opd at publish (``recombined_warmstart_adapter_dir``) so the DEPLOYED adapter
+        reproduces base+SFT+opd on the unmodified catalog base — exactly GRPO's VL warm-start path.
+    """
     init_model, init_peft = _w._init_adapter_model(model_id)
     if init_peft is None:
         # init_model is already a trainable PeftModel continuing the prior (e.g. SFT) adapter.
         return init_model.to(device)
-    if getattr(_w, "_VL_WARMSTART_SFT_DIR", None) is not None:
-        raise RuntimeError(
-            "opd warm-start from a VL SFT adapter is not yet supported (the saved adapter would need "
-            "SFT+opd recombination before deploy). Use a text-model SFT adapter, or omit "
-            "train.init_from_adapter to train a fresh LoRA on the base."
-        )
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM
 
+    # init_model is the base id (fresh run) or the VL SFT-merged dir; both load as a causal LM — the
+    # merged dir preserves the catalog arch + remote code, so this matches the base load the fresh
+    # path already uses on Qwen3.5. The fresh LoRA excludes vision modules via make_lora.
     base = AutoModelForCausalLM.from_pretrained(init_model, trust_remote_code=True, **mik).to(
         device
     )
@@ -445,7 +450,7 @@ def run_opd():
             # warm-start/deploy from step-N would use fewer updates than its name implies.
             if knobs["save_every"] and opt_steps % knobs["save_every"] == 0:
                 _save_adapter(model, tok, adapter_dir)
-                _w.publish_deployable_checkpoint(adapter_dir, opt_steps)
+                _publish_opd_deployable(adapter_dir, opt_steps, as_default=False)
 
     train_wall = time.time() - t_train
     if not loss_curve:
@@ -456,9 +461,10 @@ def run_opd():
         )
 
     _save_adapter(model, tok, adapter_dir)
-    _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-    # Name the final checkpoint by real optimizer steps applied, not the planned `steps` count.
-    _w.publish_deployable_checkpoint(adapter_dir, opt_steps)
+    # Ship the deployable adapter (VL warm-start: recombine SFT⊕opd so it reproduces base+SFT+opd on
+    # the catalog base; no-op for text/fresh). Name the final checkpoint by real optimizer steps
+    # applied, not the planned `steps` count.
+    _publish_opd_deployable(adapter_dir, opt_steps, as_default=True)
     _w.heartbeat("opd_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     _w.write_train_meta(
@@ -563,3 +569,23 @@ def _save_adapter(model, tok, adapter_dir: str) -> None:
     """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""
     model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
+
+
+def _publish_opd_deployable(adapter_dir: str, step: int, *, as_default: bool) -> None:
+    """Publish the step-``step`` deployable adapter (and, when ``as_default``, the ``<prefix>/adapter``
+    served default), recombining SFT⊕opd for a VL warm-start so the deployed adapter reproduces
+    base+SFT+opd on the unmodified catalog base. For a VL warm-start the trained ``adapter_dir`` is
+    SFT-less (a fresh LoRA on the SFT-merged base); ``recombined_warmstart_adapter_dir`` stacks the
+    original SFT LoRA back in. No-op recombine (deploys ``adapter_dir`` as-is) for the continued-
+    adapter (non-VL) and fresh-LoRA paths, which already carry the SFT. Mirrors GRPO finalize (rl.py)."""
+    recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
+    deploy_dir = recombined or adapter_dir
+    try:
+        if as_default:
+            _w.hf_upload_folder(deploy_dir, "adapter", required=True)
+        _w.publish_deployable_checkpoint(deploy_dir, step)
+    finally:
+        if recombined:
+            import shutil
+
+            shutil.rmtree(recombined, ignore_errors=True)

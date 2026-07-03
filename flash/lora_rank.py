@@ -168,26 +168,31 @@ def preflight_init_adapter_lora_rank(
             "or raise the serving cap after real-GPU validation"
         )
 
-    if spec.algorithm != "grpo" or not _uses_vl_warmstart_recombine(spec.model):
+    # VL warm-start recombines the SFT LoRA with the freshly-trained LoRA into a rank-(sft+new)
+    # deploy adapter that must fit the serving cap. GRPO rank-stacks the two; opd trains a fresh LoRA
+    # on the SFT-merged base and stacks it back at deploy (recombined_warmstart_adapter_dir) — same
+    # rank arithmetic — so both preflight here before a GPU is allocated.
+    if spec.algorithm not in ("grpo", "opd") or not _uses_vl_warmstart_recombine(spec.model):
         return
 
+    algo = spec.algorithm.upper()
     sft_rank = uniform_rank_from_adapter_config(config, source=source)
-    grpo_rank = int(spec.train.lora_rank)
-    recombined_rank = sft_rank + grpo_rank
+    new_rank = int(spec.train.lora_rank)
+    recombined_rank = sft_rank + new_rank
     if recombined_rank <= max_lora_rank:
         return
 
-    allowed_grpo_rank = max_lora_rank - sft_rank
-    if allowed_grpo_rank >= 1:
-        guidance = f"set GRPO train.lora_rank <= {allowed_grpo_rank}"
+    allowed_new_rank = max_lora_rank - sft_rank
+    if allowed_new_rank >= 1:
+        guidance = f"set {algo} train.lora_rank <= {allowed_new_rank}"
     else:
-        allowed_sft_rank = max_lora_rank - grpo_rank
+        allowed_sft_rank = max_lora_rank - new_rank
         if allowed_sft_rank >= 1:
             guidance = f"retrain the SFT adapter at rank <= {allowed_sft_rank}"
         else:
-            guidance = f"lower both SFT and GRPO ranks so their sum is <= {max_lora_rank}"
+            guidance = f"lower both SFT and {algo} ranks so their sum is <= {max_lora_rank}"
     raise ValueError(
-        "train.init_from_adapter rank preflight failed: recombined SFT+GRPO adapter would be "
-        f"rank {recombined_rank} (SFT rank {sft_rank} + GRPO rank {grpo_rank}), exceeding "
+        f"train.init_from_adapter rank preflight failed: recombined SFT+{algo} adapter would be "
+        f"rank {recombined_rank} (SFT rank {sft_rank} + {algo} rank {new_rank}), exceeding "
         f"{spec.model}'s serving max_lora_rank={max_lora_rank}; {guidance}"
     )

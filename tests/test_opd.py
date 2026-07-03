@@ -347,6 +347,113 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     )
 
 
+def test_student_model_accepts_vl_warmstart_without_raising(monkeypatch):
+    """opd VL warm-start (Qwen3.5/3.6) must build a fresh LoRA on the SFT-merged base — parity with
+    GRPO — instead of raising. _init_adapter_model returns (merged_dir, fresh_lora) and records the
+    VL merge; _student_model must LOAD the merged dir and wrap it in a PeftModel (run_opd then
+    recombines SFT⊕opd at publish)."""
+    pytest.importorskip("torch")  # AutoModelForCausalLM (patched below) needs torch present
+    pytest.importorskip("transformers")
+    import sys
+    import types
+
+    from flash.engine.worker import opd as opd_mod
+
+    sentinel = object()
+    fake_lora = object()
+    seen = {}
+
+    class _Base:
+        def to(self, device):
+            seen["device"] = device
+            return self
+
+    def _fake_init_adapter_model(model_id):
+        opd_mod._w._VL_WARMSTART_SFT_DIR = "/tmp/fake_sft_dir"  # the VL merge path records this
+        return "/tmp/merged_vl_dir", fake_lora  # merged base dir + FRESH LoRA config
+
+    monkeypatch.setattr(opd_mod._w, "_VL_WARMSTART_SFT_DIR", None, raising=False)
+    monkeypatch.setattr(opd_mod._w, "_init_adapter_model", _fake_init_adapter_model, raising=False)
+
+    import transformers
+
+    def _fake_from_pretrained(path, **kw):
+        seen["path"] = path
+        return _Base()
+
+    monkeypatch.setattr(
+        transformers.AutoModelForCausalLM, "from_pretrained", staticmethod(_fake_from_pretrained)
+    )
+    # _student_model does `from peft import get_peft_model`; peft is a worker-only dep, so inject a
+    # stub module (works with or without a real peft install — hermetic local + CI).
+    fake_peft = types.ModuleType("peft")
+    fake_peft.get_peft_model = lambda base, cfg: (sentinel, base, cfg)
+    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+
+    out = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
+    assert out[0] is sentinel  # did NOT raise; wrapped the merged base in a PeftModel
+    assert out[2] is fake_lora  # used the fresh LoRA from _init_adapter_model
+    assert seen["path"] == "/tmp/merged_vl_dir"  # loaded the MERGED dir, not the raw base id
+
+
+def test_publish_opd_deployable_recombines_for_vl_and_cleans_up(tmp_path, monkeypatch):
+    """VL warm-start: the trained adapter is SFT-less, so publish must deploy the RECOMBINED SFT⊕opd
+    adapter (as the served default AND the step checkpoint) and clean up the temp recombine dir."""
+    from flash.engine.worker import opd as opd_mod
+
+    calls = {"upload": [], "publish": []}
+    recomb = tmp_path / "recomb"
+    recomb.mkdir()
+    monkeypatch.setattr(
+        opd_mod._w, "recombined_warmstart_adapter_dir", lambda d: str(recomb), raising=False
+    )
+    monkeypatch.setattr(
+        opd_mod._w,
+        "hf_upload_folder",
+        lambda d, sub, required=False: calls["upload"].append((d, sub)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        opd_mod._w,
+        "publish_deployable_checkpoint",
+        lambda d, step: calls["publish"].append((d, step)),
+        raising=False,
+    )
+
+    opd_mod._publish_opd_deployable(str(tmp_path / "adapter"), 42, as_default=True)
+    assert calls["upload"] == [(str(recomb), "adapter")]  # served default = RECOMBINED, not raw
+    assert calls["publish"] == [(str(recomb), 42)]  # step checkpoint = RECOMBINED
+    assert not recomb.exists()  # temp recombine dir cleaned up
+
+
+def test_publish_opd_deployable_noop_recombine_deploys_adapter_dir(tmp_path, monkeypatch):
+    """Non-VL / fresh runs: recombine is a no-op (returns None); the trained adapter_dir already
+    carries the SFT, so it is deployed as-is. as_default=False publishes only the step checkpoint."""
+    from flash.engine.worker import opd as opd_mod
+
+    calls = {"upload": [], "publish": []}
+    monkeypatch.setattr(
+        opd_mod._w, "recombined_warmstart_adapter_dir", lambda d: None, raising=False
+    )
+    monkeypatch.setattr(
+        opd_mod._w,
+        "hf_upload_folder",
+        lambda d, sub, required=False: calls["upload"].append((d, sub)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        opd_mod._w,
+        "publish_deployable_checkpoint",
+        lambda d, step: calls["publish"].append((d, step)),
+        raising=False,
+    )
+
+    adir = str(tmp_path / "adapter")
+    opd_mod._publish_opd_deployable(adir, 7, as_default=False)
+    assert calls["upload"] == []  # as_default=False -> no served-default upload
+    assert calls["publish"] == [(adir, 7)]  # no-op recombine -> deploys adapter_dir as-is
+
+
 # --------------------------------------------------------------------------------------------------
 # teacher client (mocked HTTP)
 # --------------------------------------------------------------------------------------------------
