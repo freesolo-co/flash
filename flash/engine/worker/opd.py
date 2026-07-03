@@ -262,6 +262,26 @@ def run_opd():
         else RECIPE.opd.max_prompt_len,
     )
     dropped_long = 0
+
+    def _render_prompt_ids(messages):
+        text = tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
+        )
+        return tok(text, add_special_tokens=False).input_ids
+
+    # Fail fast (like GRPO's dataset pre-filter) if NOT ONE prompt fits the budget — otherwise every
+    # step would drop all its prompts and the run would burn its whole GPU allocation before the
+    # end-of-run no-signal guard. `any` early-exits at the first fitting example, so a normal dataset
+    # pays a single tokenize; only the all-over-budget failure case scans the whole set (then raises).
+    if not any(len(_render_prompt_ids(env.prompt_messages(ex))) <= prompt_budget for ex in examples):
+        raise RuntimeError(
+            f"opd: every prompt exceeds the {prompt_budget}-token budget "
+            f"(max_length={knobs['max_length'] or 'unset'}, "
+            f"max_completion={knobs['max_completion']}). Raise [train].max_length or shorten "
+            "prompts — failing before the training loop instead of dropping every prompt for "
+            "every step and burning the GPU allocation."
+        )
+
     resume_ckpt = _w.hf_resume_checkpoint()
     if resume_ckpt:
         print("[opd] resume-from-checkpoint is not yet supported for opd; starting fresh")
@@ -304,13 +324,7 @@ def run_opd():
                 # Render the student prompt from the SAME messages the teacher conditions on;
                 # env.prompt_messages can be stateful/randomized, so re-deriving it via render_prompt
                 # (which calls prompt_messages again) would desync sampling from teacher scoring.
-                prompt_text = tok.apply_chat_template(
-                    prompt_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=_w.THINKING,
-                )
-                prompt_ids = tok(prompt_text, add_special_tokens=False).input_ids
+                prompt_ids = _render_prompt_ids(prompt_messages)
                 # Drop over-budget prompts (like GRPO) rather than truncating: a truncated student
                 # prompt would no longer match the teacher's full-prompt conditioning.
                 if len(prompt_ids) > prompt_budget:
