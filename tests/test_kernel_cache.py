@@ -104,3 +104,41 @@ def test_worker_skips_baked_cache_when_arch_undetermined(monkeypatch, tmp_path):
 
     assert kernel_warmup.load_mega_cache() is False
     assert loaded["called"] is False
+
+
+def test_warm_chalk_kernels_calls_default_standalone_installers(monkeypatch):
+    calls = []
+
+    def _install(module_name, attr, result=False):
+        mod = types.ModuleType(module_name)
+
+        def installer(*args):
+            calls.append((module_name, attr, args))
+            return result
+
+        setattr(mod, attr, installer)
+        monkeypatch.setitem(sys.modules, module_name, mod)
+
+    for module_name, attr, result in (
+        ("chalk.ops.rope", "install_qwen35_rope", True),
+        ("chalk.ops.rmsnorm", "install_qwen35_rmsnorm", False),
+        ("chalk.ops.swiglu", "install_qwen35_swiglu", False),
+        ("chalk.ops.flce", "install_qwen35_flce", False),
+        ("chalk.ops.lora", "install_fused_lora_delta", False),
+        ("chalk.ops.qkv", "install_qwen35_qknorm_rope", False),
+        ("chalk.ops.embedding", "install_qwen35_fused_embedding", False),
+        ("chalk.ops.gdn", "install_qwen35_gdn", False),
+    ):
+        _install(module_name, attr, result)
+
+    assert kernel_warmup.warm_chalk_kernels() is True
+    assert calls == [
+        ("chalk.ops.rope", "install_qwen35_rope", ()),
+        ("chalk.ops.rmsnorm", "install_qwen35_rmsnorm", ()),
+        ("chalk.ops.swiglu", "install_qwen35_swiglu", ()),
+        ("chalk.ops.flce", "install_qwen35_flce", (None,)),
+        ("chalk.ops.lora", "install_fused_lora_delta", ()),
+        ("chalk.ops.qkv", "install_qwen35_qknorm_rope", (None,)),
+        ("chalk.ops.embedding", "install_qwen35_fused_embedding", (None,)),
+        ("chalk.ops.gdn", "install_qwen35_gdn", ()),
+    ]

@@ -125,89 +125,6 @@ def warm_flash_attn(torch) -> bool:
     return warmed
 
 
-def warm_liger_ce(torch) -> bool:
-    """Compile Liger cross-entropy kernels."""
-    warmed = False
-    try:
-        from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
-
-        loss_fn = LigerCrossEntropyLoss()
-        logits = torch.randn(64, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        labels = torch.randint(0, 4096, (64,), device="cuda")
-        loss_fn(logits, labels).backward()
-        torch.cuda.synchronize()
-        _log("liger fused cross-entropy compiled")
-        warmed = True
-    except Exception as e:
-        _log(f"liger CE warm skipped: {e}")
-    try:
-        candidates = (
-            ("liger_kernel.ops.fused_linear_cross_entropy", "LigerFusedLinearCrossEntropyLoss"),
-            (
-                "liger_kernel.transformers.fused_linear_cross_entropy",
-                "LigerFusedLinearCrossEntropyLoss",
-            ),
-        )
-        loss_cls = None
-        for module_name, attr in candidates:
-            try:
-                mod = __import__(module_name, fromlist=[attr])
-                loss_cls = getattr(mod, attr)
-                break
-            except Exception:
-                continue
-        if loss_cls is None:
-            raise ImportError("no fused-linear Liger loss class found")
-        # warm qwen3.5/3.6 production vocab width (~248k); triton/liger chunk specialization differs from toy 4096.
-        vocab = 248_320
-        hidden = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        weight = torch.randn(vocab, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        labels = torch.randint(0, vocab, (64,), device="cuda")
-        loss_fn = loss_cls()
-        # upstream signature: forward(lin_weight, _input, target) — weight first; call known-good form
-        # first to avoid mismatched-shape CUDA illegal access that would poison the context.
-        attempts = (
-            lambda: loss_fn(weight, hidden, labels),
-            lambda: loss_fn(weight, hidden, target=labels),
-            lambda: loss_fn(hidden, weight, labels),
-        )
-        for call in attempts:
-            try:
-                out = call()
-                if isinstance(out, tuple):
-                    out = out[0]
-                out.backward()
-                torch.cuda.synchronize()
-                _log("liger fused-linear loss compiled")
-                warmed = True
-                break
-            except Exception:
-                continue
-        else:
-            raise RuntimeError("fused-linear Liger calls were not accepted")
-    except Exception as e:
-        _log(f"liger fused-linear warm skipped: {e}")
-    try:
-        from liger_kernel.transformers.rms_norm import LigerRMSNorm
-        from liger_kernel.transformers.rope import liger_rotary_pos_emb
-
-        rms = LigerRMSNorm(hidden_size=256).to(device="cuda", dtype=torch.bfloat16)
-        x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        rms(x).sum().backward()
-        b, h, t, d = 1, 4, 64, 64
-        q = torch.randn(b, h, t, d, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(b, h, t, d, device="cuda", dtype=torch.bfloat16)
-        cos = torch.randn(b, t, d, device="cuda", dtype=torch.bfloat16)
-        sin = torch.randn(b, t, d, device="cuda", dtype=torch.bfloat16)
-        liger_rotary_pos_emb(q, k, cos, sin)
-        torch.cuda.synchronize()
-        _log("liger model-layer kernels (rmsnorm/rope) compiled")
-        warmed = True
-    except Exception as e:
-        _log(f"liger model-layer warm skipped: {e}")
-    return warmed
-
-
 def warm_fla_gdn(torch) -> bool:
     """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path)."""
     try:
@@ -258,22 +175,26 @@ def warm_fla_gdn(torch) -> bool:
 
 
 def warm_chalk_kernels() -> bool:
-    """Compile default chalk self-test kernels when freesolo-chalk is installed."""
+    """Compile PR11 default chalk self-test kernels when freesolo-chalk is installed."""
     warmed = False
-    try:
-        from chalk.transformers import install_fused_lora_delta, install_qwen35_rope
-
-        warmed = bool(install_qwen35_rope()) or warmed
-        warmed = bool(install_fused_lora_delta()) or warmed
+    installers = (
+        ("rope", "chalk.ops.rope", "install_qwen35_rope", ()),
+        ("rmsnorm", "chalk.ops.rmsnorm", "install_qwen35_rmsnorm", ()),
+        ("swiglu", "chalk.ops.swiglu", "install_qwen35_swiglu", ()),
+        ("flce", "chalk.ops.flce", "install_qwen35_flce", (None,)),
+        ("lora", "chalk.ops.lora", "install_fused_lora_delta", ()),
+        ("trainable-attn-epilogue", "chalk.ops.qkv", "install_qwen35_qknorm_rope", (None,)),
+        ("embedding", "chalk.ops.embedding", "install_qwen35_fused_embedding", (None,)),
+        ("gdn", "chalk.ops.gdn", "install_qwen35_gdn", ()),
+    )
+    for label, module_name, attr, args in installers:
         try:
-            from chalk.transformers import install_fused_embedding
-
-            warmed = bool(install_fused_embedding()) or warmed
+            mod = __import__(module_name, fromlist=[attr])
+            install = getattr(mod, attr)
+            warmed = bool(install(*args)) or warmed
         except Exception as e:
-            _log(f"chalk fused-embedding warm skipped: {e}")
-        _log(f"chalk default kernel installers ran (warmed={warmed})")
-    except Exception as e:
-        _log(f"chalk warm skipped: {e}")
+            _log(f"chalk {label} warm skipped: {e}")
+    _log(f"chalk PR11 default kernel installers ran (warmed={warmed})")
     return warmed
 
 
@@ -410,13 +331,12 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
     warmed = sum(
         [
             warm_flash_attn(torch),
-            warm_liger_ce(torch),
             warm_fla_gdn(torch),
             warm_chalk_kernels(),
             warm_torch_compile(torch),
         ]
     )
-    _log(f"{warmed}/5 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
+    _log(f"{warmed}/4 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
     saved = save_mega_cache(torch, out_dir)
     meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
     _log(f"done in {time.time() - t0:.1f}s (saved={saved})")
