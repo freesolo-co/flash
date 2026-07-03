@@ -506,17 +506,24 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
 
 
 def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
-    """Codex: when the Vast status endpoint keeps raising and the poll-error budget is spent, the poller
-    force-reads the worker's terminal DONE/marker BEFORE returning poll_error. A worker that COMPLETED
-    during the outage (DONE on HF, a different endpoint) is finished, not abandoned to a duplicate retry
-    that re-rents a GPU for an attempt that already succeeded."""
+    """Codex/Cursor: when the Vast status endpoint keeps raising and the poll-error budget is spent, the
+    poller does a BOUNDED terminal DONE/marker read (same as the deadline / dead-host paths) BEFORE
+    returning poll_error. A worker that COMPLETED during a prolonged outage — DONE on HF, a separate
+    endpoint, but lagged on the first read — is finished rather than abandoned to a duplicate retry that
+    re-rents a GPU for an attempt that already succeeded. A single read would miss the lagged DONE here."""
     from flash.providers import _poll
     from flash.providers.vast import api as vast_api
+
+    done_seq = {"n": 0}
+
+    def late_done():
+        done_seq["n"] += 1
+        return None if done_seq["n"] <= 1 else "10500.0"  # missed on the first read, surfaces on retry
 
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        done="10500.0",  # worker wrote DONE during the status-API outage
+        done=late_done,  # DONE written during the outage, lagged past the first terminal read
         metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
     )
     monkeypatch.setattr(_poll.time, "sleep", lambda s: None)  # PollErrorTracker.record backoff
@@ -526,8 +533,9 @@ def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
 
     monkeypatch.setattr(vast_api, "get_instance", always_raise)
     res = vast.poll_vast_job(_handle(started_ts=10_000.0), _spec(), seed=0, interval_s=0)
-    assert res.ok  # finished from the terminal DONE, not a poll_error abandonment
+    assert res.ok  # finished from the bounded terminal read, not a poll_error abandonment
     assert res.metrics["train_tokens"] == 4096
+    assert done_seq["n"] >= 2  # the bounded read retried past the first miss (a single read would fail)
 
 
 def test_poll_deadline_waits_for_late_terminal_artifacts(monkeypatch):

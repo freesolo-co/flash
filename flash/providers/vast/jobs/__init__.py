@@ -577,10 +577,18 @@ def poll_vast_job(
             # count against the budget and keep polling (else a read blip looks like a gone instance).
             if poll_errors.record(e):
                 # The status endpoint is down, but the worker may have COMPLETED during the outage and
-                # written its terminal DONE/marker to HF (a different endpoint). Force-read them before
-                # giving up: poll_error tears the box down and the retry can otherwise relaunch a second
-                # worker for an attempt that already finished (duplicate work + double-bill).
-                terminal = terminal_artifact_result()
+                # written its terminal DONE/marker to HF (a different endpoint). Do the BOUNDED terminal
+                # read (same as the deadline / dead-host paths) before giving up: a prolonged outage can
+                # end right as the worker finishes, so a single read can miss the just-written artifact
+                # under HF read-after-write lag. Else poll_error tears the box down and the retry relaunches
+                # a second worker for an attempt that already finished (duplicate work + double-bill).
+                terminal = _read_with_retries(
+                    terminal_artifact_result,
+                    tries=_TERMINAL_AFTER_DEAD_RETRIES,
+                    wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+                    say=say,
+                    message="status-poll outage; waiting for HF to expose any terminal DONE/marker before poll_error",
+                )
                 if terminal is not None:
                     return terminal
                 return PollResult(False, failure="poll_error", detail=str(e))
