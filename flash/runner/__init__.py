@@ -117,8 +117,9 @@ def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) 
 
 # Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
 # `step` field is 1-indexed and only appears once a step COMPLETES, so the expensive first step (a
-# GRPO rollout can be ~17 min) streams one of these stages with NO step yet -- still real GPU time.
-_TRAINING_STAGES = frozenset({"rl_step", "sft_step"})
+# GRPO rollout can be ~17 min, an opd step waits on the teacher round-trips) streams one of these
+# stages with NO step yet -- still real GPU time.
+_TRAINING_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
 
 
 def actual_steps_run(status: RunStatus) -> int:
@@ -133,7 +134,7 @@ def actual_steps_run(status: RunStatus) -> int:
     step = hb.get("step")
     if isinstance(step, (int, float)) and step > 0:
         return int(step)
-    # Training started (rl_step/sft_step) but no completed step yet -> mid-first-step -> bill 1.
+    # Training started (rl_step/sft_step/opd_step) but no completed step yet -> mid-first-step -> 1.
     if hb.get("stage") in _TRAINING_STAGES:
         return 1
     return 0

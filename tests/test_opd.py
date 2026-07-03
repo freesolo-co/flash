@@ -147,7 +147,7 @@ def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
         prompt_tensor=torch.tensor([[1]]),
         prompt_messages=[{"role": "user", "content": "say hi"}],
         gen_cfg={},
-        knobs={"kl_coef": 1.0},
+        knobs={"kl_coef": 1.0, "stop_sequences": ()},
         torch=torch,
     )
     assert loss is not None
@@ -215,6 +215,30 @@ def test_teacher_score_returns_completion_region_with_rebased_offsets_and_logpro
     assert capture["body"]["max_tokens"] == 0
     assert capture["body"]["echo"] is True
     assert capture["body"]["logprobs"] == 1
+
+
+def test_teacher_score_drops_prompt_completion_boundary_token(monkeypatch):
+    # Prompt ends in whitespace ("P: ", plen=3); the teacher emits a leading-space merge token
+    # " hi" that starts at char 2 (inside the prompt) and ends at 5 (inside the completion). Its
+    # logprob is contaminated by prompt text, so score() must DROP it (start < plen), keeping only
+    # tokens that lie entirely in the completion.
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", ":", " hi", "!"],
+                    "token_logprobs": [0.0, -1.0, -0.5, -0.2],
+                    "text_offset": [0, 1, 2, 5],
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    toks = client.score("P: ", "hi!")
+    # only "!" survives (starts at char 5 >= plen); the boundary-crossing " hi" is dropped.
+    assert [t.text for t in toks] == ["!"]
+    assert toks[0].start == 2  # 5 - plen(3)
 
 
 def test_teacher_score_raises_on_malformed_response(monkeypatch):

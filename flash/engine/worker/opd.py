@@ -76,6 +76,9 @@ def _resolve_opd_knobs():
         "kl_coef": kl_coef,
         "save_every": int(opt("save_every", 0) or 20),
         "max_length": int(opt("max_length", 0) or 0),
+        # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher
+        # never scores/trains on text past the intended answer boundary.
+        "stop_sequences": tuple(getattr(t, "stop_sequences", ()) or ()),
     }
 
 
@@ -255,10 +258,15 @@ def run_opd():
         "max_new_tokens": knobs["max_completion"],
         "pad_token_id": tok.pad_token_id,
     }
+    if knobs["stop_sequences"]:
+        # HF stops generation at any of these strings (needs the tokenizer to match them on decode).
+        gen_cfg["stop_strings"] = list(knobs["stop_sequences"])
+        gen_cfg["tokenizer"] = tok
     loss_curve: list[float] = []
     coverage_curve: list[float] = []
     generated_tokens = 0
     teacher_input_tokens = 0
+    opt_steps = 0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
     _reset_peak = getattr(_w, "_reset_peak_gpu", None)
     if _reset_peak:
         _reset_peak()
@@ -315,6 +323,7 @@ def run_opd():
                         p.grad.mul_(scale)
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             optimizer.step()
+            opt_steps += 1
             avg_loss = step_loss / nseq
             avg_cov = step_cov / nseq
             loss_curve.append(avg_loss)
@@ -358,6 +367,9 @@ def run_opd():
         generated_tokens=generated_tokens,
         notes={
             "steps": steps,
+            # Optimizer steps actually applied; < steps if any iteration had no usable teacher
+            # signal (skipped). loss_curve length == opt_steps, so reporting stays honest.
+            "opt_steps": opt_steps,
             "method": "gkd",
             "init_from_adapter": warm_start or None,
             "teacher_model": knobs["teacher_model"],
@@ -404,6 +416,13 @@ def _train_one(
     completion_ids = gen[0, prompt_tensor.shape[1] :]
     completion_text = tok.decode(completion_ids, skip_special_tokens=True)
     _train_one.last_gen_tokens = int(completion_ids.shape[0])
+    # HF includes the matched stop string in the output; drop a single trailing delimiter so the
+    # teacher scores only the answer (mirrors GRPO's vLLM `stop`, which excludes it). The sampled
+    # ids are left intact; the char-offset alignment simply won't reach into the trimmed tail.
+    for _stop in knobs["stop_sequences"]:
+        if _stop and completion_text.endswith(_stop):
+            completion_text = completion_text[: -len(_stop)]
+            break
     if not completion_text.strip():
         return None
 

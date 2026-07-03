@@ -43,8 +43,6 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # Reward grading is CONCURRENT: a step's completions score in parallel slots, so the reward
 # wall is ceil(completions / slots) waves x latency, not completions x latency.
 REWARD_CONCURRENCY = 16.0
-# OPD teacher scoring is likewise concurrent (parallel Fireworks calls per step).
-TEACHER_CONCURRENCY = 16.0
 
 # Cold-start overhead (seconds): container boot + deps + model load (+ vLLM init for GRPO).
 #
@@ -93,15 +91,18 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     peak = gpu_tflops(gpu) * 1e12  # FLOP/s
 
     if n.is_opd:
-        # OPD step = on-policy student rollout (like GRPO) + remote teacher scoring
-        # (concurrent Fireworks round-trips, replaces reward grading) + policy update (fwd+bwd
-        # only, NO local reference forward — the teacher is the API).
+        # OPD step = on-policy student rollout (like GRPO) + remote teacher scoring (serial
+        # Fireworks round-trips, replaces reward grading) + policy update (fwd+bwd only, NO local
+        # reference forward — the teacher is the API).
         completions = n.batch_size * n.group_size
         gen_tokens = completions * n.completion_len
         gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
         update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_TRAIN)
         teacher_lat = teacher_seconds_per_completion(config.reward_seconds_per_completion)
-        teacher_s = math.ceil(completions / TEACHER_CONCURRENCY) * teacher_lat
+        # run_opd scores each completion serially (nested prompt/group loops each await
+        # teacher.score before the next), so the wall cost is the full serial sum — do NOT divide
+        # by a concurrency factor or the quote materially understates teacher-bound steps.
+        teacher_s = completions * teacher_lat
         return gen_s + teacher_s + update_s
 
     if not n.is_grpo:
@@ -219,7 +220,9 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         effective_steps = (train / sps) if sps > 0 else config.steps
         completions_per_step = n.batch_size * n.group_size
         teacher_input_tokens = effective_steps * completions_per_step * n.seq_len
-        teacher_api_usd = teacher_token_cost_usd(teacher_input_tokens, 0.0)
+        teacher_api_usd = teacher_token_cost_usd(
+            teacher_input_tokens, 0.0, config.teacher_model or ""
+        )
 
     return CostEstimate(
         model_id=config.model_id,

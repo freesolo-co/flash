@@ -109,6 +109,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         provider="auto",
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
+        teacher_model=(t.teacher_model or None) if spec.algorithm == "opd" else None,
     )
 
 

@@ -27,6 +27,9 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
+    # OPD only: the Fireworks teacher id, so the teacher-token quote uses the right per-model rate
+    # (None/"" -> the default GLM rate).
+    teacher_model: str | None = None
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
