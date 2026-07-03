@@ -362,6 +362,10 @@ def run_opd():
                 # prompt would no longer match the teacher's full-prompt conditioning.
                 if len(prompt_ids) > prompt_budget:
                     dropped_long += 1
+                    # Refresh the stall clock on the drop (see the no-signal skip below): a
+                    # randomized env can re-render every prompt over budget for a whole step, which
+                    # would otherwise emit no non-liveness ping and leave the stall clock unrefreshed.
+                    _w.heartbeat("opd_step", step=opt_steps, samples_done=nseq)
                     continue
                 prompt_tensor = torch.tensor([prompt_ids], device=device)
                 for _g in range(group):
@@ -378,6 +382,14 @@ def run_opd():
                         torch=torch,
                     )
                     if loss is None:
+                        # Refresh the stall clock even when a sample yields no teacher signal. The
+                        # success ping below is the only NON-liveness opd_step heartbeat, so a step
+                        # where every sample skips (empty completions, or slow/retrying Fireworks)
+                        # would otherwise emit only liveness pings — which the pollers ignore — and a
+                        # prolonged all-skip stretch on a later step (opt_steps>=1, tight window)
+                        # could be reaped as stalled. Report opt_steps (same step-gating as the
+                        # success ping) so a still-accumulating first step keeps the wide setup grace.
+                        _w.heartbeat("opd_step", step=opt_steps, samples_done=nseq)
                         continue
                     (loss / accum_target).backward()
                     step_loss += float(loss.detach())

@@ -218,6 +218,109 @@ def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
     assert opd_mod._train_one.last_gen_tokens == 3
 
 
+def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
+    """Regression (codex[bot], opd.py:380-381): when EVERY sample in a step skips (empty completion
+    / no teacher signal, or an over-budget re-render), the per-sample SUCCESS ping is never reached.
+    Without a skip-path ping the step would emit only liveness heartbeats — which the pollers ignore
+    — so a prolonged all-skip stretch on a later step could be reaped as stalled. Assert the skip path
+    emits a NON-liveness opd_step heartbeat, and that it reports step==opt_steps (==0 while the first
+    step is still accumulating) so it keeps the WIDE setup grace rather than flipping to the tight
+    training window (opd_step is step-gated in the poller)."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    beats: list[tuple[str, dict]] = []
+
+    class _Tok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+        pad_token_id = 0
+
+        def apply_chat_template(self, messages, **kw):
+            return "PROMPT"
+
+        def __call__(self, text, add_special_tokens=False):
+            return SimpleNamespace(input_ids=[1, 2])  # 2 tokens, well within budget
+
+    class _Model(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=4, V=8)
+            self.config = SimpleNamespace(use_cache=False)
+
+    env = SimpleNamespace(
+        dataset=lambda: [{"q": "a"}, {"q": "b"}],
+        prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
+    )
+    fake_w = SimpleNamespace(
+        require_active_env=lambda: env,
+        JOB_SPEC=SimpleNamespace(
+            train=SimpleNamespace(init_from_adapter=""),
+            model="fake/model",
+            gpu=SimpleNamespace(type=None),
+        ),
+        THINKING=False,
+        SEED=0,
+        heartbeat=lambda stage, **kw: beats.append((stage, kw)),
+        prefetch_model=lambda mid: 0.0,
+        hf_resume_checkpoint=lambda: "",
+        publish_deployable_checkpoint=lambda *a, **k: None,
+        hf_upload_folder=lambda *a, **k: None,
+        write_train_meta=lambda **k: None,
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    # Deterministic knobs: 1 step / 1 prompt / group 1 -> a single sample, forced to skip.
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: {
+            "teacher_model": "accounts/fireworks/models/glm-5p2",
+            "teacher_base_url": "http://teacher.invalid",
+            "steps": 1,
+            "learning_rate": 1e-4,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "max_completion": 8,
+            "prompts_per_step": 1,
+            "group_size": 1,
+            "kl_coef": 1.0,
+            "save_every": 0,
+            "max_length": 0,
+            "stop_sequences": (),
+        },
+    )
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: _Model())
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(opd_mod, "_train_one", lambda **k: None)  # EVERY sample skips
+
+    import transformers
+
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok()
+    )
+    import flash.engine.worker.teacher as tmod
+
+    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
+    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+
+    # An all-skip run lands no optimizer step, so run_opd raises its no-trained-step guard AFTER the
+    # loop; we assert on the heartbeats captured before that raise.
+    with pytest.raises(RuntimeError, match="no trained step"):
+        opd_mod.run_opd()
+
+    # Per-sample opd_step pings carry samples_done (liveness pings never do), so this isolates the
+    # skip-path progress ping from any liveness heartbeat.
+    per_sample = [kw for (stage, kw) in beats if stage == "opd_step" and "samples_done" in kw]
+    assert per_sample, "an all-skip step emitted no per-sample opd_step ping -> stall clock unrefreshed"
+    assert all(kw.get("step") == 0 for kw in per_sample), (
+        "skip-path ping must report opt_steps (0 during the first, still-accumulating step) so the "
+        "poller keeps the wide setup grace instead of the tight training window"
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # teacher client (mocked HTTP)
 # --------------------------------------------------------------------------------------------------
