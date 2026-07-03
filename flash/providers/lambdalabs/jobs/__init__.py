@@ -34,6 +34,7 @@ from flash.providers.lambdalabs.jobs.builders import (
     build_payload,
     build_user_data,
     instance_label,
+    label_matches_run,
     run_label_prefix,
 )
 from flash.providers.runpod.jobs import make_hf_heartbeat_reader, make_hf_text_reader
@@ -562,8 +563,7 @@ def terminate_run_instances(run_id: str) -> list[str]:
     ids = [
         str(i.get("id"))
         for i in instances
-        if i.get("id")
-        and (str(i.get("name") or "") == prefix or str(i.get("name") or "").startswith(prefix + "-s"))
+        if i.get("id") and label_matches_run(str(i.get("name") or ""), prefix)
     ]
     return lambda_api.terminate_instances(ids) if ids else []
 
@@ -595,8 +595,7 @@ def sweep_orphans(
     known_prefixes = None if known_labels is None else {run_label_prefix(a) for a in (known or set())}
 
     def _matches(prefixes: set[str]) -> bool:
-        # Boundary match: flash-100 must not match flash-1000-...
-        return any(name == p or name.startswith(p + "-s") for p in prefixes)
+        return any(label_matches_run(name, p) for p in prefixes)
 
     now = time.time()
     orphans: list[str] = []

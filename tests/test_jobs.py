@@ -24,7 +24,11 @@ def test_job_handle_roundtrip():
     h2 = JobHandle("ep123", "flash-5090-abc", "job456", 2)
     assert h2.to_dict()["attempt"] == 2
     assert JobHandle.from_dict(h2.to_dict()) == h2
+    h3 = JobHandle("ep123", "flash-5090-abc", "job456", 2, 12_345.0)
+    assert h3.to_dict()["started_ts"] == 12_345.0
+    assert JobHandle.from_dict(h3.to_dict()) == h3
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).attempt == 0
+    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).started_ts == 0.0
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).endpoint_name == ""
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job", "attempt": "x"}).attempt == 0
 
@@ -302,6 +306,71 @@ def test_poll_job_failed_without_retriable_heartbeat_is_job_failed(monkeypatch):
     res = _poll_failed_with_heartbeat(monkeypatch, {"stage": "error_sft", "error": "ValueError"})
     assert not res.ok
     assert res.failure == "job_failed"
+
+
+def test_worker_flagged_retriable_gates_stale_prior_attempt_heartbeat():
+    """Codex MtTLM: the seed heartbeat path is shared across retries, so a retriable=True left by
+    attempt N-1 must NOT count for attempt N — else a DETERMINISTIC attempt-N failure that fails
+    before its own worker emits a heartbeat is reported job_preempted and burns GPUs. With
+    launch_ts/current_attempt supplied, the flag is honored only for a heartbeat belonging to THIS
+    attempt; without them it stays ungated (back-compat)."""
+    from flash.providers.runpod.jobs import worker_flagged_retriable
+
+    def reader(hb):
+        return lambda force=False: hb
+
+    stale = {"stage": "rl_step", "step": 5, "ts": 9_000.0, "attempt": 0, "retriable": True}
+    # Back-compat: an ungated call honors the flag (caller can't date the heartbeat).
+    assert worker_flagged_retriable(reader(stale)) is True
+    # Gated: stale by ts (predates this attempt's launch) -> ignored.
+    assert worker_flagged_retriable(reader(stale), launch_ts=10_000.0, current_attempt=1) is False
+    # Gated: fresh ts (a prior worker still shutting down uploads AFTER launch) but a DIFFERENT
+    # attempt -> still ignored (the subtle case a ts-only check would miss).
+    late_prior = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "attempt": 0, "retriable": True}
+    assert worker_flagged_retriable(reader(late_prior), launch_ts=10_000.0, current_attempt=1) is False
+    # Gated: a genuine THIS-attempt retriable heartbeat is still honored.
+    fresh = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "attempt": 1, "retriable": True}
+    assert worker_flagged_retriable(reader(fresh), launch_ts=10_000.0, current_attempt=1) is True
+    # A missing attempt field is not an explicit mismatch. Keep honoring the worker-stamped retry
+    # flag unless the heartbeat timestamp proves it predates this attempt's launch.
+    fresh_no_attempt = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "retriable": True}
+    assert worker_flagged_retriable(reader(fresh_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
+    stale_no_attempt = {"stage": "rl_step", "step": 5, "ts": 9_000.0, "retriable": True}
+    assert worker_flagged_retriable(reader(stale_no_attempt), launch_ts=10_000.0, current_attempt=1) is False
+    undated_no_attempt = {"stage": "rl_step", "retriable": True}
+    assert worker_flagged_retriable(reader(undated_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
+    # No retriable flag -> False regardless of gating.
+    no_flag = {"ts": 10_500.0, "attempt": 1}
+    assert worker_flagged_retriable(reader(no_flag), launch_ts=10_000.0, current_attempt=1) is False
+    # Codex clock-skew: a lagging worker host stamps a THIS-attempt heartbeat with a ts BEFORE launch.
+    # The explicit attempt match proves provenance -> the retriable flag is still honored; a ts-only
+    # staleness check would wrongly discard it and misclassify a same-attempt infra loss as job_failed.
+    clock_skew_match = {"stage": "rl_step", "step": 5, "ts": 9_000.0, "attempt": 1, "retriable": True}
+    assert worker_flagged_retriable(reader(clock_skew_match), launch_ts=10_000.0, current_attempt=1) is True
+
+
+def test_heartbeat_is_stale_prior_attempt_trusts_explicit_attempt_over_clock():
+    """Sibling of worker_flagged_retriable's gating: the explicit attempt field is definitive provenance.
+    A MATCHING attempt is THIS attempt (never stale) even when a lagging worker-host clock puts ts before
+    launch; a MISMATCH is a prior attempt; only with no attempt present do we date by ts."""
+    from flash.providers.runpod.jobs import heartbeat_is_stale_prior_attempt
+
+    def reader(hb):
+        return lambda force=False: hb
+
+    # Matching attempt but clock-skewed ts (before launch) -> NOT stale (the fix: trust the attempt).
+    skew_match = {"stage": "rl_step", "ts": 9_000.0, "attempt": 1}
+    assert heartbeat_is_stale_prior_attempt(reader(skew_match), launch_ts=10_000.0, current_attempt=1) is False
+    # A different attempt (even with a fresh, post-launch ts) -> stale prior.
+    late_prior = {"stage": "rl_step", "ts": 10_500.0, "attempt": 0}
+    assert heartbeat_is_stale_prior_attempt(reader(late_prior), launch_ts=10_000.0, current_attempt=1) is True
+    # No attempt field -> date by ts: predates launch is stale, after launch is current.
+    stale_no_attempt = {"stage": "rl_step", "ts": 9_000.0}
+    assert heartbeat_is_stale_prior_attempt(reader(stale_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
+    fresh_no_attempt = {"stage": "rl_step", "ts": 10_500.0}
+    assert heartbeat_is_stale_prior_attempt(reader(fresh_no_attempt), launch_ts=10_000.0, current_attempt=1) is False
+    # Ungated (missing launch/attempt) -> conservative: never called stale.
+    assert heartbeat_is_stale_prior_attempt(reader(stale_no_attempt)) is False
 
 
 def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):
@@ -644,6 +713,7 @@ def test_reattach_passes_persisted_current_attempt(monkeypatch):
 
     def fake_poll_job(rh, **kw):
         captured.clear()
+        captured["handle"] = rh
         captured.update(kw)
         return base.PollResult(ok=True)
 
@@ -652,10 +722,17 @@ def test_reattach_passes_persisted_current_attempt(monkeypatch):
 
     handle = base.JobHandle(
         provider="runpod",
-        data={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "attempt": 2},
+        data={
+            "endpoint_id": "ep",
+            "endpoint_name": "n",
+            "job_id": "j",
+            "attempt": 2,
+            "started_ts": 12_345.0,
+        },
     )
     RunpodProvider().poll(handle, spec, 0)
     assert captured["current_attempt"] == 2
+    assert captured["handle"].started_ts == 12_345.0
 
     for raw_attempt in ("", "x", None):
         handle = base.JobHandle(
@@ -2313,6 +2390,66 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         assert resumed["called"] is True, "attach must attempt a checkpoint resume on any non-ok poll"
         assert st.state == "failed", "a resume that fails again must terminate the run"
         assert "bad reward fn" in (st.error or "")
+
+
+def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
+    # Codex: a recovered Vast run whose poll ended not-ok must CONFIRM the in-flight instance is gone
+    # before resuming. If destroy() raises (unconfirmed DELETE — the old worker may still be running and
+    # writing this run's HF artifacts), attach must NOT launch a second worker (double-bill + corrupt
+    # the shared DONE/metrics); it keeps the handle and leaves the run non-terminal so a later
+    # recovery/sweep reconciles. Mirrors the retry-loop MtzrH guard.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers as providers
+        import flash.providers.runpod.train as flash_train
+        from flash.providers.base import PollResult
+        from flash.providers.vast import api as vast_api
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="v1",
+                state="running",
+                spec=_spec("v1").to_dict(),
+                cost_usd=0.0,
+                remote={"provider": "vast", "instance_id": "iX", "seed": 0},
+            )
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        class _RaisingVast:
+            def poll(self, handle, spec, seed, *, log=None):
+                return PollResult(False, failure="stalled", detail="host vanished")
+
+            def destroy(self, handle):  # unconfirmed teardown -> attach must not resume over it
+                raise vast_api.VastApiError("destroy unconfirmed (success:false)")
+
+            def gc(self, spec):  # best-effort label reap
+                pass
+
+            def is_configured(self):  # available_providers() probes this in the terminal-GC finally
+                return False
+
+        real_get = providers.get_provider
+        monkeypatch.setattr(
+            providers,
+            "get_provider",
+            lambda name: _RaisingVast() if name == "vast" else real_get(name),
+        )
+
+        resumed = {"called": False}
+
+        def fake_loop(spec, log, *, prior_cost, runtime_secrets=None):
+            resumed["called"] = True
+
+        monkeypatch.setattr(orch, "_run_training", fake_loop)
+
+        st = orch.attach_run("v1", log_stream=sys.stderr)
+
+        assert resumed["called"] is False, "must NOT resume a second worker over a possibly-live box"
+        assert st.state == "running", "run left non-terminal for a later recovery/sweep"
+        remote = orch.get_status("v1").remote
+        assert remote is not None, "handle preserved"
+        assert remote.get("instance_id") == "iX", "handle preserved"
 
 
 def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):
