@@ -66,7 +66,7 @@ class VastProvider:
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
         import contextlib
 
-        from flash.providers.runpod.jobs import make_hf_heartbeat_reader
+        from flash.providers._hf_artifacts import make_hf_heartbeat_reader
         from flash.providers.vast.jobs import (
             PROVISION_GRACE_S,
             VastJobHandle,

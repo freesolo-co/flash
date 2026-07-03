@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 
 from flash._logging import get_logger
+from flash.providers._hf_artifacts import make_hf_heartbeat_reader, make_hf_text_reader
 from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
@@ -37,7 +38,6 @@ from flash.providers.lambdalabs.jobs.builders import (
     label_matches_run,
     run_label_prefix,
 )
-from flash.providers.runpod.jobs import make_hf_heartbeat_reader, make_hf_text_reader
 
 logger = get_logger(__name__)
 
@@ -350,7 +350,7 @@ def poll_lambda_job(
         return finish_ok(d if (d is not None and done_is_fresh(d)) else None)
 
     def fail_from_marker(marker: dict | None) -> PollResult:
-        from flash.providers.runpod.jobs import worker_flagged_retriable
+        from flash.providers._hf_artifacts import worker_flagged_retriable
 
         retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(heartbeat_reader)
         return PollResult(
@@ -427,7 +427,7 @@ def poll_lambda_job(
             # THIS attempt's error file present = deterministic crash (fail fast); absent = host loss
             # (retry). Attempt-scoped so a prior attempt's stale traceback can't force a false job_failed.
             # A retriable heartbeat keeps the path on job_preempted regardless.
-            from flash.providers.runpod.jobs import worker_flagged_retriable
+            from flash.providers._hf_artifacts import worker_flagged_retriable
 
             err_name = f"error_{spec.phase}_attempt{int(handle.attempt or 0)}.txt"
             err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)

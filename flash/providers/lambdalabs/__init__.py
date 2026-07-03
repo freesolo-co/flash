@@ -60,13 +60,13 @@ class LambdaProvider:
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
         import contextlib
 
+        from flash.providers._hf_artifacts import make_hf_heartbeat_reader
         from flash.providers.lambdalabs import api as lambda_api
         from flash.providers.lambdalabs.jobs import (
             PROVISION_GRACE_S,
             LambdaJobHandle,
             poll_lambda_job,
         )
-        from flash.providers.runpod.jobs import make_hf_heartbeat_reader
 
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}"

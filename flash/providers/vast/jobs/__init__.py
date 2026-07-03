@@ -26,6 +26,12 @@ import time
 from collections.abc import Callable
 
 from flash._logging import get_logger
+from flash.providers._hf_artifacts import (
+    heartbeat_is_stale_prior_attempt,
+    make_hf_heartbeat_reader,
+    make_hf_text_reader,
+    worker_flagged_retriable,
+)
 from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
@@ -42,12 +48,6 @@ from flash.providers.base import (
     UnreconciledCreateError,
     min_cuda_modern,
     vast_gpu_for_offer,
-)
-from flash.providers.runpod.jobs import (
-    heartbeat_is_stale_prior_attempt,
-    make_hf_heartbeat_reader,
-    make_hf_text_reader,
-    worker_flagged_retriable,
 )
 from flash.providers.vast import api as vast_api
 from flash.providers.vast.jobs.builders import (

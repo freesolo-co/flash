@@ -353,7 +353,7 @@ def test_heartbeat_is_stale_prior_attempt_trusts_explicit_attempt_over_clock():
     """Sibling of worker_flagged_retriable's gating: the explicit attempt field is definitive provenance.
     A MATCHING attempt is THIS attempt (never stale) even when a lagging worker-host clock puts ts before
     launch; a MISMATCH is a prior attempt; only with no attempt present do we date by ts."""
-    from flash.providers.runpod.jobs import heartbeat_is_stale_prior_attempt
+    from flash.providers._hf_artifacts import heartbeat_is_stale_prior_attempt
 
     def reader(hb):
         return lambda force=False: hb
