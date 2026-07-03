@@ -536,6 +536,39 @@ def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
     assert res.ok  # survived past LOAD_TIMEOUT_S because the fresh heartbeat disarmed the load timeout
 
 
+def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
+    # Cursor 3519197324: the load-timeout guard must run AFTER the heartbeat read, so the FIRST fresh
+    # heartbeat arriving on the very tick elapsed crosses LOAD_TIMEOUT_S disarms it. If the guard is
+    # ordered BEFORE the read (the incomplete 91daa363 fix), seen_fresh_hb is still False on that tick
+    # -> a healthy, heartbeating box is torn down as 'stalled'. The heartbeat is ABSENT until the
+    # crossing tick (unlike the sibling test, whose heartbeat is present from iteration 1 and so can't
+    # expose the ordering race).
+    clock = {"t": 10_000.0}
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "loading"}],  # never flips to running -> became_running False
+        done=lambda: "12000.0" if clock["t"] >= 12_000 else None,
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+    )
+    monkeypatch.setattr(vast.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(vast.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + 500.0))
+
+    def hb(force=False):
+        # First fresh heartbeat lands exactly on the timeout-crossing tick (elapsed 900s -> t=11_000).
+        if clock["t"] >= 11_000:
+            return {"stage": "sft_model_load", "step": 0, "ts": 11_000.0, "attempt": 0}
+        return None
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=10_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=hb,
+    )
+    assert res.ok  # disarmed on the crossing tick; the pre-read ordering would return 'stalled' here
+
+
 def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
     """Codex/Cursor: when the Vast status endpoint keeps raising and the poll-error budget is spent, the
     poller does a BOUNDED terminal DONE/marker read (same as the deadline / dead-host paths) BEFORE

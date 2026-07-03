@@ -679,19 +679,6 @@ def poll_vast_job(
                 ),
             )
 
-        # Load timeout: a box that never left loading/unknown within LOAD_TIMEOUT_S never started.
-        # But a fresh heartbeat PROVES the worker booted even while the detail API lags in
-        # loading/unknown (never flipping to 'running'), so it disarms this — else a healthy,
-        # heartbeating box is torn down at 15m on a lagging status feed. deadline_s (+ the finally
-        # destroy and periodic sweep) stays the ultimate spend backstop once this is disarmed.
-        if not became_running and not seen_fresh_hb and time.time() - start > LOAD_TIMEOUT_S:
-            return PollResult(
-                False,
-                failure="stalled",
-                detail=f"instance stuck in '{status}' for {int(time.time() - start)}s "
-                f"(never started; image pull / host issue)",
-            )
-
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
@@ -709,6 +696,23 @@ def poll_vast_job(
                     # keeps cold-start pings, incl. the silent step=0 first rollout, under setup grace).
                     if is_training_heartbeat(stage, new_key[1]):
                         seen_training_hb = True
+
+        # Load timeout: a box that never left loading/unknown within LOAD_TIMEOUT_S never started.
+        # But a fresh heartbeat PROVES the worker booted even while the detail API lags in
+        # loading/unknown (never flipping to 'running'), so it disarms this — else a healthy,
+        # heartbeating box is torn down at 15m on a lagging status feed. deadline_s (+ the finally
+        # destroy and periodic sweep) stays the ultimate spend backstop once this is disarmed.
+        # ORDER MATTERS: this runs AFTER the heartbeat read above, so THIS tick's first fresh heartbeat
+        # (which sets seen_fresh_hb) disarms the timeout on the very iteration it arrives — a heartbeat
+        # landing exactly at the 15m mark must not be raced by a stale seen_fresh_hb from the prior tick.
+        if not became_running and not seen_fresh_hb and time.time() - start > LOAD_TIMEOUT_S:
+            return PollResult(
+                False,
+                failure="stalled",
+                detail=f"instance stuck in '{status}' for {int(time.time() - start)}s "
+                f"(never started; image pull / host issue)",
+            )
+
         if became_running:
             # Fast-failover: a box that reached 'running' but emitted NO heartbeat past first_liveness_s
             # might be wedged -> 'stalled'. But a healthy slow cold start (pip install / code fetch) also
