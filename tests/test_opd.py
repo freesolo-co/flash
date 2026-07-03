@@ -132,6 +132,17 @@ def test_trim_trailing_stop_drops_delimiter_from_ids_and_text():
     assert _trim_trailing_stop(_Tok(), [1, 2, 3], "Ans", ["</answer>"]) == ([1, 2, 3], "Ans")
 
 
+def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
+    # OPD generates on-policy (loss forward runs model(prompt+completion)), so allocator sizing must
+    # use the prompt+completion budget, not the SFT 1024 default — else a raised max_tokens OOMs an
+    # under-sized GPU.
+    from flash.engine.vram import opd_rollout_seq_len
+
+    assert opd_rollout_seq_len(0, None, False) == 1536  # 1024 prompt + 512 completion default
+    assert opd_rollout_seq_len(0, 8192, False) == 9216  # raised max_tokens sizes up (was 1024)
+    assert opd_rollout_seq_len(4096, 8192, False) == 4096  # explicit max_length pins the sequence
+
+
 def test_opd_rejects_unpriced_teacher_model_but_accepts_priced():
     from flash.schema import ConfigError, spec_from_dict
 

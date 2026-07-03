@@ -258,7 +258,6 @@ def run_opd():
         )
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
-    examples = train
     # Seed torch/CUDA too (not just the Python shuffle RNG): the student samples via
     # model.generate(do_sample=True), so the fixed Flash seed must reproduce the same completions
     # (and therefore the same trained adapter) run-to-run.
@@ -295,11 +294,16 @@ def run_opd():
         )
         return tok(text, add_special_tokens=False).input_ids
 
-    # Fail fast (like GRPO's dataset pre-filter) if NOT ONE prompt fits the budget — otherwise every
-    # step would drop all its prompts and the run would burn its whole GPU allocation before the
-    # end-of-run no-signal guard. `any` early-exits at the first fitting example, so a normal dataset
-    # pays a single tokenize; only the all-over-budget failure case scans the whole set (then raises).
-    if not any(len(_render_prompt_ids(env.prompt_messages(ex))) <= prompt_budget for ex in examples):
+    # Build the on-policy pool from ONLY the prompts that fit the budget (GRPO-style pre-filter). The
+    # step loop visits a deterministic examples[(step*ppl_step+i) % len] slice, so a whole-dataset
+    # `any(fits)` precheck could pass while every prompt in the visited slice is over-budget and
+    # dropped — burning the GPU allocation with no trained step. Filtering the pool here guarantees
+    # every visited prompt fits. One tokenize per prompt, once, at startup.
+    examples = [
+        ex for ex in train if len(_render_prompt_ids(env.prompt_messages(ex))) <= prompt_budget
+    ]
+    n_over_budget = len(train) - len(examples)
+    if not examples:
         raise RuntimeError(
             f"opd: every prompt exceeds the {prompt_budget}-token budget "
             f"(max_length={knobs['max_length'] or 'unset'}, "
@@ -307,6 +311,9 @@ def run_opd():
             "prompts — failing before the training loop instead of dropping every prompt for "
             "every step and burning the GPU allocation."
         )
+    if n_over_budget:
+        print(f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
+              f"{prompt_budget}-token budget; pool = {len(examples)}")
 
     resume_ckpt = _w.hf_resume_checkpoint()
     if resume_ckpt:
@@ -378,6 +385,11 @@ def run_opd():
                     generated_tokens += _train_one.last_gen_tokens
                     teacher_input_tokens += _train_one.last_teacher_tokens
                     nseq += 1
+                    # Non-liveness progress ping WITHIN the step: the pollers ignore liveness
+                    # heartbeats, so a long teacher-bound step (serial scoring of a large
+                    # batch/group, or slow/retrying Fireworks) would otherwise trip the training
+                    # stall window. The opd_step throttle bounds the actual HF upload rate.
+                    _w.heartbeat("opd_step", step=step + 1, samples_done=nseq)
             if nseq == 0:
                 print(f"[opd] step {step}: no usable teacher signal this step (skipped)")
                 continue
@@ -408,9 +420,12 @@ def run_opd():
                     f"[opd] step {step + 1}/{steps} loss={avg_loss:.4f} "
                     f"coverage={avg_cov:.0%} seqs={nseq}"
                 )
-            if knobs["save_every"] and (step + 1) % knobs["save_every"] == 0:
+            # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
+            # contain N real updates (skipped no-signal iterations don't advance opt_steps), else a
+            # warm-start/deploy from step-N would use fewer updates than its name implies.
+            if knobs["save_every"] and opt_steps % knobs["save_every"] == 0:
                 _save_adapter(model, tok, adapter_dir)
-                _w.publish_deployable_checkpoint(adapter_dir, step + 1)
+                _w.publish_deployable_checkpoint(adapter_dir, opt_steps)
 
     train_wall = time.time() - t_train
     if not loss_curve:
@@ -422,7 +437,8 @@ def run_opd():
 
     _save_adapter(model, tok, adapter_dir)
     _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-    _w.publish_deployable_checkpoint(adapter_dir, steps)
+    # Name the final checkpoint by real optimizer steps applied, not the planned `steps` count.
+    _w.publish_deployable_checkpoint(adapter_dir, opt_steps)
     _w.heartbeat("opd_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     _w.write_train_meta(

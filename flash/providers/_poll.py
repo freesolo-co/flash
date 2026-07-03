@@ -231,6 +231,12 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "rl_train_start",
         "sft_initializing",
         "rl_initializing",
+        # OPD cold-start stages (emitted before the first opd_step): wait-for-GPU, model load, and
+        # LoRA/warm-start init. Without these a slow OPD cold start is judged by the tight training
+        # stall window and retried as "stalled" instead of getting the setup grace.
+        "opd_start",
+        "opd_model_load",
+        "opd_initializing",
     }
 )
 

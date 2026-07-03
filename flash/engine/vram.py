@@ -70,6 +70,24 @@ def grpo_rollout_seq_len(
     return int(max_length or max(1024, rl.max_prompt_len + completion))
 
 
+def opd_rollout_seq_len(
+    max_length: int = 0,
+    max_tokens: int | None = None,
+    thinking: bool = False,
+) -> int:
+    """Sequence length an OPD run uses, mirroring run_opd()'s ``seq_cap``: the loss forward runs
+    ``model(prompt_ids + student_ids)`` over prompt+completion, so size for both — else a raised
+    ``max_tokens`` (unset ``max_length``) is sized as an SFT 1024-token job and OOMs on an
+    under-sized GPU."""
+    from flash.engine.recipe import RECIPE
+
+    opd = RECIPE.opd
+    completion = int(
+        max_tokens or (opd.max_completion_len_thinking if thinking else opd.max_completion_len)
+    )
+    return int(max_length or max(1024, opd.max_prompt_len + completion))
+
+
 def _resident_kv_gb(
     params_b: float | None, vllm_max_len: int, num_generations: int = 8, fp8_kv: bool = False
 ) -> float:
@@ -451,11 +469,15 @@ def model_required_vram_gb(
             return default
 
     max_tokens = _pos_int(_g(train, "max_tokens"), None)
-    if (algorithm or "").lower() in ("grpo", "rl"):
-        _grpo_default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
+    _algo = (algorithm or "").lower()
+    if _algo in ("grpo", "rl"):
+        _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
+    elif _algo == "opd":
+        # OPD generates on-policy like GRPO, so size for prompt+completion, not the SFT 1024 default.
+        _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
-        _grpo_default_len = 1024
-    seq_len = _pos_int(_g(train, "max_length"), _grpo_default_len)
+        _default_len = 1024
+    seq_len = _pos_int(_g(train, "max_length"), _default_len)
     lora_rank = _pos_int(_g(train, "lora_rank"), 32)
     group_size = _pos_int(_g(train, "group_size"), 8)
     batch_size = _pos_int(_g(train, "batch_size"), _sft_per_device_bs())
