@@ -145,24 +145,34 @@ def _trim_trailing_stop(tok, completion_ids, completion_text: str, stops):
     to stop at. Trimming both sides keeps ids and text consistent (no gkd_loss / token-count desync,
     the failure mode of a text-only trim). Returns ``(ids, text)`` (a list + str)."""
     ids = [int(t) for t in completion_ids]
-    for stop in stops:
-        if stop and completion_text.endswith(stop):
-            keep_len = len(completion_text) - len(stop)
-            kept = 0
-            for i in range(len(ids)):
-                if len(tok.decode(ids[: i + 1], skip_special_tokens=True)) > keep_len:
-                    break
-                kept = i + 1
-            # Trim the TEXT to exactly what the kept ids decode to — NOT completion_text[:keep_len].
-            # When the stop starts INSIDE the final sampled token (that token decodes to e.g.
-            # "B</answer>" while the stop is "</answer>"), that whole token is excluded from `kept`, so
-            # slicing the raw text at keep_len would keep a "B" the kept ids can no longer represent —
-            # desyncing the teacher-scored text from the student ids (gkd_loss / token-count skew).
-            # Decoding the kept ids keeps both sides identical (drops the fused char, never distils the
-            # delimiter); in the common case (the stop is its own clean token) it equals
-            # completion_text[:keep_len].
-            return ids[:kept], tok.decode(ids[:kept], skip_special_tokens=True)
-    return ids, completion_text
+    # Pick the LONGEST configured stop that is a trailing match (the earliest stop boundary in the
+    # text). Overlapping delimiters like ["\n", "\n\n"] would otherwise trim only the first-listed
+    # shorter suffix off a "\n\n" tail, leaving one newline for the teacher to score/distil; taking
+    # the longest match removes the whole delimiter in one shot regardless of config order.
+    stop = max(
+        (s for s in stops if s and completion_text.endswith(s)),
+        key=len,
+        default="",
+    )
+    if not stop:
+        return ids, completion_text
+    keep_len = len(completion_text) - len(stop)
+    # Locate the kept prefix by scanning from the END: the delimiter is short, so only a handful of
+    # trailing tokens are dropped -> O(dropped * completion) work. Decoding growing prefixes from the
+    # START (ids[:1], ids[:2], ...) instead is O(completion^2) and can dominate CPU ahead of teacher
+    # scoring on long completions once [train].max_tokens is raised.
+    kept = len(ids)
+    while kept > 0 and len(tok.decode(ids[:kept], skip_special_tokens=True)) > keep_len:
+        kept -= 1
+    # Trim the TEXT to exactly what the kept ids decode to — NOT completion_text[:keep_len].
+    # When the stop starts INSIDE the final sampled token (that token decodes to e.g.
+    # "B</answer>" while the stop is "</answer>"), that whole token is excluded from `kept`, so
+    # slicing the raw text at keep_len would keep a "B" the kept ids can no longer represent —
+    # desyncing the teacher-scored text from the student ids (gkd_loss / token-count skew).
+    # Decoding the kept ids keeps both sides identical (drops the fused char, never distils the
+    # delimiter); in the common case (the stop is its own clean token) it equals
+    # completion_text[:keep_len].
+    return ids[:kept], tok.decode(ids[:kept], skip_special_tokens=True)
 
 
 def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):

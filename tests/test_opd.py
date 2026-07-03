@@ -237,6 +237,55 @@ def test_trim_trailing_stop_keeps_ids_and_text_synced_when_stop_starts_inside_to
     assert text == _Tok().decode(ids)
 
 
+def test_trim_trailing_stop_prefers_longest_overlapping_stop():
+    r"""Regression (codex[bot], opd.py:150): with overlapping delimiters like ["\n", "\n\n"] listed
+    shortest-first, a "\n\n" tail must have BOTH newlines trimmed (the longest/earliest matching stop),
+    not just the first-listed "\n" — otherwise the teacher still scores a leftover delimiter newline."""
+    from flash.engine.worker.opd import _trim_trailing_stop
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            m = {1: "h", 2: "i", 3: "\n", 4: "\n"}
+            return "".join(m[int(i)] for i in ids)
+
+    # completion "hi\n\n"; stops list the SHORTER "\n" first. Longest match "\n\n" -> keep "hi".
+    ids, text = _trim_trailing_stop(_Tok(), [1, 2, 3, 4], "hi\n\n", ["\n", "\n\n"])
+    assert text == "hi"  # both newlines gone, not just the first-listed one
+    assert ids == [1, 2]
+    # order-independent: same result when the longer stop is listed first
+    assert _trim_trailing_stop(_Tok(), [1, 2, 3, 4], "hi\n\n", ["\n\n", "\n"]) == ([1, 2], "hi")
+
+
+def test_trim_trailing_stop_scans_from_end_not_quadratically():
+    """Regression (codex[bot], opd.py:153): trimming the stop must scan from the END (a few decodes of
+    the dropped tail), not decode every growing prefix ids[:1..n] — which was O(completion^2) and could
+    dominate CPU before teacher scoring once [train].max_tokens is raised. Assert decode is called only
+    a bounded number of times, independent of completion length."""
+    from flash.engine.worker.opd import _trim_trailing_stop
+
+    class _Tok:
+        def __init__(self):
+            self.calls = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            self.calls += 1
+            return "".join("abcdefghij"[int(x) % 10] for x in ids)  # 1 char/id, no split chars
+
+    n = 500
+    ids = list(range(n))
+    text = "".join("abcdefghij"[i % 10] for i in ids)
+    tok = _Tok()
+    stop = text[-3:]  # a 3-char trailing delimiter (3 clean tokens)
+    out_ids, out_text = _trim_trailing_stop(tok, ids, text, [stop])
+    assert out_ids == ids[: n - 3]
+    assert out_text == text[: n - 3]
+    # ~4-5 decodes (drop 3 tail tokens + the satisfying check + the final return), NOT ~n. The old
+    # forward loop decoded a growing prefix per token -> ~n calls.
+    assert tok.calls <= 10, (
+        f"decode called {tok.calls}x on a {n}-token completion -> quadratic trim"
+    )
+
+
 def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     # OPD generates on-policy (loss forward runs model(prompt+completion)), so allocator sizing must
     # use the prompt+completion budget, not the SFT 1024 default — else a raised max_tokens OOMs an
