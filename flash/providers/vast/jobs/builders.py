@@ -1,16 +1,12 @@
 """Pure, monkeypatch-free building blocks for the Vast.ai run lifecycle.
 
-The Vast-specific leaf of ``flash.providers.vast.jobs``: the normalized dataclasses
-(``VastOffer``, ``VastJobHandle``), the image accessor, and the container ``onstart`` script.
-The cross-provider pieces — the run-derived sweep label and the bootstrap payload — come from the
-shared ``flash.providers._instance`` so Vast stays byte-identical to Lambda on the parts that are
-substrate-neutral (the worker payload, the marker name, the label format the orphan sweep keys on).
+The normalized dataclasses (``VastOffer``, ``VastJobHandle``), the image accessor, and the container
+``onstart`` script. Cross-provider pieces (the sweep label, the bootstrap payload) come from the
+shared ``flash.providers._instance`` so Vast stays byte-identical to Lambda on substrate-neutral
+parts. Vast rents a CONTAINER directly (image + args), not a VM you cloud-init, so there is no
+``build_user_data``/``docker run`` — ``build_onstart`` runs the shared bootstrap as the container command.
 
-What is genuinely Vast-specific lives here: Vast rents a CONTAINER directly (image + args), not a VM
-you cloud-init, so there is no ``build_user_data``/``docker run`` — the worker image IS the rented
-container and ``build_onstart`` runs the shared bootstrap as the container's command.
-
-This module MUST NOT import the ``jobs`` package ``__init__`` (it is imported BY it).
+MUST NOT import the ``jobs`` package ``__init__`` (it is imported BY it).
 """
 
 from __future__ import annotations
@@ -44,8 +40,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class VastOffer:
-    """A normalized, fully-vetted offer (passed every ``usable_offers`` filter) — the Vast analog of
-    a vetted Lambda (region, instance_type) candidate."""
+    """A normalized, fully-vetted offer (passed every ``usable_offers`` filter)."""
 
     offer_id: int
     machine_id: int
@@ -87,10 +82,9 @@ class VastJobHandle:
 
     @classmethod
     def from_dict(cls, d: dict) -> VastJobHandle:
-        # instance_id IDENTIFIES the box (the poll/destroy target), so unlike the other fields it has no
-        # safe default — a 0/None would point teardown at a non-existent instance. But a corrupt/partial
-        # PERSISTED handle (reattach/recovery deserializes from disk) must fail with a CLEAR, actionable
-        # error, not a bare KeyError/ValueError that obscures the cause (Copilot MuX0a).
+        # instance_id identifies the box (poll/destroy target), so unlike the other fields it has no safe
+        # default — a 0/None would point teardown at a non-existent instance. A corrupt/partial persisted
+        # handle must fail with a clear, actionable error, not a bare KeyError/ValueError.
         try:
             instance_id = int(d["instance_id"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -111,13 +105,11 @@ class VastJobHandle:
 
 
 def vast_image(gpu: str | None = None) -> str:
-    """Docker image for the rented container: the prebuilt, PUBLIC worker image (the byte-identical
-    training stack RunPod bakes). Routed through ``worker_image_for_gpu`` so the SAME operator
-    overrides RunPod/Lambda honor apply to Vast too — ``FLASH_WORKER_IMAGE`` (hotfix), and the per-SM
-    kernel-cache image via ``FLASH_WORKER_IMAGE_PER_SM`` / ``FLASH_WORKER_IMAGE_TEMPLATE`` (Vast runs
-    the worker via its own onstart, so the image's CMD is irrelevant — only the baked deps/cache
-    matter, exactly what the per-SM image carries). The Blackwell driver floor lives in the
-    ``cuda_max_good`` offer filter, not the image."""
+    """Docker image for the rented container: the prebuilt PUBLIC worker image, routed through
+    ``worker_image_for_gpu`` so the same operator overrides RunPod/Lambda honor apply to Vast too
+    (``FLASH_WORKER_IMAGE`` and the per-SM kernel-cache image). Vast runs the worker via its own onstart,
+    so the image's CMD is irrelevant — only the baked deps/cache matter. The Blackwell driver floor lives
+    in the ``cuda_max_good`` offer filter, not the image."""
     from flash.providers.runpod.train.deps import WORKER_IMAGE, worker_image_for_gpu
 
     return worker_image_for_gpu(gpu) or WORKER_IMAGE
@@ -146,30 +138,26 @@ def build_payload(
 
 
 def build_onstart(payload: dict) -> str:
-    """The rented container's command: ship the payload + the shared instance bootstrap as quoted
-    heredocs and run it, then self-destroy.
+    """The rented container's command: ship the payload + shared instance bootstrap as quoted heredocs,
+    run it, then self-destroy.
 
-    Vast runs this with ``runtype="args"`` (``bash -c <onstart>``), so the script IS the container
-    command — the container's lifecycle is the job's lifecycle and no SSH key is needed on the
-    account. Everything dynamic travels base64-encoded inside the script (never interpolated into
-    shell syntax), so the job-spec JSON survives byte-exact. The full training stack is baked into the
-    worker image, so there is no base-stack install here — only the shared bootstrap (which installs
-    the per-run ``extra_pip``, fetches the flash code from HF, runs the worker, and uploads the
-    ``vast_attempt<N>.json`` marker the poller keys on).
-
-    The bootstrap source is the SHARED ``_instance_bootstrap.py`` (the same module Lambda's
-    cloud-init runs inside its container), so the in-container behavior is identical across substrates.
+    Vast runs this with ``runtype="args"`` (``bash -c <onstart>``), so the script IS the container command
+    and no SSH key is needed on the account. Everything dynamic travels base64-encoded (never interpolated
+    into shell syntax), so the job-spec JSON survives byte-exact. The training stack is baked into the
+    worker image, so only the shared bootstrap runs here — installs the per-run ``extra_pip``, fetches the
+    flash code from HF, runs the worker, uploads the ``vast_attempt<N>.json`` marker the poller keys on. The
+    bootstrap is the SHARED ``_instance_bootstrap.py`` Lambda also runs, so in-container behavior is
+    identical across substrates.
     """
-    # Spill a large job spec to HF first (same as Lambda's build_user_data): a big inline spec would
-    # balloon the base64 payload and can blow Vast's exec-arg / onstart length limit, failing the rent
-    # before any handle is persisted. Idempotent — a small (or already-spilled) payload rides inline.
+    # Spill a large job spec to HF first (like Lambda's build_user_data): a big inline spec balloons the
+    # base64 payload and can blow Vast's onstart length limit, failing the rent. Idempotent.
     payload = _spill_large_spec_to_hf(payload)
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     # Ship the SHARED instance bootstrap (sibling of the vast package's parent: providers/_instance_bootstrap.py).
     bootstrap_src = (Path(__file__).parent.parent.parent / "_instance_bootstrap.py").read_text()
-    # Verified live: Vast's args-mode wrapper resets PATH, so `python3` can resolve to the OS python
-    # (Ubuntu = PEP 668 externally-managed), not the image's stack python. Prefer the image's baked
-    # interpreter (conda / /usr/local) where torch + huggingface_hub live; fall back to python3.
+    # Vast's args-mode wrapper resets PATH, so `python3` can resolve to the OS python (PEP 668
+    # externally-managed), not the image's stack python. Prefer the image's baked interpreter
+    # (conda / /usr/local) where torch + huggingface_hub live; fall back to python3.
     return f"""#!/bin/bash
 # Flash vast worker (generated by flash.providers.vast.jobs.build_onstart; arm={payload.get("flash_arm")})
 set -x

@@ -156,8 +156,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             # breakdown — a real 404 is now treated as confirmed-gone). The poll loop's own finally
             # already best-effort-destroyed the box; re-confirm here. On an unconfirmed result, GC by
             # label (run-scoped, not orphan-sweep-shielded) and BAIL with the handle intact + the run
-            # left non-terminal, so a later recovery/sweep reconciles instead of racing a live box
-            # (Codex; mirrors the retry-loop MtzrH guard).
+            # left non-terminal, so a later recovery/sweep reconciles instead of racing a live box.
             from flash.providers import INSTANCE_PROVIDERS
 
             teardown_confirmed = True

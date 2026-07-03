@@ -1,16 +1,8 @@
-"""Vast.ai provider: verified-datacenter single-GPU CONTAINERS (REST only).
+"""Vast.ai provider: verified-datacenter single-GPU containers (REST only).
 
-Vast rents a single-GPU container from a verified-datacenter offer (the prebuilt ``WORKER_IMAGE`` IS
-the container), ships the shared instance bootstrap as the container command, and detects completion
-purely from the worker's HF artifacts (no inbound network, no serverless queue, no VM to cloud-init —
-unlike Lambda). It implements the SAME ``base.Provider`` interface as RunPod/Lambda, so the
-orchestrator/allocator treat them interchangeably.
-
-Vast is the live-market instance complement: like Lambda it is opt-in (available only when
-``VAST_API_KEY`` is set), and it is capacity-aware (the allocator offers a class only when the
-verified-datacenter market actually has a fitting offer right now).
-
-``PROVIDER`` is the ``base.Provider`` implementation the registry hands out.
+Opt-in live-market substrate (available only when ``VAST_API_KEY`` is set); detects completion
+from the worker's HF artifacts. Implements the shared ``base.Provider`` interface, so the
+allocator treats it interchangeably with RunPod/Lambda.
 """
 
 from __future__ import annotations
@@ -29,9 +21,6 @@ class VastProvider:
     def is_configured(self) -> bool:
         from flash.providers.vast.auth import load_api_key
 
-        # Opt-in live-market substrate: available only when its operator key is present. Without
-        # VAST_API_KEY (tests / CI / RunPod-only operators) allocation degrades deterministically to
-        # the other providers.
         return load_api_key() is not None
 
     def preflight(self, require_hf: bool = True) -> list[str]:
@@ -61,8 +50,7 @@ class VastProvider:
         on_last_gpu: bool = False,
         code_prefix: str | None = None,
     ) -> PollResult:
-        # ``on_last_gpu`` is accepted for the shared Provider interface (RunPod stretches its grace on
-        # the last GPU); the instance providers use a UNIFORM per-GPU wait, so it is intentionally unused.
+        # ``on_last_gpu`` is unused: the instance providers use a uniform per-GPU wait (kept for interface parity).
         from flash.providers.vast.jobs import submit_run_vast
 
         return submit_run_vast(
@@ -91,9 +79,7 @@ class VastProvider:
         vh = VastJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: vast instance={vh.instance_id}", file=log, flush=True)
-        # The wall-cap deadline counts from the instance's LAUNCH, not this reattach (Vast has no
-        # server-side execution timeout, so resetting on every recovery would extend the billable
-        # window unbounded). poll_vast_job anchors its deadline check to handle.started_ts.
+        # Deadline is launch-relative (anchored to handle.started_ts), not reattach-relative: resetting on recovery would extend the billable window unbounded.
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
         try:
             return poll_vast_job(
@@ -105,19 +91,14 @@ class VastProvider:
                 deadline_s=deadline,
             )
         finally:
-            # Recovery (attach_run) has no submit_run_vast teardown ``finally``; destroy the reattached
-            # instance here so a finished/abandoned recovered run stops billing immediately. Best-effort
-            # (warns on an unconfirmed teardown so a leak is visible now, not just at the next sweep).
+            # attach_run has no submit_run_vast teardown; destroy the reattached instance here so a recovered run stops billing.
             from flash.providers.vast.jobs import _best_effort_destroy, destroy_run_instances
 
             with contextlib.suppress(Exception):
                 if not _best_effort_destroy(vh.instance_id, context="poll recovery teardown"):
-                    # Unconfirmed single-instance teardown on a recovered run: while the run stays
-                    # ``running`` the active-run orphan sweep SHIELDS its label, so an attach that clears
-                    # ``remote`` and resumes from checkpoint on a fresh box could leave this box billing
-                    # unreaped with no persisted handle. Escalate to a run-scoped reap by label
-                    # (destroy_run_instances re-lists + retries and is NOT active-shielded), mirroring the
-                    # submit_run_vast teardown finally (Cursor).
+                    # Unconfirmed teardown: the active-run sweep shields this label, so escalate to a
+                    # run-scoped reap by label (re-lists + retries, not active-shielded), mirroring the
+                    # submit_run_vast teardown finally.
                     destroy_run_instances(spec.run_id)
 
     def cancel(self, handle: JobHandle) -> None:
@@ -133,16 +114,10 @@ class VastProvider:
         iid = d.get("instance_id")
         if not iid:
             return
-        # ``destroy_instance`` returns False on a ``success: false`` / network breakdown — the box is
-        # STILL billable. Dropping that bool (the prior behavior) let the best-effort callers log
-        # "terminated …" and clear the handle while the instance kept billing, leaving only the slow
-        # ``sweep_orphans`` backstop to notice. Surface it: warn here, then raise so the caller does not
-        # record a FALSE success (the deploy/cancel callers catch it and still run their endpoint GC /
-        # later sweep; a future non-suppressing caller sees the real failure instead of a clean return).
-        # Pass ``iid`` THROUGH unconverted: ``destroy_instance`` does the ``int()`` inside its own
-        # try/except (-> False on a corrupt/non-numeric id), so an ``int(iid)`` HERE would raise
-        # ValueError/TypeError and break the retry teardown instead of surfacing as the False -> raise
-        # VastApiError path (Copilot Mtugr; mirrors the _best_effort_destroy fix).
+        # ``destroy_instance`` returns False on ``success:false`` / breakdown — the box is STILL billable.
+        # Warn + raise instead of recording a false success (best-effort callers catch it and fall back to
+        # sweep_orphans). Pass ``iid`` through unconverted: destroy_instance does the ``int()`` internally,
+        # so converting here would raise instead of surfacing the False -> raise path.
         if not vast_api.destroy_instance(iid):
             get_logger(__name__).warning(
                 "vast destroy_instance(%s) returned unconfirmed (success:false / breakdown); "
@@ -159,11 +134,10 @@ class VastProvider:
         destroy_run_instances(spec.run_id)
 
     def run_instances_remaining(self, run_id: str) -> list[int]:
-        """Instance ids still carrying ``run_id``'s label (after any ``gc``). Empty == CONFIRMED clear;
+        """Instance ids still carrying ``run_id``'s label after ``gc``. Empty == confirmed clear;
         non-empty == a possibly-live instance survives. RAISES on a listing failure so the caller can't
-        mistake "couldn't list" for "clear". Lets the handle-less recovery resubmit verify a CONFIRMED
-        reap before launching a second worker, since ``gc``/``destroy_run_instances`` returns an empty
-        list (not an error) on an unconfirmed DELETE."""
+        mistake "couldn't list" for "clear" (``gc`` returns an empty list, not an error, on an
+        unconfirmed DELETE)."""
         from flash.providers.vast.jobs import run_instances_remaining
 
         return run_instances_remaining(run_id)

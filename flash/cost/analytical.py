@@ -154,15 +154,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     """Deterministic pre-flight cost calculation."""
     # Billing cap: mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
-    # Vast MARKET duration filter: query offers that outlast the run so a long-run quote isn't set (or
-    # its class chosen) by a short-lived offer the launch-time filter rejects (Codex MtzrI) — but it
-    # must use the SAME duration semantics ``usable_offers`` applies at LAUNCH, NOT the 60s-floored
-    # billing cap_s (Cursor MuXiS): launch passes ``spec.gpu.max_wall_seconds or 0.0`` and treats a
-    # NON-POSITIVE wall as "no duration filter" (and floors a positive one at 60s itself). So an
-    # explicit 0/negative wall must price with NO filter, not the 60s one the run never uses.
-    #   None  -> the 24h spec default the run actually runs under (== DEFAULT_WALL_CAP_S);
-    #   > 0   -> that wall (usable_offers floors it at 60s);
-    #   <= 0  -> 0.0 (no duration filter, exactly like launch).
+    # Vast market duration filter: price against offers that outlast the run, using the SAME semantics
+    # ``usable_offers`` applies at LAUNCH (not the 60s-floored billing cap_s) — a non-positive wall means
+    # NO filter, a positive one is floored at 60s by usable_offers itself:
+    #   None -> the 24h spec default the run runs under (== DEFAULT_WALL_CAP_S);
+    #   > 0  -> that wall;   <= 0 -> 0.0 (no filter, exactly like launch).
     if config.max_wall_seconds is None:
         market_wall_s = wall_cap_s
     elif config.max_wall_seconds > 0:

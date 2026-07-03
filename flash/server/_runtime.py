@@ -134,9 +134,9 @@ def _confirm_run_clear(spec) -> bool:
     today) is NOT a "can't confirm -> False" case: it has no standing-billing label to enumerate, so it
     is skipped and the run stays eligible to resubmit on the other providers' verdicts. This guard is
     therefore scoped to instance providers that DO expose the capability (Vast); only a provider that
-    HAS the method and can't return a clean ``[]`` blocks the resubmit (Copilot).
+    HAS the method and can't return a clean ``[]`` blocks the resubmit.
 
-    BILLING-SAFETY (Codex): a provider that COULD have owned this run's lost create but is now
+    BILLING-SAFETY: a provider that COULD have owned this run's lost create but is now
     UNCONFIGURABLE must also block the resubmit. A handle-less run's pre-handle non-idempotent create
     (Vast's ``PUT /asks``) may have left a phantom; if ``VAST_API_KEY`` was dropped before this restart,
     ``configured_providers()`` omits Vast, so iterating only the configured set returns "clear" and lets
@@ -204,7 +204,7 @@ def _start_resubmit(spec) -> None:
 def _deferred_resubmit_loop(spec) -> None:
     """Background retry for a DEFERRED handle-less resubmit: re-confirm the reap on a bounded schedule
     and resubmit once it's clear, so a transient Vast listing failure / a phantom reaped by a later
-    sweep doesn't leave the run stranded until the next control-plane restart (Codex)."""
+    sweep doesn't leave the run stranded until the next control-plane restart."""
     import time
 
     from flash.runner import TERMINAL_STATES
@@ -424,7 +424,7 @@ def recover_runs() -> None:
             continue
         # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer, and
         # schedule a bounded background retry so the run resubmits as soon as the phantom is gone / the
-        # listing recovers — rather than stranding it until the next control-plane restart (Codex).
+        # listing recovers — rather than stranding it until the next control-plane restart.
         _log.warning(
             "deferring resubmit of %s: instance teardown unconfirmed; scheduling background retry",
             spec.run_id,

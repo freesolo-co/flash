@@ -1,10 +1,7 @@
 """Vast.ai credential handling (operator-side), mirroring the RunPod auth module.
 
-The Vast REST client authenticates via the ``VAST_API_KEY`` environment variable, set
-by the **operator** on the control-plane host. Env-only by
-design, exactly like ``RUNPOD_API_KEY``: it is never written to config files or shipped
-to workers (the instance self-destroy backstop uses the Vast-injected, instance-scoped
-``CONTAINER_API_KEY`` instead).
+``VAST_API_KEY`` is env-only and set by the operator on the control-plane host; it is never
+shipped to workers (the instance self-destroy backstop uses the injected ``CONTAINER_API_KEY``).
 """
 
 from __future__ import annotations

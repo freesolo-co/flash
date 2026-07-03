@@ -1,10 +1,7 @@
-"""Vast's GPU classes + the offer->class mapping.
+"""Vast's GPU classes (every class with a ``vast_name``).
 
-The class table is provider-agnostic and lives in ``providers/base.py``. This module
-carves out Vast's rows (``gpu_classes()`` == every class with a ``vast_name`` — currently
-RTX 4090 / RTX 5090 / A100 PCIe / A100 SXM 40GB / A100 SXM 80GB / H100). The
-offer->class mapping (``vast_gpu_for_offer``) lives in ``providers/base.py`` and the job
-path imports it from there directly.
+The class table is provider-agnostic (``providers/base.py``); the offer->class mapping
+(``vast_gpu_for_offer``) also lives there and the job path imports it directly.
 """
 
 from __future__ import annotations
