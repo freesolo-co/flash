@@ -56,6 +56,7 @@ from flash.providers.vast.jobs.builders import (
     build_onstart,
     build_payload,
     instance_label,
+    label_matches_run,
     run_label_prefix,
     vast_image,
 )
@@ -847,13 +848,8 @@ def destroy_run_instances(run_id: str) -> list[int]:
     for inst in instances:
         iid = _coerce_instance_id(inst.get("id"))  # skip a non-intable id, don't abort the loop
         label = str(inst.get("label") or "")
-        # Match on the label boundary (equal, or followed by the ``-s`` seed boundary), not a raw prefix,
-        # so ``flash-100`` can't also destroy ``flash-1000``.
-        if (
-            iid
-            and (label == prefix or label.startswith(prefix + "-s"))
-            and vast_api.destroy_instance(iid)
-        ):
+        # Match on the label boundary (not a raw prefix) so ``flash-100`` can't also destroy ``flash-1000``.
+        if iid and label_matches_run(label, prefix) and vast_api.destroy_instance(iid):
             destroyed.append(iid)
     return destroyed
 
@@ -876,7 +872,7 @@ def run_instances_remaining(run_id: str) -> list[int]:
     remaining: list[int] = []
     for inst in instances:
         label = str(inst.get("label") or "")
-        if not (label == prefix or label.startswith(prefix + "-s")):
+        if not label_matches_run(label, prefix):
             continue
         iid = _coerce_instance_id(inst.get("id"))
         if iid is None:
@@ -925,9 +921,7 @@ def sweep_orphans(
     )
 
     def _matches(prefixes: set[str], label: str) -> bool:
-        # Name-boundary match (EQUAL or followed by the ``-s`` seed boundary) so ``flash-100`` can't
-        # shield/claim ``flash-1000-...`` (or vice versa).
-        return any(label == p or label.startswith(p + "-s") for p in prefixes)
+        return any(label_matches_run(label, p) for p in prefixes)
 
     destroyed: list[int] = []
     for inst in instances:

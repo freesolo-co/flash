@@ -19,6 +19,7 @@ from pathlib import Path
 from flash.providers._instance import (
     _spill_large_spec_to_hf,
     instance_label,
+    label_matches_run,
     run_label_prefix,
 )
 
@@ -33,6 +34,7 @@ __all__ = [
     "build_onstart",
     "build_payload",
     "instance_label",
+    "label_matches_run",
     "run_label_prefix",
     "vast_image",
 ]
