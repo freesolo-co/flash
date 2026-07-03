@@ -51,9 +51,9 @@ def gpu_hourly_usd(
         raise KeyError(f"unknown GPU class {name!r}")
     p = (provider or "").strip().lower()
     if p == "lambda" and info.lambda_name:
-        from flash.providers.lambdalabs.pricing import hourly_rate
+        from flash.providers import get_provider
 
-        return hourly_rate(name)
+        return get_provider("lambda").hourly_rate(name)
     if p == "vast" and info.vast_name:
         # Vast is a live market whose rates differ materially from RunPod's static ones, so price a
         # provider="vast" quote through the Vast pricing module (live + static fallback).

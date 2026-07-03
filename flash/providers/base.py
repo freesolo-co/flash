@@ -446,6 +446,12 @@ class Provider(Protocol):
         """Best-effort: reap any resource this run may have left registered."""
         ...
 
+    # NOTE: ``supports_weight_cache: bool`` is an OPTIONAL capability attr (read via
+    # ``getattr(prov, "supports_weight_cache", False)``, off this Protocol for the same isinstance
+    # reason as below): True only for the provider that offers the shared weight-cache network volume
+    # (RunPod). The runner gates its one-shot cache-less retry fallback on it; every other provider
+    # defaults False.
+
     # NOTE: ``run_instances_remaining(run_id) -> list[int]`` is an OPTIONAL capability, intentionally
     # NOT declared on this ``@runtime_checkable`` Protocol — adding it would make it a REQUIRED member
     # for ``isinstance(prov, Provider)``, which RunPod (serverless, self-reaping — nothing to enumerate)

@@ -17,6 +17,10 @@ from flash.providers.base import (
 class RunpodProvider:
 
     name = "runpod"
+    # Optional capability (read via getattr, kept off the runtime_checkable Protocol like
+    # run_instances_remaining): only RunPod offers the shared weight-cache network volume, so the
+    # runner's one-shot cache-less retry fallback is gated on it. Instance providers omit it -> False.
+    supports_weight_cache = True
 
     def is_configured(self) -> bool:
         # Missing key surfaces at preflight, not here.
