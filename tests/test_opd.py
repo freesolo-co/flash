@@ -116,6 +116,41 @@ def test_student_tokens_use_sampled_ids_with_offsets_into_completion_text():
     assert (toks[2].start, toks[2].end) == (2, 2)  # special token -> zero-width span (excluded)
 
 
+def test_trim_trailing_stop_drops_delimiter_from_ids_and_text():
+    from flash.engine.worker.opd import _trim_trailing_stop
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            m = {1: "A", 2: "n", 3: "s", 4: "</", 5: "answer>"}
+            return "".join(m[int(i)] for i in ids)
+
+    # completion "Ans</answer>"; stop "</answer>" spans ids 4,5 -> keep "Ans" / ids [1,2,3].
+    ids, text = _trim_trailing_stop(_Tok(), [1, 2, 3, 4, 5], "Ans</answer>", ["</answer>"])
+    assert text == "Ans"  # teacher scores the answer only, not the delimiter
+    assert ids == [1, 2, 3]  # ids trimmed in lockstep with the text (no gkd_loss/count desync)
+    # no trailing stop -> unchanged (ids normalized to a list)
+    assert _trim_trailing_stop(_Tok(), [1, 2, 3], "Ans", ["</answer>"]) == ([1, 2, 3], "Ans")
+
+
+def test_opd_rejects_unpriced_teacher_model_but_accepts_priced():
+    from flash.schema import ConfigError, spec_from_dict
+
+    def _spec(teacher):
+        return spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "opd",
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"steps": 5, "hf_repo": "owner/runs", "teacher_model": teacher},
+            },
+            run_id="x",
+        )
+
+    _spec("accounts/fireworks/models/glm-5p2")  # priced -> ok
+    with pytest.raises(ConfigError):
+        _spec("accounts/fireworks/models/mystery-9000")  # unpriced override -> reject at parse
+
+
 def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
     """Exercise the PRODUCTION caller _train_one end-to-end (the direct-call unit test above can't
     catch a broken call site). The completion ends in a zero-width eos, so this also pins the

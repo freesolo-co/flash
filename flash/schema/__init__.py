@@ -274,6 +274,18 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"[train] unknown key(s): {', '.join(unknown_train)} "
             f"(allowed: {', '.join(sorted(_TRAIN_KEYS))})"
         )
+    _teacher = _train_str(train_raw, "teacher_model")
+    if algorithm == "opd" and _teacher:
+        # Reject an unpriced teacher override at parse time: falling back to the default rate would
+        # make both the submit-time quote and the final charge wrong for a differently-priced model.
+        from flash.cost.facts import TEACHER_USD_PER_1M
+
+        if _teacher not in TEACHER_USD_PER_1M:
+            raise ConfigError(
+                f"[train] teacher_model {_teacher!r} has no pricing entry, so its cost quote and "
+                f"charge would silently use the default rate. Use a priced teacher "
+                f"({', '.join(sorted(TEACHER_USD_PER_1M))}) or add an entry in flash/cost/facts.py."
+            )
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
         gpu_raw = {}

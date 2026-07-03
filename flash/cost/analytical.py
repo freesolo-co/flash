@@ -95,9 +95,13 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # Fireworks round-trips, replaces reward grading) + policy update (fwd+bwd only, NO local
         # reference forward — the teacher is the API).
         completions = n.batch_size * n.group_size
-        gen_tokens = completions * n.completion_len
-        gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
-        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_TRAIN)
+        # Bill local compute on the FULL prompt+completion sequence (n.seq_len = prompt budget +
+        # completion), not completion-only: the loss forward runs model(prompt_ids + student_ids)
+        # over the whole sequence, and generation prefills the prompt before decoding. Completion-
+        # only underquoted GPU time for long-prompt opd jobs (the default admits ~1024 prompt tokens).
+        seq_tokens = completions * n.seq_len
+        gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
+        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_TRAIN)
         teacher_lat = teacher_seconds_per_completion(config.reward_seconds_per_completion)
         # run_opd scores each completion serially (nested prompt/group loops each await
         # teacher.score before the next), so the wall cost is the full serial sum — do NOT divide

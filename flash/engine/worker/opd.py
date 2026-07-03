@@ -111,6 +111,26 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     return ids, toks
 
 
+def _trim_trailing_stop(tok, completion_ids, completion_text: str, stops):
+    """Drop a trailing stop delimiter from BOTH the decoded text and the sampled ids (token-level).
+
+    HF ``stop_strings`` halts only AFTER the delimiter text is emitted, so a run with e.g.
+    ``[train] stop_sequences=["</answer>"]`` would otherwise score/distil the delimiter the user asked
+    to stop at. Trimming both sides keeps ids and text consistent (no gkd_loss / token-count desync,
+    the failure mode of a text-only trim). Returns ``(ids, text)`` (a list + str)."""
+    ids = [int(t) for t in completion_ids]
+    for stop in stops:
+        if stop and completion_text.endswith(stop):
+            keep_len = len(completion_text) - len(stop)
+            kept = 0
+            for i in range(len(ids)):
+                if len(tok.decode(ids[: i + 1], skip_special_tokens=True)) > keep_len:
+                    break
+                kept = i + 1
+            return ids[:kept], completion_text[:keep_len]
+    return ids, completion_text
+
+
 def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     """Groupwise reverse-KL on-policy distillation (the collinear-ai *spider* / Tinker method).
 
@@ -255,12 +275,18 @@ def run_opd():
     # Prompt budget mirrors GRPO: DROP (not truncate) prompts over the context budget, so the student
     # never conditions on a truncated prompt the teacher didn't see. Use the configured max_length
     # when set, else the recipe prompt cap.
-    prompt_budget = max(
-        1,
-        (knobs["max_length"] - knobs["max_completion"])
-        if knobs["max_length"]
-        else RECIPE.opd.max_prompt_len,
-    )
+    if knobs["max_length"]:
+        prompt_budget = knobs["max_length"] - knobs["max_completion"]
+        if prompt_budget < 1:
+            # A non-positive remainder means max_length <= max_tokens: there is no room for any
+            # prompt, so every sample would run generate+loss past the configured context. Reject
+            # loudly instead of clamping to a 1-token budget that silently admits over-budget runs.
+            raise RuntimeError(
+                f"opd: [train] max_length ({knobs['max_length']}) leaves no prompt budget after "
+                f"max_tokens ({knobs['max_completion']}); set max_length > max_tokens."
+            )
+    else:
+        prompt_budget = RECIPE.opd.max_prompt_len
     dropped_long = 0
 
     def _render_prompt_ids(messages):
@@ -458,12 +484,16 @@ def _train_one(
         gen = model.generate(prompt_tensor, **gen_cfg)
     completion_ids = gen[0, prompt_tensor.shape[1] :]
     completion_text = tok.decode(completion_ids, skip_special_tokens=True)
-    _train_one.last_gen_tokens = int(completion_ids.shape[0])
+    # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter
+    # before stopping — trim it from BOTH ids and text (token-level) so the teacher scores/distils
+    # only the answer, and ids/text stay consistent for gkd_loss + token counting.
+    if knobs["stop_sequences"]:
+        completion_ids, completion_text = _trim_trailing_stop(
+            tok, completion_ids, completion_text, knobs["stop_sequences"]
+        )
+    _train_one.last_gen_tokens = len(completion_ids)
     if not completion_text.strip():
         return None
-    # NB: `stop_sequences` are wired into `generate` (gen_cfg.stop_strings), so the student halts at
-    # the delimiter on-policy. We score the completion the student actually produced verbatim —
-    # ids and text stay consistent (no post-hoc trimming that would desync gkd_loss / token counts).
 
     teacher_prompt = _teacher_prompt_text(prompt_messages)
     try:
