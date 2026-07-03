@@ -164,6 +164,71 @@ def test_allocator_picks_runpod_candidate(monkeypatch):
     assert a.gpu == "RTX 4090"
 
 
+def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
+    """Pin allocate()'s three provider candidate lists so ranking can be tested in isolation."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
+    monkeypatch.setattr(allocator, "_runpod_candidates", lambda need: [Candidate(*c) for c in runpod])
+    monkeypatch.setattr(allocator, "_lambda_candidates", lambda need: [Candidate(*c) for c in lambda_])
+    monkeypatch.setattr(
+        allocator,
+        "_vast_candidates",
+        lambda need, disk_gb=0.0, max_wall_seconds=0.0: [Candidate(*c) for c in vast],
+    )
+
+
+def test_vast_competes_purely_on_price(monkeypatch):
+    """Vast is ranked by cost alongside runpod/lambda: the cheapest offer wins, whoever owns it."""
+    from flash.providers.allocator import allocate
+
+    # Vast is the cheapest fitting offer -> Vast is selected.
+    _stub_candidates(
+        monkeypatch,
+        runpod=[("runpod", "RTX 4090", 0.69, 24)],
+        lambda_=[("lambda", "A10", 0.60, 24)],
+        vast=[("vast", "RTX 4090", 0.47, 24)],
+    )
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
+    assert a.provider == "vast"
+    assert a.hourly_usd == pytest.approx(0.47)
+
+    # When Vast is the pricier offer it does NOT win -> no structural advantage either way.
+    _stub_candidates(
+        monkeypatch,
+        runpod=[("runpod", "RTX 4090", 0.69, 24)],
+        lambda_=[("lambda", "A10", 0.60, 24)],
+        vast=[("vast", "RTX 4090", 0.80, 24)],
+    )
+    b = allocate("Qwen/Qwen3.5-0.8B", "sft")
+    assert b.provider == "lambda"
+    assert b.hourly_usd == pytest.approx(0.60)
+
+
+def test_price_tie_break_is_provider_agnostic(monkeypatch):
+    """On an exact (price, VRAM) tie the winner is decided by GPU-class name, not provider identity,
+    so Vast is never structurally last. A registry-order tie-break would make runpod always win here."""
+    from flash.providers.allocator import allocate
+
+    # Identical price and VRAM; Vast's class name sorts before RunPod's -> Vast wins the tie.
+    _stub_candidates(
+        monkeypatch,
+        runpod=[("runpod", "RTX 4090", 0.50, 24)],
+        vast=[("vast", "A100", 0.50, 24)],
+    )
+    assert allocate("Qwen/Qwen3.5-0.8B", "sft").provider == "vast"  # "A100" < "RTX 4090"
+
+    # Flip which provider owns the name that sorts first -> the other provider wins. Ordering tracks
+    # the GPU name, never the provider, so the tie-break gives no provider a built-in edge.
+    _stub_candidates(
+        monkeypatch,
+        runpod=[("runpod", "A100", 0.50, 24)],
+        vast=[("vast", "RTX 4090", 0.50, 24)],
+    )
+    assert allocate("Qwen/Qwen3.5-0.8B", "sft").provider == "runpod"  # "A100" < "RTX 4090"
+
+
 def test_allocation_summary_formats_runpod_choice(monkeypatch):
     from flash.providers.allocator import allocation_summary
     from flash.providers.base import Allocation, Candidate

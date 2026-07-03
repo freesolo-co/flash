@@ -20,7 +20,8 @@ from functools import cache
 
 from flash.providers.base import Provider
 
-# Active provider order is also the tie-break preference (RunPod wins price ties, then Lambda, Vast).
+# Registry / iteration order only — NOT a selection preference. Allocation ranks candidates purely
+# by price (see allocator.allocate), so runpod/lambda/vast get no tie-break edge from this order.
 PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "vast")
 
 # Instance-billed providers: they rent a VM/container that BILLS UNTIL TERMINATED, so they need the

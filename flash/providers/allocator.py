@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from flash._logging import get_logger
-from flash.providers import PROVIDER_NAMES, available_providers, get_provider
+from flash.providers import available_providers, get_provider
 from flash.providers.base import (
     Allocation,
     Candidate,
@@ -125,9 +125,9 @@ def allocate(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
             f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
         )
-    # Cheapest first; ties broken by VRAM (prefer smaller), then registry order.
-    order = {n: i for i, n in enumerate(PROVIDER_NAMES)}
-    ranked = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, order.get(c.provider, 99)))
+    # Cheapest first; ties broken by VRAM (prefer smaller), then GPU class name. The tie-break is
+    # provider-agnostic, so runpod/lambda/vast compete purely on price with no structural edge.
+    ranked = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, c.gpu))
     best = ranked[0]
     return Allocation(
         provider=best.provider,
