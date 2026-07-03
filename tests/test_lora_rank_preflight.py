@@ -61,21 +61,23 @@ def test_init_adapter_preflight_allows_vl_recombined_rank_at_serving_cap():
 
 def test_init_adapter_preflight_rejects_opd_vl_recombined_rank_before_training():
     # opd VL warm-start ALSO stacks SFT⊕opd at deploy (recombined_warmstart_adapter_dir), so the
-    # recombined rank must fit the serving cap — same preflight as GRPO, worded for opd.
+    # recombined rank must fit the serving cap — same preflight as GRPO, worded for opd. 4B cap is
+    # now 64: SFT rank 56 + opd rank 16 = 72 > 64, rejected (allowed opd rank = 64 - 56 = 8).
     spec = _spec(rank=16, algorithm="opd")
 
     with pytest.raises(
         ValueError,
-        match=r"SFT\+OPD adapter would be rank 40 \(SFT rank 24 \+ OPD rank 16\).*"
+        match=r"SFT\+OPD adapter would be rank 72 \(SFT rank 56 \+ OPD rank 16\).*"
         r"set OPD train\.lora_rank <= 8",
     ):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 24}))
+        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 56}))
 
 
 def test_init_adapter_preflight_allows_opd_vl_recombined_rank_at_serving_cap():
+    # SFT rank 48 + opd rank 16 = 64 == the 4B serving cap, so it is allowed (boundary).
     spec = _spec(rank=16, algorithm="opd")
 
-    preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 16}))  # 16+16=32=cap
+    preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 48}))
 
 
 def test_init_adapter_preflight_allows_empty_vl_patterns():
