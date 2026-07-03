@@ -110,15 +110,19 @@ def reward_seconds_per_completion(override: float | None = None) -> float:
     return AVG_REWARD_SECONDS_PER_COMPLETION
 
 
-# Approximate Fireworks serverless pricing for the on-policy-distillation GLM teacher, $/1M tokens
-# as (input, output). Static like gpu_hourly_usd so cost estimation is deterministic/offline and
-# needs NO FIREWORKS_API_KEY. Update from https://fireworks.ai/pricing. opd echo-scores completions
-# (max_tokens=0), so only INPUT tokens are billed (the teacher never generates).
+# Fireworks serverless pricing for the on-policy-distillation GLM teacher, $/1M tokens as
+# (input, output). Static like gpu_hourly_usd so cost estimation is deterministic/offline and needs
+# NO FIREWORKS_API_KEY. Source: https://fireworks.ai/models/fireworks/glm-5p2 lists
+# $1.40 / $0.14 / $4.40 (input / cached input / output) per 1M. opd echo-scores completions
+# (max_tokens=0), so only INPUT tokens are billed (the teacher never generates) — but the table keeps
+# both so a mispriced entry is obvious. glm-5p1 shares the GLM-5 serverless rate.
 TEACHER_USD_PER_1M: dict[str, tuple[float, float]] = {
-    "accounts/fireworks/models/glm-5p2": (0.90, 0.90),
-    "accounts/fireworks/models/glm-5p1": (0.90, 0.90),
+    "accounts/fireworks/models/glm-5p2": (1.40, 4.40),
+    "accounts/fireworks/models/glm-5p1": (1.40, 4.40),
 }
-_DEFAULT_TEACHER_USD_PER_1M = (0.90, 0.90)
+# Representative default = the GLM-5 serverless rate. The recipe's default teacher is glm-5p2, so an
+# opd run that OMITS [train] teacher_model (priced through this fallback) still quotes the real rate.
+_DEFAULT_TEACHER_USD_PER_1M = (1.40, 4.40)
 # Fireworks echo-scoring round-trip per completion (wall time, concurrency-bound like reward grading).
 AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
 

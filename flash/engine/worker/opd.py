@@ -450,7 +450,9 @@ def run_opd():
             # warm-start/deploy from step-N would use fewer updates than its name implies.
             if knobs["save_every"] and opt_steps % knobs["save_every"] == 0:
                 _save_adapter(model, tok, adapter_dir)
-                _publish_opd_deployable(adapter_dir, opt_steps, as_default=False)
+                # Best-effort: a mid-run recombine/publish failure (e.g. transiently evicted SFT dir)
+                # must not abort the loop after real optimizer steps — the finalize publish is strict.
+                _publish_opd_deployable(adapter_dir, opt_steps, as_default=False, best_effort=True)
 
     train_wall = time.time() - t_train
     if not loss_curve:
@@ -571,19 +573,42 @@ def _save_adapter(model, tok, adapter_dir: str) -> None:
     tok.save_pretrained(adapter_dir)
 
 
-def _publish_opd_deployable(adapter_dir: str, step: int, *, as_default: bool) -> None:
+def _publish_opd_deployable(
+    adapter_dir: str, step: int, *, as_default: bool, best_effort: bool = False
+) -> None:
     """Publish the step-``step`` deployable adapter (and, when ``as_default``, the ``<prefix>/adapter``
     served default), recombining SFT⊕opd for a VL warm-start so the deployed adapter reproduces
     base+SFT+opd on the unmodified catalog base. For a VL warm-start the trained ``adapter_dir`` is
     SFT-less (a fresh LoRA on the SFT-merged base); ``recombined_warmstart_adapter_dir`` stacks the
     original SFT LoRA back in. No-op recombine (deploys ``adapter_dir`` as-is) for the continued-
-    adapter (non-VL) and fresh-LoRA paths, which already carry the SFT. Mirrors GRPO finalize (rl.py)."""
-    recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
+    adapter (non-VL) and fresh-LoRA paths, which already carry the SFT. Mirrors GRPO finalize (rl.py).
+
+    ``best_effort`` (mid-run per-step publish): swallow a recombine/publish failure and KEEP training —
+    a transient or evicted SFT dir during a save_every publish must not terminate run_opd after real
+    optimizer steps (GRPO's per-step checkpoint callback is likewise best-effort). At finalize
+    (``best_effort=False``) a recombine failure is FATAL: shipping the SFT-less adapter as the served
+    default is exactly the broken deploy the recombine guards against."""
+    try:
+        recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
+    except Exception as e:
+        if not best_effort:
+            raise
+        print(
+            f"[opd] deployable recombine failed at step {step}; "
+            f"skipping this publish, training continues: {e}"
+        )
+        return
     deploy_dir = recombined or adapter_dir
     try:
         if as_default:
             _w.hf_upload_folder(deploy_dir, "adapter", required=True)
         _w.publish_deployable_checkpoint(deploy_dir, step)
+    except Exception as e:
+        if not best_effort:
+            raise
+        print(
+            f"[opd] deployable publish failed at step {step}; skipping, training continues: {e}"
+        )
     finally:
         if recombined:
             import shutil

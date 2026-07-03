@@ -290,6 +290,7 @@ def estimate_vram_gb(
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp
     eff_b = float(active_params_b) if active_params_b else params_b
+    is_opd = (algorithm or "").lower() == "opd"
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
     width = math.sqrt(max(eff_b, 0.1))
     lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * eff_b)
@@ -313,6 +314,16 @@ def estimate_vram_gb(
     fused = sft_logits_fused(params_b, seq_len)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
+    if is_opd:
+        # opd's gkd loss forward materializes DENSE logits — there is NO fused cross-entropy: the
+        # student forward yields full-sequence bf16 logits [seq, vocab], then the completion rows are
+        # gathered in fp32 [completion, vocab] for the logsumexp. The SFT fused path budgets ZERO
+        # vocab logits for >=3B models, so a long-completion opd job (e.g. max_tokens=8192) would be
+        # sized for an under-capacity card and OOM. Reserve both tensors (opd runs ONE sequence per
+        # forward, so this is per-sequence, not per-device-batch).
+        completion = max_tokens if max_tokens else min(seq_len, 1024)
+        logits = (seq_len * 2 + completion * 4) * vocab / 1e9
+        return base + activations + logits
     # Don't clamp to budget: pd=1 is irreducible and the logits can exceed the budget at near-2048 ctx.
     logits = 0.0 if fused else pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
     return base + activations + logits

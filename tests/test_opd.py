@@ -454,6 +454,49 @@ def test_publish_opd_deployable_noop_recombine_deploys_adapter_dir(tmp_path, mon
     assert calls["publish"] == [(adir, 7)]  # no-op recombine -> deploys adapter_dir as-is
 
 
+def test_publish_opd_deployable_best_effort_survives_recombine_failure(tmp_path, monkeypatch):
+    """Per-step publish is best-effort: a recombine failure (e.g. an evicted SFT dir) is swallowed so
+    training continues; the strict finalize path re-raises (it must never ship an SFT-less default)."""
+    from flash.engine.worker import opd as opd_mod
+
+    def _boom(d):
+        raise RuntimeError("SFT dir evicted")
+
+    monkeypatch.setattr(opd_mod._w, "recombined_warmstart_adapter_dir", _boom, raising=False)
+    monkeypatch.setattr(
+        opd_mod._w, "publish_deployable_checkpoint", lambda d, s: None, raising=False
+    )
+    monkeypatch.setattr(
+        opd_mod._w, "hf_upload_folder", lambda d, sub, required=False: None, raising=False
+    )
+
+    # best_effort=True (per-step): swallowed, training continues (no raise).
+    opd_mod._publish_opd_deployable(str(tmp_path / "a"), 20, as_default=False, best_effort=True)
+    # best_effort=False (finalize): fatal — must not ship an SFT-less served default.
+    with pytest.raises(RuntimeError, match="SFT dir evicted"):
+        opd_mod._publish_opd_deployable(str(tmp_path / "a"), 100, as_default=True)
+
+
+def test_opd_vram_reserves_dense_logits_unlike_fused_sft():
+    """opd's gkd loss materializes dense logits (no fused CE), so its VRAM estimate must reserve the
+    logits a >=3B SFT job fuses away — else a long-completion opd run is sized for a card that OOMs."""
+    from flash.engine.vram import estimate_vram_gb
+
+    kw = {"seq_len": 9216, "max_tokens": 8192, "vocab": 248_320, "lora_rank": 16}
+    sft = estimate_vram_gb(4.0, "sft", "bf16", **kw)  # >=3B fuses CE -> 0 logits budgeted
+    opd = estimate_vram_gb(4.0, "opd", "bf16", **kw)  # dense logits reserved
+    assert opd > sft + 10  # ~12.7 GB of dense logits for opd vs 0 for fused SFT
+
+
+def test_opd_teacher_rate_matches_fireworks_glm5p2_input_price():
+    """glm-5p2 (and the omitted-teacher default) price at Fireworks' $1.40/M input, not the old $0.90
+    — opd echo-scoring bills input tokens from the submit-time quote."""
+    from flash.cost.facts import teacher_price_per_1m
+
+    assert teacher_price_per_1m("accounts/fireworks/models/glm-5p2")[0] == 1.40
+    assert teacher_price_per_1m("")[0] == 1.40  # omitted teacher -> representative default rate
+
+
 # --------------------------------------------------------------------------------------------------
 # teacher client (mocked HTTP)
 # --------------------------------------------------------------------------------------------------
