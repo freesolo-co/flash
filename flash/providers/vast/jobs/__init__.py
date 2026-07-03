@@ -413,7 +413,7 @@ def poll_vast_job(
     )
     metrics_reader = _make_hf_file_reader(hf_repo, f"{prefix}/metrics.json")
 
-    def finish_ok(done_content: str | None = None, fallback_end_ts: float | None = None) -> PollResult:
+    def finish_ok(end_ts_hint: float | str | None = None) -> PollResult:
         # metrics.json is written before DONE but HF read-after-write lags: re-read a few times before
         # falling back to the poll_error retry on a DONE-without-metrics.
         raw = _read_with_retries(
@@ -446,10 +446,11 @@ def poll_vast_job(
         # delayed recovery isn't measured as runtime), else now; adopt only if in [launch, now]. The
         # customer-facing cost below uses the worker training wall only.
         end_ts = time.time()
-        candidate = done_content.strip() if done_content else fallback_end_ts
-        if candidate is not None:
+        # end_ts_hint is the worker's completion time — the DONE sentinel's payload (a str) or an ok
+        # marker's ts (a float). float() tolerates surrounding whitespace, so no pre-strip is needed.
+        if end_ts_hint is not None:
             with contextlib.suppress(TypeError, ValueError):
-                ts = float(candidate)
+                ts = float(end_ts_hint)
                 if launch_ts <= ts <= end_ts:
                     end_ts = ts
         instance_wall_s = max(0.0, end_ts - launch_ts)
@@ -485,7 +486,7 @@ def poll_vast_job(
         d = done_reader(force=True)
         fresh = d is not None and done_is_fresh(d)
         marker_ts = marker.get("ts") if isinstance(marker, dict) else None
-        return finish_ok(d if fresh else None, fallback_end_ts=None if fresh else marker_ts)
+        return finish_ok(d if fresh else marker_ts)
 
     def fail_from_marker(marker: dict | None) -> PollResult:
         # A real worker error fails fast UNLESS flagged retriable (in the marker, or the worker's
@@ -502,13 +503,15 @@ def poll_vast_job(
             ),
         )
 
-    def terminal_artifact_result() -> PollResult | None:
-        # One forced read of the worker's terminal HF artifacts (DONE / attempt marker). Returns a
-        # terminal PollResult when the worker definitively finished or errored, else None.
-        d = done_reader(force=True)
+    def terminal_artifact_result(force: bool = True) -> PollResult | None:
+        # The worker's terminal HF artifacts (DONE / attempt marker) -> a terminal PollResult when it
+        # definitively finished or errored, else None. The SINGLE terminal detector shared by the poll
+        # loop and every give-up path. ``force`` bypasses the read cache: True for the one-shot give-up
+        # reads; False for the per-iteration loop poll, which already paces its own reads.
+        d = done_reader(force=force)
         if d is not None and done_is_fresh(d):
             return finish_ok(d)
-        raw = marker_reader(force=True)
+        raw = marker_reader(force=force)
         if raw:
             with contextlib.suppress(ValueError):
                 m = json.loads(raw)
@@ -613,9 +616,11 @@ def poll_vast_job(
             if observed_running_since is None:
                 observed_running_since = time.time()
 
-        done = done_reader()
-        if done is not None and done_is_fresh(done):
-            return finish_ok(done)
+        # Per-iteration terminal check: the SAME detector every give-up path uses (force=False — the loop
+        # paces its own reads). Folds the DONE and ok/err-marker checks into one call.
+        terminal = terminal_artifact_result(force=False)
+        if terminal is not None:
+            return terminal
 
         # ``unknown`` = "host has no recent heartbeat and won't progress" (host loss) -> dead for fast
         # failover. Gate on ``became_running`` because ``unknown`` is ALSO this poller's no-status
@@ -663,17 +668,6 @@ def poll_vast_job(
                     hf_repo, prefix, spec.phase, None, handle.instance_id, attempt=handle.attempt
                 ),
             )
-
-        raw_marker = marker_reader()
-        if raw_marker:
-            try:
-                marker = json.loads(raw_marker)
-            except ValueError:
-                marker = None
-            if marker and not marker.get("ok"):
-                return fail_from_marker(marker)
-            if marker and marker.get("ok"):
-                return finish_from_ok_marker(marker)
 
         if not became_running and time.time() - start > LOAD_TIMEOUT_S:
             return PollResult(
@@ -767,11 +761,10 @@ def submit_run_vast(
         )
         if o.gpu == spec.gpu.type
     ]
-    # code_prefix is passed only when set so test doubles for deploy_and_submit can omit the kwarg.
-    deploy_kwargs = {"attempt": attempt, "log": log, "runtime_secrets": runtime_secrets}
-    if code_prefix is not None:
-        deploy_kwargs["code_prefix"] = code_prefix
-    handle = deploy_and_submit(spec, seed, offers, **deploy_kwargs)
+    handle = deploy_and_submit(
+        spec, seed, offers, attempt=attempt, log=log, runtime_secrets=runtime_secrets,
+        code_prefix=code_prefix,
+    )
     # The instance is billing the MOMENT deploy_and_submit returns; the teardown ``finally`` must guard
     # EVERYTHING after that point — including ``on_handle`` (persisting the handle can itself raise).
     try:
@@ -804,8 +797,8 @@ def submit_run_vast(
 def _best_effort_destroy(instance_id, *, context: str) -> bool:
     """``destroy_instance`` for best-effort teardown paths (submit/poll ``finally``, cancel) that must
     NOT raise. Returns the confirmation bool and WARNS on an unconfirmed teardown (``success: false`` /
-    breakdown -> may still be billing) for immediate operator visibility. (``VastProvider.destroy`` keeps
-    RAISING for its suppress-wrapped callers.)
+    breakdown -> may still be billing) for immediate operator visibility. (``VastProvider.destroy`` wraps
+    this and RE-RAISES on failure for its suppress-wrapped callers.)
 
     Pass ``instance_id`` THROUGH unconverted: ``destroy_instance`` does the ``int()`` internally, so
     converting here would re-introduce a raise in the very ``finally``/``suppress`` paths this quiets."""

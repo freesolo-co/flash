@@ -107,23 +107,16 @@ class VastProvider:
         cancel(handle.to_dict())
 
     def destroy(self, handle: JobHandle) -> None:
-        from flash._logging import get_logger
         from flash.providers.vast import api as vast_api
+        from flash.providers.vast.jobs import _best_effort_destroy
 
-        d = handle.to_dict()
-        iid = d.get("instance_id")
+        iid = handle.to_dict().get("instance_id")
         if not iid:
             return
-        # ``destroy_instance`` returns False on ``success:false`` / breakdown — the box is STILL billable.
-        # Warn + raise instead of recording a false success (best-effort callers catch it and fall back to
-        # sweep_orphans). Pass ``iid`` through unconverted: destroy_instance does the ``int()`` internally,
-        # so converting here would raise instead of surfacing the False -> raise path.
-        if not vast_api.destroy_instance(iid):
-            get_logger(__name__).warning(
-                "vast destroy_instance(%s) returned unconfirmed (success:false / breakdown); "
-                "instance may still be billing — relying on sweep_orphans backstop",
-                iid,
-            )
+        # Reuse the canonical best-effort teardown (it warns on an unconfirmed success:false/breakdown and
+        # passes iid through unconverted), but RE-RAISE on failure so this suppress-wrapped path falls back
+        # to sweep_orphans rather than recording a false success.
+        if not _best_effort_destroy(iid, context="provider.destroy"):
             raise vast_api.VastApiError(
                 f"vast destroy_instance({iid}) unconfirmed (success:false); instance may still bill"
             )

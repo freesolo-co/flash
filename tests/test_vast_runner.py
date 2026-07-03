@@ -1004,7 +1004,7 @@ def _wire_submit(monkeypatch, poll_result=None, poll_raises=None):
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
 
@@ -1057,7 +1057,7 @@ def test_submit_teardown_warns_on_unconfirmed_destroy_without_raising(monkeypatc
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
@@ -1084,7 +1084,7 @@ def test_submit_unconfirmed_teardown_escalates_to_run_scoped_reap(monkeypatch):
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
@@ -1107,7 +1107,7 @@ def test_submit_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))

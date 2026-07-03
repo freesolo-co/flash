@@ -797,6 +797,28 @@ def make_hf_failure_detail_reader(
     return read
 
 
+def _heartbeat_is_prior_attempt(hb: dict, launch_ts: float | None, current_attempt) -> bool:
+    """Positively attribute a heartbeat to a PRIOR (earlier) attempt: an explicit ``attempt`` differing
+    from ``current_attempt`` (definitive provenance — a MATCH proves THIS launch, so a lagging worker-host
+    clock cannot demote it), else a parseable ``ts`` predating this attempt's launch. Un-dateable (no
+    attempt AND no usable ts) -> False: mere absence of proof is never treated as a leftover. Truthy
+    ``launch_ts`` only (0.0 = unknown launch, uncomparable). Shared decision core of
+    ``worker_flagged_retriable`` (honor the retriable flag iff NOT prior) and
+    ``heartbeat_is_stale_prior_attempt`` (stale iff prior) — one edit site instead of two lockstep copies."""
+    hb_attempt = _attempt_int(hb.get("attempt"))
+    cur_attempt = _attempt_int(current_attempt)
+    if hb_attempt is not None and cur_attempt is not None:
+        return hb_attempt != cur_attempt
+    if launch_ts:
+        try:
+            ts = float(hb.get("ts"))
+        except (TypeError, ValueError):
+            ts = None
+        if ts is not None and ts < float(launch_ts):
+            return True
+    return False
+
+
 def worker_flagged_retriable(
     heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
 ) -> bool:
@@ -820,23 +842,8 @@ def worker_flagged_retriable(
         return False
     if launch_ts is None and current_attempt is None:
         return True  # ungated: caller can't date the heartbeat -> preserve prior behavior
-    hb_attempt = _attempt_int(hb.get("attempt"))
-    cur_attempt = _attempt_int(current_attempt)
-    if hb_attempt is not None and cur_attempt is not None:
-        # Explicit attempt is definitive provenance: honor/deny by it ALONE. A MATCH proves the heartbeat
-        # belongs to THIS launch, so a lagging worker-host clock (ts < launch_ts) must NOT discard its
-        # retriable flag; a MISMATCH is a prior attempt whose flag doesn't apply here.
-        return hb_attempt == cur_attempt
-    if launch_ts:
-        # No explicit attempt to disambiguate -> date by ts: a heartbeat written before this attempt's
-        # launch is a leftover prior attempt, so its retriable flag doesn't count for us.
-        try:
-            ts = float(hb.get("ts"))
-        except (TypeError, ValueError):
-            ts = None
-        if ts is not None and ts < float(launch_ts):
-            return False
-    return True
+    # Honor the retriable flag unless the heartbeat provably belongs to a PRIOR attempt.
+    return not _heartbeat_is_prior_attempt(hb, launch_ts, current_attempt)
 
 
 def heartbeat_is_stale_prior_attempt(
@@ -862,24 +869,7 @@ def heartbeat_is_stale_prior_attempt(
     hb = heartbeat_reader(force=True)
     if not isinstance(hb, dict) or launch_ts is None or current_attempt is None:
         return False
-    # (1) Explicit attempt is definitive provenance: a MISMATCH is a heartbeat from a DIFFERENT attempt
-    # (stale prior); a MATCH is THIS attempt and is never stale, even if a lagging worker-host clock puts
-    # its ts before launch. Decide by attempt alone when both sides carry one.
-    hb_attempt = _attempt_int(hb.get("attempt"))
-    cur_attempt = _attempt_int(current_attempt)
-    if hb_attempt is not None and cur_attempt is not None:
-        return hb_attempt != cur_attempt
-    # (2) No explicit attempt -> date by ts: a parseable ts that predates THIS attempt's launch was
-    # written before we booted -> leftover. Truthy ``launch_ts`` only: 0.0 means "unknown launch"
-    # (instance handles coerce a missing started_ts to 0.0), and we cannot date against an unknown launch.
-    if launch_ts:
-        try:
-            ts = float(hb.get("ts"))
-        except (TypeError, ValueError):
-            ts = None
-        if ts is not None and ts < float(launch_ts):
-            return True
-    return False
+    return _heartbeat_is_prior_attempt(hb, launch_ts, current_attempt)
 
 
 def surfaced_worker_flags(
