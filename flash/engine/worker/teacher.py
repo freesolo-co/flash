@@ -108,6 +108,20 @@ class TeacherClient:
                 f"teacher echo response missing logprobs: {e}", permanent=True
             ) from e
         n = len(tokens)
+        # A well-formed echo response returns tokens / token_logprobs / text_offset of EQUAL length.
+        # The loop below indexes token_logprobs[i] and offsets[i] for every i, so a short array (a
+        # malformed 200) would raise IndexError there — and, unlike the KeyError/TypeError guarded
+        # above, that IndexError escapes the method as a generic (non-TeacherError) exception. In
+        # _train_one that is caught by the broad `except Exception` and treated as a TRANSIENT skipped
+        # sample, so a teacher that consistently returns malformed arrays would burn every remaining
+        # OPD step before the run fails with "no trained step". Treat the length mismatch as PERMANENT
+        # (a broken teacher-response contract will not fix itself on retry) so the worker aborts now.
+        if len(token_logprobs) < n or len(offsets) < n:
+            raise TeacherError(
+                f"teacher echo response arrays disagree in length: tokens={n}, "
+                f"token_logprobs={len(token_logprobs)}, text_offset={len(offsets)}",
+                permanent=True,
+            )
         out: list[TeacherToken] = []
         for i in range(n):
             start = int(offsets[i])

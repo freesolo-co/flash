@@ -99,15 +99,33 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     text — keeps the loss on the true on-policy tokens. Offsets are built by incrementally decoding
     the id prefix and measuring its length (clamped monotonic in ``[0, len]``, so a byte-level token
     that splits a multi-byte char never yields a negative/backward span); a special token (e.g. eos)
-    decodes to nothing, so it gets a zero-width span and is naturally excluded from the alignment."""
+    decodes to nothing, so it gets a zero-width span and is naturally excluded from the alignment.
+
+    Split multi-byte chars (byte-level tokenizers): a char whose bytes span two+ ids decodes to the
+    Unicode replacement char ``U+FFFD`` until its FINAL byte-id arrives. Measuring each half-id's
+    decoded length independently would give one half the whole char and the other a zero-width span —
+    silently dropping a real byte-token from the alignment and undercounting that char's student
+    logprob. Instead we GROW the window while the decoded prefix still ends in ``U+FFFD`` and assign
+    the SHARED completed-char span to every byte-id in it, so both halves share a ``start`` and land in
+    the same alignment group. A normal (already-complete) token is a window of one — identical to the
+    old per-token length measurement."""
     ids = [int(t) for t in completion_ids]
     toks: list[StudentToken] = []
     prev = 0
     n = len(completion_text)
-    for i in range(len(ids)):
-        end = min(n, max(prev, len(tok.decode(ids[: i + 1], skip_special_tokens=True))))
-        toks.append(StudentToken(token_id=ids[i], start=prev, end=end))
+    i = 0
+    while i < len(ids):
+        j = i
+        # Extend over consecutive byte-ids whose combined decode is still mid-multi-byte-char
+        # (trailing U+FFFD): they only form a real char together, so they must share one span.
+        while j + 1 < len(ids) and tok.decode(ids[: j + 1], skip_special_tokens=True).endswith(
+            "\ufffd"
+        ):
+            j += 1
+        end = min(n, max(prev, len(tok.decode(ids[: j + 1], skip_special_tokens=True))))
+        toks.extend(StudentToken(token_id=ids[k], start=prev, end=end) for k in range(i, j + 1))
         prev = end
+        i = j + 1
     return ids, toks
 
 
@@ -127,7 +145,15 @@ def _trim_trailing_stop(tok, completion_ids, completion_text: str, stops):
                 if len(tok.decode(ids[: i + 1], skip_special_tokens=True)) > keep_len:
                     break
                 kept = i + 1
-            return ids[:kept], completion_text[:keep_len]
+            # Trim the TEXT to exactly what the kept ids decode to — NOT completion_text[:keep_len].
+            # When the stop starts INSIDE the final sampled token (that token decodes to e.g.
+            # "B</answer>" while the stop is "</answer>"), that whole token is excluded from `kept`, so
+            # slicing the raw text at keep_len would keep a "B" the kept ids can no longer represent —
+            # desyncing the teacher-scored text from the student ids (gkd_loss / token-count skew).
+            # Decoding the kept ids keeps both sides identical (drops the fused char, never distils the
+            # delimiter); in the common case (the stop is its own clean token) it equals
+            # completion_text[:keep_len].
+            return ids[:kept], tok.decode(ids[:kept], skip_special_tokens=True)
     return ids, completion_text
 
 
@@ -240,21 +266,12 @@ def run_opd():
     mik = {"dtype": torch.bfloat16}
     if _attn:
         mik["attn_implementation"] = _attn
-    setup_seconds = time.time() - t_start
-    _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
-    with liveness_heartbeat("opd_initializing"):
-        model = _student_model(model_id, mik, device)
-        # Engine length gates whether gradient checkpointing is needed for the loss forward.
-        seq_cap = knobs["max_length"] or (RECIPE.opd.max_prompt_len + knobs["max_completion"])
-        if grad_checkpointing_on(model_id, seq_cap):
-            model.gradient_checkpointing_enable()
-            model.enable_input_require_grads()
-            print("[opd] gradient checkpointing enabled")
-    model.config.use_cache = (
-        True  # generation needs the KV cache; re-disabled per loss forward below
-    )
-
-    # Build the on-policy prompt pool from the environment (same rendering as GRPO).
+    # --- Build the on-policy prompt pool BEFORE loading the student ------------------------------
+    # Fetch the dataset, seed the RNGs, and pre-filter to the prompts that fit the context budget
+    # HERE — ahead of _student_model, which for a VL warm-start downloads the base and MERGES the SFT
+    # into it. A dataset whose every prompt is over-budget is a deterministic failure; detecting it
+    # now fails fast, before a paid worker pays for the base download + SFT merge (only tok/env/knobs
+    # are needed, none of which depend on the loaded model).
     train = env.dataset()
     if not train:
         raise RuntimeError(
@@ -263,16 +280,6 @@ def run_opd():
         )
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
-    # Seed torch/CUDA too (not just the Python shuffle RNG): the student samples via
-    # model.generate(do_sample=True), so the fixed Flash seed must reproduce the same completions
-    # (and therefore the same trained adapter) run-to-run.
-    torch.manual_seed(_w.SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(_w.SEED)
-
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=knobs["learning_rate"]
-    )
     steps = knobs["steps"]
     ppl_step = knobs["prompts_per_step"]
     group = knobs["group_size"]
@@ -302,8 +309,9 @@ def run_opd():
     # Build the on-policy pool from ONLY the prompts that fit the budget (GRPO-style pre-filter). The
     # step loop visits a deterministic examples[(step*ppl_step+i) % len] slice, so a whole-dataset
     # `any(fits)` precheck could pass while every prompt in the visited slice is over-budget and
-    # dropped — burning the GPU allocation with no trained step. Filtering the pool here guarantees
-    # every visited prompt fits. One tokenize per prompt, once, at startup.
+    # dropped — burning the GPU allocation with no trained step. Filtering the pool here (before the
+    # student is even loaded) guarantees every visited prompt fits and fails fast otherwise. One
+    # tokenize per prompt, once, at startup.
     examples = [
         ex for ex in train if len(_render_prompt_ids(env.prompt_messages(ex))) <= prompt_budget
     ]
@@ -317,8 +325,38 @@ def run_opd():
             "every step and burning the GPU allocation."
         )
     if n_over_budget:
-        print(f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
-              f"{prompt_budget}-token budget; pool = {len(examples)}")
+        print(
+            f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
+            f"{prompt_budget}-token budget; pool = {len(examples)}"
+        )
+
+    # Seed torch/CUDA BEFORE constructing the student LoRA: get_peft_model samples the LoRA A matrix
+    # (init_lora_weights=True) from the torch default generator, so seeding must precede _student_model
+    # for the fixed Flash seed to reproduce the same adapter init run-to-run (the fresh-LoRA and VL
+    # warm-start paths both build a fresh LoRA). It also makes the later model.generate(do_sample=True)
+    # completions reproducible. The prompt shuffle above uses a SEPARATE random.Random(_w.SEED), so its
+    # ordering is unaffected by where torch is seeded.
+    torch.manual_seed(_w.SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_w.SEED)
+
+    setup_seconds = time.time() - t_start
+    _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
+    with liveness_heartbeat("opd_initializing"):
+        model = _student_model(model_id, mik, device)
+        # Engine length gates whether gradient checkpointing is needed for the loss forward.
+        seq_cap = knobs["max_length"] or (RECIPE.opd.max_prompt_len + knobs["max_completion"])
+        if grad_checkpointing_on(model_id, seq_cap):
+            model.gradient_checkpointing_enable()
+            model.enable_input_require_grads()
+            print("[opd] gradient checkpointing enabled")
+    model.config.use_cache = (
+        True  # generation needs the KV cache; re-disabled per loss forward below
+    )
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=knobs["learning_rate"]
+    )
 
     resume_ckpt = _w.hf_resume_checkpoint()
     if resume_ckpt:
@@ -334,6 +372,15 @@ def run_opd():
         "top_p": knobs["top_p"],
         "max_new_tokens": knobs["max_completion"],
         "pad_token_id": tok.pad_token_id,
+        # Bound generation WALL-TIME so a degenerate or near-OOM-thrashing generate cannot silently
+        # eat the training stall window: a single _train_one blocks the loop while it runs (the
+        # per-sample opd_step heartbeat only fires AFTER it returns), so an unbounded generate that
+        # stops making progress emits no non-liveness ping and the poller reaps the whole attempt as
+        # "stalled" (observed on the OPD-16 linkd e2e: one step wedged >1500s at 93% VRAM). HF checks
+        # max_time between token steps, so a thrashing (still-stepping) generate is cut here and the
+        # sample returns partial/empty -> the heartbeat resumes. Scale with the completion budget
+        # (thinking mode needs longer) but keep it well under the poller's ~1500s training window.
+        "max_time": min(900.0, max(180.0, float(knobs["max_completion"]) * 0.75)),
     }
     if knobs["stop_sequences"]:
         # HF stops generation at any of these strings (needs the tokenizer to match them on decode).
@@ -343,7 +390,9 @@ def run_opd():
     coverage_curve: list[float] = []
     generated_tokens = 0
     teacher_input_tokens = 0
-    opt_steps = 0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
+    opt_steps = (
+        0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
+    )
     _reset_peak = getattr(_w, "_reset_peak_gpu", None)
     if _reset_peak:
         _reset_peak()
@@ -606,9 +655,7 @@ def _publish_opd_deployable(
     except Exception as e:
         if not best_effort:
             raise
-        print(
-            f"[opd] deployable publish failed at step {step}; skipping, training continues: {e}"
-        )
+        print(f"[opd] deployable publish failed at step {step}; skipping, training continues: {e}")
     finally:
         if recombined:
             import shutil

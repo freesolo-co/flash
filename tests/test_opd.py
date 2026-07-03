@@ -116,6 +116,43 @@ def test_student_tokens_use_sampled_ids_with_offsets_into_completion_text():
     assert (toks[2].start, toks[2].end) == (2, 2)  # special token -> zero-width span (excluded)
 
 
+def test_student_tokens_share_span_for_split_multibyte_char():
+    """Regression (codex[bot], opd.py): a byte-level tokenizer can split one multi-byte char across
+    two ids; the first decodes to U+FFFD until the second arrives. Measuring each id's decoded length
+    independently gave one id the whole char and the other a ZERO-WIDTH span — dropping a real
+    byte-token from the alignment and undercounting the char's student logprob. Both byte-ids must
+    share the completed-char span so neither is dropped."""
+    from flash.engine.worker.opd import student_tokens_with_offsets
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            ids = [int(i) for i in ids]
+            out = ""
+            k = 0
+            while k < len(ids):
+                if ids[k] == 7:
+                    out += "x"
+                    k += 1
+                elif ids[k] == 10 and k + 1 < len(ids) and ids[k + 1] == 11:
+                    out += "😀"  # both byte-ids present -> the real char
+                    k += 2
+                elif ids[k] == 10:
+                    out += "�"  # first byte only -> Unicode replacement char
+                    k += 1
+                else:
+                    k += 1
+            return out
+
+    # "x😀": id 7 -> 'x'; ids 10,11 -> the two bytes of the emoji.
+    ids, toks = student_tokens_with_offsets(_Tok(), [7, 10, 11], "x😀")
+    assert ids == [7, 10, 11]
+    assert (toks[0].start, toks[0].end) == (0, 1)  # 'x'
+    # both halves of the split char share the SAME [1, 2) span (before the fix, id 11 was (2, 2),
+    # zero-width -> dropped from the alignment / coverage denominator).
+    assert (toks[1].start, toks[1].end) == (1, 2)
+    assert (toks[2].start, toks[2].end) == (1, 2)
+
+
 def test_trim_trailing_stop_drops_delimiter_from_ids_and_text():
     from flash.engine.worker.opd import _trim_trailing_stop
 
@@ -130,6 +167,26 @@ def test_trim_trailing_stop_drops_delimiter_from_ids_and_text():
     assert ids == [1, 2, 3]  # ids trimmed in lockstep with the text (no gkd_loss/count desync)
     # no trailing stop -> unchanged (ids normalized to a list)
     assert _trim_trailing_stop(_Tok(), [1, 2, 3], "Ans", ["</answer>"]) == ([1, 2, 3], "Ans")
+
+
+def test_trim_trailing_stop_keeps_ids_and_text_synced_when_stop_starts_inside_token():
+    """Regression (codex[bot], opd.py): when the stop delimiter starts INSIDE the final sampled token
+    (that token decodes to "B</answer>"), the whole token is dropped from the kept ids — so returning
+    completion_text[:keep_len] would keep a "B" the ids can no longer represent, desyncing the
+    teacher-scored text from the student ids. The returned text must equal decode(kept ids)."""
+    from flash.engine.worker.opd import _trim_trailing_stop
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            m = {1: "A", 4: "B</answer>"}  # id 4 fuses a real char with the stop delimiter
+            return "".join(m[int(i)] for i in ids)
+
+    ids, text = _trim_trailing_stop(_Tok(), [1, 4], "AB</answer>", ["</answer>"])
+    # id 4 ("B</answer>") crosses the keep boundary -> excluded; text is what the KEPT ids decode to.
+    assert ids == [1]
+    assert text == "A"
+    # ids/text stay consistent (the old code returned "AB", which the kept ids [1] cannot represent).
+    assert text == _Tok().decode(ids)
 
 
 def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
@@ -324,9 +381,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
 
     import transformers
 
-    monkeypatch.setattr(
-        transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok()
-    )
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok())
     import flash.engine.worker.teacher as tmod
 
     monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
@@ -340,11 +395,197 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     # Per-sample opd_step pings carry samples_done (liveness pings never do), so this isolates the
     # skip-path progress ping from any liveness heartbeat.
     per_sample = [kw for (stage, kw) in beats if stage == "opd_step" and "samples_done" in kw]
-    assert per_sample, "an all-skip step emitted no per-sample opd_step ping -> stall clock unrefreshed"
+    assert per_sample, (
+        "an all-skip step emitted no per-sample opd_step ping -> stall clock unrefreshed"
+    )
     assert all(kw.get("step") == 0 for kw in per_sample), (
         "skip-path ping must report opt_steps (0 during the first, still-accumulating step) so the "
         "poller keeps the wide setup grace instead of the tight training window"
     )
+
+
+def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
+    """Regression (codex[bot], opd.py): _student_model builds the LoRA via get_peft_model, which
+    samples the LoRA A matrix (init_lora_weights=True) from the torch default generator. run_opd must
+    seed torch BEFORE that call, else the fixed Flash seed can't reproduce the adapter init
+    run-to-run. Record the order of torch.manual_seed vs the _student_model call."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    order: list[str] = []
+
+    class _Tok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+        pad_token_id = 0
+
+        def apply_chat_template(self, messages, **kw):
+            return "PROMPT"
+
+        def __call__(self, text, add_special_tokens=False):
+            return SimpleNamespace(input_ids=[1, 2])  # within budget
+
+    class _Model(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=4, V=8)
+            self.config = SimpleNamespace(use_cache=False)
+
+    env = SimpleNamespace(
+        dataset=lambda: [{"q": "a"}],
+        prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
+    )
+    fake_w = SimpleNamespace(
+        require_active_env=lambda: env,
+        JOB_SPEC=SimpleNamespace(
+            train=SimpleNamespace(init_from_adapter=""),
+            model="fake/model",
+            gpu=SimpleNamespace(type=None),
+        ),
+        THINKING=False,
+        SEED=1234,
+        heartbeat=lambda stage, **kw: None,
+        prefetch_model=lambda mid: 0.0,
+        hf_resume_checkpoint=lambda: "",
+        publish_deployable_checkpoint=lambda *a, **k: None,
+        hf_upload_folder=lambda *a, **k: None,
+        write_train_meta=lambda **k: None,
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: {
+            "teacher_model": "accounts/fireworks/models/glm-5p2",
+            "teacher_base_url": "http://teacher.invalid",
+            "steps": 1,
+            "learning_rate": 1e-4,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "max_completion": 8,
+            "prompts_per_step": 1,
+            "group_size": 1,
+            "kl_coef": 1.0,
+            "save_every": 0,
+            "max_length": 0,
+            "stop_sequences": (),
+        },
+    )
+
+    def _rec_student(*a, **k):
+        order.append("student_model")
+        return _Model()
+
+    monkeypatch.setattr(opd_mod, "_student_model", _rec_student)
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(opd_mod, "_train_one", lambda **k: None)
+
+    real_manual_seed = torch.manual_seed
+
+    def _rec_seed(s):
+        order.append(f"manual_seed:{s}")
+        return real_manual_seed(s)
+
+    monkeypatch.setattr(torch, "manual_seed", _rec_seed)
+
+    import transformers
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok())
+    import flash.engine.worker.teacher as tmod
+
+    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
+    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+
+    with pytest.raises(RuntimeError, match="no trained step"):
+        opd_mod.run_opd()
+
+    assert "student_model" in order
+    assert f"manual_seed:{fake_w.SEED}" in order
+    assert order.index(f"manual_seed:{fake_w.SEED}") < order.index("student_model"), (
+        "torch.manual_seed(SEED) must run BEFORE _student_model builds the LoRA (LoRA A determinism)"
+    )
+
+
+def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
+    """Regression (codex[bot], opd.py): when every prompt exceeds the context budget the run fails
+    deterministically — and that guard must fire BEFORE _student_model, which for a VL warm-start
+    downloads the base and MERGES the SFT into it. Otherwise a misconfigured dataset pays for a full
+    model load before failing. Trip if _student_model is reached."""
+    pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+        pad_token_id = 0
+
+        def apply_chat_template(self, messages, **kw):
+            return "PROMPT"
+
+        def __call__(self, text, add_special_tokens=False):
+            return SimpleNamespace(input_ids=[1] * 100000)  # every prompt is over budget
+
+    env = SimpleNamespace(
+        dataset=lambda: [{"q": "a"}, {"q": "b"}],
+        prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
+    )
+    fake_w = SimpleNamespace(
+        require_active_env=lambda: env,
+        JOB_SPEC=SimpleNamespace(
+            train=SimpleNamespace(init_from_adapter=""),
+            model="fake/model",
+            gpu=SimpleNamespace(type=None),
+        ),
+        THINKING=False,
+        SEED=0,
+        heartbeat=lambda stage, **kw: None,
+        prefetch_model=lambda mid: 0.0,
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: {
+            "teacher_model": "accounts/fireworks/models/glm-5p2",
+            "teacher_base_url": "http://teacher.invalid",
+            "steps": 1,
+            "learning_rate": 1e-4,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "max_completion": 8,
+            "prompts_per_step": 1,
+            "group_size": 1,
+            "kl_coef": 1.0,
+            "save_every": 0,
+            "max_length": 0,
+            "stop_sequences": (),
+        },
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("_student_model was loaded before the all-over-budget guard fired")
+
+    monkeypatch.setattr(opd_mod, "_student_model", _boom)
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
+
+    import transformers
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok())
+    import flash.engine.worker.teacher as tmod
+
+    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
+    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+
+    # The all-over-budget guard (RuntimeError) must fire; _student_model's AssertionError would
+    # escape pytest.raises(RuntimeError) and fail the test (its "before the fix" behavior).
+    with pytest.raises(RuntimeError, match="every prompt exceeds"):
+        opd_mod.run_opd()
 
 
 def test_student_model_accepts_vl_warmstart_without_raising(monkeypatch):
@@ -603,6 +844,33 @@ def test_teacher_score_raises_on_malformed_response(monkeypatch):
     with pytest.raises(TeacherError) as ei:
         client.score("", "hi")
     assert ei.value.permanent is True  # malformed response -> abort the run, not skip-and-burn
+
+
+def test_teacher_score_treats_mismatched_array_lengths_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): a 200 response whose tokens / token_logprobs / text_offset
+    arrays disagree in length would IndexError inside the per-token loop and escape as a generic
+    (non-TeacherError) exception — which _train_one's broad `except Exception` treats as a TRANSIENT
+    skip, so a teacher that consistently returns malformed arrays burns every OPD step before the run
+    fails with "no trained step". A length mismatch is a broken contract -> PERMANENT (abort now)."""
+    from flash.engine.worker.teacher import TeacherError
+
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["a", "b", "c"],  # 3 tokens ...
+                    "token_logprobs": [0.0, -1.0],  # ... but only 2 logprobs (malformed)
+                    "text_offset": [0, 1, 2],
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(TeacherError) as ei:
+        client.score("", "abc")
+    assert ei.value.permanent is True
+    assert "length" in str(ei.value).lower()
 
 
 def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
