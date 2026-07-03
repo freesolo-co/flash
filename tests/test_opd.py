@@ -173,6 +173,34 @@ def test_student_tokens_do_not_over_merge_a_genuine_replacement_char():
     assert (toks[1].start, toks[1].end) == (1, 2)
 
 
+def test_student_tokens_offsets_decode_is_not_quadratic():
+    """Regression (codex[bot], opd.py): offsets must be built by decoding a SMALL window per step, not
+    the whole growing prefix ids[:i+1] (which was O(len^2) and dominated CPU on long completions).
+    Assert the longest id-slice handed to tok.decode stays bounded regardless of completion length."""
+    from flash.engine.worker.opd import student_tokens_with_offsets
+
+    class _Tok:
+        def __init__(self):
+            self.max_ids = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            ids = list(ids)
+            self.max_ids = max(self.max_ids, len(ids))
+            return "".join("abcdefghij"[int(x) % 10] for x in ids)  # 1 char/id, no split chars
+
+    tok = _Tok()
+    n = 200
+    ids = list(range(n))
+    text = "".join("abcdefghij"[i % 10] for i in ids)
+    out_ids, toks = student_tokens_with_offsets(tok, ids, text)
+    assert out_ids == ids
+    assert len(toks) == n
+    # each step decodes only its own ~1-token window -> max slice is tiny, NOT ~n (a prefix decode).
+    assert tok.max_ids <= 2, f"decode saw up to {tok.max_ids} ids -> quadratic prefix decoding"
+    assert (toks[0].start, toks[0].end) == (0, 1)
+    assert (toks[-1].start, toks[-1].end) == (n - 1, n)  # offsets still correct
+
+
 def test_trim_trailing_stop_drops_delimiter_from_ids_and_text():
     from flash.engine.worker.opd import _trim_trailing_stop
 
@@ -759,6 +787,23 @@ def test_opd_vram_thinking_completion_default_not_underbudgeted():
     non_think = estimate_vram_gb(4.0, "opd", "bf16", thinking=False, **kw)  # completion=512
     think = estimate_vram_gb(4.0, "opd", "bf16", thinking=True, **kw)  # completion=1536, not 1024
     assert think > non_think  # thinking's longer completion budgets strictly more logits
+
+
+def test_opd_vram_is_single_sequence_not_batch_scaled():
+    """Regression (codex[bot], vram.py): run_opd backprops ONE completion at a time (_train_one), so
+    opd's VRAM estimate must NOT scale its activations with batch_size (the SFT per-device micro-batch
+    term over-budgeted opd and bumped the GPU tier). At a short seq_len where SFT packs a batch, opd's
+    estimate stays flat across batch_size while SFT's grows."""
+    from flash.engine.vram import estimate_vram_gb
+
+    kw = {"seq_len": 1024, "vocab": 248_320, "lora_rank": 16}
+    opd_bs1 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, **kw)
+    opd_bs16 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=16, **kw)
+    assert opd_bs1 == opd_bs16  # single-sequence: batch_size does not change opd VRAM
+    # contrast: SFT at the same short seq DOES scale with the micro-batch, so the invariant is meaningful.
+    sft_bs1 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=1, **kw)
+    sft_bs16 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=16, **kw)
+    assert sft_bs16 > sft_bs1
 
 
 def test_opd_teacher_rate_matches_fireworks_glm5p2_input_price():

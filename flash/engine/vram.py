@@ -130,7 +130,9 @@ def colocate_kv_util(
     copy + KV; the non-sleep path uses the leaner resident-KV target (_KV_CAP). MEASURED at
     4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward byte-identical, train_wall neutral; a
     tighter 12 GB budget preempts, confirming this as the floor."""
-    weights_gb = max(0.5, float(params_b or 1.0)) * 2.0  # vLLM's bf16 weight copy lives in the budget
+    weights_gb = (
+        max(0.5, float(params_b or 1.0)) * 2.0
+    )  # vLLM's bf16 weight copy lives in the budget
     # MoE: the KV pool scales with the per-token COMPUTE width (the ~3B active backbone), NOT the 35B
     # total — exactly the split estimate_vram_gb/grpo_fits_resident use (active for KV, full for the
     # weight copy). Keying the KV off total here would budget a LARGER pool than the resident-fit gate
@@ -162,7 +164,9 @@ def colocate_kv_util(
         # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
         # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
         # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
-        kv_gb = max(_KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations, fp8_kv=fp8_kv))
+        kv_gb = max(
+            _KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations, fp8_kv=fp8_kv)
+        )
         return max(0.10, min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
@@ -303,7 +307,9 @@ def estimate_vram_gb(
         if use_vllm:
             _kv_fp8_factor = 0.5 if fp8_kv else 1.0  # fp8 KV halves bytes/token (cc>=8.9)
             if sleep_offload:
-                rollout = weights + min(_KV_COEF * (seq_len / 1024.0) * width * _kv_fp8_factor, _KV_CAP)
+                rollout = weights + min(
+                    _KV_COEF * (seq_len / 1024.0) * width * _kv_fp8_factor, _KV_CAP
+                )
             else:
                 rollout = weights + _resident_kv_gb(eff_b, seq_len, group_size, fp8_kv=fp8_kv)
         group_factor = max(1.0, (max(1, group_size) / 4.0) ** 0.5)
@@ -313,16 +319,12 @@ def estimate_vram_gb(
         logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + (max(rollout, train) if sleep_offload else rollout + train)
-    fused = sft_logits_fused(params_b, seq_len) if sft_fused_ce is None else bool(sft_fused_ce)
-    pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
-    activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
     if is_opd:
         # opd's gkd loss forward materializes DENSE logits — there is NO fused cross-entropy: the
         # student forward yields full-sequence bf16 logits [seq, vocab], then the completion rows are
         # gathered in fp32 [completion, vocab] for the logsumexp. The SFT fused path budgets ZERO
         # vocab logits for >=3B models, so a long-completion opd job (e.g. max_tokens=8192) would be
-        # sized for an under-capacity card and OOM. Reserve both tensors (opd runs ONE sequence per
-        # forward, so this is per-sequence, not per-device-batch).
+        # sized for an under-capacity card and OOM.
         from flash.engine.recipe import RECIPE
 
         # Mirror opd_rollout_seq_len / run_opd's completion resolution: explicit max_tokens, else the
@@ -331,8 +333,15 @@ def estimate_vram_gb(
         completion = max_tokens or (
             RECIPE.opd.max_completion_len_thinking if thinking else RECIPE.opd.max_completion_len
         )
+        # run_opd backprops ONE completion at a time (_train_one), so the activations + dense logits
+        # are SINGLE-sequence — NOT sft_per_device(batch_size). The batch-size activation term
+        # over-budgeted opd and bumped the GPU tier unnecessarily (reported by codex[bot]).
+        activations = _ACT_COEF * (seq_len / 1024.0) * width
         logits = (seq_len * 2 + completion * 4) * vocab / 1e9
         return base + activations + logits
+    fused = sft_logits_fused(params_b, seq_len) if sft_fused_ce is None else bool(sft_fused_ce)
+    pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
+    activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
     # Don't clamp to budget: pd=1 is irreducible and the logits can exceed the budget at near-2048 ctx.
     logits = 0.0 if fused else pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
     return base + activations + logits
@@ -600,9 +609,7 @@ def model_required_vram_gb(
             # memory for the cache blocks") on a card the training-peak estimate accepted.
             need = max(
                 need,
-                grpo_kv_floor_gb(
-                    params_b or 4.0, seq_len, group_size, active_params_b=active_b
-                ),
+                grpo_kv_floor_gb(params_b or 4.0, seq_len, group_size, active_params_b=active_b),
             )
         return need
     params_b = fetch_hf_params_b(model_id)
@@ -620,9 +627,7 @@ def fetch_hf_params_b(model_id: str) -> float | None:
     try:
         from huggingface_hub import HfApi
 
-        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
-            model_id, expand=["safetensors"]
-        )
+        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(model_id, expand=["safetensors"])
         total = getattr(getattr(info, "safetensors", None), "total", None)
         if total:
             return float(total) / 1e9

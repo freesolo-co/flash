@@ -116,18 +116,20 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     i = 0
     while i < len(ids):
         j = i
-        # Extend over consecutive byte-ids whose combined decode is still mid-multi-byte-char: a
-        # byte-level tokenizer renders an INCOMPLETE char as a trailing U+FFFD that is NOT yet present
-        # in completion_text (which already holds the fully-decoded chars), so the bytes only form a
-        # real char once the next id arrives. A token that LEGITIMATELY decodes to U+FFFD (the model
-        # actually emitted the replacement glyph) is already reflected in completion_text -- decode(...)
-        # is a prefix of it -- so we must NOT over-merge the following token into this span (cursor[bot]).
+        # Grow the window over a split multi-byte char, decoding ONLY the window from the current
+        # boundary (ids[i:j+1]) \u2014 never the whole prefix ids[:j+1] \u2014 so total decoding is O(len), not
+        # O(len^2) (reported by codex[bot]; the quadratic bites once max_tokens raises completions to
+        # 1000s of tokens). A byte-level tokenizer renders an INCOMPLETE char as a trailing U+FFFD that
+        # is NOT the real char at completion_text[prev:]; a genuine U+FFFD the model emitted DOES match
+        # there (startswith from prev), so we stop and keep it as its own span, not over-merged.
         while j + 1 < len(ids):
-            dec = tok.decode(ids[: j + 1], skip_special_tokens=True)
-            if not dec.endswith("\ufffd") or completion_text.startswith(dec):
+            dec = tok.decode(ids[i : j + 1], skip_special_tokens=True)
+            if not dec.endswith("\ufffd") or completion_text.startswith(dec, prev):
                 break
             j += 1
-        end = min(n, max(prev, len(tok.decode(ids[: j + 1], skip_special_tokens=True))))
+        # end = the boundary offset prev + the char length of THIS window's decode (equals
+        # len(decode(ids[:j+1])) because the window starts at a committed char boundary).
+        end = min(n, max(prev, prev + len(tok.decode(ids[i : j + 1], skip_special_tokens=True))))
         toks.extend(StudentToken(token_id=ids[k], start=prev, end=end) for k in range(i, j + 1))
         prev = end
         i = j + 1
@@ -193,7 +195,11 @@ def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     for s_idx, teacher_logsum in groups:
         if not s_idx:  # defensive: a teacher-only span carries no student token to supervise
             continue
-        student_logsum_det = float(sum(sp[j].detach() for j in s_idx))
+        # Keep the detached group logprob sum ON-DEVICE — NO float(): float() forces a CUDA->CPU sync
+        # per alignment group, i.e. thousands of tiny device syncs on a long sample (reported by
+        # codex[bot]). teacher_logsum is a Python float, so (device tensor - float) stays a 0-dim
+        # device tensor and coeff * sp[j] never leaves the GPU; the only sync is the final .mean().
+        student_logsum_det = sum(sp[j].detach() for j in s_idx)
         # coeff > 0 where the student is MORE confident than the teacher on the span (push down);
         # coeff < 0 where the teacher is more confident (push up). Gradient = reverse-KL gradient.
         coeff = kl_coef * (student_logsum_det - teacher_logsum) / len(s_idx)
