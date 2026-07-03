@@ -18,9 +18,9 @@ def _gpu_enum():
 
 def gpu_classes() -> list[GpuClass]:
     """The GPU classes RunPod Flash can provision (those with a ``GpuType`` member)."""
-    from flash.providers.base import GPU_INFO
+    from flash.providers.base import gpu_classes_for
 
-    return [g for g in GPU_INFO.values() if g.enum_member]
+    return gpu_classes_for("enum_member")
 
 
 def flash_gpu(name: str):

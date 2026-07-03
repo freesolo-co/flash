@@ -134,13 +134,19 @@ def _raise_capacity_blip(*a, **k):
 
 
 def _stub_alloc(monkeypatch, *, runpod, lambda_, vast):
-    from flash.providers import allocator
+    from flash.providers import allocator, get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
-    monkeypatch.setattr(allocator, "_runpod_candidates", runpod)
-    monkeypatch.setattr(allocator, "_lambda_candidates", lambda_)
-    monkeypatch.setattr(allocator, "_vast_candidates", vast)
+    # allocate() now sources each provider's candidates via provider.live_candidates(need, constraints);
+    # adapt the per-provider stubs (runpod/lambda take need; vast takes need + disk/wall) onto that seam.
+    monkeypatch.setattr(get_provider("runpod"), "live_candidates", lambda need, constraints: runpod(need))
+    monkeypatch.setattr(get_provider("lambda"), "live_candidates", lambda need, constraints: lambda_(need))
+    monkeypatch.setattr(
+        get_provider("vast"),
+        "live_candidates",
+        lambda need, constraints: vast(need, constraints.disk_gb, constraints.max_wall_seconds),
+    )
 
 
 def test_transient_capacity_blip_is_retryable_not_terminal(monkeypatch):
@@ -545,7 +551,8 @@ def test_vast_candidates_searches_at_effective_disk(monkeypatch):
     # (max(disk_gb, MIN_DISK_GB)) the submit path provisions with — else a high-disk run is advertised
     # Vast capacity that only exists at the 60 GB floor and then can't actually rent (an impossible
     # attempt a max_retries=0 run never escapes).
-    from flash.providers import allocator
+    from flash.providers import get_provider
+    from flash.providers.base import AllocationConstraints
     from flash.providers.vast import jobs as vast_jobs
 
     captured = {}
@@ -555,11 +562,12 @@ def test_vast_candidates_searches_at_effective_disk(monkeypatch):
         return []
 
     monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
-    allocator._vast_candidates(16)  # default -> floored at MIN_DISK_GB
+    vast = get_provider("vast")
+    vast.live_candidates(16, AllocationConstraints())  # default -> floored at MIN_DISK_GB
     assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB
-    allocator._vast_candidates(16, disk_gb=200.0)  # high-disk run searches at the request
+    vast.live_candidates(16, AllocationConstraints(disk_gb=200.0))  # high-disk run searches at the request
     assert captured["disk_gb"] == 200.0
-    allocator._vast_candidates(16, disk_gb=10.0)  # below the floor still clamps up
+    vast.live_candidates(16, AllocationConstraints(disk_gb=10.0))  # below the floor still clamps up
     assert captured["disk_gb"] == vast_jobs.MIN_DISK_GB
 
 
@@ -567,7 +575,8 @@ def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
     # Codex Msvb0: the allocator's Vast capacity search must thread the run's wall cap so usable_offers
     # applies the duration floor — else the allocator advertises Vast classes whose only live offers
     # expire before the run finishes (fatal for a max_retries=0 run).
-    from flash.providers import allocator
+    from flash.providers import get_provider
+    from flash.providers.base import AllocationConstraints
     from flash.providers.vast import jobs as vast_jobs
 
     captured = {}
@@ -577,7 +586,8 @@ def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
         return []
 
     monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
-    allocator._vast_candidates(16)  # default -> no deadline threaded (0 = duration filter off)
+    vast = get_provider("vast")
+    vast.live_candidates(16, AllocationConstraints())  # default -> no deadline threaded (0 = duration filter off)
     assert captured["max_wall_seconds"] == 0.0
-    allocator._vast_candidates(16, max_wall_seconds=7200.0)  # long run threads its wall cap
+    vast.live_candidates(16, AllocationConstraints(max_wall_seconds=7200.0))  # long run threads its wall cap
     assert captured["max_wall_seconds"] == 7200.0

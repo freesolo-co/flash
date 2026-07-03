@@ -194,7 +194,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 owner_key_id=owner_key_id,
             )
             if code_prefix is None:
-                from flash.providers.runpod.train import upload_code
+                from flash.providers._worker import upload_code
                 from flash.runner import flash_code_prefix
 
                 code_prefix = flash_code_prefix()
