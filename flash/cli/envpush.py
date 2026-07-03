@@ -187,7 +187,11 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         "source",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"dataset"})
+# ``dataset`` is what ``flash env setup`` scaffolds; ``datasets`` (plural) is the more common
+# convention users reach for by hand. Accept both so a data dir under either name ships in the
+# tarball — a name outside this allowlist is silently dropped, which would train the worker on
+# missing rows.
+_ENV_PUSH_SIDECAR_DIRS = frozenset({"dataset", "datasets"})
 # ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
 # user-authored README/NOTES) travels with the env into the hub and back out through
 # ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
