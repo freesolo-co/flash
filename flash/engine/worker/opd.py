@@ -59,9 +59,19 @@ def _resolve_opd_knobs():
         opt("max_tokens", 0)
         or (d.max_completion_len_thinking if _w.THINKING else d.max_completion_len)
     )
-    # Honor an explicit kl_penalty_coef=0.0 (a plain `or` would treat 0.0 as unset).
+    # kl_penalty_coef IS the gkd distillation objective's scale: gkd_loss multiplies every span
+    # coefficient by it, so kl_coef=0 makes EVERY backward a zero gradient while the loop still counts
+    # opt_steps and would publish/charge a fully-untrained adapter. The shared schema allows 0 for GRPO
+    # (a valid "no KL penalty"), but for OPD it must be positive, so reject an explicit 0 here (a plain
+    # `or` would also wrongly treat 0.0 as unset). Omitting the field uses the positive recipe default.
     _kl = opt("kl_penalty_coef", None)
     kl_coef = float(_kl if _kl is not None else d.kl_coef)
+    if kl_coef == 0.0:
+        raise RuntimeError(
+            "opd: [train] kl_penalty_coef must be > 0 — it scales the gkd distillation objective, so "
+            "0 makes every optimizer step a no-op (zero gradient) yet still counts toward `steps` and "
+            "publishes an untrained adapter. Omit the field to use the default, or set a positive value."
+        )
     return {
         "teacher_model": opt("teacher_model", "") or d.teacher_model,
         "teacher_base_url": d.teacher_base_url,

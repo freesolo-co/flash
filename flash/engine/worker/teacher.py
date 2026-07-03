@@ -65,8 +65,16 @@ class TeacherClient:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
-                # Retry transient server/rate-limit errors; fail fast on 4xx client errors.
-                body_txt = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
+                # Retry transient server/rate-limit errors; fail fast on 4xx client errors. Guard the
+                # error-body preview read: a retryable 429/5xx whose body is truncated or times out
+                # makes e.read() raise IncompleteRead/OSError BEFORE last_err is set, so it would
+                # escape the loop as a generic exception that _train_one swallows without classifying
+                # (last_teacher_status stays None) — repeated retryable errors then end as permanent
+                # no-signal instead of a retriable outage. Classify by e.code regardless (codex[bot]).
+                try:
+                    body_txt = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
+                except (http.client.IncompleteRead, OSError):
+                    body_txt = "<error body unavailable>"
                 retryable = e.code in (408, 409, 425, 429, 500, 502, 503, 504)
                 last_err = TeacherError(
                     f"teacher HTTP {e.code} on {path}: {body_txt}", permanent=not retryable
@@ -155,6 +163,25 @@ class TeacherClient:
                 f"token_logprobs={len(token_logprobs)}, text_offset={len(offsets)}",
                 permanent=True,
             )
+        # The loop coerces each offset with int(offsets[i]). A malformed 200 can still put a
+        # non-numeric value in text_offset (e.g. [0, null] or [0, "bad"]) that passes the list/length
+        # guards above -- int() then raises TypeError/ValueError OUTSIDE any TeacherError, so _train_one
+        # swallows it as an unclassified skip and a consistently malformed teacher burns every OPD step
+        # (codex[bot]). Validate the offsets are numeric (bools excluded) and non-decreasing up front
+        # and reject as a PERMANENT contract break. token_logprobs[i] may still be null (handled below).
+        prev_off = None
+        for o in offsets[:n]:
+            if isinstance(o, bool) or not isinstance(o, (int, float)):
+                raise TeacherError(
+                    f"teacher echo response text_offset has a non-numeric value: {o!r}",
+                    permanent=True,
+                )
+            if prev_off is not None and o < prev_off:
+                raise TeacherError(
+                    f"teacher echo response text_offset is not non-decreasing: {prev_off!r} -> {o!r}",
+                    permanent=True,
+                )
+            prev_off = o
         out: list[TeacherToken] = []
         for i in range(n):
             start = int(offsets[i])

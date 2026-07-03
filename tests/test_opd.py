@@ -1580,6 +1580,96 @@ def test_train_one_refreshes_stall_clock_between_generation_and_scoring():
     assert order == ["heartbeat", "score"], f"heartbeat must precede teacher scoring; got {order}"
 
 
+def test_teacher_score_rejects_non_numeric_or_unordered_offsets_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py:161): a malformed 200 can put a non-numeric (null / string)
+    or out-of-order value in text_offset that passes the list/length guards; int(offsets[i]) would then
+    raise TypeError/ValueError OUTSIDE TeacherError and _train_one swallows it as an unclassified skip,
+    burning every OPD step on a broken teacher. Validate offsets up front and reject as PERMANENT."""
+    from flash.engine.worker.teacher import TeacherError
+
+    def _payload(offsets):
+        return {
+            "choices": [
+                {
+                    "logprobs": {
+                        "tokens": ["P", "hi"],
+                        "token_logprobs": [0.0, -0.5],
+                        "text_offset": offsets,
+                    }
+                }
+            ]
+        }
+
+    for bad, needle in (([0, None], "non-numeric"), ([0, "x"], "non-numeric"), ([5, 1], "non-decreasing")):
+        _mock_urlopen(monkeypatch, _payload(bad))
+        client = TeacherClient("k", "https://api.example/v1", "glm")
+        with pytest.raises(TeacherError) as ei:
+            client.score("P", "hi")
+        assert ei.value.permanent is True, f"{bad!r} must be PERMANENT"
+        assert needle in str(ei.value).lower()
+
+
+def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkeypatch):
+    """Regression (codex[bot], teacher.py:62): a retryable 5xx whose error body is truncated makes
+    e.read() raise IncompleteRead BEFORE last_err is set — without a guard it escapes _post as a generic
+    exception that _train_one skips without classifying, so repeated retryable errors end as permanent
+    no-signal. The preview read must be guarded and the error still classified by e.code."""
+    import http.client
+    import urllib.error
+
+    import flash.engine.worker.teacher as tm
+    from flash.engine.worker.teacher import TeacherError
+
+    class _BadBodyHTTPError(urllib.error.HTTPError):
+        def read(self, *a, **k):
+            raise http.client.IncompleteRead(b"", 10)
+
+    err = _BadBodyHTTPError("http://x", 503, "Service Unavailable", {}, None)
+    err.fp = object()  # force the `if e.fp` branch so the guarded read() is attempted
+
+    def raise_503(req, timeout=None):
+        raise err
+
+    monkeypatch.setattr(tm.urllib.request, "urlopen", raise_503)
+    monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hi")
+    assert ei.value.permanent is False  # 503 retryable -> transient TeacherError, not a raw exception
+    assert "503" in str(ei.value)
+
+
+def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
+    """Regression (codex[bot], opd.py:64): kl_penalty_coef scales the gkd objective, so an explicit 0
+    (allowed by the shared schema for GRPO) makes every OPD backward a zero gradient while opt_steps
+    still advances -> a fully-untrained adapter is published/charged. _resolve_opd_knobs must reject 0;
+    omitting the field (None) still resolves to the positive recipe default."""
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:  # any [train] field not set returns None (falls back to the recipe default)
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+        def __getattr__(self, name):
+            return None
+
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=0.0)), THINKING=False),
+    )
+    with pytest.raises(RuntimeError, match="kl_penalty_coef must be > 0"):
+        opd_mod._resolve_opd_knobs()
+
+    # unset (None) -> positive recipe default, no raise.
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=None)), THINKING=False),
+    )
+    assert opd_mod._resolve_opd_knobs()["kl_coef"] > 0.0
+
+
 def test_gkd_loss_skips_empty_student_group_without_crashing():
     # A group with an empty student-index list (a teacher-only span) must be skipped, not divide by
     # zero in the per-span coefficient (len(s_idx) == 0).
