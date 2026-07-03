@@ -257,6 +257,7 @@ def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
 
     uploads: list = []
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(ne, "_HB_FORCED_MIN_INTERVAL_S", 0.0)  # force always bypasses here
     monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
     ne._HB_LAST_UPLOAD = 0.0
     ne.heartbeat("opd_step", step=5, samples_done=1)  # mid-step ping claims the slot (stale step 5)
@@ -265,6 +266,25 @@ def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
     assert len(uploads) == 1, "a non-forced opd_step within the interval must be throttled"
     ne.heartbeat("opd_step", step=6, loss=0.1, coverage=1.0, force=True)  # post-update forces through
     assert len(uploads) == 2, "force=True must commit the stepped post-update ping despite the throttle"
+
+
+def test_forced_opd_step_heartbeat_is_rate_limited_to_forced_interval(monkeypatch):
+    """Regression (codex[bot], heartbeat.py): force=True must NOT commit unboundedly. A many-short-step
+    OPD run forcing every post-update past the 900s throttle would blow the HF per-repo commit cap and
+    starve the terminal/adapter upload. Forced commits are floored to _HB_FORCED_MIN_INTERVAL_S, so a
+    burst of forced pings within that window commits only ONCE."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCED_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    # First forced ping commits (nothing on record yet); the next forced pings, all within the 60s
+    # forced-interval, must be bounded out — proving fast-step forcing can't blow the commit cap.
+    for stepv in (1, 2, 3, 4):
+        ne.heartbeat("opd_step", step=stepv, loss=0.1, force=True)
+    assert len(uploads) == 1, "forced opd_step commits must be floored to _HB_FORCED_MIN_INTERVAL_S"
 
 
 def test_setup_liveness_upload_uses_shorter_interval(monkeypatch):

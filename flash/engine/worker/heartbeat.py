@@ -120,12 +120,17 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             interval_s = _w._HB_MIN_INTERVAL_S
             if stage in _HB_SETUP_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
-            # ``force`` bypasses the per-stage throttle (but not TERMINAL_ONLY mode, handled above): a
-            # caller uses it when THIS heartbeat's payload must be the one on record and a throttled
-            # drop would leave a STALE value committed. opd's post-optimizer-step ping forces so a
-            # mid-step progress ping (carrying the previous opt_steps) that just claimed the throttle
-            # slot can't suppress the stepped commit -- otherwise a cancel is billed from the stale step.
-            upload_due = force or not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
+            upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
+            # ``force`` bypasses the per-stage throttle (but not TERMINAL_ONLY mode, handled above) when
+            # THIS heartbeat's payload must be the one on record and a throttled drop would leave a STALE
+            # value committed -- opd's post-optimizer-step ping forces so a mid-step progress ping
+            # (carrying the previous opt_steps) that just claimed the slot can't suppress the stepped
+            # commit (else a cancel is billed from the stale step). But forcing is itself floored to
+            # _HB_FORCED_MIN_INTERVAL_S so a many-short-step run can't force a commit PER step and blow
+            # the HF commit cap / starve the terminal upload -- billing then stays at most that interval
+            # stale instead of up to the full 900s throttle.
+            if force and not upload_due and (now - _w._HB_LAST_UPLOAD) >= _w._HB_FORCED_MIN_INTERVAL_S:
+                upload_due = True
         prev_last_upload = _w._HB_LAST_UPLOAD
         if upload_due:
             _HB_CLAIM_SEQ += 1

@@ -225,26 +225,26 @@ class TeacherClient:
                     f"teacher echo response token_logprobs has a non-finite value: {lp!r}",
                     permanent=True,
                 )
-        # The echoed tokens must TILE `full` contiguously: each token's own text must span exactly from
-        # its offset to the NEXT token's offset (and the last token to len(full)). The emit loop below
-        # takes token i's end from offsets[i+1] (or len(full) for the last), so ANY gap or overlap --
-        # offsets[i+1] != offsets[i] + len(tokens[i]) -- stretches/shrinks that token's span onto text the
-        # teacher never scored for it, fabricating a completion span when the mismatch straddles plen: an
-        # INTERIOR gap, or a TRUNCATED echo whose last token falls short of len(full). Checking only the
-        # final token (the old guard) misses interior breaks, so validate the WHOLE tiling here. The
-        # token text is the literal echoed substring and text_offset is in the same char units (verified
-        # against the live GLM echo: composed multi-byte chars tile, and a char split across byte-tokens
-        # appears as zero-width tokens at the shared offset -- so this does NOT false-positive on
-        # unicode), and reject any break as PERMANENT (codex[bot]).
+        # The echoed tokens must TILE `full` contiguously: each token's TEXT must equal the substring it
+        # claims to span, full[offsets[i] : offsets[i+1]] (the last token to len(full)). The emit loop
+        # below takes token i's end from offsets[i+1] (or len(full) for the last), so comparing the token
+        # text to that exact substring catches EVERY way the echo can lie about a span and then have its
+        # logprob trained on the wrong text: an interior gap/overlap or a truncated last token (length
+        # changes), AND a same-length-but-different token (a malformed 200 echoing wrong tokens over the
+        # right offsets — a length-only check would miss it). Verified against the live GLM echo that
+        # composed + split multi-byte chars and JSON/regex-escaped mongo filters all echo as EXACT
+        # literal substrings tiling char-for-char (a split char appears as zero-width tokens at the
+        # shared offset), so this does NOT false-positive on real completions; a mismatch is a broken
+        # teacher contract, rejected as PERMANENT (codex[bot]).
         for i in range(n):
-            tok_end = int(offsets[i]) + len(str(tokens[i]))
+            start = int(offsets[i])
             boundary = int(offsets[i + 1]) if i + 1 < n else full_len
-            if tok_end != boundary:
-                kind = "is truncated" if i == n - 1 else "has a gap/overlap"
+            expected = full[start:boundary]
+            if str(tokens[i]) != expected:
                 raise TeacherError(
-                    f"teacher echo {kind}: token {i} text ends at char {tok_end} but the next "
-                    f"boundary is {boundary} — the echo does not tile the full prompt+completion, so "
-                    "the token span would be fabricated.",
+                    f"teacher echo does not tile the input at token {i}: token text "
+                    f"{str(tokens[i])!r} != echoed substring full[{start}:{boundary}]={expected!r} "
+                    "(gap/overlap/truncation or a non-literal echo); its span would be fabricated.",
                     permanent=True,
                 )
         out: list[TeacherToken] = []

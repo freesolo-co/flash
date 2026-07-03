@@ -150,6 +150,12 @@ _HB_LAST_PROGRESS_TS = 0.0
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
 # per-repo commit cap while staying under the provider poller's 1200s training stall window.
 _HB_MIN_INTERVAL_S = 900.0
+# A force=True heartbeat (opd's post-optimizer-step ping) bypasses the 900s throttle so a cancel isn't
+# billed from a stale mid-step step — but forced commits are themselves floored to this interval so a
+# many-short-step OPD run can't force hundreds of commits/hr past the HF per-repo cap and starve the
+# terminal/adapter uploads. 60s -> at most ~60 forced commits/hr, billing at most ~60s (a few steps)
+# stale — far better than the up-to-900s throttle staleness, and safely under the 128/hr cap.
+_HB_FORCED_MIN_INTERVAL_S = 60.0
 # Setup liveness is the user-visible signal during cold model download/load. Keep it below common
 # external "frozen heartbeat" thresholds without relaxing the noisy per-step training throttle.
 _HB_SETUP_LIVENESS_INTERVAL_S = 240.0

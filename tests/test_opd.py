@@ -858,6 +858,23 @@ def test_thinking_prefill_derives_opener_from_hybrid_template(monkeypatch):
     assert opd_mod._thinking_prefill_text(_HybridTok()) == "<think>\n"
 
 
+def test_thinking_prefill_recovers_opener_from_closed_block_hybrid(monkeypatch):
+    """Regression (codex[bot]/cursor, opd.py): a HYBRID template that disables thinking by force-CLOSING
+    the block — enable_thinking=False -> '...<think></think>\\n', enable_thinking=True -> '...<think>\\n'
+    — shares '<think>' in BOTH renders, so the common-prefix delta eats it and the previous fix returned
+    only '\\n'. The student still pre-fills '<think>\\n', so the teacher must condition on the full
+    opener; recover it from base's closing tag."""
+    from flash.engine.worker import opd as opd_mod
+
+    class _ClosedBlockTok:
+        def apply_chat_template(self, messages, *, enable_thinking, **kw):
+            # both open <think>; non-thinking force-closes it with </think>.
+            return "A:\n<think>\n" if enable_thinking else "A:\n<think></think>\n"
+
+    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    assert opd_mod._thinking_prefill_text(_ClosedBlockTok()) == "<think>\n"
+
+
 def test_opd_loop_drives_by_optimizer_updates_and_retries_on_shortfall(monkeypatch):
     """Regression (codex[bot], opd.py:467): the loop must be driven by optimizer UPDATES, not raw
     iterations -- a no-signal iteration skips optimizer.step(), so `for step in range(steps)` could
@@ -1898,7 +1915,34 @@ def test_teacher_score_rejects_truncated_echo_as_permanent(monkeypatch):
     with pytest.raises(TeacherError) as ei:
         client.score("P", "hello")
     assert ei.value.permanent is True
-    assert "truncated" in str(ei.value).lower()
+    assert "does not tile" in str(ei.value).lower()
+
+
+def test_teacher_score_rejects_same_length_wrong_text_token_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): the tiling guard must compare the token TEXT to the echoed
+    substring, not just its LENGTH. A malformed 200 echoing a same-length-but-different token over the
+    right offsets (here 'XY' where full[1:3]=='hi') passes a length-only check yet trains the gkd loss
+    on the wrong token's logprob. full 'P'+'hi'='Phi' (len 3); token 1 'XY' (len 2, == the span length)
+    must still be rejected as PERMANENT because its text isn't the echoed substring."""
+    from flash.engine.worker.teacher import TeacherError
+
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", "XY"],  # len(XY)==len(hi)==2, tiles by length but wrong text
+                    "token_logprobs": [0.0, -0.5],
+                    "text_offset": [0, 1],
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hi")
+    assert ei.value.permanent is True
+    assert "does not tile" in str(ei.value).lower()
 
 
 def test_teacher_score_rejects_interior_tiling_gap_as_permanent(monkeypatch):
@@ -1925,7 +1969,7 @@ def test_teacher_score_rejects_interior_tiling_gap_as_permanent(monkeypatch):
     with pytest.raises(TeacherError) as ei:
         client.score("P", "hiyo")
     assert ei.value.permanent is True
-    assert "gap/overlap" in str(ei.value).lower()
+    assert "does not tile" in str(ei.value).lower()
 
 
 def test_teacher_score_rejects_echo_with_no_completion_tokens_as_permanent(monkeypatch):

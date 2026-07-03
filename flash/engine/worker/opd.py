@@ -132,15 +132,9 @@ def _thinking_prefill_text(tok) -> str:
         )
         if think == base:
             return ""  # template ignores enable_thinking -> plain "Assistant: " already matches
-        # The thinking render inserts a reasoning-block opener the non-thinking render lacks, but it is
-        # NOT always a pure suffix (the old think.startswith(base) test). A HYBRID template disables
-        # thinking by APPENDING a closed empty block to base (base = "...<think></think>...") or inserts
-        # the opener BEFORE shared trailing template text, so base is not a prefix of think and the old
-        # test returned "" -- leaving the teacher prompt without the opener the student pre-filled, so
-        # every reasoning token is scored against the wrong prefix (codex[bot]). Extract the opener as
-        # the think render's UNIQUE MIDDLE: the text between the longest common PREFIX and longest common
-        # SUFFIX of the two renders. "" when the thinking render adds nothing unique (the model opens
-        # <think> itself inside the completion, so the plain "Assistant: " prefix is already correct).
+        # The thinking render opens a reasoning block the non-thinking render doesn't, but it is NOT
+        # always a pure suffix (the old think.startswith(base) test). Compute the longest common PREFIX
+        # and SUFFIX of the two renders; the thinking render's UNIQUE MIDDLE is the opener.
         p = 0
         m = min(len(base), len(think))
         while p < m and base[p] == think[p]:
@@ -148,7 +142,22 @@ def _thinking_prefill_text(tok) -> str:
         s = 0
         while s < len(base) - p and s < len(think) - p and base[-1 - s] == think[-1 - s]:
             s += 1
-        return think[p : len(think) - s]
+        think_mid = think[p : len(think) - s]
+        if think_mid:
+            return think_mid  # opener appended, or inserted before shared trailing template text
+        # think adds nothing UNIQUE yet the renders differ (checked above): a CLOSED-BLOCK hybrid where
+        # enable_thinking=False force-CLOSES the block (base has an extra "</think>..." the open render
+        # lacks) so the shared "<think>" opener the student pre-fills was eaten into the common prefix.
+        # Recover it: if base's unique middle is a closing tag ("</...>"), the opener is its opening form
+        # ("<...>") that ends the common prefix — return it plus the thinking-side trailing text so the
+        # teacher conditions on the same OPEN block instead of the empty prefix the delta alone gives
+        # (codex[bot]/cursor). "" only when the model opens <think> itself inside the completion.
+        base_mid = base[p : len(base) - s]
+        if base_mid.startswith("</") and ">" in base_mid:
+            open_tag = "<" + base_mid[2 : base_mid.index(">") + 1]  # "</think>..." -> "<think>"
+            cut = think.rfind(open_tag, 0, p)
+            if cut != -1:
+                return think[cut:]  # e.g. "<think>\n"
     return ""
 
 
