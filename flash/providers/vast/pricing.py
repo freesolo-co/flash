@@ -26,9 +26,9 @@ _rates_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 def _static_rates() -> dict[str, float]:
     """Offline fallback rate per class with a ``vast_name``: the shared catalog ``GpuClass.hourly_usd``
     (RunPod snapshot), NOT a live Vast price — a rough proxy used only when live pricing is unavailable."""
-    from flash.providers.base import GPU_INFO
+    from flash.providers.base import static_rates_for
 
-    return {name: info.hourly_usd for name, info in GPU_INFO.items() if info.vast_name}
+    return static_rates_for("vast_name")
 
 
 def live_candidate_rates(

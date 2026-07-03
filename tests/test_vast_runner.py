@@ -1243,7 +1243,7 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
     instance destroy to a run-scoped reap (mirroring the submit_run_vast finally). Otherwise a successful
     multi-seed ATTACH that clears ``remote`` and resumes the next seed leaves the box shielded by the
     active-run label and billing, with no persisted handle."""
-    from flash.providers import runpod
+    from flash.providers import _hf_artifacts
     from flash.providers.base import JobHandle, PollResult
     from flash.providers.vast import PROVIDER
     from flash.providers.vast import api as vast_api
@@ -1251,7 +1251,7 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
 
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)  # unconfirmed single destroy
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
-    monkeypatch.setattr(runpod.jobs, "make_hf_heartbeat_reader", lambda *a, **k: None)
+    monkeypatch.setattr(_hf_artifacts, "make_hf_heartbeat_reader", lambda *a, **k: None)
     reaped = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
 
@@ -1263,7 +1263,7 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
 
 def test_provider_poll_recovery_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
     """A confirmed recovery teardown needs no extra run-scoped reap (no redundant list+destroy)."""
-    from flash.providers import runpod
+    from flash.providers import _hf_artifacts
     from flash.providers.base import JobHandle, PollResult
     from flash.providers.vast import PROVIDER
     from flash.providers.vast import api as vast_api
@@ -1271,7 +1271,7 @@ def test_provider_poll_recovery_confirmed_teardown_skips_run_scoped_reap(monkeyp
 
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)  # confirmed
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
-    monkeypatch.setattr(runpod.jobs, "make_hf_heartbeat_reader", lambda *a, **k: None)
+    monkeypatch.setattr(_hf_artifacts, "make_hf_heartbeat_reader", lambda *a, **k: None)
     reaped = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
 

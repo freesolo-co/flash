@@ -232,6 +232,20 @@ def get_gpu_info(name: str) -> GpuClass:
     return _GPU_INFO_ALL[canonical_gpu(name)]
 
 
+def gpu_classes_for(identity_attr: str) -> list[GpuClass]:
+    """Managed GPU classes a provider can provision: those whose per-provider identity field is set
+    (``enum_member`` for RunPod, ``lambda_name`` for Lambda, ``vast_name`` for Vast). One catalog query
+    shared by every provider's ``gpu_classes()`` so the "which classes do I offer" rule can't drift."""
+    return [g for g in GPU_INFO.values() if getattr(g, identity_attr)]
+
+
+def static_rates_for(identity_attr: str) -> dict[str, float]:
+    """Friendly GPU name -> static ``GpuClass.hourly_usd`` for the classes a provider offers (keyed by
+    the same per-provider identity field). The offline/fallback rate snapshot for RunPod and Vast;
+    Lambda keeps its own list-price map because its prices differ from this RunPod-snapshot field."""
+    return {name: info.hourly_usd for name, info in GPU_INFO.items() if getattr(info, identity_attr)}
+
+
 # Slack between a board's REPORTED VRAM and its class nominal (boards under-report: an A100 SXM4 40 GB
 # reports ~40960 MB, an A40 ~46068 MB / 48 GB). vast_gpu_for_offer allows a class whose nominal is at
 # most this far ABOVE the offer's reported RAM, so a real board still matches its class.
@@ -357,6 +371,16 @@ class Allocation:
     candidates: tuple[Candidate, ...]  # full ranked list; retry walks this
 
 
+@dataclass(frozen=True)
+class AllocationConstraints:
+    """Run-scoped extras a capacity/market-aware provider's ``live_candidates`` needs (Vast prices
+    against the run's disk/duration floors) — carried here so they don't leak into ``allocate``'s
+    signature per-provider. RunPod/Lambda ignore them."""
+
+    disk_gb: float = 0.0
+    max_wall_seconds: float = 0.0
+
+
 @runtime_checkable
 class Provider(Protocol):
     """GPU-substrate interface implemented by each provider."""
@@ -377,6 +401,15 @@ class Provider(Protocol):
 
     def hourly_rate(self, gpu: str) -> float:
         """Static $/hr for one friendly GPU name."""
+        ...
+
+    def live_candidates(
+        self, need_vram_gb: int, constraints: AllocationConstraints
+    ) -> list[Candidate]:
+        """GPU-class candidates this provider can actually provision right now for a run needing >=
+        need_vram_gb VRAM. RunPod filters its static table and never raises; capacity/market-aware
+        providers (Lambda/Vast) query live availability and raise CapacityLookupError on a transient
+        lookup blip so allocate() can degrade to the others yet still tell 'no fit' from 'outage'."""
         ...
 
     def submit_run(
@@ -412,6 +445,12 @@ class Provider(Protocol):
     def gc(self, spec: JobSpec) -> None:
         """Best-effort: reap any resource this run may have left registered."""
         ...
+
+    # NOTE: ``supports_weight_cache: bool`` is an OPTIONAL capability attr (read via
+    # ``getattr(prov, "supports_weight_cache", False)``, off this Protocol for the same isinstance
+    # reason as below): True only for the provider that offers the shared weight-cache network volume
+    # (RunPod). The runner gates its one-shot cache-less retry fallback on it; every other provider
+    # defaults False.
 
     # NOTE: ``run_instances_remaining(run_id) -> list[int]`` is an OPTIONAL capability, intentionally
     # NOT declared on this ``@runtime_checkable`` Protocol — adding it would make it a REQUIRED member
