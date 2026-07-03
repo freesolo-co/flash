@@ -598,7 +598,6 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
 def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkeypatch):
     """Happy-path guard: the TOCTOU fix must NOT regress a genuine recovery. A not-ok poll on a
     run that is STILL active (no terminal race) must resume `_run_training` exactly as before."""
-    import flash.providers.runpod.train as flash_train
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -625,7 +624,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
         "_run_training",
         lambda *a, **k: training_calls.__setitem__("n", training_calls["n"] + 1),
     )
-    monkeypatch.setattr(flash_train, "upload_code", lambda repo, *, code_prefix: repo)
+    monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo)
 
     from flash.providers.base import PollResult
 

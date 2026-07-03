@@ -55,7 +55,7 @@ class _RetryBudget:
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     # Lazy import: dry-run / unit tests never construct a Flash endpoint.
-    from flash.providers.runpod.train import upload_code
+    from flash.providers._worker import upload_code
     from flash.runner import (
         RUNS_DIR,
         TERMINAL_STATES,

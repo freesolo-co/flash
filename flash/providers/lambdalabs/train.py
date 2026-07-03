@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from flash.providers.lambdalabs.jobs import build_payload, submit_run_lambda
-from flash.providers.runpod.train import (
+from flash.providers._worker import (
     WORKER_DEPS,
     WORKER_SYSTEM_DEPS,
     build_worker_env,
     resolve_worker_deps,
 )
+from flash.providers.lambdalabs.jobs import build_payload, submit_run_lambda
 
 __all__ = [
     "WORKER_DEPS",

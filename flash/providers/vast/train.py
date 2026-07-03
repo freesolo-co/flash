@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.providers.runpod.train import (
+from flash.providers._worker import (
     WORKER_DEPS,
     WORKER_SYSTEM_DEPS,
     build_worker_env,

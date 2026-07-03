@@ -139,7 +139,7 @@ def build_payload(
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
     ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
     from flash.envs.registry import worker_pip_for_env
-    from flash.providers.runpod.train import (
+    from flash.providers._worker import (
         build_worker_env,
         chalk_extra_pip,
         strip_runpod_volume_env,
