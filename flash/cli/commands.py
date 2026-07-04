@@ -331,15 +331,37 @@ _STARTER_DATASET_MULTITURN_JSONL = """\
 
 
 def cmd_env_setup(args) -> int:
-    multi_turn = getattr(args, "turn_mode", "single") == "multi"
+    requested_multi = getattr(args, "turn_mode", "single") == "multi"
+    starter_env = Path("environment.py")
+    dataset = Path("dataset/train.jsonl")
+    # An existing environment.py is the authoritative signal for which turn mode this
+    # scaffold already uses (the dataset is plain JSONL with no reliable mode marker).
+    # Anchor to it so a re-run never leaves a single-turn env beside a multi-turn
+    # dataset (or vice versa); the flag only decides the mode when starting fresh.
+    existing_multi: bool | None = None
+    anchor = "environment.py"
+    if starter_env.exists():
+        existing_multi = "EnvironmentMultiTurn" in starter_env.read_text(encoding="utf-8")
+    elif dataset.exists():
+        # No env.py to anchor on, but the starter multi-turn dataset carries a
+        # distinctive prompt; use it so we don't drop a single-turn env beside it.
+        existing_multi = "secret whole number" in dataset.read_text(encoding="utf-8")
+        anchor = "dataset/train.jsonl"
+    if existing_multi is not None and existing_multi != requested_multi:
+        have = "multi-turn" if existing_multi else "single-turn"
+        want = "multi-turn" if requested_multi else "single-turn"
+        msg = (
+            f"existing {anchor} is {have}; keeping it and ignoring --{want}. "
+            f"Delete environment.py and dataset/train.jsonl first to re-scaffold as {want}."
+        )
+        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
+    multi_turn = requested_multi if existing_multi is None else existing_multi
     env_py = _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY
     dataset_jsonl = _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
     Path("configs").mkdir(exist_ok=True)
     Path("dataset").mkdir(exist_ok=True)
-    dataset = Path("dataset/train.jsonl")
     if not dataset.exists():
         dataset.write_text(dataset_jsonl)
-    starter_env = Path("environment.py")
     if not starter_env.exists():
         starter_env.write_text(env_py)
     env_comment = (
