@@ -115,7 +115,6 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
     snapshot = json.dumps(payload)
     with _HB_LOCK:
         now = time.time()
-        forced_through = False
         if stage in _HB_TERMINAL_STAGES or stage.startswith("error_"):
             upload_due = True  # never miss a terminal transition
         elif _w._HB_TERMINAL_ONLY:
@@ -152,7 +151,6 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
                     and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
                 ):
                     upload_due = True
-                    forced_through = True
         prev_last_upload = _w._HB_LAST_UPLOAD
         prev_last_step = _w._HB_LAST_COMMITTED_STEP
         prev_last_forced = _w._HB_LAST_FORCED_UPLOAD
@@ -160,7 +158,14 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             _HB_CLAIM_SEQ += 1
             my_claim = _HB_CLAIM_SEQ
             _w._HB_LAST_UPLOAD = now
-            if forced_through:
+            # Arm the forced-commit floor on ANY committing force=True heartbeat -- not only ones the
+            # force branch let through. A force=True ping that commits because the regular throttle was
+            # already due (900s elapsed) still refreshed the persisted step, so the NEXT sub-floor
+            # forced ping must be coalesced; keying this off the force branch alone left the clock stale
+            # and defeated the burst throttle that protects the HF commit cap (cursor[bot]). A non-forced
+            # liveness/mid-step commit deliberately does NOT arm it, so a post-update force still punches
+            # through immediately after one steals the slot.
+            if force:
                 _w._HB_LAST_FORCED_UPLOAD = now
             _committed_step = kw.get("step")
             if isinstance(_committed_step, (int, float)) and _committed_step > _w._HB_LAST_COMMITTED_STEP:

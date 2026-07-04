@@ -182,18 +182,31 @@ def _to_cpu_ids(completion_ids):
     return [int(t) for t in completion_ids]
 
 
-def _is_truncated_rollout(completion_ids, max_completion, eos_id) -> bool:
-    """True when a rollout hit the ``max_completion`` cap WITHOUT emitting EOS — i.e. a completion cut
-    off mid-output rather than one that terminated.
+def _rollout_terminated(completion_ids, completion_text, eos_id, stop_sequences) -> bool:
+    """True iff the rollout ended NATURALLY — the student emitted EOS, or (when stop_sequences are
+    configured) the decoded text ends with a stop delimiter.
 
-    OPD cannot supervise the stop token (the teacher's and student's EOS differ and are both zero-width
-    in the text-span alignment, so EOS gets no gradient), so distilling a cap-hit fragment reinforces
-    non-terminating output that reverse-KL can never teach the student to end — a driver of the eval's
-    unterminated-JSON parse failures. A ``stop_sequence`` halt or a natural EOS both leave the rollout
-    shorter than the cap or containing EOS, so neither trips this."""
-    return len(completion_ids) >= int(max_completion) and (
-        eos_id is None or eos_id not in completion_ids
-    )
+    HF ``generate`` halts on four conditions — EOS, a ``stop_strings`` match, the ``max_new_tokens``
+    cap, or the ``gen_cfg.max_time`` wall-clock bound — and only the first two are natural completions.
+    A cap hit OR a max_time cut leaves the output cut off mid-JSON. OPD cannot supervise the stop token
+    (the teacher's and student's EOS differ and are both zero-width in the text-span alignment, so EOS
+    gets no gradient), so distilling such a fragment reinforces non-terminating output that reverse-KL
+    can never teach the student to end — a driver of the eval's unterminated-JSON parse failures. The
+    caller skips anything that isn't terminated (codex[bot]).
+
+    EOS is checked on the IDS (``completion_text`` is decoded with ``skip_special_tokens=True``, so EOS
+    isn't visible there). The stop delimiter IS in the raw text — HF emits it before halting — matched
+    with the same trailing-``endswith`` semantics ``_trim_trailing_stop`` uses to remove it, so a
+    stop-terminated rollout is recognised even when the delimiter lands as the final token AT the cap
+    (which a length-only check wrongly discarded). Fail OPEN only when NO termination signal exists at
+    all (no eos_token_id AND no stop_sequences): we then can't tell a finished answer from a cut-off one,
+    so we distil rather than skip every rollout. Real tokenizers always define eos_token_id, so in
+    production a cap/max_time cut without EOS or a stop delimiter correctly returns False (skip)."""
+    if eos_id is not None and eos_id in completion_ids:
+        return True
+    if stop_sequences and any(s and completion_text.endswith(s) for s in stop_sequences):
+        return True
+    return eos_id is None and not stop_sequences
 
 
 def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
@@ -819,9 +832,10 @@ def run_opd():
             "thinking": _w.THINKING,
             "loss_curve": loss_curve,
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,
-            # Rollouts cut off at the cap without EOS — skipped, not distilled (see _is_truncated_rollout).
-            # A high count means the student is generating runaway/non-terminating filters (cold start,
-            # untrained stop token) and warm-starting from SFT — which encodes termination — would help.
+            # Rollouts that didn't terminate naturally (max_new_tokens cap OR max_time cut, no EOS/stop)
+            # — skipped, not distilled (see _rollout_terminated). A high count means the student is
+            # generating runaway/non-terminating filters (cold start, untrained stop token) and
+            # warm-starting from SFT — which encodes termination — would help.
             "truncated_rollouts": truncated_rollouts,
             # Real alignment-health signal (mean student-tokens-per-group); mean_coverage is ~1.0 even
             # for a degenerate collapsed alignment, so it can't flag that failure mode.
@@ -864,7 +878,8 @@ def _train_one(
     _train_one.last_coverage = 0.0
     _train_one.last_gen_tokens = 0
     _train_one.last_teacher_tokens = 0
-    # A cap-hit rollout truncated mid-output (skipped, not distilled — see _is_truncated_rollout).
+    # A rollout that didn't terminate naturally — cap hit OR max_time cut, no EOS/stop (skipped, not
+    # distilled — see _rollout_terminated).
     _train_one.last_truncated = False
     # Mean student-tokens-per-alignment-group; a real health signal where mean_coverage is not.
     _train_one.last_group_granularity = 0.0
@@ -881,11 +896,15 @@ def _train_one(
         gen[0, prompt_tensor.shape[1] :]
     )  # one GPU->CPU copy, reused below
     completion_text = tok.decode(completion_ids, skip_special_tokens=True)
-    # Drop a cap-hit truncation BEFORE scoring/distilling it: a filter cut off mid-output would
-    # otherwise be echo-scored and reinforced, teaching the student a runaway it can never be taught to
-    # end (OPD can't supervise the stop token). Detect on the RAW rollout, before any stop_sequence
-    # trim (a stop-halted rollout is shorter than the cap, so it never trips this). Skip + count.
-    if _is_truncated_rollout(completion_ids, knobs["max_completion"], tok.eos_token_id):
+    # Skip a rollout that did NOT terminate naturally (no EOS, no stop delimiter) BEFORE scoring/
+    # distilling it: a max_new_tokens cap hit OR a gen_cfg.max_time cut leaves a filter cut off
+    # mid-output, which OPD would otherwise echo-score and reinforce, teaching a runaway it can never
+    # learn to end (OPD can't supervise the stop token). Checked on the RAW rollout text, before
+    # _trim_trailing_stop removes the delimiter — so a stop-terminated sample AT the cap is KEPT, not
+    # discarded (codex[bot]). getattr: a fake/EOS-less tokenizer yields None -> fail-open in the helper.
+    if not _rollout_terminated(
+        completion_ids, completion_text, getattr(tok, "eos_token_id", None), knobs["stop_sequences"]
+    ):
         _train_one.last_truncated = True
         _train_one.last_gen_tokens = len(completion_ids)
         return None

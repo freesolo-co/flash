@@ -320,23 +320,25 @@ def test_opd_sampled_ids_moved_off_gpu_in_one_transfer():
     assert _to_cpu_ids([1, 2, 3]) == [1, 2, 3]
 
 
-def test_is_truncated_rollout_flags_cap_hit_without_eos():
-    """A rollout that reaches max_completion WITHOUT EOS is a mid-output truncation OPD must NOT distil
-    (it can't supervise the stop token, so reinforcing a cap-hit fragment teaches non-terminating
-    output). EOS present, or an under-cap length (e.g. a stop_sequence halt), means it terminated."""
-    from flash.engine.worker.opd import _is_truncated_rollout
+def test_rollout_terminated_requires_eos_or_stop_not_length():
+    """A rollout is safe to distil only if it terminated NATURALLY — EOS in the ids, or (with
+    stop_sequences) the decoded text ends with a stop delimiter. A max_new_tokens cap hit OR a
+    gen_cfg.max_time cut ends without either and is a partial mid-output fragment OPD must skip (it
+    can't supervise the stop token). Length is NOT the criterion (codex[bot])."""
+    from flash.engine.worker.opd import _rollout_terminated
 
     EOS = 99
-    # hit the cap with no EOS in the ids -> truncated mid-output
-    assert _is_truncated_rollout([1, 2, 3, 4], 4, EOS) is True
-    # hit the cap but EOS was emitted -> terminated, not a truncation
-    assert _is_truncated_rollout([1, 2, 3, EOS], 4, EOS) is False
-    # under the cap, no EOS (a stop_sequence halted it before the cap) -> not a cap truncation
-    assert _is_truncated_rollout([1, 2], 4, EOS) is False
-    # under the cap with EOS -> natural termination
-    assert _is_truncated_rollout([1, EOS], 4, EOS) is False
-    # tokenizer without an EOS id -> a cap-hit rollout still counts as truncated
-    assert _is_truncated_rollout([1, 2, 3, 4], 4, None) is True
+    # EOS in the ids -> terminated (HF appends EOS when it stops on it), regardless of length.
+    assert _rollout_terminated([1, 2, 3, EOS], "abc", EOS, ()) is True
+    # no EOS, no stops -> NOT terminated: a cap hit OR a max_time cut, both partial fragments -> skip.
+    assert _rollout_terminated([1, 2, 3, 4], "abcd", EOS, ()) is False  # cap hit, no EOS
+    assert _rollout_terminated([1, 2], "ab", EOS, ()) is False  # short: max_time cut, no EOS/stop
+    # stop delimiter is the trailing text -> terminated even without EOS AND even at the cap (codex#587).
+    assert _rollout_terminated([1, 2, 3, 4], "ans</answer>", None, ("</answer>",)) is True
+    # stop configured but text doesn't end with it, no EOS -> not terminated -> skip.
+    assert _rollout_terminated([1, 2, 3, 4], "ans", None, ("</answer>",)) is False
+    # no termination signal at all (no eos id, no stops) -> fail OPEN (distil, don't skip everything).
+    assert _rollout_terminated([1, 2, 3, 4], "abcd", None, ()) is True
 
 
 def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
@@ -405,6 +407,8 @@ def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
     completion_ids = [2, 3, 5]  # 2->'h', 3->'i', 5->eos (in-vocab id, decodes to '')
 
     class _Tok:
+        eos_token_id = 5  # completion ends in id 5 -> _rollout_terminated sees natural EOS termination
+
         def decode(self, ids, skip_special_tokens=True):
             m = {2: "h", 3: "i", 5: ""}
             return "".join(m[int(x)] for x in ids)

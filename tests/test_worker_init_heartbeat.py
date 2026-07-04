@@ -312,6 +312,27 @@ def test_forced_opd_step_burst_within_floor_coalesces_to_protect_commit_cap(monk
     assert ne._HB_LAST_COMMITTED_STEP == 1
 
 
+def test_force_commit_via_regular_throttle_arms_the_floor(monkeypatch):
+    """Regression (cursor[bot], heartbeat.py): a force=True heartbeat that commits because the regular
+    throttle was ALREADY due (not because the force branch bypassed it) must STILL arm the forced-commit
+    clock — else the clock stays stale and a following sub-floor forced ping punches through, defeating
+    the burst coalescing that protects the HF commit cap."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0  # regular throttle is DUE -> the first force commits via it, not the bypass
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+    ne.heartbeat("opd_step", step=1, loss=0.1, force=True)  # commits via the elapsed regular throttle
+    assert len(uploads) == 1
+    ne.heartbeat("opd_step", step=2, loss=0.1, force=True)  # sub-floor advance -> must be COALESCED now
+    assert len(uploads) == 1, "the regular-path force commit must arm the floor so the next is coalesced"
+    assert ne._HB_LAST_COMMITTED_STEP == 1
+
+
 def test_forced_opd_step_repeated_same_step_does_not_recommit(monkeypatch):
     """Self-limiting counterpart: a forced ping whose step does NOT advance past the last committed step
     (a redundant post-update carrying the same opt_steps, or a retry) stays throttled. So forcing can't
@@ -356,10 +377,11 @@ def test_forced_opd_step_commit_failure_rolls_back_committed_step(monkeypatch):
     ne._HB_LAST_COMMITTED_STEP = 0
     ne.heartbeat("opd_step", step=2, force=True)  # succeeds -> committed step = 2, slot claimed
     assert ne._HB_LAST_COMMITTED_STEP == 2
+    forced_clock_after_2 = ne._HB_LAST_FORCED_UPLOAD  # any force=True commit arms the forced clock
     fail["on"] = True
     ne.heartbeat("opd_step", step=3, force=True)  # forces (3>2) within throttle, but upload FAILS
     assert ne._HB_LAST_COMMITTED_STEP == 2, "a failed forced commit must roll back the committed step"
-    assert ne._HB_LAST_FORCED_UPLOAD == 0.0, "a failed forced commit must roll back the forced clock"
+    assert forced_clock_after_2 == ne._HB_LAST_FORCED_UPLOAD, "and roll back the forced clock"
     fail["on"] = False
     ne.heartbeat("opd_step", step=3, force=True)  # retry: still throttled by time, must force on 3>2
     assert ne._HB_LAST_COMMITTED_STEP == 3
