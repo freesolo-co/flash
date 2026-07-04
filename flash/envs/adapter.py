@@ -142,8 +142,8 @@ class FreesoloEnvironment(BaseEnvironment):
         raw = dict(record)
         if _CANONICAL_INPUT_KEY not in raw:
             raise ValueError("Freesolo dataset records must contain an input field")
-        if str(raw.get("id") or "").strip() == "":
-            raise ValueError("Freesolo dataset records must contain an id field")
+        # Record ids are always auto-generated (see dataset()); they are never
+        # required from, or read out of, the user's source data.
         return raw
 
     def _reward_to_breakdown(self, reward) -> dict[str, float]:
@@ -181,6 +181,12 @@ class FreesoloEnvironment(BaseEnvironment):
                 raw[_CANONICAL_INPUT_KEY] = example.input
             if getattr(example, "output", None) is not None:
                 raw.setdefault(_CANONICAL_OUTPUT_KEY, _json_safe(example.output))
+            # Stamp the SDK-assigned positional id onto the record, overriding
+            # any id the source data carried. Ids are always auto-generated so
+            # they stay unique and deterministic (local SDK == remote worker).
+            example_id = getattr(example, "id", None)
+            if example_id:
+                raw["id"] = example_id
             record = self._canonical_record(raw)
             records.append(record)
         self._dataset_cache = records
