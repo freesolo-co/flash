@@ -1038,6 +1038,24 @@ def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(mon
     assert opd_mod._thinking_prefill_text(_WhitespaceEmptyBlockTok()) == "<think>\n"
 
 
+def test_thinking_prefill_recovers_opener_when_closed_block_leaves_whitespace_remainder(monkeypatch):
+    """Regression (codex[bot], opd.py:134): a closed-block hybrid whose disabled render closes IMMEDIATELY
+    after the opener (enable_thinking=False -> '...<think></think>', True -> '...<think>\\n') shares only
+    '<think>' in the common prefix, so think_mid is the NON-EMPTY whitespace remainder '\\n'. The old
+    `if think_mid: return think_mid` early-return handed back '\\n' and skipped the closed-block recovery,
+    conditioning the teacher on a prompt that opened but never continued <think>. The recovery must run
+    FIRST and return the real thinking-side opener '<think>\\n'."""
+    from flash.engine.worker import opd as opd_mod
+
+    class _ClosedImmediatelyTok:
+        def apply_chat_template(self, messages, *, enable_thinking, **kw):
+            # thinking opens "<think>\n"; non-thinking force-closes right after the opener.
+            return "A:\n<think>\n" if enable_thinking else "A:\n<think></think>"
+
+    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    assert opd_mod._thinking_prefill_text(_ClosedImmediatelyTok()) == "<think>\n"
+
+
 def test_opd_loop_drives_by_optimizer_updates_and_fails_permanently_on_deterministic_shortfall(
     monkeypatch,
 ):

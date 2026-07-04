@@ -629,6 +629,16 @@ def cost_panel(est) -> str:
         ("wall clock", f"{est.wall_clock_hours:.2f} h"),
         ("billable", f"{est.billable_hours:.2f} h  {_dim('(training only)')}"),
     ]
+    # opd teacher spend is itemized but NOT part of total_usd (billed by Fireworks on the user's key).
+    # Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it (cursor[bot]).
+    if getattr(est, "teacher_api_usd", 0) > 0:
+        pairs.append(
+            (
+                "teacher api",
+                f"{money(est.teacher_api_usd, 2)}  "
+                f"{_dim('(Fireworks GLM token spend on your key — billed by Fireworks, NOT in TOTAL)')}",
+            )
+        )
     panel = _kv(pairs)
     total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(f'${est.total_usd:.2f}', _TEAL, '1')}"
     out = f"{header('train', 'pre-flight cost estimate')}\n{panel}\n{_rule()}\n{total}"
