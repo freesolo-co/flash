@@ -95,6 +95,16 @@ class ModelInfo:
     num_layers: int = 0
     hidden_size: int = 0
 
+    @property
+    def is_moe(self) -> bool:
+        """True for a mixture-of-experts model — a token routes through only a subset of experts.
+
+        Keyed off ``active_params_b`` (0.0 == dense, "every token hits every param"). Used by the
+        GRPO worker to pick REENTRANT gradient checkpointing for MoE (its router re-dispatches tokens
+        on recompute, which the non-reentrant metadata-equality assert rejects).
+        """
+        return 0.0 < self.active_params_b < self.params_b
+
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         serving = data.get("serving")
@@ -263,9 +273,15 @@ MODELS: dict[str, ModelInfo] = {
             # rank-64 at only 6 hot slots: the fused-MoE LoRA buffer scales with
             # max_loras x rank x num_experts, so the A100-80GB ceiling is ~max_loras x rank = 384
             # (6 x 64 fits at 99.3% util; 16 x 64 OOMs on every single/multi GPU). Serving-validated.
+            # The 6 x 64 ceiling is WEIGHT-bound, not context-bound: the FP8 checkpoint's MoE experts
+            # load as bf16 under the LoRA path (~76 GiB on the 80 GiB card), so weights + the 6 x 64
+            # buffer leave only ~0.44 GiB for KV. Canary-measured 2026-07-04: at 8192 ctx that KV pool
+            # gives 2.2x concurrency; dropping to 4096 does NOT free any LoRA-slot room (7 x 64 and
+            # 8 x 64 both OOM at 4096 exactly as at 8192) but ~doubles concurrency to ~4.4x. So context
+            # is 4096 (concurrency win, matches the training-context cap) while slots stay 6 x 64.
             max_loras=6,
             max_lora_rank=64,
-            max_model_len=8192,
+            max_model_len=4096,
             max_num_seqs=8,
             max_num_batched_tokens=4096,
             gpu_memory_utilization=0.98,
@@ -311,6 +327,26 @@ def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
     if info is None or info.serving is None:
         return None
     return int(info.serving.max_lora_rank)
+
+
+def serving_context_cap(model: str | ModelInfo | None) -> int | None:
+    """Return the model's serving ``max_model_len`` (the context it is actually served at), or None
+    when Flash has no local serving entry (open-policy / uncataloged).
+
+    A LoRA trained at a longer context than it is served wastes compute and learns positions that are
+    never used at inference, so the control plane caps a run's training context to this (see
+    ``flash.lora_rank.preflight_train_context_within_serving``). Resolution mirrors
+    ``serving_lora_rank_cap``: unknown/open-policy models return None rather than a global fallback.
+    """
+    if isinstance(model, ModelInfo):
+        info = model
+    elif isinstance(model, str) and model.strip():
+        info = MODELS.get(model.strip())
+    else:
+        info = None
+    if info is None or info.serving is None:
+        return None
+    return int(info.serving.max_model_len)
 
 
 def vocab_size_for(model_id: str) -> int:
