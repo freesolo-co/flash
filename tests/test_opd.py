@@ -32,6 +32,13 @@ def _teacher(spans):
     ]
 
 
+def _skip(**k):
+    """A ``_train_one`` stub whose every sample skips: no loss, teacher not reached."""
+    from flash.engine.worker.opd import SampleResult
+
+    return SampleResult()
+
+
 # --------------------------------------------------------------------------------------------------
 # gkd groupwise alignment — the coarsest common refinement of the two tokenizations
 # --------------------------------------------------------------------------------------------------
@@ -433,7 +440,7 @@ def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
             return torch.cat([prompt_tensor, self._completion], dim=1)
 
     model = _GenLM(torch, prompt_len=1, completion_ids=completion_ids, V=8)
-    loss = opd_mod._train_one(
+    r = opd_mod._train_one(
         model=model,
         tok=_Tok(),
         teacher=_Teacher(),
@@ -445,14 +452,14 @@ def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
         knobs={"kl_coef": 1.0, "stop_sequences": ()},
         torch=torch,
     )
-    assert loss is not None
-    assert loss.requires_grad
-    loss.backward()  # the sampled ids reached gkd_loss and produce a real gradient
+    assert r.loss is not None
+    assert r.loss.requires_grad
+    r.loss.backward()  # the sampled ids reached gkd_loss and produce a real gradient
     assert model.w.grad is not None
     assert model.w.grad.abs().sum() > 0
     # eos is zero-width and joins no group; coverage is over the 2 alignable tokens -> 100%.
-    assert opd_mod._train_one.last_coverage == 1.0
-    assert opd_mod._train_one.last_gen_tokens == 3
+    assert r.coverage == 1.0
+    assert r.gen_tokens == 3
 
 
 def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
@@ -533,7 +540,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod, "_train_one", lambda **k: None)  # EVERY sample skips
+    monkeypatch.setattr(opd_mod, "_train_one", _skip)  # EVERY sample skips
 
     import transformers
 
@@ -677,13 +684,15 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
         captured["progress"] = progress
         yield
 
-    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None, liveness=_fake_liveness)
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip, liveness=_fake_liveness)
     with pytest.raises(RuntimeError):  # all-skip -> no trained step
         opd_mod.run_opd()
     assert captured["stage"] == "opd_step"
     assert callable(captured["progress"]), "opd must pass a progress callback to liveness_heartbeat"
-    # 1 step x 1 prompt x 1 group = 1 _train_one call -> samples_seen advanced to 1.
-    assert captured["progress"]() == 1
+    # The callback reports the monotonic sample count. An all-skip run lands no optimizer update, so
+    # the bounded-retry loop visits its full budget of max_iters = 2*steps + 10 = 12 fresh slices
+    # (1 prompt x 1 group each) before the post-loop guard raises -> samples_seen advanced to 12.
+    assert captured["progress"]() == 12
 
 
 def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
@@ -694,8 +703,7 @@ def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
     from flash.engine.worker.perf import RetriableInfraError
 
     def _all_transient(**k):
-        _all_transient.last_teacher_status = "transient"
-        return
+        return opd_mod.SampleResult(teacher_status="transient")
 
     opd_mod = _opd_harness(monkeypatch, train_one=_all_transient)
     with pytest.raises(RetriableInfraError, match="failed transiently"):
@@ -703,8 +711,7 @@ def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
 
     # contrast: teacher responded ("ok") but no loss -> permanent RuntimeError, NOT retriable.
     def _ok_no_align(**k):
-        _ok_no_align.last_teacher_status = "ok"
-        return
+        return opd_mod.SampleResult(teacher_status="ok")
 
     opd_mod = _opd_harness(monkeypatch, train_one=_ok_no_align)
     with pytest.raises(RuntimeError) as ei:
@@ -728,7 +735,7 @@ def test_opd_emits_progress_heartbeat_while_filtering_prompts(monkeypatch):
         calls.append((stage, progress))
         yield
 
-    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None, liveness=_fake_liveness)
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip, liveness=_fake_liveness)
     with pytest.raises(RuntimeError):  # all-skip -> no trained step, but filtering ran first
         opd_mod.run_opd()
     filt = [(s, p) for (s, p) in calls if s == "opd_filtering_prompts"]
@@ -811,7 +818,7 @@ def test_opd_step_liveness_heartbeat_carries_opt_steps_in_fields(monkeypatch):
             captured["fields"] = fields
         yield
 
-    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None, liveness=_fake_liveness)
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip, liveness=_fake_liveness)
     with pytest.raises(RuntimeError):  # all-skip -> no trained step
         opd_mod.run_opd()
     assert callable(captured.get("fields")), (
@@ -929,14 +936,12 @@ def test_opd_loop_drives_by_optimizer_updates_and_retries_on_shortfall(monkeypat
     state = {"n": 0}
 
     def _one_update_then_skip(*, model, **k):
+        from flash.engine.worker.opd import SampleResult
+
         state["n"] += 1
-        _one_update_then_skip.last_teacher_status = "ok"
-        _one_update_then_skip.last_coverage = 1.0
-        _one_update_then_skip.last_gen_tokens = 1
-        _one_update_then_skip.last_teacher_tokens = 1
-        if state["n"] == 1:  # exactly one real, backward-able update, then every sample skips
-            return model.w.float().sum() * 1e-6
-        return None
+        # exactly one real, backward-able update lands first; then every sample skips (loss=None)
+        loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
+        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
     # steps=3 but only ONE optimizer update can ever land -> the bounded loop exhausts its iteration
     # budget at opt_steps=1 and the post-loop guard must retry rather than publish 1/3.
@@ -1009,7 +1014,7 @@ def test_opd_installs_chalk_kernels_on_student(monkeypatch):
 
     monkeypatch.setattr(_opd, "install_chalk_kernels", _fake_install)
     monkeypatch.setattr(_opd, "active_kernels", lambda report: ["rms_norm"] if report else [])
-    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None)
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip)
     with pytest.raises(RuntimeError):  # all-skip -> no trained step, but init (chalk) ran first
         opd_mod.run_opd()
     assert "model" in captured, "run_opd must call install_chalk_kernels on the student"
@@ -1031,7 +1036,7 @@ def test_opd_wraps_training_loop_in_sdpa_cudnn_ctx(monkeypatch):
         entered["attn"] = attn_impl
         yield
 
-    opd_mod = _opd_harness(monkeypatch, train_one=lambda **k: None)
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip)
     # Force the Blackwell branch and record what the loop wraps itself in.
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: "sdpa")
     monkeypatch.setattr(opd_mod, "_sdpa_cudnn_ctx", _rec_ctx)
@@ -1062,14 +1067,12 @@ def test_opd_initializes_and_logs_to_wandb_when_configured(monkeypatch):
     state = {"n": 0}
 
     def _one_update_then_skip(*, model, **k):
+        from flash.engine.worker.opd import SampleResult
+
         state["n"] += 1
-        _one_update_then_skip.last_teacher_status = "ok"
-        _one_update_then_skip.last_coverage = 1.0
-        _one_update_then_skip.last_gen_tokens = 1
-        _one_update_then_skip.last_teacher_tokens = 1
-        if state["n"] == 1:  # one real optimizer step lands (W&B logs it), then the run shortfalls
-            return model.w.float().sum() * 1e-6
-        return None
+        # one real optimizer step lands (W&B logs it), then the run shortfalls (loss=None)
+        loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
+        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -1104,14 +1107,12 @@ def test_opd_skips_wandb_logging_when_not_configured(monkeypatch):
     state = {"n": 0}
 
     def _one_update_then_skip(*, model, **k):
+        from flash.engine.worker.opd import SampleResult
+
         state["n"] += 1
-        _one_update_then_skip.last_teacher_status = "ok"
-        _one_update_then_skip.last_coverage = 1.0
-        _one_update_then_skip.last_gen_tokens = 1
-        _one_update_then_skip.last_teacher_tokens = 1
-        if state["n"] == 1:
-            return model.w.float().sum() * 1e-6
-        return None
+        # one real, backward-able update lands first; then every sample skips (loss=None)
+        loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
+        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -1201,7 +1202,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod, "_train_one", lambda **k: None)
+    monkeypatch.setattr(opd_mod, "_train_one", _skip)
 
     real_manual_seed = torch.manual_seed
 

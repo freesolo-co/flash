@@ -24,11 +24,20 @@ import contextlib
 import os
 import random
 import time
+from dataclasses import dataclass
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.opd_gkd import (
+    _rollout_terminated,
+    _teacher_prompt_text,
+    _to_cpu_ids,
+    _trim_trailing_stop,
+    gkd_loss,
+    student_tokens_with_offsets,
+)
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _sdpa_cudnn_ctx,
@@ -40,11 +49,7 @@ from flash.engine.worker.perf import (
     wait_for_gpu,
 )
 from flash.engine.worker.teacher import TeacherError
-from flash.engine.worker.tokenizer_align import (
-    StudentToken,
-    groupwise_alignment,
-    groupwise_coverage,
-)
+from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 
 
 def _resolve_opd_knobs():
@@ -95,24 +100,6 @@ def _resolve_opd_knobs():
         # never scores/trains on text past the intended answer boundary.
         "stop_sequences": tuple(getattr(t, "stop_sequences", ()) or ()),
     }
-
-
-def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = "") -> str:
-    """Render the prompt for the teacher's scoring context (template-agnostic; ends at 'Assistant: ').
-
-    ``thinking_prefill`` is the extra trailing text a thinking-mode student template opens after the
-    generation prompt (e.g. Qwen's ``<think>\\n``). The student samples its on-policy completion AFTER
-    that prefill, so the teacher must condition on the SAME trailing context; otherwise every
-    thinking-mode token is scored against a prompt that never opened the reasoning block, and the gkd
-    logprobs are conditioned on a different prefix than the sampled tokens (codex[bot]). Empty (the
-    default) when thinking is off or the template ignores it -- the plain ``Assistant: `` already
-    matches."""
-    parts = []
-    for m in prompt_messages:
-        role = str(m.get("role", "user")).capitalize()
-        parts.append(f"{role}: {m.get('content', '')!s}")
-    parts.append("Assistant: " + thinking_prefill)
-    return "\n".join(parts)
 
 
 def _thinking_prefill_text(tok) -> str:
@@ -167,183 +154,6 @@ def _thinking_prefill_text(tok) -> str:
             if cut != -1:
                 return think[cut:]  # e.g. "<think>\n"
     return ""
-
-
-def _to_cpu_ids(completion_ids):
-    """Move the sampled ids off the GPU in ONE transfer and reuse the CPU list for decode/trim/offsets.
-
-    ``model.generate`` returns the ids on-device; iterating that tensor and calling ``int(t)`` per token
-    does one scalar CUDA->CPU sync per token -- thousands of tiny syncs per sample once ``[train]
-    .max_tokens`` is raised (reported by codex[bot]). A single ``detach().cpu().tolist()`` collapses that
-    to one bulk copy. Falls back to a plain-list normalization when handed a list (tests / the already-
-    trimmed path re-pass a list)."""
-    if hasattr(completion_ids, "detach"):
-        return completion_ids.detach().cpu().tolist()
-    return [int(t) for t in completion_ids]
-
-
-def _rollout_terminated(completion_ids, completion_text, eos_id, stop_sequences) -> bool:
-    """True iff the rollout ended NATURALLY — the student emitted EOS, or (when stop_sequences are
-    configured) the decoded text ends with a stop delimiter.
-
-    HF ``generate`` halts on four conditions — EOS, a ``stop_strings`` match, the ``max_new_tokens``
-    cap, or the ``gen_cfg.max_time`` wall-clock bound — and only the first two are natural completions.
-    A cap hit OR a max_time cut leaves the output cut off mid-JSON. OPD cannot supervise the stop token
-    (the teacher's and student's EOS differ and are both zero-width in the text-span alignment, so EOS
-    gets no gradient), so distilling such a fragment reinforces non-terminating output that reverse-KL
-    can never teach the student to end — a driver of the eval's unterminated-JSON parse failures. The
-    caller skips anything that isn't terminated (codex[bot]).
-
-    EOS is checked on the IDS (``completion_text`` is decoded with ``skip_special_tokens=True``, so EOS
-    isn't visible there). The stop delimiter IS in the raw text — HF emits it before halting — matched
-    with the same trailing-``endswith`` semantics ``_trim_trailing_stop`` uses to remove it, so a
-    stop-terminated rollout is recognised even when the delimiter lands as the final token AT the cap
-    (which a length-only check wrongly discarded). Fail OPEN only when NO termination signal exists at
-    all (no eos_token_id AND no stop_sequences): we then can't tell a finished answer from a cut-off one,
-    so we distil rather than skip every rollout. Real tokenizers always define eos_token_id, so in
-    production a cap/max_time cut without EOS or a stop delimiter correctly returns False (skip)."""
-    if eos_id is not None and eos_id in completion_ids:
-        return True
-    if stop_sequences and any(s and completion_text.endswith(s) for s in stop_sequences):
-        return True
-    return eos_id is None and not stop_sequences
-
-
-def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
-    """Char spans for the ORIGINAL sampled token ids, indexed into ``completion_text`` (the exact
-    string the teacher echo-scored). Using the sampled ids — not a re-tokenization of the decoded
-    text — keeps the loss on the true on-policy tokens. Offsets are built by incrementally decoding
-    the id prefix and measuring its length (clamped monotonic in ``[0, len]``, so a byte-level token
-    that splits a multi-byte char never yields a negative/backward span); a special token (e.g. eos)
-    decodes to nothing, so it gets a zero-width span and is naturally excluded from the alignment.
-
-    Split multi-byte chars (byte-level tokenizers): a char whose bytes span two+ ids decodes to the
-    Unicode replacement char ``U+FFFD`` until its FINAL byte-id arrives. Measuring each half-id's
-    decoded length independently would give one half the whole char and the other a zero-width span —
-    silently dropping a real byte-token from the alignment and undercounting that char's student
-    logprob. Instead we GROW the window while the decoded prefix still ends in ``U+FFFD`` and assign
-    the SHARED completed-char span to every byte-id in it, so both halves share a ``start`` and land in
-    the same alignment group. A normal (already-complete) token is a window of one — identical to the
-    old per-token length measurement."""
-    ids = [int(t) for t in completion_ids]
-    toks: list[StudentToken] = []
-    prev = 0
-    n = len(completion_text)
-    i = 0
-    while i < len(ids):
-        j = i
-        # Grow the window over a split multi-byte char, decoding ONLY the window from the current
-        # boundary (ids[i:j+1]) -- never the whole prefix ids[:j+1] -- so total decoding is O(len), not
-        # O(len^2) (reported by codex[bot]; the quadratic bites once max_tokens raises completions to
-        # 1000s of tokens). A byte-level tokenizer renders an INCOMPLETE char as a trailing U+FFFD that
-        # is NOT the real char at completion_text[prev:]; a genuine U+FFFD the model emitted DOES match
-        # there (startswith from prev), so we stop and keep it as its own span, not over-merged.
-        while j + 1 < len(ids):
-            dec = tok.decode(ids[i : j + 1], skip_special_tokens=True)
-            if not dec.endswith("\ufffd") or completion_text.startswith(dec, prev):
-                break
-            j += 1
-        # end = where THIS window's decoded text ends in completion_text. Anchor to completion_text
-        # (the ground-truth full decode) via find() from prev rather than prev + len(decode(window)):
-        # a SentencePiece/LLaMA tokenizer decodes a word token IN ISOLATION without its leading
-        # word-boundary space (decode([▁world]) == "world", not " world"), so prev + len(window) would
-        # undercount the span by one char and drift EVERY following offset -- misaligning teacher spans
-        # onto the wrong sampled ids (codex[bot]). find() locates where the window text actually sits
-        # (skipping any dropped leading whitespace, which is absorbed into this token's start) and the
-        # start stays pinned at prev so the spans remain contiguous. For a byte-level tokenizer (Qwen,
-        # GPT) the window already carries its space, find() returns prev, and end == the old value. An
-        # empty decode (special/eos) -> find() returns prev -> zero-width span, unchanged.
-        window_text = tok.decode(ids[i : j + 1], skip_special_tokens=True)
-        hit = completion_text.find(window_text, prev)
-        end = (hit + len(window_text)) if hit != -1 else prev + len(window_text)
-        end = min(n, max(prev, end))
-        toks.extend(StudentToken(token_id=ids[k], start=prev, end=end) for k in range(i, j + 1))
-        prev = end
-        i = j + 1
-    return ids, toks
-
-
-def _trim_trailing_stop(tok, completion_ids, completion_text: str, stops):
-    """Drop a trailing stop delimiter from BOTH the decoded text and the sampled ids (token-level).
-
-    HF ``stop_strings`` halts only AFTER the delimiter text is emitted, so a run with e.g.
-    ``[train] stop_sequences=["</answer>"]`` would otherwise score/distil the delimiter the user asked
-    to stop at. Trimming both sides keeps ids and text consistent (no gkd_loss / token-count desync,
-    the failure mode of a text-only trim). Returns ``(ids, text)`` (a list + str)."""
-    ids = [int(t) for t in completion_ids]
-    # Pick the LONGEST configured stop that is a trailing match (the earliest stop boundary in the
-    # text). Overlapping delimiters like ["\n", "\n\n"] would otherwise trim only the first-listed
-    # shorter suffix off a "\n\n" tail, leaving one newline for the teacher to score/distil; taking
-    # the longest match removes the whole delimiter in one shot regardless of config order.
-    stop = max(
-        (s for s in stops if s and completion_text.endswith(s)),
-        key=len,
-        default="",
-    )
-    if not stop:
-        return ids, completion_text
-    keep_len = len(completion_text) - len(stop)
-    # Locate the kept prefix by scanning from the END: the delimiter is short, so only a handful of
-    # trailing tokens are dropped -> O(dropped * completion) work. Decoding growing prefixes from the
-    # START (ids[:1], ids[:2], ...) instead is O(completion^2) and can dominate CPU ahead of teacher
-    # scoring on long completions once [train].max_tokens is raised.
-    kept = len(ids)
-    while kept > 0 and len(tok.decode(ids[:kept], skip_special_tokens=True)) > keep_len:
-        kept -= 1
-    # Trim the TEXT to exactly what the kept ids decode to — NOT completion_text[:keep_len].
-    # When the stop starts INSIDE the final sampled token (that token decodes to e.g.
-    # "B</answer>" while the stop is "</answer>"), that whole token is excluded from `kept`, so
-    # slicing the raw text at keep_len would keep a "B" the kept ids can no longer represent —
-    # desyncing the teacher-scored text from the student ids (gkd_loss / token-count skew).
-    # Decoding the kept ids keeps both sides identical (drops the fused char, never distils the
-    # delimiter); in the common case (the stop is its own clean token) it equals
-    # completion_text[:keep_len].
-    return ids[:kept], tok.decode(ids[:kept], skip_special_tokens=True)
-
-
-def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
-    """Groupwise reverse-KL on-policy distillation (the collinear-ai *spider* / Tinker method).
-
-    Per aligned text-span group, the per-token loss coefficient is
-    ``(log P_student(span).detach() - log P_teacher(span)) / |span|`` — the REINFORCE surrogate whose
-    gradient IS the reverse-KL gradient ``E_student[∇ log π · (log π - log p*)]`` (Thinking Machines,
-    *On-Policy Distillation*). It needs only the REALIZED-token logprobs (no top-k, no vocabulary
-    projection), so it is exact across arbitrary tokenizer mismatches and covers every token.
-    ``kl_coef`` scales the objective (``[train] kl_penalty_coef``). Scalar loss or None.
-    """
-    import torch
-
-    if not student_ids or not groups:
-        return None
-    input_ids = torch.tensor([prompt_ids + student_ids], device=device)
-    logits = model(input_ids).logits[0]  # [T, V], model dtype
-    P = len(prompt_ids)
-    # Differentiable student logprob of each REALIZED completion token (logits at P+j-1 predict token
-    # j), computed WITHOUT materializing a full [T, V] fp32 log_softmax: we select only the C
-    # completion rows, cast those to fp32, and use logit_realized - logsumexp. This keeps the
-    # vocab-projection memory at [C, V] instead of an extra [T, V] fp32 buffer (avoids OOM on tight
-    # placements with large-vocab students).
-    pos = torch.arange(P - 1, P - 1 + len(student_ids), device=logits.device)
-    ids_t = torch.tensor(student_ids, device=logits.device)
-    rows = logits.index_select(0, pos).float()  # [C, V]
-    sp_t = rows.gather(1, ids_t.unsqueeze(1)).squeeze(1) - torch.logsumexp(rows, dim=-1)  # [C]
-    sp = [sp_t[j] for j in range(len(student_ids))]
-    terms = []
-    for s_idx, teacher_logsum in groups:
-        if not s_idx:  # defensive: a teacher-only span carries no student token to supervise
-            continue
-        # Keep the detached group logprob sum ON-DEVICE — NO float(): float() forces a CUDA->CPU sync
-        # per alignment group, i.e. thousands of tiny device syncs on a long sample (reported by
-        # codex[bot]). teacher_logsum is a Python float, so (device tensor - float) stays a 0-dim
-        # device tensor and coeff * sp[j] never leaves the GPU; the only sync is the final .mean().
-        student_logsum_det = sum(sp[j].detach() for j in s_idx)
-        # coeff > 0 where the student is MORE confident than the teacher on the span (push down);
-        # coeff < 0 where the teacher is more confident (push up). Gradient = reverse-KL gradient.
-        coeff = kl_coef * (student_logsum_det - teacher_logsum) / len(s_idx)
-        terms.extend(coeff * sp[j] for j in s_idx)
-    if not terms:
-        return None
-    return torch.stack(terms).mean()
 
 
 def _student_model(model_id, mik, device):
@@ -657,7 +467,7 @@ def run_opd():
                     continue
                 prompt_tensor = torch.tensor([prompt_ids], device=device)
                 for _g in range(group):
-                    loss = _train_one(
+                    r = _train_one(
                         model=model,
                         tok=tok,
                         teacher=teacher,
@@ -679,14 +489,13 @@ def run_opd():
                         ),
                     )
                     samples_seen += 1  # advances the liveness-thread progress signal
-                    _t_status = getattr(_train_one, "last_teacher_status", None)
-                    if _t_status == "ok":
+                    if r.teacher_status == "ok":
                         teacher_ok += 1
-                    elif _t_status == "transient":
+                    elif r.teacher_status == "transient":
                         teacher_transient += 1
-                    if getattr(_train_one, "last_truncated", False):
+                    if r.truncated:
                         truncated_rollouts += 1
-                    if loss is None:
+                    if r.loss is None:
                         # Refresh the stall clock even when a sample yields no teacher signal. The
                         # success ping below is the only NON-liveness opd_step heartbeat, so a step
                         # where every sample skips (empty completions, or slow/retrying Fireworks)
@@ -696,13 +505,13 @@ def run_opd():
                         # success ping) so a still-accumulating first step keeps the wide setup grace.
                         _w.heartbeat("opd_step", step=opt_steps, samples_done=nseq)
                         continue
-                    (loss / accum_target).backward()
-                    step_loss += float(loss.detach())
-                    step_cov += _train_one.last_coverage
-                    granularity_sum += _train_one.last_group_granularity
+                    (r.loss / accum_target).backward()
+                    step_loss += float(r.loss.detach())
+                    step_cov += r.coverage
+                    granularity_sum += r.group_granularity
                     granularity_n += 1
-                    generated_tokens += _train_one.last_gen_tokens
-                    teacher_input_tokens += _train_one.last_teacher_tokens
+                    generated_tokens += r.gen_tokens
+                    teacher_input_tokens += r.teacher_tokens
                     nseq += 1
                     # Non-liveness progress ping WITHIN the step: the pollers ignore liveness
                     # heartbeats, so a long teacher-bound step (serial scoring of a large
@@ -851,6 +660,29 @@ def run_opd():
     free_gpu(model)
 
 
+@dataclass(frozen=True)
+class SampleResult:
+    """One student sample's outcome, returned by ``_train_one`` for ``run_opd`` to aggregate.
+
+    ``loss`` is the groupwise reverse-KL loss tensor when the sample was distilled, else ``None``
+    (the sample was skipped — truncated rollout, empty completion, or no teacher signal). The stats
+    describe what happened so the caller can count teacher health / truncations and, on a no-loss run,
+    decide whether it is a retriable infra failure."""
+
+    loss: object = None  # torch scalar tensor when distilled, else None (module is torch-free)
+    # "ok" once teacher.score returns, "transient" on a retryable teacher outage, else None (teacher
+    # not reached). run_opd uses this to decide whether a no-signal run is a retriable infra failure.
+    teacher_status: str | None = None
+    # A rollout that didn't terminate naturally — cap hit OR max_time cut, no EOS/stop (skipped, not
+    # distilled — see _rollout_terminated).
+    truncated: bool = False
+    coverage: float = 0.0
+    gen_tokens: int = 0
+    teacher_tokens: int = 0
+    # Mean student-tokens-per-alignment-group; a real health signal where coverage is not.
+    group_granularity: float = 0.0
+
+
 def _train_one(
     *,
     model,
@@ -865,28 +697,16 @@ def _train_one(
     torch,
     thinking_prefill="",
     on_generated=None,
-):
-    """Sample one student completion on-policy, score it with the teacher, and return the groupwise
-    reverse-KL loss (or None). Side-channels per-sequence stats on function attributes to keep the
-    caller compact. ``thinking_prefill`` is appended to the teacher prompt so it conditions on the
-    same trailing context the student sampled after in thinking mode. ``on_generated`` (optional) is
-    called AFTER generation and BEFORE teacher scoring to refresh the stall clock: both the
-    max_time-bounded generate and the retrying teacher call block for a long time and the caller's
-    per-sample progress ping only fires AFTER scoring returns, so without a mid-sample refresh a slow
-    generation followed by a teacher outage can span >1200s with no non-liveness heartbeat and be
-    reaped as stalled before the transient-teacher handling runs."""
-    _train_one.last_coverage = 0.0
-    _train_one.last_gen_tokens = 0
-    _train_one.last_teacher_tokens = 0
-    # A rollout that didn't terminate naturally — cap hit OR max_time cut, no EOS/stop (skipped, not
-    # distilled — see _rollout_terminated).
-    _train_one.last_truncated = False
-    # Mean student-tokens-per-alignment-group; a real health signal where mean_coverage is not.
-    _train_one.last_group_granularity = 0.0
-    # "ok" once teacher.score returns, "transient" on a retryable teacher outage, else None (teacher
-    # not reached). run_opd uses this to decide whether a no-signal run is a retriable infra failure.
-    _train_one.last_teacher_status = None
-
+) -> SampleResult:
+    """Sample one student completion on-policy, score it with the teacher, and return a
+    ``SampleResult`` carrying the groupwise reverse-KL loss (or None) plus per-sequence stats.
+    ``thinking_prefill`` is appended to the teacher prompt so it conditions on the same trailing
+    context the student sampled after in thinking mode. ``on_generated`` (optional) is called AFTER
+    generation and BEFORE teacher scoring to refresh the stall clock: both the max_time-bounded
+    generate and the retrying teacher call block for a long time and the caller's per-sample progress
+    ping only fires AFTER scoring returns, so without a mid-sample refresh a slow generation followed
+    by a teacher outage can span >1200s with no non-liveness heartbeat and be reaped as stalled before
+    the transient-teacher handling runs."""
     # On-policy: the student samples; the teacher echo-scores that exact completion.
     model.eval()
     model.config.use_cache = True
@@ -905,9 +725,7 @@ def _train_one(
     if not _rollout_terminated(
         completion_ids, completion_text, getattr(tok, "eos_token_id", None), knobs["stop_sequences"]
     ):
-        _train_one.last_truncated = True
-        _train_one.last_gen_tokens = len(completion_ids)
-        return None
+        return SampleResult(truncated=True, gen_tokens=len(completion_ids))
     # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter
     # before stopping — trim it from BOTH ids and text (token-level) so the teacher scores/distils
     # only the answer, and ids/text stay consistent for gkd_loss + token counting.
@@ -915,9 +733,9 @@ def _train_one(
         completion_ids, completion_text = _trim_trailing_stop(
             tok, completion_ids, completion_text, knobs["stop_sequences"]
         )
-    _train_one.last_gen_tokens = len(completion_ids)
+    gen_tokens = len(completion_ids)
     if not completion_text.strip():
-        return None
+        return SampleResult(gen_tokens=gen_tokens)
 
     # Refresh the stall clock between the (gen_cfg.max_time-bounded, up to ~900s) generation and the
     # retrying teacher call (up to four ~90s timeouts): both block, and the caller only emits its
@@ -933,20 +751,16 @@ def _train_one(
     except TeacherError as e:
         if e.permanent:  # bad key / model id / malformed -> abort now, don't burn the whole run
             raise
-        _train_one.last_teacher_status = (
-            "transient"  # retryable outage -> may make the run retriable
-        )
         print(f"[opd] teacher score failed (transient, skipping sample): {e}")
-        return None
+        return SampleResult(teacher_status="transient", gen_tokens=gen_tokens)
     except Exception as e:
         print(f"[opd] teacher score failed (skipping sample): {e}")
-        return None
-    _train_one.last_teacher_status = "ok"
-    _train_one.last_teacher_tokens = len(prompt_ids) + _train_one.last_gen_tokens
+        return SampleResult(gen_tokens=gen_tokens)
+    teacher_tokens = len(prompt_ids) + gen_tokens
 
     student_ids, student_toks = student_tokens_with_offsets(tok, completion_ids, completion_text)
     if not student_ids:
-        return None
+        return SampleResult(teacher_status="ok", gen_tokens=gen_tokens, teacher_tokens=teacher_tokens)
 
     model.train()
     model.config.use_cache = False
@@ -955,14 +769,21 @@ def _train_one(
     # Coverage = alignable (non-zero-width) student tokens that landed in a group / alignable total,
     # so it stays in [0, 1] (a zero-width eos/partial-byte token riding along in a group no longer
     # inflates it past 100%).
-    _train_one.last_coverage = groupwise_coverage(groups, student_toks)
+    coverage = groupwise_coverage(groups, student_toks)
     # mean_coverage is structurally ~1.0 for a CORRECT fine-grained alignment AND for a degenerate
     # collapsed-into-one-giant-span alignment, so it can't detect the latter. Mean student-tokens-per-
     # group does: ~1.0 == each token its own group (healthy); large == coarse spans smearing one
     # teacher logprob across many student tokens.
     _n_align = sum(1 for st in student_toks if st.end > st.start)
-    _train_one.last_group_granularity = (_n_align / len(groups)) if groups else 0.0
-    return gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs["kl_coef"])
+    group_granularity = (_n_align / len(groups)) if groups else 0.0
+    return SampleResult(
+        loss=gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs["kl_coef"]),
+        teacher_status="ok",
+        coverage=coverage,
+        gen_tokens=gen_tokens,
+        teacher_tokens=teacher_tokens,
+        group_granularity=group_granularity,
+    )
 
 
 def _save_adapter(model, tok, adapter_dir: str) -> None:

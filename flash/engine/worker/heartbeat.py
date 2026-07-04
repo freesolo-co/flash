@@ -17,38 +17,25 @@ import time
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
 
-# Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled.
-_HB_THROTTLED_STAGES = frozenset(
-    {
-        "rl_step",
-        "sft_step",
-        "opd_step",
-        "model_prefetching",
-        "sft_pretokenizing",
-        # opd_filtering_prompts renders+tokenizes the whole train split from a 30s liveness thread
-        # WITH a progress callback, so it emits a REAL (non-liveness) heartbeat every time the scan
-        # counter advances. Unthrottled that is one HF commit per tick — ~120/hr on a large split
-        # before model load, blowing the 128/hr commit cap. Throttle it exactly like its SFT analogue
-        # sft_pretokenizing (codex[bot]).
-        "opd_filtering_prompts",
-        "sft_initializing",
-        "rl_initializing",
-        "opd_initializing",
-    }
-)
+# Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
+# cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
+# (parity with sft_pretokenizing) so the stall detector stays fed while nothing is training yet.
 _HB_SETUP_LIVENESS_STAGES = frozenset(
     {
         "model_prefetching",
         "sft_pretokenizing",
-        # Setup-phase filtering: keep the tighter setup-liveness upload cadence (parity with
-        # sft_pretokenizing) so the stall detector stays fed while the split is scanned, without
-        # exceeding the commit cap now that the stage is throttled above.
         "opd_filtering_prompts",
         "sft_initializing",
         "rl_initializing",
         "opd_initializing",
     }
 )
+# Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled. Every
+# setup-liveness stage is throttled (⊂) PLUS the per-step training stages: opd_filtering_prompts alone
+# emits a REAL (non-liveness) heartbeat every scan tick — ~120/hr on a large split before model load —
+# so unthrottled the setup stages blow the cap; throttle them exactly like their sft_pretokenizing
+# analogue (codex[bot]).
+_HB_THROTTLED_STAGES = _HB_SETUP_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "opd_step"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0

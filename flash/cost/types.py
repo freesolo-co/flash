@@ -76,35 +76,21 @@ class RunConfig:
     def normalized(self) -> RunConfig:
         """A copy with every ``None`` knob filled from the recipe for this method."""
         lora = self.lora_rank if self.lora_rank is not None else RECIPE.lora.rank
-        if self.is_opd:
-            d = RECIPE.opd
+        if self.has_rollout:
+            # GRPO and opd both sample on-policy: identical sizing, only the recipe table differs.
+            rc = RECIPE.opd if self.is_opd else RECIPE.rl
             comp = self.completion_len
             if comp is None:
-                comp = d.max_completion_len_thinking if self.thinking else d.max_completion_len
-            seq = (
-                self.seq_len
-                if self.seq_len is not None
-                else max(1024, d.max_prompt_len + int(comp))
-            )
-            batch = self.batch_size if self.batch_size is not None else d.prompts_per_step
-            group = self.group_size if self.group_size is not None else d.group_size
-        elif self.is_grpo:
-            comp = self.completion_len
-            if comp is None:
-                comp = (
-                    RECIPE.rl.max_completion_len_thinking
-                    if self.thinking
-                    else RECIPE.rl.max_completion_len
-                )
-            # Explicit pin wins; else mirror the allocator's GRPO sizing of an unset max_length:
+                comp = rc.max_completion_len_thinking if self.thinking else rc.max_completion_len
+            # Explicit pin wins; else mirror the allocator's rollout sizing of an unset max_length:
             # max(1024, max_prompt_len + completion), not bare max_prompt_len (which under-sizes).
             seq = (
                 self.seq_len
                 if self.seq_len is not None
-                else max(1024, RECIPE.rl.max_prompt_len + int(comp))
+                else max(1024, rc.max_prompt_len + int(comp))
             )
-            batch = self.batch_size if self.batch_size is not None else RECIPE.rl.prompts_per_step
-            group = self.group_size if self.group_size is not None else RECIPE.rl.group_size
+            batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
+            group = self.group_size if self.group_size is not None else rc.group_size
         else:
             seq = self.seq_len
             if seq is None:
