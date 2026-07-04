@@ -95,6 +95,16 @@ class ModelInfo:
     num_layers: int = 0
     hidden_size: int = 0
 
+    @property
+    def is_moe(self) -> bool:
+        """True for a mixture-of-experts model — a token routes through only a subset of experts.
+
+        Keyed off ``active_params_b`` (0.0 == dense, "every token hits every param"). Used by the
+        GRPO worker to pick REENTRANT gradient checkpointing for MoE (its router re-dispatches tokens
+        on recompute, which the non-reentrant metadata-equality assert rejects).
+        """
+        return 0.0 < self.active_params_b < self.params_b
+
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         serving = data.get("serving")
