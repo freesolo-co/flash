@@ -518,8 +518,16 @@ def run_sft():
         print(
             "[sft] precision=fp8 -> requesting chalk FP8 frozen-base GEMM (QLoRA-style; LoRA stays bf16)"
         )
+    # chalk's fused linear-CE binds the causal-LM forward to return the fused loss with
+    # ``logits=None`` (like Liger). But the worker ships NO liger-kernel, and TRL >=1.6's
+    # SFTTrainer.compute_loss reads ``outputs.logits`` for a token-accuracy metric unless
+    # ``use_liger_kernel=True`` — which TRL rejects without liger installed (ImportError). So on
+    # this stack chalk's fused-CE + TRL SFTTrainer is a hard crash (``'NoneType' object is not
+    # subscriptable``). Keep fused-CE OFF for SFT (GRPO's GRPOTrainer path is unaffected and keeps
+    # it): the model then returns real logits and the large-vocab logits cap below sizes for it.
+    # fp8_frozen_base is independent of fused-CE, so FP8 still engages.
     _chalk_report = install_chalk_kernels(
-        getattr(trainer, "model", None), fp8=(_precision == "fp8")
+        getattr(trainer, "model", None), fp8=(_precision == "fp8"), fused_ce=False
     )
     _chalk_active = active_kernels(_chalk_report)
     if _sft_fused and "fused_linear_cross_entropy" not in _chalk_active:

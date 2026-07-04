@@ -93,7 +93,7 @@ def _fp8_kwargs(apply_fn) -> dict:
     return kw
 
 
-def install_chalk_kernels(model=None, *, fp8: bool = False) -> dict:
+def install_chalk_kernels(model=None, *, fp8: bool = False, fused_ce: bool = True) -> dict:
     """Apply chalk standalone kernels to ``model``; call AFTER TRL builds the trainer.
 
     ``fp8=True`` additionally enables the FP8 frozen-base GEMM (chalk ``fp8_frozen_base``): a
@@ -101,6 +101,14 @@ def install_chalk_kernels(model=None, *, fp8: bool = False) -> dict:
     stay bf16). It self-gates inside chalk to FP8 hardware (Ada/Hopper/Blackwell, sm_89+) and to
     Qwen3.5/3.6, so on an A100/older worker or an unsupported model it no-ops and training stays
     bf16 — logged below so the A/B stays honest.
+
+    ``fused_ce=False`` turns OFF chalk's fused linear-cross-entropy. chalk's fused-CE binds the
+    causal-LM forward to return the fused loss with ``logits=None``; that is incompatible with TRL's
+    ``SFTTrainer.compute_loss`` (it reads ``outputs.logits`` for a token-accuracy metric and only
+    skips it when ``use_liger_kernel=True``, which TRL rejects unless liger-kernel is installed —
+    it is not on this worker). The SFT path passes ``fused_ce=False`` so the model returns real
+    logits; GRPO keeps the default. ``fp8_frozen_base`` is independent, so FP8 still engages either
+    way.
 
     Returns chalk's per-kernel report, or ``{}`` when freesolo-chalk isn't installed.
     """
@@ -120,6 +128,8 @@ def install_chalk_kernels(model=None, *, fp8: bool = False) -> dict:
         return {}
 
     kwargs = dict(_KERNELS)
+    if not fused_ce:
+        kwargs["fused_linear_cross_entropy"] = False
     if fp8:
         kwargs.update(_fp8_kwargs(apply_chalk_kernel_to_qwen35))
         log.info("chalk fp8 requested: enabling fp8_frozen_base (QLoRA-style FP8 frozen-base GEMM)")

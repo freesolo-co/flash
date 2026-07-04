@@ -224,6 +224,28 @@ def test_fp8_no_wcache_feature_detected(monkeypatch):
     assert rep is not None  # apply succeeded, not swallowed
 
 
+def test_fused_ce_false_disables_fused_cross_entropy(monkeypatch):
+    """SFT passes fused_ce=False (chalk's None-logits fused-CE crashes TRL SFTTrainer sans liger);
+    only fused_linear_cross_entropy flips off, every other kernel is untouched, fp8 still composes."""
+    calls = []
+    _install_fake_chalk_fp8(monkeypatch, calls)
+    install_chalk_kernels(object(), fp8=True, fused_ce=False)
+    _, kwargs = calls[0]
+    assert kwargs["fused_linear_cross_entropy"] is False
+    assert kwargs["fp8_frozen_base"] is True  # fp8 is independent of fused-CE
+    assert kwargs["rope"] is True  # other kernels unaffected
+    assert kwargs["swiglu"] is True
+
+
+def test_fused_ce_default_on(monkeypatch):
+    """GRPO uses the default (fused_ce=True): fused_linear_cross_entropy stays ON."""
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    install_chalk_kernels(object())  # default fused_ce=True
+    _, kwargs = calls[0]
+    assert kwargs["fused_linear_cross_entropy"] is True
+
+
 def test_fp8_env_flag_still_cannot_enable(monkeypatch):
     """Only the explicit fp8= param enables FP8; a leftover FLASH_FP8_BASE env stays inert."""
     monkeypatch.setenv("FLASH_FP8_BASE", "1")
