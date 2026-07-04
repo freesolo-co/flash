@@ -249,7 +249,31 @@ def _build_parser() -> argparse.ArgumentParser:
         const="multi",
         help="scaffold a multi-turn environment (bounded episode with step_episode / score_episode).",
     )
-    setup.set_defaults(func=cmd_env_setup, turn_mode="single")
+    setup_reason = setup.add_mutually_exclusive_group()
+    setup_reason.add_argument(
+        "--reasoning",
+        dest="reasoning",
+        action="store_const",
+        const=True,
+        help="scaffold configs with reasoning enabled (thinking = true, with a raised token budget).",
+    )
+    setup_reason.add_argument(
+        "--no-reasoning",
+        dest="reasoning",
+        action="store_const",
+        const=False,
+        help="scaffold configs without reasoning. This is the default.",
+    )
+    setup.add_argument(
+        "-y",
+        "--yes",
+        dest="yes",
+        action="store_true",
+        help="accept defaults without prompting (single-turn, no reasoning).",
+    )
+    # turn_mode / reasoning default to None (unset) so the scaffold can tell an explicit flag
+    # apart from "not chosen yet" and, on an interactive terminal, ask instead of assuming.
+    setup.set_defaults(func=cmd_env_setup, turn_mode=None, reasoning=None, yes=False)
 
     env_list = env_sub.add_parser("list", help="list local environment sources")
     env_list.set_defaults(func=cmd_env_list)
