@@ -273,6 +273,38 @@ def arrow(msg: str) -> str:
     return _safe(f"{_paint(_glyph('→', '->'), _ACCENT2)} {_dim(msg)}")
 
 
+def select(title: str, options: list[tuple[str, str, str]], default: int = 0) -> str:
+    """Themed single-choice prompt; returns the chosen option's value.
+
+    ``options`` is a list of ``(value, label, hint)``. The default option is marked and taken on
+    an empty answer (enter). Reads via ``input()`` so it is easy to drive in tests; the caller
+    decides *when* to prompt (interactive stdin), so this always prompts when called. On EOF the
+    default is returned so a closed stdin never hangs the scaffold."""
+    q = _paint(_glyph("?", "?"), _ACCENT, "1")
+    print(f"{q} {_bold(_safe(title))}")
+    for i, (_value, label, hint) in enumerate(options):
+        num = _paint(f"{i + 1})", _ACCENT2)
+        lab = _bold(label) if i == default else label
+        tail = f"  {_dim(_safe(hint))}" if hint else ""
+        mark = _paint(" (default)", _GREEN) if i == default else ""
+        print(f"  {num} {_safe(lab)}{tail}{mark}")
+    pointer = _paint(_glyph("›", ">"), _ACCENT2)  # noqa: RUF001 (the glyph is the point)
+    for _ in range(5):
+        try:
+            raw = input(f"{pointer} ").strip()
+        except EOFError:
+            print()
+            return options[default][0]
+        if not raw:
+            return options[default][0]
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx][0]
+        print(note(f"enter 1-{len(options)}, or press enter for the default"))
+    return options[default][0]
+
+
 def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
 

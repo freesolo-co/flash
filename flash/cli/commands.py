@@ -330,14 +330,40 @@ _STARTER_DATASET_MULTITURN_JSONL = """\
 """
 
 
+_TURN_OPTIONS = [
+    ("single", "single-turn", "one prompt -> one response"),
+    ("multi", "multi-turn", "bounded episode: step_episode / score_episode"),
+]
+_REASONING_OPTIONS = [
+    ("off", "no reasoning", "the model answers directly"),
+    ("on", "reasoning", "thinking = true; spends more tokens per answer"),
+]
+
+
+def _setup_interactive(args) -> bool:
+    """Whether to ask the setup questions interactively.
+
+    Prompt only on a real terminal a human can answer from. Fall back to defaults (no prompt) when
+    --yes is passed, under CI, or when stdin is closed/redirected, so automation never blocks on an
+    unanswered prompt. A pseudo-TTY in CI can report isatty()=True, so CI is checked explicitly; a
+    closed fd 0 can make sys.stdin None, so that is guarded before .isatty()."""
+    if getattr(args, "yes", False):
+        return False
+    if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
+        return False
+    stdin = sys.stdin
+    if stdin is None or not stdin.isatty():
+        return False
+    return render.styled()
+
+
 def cmd_env_setup(args) -> int:
-    requested_multi = getattr(args, "turn_mode", "single") == "multi"
     starter_env = Path("environment.py")
     dataset = Path("dataset/train.jsonl")
     # An existing environment.py is the authoritative signal for which turn mode this
     # scaffold already uses (the dataset is plain JSONL with no reliable mode marker).
     # Anchor to it so a re-run never leaves a single-turn env beside a multi-turn
-    # dataset (or vice versa); the flag only decides the mode when starting fresh.
+    # dataset (or vice versa); the flag/answer only decides the mode when starting fresh.
     existing_multi: bool | None = None
     anchor = "environment.py"
     if starter_env.exists():
@@ -347,15 +373,59 @@ def cmd_env_setup(args) -> int:
         # distinctive prompt; use it so we don't drop a single-turn env beside it.
         existing_multi = "secret whole number" in dataset.read_text(encoding="utf-8")
         anchor = "dataset/train.jsonl"
-    if existing_multi is not None and existing_multi != requested_multi:
-        have = "multi-turn" if existing_multi else "single-turn"
-        want = "multi-turn" if requested_multi else "single-turn"
-        msg = (
-            f"existing {anchor} is {have}; keeping it and ignoring --{want}. "
-            f"Delete environment.py and dataset/train.jsonl first to re-scaffold as {want}."
+
+    # Resolve the turn mode. An existing scaffold wins (warn if a flag disagrees); otherwise an
+    # explicit --single-turn/--multi-turn flag wins; otherwise ask on a terminal, else single-turn.
+    flag_mode = getattr(args, "turn_mode", None)
+    if existing_multi is not None:
+        if flag_mode is not None and (flag_mode == "multi") != existing_multi:
+            have = "multi-turn" if existing_multi else "single-turn"
+            want = "multi-turn" if flag_mode == "multi" else "single-turn"
+            msg = (
+                f"existing {anchor} is {have}; keeping it and ignoring --{want}. "
+                f"Delete environment.py and dataset/train.jsonl first to re-scaffold as {want}."
+            )
+            print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
+        multi_turn = existing_multi
+    elif flag_mode is not None:
+        multi_turn = flag_mode == "multi"
+    elif _setup_interactive(args):
+        multi_turn = (
+            render.select("How does the model interact with your task?", _TURN_OPTIONS) == "multi"
         )
-        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
-    multi_turn = requested_multi if existing_multi is None else existing_multi
+    else:
+        multi_turn = False
+
+    # Resolve reasoning. Like the turn mode, an existing config is authoritative: configs are only
+    # written when absent, so applying a reasoning flag to an already-scaffolded project would
+    # silently no-op (or write one config with reasoning and leave the other without). Anchor to the
+    # existing config's `thinking` state and warn if a flag disagrees; otherwise the flag wins;
+    # otherwise ask on a terminal; else off.
+    rl = Path("configs/rl.toml")
+    sft = Path("configs/sft.toml")
+    existing_reasoning: bool | None = None
+    for cfg in (rl, sft):
+        if cfg.exists():
+            existing_reasoning = "thinking = true" in cfg.read_text(encoding="utf-8")
+            break
+    flag_reason = getattr(args, "reasoning", None)
+    if existing_reasoning is not None:
+        if flag_reason is not None and flag_reason != existing_reasoning:
+            have = "reasoning" if existing_reasoning else "no reasoning"
+            want = "reasoning" if flag_reason else "no-reasoning"
+            msg = (
+                f"existing configs are {have}; keeping them and ignoring --{want}. "
+                f"Delete configs/rl.toml and configs/sft.toml first to re-scaffold with --{want}."
+            )
+            print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
+        reasoning = existing_reasoning
+    elif flag_reason is not None:
+        reasoning = flag_reason
+    elif _setup_interactive(args):
+        reasoning = render.select("Train with reasoning (thinking)?", _REASONING_OPTIONS) == "on"
+    else:
+        reasoning = False
+
     env_py = _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY
     dataset_jsonl = _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
     Path("configs").mkdir(exist_ok=True)
@@ -373,28 +443,47 @@ def cmd_env_setup(args) -> int:
         'id = ""\n\n'
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
-    rl = Path("configs/rl.toml")
+    # `thinking = true` opts the run into reasoning mode. Reasoning shares the generation budget with
+    # the answer, so GRPO also gets a raised max_tokens. These strings are empty when reasoning is
+    # off, keeping the default scaffold byte-for-byte identical.
+    thinking_line = "thinking = true\n" if reasoning else ""
+    rl_reasoning_train = (
+        "max_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"
+        if reasoning
+        else ""
+    )
+    sft_reasoning_note = (
+        "# reasoning is on (thinking = true): each gold `output` must contain a <think>...</think>\n"
+        "# block; validate locally with freesolo.datasets.warn_missing_think_tags before a real run.\n"
+        if reasoning
+        else ""
+    )
     if not rl.exists():
         rl.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
-            'algorithm = "grpo"\n\n'
+            'algorithm = "grpo"\n'
+            f"{thinking_line}"
+            "\n"
             f"{env_comment}"
             "[train]\n"
             "steps = 150\n"
+            f"{rl_reasoning_train}"
             "lora_rank = 32\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
-    sft = Path("configs/sft.toml")
     if not sft.exists():
         sft.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
-            'algorithm = "sft"\n\n'
+            'algorithm = "sft"\n'
+            f"{thinking_line}"
+            "\n"
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
             "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
             "lora_rank = 32\n"
+            f"{sft_reasoning_note}"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
@@ -768,7 +857,9 @@ def cmd_deploy(args) -> int:
                 f"OpenAI-compatible base URL: {openai_base} — point clients at this /v1 base, "
                 "not the bare endpoint (which 404s on /chat/completions)."
             )
-            print(render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr)
+            print(
+                render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr
+            )
     if dep.get("state") != "dry_run":
         state = dep.get("state", "deploying")
         if state == "failed":
