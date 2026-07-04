@@ -44,9 +44,37 @@ def _to_cpu_ids(completion_ids):
     return [int(t) for t in completion_ids]
 
 
-def _rollout_terminated(completion_ids, completion_text, eos_id, stop_sequences) -> bool:
-    """True iff the rollout ended NATURALLY — the student emitted EOS, or (when stop_sequences are
-    configured) the decoded text ends with a stop delimiter.
+def _generation_eos_ids(model, tok) -> frozenset:
+    """The FULL set of token ids that halt this model's generation — the union of the tokenizer's
+    ``eos_token_id`` and the model's ``generation_config``/``config`` ``eos_token_id``, each of which
+    HF allows to be a single id OR a list.
+
+    A model can stop on a SECONDARY eos: MiniCPM5 halts generation on ``<|im_end|>`` while its primary
+    ``tok.eos_token_id`` is ``</s>``. A completion ending on that secondary id is a NATURAL termination
+    even though it != ``tok.eos_token_id``, so ``_rollout_terminated`` must see the whole set; a
+    single-id check misreads the rollout as truncated and skips it, which with no stop_sequences burns
+    every sample and fails the run with "no trained step" (codex[bot])."""
+    ids: set[int] = set()
+
+    def _add(v):
+        # bool is an int subclass but never a token id; exclude it from both the scalar and list forms.
+        if isinstance(v, bool):
+            return
+        if isinstance(v, int):
+            ids.add(v)
+        elif isinstance(v, (list, tuple, set, frozenset)):
+            ids.update(int(x) for x in v if isinstance(x, int) and not isinstance(x, bool))
+
+    _add(getattr(tok, "eos_token_id", None))
+    for obj in (getattr(model, "generation_config", None), getattr(model, "config", None)):
+        if obj is not None:
+            _add(getattr(obj, "eos_token_id", None))
+    return frozenset(ids)
+
+
+def _rollout_terminated(completion_ids, completion_text, eos_ids, stop_sequences) -> bool:
+    """True iff the rollout ended NATURALLY — the student emitted ANY of the model's EOS ids, or (when
+    stop_sequences are configured) the decoded text ends with a stop delimiter.
 
     HF ``generate`` halts on four conditions — EOS, a ``stop_strings`` match, the ``max_new_tokens``
     cap, or the ``gen_cfg.max_time`` wall-clock bound — and only the first two are natural completions.
@@ -56,19 +84,22 @@ def _rollout_terminated(completion_ids, completion_text, eos_id, stop_sequences)
     can never teach the student to end — a driver of the eval's unterminated-JSON parse failures. The
     caller skips anything that isn't terminated (codex[bot]).
 
-    EOS is checked on the IDS (``completion_text`` is decoded with ``skip_special_tokens=True``, so EOS
-    isn't visible there). The stop delimiter IS in the raw text — HF emits it before halting — matched
-    with the same trailing-``endswith`` semantics ``_trim_trailing_stop`` uses to remove it, so a
-    stop-terminated rollout is recognised even when the delimiter lands as the final token AT the cap
-    (which a length-only check wrongly discarded). Fail OPEN only when NO termination signal exists at
-    all (no eos_token_id AND no stop_sequences): we then can't tell a finished answer from a cut-off one,
-    so we distil rather than skip every rollout. Real tokenizers always define eos_token_id, so in
-    production a cap/max_time cut without EOS or a stop delimiter correctly returns False (skip)."""
-    if eos_id is not None and eos_id in completion_ids:
+    ``eos_ids`` is the FULL set of generation-halting ids (see ``_generation_eos_ids``), NOT a single
+    id: a model whose ``generation_config.eos_token_id`` is a list stops on any member, so a completion
+    ending in a secondary eos must count as terminated. EOS is checked on the IDS (``completion_text``
+    is decoded with ``skip_special_tokens=True``, so EOS isn't visible there). The stop delimiter IS in
+    the raw text — HF emits it before halting — matched with the same trailing-``endswith`` semantics
+    ``_trim_trailing_stop`` uses to remove it, so a stop-terminated rollout is recognised even when the
+    delimiter lands as the final token AT the cap (which a length-only check wrongly discarded). Fail
+    OPEN only when NO termination signal exists at all (empty ``eos_ids`` AND no stop_sequences): we
+    then can't tell a finished answer from a cut-off one, so we distil rather than skip every rollout.
+    Real tokenizers always define an eos, so in production a cap/max_time cut without any EOS or a stop
+    delimiter correctly returns False (skip)."""
+    if eos_ids and not eos_ids.isdisjoint(completion_ids):
         return True
     if stop_sequences and any(s and completion_text.endswith(s) for s in stop_sequences):
         return True
-    return eos_id is None and not stop_sequences
+    return not eos_ids and not stop_sequences
 
 
 def student_tokens_with_offsets(tok, completion_ids, completion_text: str):

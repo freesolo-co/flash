@@ -31,6 +31,7 @@ from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.opd_gkd import (
+    _generation_eos_ids,
     _rollout_terminated,
     _teacher_prompt_text,
     _to_cpu_ids,
@@ -594,16 +595,30 @@ def run_opd():
         )
 
     if opt_steps < steps:
-        # Real updates landed, but skips (over-budget prompts / empty completions / an intermittent
-        # teacher) kept the loop from reaching the requested `steps` optimizer updates within the
-        # iteration budget. Publishing now would serve an under-trained adapter as the DEFAULT while
-        # billing the full `steps` quote, so RETRY (a healthier teacher / less degenerate sampling may
-        # complete it next attempt) rather than silently shipping short (codex[bot]). The intermediate
-        # non-default checkpoints already published stay available; only the served default is gated.
-        raise RetriableInfraError(
+        # Real updates landed, but skips kept the loop from reaching the requested `steps` optimizer
+        # updates within the iteration budget. Publishing now would serve an under-trained adapter as
+        # the DEFAULT while billing the full `steps` quote, so gate the served default (the intermediate
+        # non-default checkpoints already published stay available) and either retry or fail loudly.
+        diag = (
             f"opd reached only {opt_steps}/{steps} optimizer updates within {max_iters} iterations "
-            f"({dropped_long} prompts dropped over budget, {teacher_transient} transient teacher "
-            "failures) — retrying rather than publishing an under-trained adapter billed as full steps."
+            f"({dropped_long} prompts dropped over budget, {truncated_rollouts} non-terminated "
+            f"rollouts, {teacher_transient} transient teacher failures)"
+        )
+        if teacher_transient > 0:
+            # SOME scoring calls hit a RETRYABLE teacher outage: a healthier teacher next attempt may
+            # complete the remaining updates, so RETRY rather than ship short (codex[bot]).
+            raise RetriableInfraError(
+                f"{diag} — retrying rather than publishing an under-trained adapter billed as full steps."
+            )
+        # No transient teacher failures: the shortfall is DETERMINISTIC (over-budget prompts /
+        # non-terminated or empty rollouts / zero teacher↔student alignment). OPD has no resume, so a
+        # retry restarts from step 0 with the same seed/model/data and reproduces the identical skips —
+        # burning GPU on an unfixable run and masking the real config/model problem. Fail PERMANENTLY
+        # with the skip diagnostics so the user fixes the env/model instead (codex[bot]).
+        raise RuntimeError(
+            f"{diag} — the shortfall is deterministic (no transient teacher failures), so a retry would "
+            "repeat it (opd has no resume). Fix the setup: shorten prompts, enable stop_sequences or a "
+            "warm-start so rollouts terminate, or verify the teacher tokenizer aligns to the student."
         )
 
     _save_adapter(model, tok, adapter_dir)
@@ -721,9 +736,11 @@ def _train_one(
     # mid-output, which OPD would otherwise echo-score and reinforce, teaching a runaway it can never
     # learn to end (OPD can't supervise the stop token). Checked on the RAW rollout text, before
     # _trim_trailing_stop removes the delimiter — so a stop-terminated sample AT the cap is KEPT, not
-    # discarded (codex[bot]). getattr: a fake/EOS-less tokenizer yields None -> fail-open in the helper.
+    # discarded (codex[bot]). _generation_eos_ids gathers EVERY halting id (tokenizer + generation_
+    # config, either of which may be a list) so a model that stops on a secondary eos isn't misread as
+    # truncated; a fake/EOS-less tokenizer yields an empty set -> fail-open in the helper.
     if not _rollout_terminated(
-        completion_ids, completion_text, getattr(tok, "eos_token_id", None), knobs["stop_sequences"]
+        completion_ids, completion_text, _generation_eos_ids(model, tok), knobs["stop_sequences"]
     ):
         return SampleResult(truncated=True, gen_tokens=len(completion_ids))
     # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter

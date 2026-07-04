@@ -334,18 +334,45 @@ def test_rollout_terminated_requires_eos_or_stop_not_length():
     can't supervise the stop token). Length is NOT the criterion (codex[bot])."""
     from flash.engine.worker.opd import _rollout_terminated
 
-    EOS = 99
+    EOS = frozenset({99})
     # EOS in the ids -> terminated (HF appends EOS when it stops on it), regardless of length.
-    assert _rollout_terminated([1, 2, 3, EOS], "abc", EOS, ()) is True
+    assert _rollout_terminated([1, 2, 3, 99], "abc", EOS, ()) is True
     # no EOS, no stops -> NOT terminated: a cap hit OR a max_time cut, both partial fragments -> skip.
     assert _rollout_terminated([1, 2, 3, 4], "abcd", EOS, ()) is False  # cap hit, no EOS
     assert _rollout_terminated([1, 2], "ab", EOS, ()) is False  # short: max_time cut, no EOS/stop
+    # A model with MULTIPLE eos ids (generation_config.eos_token_id is a list) stops on ANY member, so
+    # a completion ending in a SECONDARY eos is terminated, not a truncation to skip (codex[bot]).
+    assert _rollout_terminated([1, 2, 88], "abc", frozenset({99, 88}), ()) is True
     # stop delimiter is the trailing text -> terminated even without EOS AND even at the cap (codex#587).
-    assert _rollout_terminated([1, 2, 3, 4], "ans</answer>", None, ("</answer>",)) is True
+    assert _rollout_terminated([1, 2, 3, 4], "ans</answer>", frozenset(), ("</answer>",)) is True
     # stop configured but text doesn't end with it, no EOS -> not terminated -> skip.
-    assert _rollout_terminated([1, 2, 3, 4], "ans", None, ("</answer>",)) is False
-    # no termination signal at all (no eos id, no stops) -> fail OPEN (distil, don't skip everything).
-    assert _rollout_terminated([1, 2, 3, 4], "abcd", None, ()) is True
+    assert _rollout_terminated([1, 2, 3, 4], "ans", frozenset(), ("</answer>",)) is False
+    # no termination signal at all (empty eos set, no stops) -> fail OPEN (distil, don't skip all).
+    assert _rollout_terminated([1, 2, 3, 4], "abcd", frozenset(), ()) is True
+
+
+def test_generation_eos_ids_unions_tokenizer_and_generation_config_lists():
+    """_rollout_terminated must see EVERY halting id. _generation_eos_ids unions the tokenizer's
+    eos_token_id with the model's generation_config/config eos_token_id, each of which HF allows to be
+    a scalar OR a list — so a model like MiniCPM5 that halts on a secondary <|im_end|> (a list member)
+    while its primary eos is </s> gets both ids, and a secondary-eos rollout is not misread as truncated
+    (codex[bot]). bool is an int subclass but never a token id, so it's excluded."""
+    from flash.engine.worker.opd import _generation_eos_ids
+
+    tok = SimpleNamespace(eos_token_id=2)
+    # generation_config carries a LIST (primary + secondary); config repeats one — union dedups.
+    model = SimpleNamespace(
+        generation_config=SimpleNamespace(eos_token_id=[2, 73]),
+        config=SimpleNamespace(eos_token_id=151645),
+    )
+    assert _generation_eos_ids(model, tok) == frozenset({2, 73, 151645})
+
+    # Scalar-only tokenizer, model without generation config -> just the tokenizer id.
+    assert _generation_eos_ids(SimpleNamespace(), SimpleNamespace(eos_token_id=5)) == frozenset({5})
+    # Nothing defines an eos -> empty set (the fail-open signal for _rollout_terminated).
+    assert _generation_eos_ids(SimpleNamespace(), SimpleNamespace()) == frozenset()
+    # bool must not leak in as a token id (True == 1 would poison the set).
+    assert _generation_eos_ids(SimpleNamespace(), SimpleNamespace(eos_token_id=True)) == frozenset()
 
 
 def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
@@ -923,12 +950,16 @@ def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(mon
     assert opd_mod._thinking_prefill_text(_WhitespaceEmptyBlockTok()) == "<think>\n"
 
 
-def test_opd_loop_drives_by_optimizer_updates_and_retries_on_shortfall(monkeypatch):
-    """Regression (codex[bot], opd.py:467): the loop must be driven by optimizer UPDATES, not raw
-    iterations -- a no-signal iteration skips optimizer.step(), so `for step in range(steps)` could
-    exit with opt_steps < steps and publish an under-trained adapter as the default while billing the
-    full `steps` quote. A run that lands SOME updates but cannot reach `steps` within the bounded
-    iteration budget must raise RetriableInfraError (retry), not ship short."""
+def test_opd_loop_drives_by_optimizer_updates_and_fails_permanently_on_deterministic_shortfall(
+    monkeypatch,
+):
+    """Regression (codex[bot], opd.py:467 + shortfall guard): the loop is driven by optimizer UPDATES,
+    not raw iterations -- a no-signal iteration skips optimizer.step(), so `for step in range(steps)`
+    could exit with opt_steps < steps and publish an under-trained adapter as the default while billing
+    the full `steps` quote. When the shortfall is DETERMINISTIC (updates land, then every sample skips
+    with NO transient teacher failure), the run must fail PERMANENTLY, not RetriableInfraError: opd has
+    no resume, so a retry restarts from step 0 and reproduces the identical skips, burning GPU on an
+    unfixable run (codex[bot])."""
     from flash.engine.worker.perf import RetriableInfraError
 
     torch = pytest.importorskip("torch")
@@ -939,19 +970,49 @@ def test_opd_loop_drives_by_optimizer_updates_and_retries_on_shortfall(monkeypat
         from flash.engine.worker.opd import SampleResult
 
         state["n"] += 1
-        # exactly one real, backward-able update lands first; then every sample skips (loss=None)
+        # exactly one real, backward-able update lands first; then every sample skips (loss=None). The
+        # teacher stays "ok" throughout, so teacher_transient == 0 -> the shortfall is deterministic.
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
         return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
     # steps=3 but only ONE optimizer update can ever land -> the bounded loop exhausts its iteration
-    # budget at opt_steps=1 and the post-loop guard must retry rather than publish 1/3.
-    opd_mod = _opd_harness(
-        monkeypatch, train_one=_one_update_then_skip, steps=3, group=1
-    )
-    with pytest.raises(RetriableInfraError, match="optimizer updates"):
+    # budget at opt_steps=1 and the post-loop guard must fail permanently (deterministic), not retry.
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, steps=3, group=1)
+    with pytest.raises(RuntimeError, match="deterministic") as ei:
         opd_mod.run_opd()
+    assert not isinstance(ei.value, RetriableInfraError)  # permanent, NOT the retriable path
     # The loop is BOUNDED: it did not spin forever waiting for updates that never come.
     assert state["n"] <= 2 * 3 + 10
+
+
+def test_opd_transient_teacher_shortfall_is_retriable(monkeypatch):
+    """The OTHER branch of the shortfall guard: when a transient teacher outage (not deterministic
+    local skips) caused opt_steps < steps, retry. One update lands, then teacher.score flakes
+    transiently for the rest -> teacher_transient > 0 -> RetriableInfraError, because a healthier
+    teacher next attempt may finish the run (codex[bot])."""
+    from flash.engine.worker.perf import RetriableInfraError
+
+    pytest.importorskip("torch")
+
+    state = {"n": 0}
+
+    def _one_update_then_transient(*, model, **k):
+        from flash.engine.worker.opd import SampleResult
+
+        state["n"] += 1
+        if state["n"] == 1:  # one real update lands...
+            return SampleResult(
+                loss=model.w.float().sum() * 1e-6,
+                teacher_status="ok",
+                coverage=1.0,
+                gen_tokens=1,
+                teacher_tokens=1,
+            )
+        return SampleResult(teacher_status="transient", gen_tokens=1)  # ...then a retryable outage
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_transient, steps=3, group=1)
+    with pytest.raises(RetriableInfraError, match="optimizer updates"):
+        opd_mod.run_opd()
 
 
 def test_student_tokens_absorb_dropped_leading_space_sentencepiece():
@@ -1074,12 +1135,11 @@ def test_opd_initializes_and_logs_to_wandb_when_configured(monkeypatch):
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
         return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
-    from flash.engine.worker.perf import RetriableInfraError
-
     opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, steps=3, group=1)
     # Turn W&B ON for this run (harness defaults it off): wandb_report_to() truthy -> _wandb_on.
     monkeypatch.setattr(opd_mod._w, "wandb_report_to", lambda: ["wandb"])
-    with pytest.raises(RetriableInfraError):  # 1/3 updates -> retry, after logging the one that landed
+    # Deterministic shortfall fails permanently (not retriable); the one landed update still logs first.
+    with pytest.raises(RuntimeError):
         opd_mod.run_opd()
     assert logs, "W&B on -> run_opd must call wandb.log for each landed optimizer step"
     data, step = logs[0]
@@ -1114,12 +1174,10 @@ def test_opd_skips_wandb_logging_when_not_configured(monkeypatch):
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
         return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
-    from flash.engine.worker.perf import RetriableInfraError
-
     opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, steps=3, group=1)
     # Harness default wandb_report_to -> [] (off). The suppress(Exception) around wandb.log would hide a
     # raise, so the guard here is _wandb_on being False (wandb.log never reached), which _explode proves.
-    with pytest.raises(RetriableInfraError):
+    with pytest.raises(RuntimeError):
         opd_mod.run_opd()
 
 
