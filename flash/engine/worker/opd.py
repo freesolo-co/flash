@@ -730,7 +730,13 @@ def _train_one(
     completion_ids = _to_cpu_ids(
         gen[0, prompt_tensor.shape[1] :]
     )  # one GPU->CPU copy, reused below
-    completion_text = tok.decode(completion_ids, skip_special_tokens=True)
+    completion_text = tok.decode(completion_ids, skip_special_tokens=True)  # teacher/alignment text
+    # Stop detection + trimming run on a decode that KEEPS special tokens: a [train] stop_sequence can
+    # be a tokenizer special token (e.g. <|im_end|>) that skip_special_tokens=True strips, so the clean
+    # text no longer ends with the delimiter and the rollout is misread as truncated / never trimmed —
+    # burning every usable sample for that config (codex[bot]). HF stop_strings halts AT the delimiter
+    # (no EOS can trail it when stops are configured), so this raw tail is unambiguous.
+    stop_text = tok.decode(completion_ids, skip_special_tokens=False)
     # Skip a rollout that did NOT terminate naturally (no EOS, no stop delimiter) BEFORE scoring/
     # distilling it: a max_new_tokens cap hit OR a gen_cfg.max_time cut leaves a filter cut off
     # mid-output, which OPD would otherwise echo-score and reinforce, teaching a runaway it can never
@@ -740,7 +746,7 @@ def _train_one(
     # config, either of which may be a list) so a model that stops on a secondary eos isn't misread as
     # truncated; a fake/EOS-less tokenizer yields an empty set -> fail-open in the helper.
     if not _rollout_terminated(
-        completion_ids, completion_text, _generation_eos_ids(model, tok), knobs["stop_sequences"]
+        completion_ids, stop_text, _generation_eos_ids(model, tok), knobs["stop_sequences"]
     ):
         return SampleResult(truncated=True, gen_tokens=len(completion_ids))
     # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter
@@ -748,7 +754,7 @@ def _train_one(
     # only the answer, and ids/text stay consistent for gkd_loss + token counting.
     if knobs["stop_sequences"]:
         completion_ids, completion_text = _trim_trailing_stop(
-            tok, completion_ids, completion_text, knobs["stop_sequences"]
+            tok, completion_ids, stop_text, knobs["stop_sequences"]
         )
     gen_tokens = len(completion_ids)
     if not completion_text.strip():

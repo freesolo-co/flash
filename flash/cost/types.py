@@ -128,9 +128,10 @@ class RunConfig:
 class CostEstimate:
     """A pre-flight estimate.
 
-    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd`` (+ ``teacher_api_usd`` for
-    opd). Setup/cold-start time is reported as elapsed wall time but is not billed to the
-    user estimate.
+    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is reported
+    as elapsed wall time but is not billed to the user estimate. ``teacher_api_usd`` (opd only) is
+    itemized as a diagnostic but NOT part of ``total_usd``: the teacher runs on the user's own
+    Fireworks key, so Fireworks bills them directly.
     """
 
     model_id: str
@@ -147,8 +148,9 @@ class CostEstimate:
     wall_clock_seconds: float
     wall_capped: bool
     total_usd: float
-    # opd only: external Fireworks GLM teacher token spend (0.0 for sft/grpo), already folded
-    # into total_usd. Shown as its own itemized line.
+    # opd only: external Fireworks GLM teacher token spend (0.0 for sft/grpo). Billed by Fireworks
+    # DIRECTLY to the user's FIREWORKS_API_KEY, so it is NOT part of total_usd — shown as its own
+    # itemized diagnostic line only.
     teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()
 
@@ -177,9 +179,10 @@ class CostEstimate:
             f"Billable   : {self.billable_hours:.2f} h (training only)",
         ]
         if self.teacher_api_usd > 0:
-            gpu_usd = self.total_usd - self.teacher_api_usd
-            lines.append(f"GPU        : ${gpu_usd:.2f}")
-            lines.append(f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks GLM token spend)")
+            lines.append(
+                f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks GLM token spend on your "
+                "FIREWORKS_API_KEY — billed by Fireworks, NOT included in TOTAL)"
+            )
         lines.append(f"TOTAL      : ${self.total_usd:.2f}")
         if self.notes:
             lines.append("Notes      :")

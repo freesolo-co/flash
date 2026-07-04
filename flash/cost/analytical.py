@@ -253,7 +253,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         train_seconds=train,
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
-        total_usd=train / 3600.0 * hourly + teacher_api_usd,
+        # GPU (platform-billed) time only. OPD's teacher tokens are billed by Fireworks DIRECTLY to
+        # the user's FIREWORKS_API_KEY (a user-supplied [environment].secret), so folding
+        # teacher_api_usd into the charged total would bill it a second time — keep it itemized as a
+        # diagnostic instead (codex[bot]).
+        total_usd=train / 3600.0 * hourly,
         teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),
     )

@@ -263,6 +263,36 @@ def test_trim_trailing_stop_prefers_longest_overlapping_stop():
     assert _trim_trailing_stop(_Tok(), [1, 2, 3, 4], "hi\n\n", ["\n\n", "\n"]) == ([1, 2], "hi")
 
 
+def test_stop_detection_and_trim_handle_special_token_delimiter():
+    """Regression (codex[bot], opd.py): a [train] stop_sequence can be a tokenizer SPECIAL token (e.g.
+    <|im_end|>). A skip_special_tokens=True decode STRIPS it, so the clean text no longer ends with the
+    delimiter — _rollout_terminated would misclassify the rollout as truncated and _trim_trailing_stop
+    would never remove it, skipping every usable sample for that config. Detection/trim must run on the
+    special-tokens-INCLUDED decode."""
+    from flash.engine.worker.opd import _rollout_terminated, _trim_trailing_stop
+
+    IM_END = 9  # a special token; renders to "<|im_end|>" ONLY when specials are kept
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            answer = "".join({1: "4", 2: "2"}.get(int(i), "") for i in ids)
+            if not skip_special_tokens and any(int(i) == IM_END for i in ids):
+                return answer + "<|im_end|>"
+            return answer
+
+    ids = [1, 2, IM_END]
+    stop_text = _Tok().decode(ids, skip_special_tokens=False)  # "42<|im_end|>"
+    stops = ["<|im_end|>"]
+
+    # The clean decode drops the delimiter, but the raw stop_text keeps it -> terminated, NOT truncated.
+    assert _Tok().decode(ids, skip_special_tokens=True).endswith("<|im_end|>") is False
+    assert _rollout_terminated(ids, stop_text, frozenset(), stops) is True
+    # trim drops the special-token delimiter id; teacher/alignment text is the clean answer "42".
+    kept_ids, text = _trim_trailing_stop(_Tok(), ids, stop_text, stops)
+    assert kept_ids == [1, 2]
+    assert text == "42"
+
+
 def test_trim_trailing_stop_scans_from_end_not_quadratically():
     """Regression (codex[bot], opd.py:153): trimming the stop must scan from the END (a few decodes of
     the dropped tail), not decode every growing prefix ids[:1..n] — which was O(completion^2) and could
@@ -2290,8 +2320,10 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     assert spec_steps(spec) == 30
     est = estimate_for_spec(spec)
     assert est.method == "opd"
-    assert est.teacher_api_usd > 0.0  # external teacher token spend is itemized
-    assert est.total_usd >= est.teacher_api_usd
+    assert est.teacher_api_usd > 0.0  # external teacher token spend is itemized (diagnostic)
+    # Teacher tokens are billed by Fireworks to the user's own key, so they are NOT in the charge:
+    # total_usd is GPU (platform-billed) time only, never total + teacher (codex[bot]).
+    assert est.total_usd == pytest.approx(est.billable_hours * est.gpu_hourly_usd)
     assert "opd step" in " ".join(est.notes)
 
 

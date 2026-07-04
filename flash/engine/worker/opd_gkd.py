@@ -72,7 +72,7 @@ def _generation_eos_ids(model, tok) -> frozenset:
     return frozenset(ids)
 
 
-def _rollout_terminated(completion_ids, completion_text, eos_ids, stop_sequences) -> bool:
+def _rollout_terminated(completion_ids, stop_text, eos_ids, stop_sequences) -> bool:
     """True iff the rollout ended NATURALLY — the student emitted ANY of the model's EOS ids, or (when
     stop_sequences are configured) the decoded text ends with a stop delimiter.
 
@@ -86,18 +86,18 @@ def _rollout_terminated(completion_ids, completion_text, eos_ids, stop_sequences
 
     ``eos_ids`` is the FULL set of generation-halting ids (see ``_generation_eos_ids``), NOT a single
     id: a model whose ``generation_config.eos_token_id`` is a list stops on any member, so a completion
-    ending in a secondary eos must count as terminated. EOS is checked on the IDS (``completion_text``
-    is decoded with ``skip_special_tokens=True``, so EOS isn't visible there). The stop delimiter IS in
-    the raw text — HF emits it before halting — matched with the same trailing-``endswith`` semantics
-    ``_trim_trailing_stop`` uses to remove it, so a stop-terminated rollout is recognised even when the
-    delimiter lands as the final token AT the cap (which a length-only check wrongly discarded). Fail
-    OPEN only when NO termination signal exists at all (empty ``eos_ids`` AND no stop_sequences): we
-    then can't tell a finished answer from a cut-off one, so we distil rather than skip every rollout.
-    Real tokenizers always define an eos, so in production a cap/max_time cut without any EOS or a stop
-    delimiter correctly returns False (skip)."""
+    ending in a secondary eos must count as terminated — checked on the IDS. ``stop_text`` is the
+    completion decoded WITH special tokens (skip_special_tokens=False): the stop delimiter (which HF
+    emits before halting) is matched with the same trailing-``endswith`` semantics ``_trim_trailing_stop``
+    uses to remove it, so a stop-terminated rollout is recognised even when the delimiter is a special
+    token (e.g. ``<|im_end|>``) a clean decode would strip, or lands as the final token AT the cap
+    (which a length-only check wrongly discarded). Fail OPEN only when NO termination signal exists at
+    all (empty ``eos_ids`` AND no stop_sequences): we then can't tell a finished answer from a cut-off
+    one, so we distil rather than skip every rollout. Real tokenizers always define an eos, so in
+    production a cap/max_time cut without any EOS or a stop delimiter correctly returns False (skip)."""
     if eos_ids and not eos_ids.isdisjoint(completion_ids):
         return True
-    if stop_sequences and any(s and completion_text.endswith(s) for s in stop_sequences):
+    if stop_sequences and any(s and stop_text.endswith(s) for s in stop_sequences):
         return True
     return not eos_ids and not stop_sequences
 
@@ -160,41 +160,40 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     return ids, toks
 
 
-def _trim_trailing_stop(tok, completion_ids, completion_text: str, stops):
-    """Drop a trailing stop delimiter from BOTH the decoded text and the sampled ids (token-level).
+def _trim_trailing_stop(tok, completion_ids, stop_text: str, stops):
+    """Drop a trailing stop delimiter from BOTH the sampled ids and the decoded text (token-level).
 
     HF ``stop_strings`` halts only AFTER the delimiter text is emitted, so a run with e.g.
     ``[train] stop_sequences=["</answer>"]`` would otherwise score/distil the delimiter the user asked
-    to stop at. Trimming both sides keeps ids and text consistent (no gkd_loss / token-count desync,
-    the failure mode of a text-only trim). Returns ``(ids, text)`` (a list + str)."""
+    to stop at. ``stop_text`` is the completion decoded WITH special tokens (skip_special_tokens=False)
+    so a special-token delimiter (e.g. ``<|im_end|>``) is visible for the trailing match; the returned
+    text is the KEPT ids decoded WITHOUT special tokens (the teacher/alignment text). Returns
+    ``(ids, clean_text)`` (a list + str)."""
     ids = [int(t) for t in completion_ids]
     # Pick the LONGEST configured stop that is a trailing match (the earliest stop boundary in the
     # text). Overlapping delimiters like ["\n", "\n\n"] would otherwise trim only the first-listed
     # shorter suffix off a "\n\n" tail, leaving one newline for the teacher to score/distil; taking
     # the longest match removes the whole delimiter in one shot regardless of config order.
     stop = max(
-        (s for s in stops if s and completion_text.endswith(s)),
+        (s for s in stops if s and stop_text.endswith(s)),
         key=len,
         default="",
     )
     if not stop:
-        return ids, completion_text
-    keep_len = len(completion_text) - len(stop)
-    # Locate the kept prefix by scanning from the END: the delimiter is short, so only a handful of
-    # trailing tokens are dropped -> O(dropped * completion) work. Decoding growing prefixes from the
-    # START (ids[:1], ids[:2], ...) instead is O(completion^2) and can dominate CPU ahead of teacher
-    # scoring on long completions once [train].max_tokens is raised.
+        return ids, tok.decode(ids, skip_special_tokens=True)
+    keep_len = len(stop_text) - len(stop)
+    # Locate the kept prefix by scanning from the END on the SAME (special-tokens-included) decode
+    # keep_len is measured in, so a special-token delimiter's id(s) are dropped correctly. Scanning
+    # from the END is O(dropped * completion): the delimiter is short so only a handful of trailing
+    # tokens drop; decoding growing prefixes from the START would be O(completion^2).
     kept = len(ids)
-    while kept > 0 and len(tok.decode(ids[:kept], skip_special_tokens=True)) > keep_len:
+    while kept > 0 and len(tok.decode(ids[:kept], skip_special_tokens=False)) > keep_len:
         kept -= 1
-    # Trim the TEXT to exactly what the kept ids decode to — NOT completion_text[:keep_len].
-    # When the stop starts INSIDE the final sampled token (that token decodes to e.g.
-    # "B</answer>" while the stop is "</answer>"), that whole token is excluded from `kept`, so
-    # slicing the raw text at keep_len would keep a "B" the kept ids can no longer represent —
-    # desyncing the teacher-scored text from the student ids (gkd_loss / token-count skew).
-    # Decoding the kept ids keeps both sides identical (drops the fused char, never distils the
-    # delimiter); in the common case (the stop is its own clean token) it equals
-    # completion_text[:keep_len].
+    # Return the kept ids decoded WITHOUT special tokens — the teacher/alignment text. Decoding the
+    # kept ids (not slicing stop_text at keep_len) keeps the teacher-scored text and the student ids
+    # identical even when the stop starts INSIDE the final sampled token (that token decodes to e.g.
+    # "B</answer>"): the whole token is excluded from `kept`, so the fused "B" is dropped rather than
+    # left dangling to desync gkd_loss / the token count.
     return ids[:kept], tok.decode(ids[:kept], skip_special_tokens=True)
 
 
