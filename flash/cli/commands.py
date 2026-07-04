@@ -193,15 +193,177 @@ _STARTER_DATASET_JSONL = """\
 """
 
 
+_STARTER_ENV_MULTITURN_PY = '''\
+"""Starter Freesolo multi-turn environment.
+
+A multi-turn environment runs a bounded episode: the model produces an assistant
+action, `step_episode` advances the world (optionally appending an observation
+message), and the loop repeats until `done` or `max_episode_turns`. The finished
+transcript is graded by `score_episode`.
+
+Edit dataset/train.jsonl and the episode logic, then upload with
+`flash env push --name my-env .`.
+
+A managed run should use the returned [environment] id from
+`flash env push --name my-env .`.
+
+This starter implements a tiny "guess the secret number" game so you can see the
+episode hooks wired end-to-end. Replace it with your real task before a real run.
+
+Both SFT and GRPO train off this file:
+- GRPO (configs/rl.toml) rolls out full episodes and optimizes `score_episode`.
+- SFT (configs/sft.toml) learns the gold trajectory. Provide it per row as
+  `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
+  `output` for a single gold assistant turn.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from freesolo.datasets.types import TaskExample
+from freesolo.environments import (
+    EnvironmentEpisode,
+    EnvironmentMultiTurn,
+    EnvironmentStepResult,
+    RewardResult,
+)
+
+
+DEFAULT_DATASET_PATH = Path(__file__).parent / "dataset" / "train.jsonl"
+
+# How many assistant guesses the model gets before the episode is forced terminal.
+MAX_TURNS = 5
+
+
+def load_jsonl(path: str | Path):
+    rows = []
+    with Path(path).open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _secret(example: TaskExample) -> int:
+    return int(str(example.output).strip())
+
+
+class StarterMultiTurnEnv(EnvironmentMultiTurn):
+    dataset = load_jsonl(DEFAULT_DATASET_PATH)
+
+    def start_episode(self, example: TaskExample, prompt_text: str):
+        # The opening prompt shown to the model. `example.input` describes the range.
+        return [
+            {
+                "role": "user",
+                "content": (
+                    f"{example.input}\\n"
+                    f"Reply with a single integer per turn. I will say 'higher', "
+                    f"'lower', or 'correct'. You have {MAX_TURNS} guesses."
+                ),
+            }
+        ]
+
+    def max_episode_turns(self, example: TaskExample) -> int:
+        return MAX_TURNS
+
+    def step_episode(
+        self,
+        example: TaskExample,
+        messages: list,
+        assistant_response: str,
+    ) -> EnvironmentStepResult:
+        # Advance the world after one assistant action. Return done=True to end the
+        # episode, or append an observation message and keep going.
+        try:
+            guess = int(assistant_response.strip().split()[0])
+        except (ValueError, IndexError):
+            return EnvironmentStepResult(
+                done=False,
+                messages=[{"role": "user", "content": "Please reply with a single integer."}],
+            )
+        secret = _secret(example)
+        if guess == secret:
+            return EnvironmentStepResult(done=True, final_response_text=str(guess))
+        hint = "higher" if guess < secret else "lower"
+        return EnvironmentStepResult(
+            done=False,
+            messages=[{"role": "user", "content": hint}],
+        )
+
+    def score_episode(
+        self,
+        example: TaskExample,
+        episode: EnvironmentEpisode,
+    ) -> RewardResult:
+        # Grade the finished transcript. Reward a correct final guess; give partial
+        # credit for getting close so GRPO has a usable gradient.
+        secret = _secret(example)
+        try:
+            final = int(str(episode.response_text).strip())
+        except ValueError:
+            return RewardResult(score=0.0, threshold=1.0)
+        if final == secret:
+            return RewardResult(score=1.0, threshold=1.0, success=True)
+        # Closeness in [0, 1): further guesses score lower.
+        closeness = max(0.0, 1.0 - abs(final - secret) / 100.0)
+        return RewardResult(score=closeness * 0.5, threshold=1.0, success=False)
+
+
+def load_environment(dataset_path: str | None = None, **kwargs) -> StarterMultiTurnEnv:
+    env = StarterMultiTurnEnv()
+    if dataset_path:
+        env.dataset = load_jsonl(dataset_path)
+    return env
+'''
+
+
+# Multi-turn rows: `input` sets up the episode, `output` is the secret number.
+# The scalar `output` also serves as the gold single-turn SFT target; swap in
+# `{"messages": [...]}` to teach a full gold trajectory.
+_STARTER_DATASET_MULTITURN_JSONL = """\
+{"input":"I picked a secret whole number between 1 and 100.","output":"42"}
+{"input":"I picked a secret whole number between 1 and 100.","output":"73"}
+"""
+
+
 def cmd_env_setup(args) -> int:
+    requested_multi = getattr(args, "turn_mode", "single") == "multi"
+    starter_env = Path("environment.py")
+    dataset = Path("dataset/train.jsonl")
+    # An existing environment.py is the authoritative signal for which turn mode this
+    # scaffold already uses (the dataset is plain JSONL with no reliable mode marker).
+    # Anchor to it so a re-run never leaves a single-turn env beside a multi-turn
+    # dataset (or vice versa); the flag only decides the mode when starting fresh.
+    existing_multi: bool | None = None
+    anchor = "environment.py"
+    if starter_env.exists():
+        existing_multi = "EnvironmentMultiTurn" in starter_env.read_text(encoding="utf-8")
+    elif dataset.exists():
+        # No env.py to anchor on, but the starter multi-turn dataset carries a
+        # distinctive prompt; use it so we don't drop a single-turn env beside it.
+        existing_multi = "secret whole number" in dataset.read_text(encoding="utf-8")
+        anchor = "dataset/train.jsonl"
+    if existing_multi is not None and existing_multi != requested_multi:
+        have = "multi-turn" if existing_multi else "single-turn"
+        want = "multi-turn" if requested_multi else "single-turn"
+        msg = (
+            f"existing {anchor} is {have}; keeping it and ignoring --{want}. "
+            f"Delete environment.py and dataset/train.jsonl first to re-scaffold as {want}."
+        )
+        print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
+    multi_turn = requested_multi if existing_multi is None else existing_multi
+    env_py = _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY
+    dataset_jsonl = _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
     Path("configs").mkdir(exist_ok=True)
     Path("dataset").mkdir(exist_ok=True)
-    dataset = Path("dataset/train.jsonl")
     if not dataset.exists():
-        dataset.write_text(_STARTER_DATASET_JSONL)
-    starter_env = Path("environment.py")
+        dataset.write_text(dataset_jsonl)
     if not starter_env.exists():
-        starter_env.write_text(_STARTER_ENV_PY)
+        starter_env.write_text(env_py)
     env_comment = (
         "# Environment: upload this project folder with\n"
         "# `flash env push --name my-env .`, then paste the returned id below.\n"
