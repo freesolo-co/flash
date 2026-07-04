@@ -61,7 +61,7 @@ def _raw(**overrides) -> dict:
         ({"model": {"id": "x"}}, "must be a model id string"),
         ({"model": "   "}, "must be a model id string"),
         # A truthy non-string algorithm used to AttributeError on .lower() (uncaught 500); it must be
-        # a clean ConfigError (400) like seeds. Falsy values still default to "grpo" (tested below).
+        # a clean ConfigError (400) like seeds. Falsy values still default to "sft" (tested below).
         ({"algorithm": 5}, "algorithm must be a string"),
         ({"algorithm": ["grpo"]}, "algorithm must be a string"),
         ({"algorithm": True}, "algorithm must be a string"),
@@ -79,10 +79,13 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
-def test_falsy_algorithm_defaults_to_grpo() -> None:
-    # The type guard must preserve the original `(value or "grpo")` semantics: falsy values default.
+def test_falsy_algorithm_defaults_to_sft() -> None:
+    # The type guard must preserve the `(value or "sft")` semantics: falsy values default.
+    # Supply SFT-valid [train] fields so validation reaches the algorithm assertion instead of
+    # rejecting the now-default SFT run for a missing epochs/max_examples.
     for falsy in (None, "", 0):
-        assert spec_from_dict(_raw(algorithm=falsy)).algorithm == "grpo"
+        raw = _raw(algorithm=falsy, **{"train.epochs": 1, "train.max_examples": 8})
+        assert spec_from_dict(raw).algorithm == "sft"
 
 
 def test_sft_epochs_must_be_positive() -> None:
