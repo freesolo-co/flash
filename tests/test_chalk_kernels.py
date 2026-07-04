@@ -61,6 +61,23 @@ def test_applies_fixed_gap_fillers(monkeypatch):
     assert kwargs == _FIXED_KWARGS
 
 
+def test_fused_ce_false_disables_only_flce_for_the_trl_sft_path(monkeypatch):
+    """The trl SFT path passes fused_ce=False: flce returns logits=None, which trl's
+    SFTTrainer.compute_loss can't consume (it reads outputs.logits and only skips them under
+    use_liger_kernel=True, which flash can't set — that would make trl apply Liger and clash with
+    chalk). So flce is turned OFF there and the model materialises logits; every OTHER kernel is
+    unchanged. Default fused_ce=True keeps flce on for the custom GRPO/opd loops (they read the fused
+    loss directly)."""
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    install_chalk_kernels(object(), fused_ce=False)
+    _, kwargs = calls[0]
+    assert kwargs.pop("liger") is False
+    expected = dict(_FIXED_KWARGS)
+    expected["fused_linear_cross_entropy"] = False  # the ONLY difference vs the default
+    assert kwargs == expected
+
+
 def test_selection_ignores_env_flags(monkeypatch):
     """Selection is deterministic: a leftover FLASH_* env var does NOT change which kernels run."""
     # These would previously have toggled kernels; now they must be ignored entirely.

@@ -512,7 +512,13 @@ def run_sft():
             data_collator=_collator,
             callbacks=[_w.make_sft_heartbeat_callback(), _w.make_checkpoint_upload_callback()],
         )
-    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
+    # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
+    # chalk). So the trl SFT path keeps flce OFF and materialises logits — otherwise every large-vocab
+    # Qwen3.5 SFT crashes with "'NoneType' object is not subscriptable" once chalk actually applies flce
+    # (#421). The guard just below then restores the materialised-logits micro-batch cap. The custom
+    # GRPO/opd loops read the fused loss directly, so they keep flce on (default fused_ce=True).
+    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None), fused_ce=False)
     _chalk_active = active_kernels(_chalk_report)
     if _sft_fused and "fused_linear_cross_entropy" not in _chalk_active:
         current_pd = int(getattr(trainer.args, "per_device_train_batch_size", per_device_bs) or per_device_bs)
@@ -524,8 +530,8 @@ def run_sft():
         safe_ga = max(1, math.ceil(effective_batch / max(1.0, safe_pd * _sft_examples_per_block)))
         if safe_pd != current_pd or safe_ga != current_ga:
             print(
-                "[sft] chalk fused CE did not engage; restoring large-vocab logits cap: "
-                f"per_device={safe_pd} grad_accum={safe_ga}"
+                "[sft] fused-linear-CE off on the trl path (materialised logits); "
+                f"restoring large-vocab logits cap: per_device={safe_pd} grad_accum={safe_ga}"
             )
             trainer.args.per_device_train_batch_size = safe_pd
             trainer.args.gradient_accumulation_steps = safe_ga

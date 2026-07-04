@@ -53,8 +53,15 @@ def chalk_fused_ce_available(model_id: str | None = None) -> bool:
     return callable(_apply)
 
 
-def install_chalk_kernels(model=None) -> dict:
+def install_chalk_kernels(model=None, *, fused_ce: bool = True) -> dict:
     """Apply chalk standalone kernels to ``model``; call AFTER TRL builds the trainer.
+
+    ``fused_ce=False`` skips the fused-linear-CE kernel. flce computes the loss inside a chunked
+    LM-head+CE kernel and returns ``logits=None`` (the whole point — it never materialises the
+    ``[batch, seq, vocab]`` logits). trl's ``SFTTrainer.compute_loss`` reads ``outputs.logits`` and
+    only skips it under ``use_liger_kernel=True`` — which flash can't set, since that makes trl apply
+    Liger and clash with chalk. So the SFT (trl) path passes ``fused_ce=False`` and lets the model
+    materialise logits; the custom GRPO/opd loops read the fused loss directly and keep it on.
 
     Returns chalk's per-kernel report, or ``{}`` when freesolo-chalk isn't installed.
     """
@@ -62,6 +69,8 @@ def install_chalk_kernels(model=None) -> dict:
         return {}
 
     kwargs = dict(_KERNELS)
+    if not fused_ce:
+        kwargs["fused_linear_cross_entropy"] = False
     try:
         from chalk.transformers import apply_chalk_kernel_to_qwen35
     except ImportError:
