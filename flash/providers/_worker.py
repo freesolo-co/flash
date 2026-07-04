@@ -112,7 +112,7 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 # chalk repo is INTERNAL, so a git+https default made installs fail wherever GITHUB_TOKEN is absent
 # (bake pod, tokenless workers). freesolo-chalk 0.5.0 = chalk PR #21 fafe167 (standalone, Liger fully
 # replaced, + GRPO op + LoRA grad-gate). Bump DEFAULT_CHALK_VERSION when the merged kernel surface moves.
-DEFAULT_CHALK_VERSION = "0.5.0"
+DEFAULT_CHALK_VERSION = "0.5.1"
 DEFAULT_CHALK_SPEC = f"freesolo-chalk=={DEFAULT_CHALK_VERSION}"
 # Provenance only (kernel-cache fingerprint / traceability): the chalk commit this version was cut from.
 LATEST_CHALK_MAIN_SHA = "fafe167158eb3b7c947e7182ea4eddc351e4ca7d"
