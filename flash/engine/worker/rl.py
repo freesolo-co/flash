@@ -27,6 +27,7 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
+    grpo_use_reentrant,
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -360,7 +361,12 @@ def run_rl():
         "run_name": _w.wandb_run_name(),
         "seed": _w.SEED,
         "gradient_checkpointing": _grpo_grad_ckpt,
-        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        # MoE needs REENTRANT recompute: its router re-dispatches tokens on the backward recompute,
+        # so non-reentrant's metadata-equality assert fires on the first backward and kills the run
+        # (Qwen3.6-35B-A3B). Dense models keep the faster non-reentrant path. See grpo_use_reentrant.
+        # (Dense non-reentrant also needs chalk's fused_embedding OFF under GC — see the
+        # install_chalk_kernels(grad_checkpointing=...) call below, which _grpo_grad_ckpt drives.)
+        "gradient_checkpointing_kwargs": {"use_reentrant": grpo_use_reentrant(model_id)},
         # Pin a stable GRPO recipe instead of TRL's defaults (which suppress the lift on short runs):
         # constant LR, group-mean-centered advantages (no std scaling), no length-norm; beta = KL coef.
         "lr_scheduler_type": "constant",
