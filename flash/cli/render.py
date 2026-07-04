@@ -391,7 +391,7 @@ def models_table(rows: list[dict]) -> str:
     """Supported base models — a clean themed list of ids (the CLI lists ids only)."""
     dot = _glyph("•", "-")
     ids = "\n".join(f"  {_paint(dot, _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
-    foot = arrow("train one with: flash train configs/rl.toml")
+    foot = arrow("train one with: flash train configs/sft.toml")
     return _safe(f"{header('models', 'supported base models')}\n{ids}\n\n{foot}")
 
 
@@ -643,8 +643,8 @@ def env_setup(paths: list[str]) -> str:
     labels = {
         "environment.py": "env entrypoint — edit the reward + prompt",
         "dataset/train.jsonl": "starter training rows",
-        "configs/rl.toml": "GRPO run config",
         "configs/sft.toml": "SFT run config",
+        "configs/rl.toml": "GRPO run config",
         "TRAINING.md": "how to train well — read this first",
     }
     keyw = max(len(p) for p in paths)
