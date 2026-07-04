@@ -71,12 +71,12 @@ def test_gc_off_peak_scales_linearly_with_seq():
 
 
 def test_gc_off_unknown_dims_is_inf():
-    assert sft_gc_off_peak_gb(35.0, active_params_b=3.0, seq_len=2368, hidden=0, num_layers=40) == float(
-        "inf"
-    )
-    assert sft_gc_off_peak_gb(35.0, active_params_b=3.0, seq_len=2368, hidden=2048, num_layers=0) == float(
-        "inf"
-    )
+    assert sft_gc_off_peak_gb(
+        35.0, active_params_b=3.0, seq_len=2368, hidden=0, num_layers=40
+    ) == float("inf")
+    assert sft_gc_off_peak_gb(
+        35.0, active_params_b=3.0, seq_len=2368, hidden=2048, num_layers=0
+    ) == float("inf")
 
 
 def test_can_disable_fits_h200_not_h100_at_default_ctx():
@@ -167,14 +167,24 @@ def test_grpo_use_reentrant_true_for_moe():
     assert grpo_use_reentrant("Qwen/Qwen3.6-35B-A3B") is True
 
 
-def test_grpo_use_reentrant_false_for_dense():
-    # Dense models (active_params_b == 0 -> is_moe False) keep the faster non-reentrant path.
-    from flash.catalog import MODELS
+def test_grpo_use_reentrant_true_for_gdn_hybrid():
+    # Dense Qwen3.5/3.6 GatedDeltaNet hybrids ALSO need reentrant GC under GRPO: FA2 varlen-unpad +
+    # the fused GDN chunk-scan + chalk's fused kernels save data-dependent tensors the non-reentrant
+    # metadata-equality assert can't reconcile (forward packed [1636,..] vs recompute padded [1024,..]),
+    # crashing at step 0 exactly like MoE. Live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
-    dense_id = next(m.id for m in MODELS.values() if not m.is_moe)
-    assert grpo_use_reentrant(dense_id) is False
-    # An uncataloged / open model is treated as dense (null-safe, no crash).
+    for gdn_id in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"):
+        assert grpo_use_reentrant(gdn_id) is True, gdn_id
+
+
+def test_grpo_use_reentrant_false_for_non_gdn_dense():
+    # Non-GDN dense models (MiniCPM = plain Llama attention) keep the faster non-reentrant path:
+    # standard transformer layers recompute deterministically, no metadata divergence.
+    from flash.engine.worker.perf.memory import grpo_use_reentrant
+
+    assert grpo_use_reentrant("openbmb/MiniCPM5-1B") is False
+    # An uncataloged / open non-Qwen model is treated as non-GDN dense (null-safe, no crash).
     assert grpo_use_reentrant("some/uncataloged-open-model") is False
 
 

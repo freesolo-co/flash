@@ -71,22 +71,48 @@ def grad_checkpointing_on(
     return True
 
 
+def _is_gdn_hybrid_family(model_id: str) -> bool:
+    """Offline family check for a Qwen3.5/3.6 GatedDeltaNet hybrid (no network/config probe).
+
+    Every curated Qwen3.5/3.6 model is a GDN hybrid; the non-Qwen curated model (MiniCPM, plain
+    Llama) and uncataloged open models are not. Kept as a string check so ``grpo_use_reentrant``
+    stays pure and hermetic (callable at config-build time, unit-testable without HF access).
+    """
+    mid = (model_id or "").lower()
+    return any(token in mid for token in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6"))
+
+
 def grpo_use_reentrant(model_id: str) -> bool:
     """Whether GRPO gradient checkpointing must use REENTRANT recompute for this model.
 
-    MoE models need it. Non-reentrant checkpointing (``use_reentrant=False``) asserts that every
-    recomputed activation's metadata matches the forward pass; an MoE re-dispatches tokens through
-    its router on recompute, so the grouped expert-buffer shapes differ and the assert fires on the
-    FIRST backward — before a single optimizer step — killing the run. Live-confirmed on
-    Qwen3.6-35B-A3B: ``torch.utils.checkpoint: Recomputed values ... different metadata``
-    (forward expert-dispatch tokens 28192 vs recompute 3524 == group_size x). Reentrant checkpointing
-    re-runs the forward inside the same autograd context and does NOT assert metadata equality, so it
-    tolerates the MoE recompute. Dense models keep the (faster, lower-overhead) non-reentrant path.
+    MoE models AND GatedDeltaNet (GDN) hybrids need it. Non-reentrant checkpointing
+    (``use_reentrant=False``) asserts that every recomputed activation's metadata matches the
+    forward pass and dies on the FIRST backward — before a single optimizer step — with
+    ``torch.utils.checkpoint: Recomputed values ... different metadata`` whenever a decoder layer
+    contains a custom, data-dependent kernel whose saved-for-backward tensors the recompute lays out
+    differently:
+
+    - MoE (Qwen3.6-35B-A3B): the router re-dispatches tokens on recompute, so the grouped
+      expert-buffer shapes differ (forward expert-dispatch tokens 28192 vs recompute 3524 ==
+      group_size x). This is what #429 fixed.
+    - GDN hybrids (Qwen3.5/3.6 dense): FlashAttention-2 varlen-unpad on the full-attention layers,
+      the fused GatedDeltaNet chunk-scan on the linear-attention layers, and chalk's fused Triton
+      kernels each save shape-/data-dependent tensors that the non-reentrant metadata-equality check
+      can't positionally reconcile (live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090: forward packed
+      varlen ``[1636, ...]`` vs recompute padded ``[1024, ...]``). Same failure mode as MoE.
+
+    Reentrant checkpointing re-runs the forward inside the same autograd context over the same
+    closed-over inputs (mask/position_ids threaded via the ``partial``; ``use_cache=False``) and does
+    NOT assert metadata equality, so it tolerates these recomputes and produces correct gradients.
+    Non-GDN dense models (MiniCPM / plain-attention) keep the faster, lower-overhead non-reentrant
+    path.
     """
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
-    return bool(info and info.is_moe)
+    if info is not None and info.is_moe:
+        return True
+    return _is_gdn_hybrid_family(model_id)
 
 
 def grpo_sleep_mode(
