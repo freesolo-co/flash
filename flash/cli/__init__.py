@@ -39,6 +39,7 @@ from flash.cli.commands import (  # noqa: F401
     cmd_login,
     cmd_models,
     cmd_runs,
+    cmd_serve_base,
     cmd_status,
     cmd_train,
     cmd_undeploy,
@@ -403,6 +404,22 @@ def _build_parser() -> argparse.ArgumentParser:
     undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")
     undeploy.add_argument("run_id")
     undeploy.set_defaults(func=cmd_undeploy)
+
+    serve_base = sub.add_parser(
+        "serve-base",
+        help="register a PUBLIC base model (no adapter) that anyone can serve, billed to the caller",
+    )
+    serve_base.add_argument(
+        "model",
+        help="base model id to serve directly, e.g. Qwen/Qwen3.5-4B (callers pass it as `model`)",
+    )
+    serve_base.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="default enable_thinking=false for this base model (callers may still override)",
+    )
+    serve_base.add_argument("--dry-run", action="store_true")
+    serve_base.set_defaults(func=cmd_serve_base)
 
     export = sub.add_parser("export", help="export a trained adapter to your own HuggingFace repo")
     export.add_argument(

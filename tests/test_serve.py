@@ -603,3 +603,86 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
         "full reply"
     ]
+
+
+def test_serve_base_registers_public_base_model(monkeypatch):
+    """`deploy_base_model` POSTs a public base-model serve: serveBaseModel=true, adapterId is the
+    base model id, no LoRA repo/subfolder, and NO orgId (open to everyone, billed to the caller)."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+        seen["url"] = url
+        seen["json"] = json
+        seen["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+
+    dep = d.deploy_base_model("Qwen/Qwen3.5-4B")
+
+    assert seen["url"] == "https://serve.example/adapters"
+    assert seen["json"] == {
+        "adapterId": "Qwen/Qwen3.5-4B",
+        "repoId": "Qwen/Qwen3.5-4B",
+        "baseModel": "Qwen/Qwen3.5-4B",
+        "serveBaseModel": True,
+        "status": "ready",
+        "thinking": True,
+    }
+    assert "orgId" not in seen["json"]  # public: no owning tenant
+    assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+    assert dep.openai_model == "Qwen/Qwen3.5-4B"
+    assert dep.state == "ready"
+
+
+def test_serve_base_no_thinking_flag(monkeypatch):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        d.httpx, "post", lambda url, json=None, **k: (seen.update(json=json) or _Resp())
+    )
+    d.deploy_base_model("Qwen/Qwen3.5-2B", thinking=False)
+    assert seen["json"]["thinking"] is False
+
+
+def test_serve_base_dry_run_makes_no_request(monkeypatch):
+    import flash.serve.deploy as d
+
+    def _boom(*a, **k):
+        raise AssertionError("dry run must not touch the network")
+
+    monkeypatch.setattr(d.httpx, "post", _boom)
+    dep = d.deploy_base_model("Qwen/Qwen3.5-4B", dry_run=True)
+    assert dep.state == "dry_run"
+
+
+def test_serve_base_rejects_unknown_model(monkeypatch):
+    import flash.serve.deploy as d
+
+    def _boom(*a, **k):
+        raise AssertionError("an unknown model must be rejected before any network call")
+
+    monkeypatch.setattr(d.httpx, "post", _boom)
+    with pytest.raises(ValueError, match="unsupported model"):
+        d.deploy_base_model("not/a-real-model")

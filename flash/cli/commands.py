@@ -886,6 +886,36 @@ def cmd_deploy(args) -> int:
     return 1 if dep.get("state") == "failed" else 0
 
 
+def cmd_serve_base(args) -> int:
+    # Register a PUBLIC base-model (no-LoRA) serve, open to everyone. This is an operator action
+    # (needs FREESOLO_INTERNAL_KEY), so it calls the serving client directly rather than the
+    # per-run deploy path. Callers reach it by passing the base model id as the OpenAI `model`.
+    from flash.serve.deploy import ServingError, deploy_base_model
+
+    try:
+        dep = deploy_base_model(
+            args.model,
+            thinking=not getattr(args, "no_thinking", False),
+            dry_run=args.dry_run,
+        )
+    except (ValueError, ServingError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    payload = dep.to_dict()
+    if render.styled():
+        print(render.deployed(payload))
+    else:
+        print(json.dumps(payload, indent=2))
+    if payload.get("state") != "dry_run":
+        note = (
+            f"public base model {args.model!r} is now servable by any valid API key, billed to the "
+            f"caller's org; call it by passing model={args.model!r}. "
+            f"Use `flash undeploy {args.model}` to deregister it."
+        )
+        print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
+    return 0
+
+
 def cmd_export(args) -> int:
     from flash.client.runtime_secrets import resolve_hf_token
 

@@ -352,6 +352,51 @@ def _verify_adapter_registered(run_id: str, subfolder: str) -> None:
     )
 
 
+def deploy_base_model(
+    model: str,
+    *,
+    thinking: bool = True,
+    dry_run: bool = False,
+) -> Deployment:
+    """Register a PUBLIC base-model (no-LoRA) serve, open to everyone.
+
+    Unlike ``deploy_adapter`` this advertises the base model itself — the serving engine loads only
+    the base weights (no adapter is downloaded or applied), any valid Freesolo API key may call it,
+    and inference is billed to the CALLING org (there is no adapter owner). The base model is
+    addressed by name in the OpenAI ``model`` field, so ``adapterId`` IS the base model id and there
+    is no HF repo/subfolder. ``thinking`` is only the DEFAULT enable_thinking; base-model callers may
+    override it per request. Requires the serving internal key (an operator action).
+    """
+    from flash import catalog
+
+    catalog.get_model(model)  # reject an unknown/unserved base model before touching the network
+    dep = Deployment(
+        run_id=model,
+        model=model,
+        adapter_hf_prefix="",
+        openai_model=model,
+        endpoint_name=serving_base_url(),
+        state="dry_run" if dry_run else "ready",
+        url=f"{serving_base_url()}/v1",
+    )
+    if dry_run:
+        return dep
+    base = serving_base_url()
+    body = {
+        "adapterId": model,
+        # repoId is the base model itself; the engine ignores it for a base serve (no LoRA source).
+        "repoId": model,
+        "baseModel": model,
+        "serveBaseModel": True,
+        "status": "ready",
+        "thinking": bool(thinking),
+    }
+    # No orgId: a public base-model serve has no owning tenant.
+    _post_adapter_or_raise(f"{base}/adapters", body)
+    logger.info("registered public base model %s with freesolo serving (%s)", model, base)
+    return dep
+
+
 def undeploy_adapter(run_id: str) -> list[str]:
     """Deregister the adapter; returns [run_id] on success, [] if already gone (404)."""
     base = serving_base_url()
