@@ -515,9 +515,17 @@ def run_sft():
             callbacks=[_w.make_sft_heartbeat_callback(), _w.make_checkpoint_upload_callback()],
         )
     _precision = str(_train_opt("precision", "bf16")).lower()
-    if _precision == "fp8":
+    _fp8 = _precision in ("fp8", "fp8_free")
+    _fp8_free = _precision == "fp8_free"
+    if _fp8:
+        _mode = (
+            "free_base=drop bf16 base (~half frozen-weight mem)"
+            if _fp8_free
+            else "no_wcache=baseline mem"
+        )
         print(
-            "[sft] precision=fp8 -> requesting chalk FP8 frozen-base GEMM (QLoRA-style; LoRA stays bf16)"
+            f"[sft] precision={_precision} -> requesting chalk FP8 frozen-base GEMM "
+            f"(QLoRA-style; LoRA stays bf16; {_mode})"
         )
     # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
     # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
@@ -533,9 +541,10 @@ def run_sft():
     # fp8_frozen_base is independent, so FP8 still engages.
     _chalk_report = install_chalk_kernels(
         getattr(trainer, "model", None),
-        fp8=(_precision == "fp8"),
+        fp8=_fp8,
         fused_ce=False,
         grad_checkpointing=bool(_grad_ckpt),
+        fp8_free_base=_fp8_free,
     )
     _chalk_active = active_kernels(_chalk_report)
 

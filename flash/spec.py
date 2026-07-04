@@ -32,7 +32,9 @@ def coerce_bool(value: Any) -> bool:
 # opts the frozen base GEMM into FP8 e4m3 (chalk ``fp8_frozen_base``, QLoRA-style: the trainable
 # LoRA adapters + optimizer stay bf16, only the frozen-base forward matmul runs FP8). FP8 engages
 # on Ada/Hopper/Blackwell (sm_89+) Qwen3.5/3.6 workers and transparently stays bf16 elsewhere.
-PRECISIONS = ("bf16", "fp8")
+# "fp8_free" additionally DROPS the bf16 base (chalk ``free_base``, FP8-QLoRA) -> ~half the
+# frozen-weight memory; SFT-only (the freed base breaks GRPO's colocated-vLLM weight sync).
+PRECISIONS = ("bf16", "fp8", "fp8_free")
 
 
 def coerce_precision(value: Any) -> str:

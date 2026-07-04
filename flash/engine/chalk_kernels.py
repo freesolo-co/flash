@@ -70,17 +70,24 @@ def fp8_base_engaged(report: Mapping[str, object] | None) -> bool:
     return bool(r)
 
 
-def _fp8_kwargs(apply_fn) -> dict:
+def _fp8_kwargs(apply_fn, *, free_base: bool = False) -> dict:
     """FP8 frozen-base kwargs for ``apply_chalk_kernel_to_qwen35``, feature-detected against the
     installed chalk so an older build (missing the memory-mode knobs) can't ``TypeError`` and
     silently disable the WHOLE kernel stack.
 
     ``fp8_frozen_base`` turns the frozen-base forward GEMM into FP8 e4m3 (chalk applies it to the
-    PEFT LoRA base too, so it covers flash's ``all-linear`` LoRA). ``fp8_no_wcache`` re-quantizes
-    the fp8 weight each forward instead of caching a persistent fp8 copy: peak memory stays ~bf16
-    baseline (the cached default adds ~+50% of the frozen-weight memory) and — unlike ``free_base``
-    — it keeps the bf16 base param intact, so GRPO's colocated-vLLM weight sync still reads real
-    bf16 weights. Both are speed<->memory knobs, never trained-weight changes."""
+    PEFT LoRA base too, so it covers flash's ``all-linear`` LoRA). Two memory modes:
+
+    * default (``free_base=False``) -> ``fp8_no_wcache``: re-quantize the fp8 weight each forward
+      instead of caching a persistent copy. Peak memory stays ~bf16 baseline and the bf16 base param
+      stays intact, so GRPO's colocated-vLLM weight sync still reads real bf16 weights.
+    * ``free_base=True`` -> ``fp8_free_base``: keep the fp8 weight and DROP the bf16 base (FP8-QLoRA)
+      -> ~half the frozen-weight memory. chalk keeps checkpoints recoverable via a state_dict hook
+      that reconstitutes the dequantized bf16 weight on save, so a LoRA-adapter save is unaffected.
+      NOT for GRPO (the vLLM weight sync reads the now-freed base params). free_base supersedes
+      no_wcache (the fp8 weight must persist to be the base), so we do not also send no_wcache.
+
+    Neither is a trained-weight change."""
     try:
         import inspect
 
@@ -88,13 +95,20 @@ def _fp8_kwargs(apply_fn) -> dict:
     except (ValueError, TypeError):
         params = set()
     kw = {"fp8_frozen_base": True}
-    if "fp8_no_wcache" in params:
+    if free_base and "fp8_free_base" in params:
+        kw["fp8_free_base"] = True
+    elif not free_base and "fp8_no_wcache" in params:
         kw["fp8_no_wcache"] = True
     return kw
 
 
 def install_chalk_kernels(
-    model=None, *, fp8: bool = False, fused_ce: bool = True, grad_checkpointing: bool = False
+    model=None,
+    *,
+    fp8: bool = False,
+    fused_ce: bool = True,
+    grad_checkpointing: bool = False,
+    fp8_free_base: bool = False,
 ) -> dict:
     """Apply chalk standalone kernels to ``model``; call AFTER TRL builds the trainer.
 
@@ -102,7 +116,9 @@ def install_chalk_kernels(
     QLoRA-style forward-compute change on the FROZEN base only (trainable LoRA adapters + optimizer
     stay bf16). It self-gates inside chalk to FP8 hardware (Ada/Hopper/Blackwell, sm_89+) and to
     Qwen3.5/3.6, so on an A100/older worker or an unsupported model it no-ops and training stays
-    bf16 — logged below so the A/B stays honest.
+    bf16 — logged below so the A/B stays honest. ``fp8_free_base=True`` (implies ``fp8``) switches
+    the memory mode from the default baseline-memory ``no_wcache`` to ``free_base``: keep only the
+    fp8 base and drop the bf16 copy (~half the frozen-weight memory). SFT-only — see ``_fp8_kwargs``.
 
     ``fused_ce=False`` turns OFF chalk's fused linear-cross-entropy. chalk's fused-CE binds the
     causal-LM forward to return the fused loss with ``logits=None``; that is incompatible with TRL's
@@ -149,8 +165,13 @@ def install_chalk_kernels(
             "isn't replayed on the backward recompute -> torch.utils.checkpoint CheckpointError"
         )
     if fp8:
-        kwargs.update(_fp8_kwargs(apply_chalk_kernel_to_qwen35))
-        log.info("chalk fp8 requested: enabling fp8_frozen_base (QLoRA-style FP8 frozen-base GEMM)")
+        kwargs.update(_fp8_kwargs(apply_chalk_kernel_to_qwen35, free_base=fp8_free_base))
+        _mode = (
+            "free_base (drop bf16 base -> ~half frozen-weight memory)"
+            if fp8_free_base
+            else "no_wcache (baseline memory)"
+        )
+        log.info("chalk fp8 requested: enabling fp8_frozen_base [%s]", _mode)
 
     try:
         # liger=False: flash uses chalk standalone. TRL must not have applied Liger first.

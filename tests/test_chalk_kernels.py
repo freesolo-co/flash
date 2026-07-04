@@ -285,6 +285,48 @@ def test_grad_checkpointing_default_keeps_fused_embedding(monkeypatch):
     assert kwargs["fused_embedding"] is True
 
 
+def test_fp8_free_base_uses_free_base_mode(monkeypatch):
+    """precision=fp8_free -> install(fp8=True, fp8_free_base=True): chalk gets fp8_frozen_base +
+    fp8_free_base (drop bf16 base, ~half frozen-weight mem), and NOT no_wcache (free_base supersedes
+    it — the fp8 weight must persist to be the base)."""
+    calls = []
+
+    def apply_chalk_kernel_to_qwen35(
+        model, *, liger=False, fp8_frozen_base=False, fp8_no_wcache=False, fp8_free_base=False, **kw
+    ):
+        kw.update(
+            liger=liger,
+            fp8_frozen_base=fp8_frozen_base,
+            fp8_no_wcache=fp8_no_wcache,
+            fp8_free_base=fp8_free_base,
+        )
+        calls.append((model, kw))
+        return {}
+
+    ck = types.ModuleType("chalk.transformers")
+    ck.apply_chalk_kernel_to_qwen35 = apply_chalk_kernel_to_qwen35
+    pkg = types.ModuleType("chalk")
+    pkg.transformers = ck
+    monkeypatch.setitem(sys.modules, "chalk", pkg)
+    monkeypatch.setitem(sys.modules, "chalk.transformers", ck)
+
+    install_chalk_kernels(object(), fp8=True, fp8_free_base=True)
+    _, kwargs = calls[0]
+    assert kwargs["fp8_frozen_base"] is True
+    assert kwargs["fp8_free_base"] is True
+    assert kwargs["fp8_no_wcache"] is False  # free_base supersedes no_wcache
+
+
+def test_fp8_default_mode_is_no_wcache_not_free_base(monkeypatch):
+    """Plain precision=fp8 (fp8_free_base not passed) -> no_wcache, never free_base."""
+    calls = []
+    _install_fake_chalk_fp8(monkeypatch, calls)
+    install_chalk_kernels(object(), fp8=True)  # fp8_free_base defaults False
+    _, kwargs = calls[0]
+    assert kwargs["fp8_no_wcache"] is True
+    assert "fp8_free_base" not in kwargs or kwargs.get("fp8_free_base") is not True
+
+
 def test_fp8_env_flag_still_cannot_enable(monkeypatch):
     """Only the explicit fp8= param enables FP8; a leftover FLASH_FP8_BASE env stays inert."""
     monkeypatch.setenv("FLASH_FP8_BASE", "1")

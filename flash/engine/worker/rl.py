@@ -595,13 +595,21 @@ def run_rl():
         )
     # Apply chalk's standalone kernels on trainer.model (the authoritative target).
     _precision = str(getattr(_t, "precision", "bf16") or "bf16").lower()
-    if _precision == "fp8":
+    _fp8 = _precision in ("fp8", "fp8_free")
+    # free_base drops the bf16 base -> the colocated vLLM weight sync would read freed base params
+    # and roll out on garbage. GRPO NEVER frees the base: fp8_free falls back to the baseline-memory
+    # no_wcache mode (still FP8, just no memory saving).
+    if _precision == "fp8_free":
+        print(
+            "[grpo] precision=fp8_free -> free_base is unsafe with the vLLM weight sync; using no_wcache (baseline mem)"
+        )
+    if _fp8:
         print(
             "[grpo] precision=fp8 -> requesting chalk FP8 frozen-base GEMM (QLoRA-style; LoRA stays bf16)"
         )
     _chalk_report = install_chalk_kernels(
         getattr(trainer, "model", None),
-        fp8=(_precision == "fp8"),
+        fp8=_fp8,
         grad_checkpointing=bool(_grpo_grad_ckpt),
     )
     # Activate the weight-sync remap only now, after the initial checkpoint load is built.
