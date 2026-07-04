@@ -26,7 +26,6 @@ _FIXED_KWARGS = {
     "trainable_attn_epilogue": True,
     "fused_embedding": True,
     "gdn": True,
-    "fused_mlp": False,
     "attn_epilogue": False,
     "fp8_frozen_base": False,
 }
@@ -133,3 +132,28 @@ def test_active_kernels_filters_report():
     assert active_kernels(rep) == ["fused_lora_delta", "rope"]
     assert active_kernels({}) == []
     assert active_kernels(None) == []
+
+
+def test_kernels_match_real_chalk_signature():
+    """Every _KERNELS key must be a real parameter of chalk's apply_chalk_kernel_to_qwen35.
+
+    The other tests inject a fake chalk that accepts **kwargs, so they cannot catch a _KERNELS key
+    the REAL chalk rejects (a stray key makes install_chalk_kernels TypeError -> swallow -> silently
+    train on eager). This guards against that drift against the installed chalk; it is skipped when
+    freesolo-chalk is not installed in the test env.
+    """
+    import inspect
+
+    import pytest
+
+    from flash.engine.chalk_kernels import _KERNELS
+
+    try:
+        from chalk.transformers import apply_chalk_kernel_to_qwen35
+    except Exception:
+        pytest.skip("freesolo-chalk not installed in this test env")
+
+    accepted = set(inspect.signature(apply_chalk_kernel_to_qwen35).parameters)
+    passed = {k for k, _ in _KERNELS}
+    stray = passed - accepted
+    assert not stray, f"_KERNELS passes keys chalk rejects (would TypeError -> no-op -> eager): {sorted(stray)}"
