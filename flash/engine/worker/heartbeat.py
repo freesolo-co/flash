@@ -78,15 +78,19 @@ def _dump_thread_stacks(reason: str) -> None:
         faulthandler.dump_traceback(all_threads=True)
 
 
-def _rollback_throttle_slot(my_claim: int, prev_last_upload: float, prev_last_step: int) -> None:
+def _rollback_throttle_slot(
+    my_claim: int, prev_last_upload: float, prev_last_step: int, prev_last_forced: float
+) -> None:
     """Restore the throttle slot after a failed/abandoned upload, but only if this heartbeat still
     owns the latest claim — a newer heartbeat that bumped the slot after us must not be rolled back.
     Restores the committed-step marker too, so a failed forced commit doesn't permanently record its
-    step as committed (which would wrongly stop the retry from forcing through)."""
+    step as committed (which would wrongly stop the retry from forcing through), and the forced-commit
+    clock, so a failed forced commit doesn't start the floor window (which would delay the retry)."""
     with _HB_LOCK:
         if my_claim == _HB_CLAIM_SEQ:
             _w._HB_LAST_UPLOAD = prev_last_upload
             _w._HB_LAST_COMMITTED_STEP = prev_last_step
+            _w._HB_LAST_FORCED_UPLOAD = prev_last_forced
 
 
 def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
@@ -111,6 +115,7 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
     snapshot = json.dumps(payload)
     with _HB_LOCK:
         now = time.time()
+        forced_through = False
         if stage in _HB_TERMINAL_STAGES or stage.startswith("error_"):
             upload_due = True  # never miss a terminal transition
         elif _w._HB_TERMINAL_ONLY:
@@ -128,23 +133,35 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             # THIS heartbeat's payload must be the one on record and a throttled drop would leave a STALE
             # value committed -- opd's post-optimizer-step ping forces so a mid-step progress ping
             # (carrying the previous opt_steps) that just claimed the slot can't suppress the stepped
-            # commit (else a cancel is billed from the stale step). Force is gated on STEP ADVANCE, not a
-            # time floor: it lands iff this payload's ``step`` exceeds the last committed step. That lands
-            # every DISTINCT completed step exactly once (so a cancel always bills the true latest step,
-            # with no blind spot -- a time floor would drop a second step completing within the floor and
-            # under-bill it, cursor[bot]) while staying self-limiting -- redundant same-step/liveness
-            # pings don't advance the step so they stay throttled, and opd_step advances are teacher-
-            # round-trip-gated, keeping forced commits far under the HF per-repo cap.
+            # commit (else a cancel is billed from the stale step). Force is gated on STEP ADVANCE (this
+            # payload's ``step`` exceeds the last committed step) AND a per-force time floor measured from
+            # the last FORCED commit. The floor throttles only a SUB-FLOOR BURST of step advances (a
+            # tiny/fast OPD config landing many optimizer updates per minute, which unthrottled would blow
+            # the HF per-repo commit cap before the final adapter/DONE upload, codex[bot]); because the
+            # floor keys off the last forced commit -- not the last upload of any kind -- a force still
+            # punches through IMMEDIATELY after a liveness/mid-step ping stole the slot, and steps spaced
+            # farther apart than the floor (the normal teacher-round-trip-gated regime) each still commit
+            # exactly once, so a cancel there still bills the true latest step. The bounded cost is that a
+            # cancel DURING a sub-floor burst under-bills by up to one floor-window of steps -- acceptable
+            # (it favours the customer) and unavoidable once steps outrun the commit cap.
             if force and not upload_due:
                 fstep = kw.get("step")
-                if isinstance(fstep, (int, float)) and fstep > _w._HB_LAST_COMMITTED_STEP:
+                if (
+                    isinstance(fstep, (int, float))
+                    and fstep > _w._HB_LAST_COMMITTED_STEP
+                    and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
+                ):
                     upload_due = True
+                    forced_through = True
         prev_last_upload = _w._HB_LAST_UPLOAD
         prev_last_step = _w._HB_LAST_COMMITTED_STEP
+        prev_last_forced = _w._HB_LAST_FORCED_UPLOAD
         if upload_due:
             _HB_CLAIM_SEQ += 1
             my_claim = _HB_CLAIM_SEQ
             _w._HB_LAST_UPLOAD = now
+            if forced_through:
+                _w._HB_LAST_FORCED_UPLOAD = now
             _committed_step = kw.get("step")
             if isinstance(_committed_step, (int, float)) and _committed_step > _w._HB_LAST_COMMITTED_STEP:
                 _w._HB_LAST_COMMITTED_STEP = int(_committed_step)
@@ -163,12 +180,12 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
                         os.remove(up)
                 if committed is False:
                     # ``is False`` (not falsy) so a mock/None never trips the rollback.
-                    _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step)
+                    _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
-            _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step)
+            _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", snapshot)
 

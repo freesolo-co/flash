@@ -158,6 +158,19 @@ _HB_MIN_INTERVAL_S = 900.0
 # stay throttled below, and opd_step advances are teacher-round-trip-gated (minutes apart), so forced
 # commits stay far under the HF per-repo cap without a time floor that would blind-spot fast steps.
 _HB_LAST_COMMITTED_STEP = 0
+# A forced (post-optimizer-step) commit bypasses the 900s throttle on STEP ADVANCE so a cancel bills the
+# true latest step. But a tiny/smoke OPD config (batch=1, group=1, small student, fast/cached teacher)
+# can land optimizer steps many times per MINUTE, and forcing every one would blow the HF per-repo commit
+# cap before the final adapter/DONE upload. So forced commits are additionally throttled to at most one
+# per _HB_FORCE_MIN_INTERVAL_S -- but the floor is measured from the last FORCED commit
+# (_HB_LAST_FORCED_UPLOAD), not any upload, so a force still punches through IMMEDIATELY after an
+# unrelated (liveness / mid-step) commit stole the slot carrying a stale step (exactly when force is
+# needed). Net: when steps are farther apart than the floor (the normal teacher-round-trip-gated regime)
+# every distinct step still commits exactly once (exact cancel-billing preserved); only a sub-floor BURST
+# is coalesced, bounding the cancel under-bill to one floor-window of steps while keeping forced commits
+# under the HF cap (codex[bot]).
+_HB_LAST_FORCED_UPLOAD = 0.0
+_HB_FORCE_MIN_INTERVAL_S = 60.0
 # Setup liveness is the user-visible signal during cold model download/load. Keep it below common
 # external "frozen heartbeat" thresholds without relaxing the noisy per-step training throttle.
 _HB_SETUP_LIVENESS_INTERVAL_S = 240.0
@@ -326,7 +339,9 @@ __all__ = [
     "RUN_MODE",
     "SEED",
     "THINKING",
+    "_HB_FORCE_MIN_INTERVAL_S",
     "_HB_LAST_COMMITTED_STEP",
+    "_HB_LAST_FORCED_UPLOAD",
     "_HB_LAST_PROGRESS_TS",
     "_HB_LAST_UPLOAD",
     "_HB_LOCK",

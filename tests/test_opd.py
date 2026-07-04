@@ -894,6 +894,24 @@ def test_thinking_prefill_recovers_opener_from_closed_block_hybrid(monkeypatch):
     assert opd_mod._thinking_prefill_text(_ClosedBlockTok()) == "<think>\n"
 
 
+def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(monkeypatch):
+    """Regression (codex[bot], opd.py): a hybrid whose disabled render is an EMPTY block WITH whitespace
+    (enable_thinking=False -> '...<think>\\n\\n</think>\\n', True -> '...<think>\\n') shares '<think>\\n'
+    in the common prefix, so base's unique middle is '\\n</think>\\n' -- the closer behind a newline. The
+    closed-block recovery must lstrip that intra-block whitespace before the '</' test, else it returns ''
+    and thinking-mode OPD scores the student's reasoning against a teacher prompt that never opened
+    <think>. The opener returned is still the thinking-side '<think>\\n'."""
+    from flash.engine.worker import opd as opd_mod
+
+    class _WhitespaceEmptyBlockTok:
+        def apply_chat_template(self, messages, *, enable_thinking, **kw):
+            # both open <think>\n; non-thinking force-closes with a whitespace-only empty block.
+            return "A:\n<think>\n" if enable_thinking else "A:\n<think>\n\n</think>\n"
+
+    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    assert opd_mod._thinking_prefill_text(_WhitespaceEmptyBlockTok()) == "<think>\n"
+
+
 def test_opd_loop_drives_by_optimizer_updates_and_retries_on_shortfall(monkeypatch):
     """Regression (codex[bot], opd.py:467): the loop must be driven by optimizer UPDATES, not raw
     iterations -- a no-signal iteration skips optimizer.step(), so `for step in range(steps)` could

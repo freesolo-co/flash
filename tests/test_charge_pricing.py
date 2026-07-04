@@ -84,6 +84,13 @@ def test_actual_steps_run_reads_last_heartbeat_step():
     assert runner.actual_steps_run(st({"stage": "rl_step", "step": 0})) == 1
     assert runner.actual_steps_run(st({"stage": "rl_step"})) == 1
     assert runner.actual_steps_run(st({"stage": "sft_step"})) == 1
+    # A completed OPD run's final pre-DONE heartbeats (opd_trained / opd_train_done) are NOT training
+    # stages, so a STEPLESS one floors a cancel-between-publish-and-DONE to 0 -- re-pricing a fully
+    # trained run as $0. opd.py/finalize.py attach step=opt_steps so the true count bills (codex[bot]).
+    assert runner.actual_steps_run(st({"stage": "opd_trained"})) == 0  # the bug the step guards against
+    assert runner.actual_steps_run(st({"stage": "opd_train_done"})) == 0
+    assert runner.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
+    assert runner.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12
 
 
 # --------------------------------------------------------------------------- cancel re-pricing

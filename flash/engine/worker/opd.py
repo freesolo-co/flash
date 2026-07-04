@@ -153,8 +153,16 @@ def _thinking_prefill_text(tok) -> str:
         # teacher conditions on the same OPEN block instead of the empty prefix the delta alone gives
         # (codex[bot]/cursor). "" only when the model opens <think> itself inside the completion.
         base_mid = base[p : len(base) - s]
-        if base_mid.startswith("</") and ">" in base_mid:
-            open_tag = "<" + base_mid[2 : base_mid.index(">") + 1]  # "</think>..." -> "<think>"
+        # base_mid is base's unique middle: the closing tag, possibly PRECEDED by intra-block whitespace.
+        # A hybrid whose disabled render is an EMPTY block *with whitespace* (base "<think>\n\n</think>",
+        # think "<think>\n") shares "<think>\n" in the common prefix, so base_mid = "\n</think>\n" -- the
+        # closer behind a newline. lstrip that whitespace before the tag test, else base_mid.startswith
+        # ("</") is False, we return "", and thinking-mode OPD scores the student's reasoning tokens
+        # against a teacher prompt that never opened <think> (codex[bot]). We still return think[cut:]
+        # (the thinking-side opener), so the stripped whitespace only affects DETECTION, not the opener.
+        base_mid_tag = base_mid.lstrip()
+        if base_mid_tag.startswith("</") and ">" in base_mid_tag:
+            open_tag = "<" + base_mid_tag[2 : base_mid_tag.index(">") + 1]  # "</think>..." -> "<think>"
             cut = think.rfind(open_tag, 0, p)
             if cut != -1:
                 return think[cut:]  # e.g. "<think>\n"
@@ -781,10 +789,16 @@ def run_opd():
     # the catalog base; no-op for text/fresh). Name the final checkpoint by real optimizer steps
     # applied, not the planned `steps` count.
     _publish_opd_deployable(adapter_dir, opt_steps, as_default=True)
-    _w.heartbeat("opd_trained", train_wall=train_wall, gpu=gpu_diagnostics())
+    # step=opt_steps on this (unthrottled) final ping AND on the opd_train_done ping below keeps the
+    # persisted heartbeat's step at the true completed count. Without it, a cancel landing after the
+    # adapter publish but before DONE is persisted reads a STEPLESS opd_trained/opd_train_done as the
+    # last heartbeat, and actual_steps_run floors a fully-trained run to 0 (opd_trained isn't a training
+    # stage) -- re-pricing paid work as $0 (codex[bot]).
+    _w.heartbeat("opd_trained", step=opt_steps, train_wall=train_wall, gpu=gpu_diagnostics())
 
     _w.write_train_meta(
         phase="opd",
+        step=opt_steps,
         adapter_dir=adapter_dir,
         model_id=model_id,
         train_wall=train_wall,
