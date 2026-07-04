@@ -518,8 +518,9 @@ def test_env_setup_multi_turn_flag_scaffolds_multiturn(monkeypatch, tmp_path) ->
 def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp_path) -> None:
     # A real terminal: the two survey questions are asked and answered "2" (multi-turn) then
     # "2" (reasoning). FLASH_STYLE forces the themed path; a fake stdin reports a tty; input()
-    # is stubbed so no real keypress is read.
+    # is stubbed so no real keypress is read. CI is cleared so the guard doesn't force defaults.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
     answers = iter(["2", "2"])
@@ -535,6 +536,7 @@ def test_env_setup_interactive_enter_takes_defaults(monkeypatch, tmp_path) -> No
     # Pressing enter (empty answer) at both questions selects the marked defaults: single-turn,
     # no reasoning — identical to the non-interactive scaffold.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("builtins.input", lambda *a, **k: "")
@@ -542,6 +544,36 @@ def test_env_setup_interactive_enter_takes_defaults(monkeypatch, tmp_path) -> No
     env_py = (tmp_path / "environment.py").read_text()
     assert "EnvironmentSingleTurn" in env_py
     assert "EnvironmentMultiTurn" not in env_py
+    assert "thinking = true" not in (tmp_path / "configs/rl.toml").read_text()
+
+
+def test_env_setup_under_ci_never_prompts(monkeypatch, tmp_path) -> None:
+    # Even with a tty and themed output, CI=true must fall back to defaults instead of blocking on
+    # a prompt. input() raises so a regression (actually prompting) fails loudly.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
+
+    def _boom(*a, **k):
+        raise AssertionError("prompted under CI")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    assert _run(["env", "setup"]) == 0
+    assert "EnvironmentSingleTurn" in (tmp_path / "environment.py").read_text()
+    assert "thinking = true" not in (tmp_path / "configs/rl.toml").read_text()
+
+
+def test_env_setup_reasoning_flag_warns_when_configs_exist(monkeypatch, tmp_path, capsys) -> None:
+    # First scaffold (no reasoning), then re-run with --reasoning: the existing configs win and the
+    # command warns instead of silently ignoring the flag or writing mismatched configs.
+    monkeypatch.chdir(tmp_path)
+    assert _run(["env", "setup"]) == 0
+    capsys.readouterr()
+    assert _run(["env", "setup", "--reasoning"]) == 0
+    err = capsys.readouterr().err
+    assert "existing configs are no reasoning" in err
+    assert "ignoring --reasoning" in err
     assert "thinking = true" not in (tmp_path / "configs/rl.toml").read_text()
 
 

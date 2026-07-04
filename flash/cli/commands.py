@@ -341,8 +341,20 @@ _REASONING_OPTIONS = [
 
 
 def _setup_interactive(args) -> bool:
-    """Prompt only on a real terminal the user can answer from, and never when --yes is passed."""
-    return not getattr(args, "yes", False) and sys.stdin.isatty() and render.styled()
+    """Whether to ask the setup questions interactively.
+
+    Prompt only on a real terminal a human can answer from. Fall back to defaults (no prompt) when
+    --yes is passed, under CI, or when stdin is closed/redirected, so automation never blocks on an
+    unanswered prompt. A pseudo-TTY in CI can report isatty()=True, so CI is checked explicitly; a
+    closed fd 0 can make sys.stdin None, so that is guarded before .isatty()."""
+    if getattr(args, "yes", False):
+        return False
+    if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
+        return False
+    stdin = sys.stdin
+    if stdin is None or not stdin.isatty():
+        return False
+    return render.styled()
 
 
 def cmd_env_setup(args) -> int:
@@ -384,14 +396,32 @@ def cmd_env_setup(args) -> int:
     else:
         multi_turn = False
 
-    # Resolve reasoning. An explicit flag wins; otherwise ask on a terminal, but only while a config
-    # is still to be written (asking is pointless when both configs already exist); else off.
+    # Resolve reasoning. Like the turn mode, an existing config is authoritative: configs are only
+    # written when absent, so applying a reasoning flag to an already-scaffolded project would
+    # silently no-op (or write one config with reasoning and leave the other without). Anchor to the
+    # existing config's `thinking` state and warn if a flag disagrees; otherwise the flag wins;
+    # otherwise ask on a terminal; else off.
     rl = Path("configs/rl.toml")
     sft = Path("configs/sft.toml")
+    existing_reasoning: bool | None = None
+    for cfg in (rl, sft):
+        if cfg.exists():
+            existing_reasoning = "thinking = true" in cfg.read_text(encoding="utf-8")
+            break
     flag_reason = getattr(args, "reasoning", None)
-    if flag_reason is not None:
+    if existing_reasoning is not None:
+        if flag_reason is not None and flag_reason != existing_reasoning:
+            have = "reasoning" if existing_reasoning else "no reasoning"
+            want = "reasoning" if flag_reason else "no-reasoning"
+            msg = (
+                f"existing configs are {have}; keeping them and ignoring --{want}. "
+                f"Delete configs/rl.toml and configs/sft.toml first to re-scaffold with --{want}."
+            )
+            print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
+        reasoning = existing_reasoning
+    elif flag_reason is not None:
         reasoning = flag_reason
-    elif _setup_interactive(args) and not (rl.exists() and sft.exists()):
+    elif _setup_interactive(args):
         reasoning = render.select("Train with reasoning (thinking)?", _REASONING_OPTIONS) == "on"
     else:
         reasoning = False
