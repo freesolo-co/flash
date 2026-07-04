@@ -210,11 +210,14 @@ A managed run should use the returned [environment] id from
 This starter implements a tiny "guess the secret number" game so you can see the
 episode hooks wired end-to-end. Replace it with your real task before a real run.
 
-Both SFT and GRPO train off this file:
+SFT and GRPO train off this file; OPD (configs/opd.toml) does NOT support multi-turn:
 - GRPO (configs/rl.toml) rolls out full episodes and optimizes `score_episode`.
 - SFT (configs/sft.toml) learns the gold trajectory. Provide it per row as
   `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
   `output` for a single gold assistant turn.
+- OPD (configs/opd.toml) distils one sampled completion per prompt and cannot drive the
+  turn loop, so it is single-turn only — `flash train configs/opd.toml` fails fast here.
+  Use OPD with a single-turn env (`flash env setup --single-turn`).
 """
 
 from __future__ import annotations
@@ -400,9 +403,22 @@ def cmd_env_setup(args) -> int:
         )
     opd = Path("configs/opd.toml")
     if not opd.exists():
+        # opd (on-policy distillation) is SINGLE-TURN only: it samples one completion per prompt and
+        # cannot drive a multi-turn/tool episode loop, so `flash train configs/opd.toml` FAILS FAST on a
+        # multi-turn env (run_opd rejects it at setup). Scaffold it in both modes for reference, but say
+        # so loudly in the multi-turn one so the config isn't a footgun.
+        opd_multiturn_note = (
+            "# NOTE: opd is SINGLE-TURN only — it distils one sampled completion per prompt and cannot\n"
+            "# drive this multi-turn environment's episode loop, so `flash train configs/opd.toml` will\n"
+            "# fail fast here. Use configs/rl.toml (grpo) or configs/sft.toml for multi-turn; keep opd for\n"
+            "# a single-turn env (`flash env setup --single-turn`).\n\n"
+            if multi_turn
+            else ""
+        )
         opd.write_text(
+            f"{opd_multiturn_note}"
             'model = "Qwen/Qwen3.5-4B"\n'
-            'algorithm = "opd"   # on-policy distillation from a Fireworks GLM teacher\n\n'
+            'algorithm = "opd"   # on-policy distillation from a Fireworks GLM teacher (single-turn only)\n\n'
             "# Environment: upload this project folder with\n"
             "# `flash env push --name my-env .`, then paste the returned id below.\n"
             "# FIREWORKS_API_KEY (the GLM teacher key) is read from your shell/.env at submit time.\n"

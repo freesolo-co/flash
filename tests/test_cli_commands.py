@@ -455,6 +455,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert 'algorithm = "opd"' in opd.read_text()
     assert "steps = 100" in opd.read_text()
     assert "FIREWORKS_API_KEY" in opd.read_text()
+    # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
+    assert "fail fast" not in opd.read_text()
     training = tmp_path / "TRAINING.md"
     assert training.is_file()
     training_text = training.read_text(encoding="utf-8")
@@ -478,6 +480,30 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "configs/rl.toml" in out
     assert "configs/opd.toml" in out
     assert "TRAINING.md" in out
+
+
+def test_env_setup_multi_turn_scaffolds_opd_with_single_turn_warning(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`flash env setup --multi-turn` scaffolds all three configs (sft/rl/opd) so opd.toml is present
+    in both modes — but opd is single-turn only (run_opd rejects multi-turn), so the multi-turn opd.toml
+    and the starter env docstring must say so loudly rather than hand the user a config that fails fast."""
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup", "--multi-turn"]) == 0
+
+    env_py = (tmp_path / "environment.py").read_text()
+    assert "EnvironmentMultiTurn" in env_py  # genuinely a multi-turn scaffold
+    assert "OPD (configs/opd.toml)" in env_py  # docstring documents opd's single-turn limitation
+    # all three algorithm configs are scaffolded in multi-turn mode too
+    for name in ("configs/sft.toml", "configs/rl.toml", "configs/opd.toml"):
+        assert (tmp_path / name).is_file(), name
+    opd_text = (tmp_path / "configs/opd.toml").read_text()
+    assert 'algorithm = "opd"' in opd_text
+    # ...but the multi-turn opd.toml warns it is single-turn only and will fail fast on this env
+    assert "SINGLE-TURN only" in opd_text
+    assert "fail fast" in opd_text
+    assert "configs/opd.toml" in capsys.readouterr().out
 
 
 def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:
