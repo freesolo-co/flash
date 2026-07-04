@@ -519,6 +519,64 @@ def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
     assert r.gen_tokens == 3
 
 
+def test_train_one_skips_completion_with_invalid_utf8_replacement_char():
+    """A lone byte-level BPE token that is a PARTIAL/invalid UTF-8 sequence decodes to U+FFFD ('�').
+    Echo-scoring it would fail teacher.score's char-for-char tiling check and raise a PERMANENT
+    TeacherError, aborting the whole run over one un-scorable on-policy sample. _train_one must SKIP
+    such a rollout (loss=None) WITHOUT reaching the teacher, like a truncated/empty completion.
+    Regression: gsm8k OPD run flash-1783163026 died at step 6 on exactly this ('� at token 220')."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.teacher import TeacherError
+
+    # id 9 decodes to a lone replacement char (invalid UTF-8); the rollout still terminates on eos id 5,
+    # so it passes _rollout_terminated and is NOT filtered as truncated -- the U+FFFD guard must catch it.
+    completion_ids = [2, 9, 3, 5]
+
+    class _Tok:
+        eos_token_id = 5
+
+        def decode(self, ids, skip_special_tokens=True):
+            m = {2: "h", 9: "\ufffd", 3: "i", 5: ""}  # id 9 -> U+FFFD (invalid UTF-8)
+            return "".join(m[int(x)] for x in ids)
+
+    class _Teacher:
+        def score(self, prompt, completion):
+            raise TeacherError("teacher must NOT be reached for a U+FFFD rollout", permanent=True)
+
+    class _GenLM(_TinyLM):
+        def __init__(self, torch, prompt_len, completion_ids, V):
+            super().__init__(torch, T=prompt_len + len(completion_ids), V=V)
+            self.config = SimpleNamespace(use_cache=True)
+            self._completion = torch.tensor([completion_ids])
+
+        def eval(self):
+            return self
+
+        def train(self):
+            return self
+
+        def generate(self, prompt_tensor, **cfg):
+            return torch.cat([prompt_tensor, self._completion], dim=1)
+
+    model = _GenLM(torch, prompt_len=1, completion_ids=completion_ids, V=10)
+    r = opd_mod._train_one(
+        model=model,
+        tok=_Tok(),
+        teacher=_Teacher(),  # raises if reached -> proves the guard short-circuits before scoring
+        device="cpu",
+        prompt_ids=[1],
+        prompt_tensor=torch.tensor([[1]]),
+        prompt_messages=[{"role": "user", "content": "say hi"}],
+        gen_cfg={},
+        knobs={"kl_coef": 1.0, "stop_sequences": ()},
+        torch=torch,
+    )
+    assert r.loss is None  # skipped, not distilled
+    assert r.teacher_status is None  # teacher never reached (else it would have raised)
+    assert r.gen_tokens == len(completion_ids)
+
+
 def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     """Regression (codex[bot], opd.py:380-381): when EVERY sample in a step skips (empty completion
     / no teacher signal, or an over-budget re-render), the per-sample SUCCESS ping is never reached.

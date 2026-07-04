@@ -759,6 +759,15 @@ def _train_one(
     gen_tokens = len(completion_ids)
     if not completion_text.strip():
         return SampleResult(gen_tokens=gen_tokens)
+    # A completion carrying U+FFFD (the Unicode replacement char) decoded a PARTIAL/invalid UTF-8 byte
+    # sequence — the student emitted a lone byte-level BPE token that is not a whole character. Echo-
+    # scoring it is impossible: '�' does not re-tokenize to the same char span, so teacher.score fails
+    # its char-for-char tiling check and raises a PERMANENT TeacherError that would abort the ENTIRE run
+    # over one un-scorable on-policy sample. On-policy sampling (esp. at temperature 1.0) occasionally
+    # emits these, so skip the rollout like a truncated/empty one and keep training; the shortfall guard
+    # still fails the run if too many samples end up unusable.
+    if "\ufffd" in completion_text:  # U+FFFD replacement char
+        return SampleResult(gen_tokens=gen_tokens)
 
     # Refresh the stall clock between the (gen_cfg.max_time-bounded, up to ~900s) generation and the
     # retrying teacher call (up to four ~90s timeouts): both block, and the caller only emits its
