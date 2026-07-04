@@ -512,7 +512,10 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     # wired in via the _grad_ckpt result — still on by default, droppable only when the GC-off peak fits.
     assert "grad_checkpointing_on(\n        model_id,\n        sft_max_len," in src
     assert '"gradient_checkpointing": _grad_ckpt' in src
-    assert '"use_reentrant": False' in src
+    # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
+    # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
+    # non-reentrant's metadata-equality assert kills the first backward. Dense stays non-reentrant.
+    assert '"use_reentrant": grpo_use_reentrant(model_id)' in src
     assert '"optim": fused_optim_name()' in src
 
 
