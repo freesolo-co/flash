@@ -6,7 +6,7 @@ import os
 import random
 import time
 
-from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
+from flash.engine.chalk_kernels import active_kernels, fp8_base_engaged, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.grpo import resolve_grpo_sleep_mode
@@ -51,7 +51,9 @@ def run_rl():
             import torch._dynamo
 
             torch._dynamo.config.suppress_errors = True
-            print("[rl] multi-turn: torch._dynamo suppress_errors=True (dynamic-shape compiled helpers fall back)")
+            print(
+                "[rl] multi-turn: torch._dynamo suppress_errors=True (dynamic-shape compiled helpers fall back)"
+            )
         except Exception as exc:
             print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
@@ -60,7 +62,9 @@ def run_rl():
     download_seconds = _w.prefetch_model(model_id)
     rl = RECIPE.rl
     steps = int(
-        _w.JOB_SPEC.train.steps if _w.JOB_SPEC and _w.JOB_SPEC.train.steps is not None else rl.num_steps
+        _w.JOB_SPEC.train.steps
+        if _w.JOB_SPEC and _w.JOB_SPEC.train.steps is not None
+        else rl.num_steps
     )
     gcfg = _w.grpo_overrides()
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
@@ -115,9 +119,7 @@ def run_rl():
 
     # TRL 1.5's GRPOConfig doesn't truncate prompts, so drop over-budget prompts up front (applies
     # to both string and conversational prompts) before the paid worker rolls out.
-    _oai_tools = (
-        getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
-    )
+    _oai_tools = getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
 
     def _render_for_budget(p) -> str:
         """Render a prompt to text EXACTLY as the rollout does (incl. tool schemas)."""
@@ -404,6 +406,7 @@ def run_rl():
             vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
             vllm_enable_sleep_mode=sleep_mode,
         )
+
         def _set_vllm_field(names, value, label):
             for _f in names:
                 if _f in _grpo_fields:
@@ -422,9 +425,7 @@ def run_rl():
         _kv_dtype = "fp8" if _cc >= (8, 9) else None
         _mnbt = max(8192, vllm_max_len) if _card_gb >= 140 else None
         if _kv_dtype or _mnbt:
-            _w.patch_trl_colocate_llm_kwargs(
-                kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt
-            )
+            _w.patch_trl_colocate_llm_kwargs(kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt)
         _set_vllm_field(
             ("vllm_enable_prefix_caching", "enable_prefix_caching"),
             True,
@@ -516,7 +517,9 @@ def run_rl():
         grpo_kwargs[_tis_clip_field] = _tis_c
         print(f"[rl] tis clip c_max={_tis_c} ({_tis_clip_field})")
     else:
-        print("[rl] tis: trl default importance-sampling correction in effect; no clip field on this trl")
+        print(
+            "[rl] tis: trl default importance-sampling correction in effect; no clip field on this trl"
+        )
     cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
     _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
@@ -581,7 +584,14 @@ def run_rl():
             **extra_trainer_kwargs,
         )
     # Apply chalk's standalone kernels on trainer.model (the authoritative target).
-    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    _precision = str(getattr(_t, "precision", "bf16") or "bf16").lower()
+    if _precision == "fp8":
+        print(
+            "[grpo] precision=fp8 -> requesting chalk FP8 frozen-base GEMM (QLoRA-style; LoRA stays bf16)"
+        )
+    _chalk_report = install_chalk_kernels(
+        getattr(trainer, "model", None), fp8=(_precision == "fp8")
+    )
     # Activate the weight-sync remap only now, after the initial checkpoint load is built.
     if use_vllm:
         _LM_SYNC_REMAP_ON["on"] = True
@@ -684,6 +694,9 @@ def run_rl():
             "device_peak_gpu_gb": rl_device_peak_gpu_gb,
             # Which chalk kernels actually engaged (None = not installed / all fell back).
             "chalk_kernels": active_kernels(_chalk_report) or None,
+            # A/B provenance: requested precision + whether the FP8 frozen-base GEMM actually ran.
+            "precision": _precision,
+            "fp8_engaged": fp8_base_engaged(_chalk_report),
             **_w.wandb_run_info(),
             "gen_tokens_is_upper_bound": True,
             "thinking": _w.THINKING,

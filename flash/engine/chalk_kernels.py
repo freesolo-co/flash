@@ -53,15 +53,60 @@ def chalk_fused_ce_available(model_id: str | None = None) -> bool:
     return callable(_apply)
 
 
-def install_chalk_kernels(model=None) -> dict:
+def fp8_base_engaged(report: Mapping[str, object] | None) -> bool:
+    """True iff chalk's ``fp8_frozen_base`` actually wrapped at least one Linear.
+
+    Its report is a dict ``{installed, attn, mlp, ...}`` even on a no-op (``installed: 0`` on a
+    non-FP8 GPU / unsupported model), so — unlike ``active_kernels`` — engagement must be read off
+    the ``installed`` count, not mere dict-presence."""
+    r = (report or {}).get("fp8_frozen_base")
+    if isinstance(r, dict):
+        if "error" in r:
+            return False
+        try:
+            return int(r.get("installed", 0) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    return bool(r)
+
+
+def _fp8_kwargs(apply_fn) -> dict:
+    """FP8 frozen-base kwargs for ``apply_chalk_kernel_to_qwen35``, feature-detected against the
+    installed chalk so an older build (missing the memory-mode knobs) can't ``TypeError`` and
+    silently disable the WHOLE kernel stack.
+
+    ``fp8_frozen_base`` turns the frozen-base forward GEMM into FP8 e4m3 (chalk applies it to the
+    PEFT LoRA base too, so it covers flash's ``all-linear`` LoRA). ``fp8_no_wcache`` re-quantizes
+    the fp8 weight each forward instead of caching a persistent fp8 copy: peak memory stays ~bf16
+    baseline (the cached default adds ~+50% of the frozen-weight memory) and — unlike ``free_base``
+    — it keeps the bf16 base param intact, so GRPO's colocated-vLLM weight sync still reads real
+    bf16 weights. Both are speed<->memory knobs, never trained-weight changes."""
+    try:
+        import inspect
+
+        params = set(inspect.signature(apply_fn).parameters)
+    except (ValueError, TypeError):
+        params = set()
+    kw = {"fp8_frozen_base": True}
+    if "fp8_no_wcache" in params:
+        kw["fp8_no_wcache"] = True
+    return kw
+
+
+def install_chalk_kernels(model=None, *, fp8: bool = False) -> dict:
     """Apply chalk standalone kernels to ``model``; call AFTER TRL builds the trainer.
+
+    ``fp8=True`` additionally enables the FP8 frozen-base GEMM (chalk ``fp8_frozen_base``): a
+    QLoRA-style forward-compute change on the FROZEN base only (trainable LoRA adapters + optimizer
+    stay bf16). It self-gates inside chalk to FP8 hardware (Ada/Hopper/Blackwell, sm_89+) and to
+    Qwen3.5/3.6, so on an A100/older worker or an unsupported model it no-ops and training stays
+    bf16 — logged below so the A/B stays honest.
 
     Returns chalk's per-kernel report, or ``{}`` when freesolo-chalk isn't installed.
     """
     if model is None:
         return {}
 
-    kwargs = dict(_KERNELS)
     try:
         from chalk.transformers import apply_chalk_kernel_to_qwen35
     except ImportError:
@@ -74,6 +119,11 @@ def install_chalk_kernels(model=None) -> dict:
         log.warning("chalk import failed (ignored, kernels disabled): %s", e)
         return {}
 
+    kwargs = dict(_KERNELS)
+    if fp8:
+        kwargs.update(_fp8_kwargs(apply_chalk_kernel_to_qwen35))
+        log.info("chalk fp8 requested: enabling fp8_frozen_base (QLoRA-style FP8 frozen-base GEMM)")
+
     try:
         # liger=False: flash uses chalk standalone. TRL must not have applied Liger first.
         report = apply_chalk_kernel_to_qwen35(model, liger=False, **kwargs)
@@ -84,4 +134,16 @@ def install_chalk_kernels(model=None) -> dict:
     active = active_kernels(report)
     if active:
         log.info("chalk kernels active: %s", ", ".join(active))
+    if fp8:
+        # Honest A/B: distinguish "fp8 engaged" from "fp8 requested but the worker/model couldn't
+        # run it" (chalk returns a falsy/`installed: 0` report for fp8_frozen_base then).
+        if fp8_base_engaged(report):
+            n = report.get("fp8_frozen_base", {})
+            n = n.get("installed") if isinstance(n, dict) else n
+            log.info("chalk fp8 ENGAGED: %s frozen-base Linear(s) running FP8 e4m3 GEMM", n)
+        else:
+            log.warning(
+                "chalk fp8 requested but did NOT engage (needs sm_89+ FP8 hardware "
+                "[Ada/Hopper/Blackwell] and a Qwen3.5/3.6 model); training runs in bf16"
+            )
     return report or {}

@@ -20,6 +20,7 @@ from flash.schema.fields import (
     _require_environment_ref,
     _train_float,
     _train_int,
+    _train_precision,
     _train_stops,
     _wandb_spec,
     _worker_env,
@@ -209,6 +210,7 @@ _TRAIN_KEYS = frozenset(
         "stop_sequences",
         "max_steps",
         "max_examples",
+        "precision",
     }
 )
 
@@ -356,6 +358,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
+            precision=_train_precision(train_raw),
         ),
         gpu=GpuSpec(type=gpu_type),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set

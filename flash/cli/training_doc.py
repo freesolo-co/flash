@@ -106,6 +106,10 @@ epochs = 1                  # SFT is epoch-driven; GRPO is step-driven (steps = 
 max_examples = 2            # rows to train on (the starter dataset has 2)
 lora_rank = 32
 lora_alpha = 64
+# precision = "fp8"         # opt-in FP8 frozen-base GEMM (QLoRA-style; LoRA stays bf16). Default
+                            # "bf16". Best-effort: engages on Ada/Hopper/Blackwell (sm_89+) Qwen3.5/3.6
+                            # workers for a faster frozen-base matmul at ~baseline memory, and
+                            # transparently stays bf16 elsewhere.
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 

@@ -28,6 +28,29 @@ def coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+# Training compute precision for the FROZEN base weights. "bf16" is the classic path; "fp8"
+# opts the frozen base GEMM into FP8 e4m3 (chalk ``fp8_frozen_base``, QLoRA-style: the trainable
+# LoRA adapters + optimizer stay bf16, only the frozen-base forward matmul runs FP8). FP8 engages
+# on Ada/Hopper/Blackwell (sm_89+) Qwen3.5/3.6 workers and transparently stays bf16 elsewhere.
+PRECISIONS = ("bf16", "fp8")
+
+
+def coerce_precision(value: Any) -> str:
+    """Normalize the training precision knob to one of ``PRECISIONS``; None/empty -> "bf16".
+
+    Raises ``ValueError`` on an unknown value so a malformed worker payload fails loudly rather
+    than silently training at the wrong precision (the schema layer surfaces a friendlier error).
+    """
+    if value is None:
+        return "bf16"
+    s = str(value).strip().lower()
+    if not s:
+        return "bf16"
+    if s not in PRECISIONS:
+        raise ValueError(f"precision must be one of {', '.join(PRECISIONS)}; got {value!r}")
+    return s
+
+
 def _coerce_str_map(value: Any) -> dict[str, str]:
     """Coerce to dict[str, str]; non-dict input returns empty dict."""
     if not isinstance(value, dict):
@@ -124,6 +147,8 @@ class TrainSpec:
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
+    # Frozen-base compute precision: "bf16" (default) or "fp8" (chalk fp8_frozen_base, QLoRA-style).
+    precision: str = "bf16"
 
 
 @dataclass(frozen=True)
@@ -210,6 +235,7 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
+                precision=coerce_precision(train.get("precision")),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

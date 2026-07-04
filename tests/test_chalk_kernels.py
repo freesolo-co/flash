@@ -156,4 +156,110 @@ def test_kernels_match_real_chalk_signature():
     accepted = set(inspect.signature(apply_chalk_kernel_to_qwen35).parameters)
     passed = {k for k, _ in _KERNELS}
     stray = passed - accepted
-    assert not stray, f"_KERNELS passes keys chalk rejects (would TypeError -> no-op -> eager): {sorted(stray)}"
+    assert not stray, (
+        f"_KERNELS passes keys chalk rejects (would TypeError -> no-op -> eager): {sorted(stray)}"
+    )
+
+
+# --- FP8 frozen-base training (precision="fp8") ---------------------------------------------------
+
+
+def _install_fake_chalk_fp8(monkeypatch, calls, *, report=None, no_wcache_param=True):
+    """Fake chalk whose apply has an EXPLICIT fp8 signature so ``_fp8_kwargs`` feature-detection
+    (via inspect.signature) can see ``fp8_no_wcache`` — the generic ``**kwargs`` fake hides it."""
+    ck = types.ModuleType("chalk.transformers")
+
+    if no_wcache_param:
+
+        def apply_chalk_kernel_to_qwen35(
+            model, *, liger=False, fp8_frozen_base=False, fp8_no_wcache=False, **kwargs
+        ):
+            kwargs.update(liger=liger, fp8_frozen_base=fp8_frozen_base, fp8_no_wcache=fp8_no_wcache)
+            calls.append((model, kwargs))
+            return report if report is not None else {}
+    else:
+
+        def apply_chalk_kernel_to_qwen35(model, *, liger=False, fp8_frozen_base=False, **kwargs):
+            kwargs.update(liger=liger, fp8_frozen_base=fp8_frozen_base)
+            calls.append((model, kwargs))
+            return report if report is not None else {}
+
+    ck.apply_chalk_kernel_to_qwen35 = apply_chalk_kernel_to_qwen35
+    chalk_pkg = types.ModuleType("chalk")
+    chalk_pkg.transformers = ck
+    monkeypatch.setitem(sys.modules, "chalk", chalk_pkg)
+    monkeypatch.setitem(sys.modules, "chalk.transformers", ck)
+
+
+def test_fp8_false_keeps_frozen_base_off(monkeypatch):
+    """Default precision (bf16): fp8_frozen_base stays OFF — unchanged from the fixed selection."""
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    install_chalk_kernels(object(), fp8=False)
+    _, kwargs = calls[0]
+    assert kwargs["fp8_frozen_base"] is False
+    assert "fp8_no_wcache" not in kwargs  # never added on the bf16 path
+
+
+def test_fp8_true_enables_frozen_base_and_no_wcache(monkeypatch):
+    """precision=fp8: fp8_frozen_base flips ON and (chalk supports it) fp8_no_wcache is added
+    (baseline-memory mode), while every other fixed kernel is untouched."""
+    calls = []
+    _install_fake_chalk_fp8(monkeypatch, calls)
+    install_chalk_kernels(object(), fp8=True)
+    _, kwargs = calls[0]
+    assert kwargs["fp8_frozen_base"] is True
+    assert kwargs["fp8_no_wcache"] is True
+
+
+def test_fp8_no_wcache_feature_detected(monkeypatch):
+    """An older chalk without ``fp8_no_wcache`` must NOT get the kwarg (else TypeError -> whole
+    kernel stack silently disabled); it still enables fp8_frozen_base (cached-weight mode)."""
+    calls = []
+    _install_fake_chalk_fp8(monkeypatch, calls, no_wcache_param=False)
+    rep = install_chalk_kernels(object(), fp8=True)
+    _, kwargs = calls[0]
+    assert kwargs["fp8_frozen_base"] is True
+    assert "fp8_no_wcache" not in kwargs  # gracefully omitted
+    assert rep is not None  # apply succeeded, not swallowed
+
+
+def test_fp8_env_flag_still_cannot_enable(monkeypatch):
+    """Only the explicit fp8= param enables FP8; a leftover FLASH_FP8_BASE env stays inert."""
+    monkeypatch.setenv("FLASH_FP8_BASE", "1")
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    install_chalk_kernels(object())  # no fp8= -> default bf16
+    _, kwargs = calls[0]
+    assert kwargs["fp8_frozen_base"] is False
+
+
+def test_fp8_base_engaged_reads_installed_count():
+    """fp8_base_engaged reflects REAL engagement: installed>0 True; a no-op installed:0 report
+    (non-FP8 GPU / unsupported model) or an error report is NOT engaged."""
+    from flash.engine.chalk_kernels import fp8_base_engaged
+
+    assert fp8_base_engaged({"fp8_frozen_base": {"installed": 42, "attn": 24, "mlp": 18}}) is True
+    assert fp8_base_engaged({"fp8_frozen_base": {"installed": 0}}) is False
+    assert fp8_base_engaged({"fp8_frozen_base": {"error": "boom"}}) is False
+    assert fp8_base_engaged({"fp8_frozen_base": True}) is True
+    assert fp8_base_engaged({"fp8_frozen_base": False}) is False
+    assert fp8_base_engaged({}) is False
+    assert fp8_base_engaged(None) is False
+
+
+def test_fp8_kwargs_match_real_chalk_signature():
+    """The fp8 kwargs flash sends (fp8_frozen_base + fp8_no_wcache) must be REAL chalk params, or
+    the fp8 path TypeErrors -> swallowed -> silently trains eager bf16. Skipped without chalk."""
+    import inspect
+
+    import pytest
+
+    try:
+        from chalk.transformers import apply_chalk_kernel_to_qwen35
+    except Exception:
+        pytest.skip("freesolo-chalk not installed in this test env")
+
+    accepted = set(inspect.signature(apply_chalk_kernel_to_qwen35).parameters)
+    # fp8_frozen_base is the hard requirement; fp8_no_wcache is feature-detected so only warn-worthy.
+    assert "fp8_frozen_base" in accepted, "chalk dropped fp8_frozen_base — flash fp8 path is dead"

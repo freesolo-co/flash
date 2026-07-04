@@ -6,7 +6,7 @@ import math
 from typing import Any
 
 from flash.envs.adapter import is_freesolo_environment_id
-from flash.spec import WandbSpec
+from flash.spec import PRECISIONS, WandbSpec
 
 
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
@@ -66,6 +66,26 @@ def _train_stops(train_raw: dict) -> tuple[str, ...]:
         if not isinstance(s, str):
             raise ConfigError("train.stop_sequences entries must be strings")
     return tuple(s for s in v if s)
+
+
+def _train_precision(train_raw: dict) -> str:
+    """Validate the optional ``train.precision`` knob -> "bf16" (default) or "fp8".
+
+    "fp8" opts the frozen-base GEMM into FP8 e4m3 (chalk fp8_frozen_base); it is best-effort and
+    transparently stays bf16 on workers without FP8 hardware (needs Ada/Hopper/Blackwell sm_89+)
+    or on model families chalk doesn't cover, so it never hard-fails a run — only the value is
+    validated here."""
+    v = train_raw.get("precision")
+    if v is None:
+        return "bf16"
+    if not isinstance(v, str):
+        raise ConfigError(f"train.precision must be a string ({' or '.join(PRECISIONS)})")
+    s = v.strip().lower()
+    if not s:
+        return "bf16"
+    if s not in PRECISIONS:
+        raise ConfigError(f"train.precision must be one of {', '.join(PRECISIONS)}; got {v!r}")
+    return s
 
 
 class ConfigError(ValueError):
@@ -129,8 +149,7 @@ def _environment_secrets(raw: Any) -> tuple[str, ...]:
     reserved = sorted(set(secrets) & _RESERVED_ENVIRONMENT_SECRET_KEYS)
     if reserved:
         raise ConfigError(
-            "[environment] secrets must not include platform-managed key(s): "
-            f"{', '.join(reserved)}"
+            f"[environment] secrets must not include platform-managed key(s): {', '.join(reserved)}"
         )
     return secrets
 

@@ -10,6 +10,7 @@ import time
 from flash.engine.chalk_kernels import (
     active_kernels,
     chalk_fused_ce_available,
+    fp8_base_engaged,
     install_chalk_kernels,
 )
 from flash.engine.recipe import RECIPE
@@ -512,11 +513,22 @@ def run_sft():
             data_collator=_collator,
             callbacks=[_w.make_sft_heartbeat_callback(), _w.make_checkpoint_upload_callback()],
         )
-    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    _precision = str(_train_opt("precision", "bf16")).lower()
+    if _precision == "fp8":
+        print(
+            "[sft] precision=fp8 -> requesting chalk FP8 frozen-base GEMM (QLoRA-style; LoRA stays bf16)"
+        )
+    _chalk_report = install_chalk_kernels(
+        getattr(trainer, "model", None), fp8=(_precision == "fp8")
+    )
     _chalk_active = active_kernels(_chalk_report)
     if _sft_fused and "fused_linear_cross_entropy" not in _chalk_active:
-        current_pd = int(getattr(trainer.args, "per_device_train_batch_size", per_device_bs) or per_device_bs)
-        current_ga = int(getattr(trainer.args, "gradient_accumulation_steps", grad_accum) or grad_accum)
+        current_pd = int(
+            getattr(trainer.args, "per_device_train_batch_size", per_device_bs) or per_device_bs
+        )
+        current_ga = int(
+            getattr(trainer.args, "gradient_accumulation_steps", grad_accum) or grad_accum
+        )
         safe_pd_cap, _ = sft_grad_accum(
             effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=False
         )
@@ -593,6 +605,9 @@ def run_sft():
             ),
             "loraplus_applied": getattr(trainer, "_loraplus_applied", False),
             "chalk_kernels": _chalk_active or None,
+            # A/B provenance: requested precision + whether the FP8 frozen-base GEMM actually ran.
+            "precision": _precision,
+            "fp8_engaged": fp8_base_engaged(_chalk_report),
             **_w.wandb_run_info(),
         },
     )
