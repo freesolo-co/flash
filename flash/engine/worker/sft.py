@@ -33,6 +33,7 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
+    grpo_use_reentrant,
     loraplus_optimizer_cls,
     optimal_attn_impl,
     setup_perf_backends,
@@ -270,7 +271,11 @@ def run_sft():
         "dataloader_persistent_workers": True,
         "seed": _w.SEED,
         "gradient_checkpointing": _grad_ckpt,
-        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        # MoE / GatedDeltaNet hybrids re-dispatch tokens (MoE router) or lay out custom-kernel
+        # saved tensors differently on recompute, so non-reentrant checkpointing's metadata-equality
+        # assert fires on the FIRST backward (Qwen3.6-35B-A3B). Mirror the GRPO path (rl.py, #429/#432)
+        # and pick REENTRANT recompute for those; dense models keep the faster non-reentrant path.
+        "gradient_checkpointing_kwargs": {"use_reentrant": grpo_use_reentrant(model_id)},
         "completion_only_loss": True,
         # remove_unused_columns=False: HF Trainer would otherwise drop completion_mask before
         # collation, silently reverting all paths to full-transcript loss.
