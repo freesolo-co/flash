@@ -8,6 +8,7 @@ the remaining commands are covered without a server.
 from __future__ import annotations
 
 import io
+import types
 
 import pytest
 
@@ -472,6 +473,76 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "dataset/train.jsonl" in out
     assert "configs/rl.toml" in out
     assert "TRAINING.md" in out
+
+
+def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
+    # Non-interactive (pytest stdin is not a tty) with no flags stays on today's scaffold: no
+    # reasoning knobs land in either config.
+    monkeypatch.chdir(tmp_path)
+    assert _run(["env", "setup"]) == 0
+    rl = (tmp_path / "configs/rl.toml").read_text()
+    sft = (tmp_path / "configs/sft.toml").read_text()
+    assert "thinking = true" not in rl
+    assert "thinking = true" not in sft
+    assert "max_tokens" not in rl
+    assert "EnvironmentSingleTurn" in (tmp_path / "environment.py").read_text()
+
+
+def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert _run(["env", "setup", "--reasoning"]) == 0
+    rl = (tmp_path / "configs/rl.toml").read_text()
+    sft = (tmp_path / "configs/sft.toml").read_text()
+    assert "thinking = true" in rl
+    assert "thinking = true" in sft
+    # GRPO raises the generation budget so reasoning does not truncate the answer.
+    assert "max_tokens = 2048" in rl
+    # SFT can't share a token budget it doesn't generate; it gets the gold think-tag guidance instead.
+    assert "warn_missing_think_tags" in sft
+    assert "max_tokens" not in sft
+
+
+def test_env_setup_no_reasoning_flag_is_explicit_off(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert _run(["env", "setup", "--no-reasoning"]) == 0
+    assert "thinking = true" not in (tmp_path / "configs/rl.toml").read_text()
+
+
+def test_env_setup_multi_turn_flag_scaffolds_multiturn(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert _run(["env", "setup", "--multi-turn"]) == 0
+    assert "EnvironmentMultiTurn" in (tmp_path / "environment.py").read_text()
+    assert "secret whole number" in (tmp_path / "dataset/train.jsonl").read_text()
+
+
+def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp_path) -> None:
+    # A real terminal: the two survey questions are asked and answered "2" (multi-turn) then
+    # "2" (reasoning). FLASH_STYLE forces the themed path; a fake stdin reports a tty; input()
+    # is stubbed so no real keypress is read.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
+    answers = iter(["2", "2"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    assert _run(["env", "setup"]) == 0
+    assert "EnvironmentMultiTurn" in (tmp_path / "environment.py").read_text()
+    rl = (tmp_path / "configs/rl.toml").read_text()
+    assert "thinking = true" in rl
+    assert "max_tokens = 2048" in rl
+
+
+def test_env_setup_interactive_enter_takes_defaults(monkeypatch, tmp_path) -> None:
+    # Pressing enter (empty answer) at both questions selects the marked defaults: single-turn,
+    # no reasoning — identical to the non-interactive scaffold.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+    assert _run(["env", "setup"]) == 0
+    env_py = (tmp_path / "environment.py").read_text()
+    assert "EnvironmentSingleTurn" in env_py
+    assert "EnvironmentMultiTurn" not in env_py
+    assert "thinking = true" not in (tmp_path / "configs/rl.toml").read_text()
 
 
 def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:
