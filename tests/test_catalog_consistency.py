@@ -90,7 +90,9 @@ def test_serving_capacity_matches_validated_matrix():
             "serve_model_id": "Qwen/Qwen3.6-35B-A3B-FP8",
             "max_loras": 6,
             "max_lora_rank": 64,
-            "max_model_len": 8192,
+            # 4096 (down from 8192): the 6x64 LoRA ceiling is weight-bound not context-bound, so the
+            # smaller context buys ~2x serving concurrency without costing slots (canary 2026-07-04).
+            "max_model_len": 4096,
             "max_num_seqs": 8,
             "max_num_batched_tokens": 4096,
             "gpu_memory_utilization": 0.98,
