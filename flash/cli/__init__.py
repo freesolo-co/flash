@@ -234,7 +234,22 @@ def _build_parser() -> argparse.ArgumentParser:
     env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
     setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
-    setup.set_defaults(func=cmd_env_setup)
+    setup_mode = setup.add_mutually_exclusive_group()
+    setup_mode.add_argument(
+        "--single-turn",
+        dest="turn_mode",
+        action="store_const",
+        const="single",
+        help="scaffold a single-turn environment (prompt -> one response). This is the default.",
+    )
+    setup_mode.add_argument(
+        "--multi-turn",
+        dest="turn_mode",
+        action="store_const",
+        const="multi",
+        help="scaffold a multi-turn environment (bounded episode with step_episode / score_episode).",
+    )
+    setup.set_defaults(func=cmd_env_setup, turn_mode="single")
 
     env_list = env_sub.add_parser("list", help="list local environment sources")
     env_list.set_defaults(func=cmd_env_list)
