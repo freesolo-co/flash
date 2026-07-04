@@ -246,6 +246,28 @@ def test_fused_ce_default_on(monkeypatch):
     assert kwargs["fused_linear_cross_entropy"] is True
 
 
+def test_grad_checkpointing_disables_fused_embedding(monkeypatch):
+    """Under gradient checkpointing, chalk's fused_embedding (stateful layer-0 input_ids stash) is
+    checkpoint-unsafe and crashes the backward recompute; install_chalk_kernels(grad_checkpointing=
+    True) turns it OFF while leaving every other kernel (incl. fp8) intact."""
+    calls = []
+    _install_fake_chalk_fp8(monkeypatch, calls)
+    install_chalk_kernels(object(), fp8=True, grad_checkpointing=True)
+    _, kwargs = calls[0]
+    assert kwargs["fused_embedding"] is False
+    assert kwargs["fp8_frozen_base"] is True  # fp8 unaffected
+    assert kwargs["rope"] is True  # only fused_embedding is dropped
+
+
+def test_grad_checkpointing_default_keeps_fused_embedding(monkeypatch):
+    """Default (no GC): fused_embedding stays ON (SFT on small models runs without checkpointing)."""
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    install_chalk_kernels(object())  # grad_checkpointing defaults False
+    _, kwargs = calls[0]
+    assert kwargs["fused_embedding"] is True
+
+
 def test_fp8_env_flag_still_cannot_enable(monkeypatch):
     """Only the explicit fp8= param enables FP8; a leftover FLASH_FP8_BASE env stays inert."""
     monkeypatch.setenv("FLASH_FP8_BASE", "1")

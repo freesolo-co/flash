@@ -333,6 +333,10 @@ def run_rl():
     out_dir = f"/tmp/rl_seed{_w.SEED}"
     resume_ckpt = _w.hf_resume_checkpoint()
 
+    # GRPO always non-reentrant-checkpoints; capture the decision so we can also tell chalk to skip
+    # its checkpoint-unsafe fused_embedding (see install_chalk_kernels) when GC is on.
+    _grpo_grad_ckpt = grad_checkpointing_on(model_id, vllm_max_len)
+
     grpo_kwargs = {
         "output_dir": out_dir,
         "learning_rate": (
@@ -355,7 +359,7 @@ def run_rl():
         "report_to": _w.wandb_report_to(),
         "run_name": _w.wandb_run_name(),
         "seed": _w.SEED,
-        "gradient_checkpointing": grad_checkpointing_on(model_id, vllm_max_len),
+        "gradient_checkpointing": _grpo_grad_ckpt,
         "gradient_checkpointing_kwargs": {"use_reentrant": False},
         # Pin a stable GRPO recipe instead of TRL's defaults (which suppress the lift on short runs):
         # constant LR, group-mean-centered advantages (no std scaling), no length-norm; beta = KL coef.
@@ -590,7 +594,9 @@ def run_rl():
             "[grpo] precision=fp8 -> requesting chalk FP8 frozen-base GEMM (QLoRA-style; LoRA stays bf16)"
         )
     _chalk_report = install_chalk_kernels(
-        getattr(trainer, "model", None), fp8=(_precision == "fp8")
+        getattr(trainer, "model", None),
+        fp8=(_precision == "fp8"),
+        grad_checkpointing=bool(_grpo_grad_ckpt),
     )
     # Activate the weight-sync remap only now, after the initial checkpoint load is built.
     if use_vllm:

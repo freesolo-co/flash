@@ -93,7 +93,9 @@ def _fp8_kwargs(apply_fn) -> dict:
     return kw
 
 
-def install_chalk_kernels(model=None, *, fp8: bool = False, fused_ce: bool = True) -> dict:
+def install_chalk_kernels(
+    model=None, *, fp8: bool = False, fused_ce: bool = True, grad_checkpointing: bool = False
+) -> dict:
     """Apply chalk standalone kernels to ``model``; call AFTER TRL builds the trainer.
 
     ``fp8=True`` additionally enables the FP8 frozen-base GEMM (chalk ``fp8_frozen_base``): a
@@ -109,6 +111,16 @@ def install_chalk_kernels(model=None, *, fp8: bool = False, fused_ce: bool = Tru
     it is not on this worker). The SFT path passes ``fused_ce=False`` so the model returns real
     logits; GRPO keeps the default. ``fp8_frozen_base`` is independent, so FP8 still engages either
     way.
+
+    ``grad_checkpointing=True`` turns OFF chalk's ``fused_embedding``. That kernel stashes the step's
+    ``input_ids`` on ``embed_tokens`` and consumes them in layer-0's ``input_layernorm`` (taking the
+    fused path because the base embed/norm are frozen). Under non-reentrant gradient checkpointing,
+    ``embed_tokens`` runs only on the RECORD pass (it's outside the checkpointed decoder layers); the
+    backward RECOMPUTE finds the stash cleared, so layer-0 norm flips to eager RMSNorm — the two
+    passes enroll a different saved-tensor sequence and ``torch.utils.checkpoint`` raises
+    ``CheckpointError`` at the first backward (crashes bf16 and fp8 alike, any arch). Disabling it
+    makes both passes take the identical eager path. It's a single-norm micro-opt, so the only cost
+    is losing that fusion whenever GC is on.
 
     Returns chalk's per-kernel report, or ``{}`` when freesolo-chalk isn't installed.
     """
@@ -130,6 +142,12 @@ def install_chalk_kernels(model=None, *, fp8: bool = False, fused_ce: bool = Tru
     kwargs = dict(_KERNELS)
     if not fused_ce:
         kwargs["fused_linear_cross_entropy"] = False
+    if grad_checkpointing:
+        kwargs["fused_embedding"] = False
+        log.info(
+            "chalk fused_embedding disabled (gradient checkpointing on): its layer-0 input_ids stash "
+            "isn't replayed on the backward recompute -> torch.utils.checkpoint CheckpointError"
+        )
     if fp8:
         kwargs.update(_fp8_kwargs(apply_chalk_kernel_to_qwen35))
         log.info("chalk fp8 requested: enabling fp8_frozen_base (QLoRA-style FP8 frozen-base GEMM)")

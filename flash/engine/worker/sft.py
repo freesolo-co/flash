@@ -526,8 +526,16 @@ def run_sft():
     # subscriptable``). Keep fused-CE OFF for SFT (GRPO's GRPOTrainer path is unaffected and keeps
     # it): the model then returns real logits and the large-vocab logits cap below sizes for it.
     # fp8_frozen_base is independent of fused-CE, so FP8 still engages.
+    # Disable chalk's checkpoint-unsafe fused_embedding when gradient checkpointing is (or will be)
+    # on. ``_grad_ckpt`` is the initial decision; the fused-CE fallback below can still flip GC on
+    # when ``_sft_fused`` (fused-CE is always off for SFT here), so gate on both to be safe — chalk
+    # is installed once, before that fallback runs.
+    _sft_gc = bool(_grad_ckpt) or bool(_sft_fused)
     _chalk_report = install_chalk_kernels(
-        getattr(trainer, "model", None), fp8=(_precision == "fp8"), fused_ce=False
+        getattr(trainer, "model", None),
+        fp8=(_precision == "fp8"),
+        fused_ce=False,
+        grad_checkpointing=_sft_gc,
     )
     _chalk_active = active_kernels(_chalk_report)
     if _sft_fused and "fused_linear_cross_entropy" not in _chalk_active:
