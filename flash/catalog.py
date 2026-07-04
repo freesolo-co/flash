@@ -12,7 +12,7 @@ ALGORITHMS = ("sft", "grpo")
 def normalize_algorithm(value: str) -> str:
     """Canonical (lowercased, validated) algorithm name."""
     if not value:
-        value = "grpo"
+        value = "sft"
     elif not isinstance(value, str):
         # A truthy non-string (e.g. a JSON number/bool/array) would AttributeError on .lower(), which
         # escapes the callers' ValueError/ConfigError guards -> uncaught 500. Raise ValueError instead.

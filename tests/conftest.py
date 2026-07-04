@@ -29,12 +29,13 @@ def _offline(monkeypatch):
 
     monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [], raising=False)
 
-    # Lambda is an OPT-IN instance-based complement (keyed by LAMBDA_API_KEY). On an operator box
-    # whose shell sources a .env, that key is present in the process env — which would make the
-    # provider "available" and pull live capacity/pricing into offline tests (allocation candidates,
-    # registry). Delete it by default so the suite stays hermetic and RunPod-only; a provider test
-    # opts back in with ``monkeypatch.setenv(...)``.
+    # Lambda and Vast are OPT-IN instance-based complements (keyed by LAMBDA_API_KEY / VAST_API_KEY).
+    # On an operator box whose shell sources a .env, those keys are present in the process env — which
+    # would make the provider "available" and pull live capacity/pricing into offline tests (allocation
+    # candidates, registry). Delete them by default so the suite stays hermetic and RunPod-only; a
+    # provider test opts back in with ``monkeypatch.setenv(...)``.
     monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
 
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every

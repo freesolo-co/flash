@@ -10,22 +10,30 @@ Constants tests monkeypatch stay in this __init__ so monkeypatch.setattr(jobs, �
 from __future__ import annotations
 
 import contextlib
-import json
 import time
 from collections.abc import Callable
 
 from flash._logging import get_logger
+from flash.providers._hf_artifacts import (
+    error_artifact_name,
+    heartbeat_reader_for,
+    make_hf_text_reader,
+)
+from flash.providers._instance_poll import InstancePollAdapter, poll_instance_job
 from flash.providers._poll import (
-    BOOT_LOG_ABSENT_POLLS,
-    FIRST_LIVENESS_OBSERVED_FLOOR_S,
     FIRST_LIVENESS_S,
-    PollErrorTracker,
-    heartbeat_progress_ts,
-    is_training_heartbeat,
+    LOAD_TIMEOUT_S,
+    PROVISION_GRACE_S,
+    SETUP_GRACE_S,
+    STALL_AFTER_S,
     make_say,
     preload_box_reap_due,
-    surface_heartbeat,
 )
+
+# Re-exported (unused here) so the cross-provider symmetry guard can assert every rent-a-box jobs module
+# draws the setup-vs-training stall boundary from the ONE canonical helper (the shared poll driver uses
+# it); keeps the rule from drifting between providers.
+from flash.providers._poll import is_training_heartbeat as is_training_heartbeat
 from flash.providers.base import GPU_INFO, PollResult
 from flash.providers.lambdalabs import api as lambda_api
 from flash.providers.lambdalabs.jobs.builders import (
@@ -34,20 +42,16 @@ from flash.providers.lambdalabs.jobs.builders import (
     build_payload,
     build_user_data,
     instance_label,
+    label_matches_run,
     run_label_prefix,
 )
-from flash.providers.runpod.jobs import make_hf_heartbeat_reader, make_hf_text_reader
 
 logger = get_logger(__name__)
 
-LOAD_TIMEOUT_S = 900.0
-# Setup grace covers Docker pull + pip + model download (no heartbeat until training starts).
-SETUP_GRACE_S = 3000.0
-STALL_AFTER_S = 1500.0
-PROVISION_GRACE_S = 3000.0
-
-_METRICS_READ_RETRIES = 3
-_METRICS_READ_BACKOFF_S = 2.0
+# The shared instance-poll timing defaults imported from ``_poll`` above (setup grace covers Docker pull
+# + pip + model download, before any heartbeat). LOAD_TIMEOUT_S and PROVISION_GRACE_S are read at call
+# time so ``monkeypatch.setattr(jobs, …)`` takes effect; SETUP_GRACE_S / STALL_AFTER_S / FIRST_LIVENESS_S
+# are supplied as ``poll_lambda_job`` defaults (override by passing the kwarg, not by patching the global).
 
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
 
@@ -255,7 +259,7 @@ def _failure_detail(hf_repo: str, prefix: str, phase: str, marker: dict | None, 
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
-    err_name = f"error_{phase}_attempt{int(attempt or 0)}.txt"  # matches worker error_artifact_name
+    err_name = error_artifact_name(phase, attempt)
     err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
     if err:
         parts.append(f"--- {err_name} ---\n{err[-2000:]}")
@@ -277,51 +281,24 @@ def poll_lambda_job(
     first_liveness_s: float = FIRST_LIVENESS_S,
     deadline_s: float | None = None,
 ) -> PollResult:
-    """Poll instance status + HF artifacts to a terminal state."""
-    say = make_say(log)
+    """Poll instance status + HF artifacts to a terminal state.
 
-    # 0.0 = corrupt/missing handle; fall back to now to avoid billing from the 1970 epoch.
-    launch_ts = handle.started_ts or time.time()
-
+    A thin wrapper that builds the Lambda :class:`InstancePollAdapter` and defers to the shared
+    ``poll_instance_job`` kernel (baselined on Vast). Lambda stamps the customer cost from the INSTANCE
+    wall (launch->done), notes the provider instance type + region, and — having no live console API —
+    reads early-liveness + failure detail from the host boot.log on HF. ``LOAD_TIMEOUT_S`` is read here
+    (a module global) so ``monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", ...)`` still bites.
+    """
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}"
-    done_reader = _make_hf_file_reader(hf_repo, f"{prefix}/DONE")
-    marker_reader = _make_hf_file_reader(
-        hf_repo, f"{prefix}/lambda_attempt{handle.attempt}.json", min_interval_s=60.0
-    )
-    metrics_reader = _make_hf_file_reader(hf_repo, f"{prefix}/metrics.json")
+    err_name = error_artifact_name(spec.phase, handle.attempt)
     # Absence of boot.log while active = cloud-init never ran (sick region / stuck host).
     boot_log_reader = _make_hf_file_reader(
         hf_repo, f"{prefix}/lambda_attempt{handle.attempt}_boot.log", min_interval_s=60.0
     )
 
-    def finish_ok(done_content: str | None = None) -> PollResult:
-        # metrics.json None here is a transient HF blip (worker uploads it before DONE); retry rather
-        # than treating a successful run as job_failed (which is not infra-retried).
-        raw = metrics_reader(force=True)
-        for _ in range(_METRICS_READ_RETRIES):
-            if raw is not None:
-                break
-            time.sleep(_METRICS_READ_BACKOFF_S)
-            raw = metrics_reader(force=True)
-        if raw is None:
-            return PollResult(
-                False,
-                failure="poll_error",
-                detail="DONE seen but metrics.json unreadable after retries (transient HF read)",
-            )
-        metrics = json.loads(raw)
-        # Prefer the worker's DONE timestamp when present and sane; fall back to now. On delayed
-        # recovery the control plane may poll hours after the box wrote DONE, so billing to now
-        # would over-bill by the downtime.
-        end_ts = time.time()
-        if done_content:
-            try:
-                done_ts = float(done_content.strip())
-                if launch_ts <= done_ts <= end_ts:
-                    end_ts = done_ts  # prefer worker's timestamp to avoid over-billing on delayed recovery
-            except ValueError:
-                pass
+    def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
+        # Lambda bills the INSTANCE wall (launch -> completion), not the worker's train wall.
         wall_h = (end_ts - launch_ts) / 3600.0
         metrics["cost_usd"] = round(wall_h * handle.hourly_usd, 6)
         notes = metrics.get("notes") if isinstance(metrics.get("notes"), dict) else {}
@@ -335,176 +312,53 @@ def poll_lambda_job(
             }
         )
         metrics["notes"] = notes
-        return PollResult(True, metrics=metrics)
 
-    def done_is_fresh(content: str) -> bool:
-        # 120s clock-skew grace; rejects leftover DONE from a prior attempt.
-        try:
-            return float(content.strip()) > launch_ts - 120.0
-        except ValueError:
-            return False
-
-    def finish_from_ok_marker() -> PollResult:
-        d = done_reader(force=True)
-        return finish_ok(d if (d is not None and done_is_fresh(d)) else None)
-
-    def fail_from_marker(marker: dict | None) -> PollResult:
-        from flash.providers.runpod.jobs import worker_flagged_retriable
-
-        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(heartbeat_reader)
-        return PollResult(
-            False,
-            failure="job_preempted" if retriable else "job_failed",
-            detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.attempt),
-        )
-
-    def terminal_artifact_result() -> PollResult | None:
-        """Force-read terminal artifacts; preserves work done during a control-plane outage."""
-        d = done_reader(force=True)
-        if d is not None and done_is_fresh(d):
-            return finish_ok(d)
-        raw = marker_reader(force=True)
-        if raw:
-            with contextlib.suppress(ValueError):
-                m = json.loads(raw)
-                if m.get("ok"):
-                    return finish_from_ok_marker()  # finished (stale DONE ok)
-                return fail_from_marker(m)
-        return None
-
-    poll_errors = PollErrorTracker(say, interval_s)
-    # Anchor all clocks to launch (not poll start) so a reattach doesn't hand a timed-out box a fresh window.
-    start = launch_ts
-    last_status = None
-    last_hb_key = None
-    last_progress = start
-    became_active = False
-    active_since = start  # launch-anchored; advanced to now only on a genuine inactive->active transition
-    observed_active_since = None  # when THIS session first saw active (unset on reattach until first read)
-    seen_training_hb = False
-    seen_fresh_hb = False  # any fresh hb (boot or training) disarms the first-liveness deadline
-    boot_log_seen = False  # latched once present; guards against rate-limited None after first observe
-    boot_log_absent_polls = 0
-    missing_streak = 0
-    while True:
-        if deadline_s is not None and time.time() - start > deadline_s:
-            terminal = terminal_artifact_result()
-            if terminal is not None:
-                return terminal
-            return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
-        try:
-            inst = lambda_api.get_instance(handle.instance_id)
-            poll_errors.reset()
-        except lambda_api.LambdaApiError as e:
-            if poll_errors.record(e):
-                return PollResult(False, failure="poll_error", detail=str(e))
-            continue
-        missing_streak = missing_streak + 1 if inst is None else 0
-        status = (inst or {}).get("status") or ("missing" if inst is None else "unknown")
-        if status != last_status:
-            say(f"instance {handle.instance_id}: {status}")
-            # Skip first observation (last_status=None on reattach) so the launch-anchored clock is not reset.
-            if last_status is not None:
-                last_progress = time.time()
-                if status == "active":
-                    active_since = time.time()
-            last_status = status
-        if status == "active":
-            became_active = True
-            if observed_active_since is None:
-                observed_active_since = time.time()
-
-        done = done_reader()
-        if done is not None and done_is_fresh(done):
-            return finish_ok(done)
-
-        dead = missing_streak >= 3 or status in _DEAD_STATES
-        if dead:
-            terminal = terminal_artifact_result()
-            if terminal is not None:
-                return terminal
-            # THIS attempt's error file present = deterministic crash (fail fast); absent = host loss
-            # (retry). Attempt-scoped so a prior attempt's stale traceback can't force a false job_failed.
-            # A retriable heartbeat keeps the path on job_preempted regardless.
-            from flash.providers.runpod.jobs import worker_flagged_retriable
-
-            err_name = f"error_{spec.phase}_attempt{int(handle.attempt or 0)}.txt"
-            err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
-            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
-            return PollResult(
-                False,
-                failure="job_failed" if worker_crashed else "job_preempted",
-                detail=_failure_detail(hf_repo, prefix, spec.phase, None, handle.attempt),
-            )
-
-        raw_marker = marker_reader()
-        if raw_marker:
-            try:
-                marker = json.loads(raw_marker)
-            except ValueError:
-                marker = None
-            if marker and not marker.get("ok"):
-                return fail_from_marker(marker)
-            if marker and marker.get("ok"):
-                return finish_from_ok_marker()
-
-        if not became_active and time.time() - start > LOAD_TIMEOUT_S:
-            return PollResult(
-                False,
-                failure="stalled",
-                detail=f"instance stuck in '{status}' for {int(time.time() - start)}s "
-                f"(never became active; provisioning / host issue)",
-            )
-
-        new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
-        if new_key != last_hb_key:
-            last_hb_key = new_key
-            # Use the heartbeat's own timestamp (clamped to [launch, now]); a stale reattach read
-            # must not reset the stall clock to now. ``fresh`` is False for prior-attempt leftover hbs.
-            hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, handle.attempt)
-            if fresh:
-                seen_fresh_hb = True
-                if stage is not None:
-                    last_progress = max(last_progress, hb_ts)  # monotonic: never let progress regress
-                    if is_training_heartbeat(stage, new_key[1]):
-                        seen_training_hb = True
-        if became_active:
-            if (
-                not seen_fresh_hb
-                and not boot_log_seen
-                and time.time() - active_since > first_liveness_s
-                and time.time() - observed_active_since > FIRST_LIVENESS_OBSERVED_FLOOR_S
-            ):
-                # Empty "" boot.log counts as liveness (existence = cloud-init ran).
-                if boot_log_reader(force=True) is None:
-                    # Require absence to persist (BOOT_LOG_ABSENT_POLLS) to tolerate transient HF blips.
-                    boot_log_absent_polls += 1
-                    if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
-                        terminal = terminal_artifact_result()
-                        if terminal is not None:
-                            return terminal
-                        return PollResult(
-                            False,
-                            failure="stalled",
-                            detail=f"no worker liveness (boot.log/heartbeat) for "
-                            f"{int(time.time() - active_since)}s after instance became active "
-                            f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
-                        )
-                else:
-                    boot_log_seen = True
-            limit = stall_after_s if seen_training_hb else setup_grace_s
-            if time.time() - last_progress > limit:
-                terminal = terminal_artifact_result()
-                if terminal is not None:
-                    return terminal
-                phase = "training" if seen_training_hb else "setup (pre-training)"
-                return PollResult(
-                    False,
-                    failure="stalled",
-                    detail=f"no worker progress for {int(time.time() - last_progress)}s "
-                    f"during {phase} (instance status {status}, limit {int(limit)}s)",
-                )
-        time.sleep(interval_s)
+    adapter = InstancePollAdapter(
+        instance_id=handle.instance_id,
+        current_attempt=handle.attempt,
+        # 0.0 = corrupt/missing handle -> anchor elapsed/cost to now (avoid billing from the 1970 epoch);
+        # the heartbeat attempt-DATING uses the TRUE launch (0.0 == unknown), NOT the now() fallback.
+        launch_ts=handle.started_ts or time.time(),
+        dating_launch=handle.started_ts or 0.0,
+        done_reader=_make_hf_file_reader(hf_repo, f"{prefix}/DONE"),
+        marker_reader=_make_hf_file_reader(
+            hf_repo, f"{prefix}/lambda_attempt{handle.attempt}.json", min_interval_s=60.0
+        ),
+        metrics_reader=_make_hf_file_reader(hf_repo, f"{prefix}/metrics.json"),
+        # Resolve get_instance on the api MODULE at call time so a monkeypatch bites.
+        fetch_instance=lambda: lambda_api.get_instance(handle.instance_id),
+        poll_error_exceptions=(lambda_api.LambdaApiError,),
+        status_field="status",
+        running_status="active",
+        dead_states=_DEAD_STATES,
+        missing_dead_threshold=3,
+        # Empty "" boot.log counts as liveness (existence = cloud-init ran) -> ``is not None``.
+        early_liveness_alive=lambda: boot_log_reader(force=True) is not None,
+        read_current_error=lambda: _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True),
+        stamp_cost_and_notes=stamp_cost_and_notes,
+        failure_detail=lambda marker: _failure_detail(
+            hf_repo, prefix, spec.phase, marker, handle.attempt
+        ),
+        load_timeout_detail=lambda status, elapsed: (
+            f"instance stuck in '{status}' for {int(elapsed)}s "
+            f"(never became active; provisioning / host issue)"
+        ),
+        first_liveness_detail=lambda elapsed, fl: (
+            f"no worker liveness (boot.log/heartbeat) for {int(elapsed)}s after instance became active "
+            f"(cloud-init/worker never started; limit {int(fl)}s)"
+        ),
+    )
+    return poll_instance_job(
+        adapter,
+        log=log,
+        interval_s=interval_s,
+        heartbeat_reader=heartbeat_reader,
+        setup_grace_s=setup_grace_s,
+        stall_after_s=stall_after_s,
+        first_liveness_s=first_liveness_s,
+        load_timeout_s=LOAD_TIMEOUT_S,
+        deadline_s=deadline_s,
+    )
 
 
 def submit_run_lambda(
@@ -534,9 +388,7 @@ def submit_run_lambda(
     try:
         if on_handle is not None:
             on_handle(handle.to_dict())
-        hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}"
-        reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
+        reader = heartbeat_reader_for(spec)
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
         return poll_lambda_job(
             handle,
@@ -562,8 +414,7 @@ def terminate_run_instances(run_id: str) -> list[str]:
     ids = [
         str(i.get("id"))
         for i in instances
-        if i.get("id")
-        and (str(i.get("name") or "") == prefix or str(i.get("name") or "").startswith(prefix + "-s"))
+        if i.get("id") and label_matches_run(str(i.get("name") or ""), prefix)
     ]
     return lambda_api.terminate_instances(ids) if ids else []
 
@@ -595,8 +446,7 @@ def sweep_orphans(
     known_prefixes = None if known_labels is None else {run_label_prefix(a) for a in (known or set())}
 
     def _matches(prefixes: set[str]) -> bool:
-        # Boundary match: flash-100 must not match flash-1000-...
-        return any(name == p or name.startswith(p + "-s") for p in prefixes)
+        return any(label_matches_run(name, p) for p in prefixes)
 
     now = time.time()
     orphans: list[str] = []

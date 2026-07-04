@@ -149,8 +149,35 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 f"attach: {run_id} ended ({res.failure}); resuming from checkpoint",
                 file=log,
             )
+            # Before resuming, the in-flight instance MUST be CONFIRMED torn down. Resubmitting while
+            # it may still be alive runs TWO workers against this run's shared HF artifacts
+            # (DONE/metrics/checkpoints) — double bill AND corrupted state. An instance provider's
+            # destroy() raises only on an UNCONFIRMED teardown (Vast: DELETE success:false / network
+            # breakdown — a real 404 is now treated as confirmed-gone). The poll loop's own finally
+            # already best-effort-destroyed the box; re-confirm here. On an unconfirmed result, GC by
+            # label (run-scoped, not orphan-sweep-shielded) and BAIL with the handle intact + the run
+            # left non-terminal, so a later recovery/sweep reconciles instead of racing a live box.
+            from flash.providers import INSTANCE_PROVIDERS
+
+            teardown_confirmed = True
+            if handle.provider in INSTANCE_PROVIDERS:
+                try:
+                    get_provider(handle.provider).destroy(handle)
+                except Exception as exc:
+                    teardown_confirmed = False
+                    print(
+                        f"attach: {run_id} {handle.provider} instance teardown UNCONFIRMED ({exc}); "
+                        "not resuming over a possibly-live box",
+                        file=log,
+                    )
+            # GC the dead endpoint / any label-named instances (a second force-reap attempt when the
+            # teardown above was unconfirmed), then clear the stale handle.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(public_spec)
+            if not teardown_confirmed:
+                # Keep ``remote`` so the still-billing box stays reachable for the next recovery/sweep,
+                # and leave the run non-terminal (do not _update) so a future re-attach re-polls it.
+                return get_status(run_id)
             # Bail if the run was raced to terminal during the long poll above: _update's CAS
             # returns False, and resuming would submit paid work for a dead run.
             if not _update(run_id, "running", remote=None):
@@ -167,7 +194,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 owner_key_id=owner_key_id,
             )
             if code_prefix is None:
-                from flash.providers.runpod.train import upload_code
+                from flash.providers._worker import upload_code
                 from flash.runner import flash_code_prefix
 
                 code_prefix = flash_code_prefix()
