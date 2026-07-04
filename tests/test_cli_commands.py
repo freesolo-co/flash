@@ -447,6 +447,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "private environment-scoped repo" in grpo.read_text()
     assert 'algorithm = "sft"' in sft.read_text()
     assert "epochs = 1" in sft.read_text()
+    assert "max_examples = 2" in sft.read_text()
     assert "cheapest fitting managed class" in sft.read_text()
     assert "private environment-scoped repo" in sft.read_text()
     opd = tmp_path / "configs/opd.toml"

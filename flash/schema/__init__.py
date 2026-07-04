@@ -98,7 +98,7 @@ def load_toml(path: str) -> dict[str, Any]:
             return tomllib.load(f)
     except FileNotFoundError as exc:
         raise ConfigError(
-            f"config file not found: {path} (run `flash env setup` to scaffold configs/rl.toml)"
+            f"config file not found: {path} (run `flash env setup` to scaffold configs/sft.toml)"
         ) from exc
     except IsADirectoryError as exc:
         raise ConfigError(

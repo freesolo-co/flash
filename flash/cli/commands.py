@@ -231,6 +231,7 @@ def cmd_env_setup(args) -> int:
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
+            "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
             "lora_rank = 32\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
@@ -260,8 +261,8 @@ def cmd_env_setup(args) -> int:
     scaffolded = [
         "environment.py",
         "dataset/train.jsonl",
-        "configs/rl.toml",
         "configs/sft.toml",
+        "configs/rl.toml",
         "configs/opd.toml",
         "TRAINING.md",
     ]
