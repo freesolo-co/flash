@@ -320,6 +320,25 @@ def test_opd_sampled_ids_moved_off_gpu_in_one_transfer():
     assert _to_cpu_ids([1, 2, 3]) == [1, 2, 3]
 
 
+def test_is_truncated_rollout_flags_cap_hit_without_eos():
+    """A rollout that reaches max_completion WITHOUT EOS is a mid-output truncation OPD must NOT distil
+    (it can't supervise the stop token, so reinforcing a cap-hit fragment teaches non-terminating
+    output). EOS present, or an under-cap length (e.g. a stop_sequence halt), means it terminated."""
+    from flash.engine.worker.opd import _is_truncated_rollout
+
+    EOS = 99
+    # hit the cap with no EOS in the ids -> truncated mid-output
+    assert _is_truncated_rollout([1, 2, 3, 4], 4, EOS) is True
+    # hit the cap but EOS was emitted -> terminated, not a truncation
+    assert _is_truncated_rollout([1, 2, 3, EOS], 4, EOS) is False
+    # under the cap, no EOS (a stop_sequence halted it before the cap) -> not a cap truncation
+    assert _is_truncated_rollout([1, 2], 4, EOS) is False
+    # under the cap with EOS -> natural termination
+    assert _is_truncated_rollout([1, EOS], 4, EOS) is False
+    # tokenizer without an EOS id -> a cap-hit rollout still counts as truncated
+    assert _is_truncated_rollout([1, 2, 3, 4], 4, None) is True
+
+
 def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     # OPD generates on-policy (loss forward runs model(prompt+completion)), so allocator sizing must
     # use the prompt+completion budget, not the SFT 1024 default — else a raised max_tokens OOMs an

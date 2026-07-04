@@ -174,6 +174,20 @@ def _to_cpu_ids(completion_ids):
     return [int(t) for t in completion_ids]
 
 
+def _is_truncated_rollout(completion_ids, max_completion, eos_id) -> bool:
+    """True when a rollout hit the ``max_completion`` cap WITHOUT emitting EOS — i.e. a completion cut
+    off mid-output rather than one that terminated.
+
+    OPD cannot supervise the stop token (the teacher's and student's EOS differ and are both zero-width
+    in the text-span alignment, so EOS gets no gradient), so distilling a cap-hit fragment reinforces
+    non-terminating output that reverse-KL can never teach the student to end — a driver of the eval's
+    unterminated-JSON parse failures. A ``stop_sequence`` halt or a natural EOS both leave the rollout
+    shorter than the cap or containing EOS, so neither trips this."""
+    return len(completion_ids) >= int(max_completion) and (
+        eos_id is None or eos_id not in completion_ids
+    )
+
+
 def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     """Char spans for the ORIGINAL sampled token ids, indexed into ``completion_text`` (the exact
     string the teacher echo-scored). Using the sampled ids — not a re-tokenization of the decoded
@@ -549,6 +563,11 @@ def run_opd():
     coverage_curve: list[float] = []
     generated_tokens = 0
     teacher_input_tokens = 0
+    # Rollouts skipped for hitting the cap without EOS (mid-output truncations we refuse to distil),
+    # and a running mean of alignment granularity — both surfaced in train_meta for diagnosis.
+    truncated_rollouts = 0
+    granularity_sum = 0.0
+    granularity_n = 0
     opt_steps = (
         0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
     )
@@ -644,6 +663,8 @@ def run_opd():
                         teacher_ok += 1
                     elif _t_status == "transient":
                         teacher_transient += 1
+                    if getattr(_train_one, "last_truncated", False):
+                        truncated_rollouts += 1
                     if loss is None:
                         # Refresh the stall clock even when a sample yields no teacher signal. The
                         # success ping below is the only NON-liveness opd_step heartbeat, so a step
@@ -657,6 +678,8 @@ def run_opd():
                     (loss / accum_target).backward()
                     step_loss += float(loss.detach())
                     step_cov += _train_one.last_coverage
+                    granularity_sum += _train_one.last_group_granularity
+                    granularity_n += 1
                     generated_tokens += _train_one.last_gen_tokens
                     teacher_input_tokens += _train_one.last_teacher_tokens
                     nseq += 1
@@ -782,6 +805,13 @@ def run_opd():
             "thinking": _w.THINKING,
             "loss_curve": loss_curve,
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,
+            # Rollouts cut off at the cap without EOS — skipped, not distilled (see _is_truncated_rollout).
+            # A high count means the student is generating runaway/non-terminating filters (cold start,
+            # untrained stop token) and warm-starting from SFT — which encodes termination — would help.
+            "truncated_rollouts": truncated_rollouts,
+            # Real alignment-health signal (mean student-tokens-per-group); mean_coverage is ~1.0 even
+            # for a degenerate collapsed alignment, so it can't flag that failure mode.
+            "mean_align_granularity": (granularity_sum / granularity_n) if granularity_n else 0.0,
             "teacher_input_tokens": teacher_input_tokens,
             "temperature": knobs["temperature"],
             "group_size": group,
@@ -820,6 +850,10 @@ def _train_one(
     _train_one.last_coverage = 0.0
     _train_one.last_gen_tokens = 0
     _train_one.last_teacher_tokens = 0
+    # A cap-hit rollout truncated mid-output (skipped, not distilled — see _is_truncated_rollout).
+    _train_one.last_truncated = False
+    # Mean student-tokens-per-alignment-group; a real health signal where mean_coverage is not.
+    _train_one.last_group_granularity = 0.0
     # "ok" once teacher.score returns, "transient" on a retryable teacher outage, else None (teacher
     # not reached). run_opd uses this to decide whether a no-signal run is a retriable infra failure.
     _train_one.last_teacher_status = None
@@ -833,6 +867,14 @@ def _train_one(
         gen[0, prompt_tensor.shape[1] :]
     )  # one GPU->CPU copy, reused below
     completion_text = tok.decode(completion_ids, skip_special_tokens=True)
+    # Drop a cap-hit truncation BEFORE scoring/distilling it: a filter cut off mid-output would
+    # otherwise be echo-scored and reinforced, teaching the student a runaway it can never be taught to
+    # end (OPD can't supervise the stop token). Detect on the RAW rollout, before any stop_sequence
+    # trim (a stop-halted rollout is shorter than the cap, so it never trips this). Skip + count.
+    if _is_truncated_rollout(completion_ids, knobs["max_completion"], tok.eos_token_id):
+        _train_one.last_truncated = True
+        _train_one.last_gen_tokens = len(completion_ids)
+        return None
     # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter
     # before stopping — trim it from BOTH ids and text (token-level) so the teacher scores/distils
     # only the answer, and ids/text stay consistent for gkd_loss + token counting.
@@ -881,6 +923,12 @@ def _train_one(
     # so it stays in [0, 1] (a zero-width eos/partial-byte token riding along in a group no longer
     # inflates it past 100%).
     _train_one.last_coverage = groupwise_coverage(groups, student_toks)
+    # mean_coverage is structurally ~1.0 for a CORRECT fine-grained alignment AND for a degenerate
+    # collapsed-into-one-giant-span alignment, so it can't detect the latter. Mean student-tokens-per-
+    # group does: ~1.0 == each token its own group (healthy); large == coarse spans smearing one
+    # teacher logprob across many student tokens.
+    _n_align = sum(1 for st in student_toks if st.end > st.start)
+    _train_one.last_group_granularity = (_n_align / len(groups)) if groups else 0.0
     return gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs["kl_coef"])
 
 
