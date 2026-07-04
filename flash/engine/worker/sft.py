@@ -7,11 +7,7 @@ import os
 import random
 import time
 
-from flash.engine.chalk_kernels import (
-    active_kernels,
-    chalk_fused_ce_available,
-    install_chalk_kernels,
-)
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -177,7 +173,7 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     from flash.catalog import MODELS, vocab_size_for
-    from flash.engine.vram import resolve_params_b, sft_grad_accum, sft_logits_fused
+    from flash.engine.vram import sft_grad_accum
 
     sft_lr = _train_opt("learning_rate", RECIPE.sft.learning_rate)
     sft_max_len = _train_opt(
@@ -204,12 +200,14 @@ def run_sft():
             f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
         )
     effective_batch = _train_opt("batch_size", RECIPE.sft.effective_batch)
-    # Large-vocab OOM guard: chalk standalone owns fused CE by default. Without fused CE, SFTTrainer
-    # materializes [per_device, seq, vocab] fp32 logits; cap micro-batch so they fit, raise
-    # grad-accum to keep effective batch unchanged.
-    _sft_params_b = resolve_params_b(model_id)
+    # Large-vocab logits sizing: the trl SFT path DISABLES chalk fused CE (install_chalk_kernels(
+    # fused_ce=False) below — the #421/#431 logits=None fix) and Liger is off, so SFTTrainer ALWAYS
+    # materialises [micro_batch, seq, vocab] fp32 logits. Size the micro-batch / grad-accum / grad-
+    # checkpointing (and the allocator, vram.py) for that UNFUSED path UP FRONT — cap the micro-batch and
+    # raise grad-accum to hold the effective batch — instead of sizing fused and fixing it up AFTER the
+    # trainer's Accelerator is built (which left the accelerator's grad-accum stale; codex[bot]).
     _sft_vocab = vocab_size_for(model_id)
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and chalk_fused_ce_available(model_id)
+    _sft_fused = False
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
     )
@@ -514,43 +512,15 @@ def run_sft():
         )
     # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
     # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
-    # chalk). So the trl SFT path keeps flce OFF and materialises logits — otherwise every large-vocab
-    # Qwen3.5 SFT crashes with "'NoneType' object is not subscriptable" once chalk actually applies flce
-    # (#421). The guard just below then restores the materialised-logits micro-batch cap. The custom
-    # GRPO/opd loops read the fused loss directly, so they keep flce on (default fused_ce=True).
+    # chalk). So the trl SFT path keeps flce OFF and materialises [micro_batch, seq, vocab] logits —
+    # otherwise every large-vocab Qwen3.5 SFT crashes with "'NoneType' object is not subscriptable" once
+    # chalk actually applies flce (#421). Because flce is ALWAYS off here, _sft_fused is False above and
+    # the micro-batch / grad-accum / grad-checkpointing (and the allocator, vram.py) were already sized
+    # for the materialised-logits path UP FRONT — no post-init batch/grad-accum fixup is needed, which
+    # would otherwise mutate grad_accum after the trainer's Accelerator was built from the old value
+    # (codex[bot]). The custom GRPO/opd loops read the fused loss directly, so they keep flce on.
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None), fused_ce=False)
     _chalk_active = active_kernels(_chalk_report)
-    if _sft_fused and "fused_linear_cross_entropy" not in _chalk_active:
-        current_pd = int(getattr(trainer.args, "per_device_train_batch_size", per_device_bs) or per_device_bs)
-        current_ga = int(getattr(trainer.args, "gradient_accumulation_steps", grad_accum) or grad_accum)
-        safe_pd_cap, _ = sft_grad_accum(
-            effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=False
-        )
-        safe_pd = max(1, min(current_pd, safe_pd_cap))
-        safe_ga = max(1, math.ceil(effective_batch / max(1.0, safe_pd * _sft_examples_per_block)))
-        if safe_pd != current_pd or safe_ga != current_ga:
-            print(
-                "[sft] fused-linear-CE off on the trl path (materialised logits); "
-                f"restoring large-vocab logits cap: per_device={safe_pd} grad_accum={safe_ga}"
-            )
-            trainer.args.per_device_train_batch_size = safe_pd
-            trainer.args.gradient_accumulation_steps = safe_ga
-            # HF Trainer caches _train_batch_size at init and the TRAIN DATALOADER reads THAT, not
-            # args.per_device_train_batch_size — so lowering the arg alone leaves the dataloader on the
-            # old (larger) batch and can still OOM the very case this fallback exists to avoid. Refresh
-            # the cache to the reduced size (args.train_batch_size = per_device * n_gpu).
-            if hasattr(trainer, "_train_batch_size"):
-                trainer._train_batch_size = trainer.args.train_batch_size
-            per_device_bs, grad_accum = safe_pd, safe_ga
-        if not _grad_ckpt:
-            _grad_ckpt = True
-            trainer.args.gradient_checkpointing = True
-            try:
-                trainer.model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": False}
-                )
-            except Exception as e:
-                print(f"[sft] warning: failed to re-enable gradient checkpointing: {e}")
 
     _reset_peak_gpu()
     _gpu_sampler = _GpuPeakSampler().start()

@@ -493,15 +493,13 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
     # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
-    # chalk standalone RMSNorm/SwiGLU/RoPE; flce is OFF on the trl SFT path (returns logits=None,
-    # which trl's SFTTrainer.compute_loss can't consume) — the guard materialises logits instead.
+    # chalk standalone RMSNorm/SwiGLU/RoPE; flce is OFF on the trl SFT path (returns logits=None, which
+    # trl's SFTTrainer.compute_loss can't consume) — so SFT materialises logits and is sized UNFUSED
+    # (_sft_fused = False) up front, no post-init batch/grad-accum fixup.
     assert "install_chalk_kernels(" in src
     assert "fused_ce=False" in src
-    assert "chalk_fused_ce_available(model_id)" in src
-    assert "fused-linear-CE off on the trl path" in src
+    assert "_sft_fused = False" in src
     assert "_sft_examples_per_block" in src
-    assert "safe_pd * _sft_examples_per_block" in src
-    assert 'getattr(trainer.args, "per_device_train_batch_size"' in src
     assert 'cfg_kwargs["use_liger_kernel"] = False' in src
     assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
     # LoRA+ (B-matrix LR ratio)
