@@ -189,7 +189,7 @@ def test_chalk_extra_pip_defaults_to_latest_main_without_spec(monkeypatch):
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
     # public PyPI pin so tokenless bake/worker pods can pip-install (chalk repo is internal)
     assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk==")
-    assert DEFAULT_CHALK_SPEC == "freesolo-chalk==0.5.0"
+    assert DEFAULT_CHALK_SPEC == "freesolo-chalk==0.5.1"
 
 
 def test_chalk_extra_pip_adds_spec_when_set(monkeypatch):
