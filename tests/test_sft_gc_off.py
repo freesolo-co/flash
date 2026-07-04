@@ -156,3 +156,31 @@ def test_gate_unchanged_without_disable_signal():
         )
         is True
     )
+
+
+def test_grpo_use_reentrant_true_for_moe():
+    # MoE (Qwen3.6-35B-A3B, active 3B < total 35B) MUST use reentrant GC recompute under GRPO:
+    # non-reentrant asserts recompute-metadata equality, which the MoE router violates on the first
+    # backward (fwd 28192 vs recompute 3524 == group_size x) and crashes the run before step 1.
+    from flash.engine.worker.perf.memory import grpo_use_reentrant
+
+    assert grpo_use_reentrant("Qwen/Qwen3.6-35B-A3B") is True
+
+
+def test_grpo_use_reentrant_false_for_dense():
+    # Dense models (active_params_b == 0 -> is_moe False) keep the faster non-reentrant path.
+    from flash.catalog import MODELS
+    from flash.engine.worker.perf.memory import grpo_use_reentrant
+
+    dense_id = next(m.id for m in MODELS.values() if not m.is_moe)
+    assert grpo_use_reentrant(dense_id) is False
+    # An uncataloged / open model is treated as dense (null-safe, no crash).
+    assert grpo_use_reentrant("some/uncataloged-open-model") is False
+
+
+def test_is_moe_property():
+    from flash.catalog import MODELS
+
+    assert MODELS["Qwen/Qwen3.6-35B-A3B"].is_moe is True
+    # every dense entry: active_params_b defaults to 0.0
+    assert all(m.is_moe is False for m in MODELS.values() if m.active_params_b == 0.0)
