@@ -508,9 +508,13 @@ def submit_job(
         owner_key_id=owner_key_id,
     )
     if not dry_run:
-        from flash.lora_rank import preflight_init_adapter_lora_rank
+        from flash.lora_rank import (
+            preflight_init_adapter_lora_rank,
+            preflight_train_context_within_serving,
+        )
 
         preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
+        preflight_train_context_within_serving(worker_spec)
     # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
     status = RunStatus(
         run_id=public_spec.run_id,
@@ -523,9 +527,7 @@ def submit_job(
         # Snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
-        submitted_instance_providers=[
-            n for n in available_providers() if n in INSTANCE_PROVIDERS
-        ],
+        submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
     )
     _save_status(status)
     _report_status(status)
