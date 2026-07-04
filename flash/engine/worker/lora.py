@@ -15,6 +15,30 @@ from __future__ import annotations
 # its LoRA loader rejects "unexpected modules" (observed with Qwen3.5-2B).
 _VL_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "multi_modal_projector", "mtp")
 
+# Extra module-path segments dropped from LoRA when a run opts into attention+router-only training on
+# a routed-MoE checkpoint via FLASH_LORA_ATTN_ROUTER_ONLY (see lora_exclude_modules). Removes the
+# routed experts (mlp.experts.*), the shared expert (mlp.shared_expert.*) and its sigmoid gate
+# (mlp.shared_expert_gate), and the linear-attention path (linear_attn.*) — leaving LoRA on ONLY the
+# softmax attention (self_attn.*) and the MoE router (mlp.gate). This matches the serving-side
+# lora_target_modules=[qkv_proj, o_proj, gate] (experts stay FP8 → ~40 GiB freed → 16 hot LoRAs). The
+# router `gate` is never matched by these segments, and `shared_expert` cannot match
+# `shared_expert_gate` (the fullmatch regex is segment-bounded), so the gate is listed explicitly.
+_MOE_ATTN_ROUTER_EXCLUDE_SEGMENTS = (
+    "experts",
+    "shared_expert",
+    "shared_expert_gate",
+    "linear_attn",
+)
+
+
+def _attn_router_only_requested() -> bool:
+    """Whether this run opted into attention+router-only LoRA via the per-run [worker_env] flag."""
+    import os
+
+    from flash.spec import coerce_bool
+
+    return coerce_bool(os.environ.get("FLASH_LORA_ATTN_ROUTER_ONLY"))
+
 
 def lora_exclude_modules(model_id: str) -> str | None:
     """Regex (peft fullmatch semantics) excluding vision-tower modules from LoRA.
@@ -37,8 +61,20 @@ def lora_exclude_modules(model_id: str) -> str | None:
         print("lora_exclude_modules: config probe failed:", e)
         return None
     segments = excludes.get(model_type)
-    if not segments:
+    if segments is None:
+        # Non-VL / non-catalog architecture: no LoRA exclusion, regardless of the attn-router flag
+        # (the flag only augments the exclude set for the curated VL/MoE checkpoints above).
         return None
+    # OPT-IN (FLASH_LORA_ATTN_ROUTER_ONLY, set per-run via [worker_env]): additionally drop the routed
+    # experts / shared expert / linear-attention path so LoRA lands on ONLY self_attn.* and the MoE
+    # router (mlp.gate). Unset → segments is untouched and the returned regex is byte-identical to the
+    # all-linear baseline.
+    if _attn_router_only_requested():
+        segments = tuple(segments) + _MOE_ATTN_ROUTER_EXCLUDE_SEGMENTS
+        print(
+            "[lora] FLASH_LORA_ATTN_ROUTER_ONLY=1: excluding routed experts / shared_expert / "
+            "linear_attn — LoRA on attention (self_attn.*) + router (mlp.gate) only"
+        )
     alt = "|".join(segments)
     return rf"(^|.*\.)({alt})(\..*|$)"
 
