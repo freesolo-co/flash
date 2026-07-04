@@ -236,6 +236,18 @@ class TeacherClient:
                     f"teacher echo response token_logprobs has a non-finite value: {lp!r}",
                     permanent=True,
                 )
+            if lp > 1e-6:
+                # A log-probability cannot exceed 0. A malformed 200 with a POSITIVE value is a
+                # probability > 1: summed into teacher_logsum it poisons the reverse-KL coefficient
+                # (logP_student.detach() - logP_teacher) with impossible teacher mass, so OPD would
+                # train on a bogus signal instead of aborting like the other contract violations. Reject
+                # as PERMANENT. The 1e-6 tolerance absorbs float rounding of a ~0 logprob on a
+                # near-deterministic token (codex[bot]).
+                raise TeacherError(
+                    f"teacher echo response token_logprobs has a positive value {lp!r} "
+                    "(a log-probability cannot exceed 0).",
+                    permanent=True,
+                )
         # The echoed tokens must TILE `full` contiguously: each token's TEXT must equal the substring it
         # claims to span, full[offsets[i] : offsets[i+1]] (the last token to len(full)). The emit loop
         # below takes token i's end from offsets[i+1] (or len(full) for the last), so comparing the token

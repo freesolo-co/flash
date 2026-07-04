@@ -239,7 +239,14 @@ def _finalize(metrics: RunMetrics):
     with open("/tmp/DONE", "w") as f:
         f.write(str(time.time()))
     hf_upload_file("/tmp/DONE", "DONE", required=True)
-    heartbeat("done", gpu=gpu_diagnostics())
+    # Carry the completed optimizer step onto the terminal `done` heartbeat. Without it, a cancel that
+    # races the DONE upload (this stepless `done` heartbeat recorded, but the poller hasn't transitioned
+    # the run to done yet) prices from actual_steps_run(), which treats `done` as a non-training stage
+    # with no step and floors a fully-trained run to 0 (codex[bot]). opt_steps rides in metrics.notes
+    # for opd; absent (other phases) -> stepless as before.
+    _step = (metrics.notes or {}).get("opt_steps") or (metrics.notes or {}).get("step")
+    _step_field = {"step": int(_step)} if isinstance(_step, (int, float)) and _step > 0 else {}
+    heartbeat("done", **_step_field, gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
 
 

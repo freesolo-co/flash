@@ -1931,6 +1931,43 @@ def test_teacher_score_rejects_non_numeric_or_nonfinite_logprobs_as_permanent(mo
     assert toks[0].logprob == -0.5
 
 
+def test_teacher_score_rejects_positive_logprob_as_permanent(monkeypatch):
+    """Regression (codex[bot], teacher.py): a log-probability cannot exceed 0. A malformed 200 with a
+    POSITIVE token_logprob is a probability > 1; summed into teacher_logsum it poisons the reverse-KL
+    coefficient with impossible teacher mass, so OPD would train on a bogus signal instead of aborting.
+    Reject as PERMANENT like the other teacher-contract violations. A ~0 logprob (near-deterministic
+    token) stays allowed via the small float-rounding tolerance."""
+    from flash.engine.worker.teacher import TeacherError
+
+    def _payload(logprobs):
+        return {
+            "choices": [
+                {
+                    "logprobs": {
+                        "tokens": ["P", "hi"],
+                        "token_logprobs": logprobs,
+                        "text_offset": [0, 1],
+                    }
+                }
+            ]
+        }
+
+    # A clearly-positive completion logprob (prob e^2.5 >> 1) is rejected as PERMANENT.
+    _mock_urlopen(monkeypatch, _payload([0.0, 2.5]))
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(TeacherError) as ei:
+        client.score("P", "hi")
+    assert ei.value.permanent is True
+    assert "positive" in str(ei.value).lower()
+
+    # A ~0 logprob within float-rounding tolerance (near-deterministic token) is NOT rejected.
+    _mock_urlopen(monkeypatch, _payload([None, 1e-9]))
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    toks = client.score("P", "hi")
+    assert toks  # completion token survives
+    assert abs(toks[0].logprob - 1e-9) < 1e-12
+
+
 def test_teacher_score_rejects_truncated_echo_as_permanent(monkeypatch):
     """Regression (codex[bot], teacher.py): a malformed 200 with equal-length arrays can still OMIT a
     suffix of `full`. The final token's end falls back to len(full), so a truncated echo stretches the

@@ -91,6 +91,11 @@ def test_actual_steps_run_reads_last_heartbeat_step():
     assert runner.actual_steps_run(st({"stage": "opd_train_done"})) == 0
     assert runner.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
     assert runner.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12
+    # Terminal `done` heartbeat: a cancel racing the DONE upload (done recorded, run not yet
+    # transitioned) reads a STEPLESS done and floors a fully-trained run to 0. _finalize carries
+    # opt_steps onto `done` so the true count bills (codex[bot]).
+    assert runner.actual_steps_run(st({"stage": "done"})) == 0  # the bug the step guards against
+    assert runner.actual_steps_run(st({"stage": "done", "step": 12})) == 12
 
 
 # --------------------------------------------------------------------------- cancel re-pricing
