@@ -400,7 +400,9 @@ def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
     import flash.engine.worker as w
 
     monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
-    sentinel_last_upload = 123.0  # a prior successful-commit timestamp the failed retry must restore
+    sentinel_last_upload = (
+        123.0  # a prior successful-commit timestamp the failed retry must restore
+    )
     monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
 
     calls = []
@@ -471,8 +473,12 @@ def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
     finally:
         hbmod._HB_UPLOAD_LOCK.release()
 
-    assert progress_wait < 0.3, f"progress stage should skip after the short timeout, waited {progress_wait:.2f}s"
-    assert critical_wait >= 0.3, f"critical stage should wait the long timeout, waited {critical_wait:.2f}s"
+    assert progress_wait < 0.3, (
+        f"progress stage should skip after the short timeout, waited {progress_wait:.2f}s"
+    )
+    assert critical_wait >= 0.3, (
+        f"critical stage should wait the long timeout, waited {critical_wait:.2f}s"
+    )
     assert critical_wait > progress_wait + 0.15
 
 
@@ -1019,7 +1025,9 @@ def test_tilelang_pin_is_consistent_and_pinned():
     perf_src = (root / "flash" / "engine" / "worker" / "perf" / "__init__.py").read_text()
     # perf/__init__.py builds the spec via an f-string `f"tilelang=={TILELANG_PIN}"`, so assert the constant.
     pm = re.search(r'TILELANG_PIN\s*=\s*"([0-9][0-9A-Za-z.\-]*)"', perf_src)
-    assert pm, "perf/__init__.py must define a pinned TILELANG_PIN constant for the runtime reinstall"
+    assert pm, (
+        "perf/__init__.py must define a pinned TILELANG_PIN constant for the runtime reinstall"
+    )
     assert pm.group(1) == pin, (
         f"perf/__init__.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
     )
@@ -1188,7 +1196,9 @@ def test_neutralize_never_loads_the_stub_into_the_process(tmp_path, monkeypatch)
     if not os.path.exists("/proc/self/maps"):
         import pytest
 
-        pytest.skip("/proc/self/maps unavailable (non-Linux); the loaded-mapping assertion needs it")
+        pytest.skip(
+            "/proc/self/maps unavailable (non-Linux); the loaded-mapping assertion needs it"
+        )
 
     pkg = tmp_path / "tilelang"
     (pkg / "lib").mkdir(parents=True)
@@ -1306,7 +1316,216 @@ def test_find_real_libcudart_finds_cu13_wheel_layout(tmp_path, monkeypatch):
     monkeypatch.setattr(ctypes.util, "find_library", lambda _n: None)
     _real_glob = glob.glob
     monkeypatch.setattr(
-        glob, "glob", lambda p, *a, **k: ([] if p.startswith("/usr") else _real_glob(p, *a, **k))
+        glob, "glob", lambda p, *a, **k: [] if p.startswith("/usr") else _real_glob(p, *a, **k)
     )
 
     assert perf._find_real_libcudart() == os.path.realpath(real)
+
+
+# ---------------------------------------------------------------------------
+# Blackwell fla GDN autotune restriction (fla #913 / #1000): on sm100/sm120 the
+# unrestricted prepare_wy_repr_bwd autotune space can select grad-miscomputing
+# configs (live B200 Qwen3.6-35B-A3B SFT: grad_norm ~1e8 from the first logged
+# step, loss flat or collapsing at every LR, while H200 trained healthily). The
+# worker restricts the space in-process to the B200-validated config, and fails
+# CLOSED (disables fla -> pure-PyTorch delta) when it cannot.
+# ---------------------------------------------------------------------------
+def _blackwell_torch(cc=(10, 0)):
+    """A stub ``torch`` that looks like a Blackwell card with CUDA available."""
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_capability=lambda *a: cc,
+    )
+    return t
+
+
+class _TunerCfg:
+    def __init__(self, num_warps: int, num_stages: int) -> None:
+        self.num_warps = num_warps
+        self.num_stages = num_stages
+
+
+class _FakeTuner:
+    def __init__(self, configs) -> None:
+        self.configs = configs
+
+
+class _TunerWrapper:
+    """Decorator layer (heuristics/cache wrapper) the unwrap walk descends through via ``.fn``."""
+
+    def __init__(self, fn) -> None:
+        self.fn = fn
+
+
+_FULL_SPACE = [(2, 2), (2, 3), (2, 4), (4, 2), (4, 3), (4, 4)]
+
+
+def _patch_blackwell_stack(monkeypatch, *, cc=(10, 0), fla_present: bool = True, kernel=None):
+    """Wire the perf helper's touchpoints for the Blackwell autotune-restriction tests.
+
+    ``kernel`` is what ``fla.ops.gated_delta_rule.wy_fast.prepare_wy_repr_bwd_kernel``
+    resolves to (None = attribute absent). Returns (perf, removed, wy_fast_module).
+    """
+    import importlib.util
+
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", _blackwell_torch(cc))
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        (lambda name: object()) if fla_present else (lambda name: None),
+        raising=True,
+    )
+    wy = types.ModuleType("fla.ops.gated_delta_rule.wy_fast")
+    if kernel is not None:
+        wy.prepare_wy_repr_bwd_kernel = kernel
+    pkg_fla = types.ModuleType("fla")
+    pkg_ops = types.ModuleType("fla.ops")
+    pkg_gdr = types.ModuleType("fla.ops.gated_delta_rule")
+    pkg_fla.__path__, pkg_ops.__path__, pkg_gdr.__path__ = [], [], []
+    pkg_gdr.wy_fast = wy
+    for name, mod in (
+        ("fla", pkg_fla),
+        ("fla.ops", pkg_ops),
+        ("fla.ops.gated_delta_rule", pkg_gdr),
+        ("fla.ops.gated_delta_rule.wy_fast", wy),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    removed: list[int] = []
+    monkeypatch.setattr(
+        perf, "_remove_fla_from_disk", lambda: (removed.append(1), (["/x/fla"], False))[1]
+    )
+    return perf, removed, wy
+
+
+def test_blackwell_gdn_autotune_restricted_to_validated_config(monkeypatch):
+    """sm100 + full upstream config space -> only num_warps=2/num_stages=4 survives; fla is KEPT.
+    The tuner is wrapped in decorator layers, so the unwrap walk (.fn descent) is exercised too."""
+    tuner = _FakeTuner([_TunerCfg(w, s) for w, s in _FULL_SPACE])
+    perf, removed, _ = _patch_blackwell_stack(
+        monkeypatch, kernel=_TunerWrapper(_TunerWrapper(tuner))
+    )
+
+    perf._restrict_fla_gdn_autotune_on_blackwell()
+
+    assert [(c.num_warps, c.num_stages) for c in tuner.configs] == [(2, 4)]
+    assert not removed, "restriction succeeded -> fla must be KEPT"
+
+
+def test_blackwell_gdn_autotune_sm120_also_restricted(monkeypatch):
+    """Consumer Blackwell (sm120) matches upstream's IS_NVIDIA_BLACKWELL gate: restricted too."""
+    tuner = _FakeTuner([_TunerCfg(w, s) for w, s in _FULL_SPACE])
+    perf, removed, _ = _patch_blackwell_stack(monkeypatch, cc=(12, 0), kernel=tuner)
+
+    perf._restrict_fla_gdn_autotune_on_blackwell()
+
+    assert [(c.num_warps, c.num_stages) for c in tuner.configs] == [(2, 4)]
+    assert not removed
+
+
+def test_blackwell_gdn_autotune_already_restricted_is_noop(monkeypatch):
+    """A pinned fla that already carries fla #1000 (space == validated config) is left alone —
+    the guard must be a no-op on a future pin bump, not a second filter or a fail-closed."""
+    tuner = _FakeTuner([_TunerCfg(2, 4)])
+    perf, removed, _ = _patch_blackwell_stack(monkeypatch, kernel=tuner)
+
+    perf._restrict_fla_gdn_autotune_on_blackwell()
+
+    assert [(c.num_warps, c.num_stages) for c in tuner.configs] == [(2, 4)]
+    assert not removed
+
+
+def test_blackwell_gdn_autotune_fail_closed_when_tuner_missing(monkeypatch):
+    """Autotuner not found (fla layout changed, e.g. an unreviewed pin bump) -> fail CLOSED:
+    fla is physically removed so transformers falls back to the pure-PyTorch delta rule."""
+    perf, removed, _ = _patch_blackwell_stack(monkeypatch, kernel=None)
+
+    perf._restrict_fla_gdn_autotune_on_blackwell()
+
+    assert removed, "no autotuner -> must DISABLE fla (grad-correctness over speed)"
+
+
+def test_blackwell_gdn_autotune_fail_closed_when_no_validated_config(monkeypatch):
+    """The validated (2,4) config missing from the space -> nothing safe to run -> fail CLOSED."""
+    tuner = _FakeTuner([_TunerCfg(4, 2), _TunerCfg(4, 3)])
+    perf, removed, _ = _patch_blackwell_stack(monkeypatch, kernel=tuner)
+
+    perf._restrict_fla_gdn_autotune_on_blackwell()
+
+    assert removed, "no validated config in space -> must DISABLE fla"
+
+
+def test_blackwell_gdn_autotune_noop_without_fla(monkeypatch):
+    """fla absent (already the pure-PyTorch path) -> nothing to restrict, nothing to remove."""
+    perf, removed, _ = _patch_blackwell_stack(monkeypatch, fla_present=False, kernel=None)
+
+    perf._restrict_fla_gdn_autotune_on_blackwell()
+
+    assert not removed
+
+
+def test_non_blackwell_gdn_autotune_untouched(monkeypatch):
+    """Hopper (sm90) keeps the full autotune space — the restriction is Blackwell-only (the
+    tilelang fast path owns the sm90 story; shrinking its Triton space would only cost perf)."""
+    tuner = _FakeTuner([_TunerCfg(w, s) for w, s in _FULL_SPACE])
+    perf, removed, _ = _patch_blackwell_stack(monkeypatch, cc=(9, 0), kernel=tuner)
+
+    perf._restrict_fla_gdn_autotune_on_blackwell()
+
+    assert len(tuner.configs) == len(_FULL_SPACE)
+    assert not removed
+
+
+# ---------------------------------------------------------------------------
+# sm100 tilelang GDN opt-out: the baked tilelang backend (needed for Hopper, fla
+# #640) computes WRONG GRADIENTS on B200/sm100 (measured: dq/dk ~0.72, dg ~1.28
+# rel-err at the production H==HV call shapes, deterministic, bf16 AND fp32) —
+# the root cause of the B200 35B-A3B SFT incident. The worker must opt fla out
+# via FLA_TILELANG=0 (upstream's own knob; upstream default-gates tilelang to
+# Hopper since fla #975) so fla dispatches to its Triton path, correct on sm100.
+# ---------------------------------------------------------------------------
+def _patch_arch(monkeypatch, cc):
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", _blackwell_torch(cc))
+    return perf
+
+
+def test_sm100_fla_tilelang_opted_out(monkeypatch):
+    """sm100 + FLA_TILELANG unset -> the worker sets FLA_TILELANG=0 before any fla dispatch."""
+    import os
+
+    perf = _patch_arch(monkeypatch, (10, 0))
+    monkeypatch.delenv("FLA_TILELANG", raising=False)
+
+    perf._force_fla_triton_gdn_on_sm100()
+
+    assert os.environ.get("FLA_TILELANG") == "0"
+
+
+def test_sm100_fla_tilelang_explicit_preset_wins(monkeypatch):
+    """An explicitly pre-set FLA_TILELANG (e.g. testing a fixed tilelang) is respected."""
+    import os
+
+    perf = _patch_arch(monkeypatch, (10, 0))
+    monkeypatch.setenv("FLA_TILELANG", "1")
+
+    perf._force_fla_triton_gdn_on_sm100()
+
+    assert os.environ.get("FLA_TILELANG") == "1"
+
+
+@pytest.mark.parametrize("cc", [(9, 0), (12, 0), (8, 9)])
+def test_non_sm100_fla_tilelang_untouched(monkeypatch, cc):
+    """sm90 NEEDS tilelang (fla #640); sm89/sm120 train healthily under the pin's default —
+    the opt-out is strictly sm100 (the measured-broken arch)."""
+    import os
+
+    perf = _patch_arch(monkeypatch, cc)
+    monkeypatch.delenv("FLA_TILELANG", raising=False)
+
+    perf._force_fla_triton_gdn_on_sm100()
+
+    assert "FLA_TILELANG" not in os.environ
