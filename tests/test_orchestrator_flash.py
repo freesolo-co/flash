@@ -19,7 +19,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
         # _run_job_inner uploads the run code before training; stub it (no HF).
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "mock/repo")
+        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "mock/repo")
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
@@ -254,7 +254,7 @@ def test_upload_code_retries_transient_repo_settings(monkeypatch):
 
     import flash.providers.runpod.train as flash_train
 
-    monkeypatch.setattr(flash_train.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr("flash.providers._worker.time.sleep", lambda _delay: None)
 
     flash_train.upload_code("owner/transient-settings")
 
@@ -286,7 +286,7 @@ def test_hf_call_honors_retry_after(monkeypatch):
             raise _RateLimited("slow down")
         return "ok"
 
-    monkeypatch.setattr(flash_train.time, "sleep", sleeps.append)
+    monkeypatch.setattr("flash.providers._worker.time.sleep", sleeps.append)
     monkeypatch.setattr(flash_train.logger, "warning", lambda msg, *args: logs.append((msg, args)))
 
     assert flash_train._hf_call(flaky, "upload") == "ok"
@@ -316,7 +316,7 @@ def test_hf_call_caps_http_date_retry_after(monkeypatch):
             raise _RateLimited("slow down")
         return "ok"
 
-    monkeypatch.setattr(flash_train.time, "sleep", sleeps.append)
+    monkeypatch.setattr("flash.providers._worker.time.sleep", sleeps.append)
     monkeypatch.setattr(flash_train.logger, "warning", lambda *_args: None)
 
     assert flash_train._hf_call(flaky, "upload") == "ok"

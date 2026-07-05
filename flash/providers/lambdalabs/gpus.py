@@ -2,16 +2,9 @@
 
 from __future__ import annotations
 
-from flash.providers.base import GpuClass, UnsupportedGpuError, get_gpu_info, providers_for
+from flash.providers.base import UnsupportedGpuError, get_gpu_info, providers_for
 
-__all__ = ["gpu_classes", "instance_type_for"]
-
-
-def gpu_classes() -> list[GpuClass]:
-    """The GPU classes Lambda can provision (those with a ``lambda_name``)."""
-    from flash.providers.base import GPU_INFO
-
-    return [g for g in GPU_INFO.values() if g.lambda_name]
+__all__ = ["instance_type_for"]
 
 
 def instance_type_for(name: str) -> str:

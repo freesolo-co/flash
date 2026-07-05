@@ -26,6 +26,8 @@ class GpuClass:
     # Server REJECTS non-validated classes; client restricts to this pool by default.
     validated: bool = False
     lambda_name: str | None = None  # None -> not on Lambda; priced from Lambda live rates
+    vast_name: str | None = None  # None -> not on Vast; priced from Vast live/static rates
+    vast_aliases: tuple[str, ...] = ()
 
 
 # Hourly rates are RunPod secure-cloud on-demand snapshots.
@@ -38,6 +40,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.69,
         validated=True,
+        vast_name="RTX 4090",
     ),
     GpuClass(
         "RTX 5090",
@@ -48,6 +51,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         0.99,
         min_cuda_modern="13.0",
         validated=True,
+        vast_name="RTX 5090",
     ),
     # Lambda-only; RunPod has no A10. Allocator reaches it only after cheaper RunPod classes exhaust.
     GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
@@ -61,6 +65,8 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         1.99,
         lambda_name="gpu_1x_a100_sxm4",
         validated=True,
+        vast_name="A100 SXM4",
+        vast_aliases=("A100 PCIE",),
     ),
     GpuClass(
         "A100 PCIe",
@@ -70,6 +76,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm80",
         1.39,
         validated=True,
+        vast_name="A100 PCIE",
     ),
     GpuClass(
         "A100 SXM",
@@ -79,6 +86,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm80",
         1.49,
         validated=True,
+        vast_name="A100 SXM4",
     ),
     GpuClass(
         "H100",
@@ -89,6 +97,11 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         3.29,
         validated=True,
         lambda_name="gpu_1x_h100_pcie",
+        vast_name="H100 SXM",
+        # Vast lists PCIe H100s separately as "H100 PCIE"; accept them as H100 capacity (same sm90 / 80
+        # GB; for our single-GPU runs the SXM-vs-PCIe interconnect gap doesn't apply). Priced live off
+        # the actual offer, so a cheaper PCIe board just makes the class more available.
+        vast_aliases=("H100 PCIE",),
     ),
     GpuClass(
         "H200",
@@ -124,6 +137,19 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
+LEGACY_GPU_CLASSES: tuple[GpuClass, ...] = (
+    GpuClass(
+        "RTX A6000",
+        "NVIDIA_RTX_A6000",
+        48,
+        "a6000",
+        "sm86",
+        0.49,
+        lambda_name="gpu_1x_a6000",
+        vast_name="RTX A6000",
+    ),
+)
+_GPU_INFO_ALL: dict[str, GpuClass] = {**GPU_INFO, **{g.name: g for g in LEGACY_GPU_CLASSES}}
 KNOWN = tuple(GPU_INFO)
 VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
@@ -140,7 +166,7 @@ def _alias_keys(name: str) -> set[str]:
 
 
 _ALIASES: dict[str, str] = {}
-for _info in GPU_INFO.values():
+for _info in _GPU_INFO_ALL.values():
     for _k in _alias_keys(_info.name):
         _ALIASES[_k] = _info.name
 # Full marketing names (nvidia-smi / RunPod API) and historical aliases not covered by generic rules.
@@ -170,8 +196,32 @@ class UnsupportedGpuError(ValueError):
     pass
 
 
+class CapacityLookupError(RuntimeError):
+    """A provider's LIVE capacity/offer lookup failed transiently (network / API blip / rate limit) —
+    distinct from ``UnsupportedGpuError`` ("no GPU class fits this job"). A per-provider failure degrades
+    to the other providers; only when it was the SOLE reason NO candidate was found does ``allocate``
+    re-raise it. Because it is NOT an ``UnsupportedGpuError``, the runner treats it as infra-retryable
+    (poll_error) rather than terminal — so a run whose only fitting capacity a transient outage hid is
+    retried on its infra budget instead of being killed."""
+
+
+class UnreconciledCreateError(RuntimeError):
+    """A non-idempotent provider create (e.g. Vast's ``PUT /asks``) failed AMBIGUOUSLY and could NOT be
+    reconciled: the possibly-created resource is not visible yet (object-store / API eventual
+    consistency), so we cannot adopt it and we cannot prove it does not exist. Retrying the run would
+    rent a SECOND instance while a phantom from this attempt may still materialize and bill under the
+    still-active run (where ``sweep_orphans`` shields it). The orchestrator must therefore FAIL THE RUN
+    TERMINALLY rather than consume a retry — the run's teardown plus a later sweep (the run is now
+    inactive, so no longer shielded) reclaim any late-materializing instance, preserving the
+    cost-safety invariant that a rented box is always destroyed."""
+
+
 def canonical_gpu(name: str) -> str:
-    """Normalize a friendly GPU name to a managed class; raise otherwise."""
+    """Normalize a friendly GPU name to an active or retired class; raise otherwise.
+
+    Retired classes resolve for teardown/pricing compatibility but stay absent from ``GPU_INFO`` so
+    allocation, display, and provider offer matching do not select them.
+    """
     key = (name or "").strip().lower()
     if key in _ALIASES:
         return _ALIASES[key]
@@ -179,7 +229,45 @@ def canonical_gpu(name: str) -> str:
 
 
 def get_gpu_info(name: str) -> GpuClass:
-    return GPU_INFO[canonical_gpu(name)]
+    return _GPU_INFO_ALL[canonical_gpu(name)]
+
+
+def gpu_classes_for(identity_attr: str) -> list[GpuClass]:
+    """Managed GPU classes a provider can provision: those whose per-provider identity field is set
+    (``enum_member`` for RunPod, ``lambda_name`` for Lambda, ``vast_name`` for Vast). One catalog query
+    shared by every provider's ``gpu_classes()`` so the "which classes do I offer" rule can't drift."""
+    return [g for g in GPU_INFO.values() if getattr(g, identity_attr)]
+
+
+def static_rates_for(identity_attr: str) -> dict[str, float]:
+    """Friendly GPU name -> static ``GpuClass.hourly_usd`` for the classes a provider offers (keyed by
+    the same per-provider identity field). The offline/fallback rate snapshot for RunPod and Vast;
+    Lambda keeps its own list-price map because its prices differ from this RunPod-snapshot field."""
+    return {name: info.hourly_usd for name, info in GPU_INFO.items() if getattr(info, identity_attr)}
+
+
+# Slack between a board's REPORTED VRAM and its class nominal (boards under-report: an A100 SXM4 40 GB
+# reports ~40960 MB, an A40 ~46068 MB / 48 GB). vast_gpu_for_offer allows a class whose nominal is at
+# most this far ABOVE the offer's reported RAM, so a real board still matches its class.
+_VRAM_MATCH_TOLERANCE_GB = 3.5
+
+
+def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
+    """Map a Vast offer (``gpu_name`` + ``gpu_ram`` MB) to a canonical managed GPU class.
+
+    Returns None for anything not in the managed table — the hard Ampere+ floor (T4 / 2080 Ti /
+    Quadro RTX offers never match). Names shared across VRAM variants ("A100 SXM4" = 40/80 GB) resolve
+    to the LARGEST class the board's actual RAM covers.
+    """
+    fitting = [
+        g
+        for g in GPU_INFO.values()
+        if (g.vast_name == gpu_name or gpu_name in g.vast_aliases)
+        and g.vram_gb <= gpu_ram_mb / 1024 + _VRAM_MATCH_TOLERANCE_GB
+    ]
+    if not fitting:
+        return None
+    return max(fitting, key=lambda g: g.vram_gb).name
 
 
 def providers_for(name: str) -> tuple[str, ...]:
@@ -190,6 +278,8 @@ def providers_for(name: str) -> tuple[str, ...]:
         out.append("runpod")
     if info.lambda_name:
         out.append("lambda")
+    if info.vast_name:
+        out.append("vast")
     return tuple(out)
 
 
@@ -281,6 +371,16 @@ class Allocation:
     candidates: tuple[Candidate, ...]  # full ranked list; retry walks this
 
 
+@dataclass(frozen=True)
+class AllocationConstraints:
+    """Run-scoped extras a capacity/market-aware provider's ``live_candidates`` needs (Vast prices
+    against the run's disk/duration floors) — carried here so they don't leak into ``allocate``'s
+    signature per-provider. RunPod/Lambda ignore them."""
+
+    disk_gb: float = 0.0
+    max_wall_seconds: float = 0.0
+
+
 @runtime_checkable
 class Provider(Protocol):
     """GPU-substrate interface implemented by each provider."""
@@ -301,6 +401,15 @@ class Provider(Protocol):
 
     def hourly_rate(self, gpu: str) -> float:
         """Static $/hr for one friendly GPU name."""
+        ...
+
+    def live_candidates(
+        self, need_vram_gb: int, constraints: AllocationConstraints
+    ) -> list[Candidate]:
+        """GPU-class candidates this provider can actually provision right now for a run needing >=
+        need_vram_gb VRAM. RunPod filters its static table and never raises; capacity/market-aware
+        providers (Lambda/Vast) query live availability and raise CapacityLookupError on a transient
+        lookup blip so allocate() can degrade to the others yet still tell 'no fit' from 'outage'."""
         ...
 
     def submit_run(
@@ -336,6 +445,22 @@ class Provider(Protocol):
     def gc(self, spec: JobSpec) -> None:
         """Best-effort: reap any resource this run may have left registered."""
         ...
+
+    # NOTE: ``supports_weight_cache: bool`` is an OPTIONAL capability attr (read via
+    # ``getattr(prov, "supports_weight_cache", False)``, off this Protocol for the same isinstance
+    # reason as below): True only for the provider that offers the shared weight-cache network volume
+    # (RunPod). The runner gates its one-shot cache-less retry fallback on it; every other provider
+    # defaults False.
+
+    # NOTE: ``run_instances_remaining(run_id) -> list[int]`` is an OPTIONAL capability, intentionally
+    # NOT declared on this ``@runtime_checkable`` Protocol — adding it would make it a REQUIRED member
+    # for ``isinstance(prov, Provider)``, which RunPod (serverless, self-reaping — nothing to enumerate)
+    # and Lambda do not implement. Instance providers that CAN enumerate billable resources by run
+    # label (Vast) implement it so the handle-less recovery resubmit can require a CONFIRMED reap before
+    # launching a second worker (a best-effort ``gc`` returns no error on an unconfirmed teardown).
+    # Callers detect it via ``getattr(prov, "run_instances_remaining", None)`` (see server/_runtime.py).
+    # Contract: ``[]`` == CONFIRMED no resource for the run remains; non-empty == a possibly-live one
+    # survives; RAISES on an incomplete enumeration so a caller can't mistake "couldn't list" for "clear".
 
     def sweep_orphans(
         self,

@@ -570,17 +570,19 @@ def test_freesolo_adapter_preserves_top_level_record_keys(monkeypatch, tmp_path)
     ]
 
 
-def test_freesolo_adapter_requires_explicit_record_id(monkeypatch):
+def test_freesolo_adapter_no_longer_requires_record_id(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
     from flash.envs.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
 
-    with pytest.raises(ValueError, match="id field"):
-        env._canonical_record({"input": "x"})
-    with pytest.raises(ValueError, match="id field"):
-        env._canonical_record({"id": "   ", "input": "x"})
+    # Ids are auto-generated, so a record with no id (or a blank one) is accepted
+    # rather than rejected; only a missing input is an error.
+    assert env._canonical_record({"input": "x"}) == {"input": "x"}
+    assert env._canonical_record({"id": "   ", "input": "x"}) == {"id": "   ", "input": "x"}
+    with pytest.raises(ValueError, match="input field"):
+        env._canonical_record({"id": "1"})
 
 
 def test_freesolo_adapter_allows_missing_output(monkeypatch, tmp_path):
@@ -705,7 +707,7 @@ def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
     ]
 
 
-def test_freesolo_adapter_does_not_synthesize_record_id(monkeypatch):
+def test_freesolo_adapter_stamps_example_id_onto_record(monkeypatch):
     class SdkExampleEnv(_EnvironmentSingleTurn):
         dataset: ClassVar[list[_TaskExample]] = [
             _TaskExample(record={"input": "2+2?"}, input="2+2?", id="ex-1", output="4")
@@ -716,8 +718,9 @@ def test_freesolo_adapter_does_not_synthesize_record_id(monkeypatch):
     from flash.envs.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(SdkExampleEnv(), "owner/env", source=None, contract_text="")
-    with pytest.raises(ValueError, match="id field"):
-        env.dataset()
+    # The record carries no id; the SDK-assigned (auto-generated) example id is
+    # stamped onto it instead of raising.
+    assert env.dataset() == [{"input": "2+2?", "output": "4", "id": "ex-1"}]
 
 
 def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):

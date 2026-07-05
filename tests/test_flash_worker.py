@@ -166,7 +166,7 @@ def test_chalk_extra_pip_defaults_to_latest_main_without_spec(monkeypatch):
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
     # public PyPI pin so tokenless bake/worker pods can pip-install (chalk repo is internal)
     assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk==")
-    assert DEFAULT_CHALK_SPEC == "freesolo-chalk==0.5.0"
+    assert DEFAULT_CHALK_SPEC == "freesolo-chalk==0.5.2"
 
 
 def test_chalk_extra_pip_adds_spec_when_set(monkeypatch):
@@ -493,13 +493,13 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
     # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
-    # chalk standalone fused CE/RMSNorm/SwiGLU/RoPE
+    # chalk standalone RMSNorm/SwiGLU/RoPE; flce is OFF on the trl SFT path (returns logits=None, which
+    # trl's SFTTrainer.compute_loss can't consume) — so SFT materialises logits and is sized UNFUSED
+    # (_sft_fused = False) up front, no post-init batch/grad-accum fixup.
     assert "install_chalk_kernels(" in src
-    assert "chalk_fused_ce_available(model_id)" in src
-    assert "chalk fused CE did not engage" in src
+    assert "fused_ce=False" in src
+    assert "_sft_fused = False" in src
     assert "_sft_examples_per_block" in src
-    assert "safe_pd * _sft_examples_per_block" in src
-    assert 'getattr(trainer.args, "per_device_train_batch_size"' in src
     assert 'cfg_kwargs["use_liger_kernel"] = False' in src
     assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
     # LoRA+ (B-matrix LR ratio)
@@ -512,7 +512,10 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     # wired in via the _grad_ckpt result — still on by default, droppable only when the GC-off peak fits.
     assert "grad_checkpointing_on(\n        model_id,\n        sft_max_len," in src
     assert '"gradient_checkpointing": _grad_ckpt' in src
-    assert '"use_reentrant": False' in src
+    # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
+    # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
+    # non-reentrant's metadata-equality assert kills the first backward. Dense stays non-reentrant.
+    assert '"use_reentrant": grpo_use_reentrant(model_id)' in src
     assert '"optim": fused_optim_name()' in src
 
 

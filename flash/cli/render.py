@@ -273,6 +273,38 @@ def arrow(msg: str) -> str:
     return _safe(f"{_paint(_glyph('→', '->'), _ACCENT2)} {_dim(msg)}")
 
 
+def select(title: str, options: list[tuple[str, str, str]], default: int = 0) -> str:
+    """Themed single-choice prompt; returns the chosen option's value.
+
+    ``options`` is a list of ``(value, label, hint)``. The default option is marked and taken on
+    an empty answer (enter). Reads via ``input()`` so it is easy to drive in tests; the caller
+    decides *when* to prompt (interactive stdin), so this always prompts when called. On EOF the
+    default is returned so a closed stdin never hangs the scaffold."""
+    q = _paint(_glyph("?", "?"), _ACCENT, "1")
+    print(f"{q} {_bold(_safe(title))}")
+    for i, (_value, label, hint) in enumerate(options):
+        num = _paint(f"{i + 1})", _ACCENT2)
+        lab = _bold(label) if i == default else label
+        tail = f"  {_dim(_safe(hint))}" if hint else ""
+        mark = _paint(" (default)", _GREEN) if i == default else ""
+        print(f"  {num} {_safe(lab)}{tail}{mark}")
+    pointer = _paint(_glyph("›", ">"), _ACCENT2)  # noqa: RUF001 (the glyph is the point)
+    for _ in range(5):
+        try:
+            raw = input(f"{pointer} ").strip()
+        except EOFError:
+            print()
+            return options[default][0]
+        if not raw:
+            return options[default][0]
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx][0]
+        print(note(f"enter 1-{len(options)}, or press enter for the default"))
+    return options[default][0]
+
+
 def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
 
@@ -359,6 +391,8 @@ def _color_json(obj, depth: int) -> str:
 
 def _hide_provider_metadata(obj):
     """Styled CLI details are for humans; keep backend provider names out of that view."""
+    from flash.providers import PROVIDER_NAMES
+
     if isinstance(obj, dict):
         return {
             k: _hide_provider_metadata(v)
@@ -367,7 +401,7 @@ def _hide_provider_metadata(obj):
         }
     if isinstance(obj, list):
         return [_hide_provider_metadata(v) for v in obj]
-    if isinstance(obj, str) and obj.lower() in {"runpod", "lambda"}:
+    if isinstance(obj, str) and obj.lower() in PROVIDER_NAMES:
         return "managed"
     return obj
 
@@ -389,7 +423,7 @@ def models_table(rows: list[dict]) -> str:
     """Supported base models — a clean themed list of ids (the CLI lists ids only)."""
     dot = _glyph("•", "-")
     ids = "\n".join(f"  {_paint(dot, _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
-    foot = arrow("train one with: flash train configs/rl.toml")
+    foot = arrow("train one with: flash train configs/sft.toml")
     return _safe(f"{header('models', 'supported base models')}\n{ids}\n\n{foot}")
 
 
@@ -641,8 +675,8 @@ def env_setup(paths: list[str]) -> str:
     labels = {
         "environment.py": "env entrypoint — edit the reward + prompt",
         "dataset/train.jsonl": "starter training rows",
-        "configs/rl.toml": "GRPO run config",
         "configs/sft.toml": "SFT run config",
+        "configs/rl.toml": "GRPO run config",
         "TRAINING.md": "how to train well — read this first",
     }
     keyw = max(len(p) for p in paths)
