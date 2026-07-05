@@ -267,8 +267,15 @@ def liveness_heartbeat(stage, progress=None, progress_step=False):
             if progress is not None:
                 with contextlib.suppress(Exception):
                     v = progress()
-                    if v is not None and (last_val is None or float(v) > last_val):
-                        last_val, made_progress = float(v), True
+                    if v is not None:
+                        if last_val is None:
+                            # first sample is a BASELINE, not progress: a resumed run's restored
+                            # global step must not tighten the provider's stall window seconds
+                            # into train(), and a constant counter must never emit phantom
+                            # progress. only a later ADVANCE past this baseline is real.
+                            last_val = float(v)
+                        elif float(v) > last_val:
+                            last_val, made_progress = float(v), True
             gpu = gpu_diagnostics(include_torch=False)
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return

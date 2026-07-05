@@ -566,17 +566,19 @@ def run_sft():
     sft_peak_gpu_gb = _peak_gpu_gb()
     sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()
 
+    _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
     # adapter save + required upload can take minutes on a slow HF; keep the heartbeat fresh.
-    with liveness_heartbeat("sft_finalizing"):
+    # progress_step stamps the final step on every finalize heartbeat so a cancel landing in this
+    # window still bills the actual steps trained (actual_steps_run reads last_heartbeat.step).
+    with liveness_heartbeat("sft_finalizing", progress=lambda: _final_step, progress_step=True):
         adapter_dir = f"{out_dir}/adapter"
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         # Ensure `flash deploy RUN_ID/step-<final>` always resolves: save_steps may not align with the last step.
-        _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
         if _final_step:
             _w.publish_deployable_checkpoint(adapter_dir, _final_step)
-    _w.heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
+    _w.heartbeat("sft_trained", train_wall=train_wall, step=_final_step, gpu=gpu_diagnostics())
 
     train_tokens = _total_tok * epochs
     _w.write_train_meta(

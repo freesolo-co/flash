@@ -647,7 +647,9 @@ def run_rl():
         )
     # adapter save + recombine + required upload can take minutes (recombine loads a full base
     # model on VL warm-starts); keep the heartbeat fresh through the whole finalize.
-    with liveness_heartbeat("rl_finalizing"):
+    # progress_step stamps the final step on every finalize heartbeat so a cancel landing in this
+    # window still bills the actual steps trained (actual_steps_run reads last_heartbeat.step).
+    with liveness_heartbeat("rl_finalizing", progress=lambda: _steps_run, progress_step=True):
         adapter_dir = f"{out_dir}/adapter"
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
@@ -680,7 +682,7 @@ def run_rl():
                 import shutil
 
                 shutil.rmtree(recombined, ignore_errors=True)
-    _w.heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
+    _w.heartbeat("rl_trained", train_wall=train_wall, step=_steps_run, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens (over-counts; used only for a rough throughput).
     gen_tokens = steps * batching["unique_prompts_per_step"] * group_size * _max_completion

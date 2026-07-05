@@ -173,6 +173,23 @@ def test_liveness_heartbeat_progress_step_stamps_step(monkeypatch):
     )
 
 
+def test_liveness_heartbeat_first_progress_sample_is_baseline_not_progress(monkeypatch):
+    """A resumed run's restored global_step (or a constant finalize counter) must NOT count as
+    progress on the daemon's first sample — it would emit a real step>=1 heartbeat seconds into
+    train() and prematurely tighten the provider's stall window, defeating the per-attempt
+    setup-grace re-arm. Only an ADVANCE past the first-seen value is progress."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    seen: list = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: seen.append((k.get("liveness"), k.get("step"))))
+    with hb.liveness_heartbeat("rl_step", progress=lambda: 57, progress_step=True):
+        time.sleep(0.2)
+    assert seen
+    assert all(liveness is True for liveness, _ in seen), (
+        "a never-advancing counter must emit only liveness pings"
+    )
+    assert all(step == 57 for _, step in seen), "pings still stamp the baseline step"
+
+
 def test_liveness_heartbeat_dumps_stacks_once_when_progress_stale(monkeypatch):
     """No REAL progress for _STALL_DUMP_S -> dump every thread's stack ONCE (operator trace); the
     provider does the kill+retry off the same stale-progress signal."""
@@ -342,11 +359,13 @@ def test_quiet_phases_upload_at_setup_liveness_interval():
 # upgrades the NEXT committed liveness ping to a real heartbeat. Without it, the train-loop liveness
 # daemon can win the shared 900s upload slot with a bare ping, deferring the real per-step heartbeat
 # to T+1800s > the provider's 1500s stall window — a healthy training run killed as "stalled".
-def _reset_hb_state(ne, *, last_upload=0.0):
-    ne._HB_LAST_UPLOAD = last_upload
-    ne._HB_LAST_PROGRESS_TS = 0.0
-    ne._HB_PROGRESS_SEQ = 0
-    ne._HB_PROGRESS_UPLOADED_SEQ = 0
+def _reset_hb_state(monkeypatch, ne, *, last_upload=0.0):
+    # monkeypatch (not direct assignment) so the latch state is restored after each test — a
+    # leaked pending latch would make unrelated later tests order-dependent.
+    monkeypatch.setattr(ne, "_HB_LAST_UPLOAD", last_upload)
+    monkeypatch.setattr(ne, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(ne, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(ne, "_HB_PROGRESS_UPLOADED_SEQ", 0)
 
 
 def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(monkeypatch):
@@ -365,7 +384,7 @@ def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(monkeypatch
     monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
     monkeypatch.setattr(ne, "hf_upload_file", _capture)
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
-    _reset_hb_state(ne, last_upload=1000.0)
+    _reset_hb_state(monkeypatch, ne, last_upload=1000.0)
 
     ne.heartbeat("sft_step", step=5)  # real progress, throttled away (slot busy for 900s)
     assert uploads == []
@@ -401,7 +420,7 @@ def test_progress_carry_survives_failed_upload(monkeypatch):
 
     monkeypatch.setattr(ne, "hf_upload_file", _capture)
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
-    _reset_hb_state(ne)
+    _reset_hb_state(monkeypatch, ne)
 
     ne.heartbeat("sft_step", step=9)  # real, upload FAILS -> progress still pending
     assert uploads[-1].get("liveness") is None
@@ -423,7 +442,7 @@ def test_progress_carry_does_not_mark_new_progress(monkeypatch):
 
     monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: False)  # keep the latch pending
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
-    _reset_hb_state(ne)
+    _reset_hb_state(monkeypatch, ne)
 
     ne.heartbeat("sft_step", step=1)  # real; upload fails -> pending
     after_real = ne._HB_LAST_PROGRESS_TS
@@ -595,7 +614,7 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
     mod = importlib.import_module(modname)
     src = inspect.getsource(getattr(mod, outer))
     for stage in stages:
-        assert f'liveness_heartbeat("{stage}")' in src, f"{outer} must wrap the {stage} phase"
+        assert f'liveness_heartbeat("{stage}"' in src, f"{outer} must wrap the {stage} phase"
 
 
 def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
@@ -612,11 +631,34 @@ def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
     [("flash.engine.worker.sft", "run_sft"), ("flash.engine.worker.rl", "run_rl")],
 )
 def test_chalk_kernel_install_runs_inside_init_liveness_wrap(modname, outer):
-    """install_chalk_kernels can JIT-compile for minutes right after trainer init; it must stay
-    inside the *_initializing liveness wrap (pinned via its 8-space block indentation)."""
+    """install_chalk_kernels can JIT-compile for minutes right after trainer init; it must run
+    INSIDE the *_initializing liveness wrap (checked structurally via the AST, not indentation)."""
+    import ast
+    import textwrap
+
+    def _call_name(call):
+        return getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+
     mod = importlib.import_module(modname)
-    src = inspect.getsource(getattr(mod, outer))
-    assert "        _chalk_report = install_chalk_kernels(" in src
+    tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(mod, outer))))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        for item in node.items:
+            call = item.context_expr
+            if not (isinstance(call, ast.Call) and _call_name(call) == "liveness_heartbeat"):
+                continue
+            stage = call.args[0].value if call.args and isinstance(call.args[0], ast.Constant) else ""
+            if not str(stage).endswith("_initializing"):
+                continue
+            if any(
+                isinstance(n, ast.Call) and _call_name(n) == "install_chalk_kernels"
+                for n in ast.walk(node)
+            ):
+                return
+    raise AssertionError(
+        f"{outer}: install_chalk_kernels must run inside the *_initializing liveness wrap"
+    )
 
 
 def test_no_worker_side_stall_watchdog():

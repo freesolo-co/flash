@@ -556,7 +556,7 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         running = str(obj.get("state") or "") == "running"
         if running and isinstance(ts, (int, float)) and (time.time() - ts) > _HB_QUIET_HINT_AFTER_S:
             age += _dim(
-                "  (heartbeat uploads are throttled; quiet is not dead - check flash log -f)"
+                "  (heartbeat uploads are throttled; quiet is not dead - check flash log -f <run-id>)"
             )
         pairs.append(("heartbeat", age))
     return pairs

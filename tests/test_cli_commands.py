@@ -728,3 +728,7 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
 
     state, progress = _log_follow_progress({"state": "running"}, "unknown")
     assert "hb=" not in progress  # no heartbeat yet -> no fabricated age
+
+    malformed = {"state": "running", "last_heartbeat": {"stage": "sft_step", "ts": "oops"}}
+    _, progress = _log_follow_progress(malformed, "unknown")
+    assert "hb=" not in progress  # non-numeric ts -> no fabricated age
