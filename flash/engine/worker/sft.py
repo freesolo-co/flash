@@ -99,6 +99,21 @@ def _model_arch_dims(model_id: str) -> tuple[int, int]:
         return c_hidden, c_layers
 
 
+def select_sft_examples(train, max_examples, seed):
+    """Pick the SFT sample: the first ``max_examples`` rows of the dataset (file order), shuffled.
+
+    The slice happens BEFORE the shuffle so ``max_examples`` is a deterministic prefix fence,
+    not a random subsample. A train.jsonl that carries fully-labeled SFT rows first and
+    prompt-only (empty-output) GRPO rows after can cap SFT to the labeled head — an empty
+    completion can never be shuffled into the SFT sample and teach the model to emit nothing.
+    """
+    if max_examples > 0:
+        train = train[:max_examples]
+    rng = random.Random(seed)
+    rng.shuffle(train)
+    return train
+
+
 def run_sft():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -122,12 +137,7 @@ def run_sft():
         val = getattr(_t, name, None) if _t else None
         return val if val is not None else default
 
-    train = env.dataset()
-    rng = random.Random(_w.SEED)
-    rng.shuffle(train)
-    max_examples = int(_train_opt("max_examples", 0) or 0)
-    if max_examples > 0:
-        train = train[:max_examples]
+    train = select_sft_examples(env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED)
     texts = []
     multiturn_targets = 0
     for ex in train:
