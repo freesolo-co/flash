@@ -41,7 +41,9 @@ WORKER_DEPS = [
     "wandb>=0.17",
     # fla from git: PyPI wheel is a broken stub missing fla.modules. SHA-pinned for reproducibility;
     # keep in lockstep with Dockerfile.worker. fla kept on ALL arches — worker ensures tilelang
-    # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper).
+    # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper)
+    # and OPTS OUT of tilelang on sm100 (B200) where tilelang's chunk_bwd_dqkwg miscomputes grads
+    # (worker _force_fla_triton_gdn_on_sm100; upstream default-gates tilelang to Hopper since fla #975).
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
     # tilelang version-pinned in lockstep with Dockerfile.worker + perf.py runtime reinstall.
     "tilelang==0.1.11",
