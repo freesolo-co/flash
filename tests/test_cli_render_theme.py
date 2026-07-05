@@ -402,3 +402,44 @@ def test_theme_follows_terminal_background(monkeypatch) -> None:
     assert render._theme() == "dark"
     monkeypatch.delenv("COLORFGBG", raising=False)
     assert render._theme() == "dark"  # default when nothing indicates a light terminal
+
+
+def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
+    """The curated panel must show the worker stage and heartbeat age so a throttled (quiet)
+    heartbeat reads as "alive N minutes ago", not as a dead worker."""
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    fresh = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "last_heartbeat": {"stage": "sft_step", "step": 42, "ts": _time.time() - 125},
+    }
+    out = render.run_status(fresh)
+    assert "worker" in out
+    assert "sft_step" in out
+    assert "step 42" in out
+    assert "2m ago" in out
+    assert "quiet is not dead" not in out  # fresh heartbeat needs no hint
+
+    stale = dict(fresh, last_heartbeat={"stage": "sft_initializing", "ts": _time.time() - 840})
+    out = render.run_status(stale)
+    assert "sft_initializing" in out
+    assert "14m ago" in out
+    assert "quiet is not dead" in out, "a stale heartbeat on a running run must show the hint"
+
+    ping = dict(
+        fresh, last_heartbeat={"stage": "sft_initializing", "ts": _time.time(), "liveness": True}
+    )
+    out = render.run_status(ping)
+    assert "alive ping" in out
+
+    done = dict(stale, state="done")
+    assert "quiet is not dead" not in render.run_status(done), "no hint on terminal runs"
+
+    no_hb = {"run_id": "flash-1", "state": "running", "spec": {}}
+    out = render.run_status(no_hb)
+    assert "worker" not in out.split("details")[0]  # no empty heartbeat rows
