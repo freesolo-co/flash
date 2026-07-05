@@ -100,6 +100,7 @@ from flash.engine.worker.perf import (
     _estimate_params,
     _flash_attn_3_available,
     _flash_attn_available,
+    _force_fla_triton_gdn_on_sm100,
     _GpuPeakSampler,
     _liger_default_for_model,
     _memory_mode,
@@ -108,6 +109,7 @@ from flash.engine.worker.perf import (
     _peak_gpu_gb,
     _remove_fla_from_disk,
     _reset_peak_gpu,
+    _restrict_fla_gdn_autotune_on_blackwell,
     _sdpa_cudnn_ctx,
     free_gpu,
     fused_optim_name,
@@ -265,9 +267,15 @@ def main():
                 raise RetriableInfraError(
                     f"DONE present but metrics.json unreadable after retries (transient HF): {last_err}"
                 )
+        # BEFORE any model import / fla dispatch: on sm100 the baked tilelang GDN backend
+        # computes wrong gradients — opt out so fla uses its (correct-there) Triton path.
+        _force_fla_triton_gdn_on_sm100()
         _ensure_fla_fastpath_on_hopper()
         # Must run AFTER fla fast path (may reinstall tilelang) and BEFORE model/vLLM import.
         _neutralize_tilelang_cudart_stub()
+        # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
+        # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
+        _restrict_fla_gdn_autotune_on_blackwell()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()
         load_mega_cache()
@@ -344,6 +352,7 @@ __all__ = [
     "_finalize",
     "_flash_attn_3_available",
     "_flash_attn_available",
+    "_force_fla_triton_gdn_on_sm100",
     "_grpo_is_no_op_failure",
     "_grpo_resume_already_complete",
     "_hf_upload",
@@ -359,6 +368,7 @@ __all__ = [
     "_remove_fla_from_disk",
     "_reset_peak_gpu",
     "_resolve_adapter_ref",
+    "_restrict_fla_gdn_autotune_on_blackwell",
     "_sdpa_cudnn_ctx",
     "assert_adapter_delta_nonzero",
     "assert_adapter_load_clean",
