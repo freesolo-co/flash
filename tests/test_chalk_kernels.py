@@ -26,7 +26,6 @@ _FIXED_KWARGS = {
     "trainable_attn_epilogue": True,
     "fused_embedding": True,
     "gdn": True,
-    "fused_mlp": False,
     "attn_epilogue": False,
     "fp8_frozen_base": False,
 }
@@ -60,6 +59,23 @@ def test_applies_fixed_gap_fillers(monkeypatch):
     assert got_model is model
     assert kwargs.pop("liger") is False  # chalk standalone; TRL must not apply Liger first
     assert kwargs == _FIXED_KWARGS
+
+
+def test_fused_ce_false_disables_only_flce_for_the_trl_sft_path(monkeypatch):
+    """The trl SFT path passes fused_ce=False: flce returns logits=None, which trl's
+    SFTTrainer.compute_loss can't consume (it reads outputs.logits and only skips them under
+    use_liger_kernel=True, which flash can't set — that would make trl apply Liger and clash with
+    chalk). So flce is turned OFF there and the model materialises logits; every OTHER kernel is
+    unchanged. Default fused_ce=True keeps flce on for the custom GRPO/opd loops (they read the fused
+    loss directly)."""
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    install_chalk_kernels(object(), fused_ce=False)
+    _, kwargs = calls[0]
+    assert kwargs.pop("liger") is False
+    expected = dict(_FIXED_KWARGS)
+    expected["fused_linear_cross_entropy"] = False  # the ONLY difference vs the default
+    assert kwargs == expected
 
 
 def test_selection_ignores_env_flags(monkeypatch):
@@ -133,3 +149,28 @@ def test_active_kernels_filters_report():
     assert active_kernels(rep) == ["fused_lora_delta", "rope"]
     assert active_kernels({}) == []
     assert active_kernels(None) == []
+
+
+def test_kernels_match_real_chalk_signature():
+    """Every _KERNELS key must be a real parameter of chalk's apply_chalk_kernel_to_qwen35.
+
+    The other tests inject a fake chalk that accepts **kwargs, so they cannot catch a _KERNELS key
+    the REAL chalk rejects (a stray key makes install_chalk_kernels TypeError -> swallow -> silently
+    train on eager). This guards against that drift against the installed chalk; it is skipped when
+    freesolo-chalk is not installed in the test env.
+    """
+    import inspect
+
+    import pytest
+
+    from flash.engine.chalk_kernels import _KERNELS
+
+    try:
+        from chalk.transformers import apply_chalk_kernel_to_qwen35
+    except Exception:
+        pytest.skip("freesolo-chalk not installed in this test env")
+
+    accepted = set(inspect.signature(apply_chalk_kernel_to_qwen35).parameters)
+    passed = {k for k, _ in _KERNELS}
+    stray = passed - accepted
+    assert not stray, f"_KERNELS passes keys chalk rejects (would TypeError -> no-op -> eager): {sorted(stray)}"

@@ -274,10 +274,11 @@ def _sweep_orphan_instances_once() -> int:
 
 
 async def _sweep_orphan_instances_loop() -> None:
-    """Background loop: proactively tear down orphaned Lambda instances (billed instances left
-    by finished/crashed runs that the per-run ``finally`` teardown missed) so they stop billing
-    without waiting for the next control-plane restart. This is the in-lifetime counterpart of the
-    instance providers' startup ``sweep_orphans`` (``recover_runs``) — the instance analogue of
+    """Background loop: proactively tear down orphaned instance-provider workers (billed instances
+    left by finished/crashed runs that the per-run ``finally`` teardown missed) so they stop
+    billing without waiting for the next control-plane restart. Covers all instance-billed
+    providers (Lambda, Vast). This is the in-lifetime counterpart of the instance providers'
+    startup ``sweep_orphans`` (``recover_runs``) — the instance analogue of
     ``_reap_idle_endpoints_loop`` for RunPod. Blocking provider calls are offloaded to a thread; a
     failed sweep is logged and retried next cycle."""
     interval = 600.0  # sweep every 10 min (matches the RunPod idle reaper)
@@ -294,12 +295,12 @@ async def _sweep_orphan_instances_loop() -> None:
 
 
 def _instance_providers_configured() -> bool:
-    """True when an instance-based provider (Lambda) is configured on this plane, so the
+    """True when an instance-based provider (Lambda or Vast) is configured on this plane, so the
     periodic instance orphan sweep is worth running. RunPod-only planes skip it — RunPod has no
     standing per-run billing to reap between restarts (its idle reaper covers warm endpoints)."""
-    from flash.providers import available_providers
+    from flash.providers import INSTANCE_PROVIDERS, available_providers
 
-    return any(name in ("lambda",) for name in available_providers())
+    return any(name in INSTANCE_PROVIDERS for name in available_providers())
 
 
 def create_app():

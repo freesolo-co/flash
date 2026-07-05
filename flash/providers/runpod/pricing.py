@@ -5,9 +5,9 @@ from __future__ import annotations
 
 def static_rates() -> dict[str, float]:
     """Friendly GPU name -> static $/hr snapshot."""
-    from flash.providers.base import GPU_INFO
+    from flash.providers.base import static_rates_for
 
-    return {name: info.hourly_usd for name, info in GPU_INFO.items() if info.enum_member}
+    return static_rates_for("enum_member")
 
 
 def hourly_rate(gpu_name: str) -> float:

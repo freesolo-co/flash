@@ -147,7 +147,7 @@ class WandbSpec:
 @dataclass(frozen=True)
 class JobSpec:
     model: str = DEFAULT_MODEL
-    algorithm: str = "grpo"
+    algorithm: str = "sft"
     environment: EnvironmentSpec = field(default_factory=EnvironmentSpec)
     train: TrainSpec = field(default_factory=TrainSpec)
     gpu: GpuSpec = field(default_factory=GpuSpec)
