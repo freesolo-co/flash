@@ -437,9 +437,29 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
-def _run_gpu(spec: dict, remote: dict) -> str:
-    """Human-facing GPU label. Provider metadata stays internal."""
-    return remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+# Attempt outcomes meaning "never got a worker" (queue/allocation failures); they carry a GPU class
+# that never executed anything, so they don't earn a place in the human-facing trail label.
+_NEVER_RAN_OUTCOMES = frozenset({"no_capacity", "poll_error"})
+
+
+def _run_gpu(spec: dict, remote: dict, attempts: list | None = None) -> str:
+    """Human-facing GPU label. Provider metadata stays internal.
+
+    A run whose retry attempts ran on more than one GPU class shows the whole trail
+    (``H200->B200``) — a single-class label would silently mask a mid-run switch. The trail keeps
+    the persisted (chronological) order — attempt NUMBERS restart at 0 on control-plane recovery,
+    so sorting by them would invert history. Attempts that never obtained a worker are skipped;
+    tolerate malformed entries (status JSON on disk outlives writers)."""
+    trail: list[str] = []
+    for a in attempts or []:
+        if not isinstance(a, dict) or a.get("outcome") in _NEVER_RAN_OUTCOMES:
+            continue
+        gpu = a.get("gpu")
+        if gpu and (not trail or trail[-1] != gpu):
+            trail.append(str(gpu))
+    if len(trail) > 1:
+        return "->".join(trail)
+    return remote.get("gpu") or (trail[0] if trail else "") or (spec.get("gpu") or {}).get("type", "")
 
 
 def runs_table(runs: list[dict]) -> str:
@@ -449,7 +469,7 @@ def runs_table(runs: list[dict]) -> str:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        where = _run_gpu(spec, r.get("remote") or {})
+        where = _run_gpu(spec, r.get("remote") or {}, r.get("attempts"))
         color, uni, ascii_dot = _STATE_STYLE.get(str(r.get("state", "")).lower(), (_GRAY, "•", "-"))
         body.append(
             [
@@ -523,7 +543,7 @@ def _humanize_ts(value) -> str | None:
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
-    where = _run_gpu(spec, obj.get("remote") or {}) or None
+    where = _run_gpu(spec, obj.get("remote") or {}, obj.get("attempts")) or None
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),

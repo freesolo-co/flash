@@ -540,7 +540,16 @@ def run_sft():
     _reset_peak_gpu()
     _gpu_sampler = _GpuPeakSampler().start()
     t_train = time.time()
-    with liveness_heartbeat("sft_step"), _sdpa_cudnn_ctx(_attn):
+    # progress=global_step: step advances emit REAL step-carrying heartbeats even when the on_log
+    # callback's commits are throttled — the plane must keep seeing progress or it kills+retries a
+    # healthy worker (and the retry may land on a different GPU class mid-run).
+    with (
+        liveness_heartbeat(
+            "sft_step",
+            progress=lambda: getattr(getattr(trainer, "state", None), "global_step", None),
+        ),
+        _sdpa_cudnn_ctx(_attn),
+    ):
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     sft_peak_gpu_gb = _peak_gpu_gb()

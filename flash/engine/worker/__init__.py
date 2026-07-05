@@ -148,6 +148,10 @@ PHASE = os.environ.get(
 )
 
 _HB_LAST_UPLOAD = 0.0
+# Liveness pings throttle through their own slot so they can never starve the real (progress)
+# heartbeats out of the _HB_LAST_UPLOAD slot — the plane ignores liveness for stall detection, so a
+# starved real channel makes a healthy run look stalled (killed + retried, possibly cross-GPU-class).
+_HB_LAST_LIVENESS_UPLOAD = 0.0
 _HB_LAST_PROGRESS_TS = 0.0
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
 # per-repo commit cap while staying under the provider poller's 1200s training stall window.
@@ -325,6 +329,7 @@ __all__ = [
     "RUN_MODE",
     "SEED",
     "THINKING",
+    "_HB_LAST_LIVENESS_UPLOAD",
     "_HB_LAST_PROGRESS_TS",
     "_HB_LAST_UPLOAD",
     "_HB_LOCK",

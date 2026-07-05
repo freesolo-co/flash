@@ -48,8 +48,21 @@ _HB_UPLOAD_LOCK = threading.Lock()
 # Terminal/error commits wait longer — no later heartbeat can repair them.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
 _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
-# Monotonic claim counter; rollback guard uses SEQ not wall-clock (two threads can share same ts).
+# Monotonic claim counters; rollback guard uses SEQ not wall-clock (two threads can share same ts).
+# One per throttle slot (real vs liveness) so a failed commit on one slot never blocks the other.
 _HB_CLAIM_SEQ = 0
+_HB_CLAIM_SEQ_LIVENESS = 0
+# Claim seq of the last REAL payload that actually landed on HF. A due liveness commit skips its
+# upload when a real payload CLAIMED AFTER the liveness claim has already landed (heartbeat.json
+# keeps only the latest file, and the plane ignores liveness for progress — landing the liveness
+# ping second would hide that window's only progress beat). Seq-based, not ts-based: exact under
+# the locks and immune to frozen/mocked clocks. A real claimed BEFORE the liveness claim can't
+# race this way — its slot update makes the liveness ping not-due in the first place.
+_HB_LAST_REAL_LANDED_SEQ = 0
+
+# Stages whose progress counter IS the training step; only these carry ``step`` in ticker-emitted
+# heartbeats (model_prefetching's counter is downloaded BYTES — not a step).
+_HB_STEP_PROGRESS_STAGES = frozenset({"rl_step", "sft_step"})
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
@@ -65,16 +78,23 @@ def _dump_thread_stacks(reason: str) -> None:
         faulthandler.dump_traceback(all_threads=True)
 
 
-def _rollback_throttle_slot(my_claim: int, prev_last_upload: float) -> None:
+def _rollback_throttle_slot(my_claim: int, prev_last_upload: float, *, liveness_slot: bool) -> None:
     """Restore the throttle slot after a failed/abandoned upload, but only if this heartbeat still
-    owns the latest claim — a newer heartbeat that bumped the slot after us must not be rolled back."""
+    owns the latest claim on ITS slot — a newer heartbeat that bumped the slot after us must not be
+    rolled back."""
     with _HB_LOCK:
-        if my_claim == _HB_CLAIM_SEQ:
+        if liveness_slot:
+            if my_claim == _HB_CLAIM_SEQ_LIVENESS:
+                _w._HB_LAST_LIVENESS_UPLOAD = prev_last_upload
+        elif my_claim == _HB_CLAIM_SEQ:
             _w._HB_LAST_UPLOAD = prev_last_upload
 
 
-def heartbeat(stage: str, *, liveness: bool = False, **kw):
-    global _HB_CLAIM_SEQ
+def heartbeat(stage: str, *, liveness: bool = False, **kw) -> bool:
+    """Emit one heartbeat. Returns True when the payload was committed to the HF channel; False
+    when it was throttled out, skipped, or the commit failed (callers that must re-send a pending
+    progress advance — liveness_heartbeat's ticker — key off this)."""
+    global _HB_CLAIM_SEQ, _HB_CLAIM_SEQ_LIVENESS, _HB_LAST_REAL_LANDED_SEQ
     ts = time.time()
     # liveness pings don't count as progress; provider stall detection skips them.
     if not liveness:
@@ -95,47 +115,90 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
     snapshot = json.dumps(payload)
     with _HB_LOCK:
         now = time.time()
+        # Liveness pings commit through their OWN throttle slot. They must never claim the real
+        # slot: the 30s liveness ticker would otherwise always win the expiring slot ahead of the
+        # rarer step-carrying heartbeats, and the plane deliberately ignores liveness for progress
+        # — so a healthy slow-stepping run looks stalled, gets killed, and retries on whatever GPU
+        # class has capacity (the 2026-07-05 H200→B200 mid-run switch that resumed a checkpoint
+        # onto broken sm100 gradients started exactly this way).
+        liveness_slot = liveness
         if stage in _HB_TERMINAL_STAGES or stage.startswith("error_"):
             upload_due = True  # never miss a terminal transition
+            liveness_slot = False
         elif _w._HB_TERMINAL_ONLY:
             upload_due = (
                 _w._HB_LAST_UPLOAD == 0.0
                 or (now - _w._HB_LAST_UPLOAD) >= _HB_TERMINAL_ONLY_INTERVAL_S
             )
+            liveness_slot = False
         else:
             throttled = stage in _HB_THROTTLED_STAGES
             interval_s = _w._HB_MIN_INTERVAL_S
             if stage in _HB_SETUP_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
-            upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
-        prev_last_upload = _w._HB_LAST_UPLOAD
-        if upload_due:
-            _HB_CLAIM_SEQ += 1
-            my_claim = _HB_CLAIM_SEQ
-            _w._HB_LAST_UPLOAD = now
+            if not throttled:
+                upload_due = True
+            elif liveness:
+                # A liveness commit is only worth an HF commit when NOTHING (real or liveness)
+                # landed within the interval — a fresh real commit already proves the worker alive.
+                last_any = max(_w._HB_LAST_UPLOAD, _w._HB_LAST_LIVENESS_UPLOAD)
+                upload_due = (now - last_any) >= interval_s
+            else:
+                upload_due = (now - _w._HB_LAST_UPLOAD) >= interval_s
+        real_seq_at_claim = _HB_CLAIM_SEQ
+        if liveness_slot:
+            prev_last_upload = _w._HB_LAST_LIVENESS_UPLOAD
+            if upload_due:
+                _HB_CLAIM_SEQ_LIVENESS += 1
+                my_claim = _HB_CLAIM_SEQ_LIVENESS
+                _w._HB_LAST_LIVENESS_UPLOAD = now
+        else:
+            prev_last_upload = _w._HB_LAST_UPLOAD
+            if upload_due:
+                _HB_CLAIM_SEQ += 1
+                my_claim = _HB_CLAIM_SEQ
+                _w._HB_LAST_UPLOAD = now
+    landed = False
     if upload_due:
         critical = stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
         if _HB_UPLOAD_LOCK.acquire(timeout=lock_timeout):
             try:
-                up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
-                with open(up, "w") as f:
-                    f.write(snapshot)
-                try:
-                    committed = _w.hf_upload_file(up, "heartbeat.json")
-                finally:
-                    with contextlib.suppress(OSError):
-                        os.remove(up)
-                if committed is False:
-                    # ``is False`` (not falsy) so a mock/None never trips the rollback.
-                    _rollback_throttle_slot(my_claim, prev_last_upload)
-                    print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
+                skip_stale_liveness = False
+                if liveness_slot:
+                    # Both slots can come due in the same window; the poller reads only the LATEST
+                    # heartbeat.json and ignores liveness for progress, so a liveness commit landing
+                    # after a real one would erase that window's only progress beat. The real-landed
+                    # marker is written under the upload lock we now hold, so this check is exact.
+                    with _HB_LOCK:
+                        skip_stale_liveness = real_seq_at_claim < _HB_LAST_REAL_LANDED_SEQ
+                if not skip_stale_liveness:
+                    up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
+                    with open(up, "w") as f:
+                        f.write(snapshot)
+                    try:
+                        committed = _w.hf_upload_file(up, "heartbeat.json")
+                    finally:
+                        with contextlib.suppress(OSError):
+                            os.remove(up)
+                    if committed is False:
+                        # ``is False`` (not falsy) so a mock/None never trips the rollback.
+                        _rollback_throttle_slot(
+                            my_claim, prev_last_upload, liveness_slot=liveness_slot
+                        )
+                        print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
+                    else:
+                        landed = True
+                        if not liveness_slot:
+                            with _HB_LOCK:
+                                _HB_LAST_REAL_LANDED_SEQ = max(_HB_LAST_REAL_LANDED_SEQ, my_claim)
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
-            _rollback_throttle_slot(my_claim, prev_last_upload)
+            _rollback_throttle_slot(my_claim, prev_last_upload, liveness_slot=liveness_slot)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", snapshot)
+    return landed
 
 
 def make_reward_heartbeat_callback():
@@ -224,19 +287,32 @@ def liveness_heartbeat(stage, progress=None):
     done = threading.Event()
 
     def _loop() -> None:
-        last_val = None
+        # Track the last value the plane actually SAW (committed), not the last one observed: an
+        # advance observed while the commit throttle window is closed must be re-sent every tick
+        # until it lands, or a slow-stepping run (step time near the throttle interval) goes
+        # progress-silent past the plane's stall window and gets killed while healthy.
+        committed_val = None
         dumped = False
         while not done.wait(_LIVENESS_TICK_S):
-            made_progress = False
+            cur = None
             if progress is not None:
                 with contextlib.suppress(Exception):
                     v = progress()
-                    if v is not None and (last_val is None or float(v) > last_val):
-                        last_val, made_progress = float(v), True
+                    if v is not None:
+                        cur = float(v)
+            advanced = cur is not None and (committed_val is None or cur > committed_val)
             gpu = gpu_diagnostics(include_torch=False)
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
-            _w.heartbeat(stage, liveness=not made_progress, gpu=gpu)
+            # A progress advance is a REAL heartbeat; for per-step stages carry the counter as
+            # ``step`` so the plane's stall detector both sees progress and can classify the run
+            # as in-training (its step-gated stages ignore step-less pings).
+            extra = (
+                {"step": int(cur)} if (advanced and stage in _HB_STEP_PROGRESS_STAGES) else {}
+            )
+            landed = _w.heartbeat(stage, liveness=not advanced, gpu=gpu, **extra)
+            if advanced and landed is not False:  # mocks returning None count as landed
+                committed_val = cur
             last_progress = float(getattr(_w, "_HB_LAST_PROGRESS_TS", 0.0) or 0.0)
             if not dumped and last_progress and (time.time() - last_progress) > _STALL_DUMP_S:
                 _dump_thread_stacks(f"{stage}: no progress for >{_STALL_DUMP_S:.0f}s")

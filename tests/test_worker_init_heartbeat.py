@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import re
 import sys
 import threading
 import time
@@ -241,7 +242,8 @@ def test_sft_step_liveness_upload_is_throttled(monkeypatch):
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 60.0)
     monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
     ne._HB_LAST_UPLOAD = 0.0
-    # First sft_step claims the slot; the next two (well within 60s) must be throttled out.
+    ne._HB_LAST_LIVENESS_UPLOAD = 0.0
+    # First sft_step claims the liveness slot; the next two (well within 60s) must be throttled out.
     for _ in range(3):
         ne.heartbeat("sft_step", liveness=True, step=0)
     assert len(uploads) == 1, "sft_step uploads must be throttled to one per _HB_MIN_INTERVAL_S"
@@ -269,6 +271,7 @@ def test_setup_liveness_upload_uses_shorter_interval(monkeypatch):
     monkeypatch.setattr(ne, "_HB_SETUP_LIVENESS_INTERVAL_S", 240.0)
 
     ne._HB_LAST_UPLOAD = 1000.0
+    ne._HB_LAST_LIVENESS_UPLOAD = 0.0
     now["t"] = 1239.0
     ne.heartbeat("sft_initializing", liveness=True)
     assert uploads == []
@@ -280,6 +283,7 @@ def test_setup_liveness_upload_uses_shorter_interval(monkeypatch):
 
     uploads.clear()
     ne._HB_LAST_UPLOAD = 1000.0
+    ne._HB_LAST_LIVENESS_UPLOAD = 0.0
     now["t"] = 1241.0
     ne.heartbeat("sft_step", liveness=True, step=0)
     assert uploads == [], "training-step liveness must stay on _HB_MIN_INTERVAL_S"
@@ -388,10 +392,19 @@ def test_sft_init_wraps_trainer_build_in_liveness_heartbeat():
 def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
     mod = importlib.import_module(modname)
     src = inspect.getsource(getattr(mod, outer))
-    assert f'liveness_heartbeat("{stage}")' in src, (
+    m = re.search(r"liveness_heartbeat\(\s*\"" + stage + r"\"", src)
+    assert m, (
         f"{outer} must wrap trainer.train() in liveness_heartbeat({stage!r}) — without it the cold "
         "first step emits no real heartbeat and looks like a hang"
     )
+    window = src[m.start() : m.start() + 300]
+    assert "progress=" in window, (
+        f"{outer}'s liveness_heartbeat({stage!r}) must pass progress=<global_step> — step advances "
+        "must reach the plane as REAL heartbeats even when the on_log callback's commits are "
+        "throttled, or the plane kills a healthy run as stalled (and the retry can land on a "
+        "different GPU class mid-run)"
+    )
+    assert "global_step" in window, "the progress callback must report trainer.state.global_step"
 
 
 def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
@@ -411,3 +424,145 @@ def test_no_worker_side_stall_watchdog():
     hb = importlib.import_module("flash.engine.worker.heartbeat")
     assert not hasattr(hb, "_rearm_stall_faulthandler")
     assert not hasattr(hb, "_STALL_WATCHDOG_S")
+
+
+def test_liveness_ping_cannot_starve_real_progress_commits(monkeypatch):
+    """THE 2026-07-05 false-stall regression: liveness pings and real heartbeats throttle through
+    SEPARATE slots. With one shared slot the 30s liveness ticker always claimed it the moment it
+    expired, so the rarer step-carrying heartbeats never committed; the plane (which deliberately
+    ignores liveness for progress) declared a healthy, actively-training 35B SFT stalled, killed
+    it, and the retry resumed its checkpoint on a different GPU class — corrupting every step
+    after the resume. A real heartbeat must commit regardless of how recently liveness committed."""
+    import json
+
+    import flash.engine.worker as ne
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    now = {"t": 1000.0}
+    uploads: list[dict] = []
+
+    def _capture(local, *a, **k):
+        with open(local) as f:
+            uploads.append(json.load(f))
+
+    monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
+    monkeypatch.setattr(ne, "hf_upload_file", _capture)
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_LIVENESS_UPLOAD = 0.0
+
+    # t=1000: the liveness ticker wins the race to the expired window and commits.
+    ne.heartbeat("sft_step", liveness=True, step=10)
+    assert [u.get("liveness") for u in uploads] == [True]
+
+    # t=1030: a real step heartbeat arrives 30s later. The old shared slot throttled it for the
+    # next 900s — the plane then saw zero progress and killed the run. It must commit NOW.
+    now["t"] = 1030.0
+    ne.heartbeat("sft_step", step=20, loss=0.5)
+    assert [u.get("liveness") for u in uploads] == [True, None], (
+        "a liveness commit must never consume the real heartbeat's throttle slot"
+    )
+    assert uploads[-1]["step"] == 20
+
+    # Both slots fresh: further traffic of either kind stays under the commit cap.
+    now["t"] = 1060.0
+    ne.heartbeat("sft_step", step=30)
+    now["t"] = 1090.0
+    ne.heartbeat("sft_step", liveness=True, step=30)
+    assert len(uploads) == 2, "fresh slots must throttle both kinds (HF commit budget unchanged)"
+
+    # Liveness only spends a commit when NOTHING committed for a full interval (worker looks dead
+    # otherwise); a fresh real commit already proves liveness.
+    now["t"] = 1000.0 + 901.0
+    ne.heartbeat("sft_step", liveness=True, step=30)
+    assert len(uploads) == 2, "liveness must defer to the fresher real commit"
+    now["t"] = 1030.0 + 901.0
+    ne.heartbeat("sft_step", liveness=True, step=30)
+    assert len(uploads) == 3
+    assert uploads[-1].get("liveness") is True
+
+
+def test_liveness_ticker_reemits_progress_until_it_commits(monkeypatch):
+    """A step advance observed while the commit throttle window is CLOSED must be re-sent every
+    tick until a commit lands — tracking merely-observed values goes progress-silent past the
+    plane's stall window for step times near the throttle interval (the false-stall class this
+    PR fixes). heartbeat() returns commit status; the ticker advances its watermark only on it."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    landed = {"v": False}
+    seen: list = []
+    monkeypatch.setattr(
+        w, "heartbeat", lambda s, **k: (seen.append(bool(k.get("liveness"))), landed["v"])[1]
+    )
+    monkeypatch.setattr(w, "_HB_LAST_PROGRESS_TS", time.time())
+    with hb.liveness_heartbeat("sft_step", progress=lambda: 7):
+        time.sleep(0.1)  # several ticks; every emit is real (advance pending, commits failing)
+        assert seen, "ticker must emit while alive"
+        assert all(v is False for v in seen), (
+            "an uncommitted advance must be RE-SENT as a real heartbeat every tick, not dropped"
+        )
+        landed["v"] = True  # the throttle window opens; the next real emit commits
+        time.sleep(0.1)
+    assert True in seen, "once the advance committed, subsequent ticks are liveness pings again"
+
+
+def test_liveness_ticker_step_field_only_for_step_stages(monkeypatch):
+    """Only per-step training stages carry the progress counter as ``step`` — model_prefetching's
+    counter is downloaded BYTES, and stamping those as step numbers pollutes run status/telemetry."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    payloads: list[dict] = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: payloads.append({"stage": s, **k}))
+    monkeypatch.setattr(w, "_HB_LAST_PROGRESS_TS", time.time())
+
+    with hb.liveness_heartbeat("model_prefetching", progress=lambda: 34_359_738_368):
+        time.sleep(0.05)
+    prefetch_real = [p for p in payloads if not p.get("liveness")]
+    assert prefetch_real, "byte-count advances still emit real heartbeats"
+    assert all("step" not in p for p in prefetch_real), (
+        "a byte counter must never be reported as a training step"
+    )
+
+    payloads.clear()
+    with hb.liveness_heartbeat("sft_step", progress=lambda: 42):
+        time.sleep(0.05)
+    step_real = [p for p in payloads if not p.get("liveness")]
+    assert step_real
+    assert step_real[0]["step"] == 42, "per-step stages carry the counter as step"
+
+
+def test_stale_liveness_commit_never_overwrites_a_fresher_real_commit(monkeypatch):
+    """Both throttle slots can come due in the same window. heartbeat.json keeps only the LATEST
+    file and the plane ignores liveness for progress, so a liveness commit that lands after a real
+    one claimed later would erase that window's only progress beat. The upload path skips a due
+    liveness commit once a real payload claimed after it has landed."""
+    import json
+
+    import flash.engine.worker as ne
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    uploads: list[dict] = []
+
+    def _capture(local, *a, **k):
+        with open(local) as f:
+            uploads.append(json.load(f))
+
+    monkeypatch.setattr(ne, "hf_upload_file", _capture)
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_LIVENESS_UPLOAD = 0.0
+
+    # Simulate the race at the exact interleaving the locks allow: the liveness ping claims its
+    # slot while both slots are idle (so it IS due), but by the time it reaches the upload path a
+    # real payload with a LATER claim has already landed — represented by the landed-seq marker
+    # sitting above the claim counter the liveness ping captured.
+    monkeypatch.setattr(hbmod, "_HB_LAST_REAL_LANDED_SEQ", hbmod._HB_CLAIM_SEQ + 1)
+    ne.heartbeat("sft_step", liveness=True, step=20)
+    assert uploads == [], (
+        "a due liveness commit must be skipped once a real commit claimed after it has landed"
+    )
+
+    # The skip is liveness-only: real commits keep flowing regardless of the marker.
+    ne.heartbeat("sft_step", step=21)
+    assert [u.get("liveness") for u in uploads] == [None]
+    assert uploads[0]["step"] == 21

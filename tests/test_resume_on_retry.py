@@ -523,3 +523,370 @@ def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
 
     assert calls == [0], "an unreconciled create must fail fast, not relaunch (no double-provision)"
     assert "not retrying" in log.getvalue()
+
+
+# ============================================================================================
+# 4. GPU-ARCH SAFETY — a resume must never silently cross GPU architectures
+# (2026-07-05 incident: a false-stall retry moved a healthy H200 35B SFT onto a B200 mid-run;
+# the resumed checkpoint then trained every remaining step on sm100's broken GDN backward with
+# grad_norm ~1e7 while loss looked normal. Three layers lock that out: the worker stamps each
+# streamed checkpoint with its arch, the worker refuses to resume a mismatched stamp, and the
+# control plane pins retry candidates to the stamped arch.)
+# ============================================================================================
+def test_on_save_stamps_gpu_arch_into_checkpoint(tmp_path, monkeypatch, fake_transformers):
+    """Every streamed resume checkpoint carries flash_gpu.json recording the producing arch."""
+    import json
+
+    from flash.engine.worker import hf as hf_mod
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(hf_mod, "_live_gpu_sm", lambda: "sm90")
+    ckpt = _full_checkpoint(tmp_path, 60)
+
+    worker.make_checkpoint_upload_callback().on_save(
+        SimpleNamespace(output_dir=str(tmp_path)),
+        SimpleNamespace(global_step=60),
+        SimpleNamespace(),
+    )
+
+    stamp_path = os.path.join(str(ckpt), hf_mod.GPU_STAMP_FILE)
+    assert os.path.isfile(stamp_path), "on_save must stamp the checkpoint before enqueueing it"
+    with open(stamp_path) as fh:
+        stamp = json.load(fh)
+    assert stamp["sm"] == "sm90"
+    # The stamp rides inside the checkpoint folder upload (folder_path IS the stamped dir).
+    streams = [u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoint/checkpoint-60")]
+    assert streams
+    assert streams[0]["folder_path"] == str(ckpt)
+
+
+def test_on_save_skips_stamp_off_gpu(tmp_path, monkeypatch, fake_transformers):
+    """No live GPU (local/dev run) -> no stamp; the save/upload must proceed unchanged."""
+    from flash.engine.worker import hf as hf_mod
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(hf_mod, "_live_gpu_sm", lambda: None)
+    ckpt = _full_checkpoint(tmp_path, 60)
+
+    worker.make_checkpoint_upload_callback().on_save(
+        SimpleNamespace(output_dir=str(tmp_path)),
+        SimpleNamespace(global_step=60),
+        SimpleNamespace(),
+    )
+
+    assert not os.path.exists(os.path.join(str(ckpt), hf_mod.GPU_STAMP_FILE))
+    assert any(u["path_in_repo"].endswith("/checkpoint/checkpoint-60") for u in rec.uploads)
+
+
+def _stamped_snapshot(steps, sm):
+    """_fake_snapshot + a flash_gpu.json arch stamp inside every materialized checkpoint dir."""
+    import json
+
+    inner = _fake_snapshot(steps)
+
+    def _dl(*, repo_id, repo_type, allow_patterns, local_dir, token=None, **_):
+        inner(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            allow_patterns=allow_patterns,
+            local_dir=local_dir,
+            token=token,
+        )
+        prefix = allow_patterns[0][: -len("/checkpoint/**")]
+        for s in steps:
+            d = os.path.join(local_dir, prefix, "checkpoint", f"checkpoint-{s}")
+            with open(os.path.join(d, "flash_gpu.json"), "w") as fh:
+                json.dump({"sm": sm, "device_name": "NVIDIA H200", "gpu_class": "H200"}, fh)
+        return local_dir
+
+    return _dl
+
+
+def test_hf_resume_checkpoint_refuses_cross_arch_stamp(monkeypatch, resume_run_id):
+    """A checkpoint stamped sm90 must NOT resume on an sm100 worker: raise retriable, never train.
+
+    The raise must escape hf_resume_checkpoint's own swallow-everything download handling — a
+    silent None here would restart from scratch and silently discard the run's paid progress,
+    and a silent resume is the corruption the stamp exists to stop."""
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+
+    from flash.engine.worker import hf as hf_mod
+    from flash.engine.worker.perf import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _stamped_snapshot([50], "sm90"))
+    monkeypatch.setattr(hf_mod, "_live_gpu_sm", lambda: "sm100")
+
+    with pytest.raises(RetriableInfraError, match=r"sm90.*sm100|sm100.*sm90"):
+        worker.hf_resume_checkpoint()
+
+
+def test_hf_resume_checkpoint_allows_matching_arch_stamp(monkeypatch, resume_run_id):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+
+    from flash.engine.worker import hf as hf_mod
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _stamped_snapshot([50], "sm90"))
+    monkeypatch.setattr(hf_mod, "_live_gpu_sm", lambda: "sm90")
+
+    path = worker.hf_resume_checkpoint()
+    assert path is not None
+    assert path.endswith("checkpoint-50")
+
+
+def test_hf_resume_checkpoint_allows_unstamped_legacy_checkpoint(monkeypatch, resume_run_id):
+    """Pre-stamp checkpoints (no flash_gpu.json) must keep resuming — fail-open, not a hard cut."""
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+
+    from flash.engine.worker import hf as hf_mod
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([50]))
+    monkeypatch.setattr(hf_mod, "_live_gpu_sm", lambda: "sm100")
+
+    path = worker.hf_resume_checkpoint()
+    assert path is not None
+    assert path.endswith("checkpoint-50")
+
+
+def _alloc_h200_b200():
+    from flash.providers.base import Allocation, Candidate
+
+    candidates = (
+        Candidate("runpod", "H200", 4.39, 141),
+        Candidate("runpod", "B200", 5.89, 180),
+    )
+    return Allocation(
+        provider="runpod", gpu="H200", hourly_usd=4.39, min_vram_gb=100, candidates=candidates
+    )
+
+
+def test_retry_pins_resume_arch_instead_of_walking_classes(orch, monkeypatch):
+    """A retry that will resume a stamped checkpoint must stay on the checkpoint's arch, even
+    though the retry walk otherwise PREFERS an untried class — that preference is exactly what
+    moved the incident run H200->B200 mid-run."""
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import lifecycle
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc_h200_b200())
+    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: "sm90")
+
+    gpus = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        if attempt == 0:
+            return PollResult(False, failure="stalled", detail="false stall")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec(type="H200")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+
+    assert metrics["train_tokens"] == 4096
+    assert gpus == ["H200", "H200"], "the resume retry must stay on the checkpoint's sm90 arch"
+    assert "pinning to sm90" in log.getvalue()
+
+
+def test_retry_fails_rather_than_resume_cross_arch(orch, monkeypatch):
+    """When NO candidate matches the checkpoint's arch, the retry must fail no_capacity — never
+    silently resume on another arch. Corrupt-but-completed is strictly worse than failed."""
+    from flash.providers import allocator
+    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import lifecycle
+
+    b200_only = Allocation(
+        provider="runpod",
+        gpu="B200",
+        hourly_usd=5.89,
+        min_vram_gb=100,
+        candidates=(Candidate("runpod", "B200", 5.89, 180),),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: b200_only)
+    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: "sm90")
+    # The pin-blocked path deliberately backs off between synthesized no_capacity results (nothing
+    # provisions or waits otherwise); collect instead of sleeping so the test stays fast.
+    sleeps: list[float] = []
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: sleeps.append(s))
+
+    submits = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        submits.append(attempt)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        return PollResult(False, failure="stalled", detail="false stall")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec(type="B200")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="refusing a cross-arch resume"):
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submits == [0], "no retry may provision a cross-arch worker for a stamped resume"
+    assert "refusing a cross-arch resume" in log.getvalue()
+    assert sleeps, "pin-blocked retries must back off, not burn the infra budget in seconds"
+
+
+def test_oom_past_largest_same_arch_class_fails_terminally(orch, monkeypatch):
+    """OOM on the biggest GPU of the pinned arch is unwinnable (escalating VRAM means crossing
+    archs, which the resume pin forbids): fail immediately with the real reason, don't spin the
+    budget on synthesized no_capacity with a misleading detail."""
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import lifecycle
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc_h200_b200())
+    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: "sm90")
+
+    submits = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        submits.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        return PollResult(False, failure="oom", detail="CUDA out of memory")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec(type="H200")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="resubmit the run to restart"):
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submits == ["H200"], "the >141GB escalation set is all cross-arch; nothing may submit"
+    assert "pins this run to sm90" in log.getvalue()
+
+
+def test_recovery_attempt0_with_prior_trail_is_arch_pinned(orch, monkeypatch):
+    """Post-restart recovery re-enters with attempt=0 but WILL resume a checkpoint; a persisted
+    attempt trail marks it as a recovery, so attempt 0 must apply the pin instead of provisioning
+    the cheapest (possibly cross-arch) class and burning a paid boot on the worker-side check."""
+    from flash.providers import allocator
+    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import lifecycle
+
+    # B200 cheapest so an UNpinned attempt 0 would pick it.
+    b200_cheapest = Allocation(
+        provider="runpod",
+        gpu="B200",
+        hourly_usd=3.00,
+        min_vram_gb=100,
+        candidates=(
+            Candidate("runpod", "B200", 3.00, 180),
+            Candidate("runpod", "H200", 4.39, 141),
+        ),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: b200_cheapest)
+    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: "sm90")
+
+    gpus = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec(type="H200")
+    _seed_status(orch, spec)
+    # The pre-restart life left its trail behind — that's the recovery signal.
+    orch.record_attempt(spec.run_id, {"attempt": 0, "provider": "runpod", "gpu": "H200"})
+
+    orch._submit_seed_supervised(spec, 0, io.StringIO())
+
+    assert gpus == ["H200"], "recovery attempt 0 must pin to the checkpoint's arch"
+
+
+def test_record_attempt_survives_control_plane_restart(orch):
+    """Attempt numbers restart at 0 on recovery; the trail must APPEND, not overwrite — the
+    pre-restart history is exactly what the trail exists to preserve."""
+    from flash.cli.render import _run_gpu
+
+    spec = _spec()
+    _seed_status(orch, spec)
+    orch.record_attempt(spec.run_id, {"attempt": 0, "provider": "runpod", "gpu": "H200"})
+    orch.record_attempt(spec.run_id, {"attempt": 0, "outcome": "stalled"})
+    # Control plane restarts; recovery resubmits with the counter back at 0, on a different class.
+    orch.record_attempt(spec.run_id, {"attempt": 0, "provider": "runpod", "gpu": "B200"})
+    orch.record_attempt(spec.run_id, {"attempt": 0, "outcome": "ok"})
+
+    trail = orch.get_status(spec.run_id).attempts
+    assert [(a["gpu"], a.get("outcome")) for a in trail] == [
+        ("H200", "stalled"),
+        ("B200", "ok"),
+    ], "restart must append a new record, and each outcome must land on its own life's record"
+    assert _run_gpu({}, {}, trail) == "H200->B200"
+
+
+# ============================================================================================
+# 5. OBSERVABILITY — the per-attempt GPU trail (a single-GPU run record masked the incident's
+# mid-run class switch for hours; `flash runs` showed only the final B200... as "H200").
+# ============================================================================================
+def test_attempt_trail_records_each_attempts_gpu_and_outcome(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import lifecycle
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc_h200_b200())
+    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: None)  # unstamped legacy
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        if attempt == 0:
+            return PollResult(False, failure="stalled", detail="false stall")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec(type="H200")
+    _seed_status(orch, spec)
+
+    orch._submit_seed_supervised(spec, 0, io.StringIO())
+
+    trail = orch.get_status(spec.run_id).attempts
+    assert [(a["attempt"], a["gpu"], a.get("outcome")) for a in trail] == [
+        (0, "H200", "stalled"),
+        (1, "B200", "ok"),
+    ], "every attempt must persist WHERE it ran and how it ended"
+
+
+def test_run_gpu_label_shows_multi_class_trail():
+    """`flash runs` must surface a mid-run class switch as a trail, not the last class alone."""
+    from flash.cli.render import _run_gpu
+
+    attempts = [
+        {"attempt": 0, "gpu": "H200", "outcome": "stalled"},
+        {"attempt": 1, "gpu": "B200", "outcome": "ok"},
+    ]
+    assert _run_gpu({}, {}, attempts) == "H200->B200"
+    # Single class: unchanged label precedence (remote wins, then trail, then spec).
+    assert _run_gpu({}, {"gpu": "B200"}, attempts[1:]) == "B200"
+    assert _run_gpu({"gpu": {"type": "H200"}}, {}, None) == "H200"
+    assert _run_gpu({}, {}, [{"attempt": 0, "gpu": "H200"}, {"attempt": 1, "gpu": "H200"}]) == "H200"
+    # An attempt that never obtained a worker (queue/allocation failure) carries a class that never
+    # executed anything — it must not fabricate a multi-class trail for a single-class run.
+    never_ran = [
+        {"attempt": 0, "gpu": "H200", "outcome": "stalled"},
+        {"attempt": 1, "gpu": "B200", "outcome": "no_capacity"},
+        {"attempt": 2, "gpu": "H200", "outcome": "ok"},
+    ]
+    assert _run_gpu({}, {}, never_ran) == "H200"
+    # Malformed on-disk entries (status JSON outlives writers) must not crash `flash runs`.
+    assert _run_gpu({}, {}, ["garbage", {"attempt": 1, "gpu": "B200"}]) == "B200"

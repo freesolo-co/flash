@@ -597,7 +597,15 @@ def run_rl():
     t_train = time.time()
     # The cold first GRPO step (~17 min) emits no rl_step; liveness pings keep the stall detector
     # quiet while the real per-step rl_step callback remains the progress signal.
-    with liveness_heartbeat("rl_step"), _sdpa_cudnn_ctx(_attn):
+    # progress=global_step: step advances also emit REAL step-carrying heartbeats so the reward
+    # callback's throttled commits can't leave the plane blind to progress (see sft.py).
+    with (
+        liveness_heartbeat(
+            "rl_step",
+            progress=lambda: getattr(getattr(trainer, "state", None), "global_step", None),
+        ),
+        _sdpa_cudnn_ctx(_attn),
+    ):
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     rl_peak_gpu_gb = _peak_gpu_gb()

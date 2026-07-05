@@ -177,6 +177,10 @@ class RunStatus:
     platform_context: dict | None = None
     last_heartbeat: dict | None = None
     gpu_status: dict | None = None
+    # Per-attempt allocation trail ({attempt, provider, gpu, ts, outcome}). ``remote`` is
+    # overwritten (and cleared) per attempt, so without this a multi-attempt run loses WHERE each
+    # attempt ran — which is exactly what masked the 2026-07-05 H200→B200 mid-run class switch.
+    attempts: list[dict] | None = None
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -636,6 +640,47 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.updated_at = time.time()
         _save_status(status)
     _report_status(status)
+
+
+# Retry budgets top out around 1 + INFRA_RETRY_FLOOR + oom retries; 16 leaves generous headroom.
+_MAX_RECORDED_ATTEMPTS = 16
+
+
+def record_attempt(run_id: str, entry: dict) -> None:
+    """Record one attempt's allocation trail entry ({attempt, provider, gpu, ts, outcome}).
+
+    ``status.remote`` is overwritten (and cleared) per attempt, so a multi-attempt run otherwise
+    loses the history of WHERE each attempt ran — which masked the 2026-07-05 H200→B200 mid-run
+    GPU-class switch. The trail is CHRONOLOGICAL and append-only for submit-time writes; an
+    outcome-only write ({attempt, outcome}) merges into the newest still-open (outcome-less)
+    record with that attempt number. A control-plane restart resets the attempt counter to 0, so
+    keying purely on attempt number would overwrite the pre-restart history — appending preserves
+    it (the pre-restart record simply stays outcome-less: interrupted). Diagnostic only; never
+    raises."""
+    if not run_id or not isinstance(entry, dict) or entry.get("attempt") is None:
+        return
+    try:
+        with _STATUS_LOCK:
+            try:
+                status = get_status(run_id)
+            except FileNotFoundError:
+                return
+            trail = [a for a in (status.attempts or []) if isinstance(a, dict)]
+            outcome_only = "outcome" in entry and "gpu" not in entry and "provider" not in entry
+            merged_in = False
+            if outcome_only:
+                for i in range(len(trail) - 1, -1, -1):
+                    if trail[i].get("attempt") == entry.get("attempt") and "outcome" not in trail[i]:
+                        trail[i] = {**trail[i], **entry}
+                        merged_in = True
+                        break
+            if not merged_in:
+                trail.append(entry)
+            status.attempts = [_sanitize_status_value(a) for a in trail][-_MAX_RECORDED_ATTEMPTS:]
+            status.updated_at = time.time()
+            _save_status(status)
+    except Exception as e:
+        print(f"record_attempt warn ({run_id}): {e}")
 
 
 def _persist_metrics(spec: JobSpec, metrics: dict) -> float:

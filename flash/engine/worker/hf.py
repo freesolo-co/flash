@@ -115,8 +115,82 @@ def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) 
     )
 
 
+# Stamped into every streamed resume checkpoint; read back before resuming (see write_gpu_stamp).
+GPU_STAMP_FILE = "flash_gpu.json"
+
+
+def _live_gpu_sm() -> str | None:
+    """The live device's sm arch string (e.g. ``sm90``), or None off-GPU."""
+    try:
+        import torch
+
+        cap = torch.cuda.get_device_capability(0)
+        return f"sm{cap[0]}{cap[1]}"
+    except Exception:
+        return None
+
+
+def write_gpu_stamp(ckpt_dir: str) -> None:
+    """Record which GPU arch produced this checkpoint (``flash_gpu.json`` inside the checkpoint dir).
+
+    ``hf_resume_checkpoint`` refuses to resume a stamped checkpoint on a different arch: each arch
+    dispatches different kernels, so weights + optimizer state trained under one arch can silently
+    diverge under another (the 2026-07-05 incident: a false-stall retry moved a healthy H200 SFT
+    onto a B200 mid-run, resumed its checkpoint, and sm100's then-broken GDN backward corrupted
+    every step after the resume while loss looked normal). Best-effort: a stamp failure never
+    blocks the save."""
+    try:
+        sm = _live_gpu_sm()
+        if not sm:
+            return
+        name = None
+        with contextlib.suppress(Exception):
+            import torch
+
+            name = torch.cuda.get_device_name(0)
+        stamp = {
+            "sm": sm,
+            "device_name": name,
+            "gpu_class": (_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None),
+            "attempt": _w.ATTEMPT,
+        }
+        with open(os.path.join(ckpt_dir, GPU_STAMP_FILE), "w") as f:
+            json.dump(stamp, f)
+    except Exception as e:
+        print("[ckpt] gpu-arch stamp warn:", e)
+
+
+def _check_resume_arch(ckpt_path: str) -> None:
+    """Raise RetriableInfraError when this worker's GPU arch differs from the checkpoint's stamp.
+
+    Raising retriable (instead of silently resuming, or discarding the checkpoint) hands the
+    decision back to the control plane, whose retry allocator pins the run's arch — the loop
+    converges onto a matching GPU without ever training a step cross-arch. Unstamped (pre-stamp)
+    checkpoints pass through unchanged."""
+    try:
+        with open(os.path.join(ckpt_path, GPU_STAMP_FILE)) as f:
+            stamp = json.load(f)
+        ckpt_sm = str(stamp.get("sm") or "")
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print("[resume] gpu-arch stamp unreadable (allowing resume):", e)
+        return
+    live = _live_gpu_sm()
+    if not ckpt_sm or live is None or live == ckpt_sm:
+        return
+    raise RetriableInfraError(
+        f"resume checkpoint {os.path.basename(ckpt_path)} was trained on {ckpt_sm} "
+        f"({stamp.get('device_name')}, class {stamp.get('gpu_class')}) but this worker is {live}; "
+        "cross-arch resume risks silently divergent gradients — retrying on a matching GPU"
+    )
+
+
 def hf_resume_checkpoint() -> str | None:
-    """Download the latest streamed trainer checkpoint for this run, or return None."""
+    """Download the latest streamed trainer checkpoint for this run, or return None.
+
+    Raises RetriableInfraError (never swallowed below) when the checkpoint's GPU-arch stamp does
+    not match the live device — resuming would be silently numerics-unsafe."""
     if not _w.HF_REPO:
         return None
     try:
@@ -137,11 +211,12 @@ def hf_resume_checkpoint() -> str | None:
             return None
         latest = max(cands, key=lambda d: int(d.split("-")[-1]))
         path = os.path.join(base, latest)
-        print(f"[resume] found streamed checkpoint: {path}")
-        return path
     except Exception as e:
         print("hf_resume_checkpoint warn:", e)
         return None
+    _check_resume_arch(path)
+    print(f"[resume] found streamed checkpoint: {path}")
+    return path
 
 
 def _shared_weight_cache_dir() -> str | None:
@@ -268,6 +343,7 @@ _CHECKPOINT_TRAINER_STATE = (
     "global_step*/**",
     "latest",
     "zero_to_fp32.py",
+    GPU_STAMP_FILE,  # resume-only arch stamp; meaningless to the serving engine
 )
 
 
@@ -519,6 +595,7 @@ def make_checkpoint_upload_callback():
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
             if not os.path.isdir(ckpt_dir):
                 return
+            write_gpu_stamp(ckpt_dir)
             pump.enqueue(step, ckpt_dir)
 
         def on_train_end(self, args, state, control, **kwargs):

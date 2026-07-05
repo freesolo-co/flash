@@ -127,6 +127,59 @@ def _oom_escalated(candidates, oom_vram_floor: int):
     return [c for c in candidates if c.vram_gb > oom_vram_floor]
 
 
+def _class_sm(gpu_name: str) -> str | None:
+    """The sm arch of a managed GPU class name (e.g. ``sm90``), or None if unknown."""
+    try:
+        from flash.providers.base import get_gpu_info
+
+        return get_gpu_info(gpu_name).sm
+    except Exception:
+        return None
+
+
+def _resume_checkpoint_sm(spec: JobSpec) -> str | None:
+    """The GPU arch stamped into the run's latest streamed resume checkpoint, or None (no pin).
+
+    An attempt that resumes from a checkpoint must run on the arch that produced it: each arch
+    dispatches different kernels, so a cross-arch resume silently risks divergent gradients (the
+    2026-07-05 incident — a false-stall retry moved a healthy H200 35B SFT onto a B200 mid-run and
+    every post-resume step trained on sm100's then-broken GDN backward, invisible in loss space).
+    Read plane-side so the allocator pins candidates BEFORE provisioning; the worker-side check in
+    ``hf_resume_checkpoint`` stays the authoritative backstop (a checkpoint can land seconds after
+    this check — the incident run's dying worker uploaded step-50 AFTER the retry was submitted).
+    Fail-open: listing errors and unstamped (pre-stamp) checkpoints mean no pin."""
+    repo = getattr(spec.train, "hf_repo", "") or ""
+    if not repo:
+        return None
+    try:
+        import json
+
+        from huggingface_hub import HfApi, hf_hub_download
+
+        token = os.environ.get("HF_TOKEN")
+        prefix = f"{spec.phase}/{spec.run_id}/checkpoint"
+        steps = []
+        for entry in HfApi(token=token).list_repo_tree(
+            repo, path_in_repo=prefix, repo_type="dataset", recursive=False
+        ):
+            name = str(getattr(entry, "path", "")).rsplit("/", 1)[-1]
+            if name.startswith("checkpoint-"):
+                with contextlib.suppress(ValueError):
+                    steps.append(int(name.split("-")[-1]))
+        if not steps:
+            return None
+        local = hf_hub_download(
+            repo,
+            f"{prefix}/checkpoint-{max(steps)}/flash_gpu.json",
+            repo_type="dataset",
+            token=token,
+        )
+        with open(local) as f:
+            return str(json.load(f).get("sm") or "") or None
+    except Exception:
+        return None
+
+
 def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
@@ -148,6 +201,7 @@ def _submit_seed_supervised(
         _update,
         flash_code_prefix,
         get_status,
+        record_attempt,
     )
 
     code_prefix = code_prefix or flash_code_prefix()
@@ -325,52 +379,113 @@ def _submit_seed_supervised(
                     flush=True,
                 )
                 break
-            chosen = _select_candidate(cands, failed_providers, tried_classes)
-            untried = [c for c in cands if (c.provider, c.gpu) not in tried_classes]
-            cache_fallback_available = (
-                started_with_shared_cache
-                and not drop_weight_cache
-                and chosen is not None
-                and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
-            )
-            on_last_gpu = len(untried) <= 1 or (
-                retry_budget.infra_exhausted(cache_fallback_available=cache_fallback_available)
-            )
-            current_on_last_gpu["value"] = on_last_gpu
-            print(allocation_summary(alloc), file=log, flush=True)
-            if (chosen.provider, chosen.gpu) != (alloc.provider, alloc.gpu):
-                print(
-                    f"retry {attempt}: walking past the cheapest class to {chosen.gpu} "
-                    f"@ {chosen.provider} ${chosen.hourly_usd:.2f}/hr",
-                    file=log,
-                    flush=True,
-                )
-            run_spec = _spec_with_gpu(spec, chosen.gpu)
-            if drop_weight_cache:
-                run_spec = _drop_weight_cache(run_spec)
-            current_gpu["name"] = chosen.gpu
-            current_attempt["value"] = attempt
-            provider = get_provider(chosen.provider)
-            try:
-                submit_kwargs = {
-                    "log": log,
-                    "on_handle": on_handle,
-                    "attempt": attempt,
-                    "on_last_gpu": on_last_gpu,
-                    "code_prefix": code_prefix,
-                }
-                if runtime_secrets:
-                    submit_kwargs["runtime_secrets"] = runtime_secrets
-                res = provider.submit_run(run_spec, seed, **submit_kwargs)
-            except Exception as exc:
-                from flash.providers.base import UnreconciledCreateError
-
-                if isinstance(exc, UnreconciledCreateError):
-                    res = PollResult(False, failure="job_failed", detail=f"unreconciled create: {exc}")
+            # Arch-pin: an attempt that will resume a GPU-arch-stamped checkpoint must stay on that
+            # arch (cross-arch resume is numerics-unsafe; see _resume_checkpoint_sm). A fresh run's
+            # attempt 0 skips the HF round-trip; attempt 0 WITH a persisted attempt trail is a
+            # post-restart recovery that may resume, so it checks too. Either way the worker-side
+            # stamp check stays the backstop — its retriable failure re-enters this loop pinned.
+            check_pin = attempt > 0
+            if not check_pin:
+                with contextlib.suppress(Exception):
+                    check_pin = bool(get_status(spec.run_id).attempts)
+            pin_sm = _resume_checkpoint_sm(spec) if check_pin else None
+            if pin_sm:
+                same_arch = [c for c in cands if _class_sm(c.gpu) == pin_sm]
+                if same_arch:
+                    if len(same_arch) < len(cands):
+                        print(
+                            f"attempt {attempt}: pinning to {pin_sm} candidates — the run's resume "
+                            f"checkpoint was trained on {pin_sm}",
+                            file=log,
+                            flush=True,
+                        )
+                    cands = same_arch
+                elif oom_vram_floor:
+                    # OOM'd the largest same-arch class: escalating VRAM means crossing archs, which
+                    # the resume pin forbids — unwinnable, so fail NOW with the real reason instead
+                    # of spinning the budget on synthesized no_capacity.
+                    last_detail = (
+                        f"oom on the largest {pin_sm} class ({oom_vram_floor} GB); the resume "
+                        f"checkpoint pins this run to {pin_sm}, so a larger cross-arch GPU cannot "
+                        "resume it — resubmit the run to restart from scratch on a bigger class"
+                    )
+                    print(f"seed={seed} {last_detail}", file=log, flush=True)
+                    break
                 else:
-                    res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
+                    res = PollResult(
+                        False,
+                        failure="no_capacity",
+                        detail=(
+                            f"the run's resume checkpoint was trained on {pin_sm} and no {pin_sm} "
+                            "candidate is currently allocatable; refusing a cross-arch resume "
+                            "(weights + optimizer state trained under one arch's kernels can "
+                            "silently diverge under another's)"
+                        ),
+                    )
                     if attempt < infra_budget:
-                        time.sleep(10 * (attempt + 1))  # let the transient clear
+                        # Synthesized failure — nothing provisions or waits, so back off here to
+                        # ride out a transient same-arch capacity gap instead of burning the whole
+                        # infra budget in seconds.
+                        time.sleep(min(300.0, 60.0 * attempt))
+            if res is None:
+                chosen = _select_candidate(cands, failed_providers, tried_classes)
+                untried = [c for c in cands if (c.provider, c.gpu) not in tried_classes]
+                cache_fallback_available = (
+                    started_with_shared_cache
+                    and not drop_weight_cache
+                    and chosen is not None
+                    and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
+                )
+                on_last_gpu = len(untried) <= 1 or (
+                    retry_budget.infra_exhausted(cache_fallback_available=cache_fallback_available)
+                )
+                current_on_last_gpu["value"] = on_last_gpu
+                print(allocation_summary(alloc), file=log, flush=True)
+                if (chosen.provider, chosen.gpu) != (alloc.provider, alloc.gpu):
+                    print(
+                        f"retry {attempt}: walking past the cheapest class to {chosen.gpu} "
+                        f"@ {chosen.provider} ${chosen.hourly_usd:.2f}/hr",
+                        file=log,
+                        flush=True,
+                    )
+                run_spec = _spec_with_gpu(spec, chosen.gpu)
+                if drop_weight_cache:
+                    run_spec = _drop_weight_cache(run_spec)
+                current_gpu["name"] = chosen.gpu
+                current_attempt["value"] = attempt
+                with contextlib.suppress(Exception):
+                    record_attempt(
+                        spec.run_id,
+                        {
+                            "attempt": attempt,
+                            "provider": chosen.provider,
+                            "gpu": chosen.gpu,
+                            "ts": time.time(),
+                        },
+                    )
+                provider = get_provider(chosen.provider)
+                try:
+                    submit_kwargs = {
+                        "log": log,
+                        "on_handle": on_handle,
+                        "attempt": attempt,
+                        "on_last_gpu": on_last_gpu,
+                        "code_prefix": code_prefix,
+                    }
+                    if runtime_secrets:
+                        submit_kwargs["runtime_secrets"] = runtime_secrets
+                    res = provider.submit_run(run_spec, seed, **submit_kwargs)
+                except Exception as exc:
+                    from flash.providers.base import UnreconciledCreateError
+
+                    if isinstance(exc, UnreconciledCreateError):
+                        res = PollResult(
+                            False, failure="job_failed", detail=f"unreconciled create: {exc}"
+                        )
+                    else:
+                        res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
+                        if attempt < infra_budget:
+                            time.sleep(10 * (attempt + 1))  # let the transient clear
         if res.ok:
             # A late worker success must not resurrect a cancelled run.
             try:
@@ -381,8 +496,12 @@ def _submit_seed_supervised(
             _gc_seen_endpoints()
             if chosen is not None and isinstance(res.metrics, dict):
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
+            with contextlib.suppress(Exception):
+                record_attempt(spec.run_id, {"attempt": attempt, "outcome": "ok"})
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
+        with contextlib.suppress(Exception):
+            record_attempt(spec.run_id, {"attempt": attempt, "outcome": str(res.failure or "")})
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
             oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)
