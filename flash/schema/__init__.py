@@ -88,8 +88,24 @@ def normalize_env_name_segment(value: str) -> str | None:
 
 
 def load_toml(path: str) -> dict[str, Any]:
-    with open(path, "rb") as f:
-        return tomllib.load(f)
+    # a missing path, a directory, or an unreadable file is a user mistake, not a flash bug. only
+    # FileNotFoundError is in _USER_ERRORS, so IsADirectoryError / PermissionError would otherwise
+    # dump a raw traceback (and FileNotFoundError still surfaced a bare [Errno 2] string). route the
+    # whole OSError family through ConfigError so the cli prints one clean `error:` line instead.
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError as exc:
+        raise ConfigError(
+            f"config file not found: {path} (run `flash env setup` to scaffold configs/sft.toml)"
+        ) from exc
+    except IsADirectoryError as exc:
+        raise ConfigError(
+            f"{path} is a directory, not a TOML config (point train at a .toml file)"
+        ) from exc
+    except OSError as exc:
+        # permission denied, ENOTDIR on a path component, symlink loops, etc.
+        raise ConfigError(f"cannot read config {path}: {exc.strerror or exc}") from exc
 
 
 def spec_from_file(

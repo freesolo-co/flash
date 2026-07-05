@@ -40,8 +40,8 @@ flash gpus                           # managed GPU classes with estimated $/hr
 ```text
 environment.py          # the task: how to prompt the model and how to score it
 dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "output": ...}
-configs/rl.toml         # a GRPO (RL) run config
 configs/sft.toml        # an SFT run config
+configs/rl.toml         # a GRPO (RL) run config
 TRAINING.md             # this file
 ```
 
@@ -92,7 +92,7 @@ edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 ```toml
 model = "Qwen/Qwen3.5-4B"   # see `flash models`
-algorithm = "grpo"          # "grpo" (RL) or "sft"
+algorithm = "sft"           # "sft" (supervised) or "grpo" (RL)
 # thinking = true           # opt-in reasoning mode, for models that support it
 
 [environment]
@@ -102,10 +102,11 @@ id = "your-org/my-env"      # the id printed by `flash env push`
                                    # never stored in the spec
 
 [train]
-steps = 150                 # GRPO is step-driven; SFT is epoch-driven (epochs = N)
+epochs = 1                  # SFT is epoch-driven; GRPO is step-driven (steps = N)
+max_examples = 2            # rows to train on (the starter dataset has 2)
 lora_rank = 32
 lora_alpha = 64
-# All GRPO/SFT knobs live under [train]. Do not add [grpo] or [sft] tables.
+# All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 
 GPU and HF artifacts are **fully managed** — do not pick `gpu.type` or set
@@ -117,10 +118,10 @@ extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.steps=300`).
 ### 4. Submit
 
 ```bash
-flash train configs/rl.toml --dry-run   # validate the config locally — no GPU, no charge
-flash train configs/rl.toml --cost      # pre-flight USD estimate, then exit
-flash train configs/rl.toml             # submit and follow logs (Ctrl-C detaches)
-flash train configs/rl.toml --background  # submit and return immediately
+flash train configs/sft.toml --dry-run     # validate the config locally — no GPU, no charge
+flash train configs/sft.toml --cost        # pre-flight USD estimate, then exit
+flash train configs/sft.toml               # submit and follow logs (Ctrl-C detaches)
+flash train configs/sft.toml --background  # submit and return immediately
 ```
 
 ### 5. Monitor
@@ -159,9 +160,9 @@ Work in tight, attributable iterations. Each one is a hypothesis:
 1. Reconstruct state — what's the best run so far, and what have you already tried?
 2. Form a hypothesis — pick ONE lever and say WHY it will move the metric.
 3. Change that ONE lever.
-4. Validate locally — `flash train configs/rl.toml --dry-run` (catches config errors
+4. Validate locally — `flash train configs/sft.toml --dry-run` (catches config errors
    for free; a paid run on a broken config or an all-zero reward is wasted budget).
-5. Submit — `flash train configs/rl.toml`.
+5. Submit — `flash train configs/sft.toml`.
 6. Judge — read the metric trend AND a sample of real rollouts (see below).
 7. Keep the best run; revert the change if it didn't beat the noise band. Repeat.
 ```
@@ -181,7 +182,7 @@ different value.
 A run is only evidence of improvement when **all** of these hold:
 
 - [ ] The run reached `done` (confirmed via `flash status <run-id>`), not merely submitted.
-- [ ] The reward trend rose (GRPO `reward_mean`) or the SFT loss fell — **beyond the noise band**, not within it.
+- [ ] The SFT loss fell or the reward trend rose (GRPO `reward_mean`) — **beyond the noise band**, not within it.
 - [ ] You **probed the trained adapter on real inputs** (`flash deploy` + `flash chat`), including cases it should fail — not just the metrics.
 - [ ] The score is real behavior, not empty/truncated/templated outputs, skipped rows, leakage, a swallowed exception, or a format-only win.
 - [ ] If you track a clean success signal separately from the shaped reward (an explicit `RewardMetric`), *that* moved too.
@@ -219,7 +220,7 @@ spending another GPU run:
 ## Judge the run, don't just finish it
 
 - **Judge the trend, not a single number.** The proof of training is the curve:
-  `reward_mean` rising over steps (GRPO) or loss falling (SFT). Record the base/early
+  loss falling (SFT) or `reward_mean` rising over steps (GRPO). Record the base/early
   value and the final value. A flat or noisy trend with no improvement is not success.
 - **Read the model's outputs, not just the metrics.** A rising reward can come from
   reward-hacking or a degenerate output the reward still credits — metrics alone never
@@ -480,9 +481,9 @@ flash env setup                       # scaffold environment.py, dataset/, confi
 flash env push --name my-env .        # publish the environment; paste the returned id into [environment]
 flash env pull your-org/my-env        # download a published environment into the current folder
 flash env delete your-org/my-env -y   # delete a published environment
-flash train configs/rl.toml --dry-run # validate the config locally (no GPU, no charge)
-flash train configs/rl.toml --cost    # pre-flight USD estimate, then exit
-flash train configs/rl.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
+flash train configs/sft.toml --dry-run # validate the config locally (no GPU, no charge)
+flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
+flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
 flash status <run-id>                 # state + accrued cost
 flash log <run-id>                    # reward/loss trend + worker console/error logs
 flash log <run-id> --follow           # stream a live run to completion

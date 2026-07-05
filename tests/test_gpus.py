@@ -17,7 +17,7 @@ def test_canonical_gpu_aliases():
 def test_unknown_gpu_rejected():
     from flash.providers.base import UnsupportedGpuError, canonical_gpu
 
-    for bad in ("", "TPU v5", "RTX 9090", "Tesla T4", "RTX A6000"):
+    for bad in ("", "TPU v5", "RTX 9090", "Tesla T4"):
         with pytest.raises(UnsupportedGpuError):
             canonical_gpu(bad)
 
@@ -25,15 +25,37 @@ def test_unknown_gpu_rejected():
 def test_providers_for():
     from flash.providers.base import providers_for
 
-    # Consumer cards are RunPod-only (datacenter clouds don't carry GeForce).
-    assert providers_for("RTX 4090") == ("runpod",)
-    assert providers_for("RTX 5090") == ("runpod",)
+    # Consumer GeForce cards are RunPod + Vast (Vast's verified-datacenter market carries GeForce;
+    # Lambda's datacenter fleet does not). Order follows the registry: runpod, lambda, vast.
+    assert providers_for("RTX 4090") == ("runpod", "vast")
+    assert providers_for("RTX 5090") == ("runpod", "vast")
     # Datacenter cards span the instance-based complements where the hardware exists.
-    assert providers_for("H100") == ("runpod", "lambda")
-    assert providers_for("A100 PCIe") == ("runpod",)
-    assert providers_for("RTX Pro 6000") == ("runpod",)
-    # Provider-exclusive classes.
-    assert providers_for("A10") == ("lambda",)  # Lambda-only
+    assert providers_for("H100") == ("runpod", "lambda", "vast")
+    assert providers_for("A100 PCIe") == ("runpod", "vast")
+    assert providers_for("RTX Pro 6000") == ("runpod",)  # no vast_name (RunPod-only)
+    # Provider-exclusive / mixed instance classes.
+    assert providers_for("A10") == ("lambda",)  # Lambda-only (no RunPod A10, no Vast A10)
+    assert providers_for("A100 SXM 40GB") == ("lambda", "vast")  # instance-only 40 GB SXM4
+
+
+def test_vast_gpu_for_offer_accepts_h100_pcie_alias():
+    # Codex Mslmq: Vast lists PCIe H100s as "H100 PCIE" (distinct from the SXM "H100 SXM"). Both must
+    # map to the canonical H100 class, else a PCIe-only market is dropped as unknown capacity.
+    from flash.providers.base import vast_gpu_for_offer
+
+    h100_ram = 80 * 1024  # MB
+    assert vast_gpu_for_offer("H100 SXM", h100_ram) == "H100"
+    assert vast_gpu_for_offer("H100 PCIE", h100_ram) == "H100"
+    # an unmanaged name still maps to nothing (the Ampere+ floor / unknown-board guard holds)
+    assert vast_gpu_for_offer("Tesla T4", 16 * 1024) is None
+
+
+def test_retired_gpu_resolves_but_is_not_active():
+    from flash.providers.base import GPU_INFO, canonical_gpu, get_gpu_info
+
+    assert canonical_gpu("RTX A6000") == "RTX A6000"
+    assert get_gpu_info("RTX A6000").vram_gb == 48
+    assert "RTX A6000" not in GPU_INFO
 
 
 def test_expanded_gpu_table():

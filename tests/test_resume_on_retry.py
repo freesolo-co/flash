@@ -372,6 +372,100 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
     assert "resume from last checkpoint" in log.getvalue()
 
 
+def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatch):
+    """Codex MtzrH: when an instance-provider destroy() RAISES (Vast's unconfirmed DELETE — the old box
+    may STILL be running and writing this seed's HF artifacts), the retry must NOT launch a second
+    worker over it (double-bill + corrupt the shared seed-scoped DONE/metrics). Force-reap the run's
+    label (provider.gc, run-scoped / not active-shielded) and FAIL the seed terminally; the handle is
+    preserved (not cleared) for the run's outer GC."""
+    import flash.providers as providers
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    submits = []
+    gc_calls = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        submits.append(attempt)
+        on_handle({"provider": "vast", "instance_id": f"i{attempt}"})  # vast handle drives the teardown
+        return PollResult(False, failure="stalled", detail="infra")  # attempt 0 fails infra-shaped
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+
+    class _RaisingVast:
+        def destroy(self, handle):  # unconfirmed teardown
+            from flash.providers.vast import api as vast_api
+
+            raise vast_api.VastApiError("destroy unconfirmed (success:false)")
+
+        def gc(self, spec):  # run-scoped force-reap by label
+            gc_calls.append(spec.run_id)
+
+    real_get = providers.get_provider
+    monkeypatch.setattr(
+        providers,
+        "get_provider",
+        lambda name: _RaisingVast() if name == "vast" else real_get(name),
+    )
+
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed"):
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submits == [0], "must NOT launch a second worker over a possibly-live box"
+    assert gc_calls == [spec.run_id], "force-reap the run's label before failing terminally"
+    assert "teardown UNCONFIRMED" in log.getvalue()
+    # handle preserved (not cleared) so the run's outer GC can still reach the box
+    remote = orch.get_status(spec.run_id).remote
+    assert remote is not None
+    assert remote.get("instance_id") == "i0"
+
+
+def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, monkeypatch):
+    """Codex: after a CONFIRMED teardown the in-memory last_handle must be cleared, not just the
+    persisted remote. Otherwise a retry that fails BEFORE provisioning a new handle (allocation/search
+    error -> on_handle never fires) leaves the prior, already-torn-down handle live, so the NEXT retry
+    re-tears-down that already-gone resource. For an instance provider a transient destroy/list failure
+    on that phantom re-teardown would mis-classify as the unconfirmed-teardown FATAL path though no
+    prior worker remains; for RunPod it re-issues a redundant cancel/delete. Sequence: attempt 0
+    provisions ep0 then fails infra; attempt 1 confirms ep0's teardown then fails no_capacity (no new
+    handle); attempt 2 must NOT touch ep0 again (last_handle cleared) and must succeed."""
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    # cancel_job fires ONLY in the inter-attempt teardown block (never in the success _gc_seen_endpoints
+    # sweep, which only delete_endpoints), so counting it cleanly isolates re-teardown.
+    cancels: list[str] = []
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda eid, jid: cancels.append(eid))
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        if attempt == 0:
+            on_handle(_runpod_handle("ep0", "j0"))  # provisioned, then lost infra-shaped
+            return PollResult(False, failure="stalled", detail="infra")
+        if attempt == 1:
+            # Allocation/search-shaped failure BEFORE a new handle is recorded (on_handle never fires).
+            # last_handle must already be EMPTY here (ep0's teardown was confirmed at the top of this
+            # attempt), so the next retry has no stale handle to re-tear-down.
+            return PollResult(False, failure="no_capacity", detail="search flaked")
+        on_handle(_runpod_handle("ep2", "j2"))  # fresh endpoint on the final retry
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+
+    assert metrics["train_tokens"] == 4096, "the run must reach the successful final retry"
+    assert cancels == ["ep0"], "ep0 must be torn down exactly once, never re-torn after confirmed clear"
+
+
 def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
     """A genuine worker error (the run's own code crashed) must NOT consume a retry.
 
@@ -402,4 +496,30 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
         orch._submit_seed_supervised(spec, 0, log)
 
     assert calls == [0], "a non-infra failure must fail fast, not relaunch"
+    assert "not retrying" in log.getvalue()
+
+
+def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
+    """Codex MtbAD: an ambiguous, unreconciled non-idempotent create (Vast's ``PUT /asks`` 5xx with no
+    instance adoptable) raises ``UnreconciledCreateError`` from submit. The supervisor must classify it
+    TERMINAL (job_failed), NOT as the generic ``poll_error`` flake — retrying would rent a SECOND box
+    while the phantom from this attempt may still surface and bill under the still-active run."""
+    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.runpod import jobs as rp_jobs
+
+    calls = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        calls.append(attempt)
+        raise UnreconciledCreateError("ambiguous vast create; aborting the offer walk")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert calls == [0], "an unreconciled create must fail fast, not relaunch (no double-provision)"
     assert "not retrying" in log.getvalue()

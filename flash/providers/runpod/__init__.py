@@ -4,12 +4,23 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.providers.base import GpuClass, JobHandle, PollResult, Provider
+from flash.providers.base import (
+    AllocationConstraints,
+    Candidate,
+    GpuClass,
+    JobHandle,
+    PollResult,
+    Provider,
+)
 
 
 class RunpodProvider:
 
     name = "runpod"
+    # Optional capability (read via getattr, kept off the runtime_checkable Protocol like
+    # run_instances_remaining): only RunPod offers the shared weight-cache network volume, so the
+    # runner's one-shot cache-less retry fallback is gated on it. Instance providers omit it -> False.
+    supports_weight_cache = True
 
     def is_configured(self) -> bool:
         # Missing key surfaces at preflight, not here.
@@ -29,6 +40,16 @@ class RunpodProvider:
         from flash.providers.runpod.pricing import hourly_rate
 
         return hourly_rate(gpu)
+
+    def live_candidates(
+        self, need_vram_gb: int, constraints: AllocationConstraints
+    ) -> list[Candidate]:
+        """RunPod validated classes fitting the VRAM requirement, priced by the static table."""
+        return [
+            Candidate("runpod", g.name, self.hourly_rate(g.name), g.vram_gb)
+            for g in self.gpu_classes()
+            if g.vram_gb >= need_vram_gb and g.validated
+        ]
 
     def submit_run(
         self,

@@ -193,15 +193,247 @@ _STARTER_DATASET_JSONL = """\
 """
 
 
+_STARTER_ENV_MULTITURN_PY = '''\
+"""Starter Freesolo multi-turn environment.
+
+A multi-turn environment runs a bounded episode: the model produces an assistant
+action, `step_episode` advances the world (optionally appending an observation
+message), and the loop repeats until `done` or `max_episode_turns`. The finished
+transcript is graded by `score_episode`.
+
+Edit dataset/train.jsonl and the episode logic, then upload with
+`flash env push --name my-env .`.
+
+A managed run should use the returned [environment] id from
+`flash env push --name my-env .`.
+
+This starter implements a tiny "guess the secret number" game so you can see the
+episode hooks wired end-to-end. Replace it with your real task before a real run.
+
+Both SFT and GRPO train off this file:
+- GRPO (configs/rl.toml) rolls out full episodes and optimizes `score_episode`.
+- SFT (configs/sft.toml) learns the gold trajectory. Provide it per row as
+  `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
+  `output` for a single gold assistant turn.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from freesolo.datasets.types import TaskExample
+from freesolo.environments import (
+    EnvironmentEpisode,
+    EnvironmentMultiTurn,
+    EnvironmentStepResult,
+    RewardResult,
+)
+
+
+DEFAULT_DATASET_PATH = Path(__file__).parent / "dataset" / "train.jsonl"
+
+# How many assistant guesses the model gets before the episode is forced terminal.
+MAX_TURNS = 5
+
+
+def load_jsonl(path: str | Path):
+    rows = []
+    with Path(path).open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _secret(example: TaskExample) -> int:
+    return int(str(example.output).strip())
+
+
+class StarterMultiTurnEnv(EnvironmentMultiTurn):
+    dataset = load_jsonl(DEFAULT_DATASET_PATH)
+
+    def start_episode(self, example: TaskExample, prompt_text: str):
+        # The opening prompt shown to the model. `example.input` describes the range.
+        return [
+            {
+                "role": "user",
+                "content": (
+                    f"{example.input}\\n"
+                    f"Reply with a single integer per turn. I will say 'higher', "
+                    f"'lower', or 'correct'. You have {MAX_TURNS} guesses."
+                ),
+            }
+        ]
+
+    def max_episode_turns(self, example: TaskExample) -> int:
+        return MAX_TURNS
+
+    def step_episode(
+        self,
+        example: TaskExample,
+        messages: list,
+        assistant_response: str,
+    ) -> EnvironmentStepResult:
+        # Advance the world after one assistant action. Return done=True to end the
+        # episode, or append an observation message and keep going.
+        try:
+            guess = int(assistant_response.strip().split()[0])
+        except (ValueError, IndexError):
+            return EnvironmentStepResult(
+                done=False,
+                messages=[{"role": "user", "content": "Please reply with a single integer."}],
+            )
+        secret = _secret(example)
+        if guess == secret:
+            return EnvironmentStepResult(done=True, final_response_text=str(guess))
+        hint = "higher" if guess < secret else "lower"
+        return EnvironmentStepResult(
+            done=False,
+            messages=[{"role": "user", "content": hint}],
+        )
+
+    def score_episode(
+        self,
+        example: TaskExample,
+        episode: EnvironmentEpisode,
+    ) -> RewardResult:
+        # Grade the finished transcript. Reward a correct final guess; give partial
+        # credit for getting close so GRPO has a usable gradient.
+        secret = _secret(example)
+        try:
+            final = int(str(episode.response_text).strip())
+        except ValueError:
+            return RewardResult(score=0.0, threshold=1.0)
+        if final == secret:
+            return RewardResult(score=1.0, threshold=1.0, success=True)
+        # Closeness in [0, 1): further guesses score lower.
+        closeness = max(0.0, 1.0 - abs(final - secret) / 100.0)
+        return RewardResult(score=closeness * 0.5, threshold=1.0, success=False)
+
+
+def load_environment(dataset_path: str | None = None, **kwargs) -> StarterMultiTurnEnv:
+    env = StarterMultiTurnEnv()
+    if dataset_path:
+        env.dataset = load_jsonl(dataset_path)
+    return env
+'''
+
+
+# Multi-turn rows: `input` sets up the episode, `output` is the secret number.
+# The scalar `output` also serves as the gold single-turn SFT target; swap in
+# `{"messages": [...]}` to teach a full gold trajectory.
+_STARTER_DATASET_MULTITURN_JSONL = """\
+{"input":"I picked a secret whole number between 1 and 100.","output":"42"}
+{"input":"I picked a secret whole number between 1 and 100.","output":"73"}
+"""
+
+
+_TURN_OPTIONS = [
+    ("single", "single-turn", "one prompt -> one response"),
+    ("multi", "multi-turn", "bounded episode: step_episode / score_episode"),
+]
+_REASONING_OPTIONS = [
+    ("off", "no reasoning", "the model answers directly"),
+    ("on", "reasoning", "thinking = true; spends more tokens per answer"),
+]
+
+
+def _setup_interactive(args) -> bool:
+    """Whether to ask the setup questions interactively.
+
+    Prompt only on a real terminal a human can answer from. Fall back to defaults (no prompt) when
+    --yes is passed, under CI, or when stdin is closed/redirected, so automation never blocks on an
+    unanswered prompt. A pseudo-TTY in CI can report isatty()=True, so CI is checked explicitly; a
+    closed fd 0 can make sys.stdin None, so that is guarded before .isatty()."""
+    if getattr(args, "yes", False):
+        return False
+    if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
+        return False
+    stdin = sys.stdin
+    if stdin is None or not stdin.isatty():
+        return False
+    return render.styled()
+
+
 def cmd_env_setup(args) -> int:
+    starter_env = Path("environment.py")
+    dataset = Path("dataset/train.jsonl")
+    # An existing environment.py is the authoritative signal for which turn mode this
+    # scaffold already uses (the dataset is plain JSONL with no reliable mode marker).
+    # Anchor to it so a re-run never leaves a single-turn env beside a multi-turn
+    # dataset (or vice versa); the flag/answer only decides the mode when starting fresh.
+    existing_multi: bool | None = None
+    anchor = "environment.py"
+    if starter_env.exists():
+        existing_multi = "EnvironmentMultiTurn" in starter_env.read_text(encoding="utf-8")
+    elif dataset.exists():
+        # No env.py to anchor on, but the starter multi-turn dataset carries a
+        # distinctive prompt; use it so we don't drop a single-turn env beside it.
+        existing_multi = "secret whole number" in dataset.read_text(encoding="utf-8")
+        anchor = "dataset/train.jsonl"
+
+    # Resolve the turn mode. An existing scaffold wins (warn if a flag disagrees); otherwise an
+    # explicit --single-turn/--multi-turn flag wins; otherwise ask on a terminal, else single-turn.
+    flag_mode = getattr(args, "turn_mode", None)
+    if existing_multi is not None:
+        if flag_mode is not None and (flag_mode == "multi") != existing_multi:
+            have = "multi-turn" if existing_multi else "single-turn"
+            want = "multi-turn" if flag_mode == "multi" else "single-turn"
+            msg = (
+                f"existing {anchor} is {have}; keeping it and ignoring --{want}. "
+                f"Delete environment.py and dataset/train.jsonl first to re-scaffold as {want}."
+            )
+            print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
+        multi_turn = existing_multi
+    elif flag_mode is not None:
+        multi_turn = flag_mode == "multi"
+    elif _setup_interactive(args):
+        multi_turn = (
+            render.select("How does the model interact with your task?", _TURN_OPTIONS) == "multi"
+        )
+    else:
+        multi_turn = False
+
+    # Resolve reasoning. Like the turn mode, an existing config is authoritative: configs are only
+    # written when absent, so applying a reasoning flag to an already-scaffolded project would
+    # silently no-op (or write one config with reasoning and leave the other without). Anchor to the
+    # existing config's `thinking` state and warn if a flag disagrees; otherwise the flag wins;
+    # otherwise ask on a terminal; else off.
+    rl = Path("configs/rl.toml")
+    sft = Path("configs/sft.toml")
+    existing_reasoning: bool | None = None
+    for cfg in (rl, sft):
+        if cfg.exists():
+            existing_reasoning = "thinking = true" in cfg.read_text(encoding="utf-8")
+            break
+    flag_reason = getattr(args, "reasoning", None)
+    if existing_reasoning is not None:
+        if flag_reason is not None and flag_reason != existing_reasoning:
+            have = "reasoning" if existing_reasoning else "no reasoning"
+            want = "reasoning" if flag_reason else "no-reasoning"
+            msg = (
+                f"existing configs are {have}; keeping them and ignoring --{want}. "
+                f"Delete configs/rl.toml and configs/sft.toml first to re-scaffold with --{want}."
+            )
+            print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
+        reasoning = existing_reasoning
+    elif flag_reason is not None:
+        reasoning = flag_reason
+    elif _setup_interactive(args):
+        reasoning = render.select("Train with reasoning (thinking)?", _REASONING_OPTIONS) == "on"
+    else:
+        reasoning = False
+
+    env_py = _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY
+    dataset_jsonl = _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
     Path("configs").mkdir(exist_ok=True)
     Path("dataset").mkdir(exist_ok=True)
-    dataset = Path("dataset/train.jsonl")
     if not dataset.exists():
-        dataset.write_text(_STARTER_DATASET_JSONL)
-    starter_env = Path("environment.py")
+        dataset.write_text(dataset_jsonl)
     if not starter_env.exists():
-        starter_env.write_text(_STARTER_ENV_PY)
+        starter_env.write_text(env_py)
     env_comment = (
         "# Environment: upload this project folder with\n"
         "# `flash env push --name my-env .`, then paste the returned id below.\n"
@@ -211,27 +443,47 @@ def cmd_env_setup(args) -> int:
         'id = ""\n\n'
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
-    rl = Path("configs/rl.toml")
+    # `thinking = true` opts the run into reasoning mode. Reasoning shares the generation budget with
+    # the answer, so GRPO also gets a raised max_tokens. These strings are empty when reasoning is
+    # off, keeping the default scaffold byte-for-byte identical.
+    thinking_line = "thinking = true\n" if reasoning else ""
+    rl_reasoning_train = (
+        "max_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"
+        if reasoning
+        else ""
+    )
+    sft_reasoning_note = (
+        "# reasoning is on (thinking = true): each gold `output` must contain a <think>...</think>\n"
+        "# block; validate locally with freesolo.datasets.warn_missing_think_tags before a real run.\n"
+        if reasoning
+        else ""
+    )
     if not rl.exists():
         rl.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
-            'algorithm = "grpo"\n\n'
+            'algorithm = "grpo"\n'
+            f"{thinking_line}"
+            "\n"
             f"{env_comment}"
             "[train]\n"
             "steps = 150\n"
+            f"{rl_reasoning_train}"
             "lora_rank = 32\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
-    sft = Path("configs/sft.toml")
     if not sft.exists():
         sft.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
-            'algorithm = "sft"\n\n'
+            'algorithm = "sft"\n'
+            f"{thinking_line}"
+            "\n"
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
+            "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
             "lora_rank = 32\n"
+            f"{sft_reasoning_note}"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
@@ -242,8 +494,8 @@ def cmd_env_setup(args) -> int:
     scaffolded = [
         "environment.py",
         "dataset/train.jsonl",
-        "configs/rl.toml",
         "configs/sft.toml",
+        "configs/rl.toml",
         "TRAINING.md",
     ]
     if render.styled():
@@ -605,7 +857,9 @@ def cmd_deploy(args) -> int:
                 f"OpenAI-compatible base URL: {openai_base} — point clients at this /v1 base, "
                 "not the bare endpoint (which 404s on /chat/completions)."
             )
-            print(render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr)
+            print(
+                render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr
+            )
     if dep.get("state") != "dry_run":
         state = dep.get("state", "deploying")
         if state == "failed":

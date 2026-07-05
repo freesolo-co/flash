@@ -678,7 +678,7 @@ def _supervised_walk(monkeypatch, failures):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None, **_: "repo")
+        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(

@@ -16,6 +16,12 @@ from flash._logging import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+from flash.providers._hf_artifacts import (
+    make_hf_failure_detail_reader,
+    make_hf_heartbeat_reader,
+    make_hf_text_reader,
+    worker_flagged_retriable,
+)
 from flash.providers._poll import (
     PollErrorTracker,
     _attempt_int,
@@ -148,6 +154,8 @@ class JobHandle:
     job_id: str
     # Attempts share the seed's HF heartbeat path, so poll_job needs this to reject prior-attempt leftovers.
     attempt: int = 0
+    # Submit timestamp used to date shared heartbeat artifacts across retries. 0.0 = legacy/unknown.
+    started_ts: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -156,15 +164,21 @@ class JobHandle:
             "endpoint_name": self.endpoint_name,
             "job_id": self.job_id,
             "attempt": self.attempt,
+            "started_ts": self.started_ts,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> JobHandle:
+        try:
+            started_ts = float(d.get("started_ts") or 0.0)
+        except (TypeError, ValueError):
+            started_ts = 0.0
         return cls(
             d["endpoint_id"],
             d.get("endpoint_name", ""),
             d["job_id"],
             _attempt_int(d.get("attempt")) or 0,
+            started_ts,
         )
 
 
@@ -492,6 +506,7 @@ def poll_job(
     poll_errors = PollErrorTracker(say, interval_s)
 
     start = time.time()
+    launch_ts = handle.started_ts or 0.0
     last_status = None
     last_hb_key = None
     last_hb_ts = 0.0
@@ -522,7 +537,7 @@ def poll_job(
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:
                 last_hb_key, retriable, oom = surfaced_worker_flags(
-                    heartbeat_reader, last_hb_key, say, current_attempt
+                    heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
                 )
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
@@ -540,7 +555,7 @@ def poll_job(
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
             last_hb_key, retriable, oom = surfaced_worker_flags(
-                heartbeat_reader, last_hb_key, say, current_attempt
+                heartbeat_reader, last_hb_key, say, current_attempt, launch_ts=launch_ts
             )
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
@@ -680,6 +695,7 @@ def submit_run(
         "extra_pip": extra_pip,
         "code_prefix": code_prefix or flash_code_prefix(),
     }
+    submitted_ts = time.time()
     try:
         job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
     except Exception:
@@ -687,7 +703,7 @@ def submit_run(
         with contextlib.suppress(Exception):
             runpod_api.delete_endpoint(endpoint_id)
         raise
-    handle = JobHandle(endpoint_id, name, job_id, int(attempt))
+    handle = JobHandle(endpoint_id, name, job_id, int(attempt), submitted_ts)
     if log is not None:
         print(
             f"submitted job: endpoint={name} ({endpoint_id}) job={job_id} "
@@ -715,91 +731,24 @@ def submit_run(
     )
 
 
-def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
-    """Rate-limited reader for an HF artifact; returns None until it exists or on any error."""
-    state = {"last": 0.0}
-
-    def read(force: bool = False) -> str | None:
-        if not hf_repo:
-            return None
-        if not force and time.time() - state["last"] < min_interval_s:
-            return None
-        state["last"] = time.time()
-        try:
-            from huggingface_hub import hf_hub_download
-
-            p = hf_hub_download(
-                hf_repo,
-                path_in_repo,
-                repo_type="dataset",
-                token=os.environ.get("HF_TOKEN"),
-                force_download=True,
-            )
-            with open(p) as f:
-                return f.read()
-        except Exception:
-            return None
-
-    return read
+# make_hf_text_reader / make_hf_heartbeat_reader / make_hf_failure_detail_reader and the heartbeat-
+# provenance predicate worker_flagged_retriable are provider-neutral and now live in
+# flash.providers._hf_artifacts; re-exported at the top of this module for back-compat (preload +
+# tests still reference runpod.jobs.<name>).
 
 
-def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 30.0):
-    """Rate-limited JSON reader for ``{prefix}/heartbeat.json`` on HF."""
-    text_reader = make_hf_text_reader(hf_repo, f"{prefix}/heartbeat.json", min_interval_s)
-
-    def read(force: bool = False) -> dict | None:
-        raw = text_reader(force=force)
-        if raw is None:
-            return None
-        try:
-            return json.loads(raw)
-        except (ValueError, TypeError):
-            return None
-
-    return read
-
-
-def make_hf_failure_detail_reader(
-    hf_repo: str,
-    prefix: str,
-    phase: str,
-    min_interval_s: float = 45.0,
-    attempt: int = 0,
-):
-    """Reader for worker-uploaded failure artifacts on HF (error/console txt); force-read after terminal failure."""
-    # Attempt-scoped to match the worker's error_artifact_name(mode, attempt).
-    err_name = f"error_{phase}_attempt{int(attempt or 0)}.txt"
-    error_reader = make_hf_text_reader(hf_repo, f"{prefix}/{err_name}", min_interval_s)
-    console_reader = make_hf_text_reader(
-        hf_repo, f"{prefix}/console_{phase}.txt", min_interval_s
-    )
-
-    def read(force: bool = False) -> str | None:
-        parts: list[str] = []
-        error_text = error_reader(force=force)
-        if error_text:
-            parts.append(f"--- {err_name} ---\n{error_text[-4000:]}")
-        console_text = console_reader(force=force)
-        if console_text:
-            parts.append(f"--- console_{phase}.txt ---\n{console_text[-4000:]}")
-        return "\n".join(parts) if parts else None
-
-    return read
-
-
-def worker_flagged_retriable(heartbeat_reader) -> bool:
-    """True if the worker stamped ``retriable`` in its last heartbeat (forces a fresh read)."""
-    if heartbeat_reader is None:
-        return False
-    hb = heartbeat_reader(force=True)
-    if not isinstance(hb, dict):
-        return False
-    return bool(hb.get("retriable"))
-
-
-def surfaced_worker_flags(heartbeat_reader, last_hb_key, say, current_attempt: int | None = None) -> tuple:
+def surfaced_worker_flags(
+    heartbeat_reader,
+    last_hb_key,
+    say,
+    current_attempt: int | None = None,
+    *,
+    launch_ts: float | None = None,
+) -> tuple:
     """Read once for heartbeat surfacing plus structured retriable/OOM flags."""
     hb = heartbeat_reader(force=True) if heartbeat_reader is not None else None
     last_hb_key, _ = surface_heartbeat(lambda: hb, last_hb_key, say)
-    retriable = bool(hb.get("retriable")) if isinstance(hb, dict) else False
+    retriable = worker_flagged_retriable(
+        lambda force=False: hb, launch_ts=launch_ts, current_attempt=current_attempt
+    )
     return last_hb_key, retriable, heartbeat_oom_for_attempt(hb, current_attempt)
