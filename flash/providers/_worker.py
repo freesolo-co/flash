@@ -41,7 +41,9 @@ WORKER_DEPS = [
     "wandb>=0.17",
     # fla from git: PyPI wheel is a broken stub missing fla.modules. SHA-pinned for reproducibility;
     # keep in lockstep with Dockerfile.worker. fla kept on ALL arches — worker ensures tilelang
-    # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper).
+    # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper)
+    # and OPTS OUT of tilelang on sm100 (B200) where tilelang's chunk_bwd_dqkwg miscomputes grads
+    # (worker _force_fla_triton_gdn_on_sm100; upstream default-gates tilelang to Hopper since fla #975).
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
     # tilelang version-pinned in lockstep with Dockerfile.worker + perf.py runtime reinstall.
     "tilelang==0.1.11",
@@ -110,13 +112,14 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 # Chalk is published to PUBLIC PyPI on every version bump (chalk .github/workflows/publish.yml).
 # Pin the exact PUBLIC version so worker + kernel-cache-bake pods install with NO GitHub auth — the
 # chalk repo is INTERNAL, so a git+https default made installs fail wherever GITHUB_TOKEN is absent
-# (bake pod, tokenless workers). freesolo-chalk 0.5.2 = chalk dev->main sync #44 (standalone, Liger
-# fully replaced; adds arch-TUNED gdn_gated_rmsnorm + lora on sm89/sm90/sm100, MoE grouped-GEMM,
-# serving surface, MiniCPM/Llama kernels). Bump DEFAULT_CHALK_VERSION when the merged kernel surface moves.
-DEFAULT_CHALK_VERSION = "0.5.2"
+# (bake pod, tokenless workers). freesolo-chalk 0.5.3 = chalk dev->main sync #67 (adds the decode
+# serving kernels rope + GDN gated-rmsnorm; GPU-A/B'd launch tuning: flce chunk_mult 16, rope
+# num_warps=2, gdn_conv warps formula, lora fwd autotune candidate; OP_MEAS_OVERRIDE; flce
+# chunk_mult tradeoff docs). Bump DEFAULT_CHALK_VERSION when the merged kernel surface moves.
+DEFAULT_CHALK_VERSION = "0.5.3"
 DEFAULT_CHALK_SPEC = f"freesolo-chalk=={DEFAULT_CHALK_VERSION}"
 # Provenance only (kernel-cache fingerprint / traceability): the chalk commit this version was cut from.
-LATEST_CHALK_MAIN_SHA = "37b2fb9e1a123ceb902ba6ffc4ed182182c6e7d7"
+LATEST_CHALK_MAIN_SHA = "c63f0367e01795006bc0e91e2540ec85e740f19b"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
