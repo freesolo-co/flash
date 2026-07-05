@@ -77,7 +77,9 @@ def _require_gpu():
         if not torch.cuda.is_available():
             _log("no CUDA device visible — kernel warmup must run on a GPU builder; nothing baked")
             return None
-        _log(f"GPU: {torch.cuda.get_device_name(0)} ({_torch_sm(torch)}), torch {torch.__version__}")
+        _log(
+            f"GPU: {torch.cuda.get_device_name(0)} ({_torch_sm(torch)}), torch {torch.__version__}"
+        )
         return torch
     except Exception as e:
         _log(f"torch unavailable ({e}); cannot warm kernels")
@@ -128,6 +130,13 @@ def warm_flash_attn(torch) -> bool:
 def warm_fla_gdn(torch) -> bool:
     """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path)."""
     try:
+        # sm100: tilelang's GDN bwd miscomputes grads — warm the Triton path the worker will run.
+        try:
+            from flash.engine.worker.perf import _force_fla_triton_gdn_on_sm100
+
+            _force_fla_triton_gdn_on_sm100()
+        except Exception as e:
+            _log(f"sm100 fla tilelang opt-out skipped: {e}")
         # fla #640: GDN chunk_bwd needs tilelang on Hopper; Triton path miscomputes/raises there.
         try:
             from flash.engine.worker.perf import _ensure_fla_fastpath_on_hopper
@@ -135,6 +144,14 @@ def warm_fla_gdn(torch) -> bool:
             _ensure_fla_fastpath_on_hopper()
         except Exception as e:
             _log(f"hopper fla fast-path setup skipped: {e}")
+        # fla #913: on Blackwell, warm the SAME restricted autotune space the worker boot will
+        # run (grad-correct configs only) so the baked cache holds the config that actually runs.
+        try:
+            from flash.engine.worker.perf import _restrict_fla_gdn_autotune_on_blackwell
+
+            _restrict_fla_gdn_autotune_on_blackwell()
+        except Exception as e:
+            _log(f"blackwell fla autotune restriction skipped: {e}")
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
         b, h, t, d = 1, 4, 256, 64

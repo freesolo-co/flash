@@ -69,7 +69,12 @@ RUN pip install --no-cache-dir \
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
 # we bake the pinned tilelang==0.1.11 + apache-tvm-ffi==0.1.11 (0.1.12 double-registers TVM-FFI ->
 # `import tilelang` aborts) and KEEP fla on every arch; flash.engine.worker._ensure_fla_fastpath_on_hopper
-# ensures the tilelang backend is live on sm90 before any model import. Validated win vs the old
+# ensures the tilelang backend is live on sm90 before any model import. The INVERSE holds on
+# B200/sm100: THERE the tilelang chunk_bwd_dqkwg miscomputes gradients while the Triton path is
+# correct — and the pinned fla default-enables tilelang wherever it imports (i.e. everywhere,
+# since it is baked here for Hopper), so the worker opts sm100 out via FLA_TILELANG=0
+# (engine.worker.perf._force_fla_triton_gdn_on_sm100; upstream default-gates tilelang to
+# Hopper-only since fla #975). Validated win vs the old
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
