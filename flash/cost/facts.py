@@ -13,8 +13,8 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "RTX 5090": 210.0,
     "A100 PCIe": 312.0,
     "A100 SXM": 312.0,
-    # A100 SXM 40GB: same SMs/tensor cores as the 80GB A100 SXM, less HBM only (Lambda-only class).
-    # Without this, removing A6000 leaves the 33-40 GB Lambda pick falling back to _DEFAULT_TFLOPS.
+    # A100 SXM 40GB: same SMs/tensor cores as the 80GB A100 SXM, less HBM only.
+    # Without this, 33-40 GB Lambda/Vast quotes fall back to _DEFAULT_TFLOPS.
     "A100 SXM 40GB": 312.0,
     "H100": 990.0,
     # H200: same SMs/tensor cores as H100, more HBM only.
@@ -31,16 +31,35 @@ def gpu_tflops(name: str) -> float:
     return GPU_COMPUTE_TFLOPS.get(name, _DEFAULT_TFLOPS)
 
 
-def gpu_hourly_usd(name: str, provider: str | None = None) -> float:
-    """Representative $/hr for a class; uses provider-specific rate when provider='lambda'."""
+def gpu_hourly_usd(
+    name: str, provider: str | None = None, max_wall_seconds: float = 0.0, min_vram_gb: int = 0
+) -> float:
+    """Representative $/hr for a class, on ``provider`` when given.
+
+    When ``provider`` is ``lambda`` or ``vast`` and the class is offered there, price it through that
+    provider's pricing module (live with a static fallback); otherwise use the RunPod static rate.
+
+    ``max_wall_seconds`` (>0) is threaded into the Vast live market so a duration-bound quote prices
+    against offers that outlast the run, not a short-lived one filtered out at launch.
+
+    ``min_vram_gb`` (>0) floors the Vast market search at the job's required VRAM — the SAME floor
+    ``pick_gpu`` selected under — so a high-VRAM class isn't crowded off the price-sorted page and
+    misquoted on the static fallback (selection/quote parity).
+    """
     info = GPU_INFO.get(name)
     if info is None:
         raise KeyError(f"unknown GPU class {name!r}")
     p = (provider or "").strip().lower()
     if p == "lambda" and info.lambda_name:
-        from flash.providers.lambdalabs.pricing import hourly_rate
+        from flash.providers import get_provider
 
-        return hourly_rate(name)
+        return get_provider("lambda").hourly_rate(name)
+    if p == "vast" and info.vast_name:
+        # Vast is a live market whose rates differ materially from RunPod's static ones, so price a
+        # provider="vast" quote through the Vast pricing module (live + static fallback).
+        from flash.providers.vast.pricing import hourly_rate
+
+        return hourly_rate(name, max_wall_seconds=max_wall_seconds, min_vram_gb=min_vram_gb)
     return info.hourly_usd
 
 
@@ -51,8 +70,18 @@ def gpu_vram_gb(name: str) -> int:
     return info.vram_gb
 
 
-def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
-    """Cheapest GPU class (by $/hr) that fits required_vram_gb; gate-free (submit-time allocator restricts to validated pool)."""
+def pick_gpu(
+    required_vram_gb: int, *, provider: str | None = None, max_wall_seconds: float = 0.0
+) -> str:
+    """Cheapest GPU class that fits ``required_vram_gb``, ranked by static $/hr.
+
+    No pin; every fitting class is eligible, validated or not. NOTE this is intentionally
+    gate-free: the submit-time allocator restricts to the validated pool, so the
+    actually-provisioned class can be pricier than the one priced here. ``provider`` restricts
+    candidates to what it can provision. ``max_wall_seconds`` (>0) prices the Vast market against
+    offers that outlast the run, so a long-run quote doesn't SELECT a class on the strength of a
+    short-lived offer that won't survive to launch.
+    """
 
     def _selectable(g: GpuClass) -> bool:
         return provider in (None, "auto") or provider in providers_for(g.name)
@@ -60,9 +89,31 @@ def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     candidates = [g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)]
     if not candidates:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
-    best = min(
-        candidates, key=lambda g: (gpu_hourly_usd(g.name, provider=provider), g.vram_gb, g.name)
-    )
+    # Rank by the rate on the REQUESTED provider, not the RunPod nominal. For Vast, fetch the live offer
+    # map ONCE (a duration-bound query bypasses the per-call cache, so pricing per candidate would fire N
+    # identical market fetches) and, when reachable, restrict to classes that actually have a rentable
+    # offer under the wall cap and rank by LIVE price — else a cheaper class with no surviving offer gets
+    # selected/quoted on a static rate the launch path would never rent. Static fallback when offline.
+    if (provider or "").strip().lower() == "vast":
+        from flash.providers.vast.pricing import live_offer_rates
+
+        live = live_offer_rates(max_wall_seconds=max_wall_seconds, min_vram_gb=required_vram_gb)
+        rentable = [g for g in candidates if g.name in live] if live else []
+        if rentable:
+            candidates = rentable
+
+            def _rate(g: GpuClass) -> float:
+                return live[g.name]
+        else:
+
+            def _rate(g: GpuClass) -> float:
+                return g.hourly_usd
+    else:
+
+        def _rate(g: GpuClass) -> float:
+            return gpu_hourly_usd(g.name, provider=provider, max_wall_seconds=max_wall_seconds)
+
+    best = min(candidates, key=lambda g: (_rate(g), g.vram_gb, g.name))
     return best.name
 
 

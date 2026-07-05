@@ -40,6 +40,18 @@ FIRST_LIVENESS_OBSERVED_FLOOR_S = 120.0
 # Require absence to persist this many polls before declaring sick — one None could be a Hub blip.
 BOOT_LOG_ABSENT_POLLS = 3
 
+# Standardized instance-poll timing defaults, shared by every rent-a-box provider (lambda + vast). The
+# per-provider _DEAD_STATES vocabulary and status-field name stay local to each jobs module.
+# LOAD_TIMEOUT_S: how long an instance may sit non-running (image pull / provisioning) before we give up.
+# SETUP_GRACE_S / STALL_AFTER_S: the staged no-progress window once running — the larger setup grace
+# covers the heartbeat-less cold start (pip install + base-model download), tightening to STALL_AFTER_S
+# only once a real training heartbeat arrives. PROVISION_GRACE_S: provision + cold-start slack added to
+# the run's wall cap for the client-side poll deadline (neither substrate has a server-side timeout).
+LOAD_TIMEOUT_S = 900.0
+SETUP_GRACE_S = 3000.0
+STALL_AFTER_S = 1500.0
+PROVISION_GRACE_S = 3000.0
+
 
 def make_say(log) -> Callable[[str], None]:
     """A timestamped line logger that no-ops when ``log`` is None."""

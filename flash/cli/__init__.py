@@ -168,7 +168,7 @@ class _FlashParser(_ThemedParser):
         footers = [
             f"new here? run `{CLI_NAME} login`, then `{CLI_NAME} env setup`",
             f"train after publishing: `{CLI_NAME} env push --name my-env .`, "
-            f"then `{CLI_NAME} train configs/rl.toml`",
+            f"then `{CLI_NAME} train configs/sft.toml`",
             f"any command in depth: `{CLI_NAME} <command> --help`",
             "docs: https://freesolo.co/docs",
         ]
@@ -234,7 +234,46 @@ def _build_parser() -> argparse.ArgumentParser:
     env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
     setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
-    setup.set_defaults(func=cmd_env_setup)
+    setup_mode = setup.add_mutually_exclusive_group()
+    setup_mode.add_argument(
+        "--single-turn",
+        dest="turn_mode",
+        action="store_const",
+        const="single",
+        help="scaffold a single-turn environment (prompt -> one response). This is the default.",
+    )
+    setup_mode.add_argument(
+        "--multi-turn",
+        dest="turn_mode",
+        action="store_const",
+        const="multi",
+        help="scaffold a multi-turn environment (bounded episode with step_episode / score_episode).",
+    )
+    setup_reason = setup.add_mutually_exclusive_group()
+    setup_reason.add_argument(
+        "--reasoning",
+        dest="reasoning",
+        action="store_const",
+        const=True,
+        help="scaffold configs with reasoning enabled (thinking = true, with a raised token budget).",
+    )
+    setup_reason.add_argument(
+        "--no-reasoning",
+        dest="reasoning",
+        action="store_const",
+        const=False,
+        help="scaffold configs without reasoning. This is the default.",
+    )
+    setup.add_argument(
+        "-y",
+        "--yes",
+        dest="yes",
+        action="store_true",
+        help="accept defaults without prompting (single-turn, no reasoning).",
+    )
+    # turn_mode / reasoning default to None (unset) so the scaffold can tell an explicit flag
+    # apart from "not chosen yet" and, on an interactive terminal, ask instead of assuming.
+    setup.set_defaults(func=cmd_env_setup, turn_mode=None, reasoning=None, yes=False)
 
     env_list = env_sub.add_parser("list", help="list local environment sources")
     env_list.set_defaults(func=cmd_env_list)

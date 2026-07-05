@@ -276,6 +276,8 @@ def test_init_from_adapter_accepts_checkpoint_step_ref() -> None:
     [
         "Freesolo-Co/flashrun-run-x:sft/run-x",  # legacy long storage form: no longer accepted
         "Freesolo-Co/flashrun-run-x:rl/run-x/checkpoints/step-40",
+        "run-x/run-x/step-40",  # doubled run_id: only ONE run_id segment, then optional /step-N
+        "run-x/step-40/step-1",  # more than one /step-N segment
         "run-x/step-",  # no step number
         "run-x/step-1111111111111111111",  # too many digits to be a bounded step
         "run-x/step-4/adapter",  # trailing path
@@ -287,6 +289,21 @@ def test_init_from_adapter_accepts_checkpoint_step_ref() -> None:
 def test_init_from_adapter_rejects_non_short_refs(bad_ref: str) -> None:
     with pytest.raises(ConfigError, match="run_id"):
         spec_from_dict(_spec_raw(bad_ref), run_id="grpo-x")
+
+
+def test_init_from_adapter_accepts_only_the_two_canonical_shapes() -> None:
+    """Pin the warm-start grammar: `train.init_from_adapter` accepts EXACTLY `<run_id>` and
+    `<run_id>/step-N` — nothing else. This is the one public shape the control plane also
+    speaks; keeping the client's accepted set identical is what prevents a repeat of the
+    0.2.34 CLI-vs-control-plane skew (CLI wanted the long `<owner>/<repo>:<phase>/<run_id>`
+    storage ref, the server wanted the bare run id, and no single string satisfied both)."""
+    for good in ("run-x", "run-x/step-40"):
+        assert spec_from_dict(_spec_raw(good), run_id="grpo-x").train.init_from_adapter == good
+    # Anything with a second path segment other than a single /step-N is rejected — in
+    # particular the doubled `<run_id>/<run_id>/step-N` form and the legacy storage ref.
+    for bad in ("run-x/run-x/step-40", "run-x/step-40/step-1", "Freesolo-Co/repo:sft/run-x"):
+        with pytest.raises(ConfigError, match="run_id"):
+            spec_from_dict(_spec_raw(bad), run_id="grpo-x")
 
 
 @pytest.mark.parametrize(

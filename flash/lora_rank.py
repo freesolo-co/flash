@@ -60,8 +60,7 @@ def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
         rank_pattern = config["rank_pattern"]
         if not isinstance(rank_pattern, Mapping):
             raise ValueError(
-                f"could not verify adapter rank: {source} has invalid rank metadata "
-                "(rank_pattern)"
+                f"could not verify adapter rank: {source} has invalid rank metadata (rank_pattern)"
             )
         ranks.extend(
             _positive_int(v, source=source, field="rank_pattern") for v in rank_pattern.values()
@@ -76,9 +75,7 @@ def uniform_rank_from_adapter_config(config: Mapping[str, Any], *, source: str) 
     if not isinstance(config, Mapping):
         raise ValueError(f"adapter rank preflight: {source} is not a JSON object")
     if config.get("r") is None:
-        raise ValueError(
-            f"adapter rank preflight: {source} must contain a positive integer `r`"
-        )
+        raise ValueError(f"adapter rank preflight: {source} must contain a positive integer `r`")
     rank = _positive_int(config["r"], source=source, field="r")
     for key in ("rank_pattern", "alpha_pattern"):
         pattern = config.get(key)
@@ -126,8 +123,7 @@ def load_hf_adapter_config(adapter_ref: str, token: str | None = None) -> Mappin
         ) from exc
     if not isinstance(config, Mapping):
         raise ValueError(
-            f"could not verify train.init_from_adapter rank: {repo}:{filename} "
-            "is not a JSON object"
+            f"could not verify train.init_from_adapter rank: {repo}:{filename} is not a JSON object"
         )
     return config
 
@@ -191,3 +187,42 @@ def preflight_init_adapter_lora_rank(
         f"rank {recombined_rank} (SFT rank {sft_rank} + GRPO rank {grpo_rank}), exceeding "
         f"{spec.model}'s serving max_lora_rank={max_lora_rank}; {guidance}"
     )
+
+
+def preflight_train_context_within_serving(spec: JobSpec) -> None:
+    """Reject a run whose training context exceeds the model's serving ``max_model_len``.
+
+    A LoRA is served at the model's fixed serving context; training it at a LONGER sequence wastes
+    compute and learns positions inference never uses. The control plane calls this before submitting
+    a run — CPU-only (catalog lookup, no GPU, no network), like the rank preflight above.
+    Open-policy / uncataloged models have no serving cap and are skipped.
+
+    SFT training context is ``train.max_length``; GRPO is the rollout prompt+completion length
+    (``grpo_rollout_seq_len``, which folds in ``train.max_tokens`` and the recipe defaults). An unset
+    SFT ``max_length`` uses the worker's small recipe default (always within the cap) and is skipped.
+    """
+    from flash.catalog import serving_context_cap
+    from flash.engine.vram import grpo_rollout_seq_len
+
+    cap = serving_context_cap(spec.model)
+    if cap is None:
+        return
+
+    if spec.algorithm == "grpo":
+        effective = grpo_rollout_seq_len(
+            spec.train.max_length or 0, spec.train.max_tokens, spec.thinking
+        )
+        knob = "train.max_length / train.max_tokens (GRPO rollout prompt+completion)"
+    else:
+        effective = int(spec.train.max_length or 0)
+        if effective <= 0:  # unset -> worker recipe default, always within the cap
+            return
+        knob = "train.max_length"
+
+    if effective > cap:
+        raise ValueError(
+            f"{knob}={effective} exceeds {spec.model}'s serving max_model_len={cap}: a LoRA trained "
+            f"at a longer context than it is served wastes compute and learns positions never used "
+            f"at inference. Lower it to <= {cap}, or raise the serving context after real-GPU "
+            f"validation."
+        )

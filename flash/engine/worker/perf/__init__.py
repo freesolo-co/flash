@@ -54,6 +54,7 @@ from flash.engine.worker.perf.memory import (
     fused_optim_name,
     grad_checkpointing_on,
     grpo_sleep_mode,
+    grpo_use_reentrant,
 )
 
 
@@ -350,6 +351,7 @@ __all__ = [
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "grpo_sleep_mode",
+    "grpo_use_reentrant",
     "is_cuda_oom",
     "liger_on",
     "loraplus_optimizer_cls",
