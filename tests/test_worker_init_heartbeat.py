@@ -190,6 +190,33 @@ def test_liveness_heartbeat_first_progress_sample_is_baseline_not_progress(monke
     assert all(step == 57 for _, step in seen), "pings still stamp the baseline step"
 
 
+def test_liveness_heartbeat_survives_inline_thread_stub(monkeypatch):
+    """Several suites stub threading.Thread to run targets INLINE on .start() (to make the
+    checkpoint-upload daemon synchronous). The liveness daemon must detect it is running on the
+    spawning thread and bail, or the inlined loop spins forever and hangs the whole test run
+    (bit test_resume_on_retry via the checkpoint_prefetching wrap in hf_resume_checkpoint)."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    emitted: list = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: emitted.append(s))
+
+    class _SyncThread:
+        def __init__(self, target=None, daemon=None, **kw):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(hb.threading, "Thread", _SyncThread)
+    t0 = time.time()
+    with hb.liveness_heartbeat("checkpoint_prefetching"):
+        pass
+    assert time.time() - t0 < 5, "inlined daemon must return immediately, not spin on done.wait"
+    assert emitted == [], "an inlined daemon emits nothing"
+
+
 def test_liveness_heartbeat_dumps_stacks_once_when_progress_stale(monkeypatch):
     """No REAL progress for _STALL_DUMP_S -> dump every thread's stack ONCE (operator trace); the
     provider does the kill+retry off the same stale-progress signal."""

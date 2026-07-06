@@ -258,8 +258,14 @@ def liveness_heartbeat(stage, progress=None, progress_step=False):
     Uses nvidia-smi-only diagnostics (main thread holds CUDA/allocator locks).
     """
     done = threading.Event()
+    spawner = threading.current_thread()
 
     def _loop() -> None:
+        if threading.current_thread() is spawner:
+            # some tests stub threading.Thread to run targets INLINE on .start() (to make the
+            # checkpoint-upload daemon synchronous). inlined, this loop would spin forever on
+            # the caller's thread — a liveness daemon is only meaningful on its own thread.
+            return
         last_val = None
         dumped = False
         while not done.wait(_LIVENESS_TICK_S):
