@@ -23,17 +23,32 @@ _HB_THROTTLED_STAGES = frozenset(
         "rl_step",
         "sft_step",
         "model_prefetching",
+        "checkpoint_prefetching",
+        "sft_data_loading",
+        "rl_data_loading",
+        "rl_adapter_loading",
         "sft_pretokenizing",
         "sft_initializing",
         "rl_initializing",
+        "sft_finalizing",
+        "rl_finalizing",
     }
 )
+# quiet phases where the liveness daemon is the only signal; upload at the faster setup cadence so
+# run status stays visibly fresh. every stage here must also be in _HB_THROTTLED_STAGES (the daemon
+# re-emits the same stage every 30s, which would otherwise commit unthrottled).
 _HB_SETUP_LIVENESS_STAGES = frozenset(
     {
         "model_prefetching",
+        "checkpoint_prefetching",
+        "sft_data_loading",
+        "rl_data_loading",
+        "rl_adapter_loading",
         "sft_pretokenizing",
         "sft_initializing",
         "rl_initializing",
+        "sft_finalizing",
+        "rl_finalizing",
     }
 )
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
@@ -79,6 +94,17 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
     # liveness pings don't count as progress; provider stall detection skips them.
     if not liveness:
         _w._HB_LAST_PROGRESS_TS = ts
+    with _HB_LOCK:
+        if not liveness:
+            _w._HB_PROGRESS_SEQ += 1
+        elif _w._HB_PROGRESS_SEQ > _w._HB_PROGRESS_UPLOADED_SEQ:
+            # progress-carry: a real heartbeat since the last committed snapshot never reached HF
+            # (throttled away or its upload failed). upgrade this ping to a real heartbeat so the
+            # control plane's stall clock sees that progress instead of killing a healthy run.
+            # deliberately after the _HB_LAST_PROGRESS_TS bump above: carried progress is not NEW
+            # progress, so the worker's own stall-dump timer keeps its original reference point.
+            liveness = False
+        my_progress_seq = _w._HB_PROGRESS_SEQ
     payload = {
         "stage": stage,
         "ts": ts,
@@ -130,6 +156,13 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
                     # ``is False`` (not falsy) so a mock/None never trips the rollback.
                     _rollback_throttle_slot(my_claim, prev_last_upload)
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
+                elif not liveness:
+                    # this committed snapshot carried real progress; settle the progress-carry
+                    # latch up to the seq captured when the snapshot was built (max: a concurrent
+                    # newer real heartbeat that lost the upload race must stay pending).
+                    with _HB_LOCK:
+                        if my_progress_seq > _w._HB_PROGRESS_UPLOADED_SEQ:
+                            _w._HB_PROGRESS_UPLOADED_SEQ = my_progress_seq
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
@@ -215,15 +248,24 @@ _STALL_DUMP_S = 1200.0
 
 
 @contextlib.contextmanager
-def liveness_heartbeat(stage, progress=None):
+def liveness_heartbeat(stage, progress=None, progress_step=False):
     """Emit liveness pings for ``stage`` while the wrapped block runs on the main thread.
 
     ``progress``: optional ``() -> float | None`` monotonic counter; advances emit a REAL heartbeat.
+    ``progress_step``: the counter IS the trainer global step; stamp it as ``step`` on every emit so
+    the poller's step gate and cancel billing see the true step even when this daemon wins the
+    upload slot ahead of the trainer's own per-step callback.
     Uses nvidia-smi-only diagnostics (main thread holds CUDA/allocator locks).
     """
     done = threading.Event()
+    spawner = threading.current_thread()
 
     def _loop() -> None:
+        if threading.current_thread() is spawner:
+            # some tests stub threading.Thread to run targets INLINE on .start() (to make the
+            # checkpoint-upload daemon synchronous). inlined, this loop would spin forever on
+            # the caller's thread — a liveness daemon is only meaningful on its own thread.
+            return
         last_val = None
         dumped = False
         while not done.wait(_LIVENESS_TICK_S):
@@ -231,12 +273,22 @@ def liveness_heartbeat(stage, progress=None):
             if progress is not None:
                 with contextlib.suppress(Exception):
                     v = progress()
-                    if v is not None and (last_val is None or float(v) > last_val):
-                        last_val, made_progress = float(v), True
+                    if v is not None:
+                        if last_val is None:
+                            # first sample is a BASELINE, not progress: a resumed run's restored
+                            # global step must not tighten the provider's stall window seconds
+                            # into train(), and a constant counter must never emit phantom
+                            # progress. only a later ADVANCE past this baseline is real.
+                            last_val = float(v)
+                        elif float(v) > last_val:
+                            last_val, made_progress = float(v), True
             gpu = gpu_diagnostics(include_torch=False)
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
-            _w.heartbeat(stage, liveness=not made_progress, gpu=gpu)
+            extra = {}
+            if progress_step and last_val is not None:
+                extra["step"] = int(last_val)
+            _w.heartbeat(stage, liveness=not made_progress, gpu=gpu, **extra)
             last_progress = float(getattr(_w, "_HB_LAST_PROGRESS_TS", 0.0) or 0.0)
             if not dumped and last_progress and (time.time() - last_progress) > _STALL_DUMP_S:
                 _dump_thread_stacks(f"{stage}: no progress for >{_STALL_DUMP_S:.0f}s")
