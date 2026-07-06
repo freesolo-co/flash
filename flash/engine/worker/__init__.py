@@ -154,12 +154,18 @@ _HB_LAST_UPLOAD = 0.0
 # starved real channel makes a healthy run look stalled (killed + retried, possibly cross-GPU-class).
 _HB_LAST_LIVENESS_UPLOAD = 0.0
 _HB_LAST_PROGRESS_TS = 0.0
-# Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
-# per-repo commit cap while staying under the provider poller's 1200s training stall window.
-_HB_MIN_INTERVAL_S = 900.0
-# Setup liveness is the user-visible signal during cold model download/load. Keep it below common
-# external "frozen heartbeat" thresholds without relaxing the noisy per-step training throttle.
-_HB_SETUP_LIVENESS_INTERVAL_S = 240.0
+# Heartbeat commit cadence. Environment-scoped artifact repos are shared by many runs (~128/hr HF
+# commit cap), so STEADY-STATE (training) stays at 900s -> ~4 commits/hr/run; with the ~1/hr console
+# upload that's <=5/hr/run, keeping ~25 concurrent same-env runs under the cap (guarded by
+# test_live_console_uploads_are_throttled_for_shared_artifact_repos). Every training commit carries
+# the live global_step and the poller's training stall window is 1200s > 900s, so a throttled-but-
+# healthy run is never auto-cancelled.
+_HB_MIN_INTERVAL_S = float(os.environ.get("FLASH_HB_TRAIN_INTERVAL_S") or 900.0)
+# SETUP liveness (download / tokenize / trainer-init) is where `last_heartbeat.ts` froze for minutes:
+# a ~145s model download never reached the old 240s interval, so NO heartbeat committed for the whole
+# download. 90s guarantees mid-phase commits so status keeps advancing. Setup is TIME-BOUNDED (a few
+# minutes, then training's 900s takes over), so the tighter rate doesn't move the steady-state budget.
+_HB_SETUP_LIVENESS_INTERVAL_S = float(os.environ.get("FLASH_HB_SETUP_INTERVAL_S") or 90.0)
 _HB_TERMINAL_ONLY = False
 
 _WANDB_FINISH_WAIT_S = 120.0

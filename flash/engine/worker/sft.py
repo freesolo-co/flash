@@ -10,7 +10,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.heartbeat import compile_cache_bytes, liveness_heartbeat
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
     completion_mask_from_ids,
@@ -515,7 +515,9 @@ def run_sft():
     # SFTTrainer.__init__ can block 10-15 min (FA2 JIT). liveness_heartbeat keeps the control plane
     # from recycling the worker. include_torch=False: side-thread torch.cuda telemetry serializes on
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
-    with liveness_heartbeat("sft_initializing"):
+    # progress=compile_cache_bytes: FA2/torch-compile JIT grows the kernel cache as it works, so the
+    # plane sees real forward motion during the 10-15 min init and never false-stalls a healthy build.
+    with liveness_heartbeat("sft_initializing", progress=compile_cache_bytes):
         trainer = _SFT(
             model=model_id,
             args=cfg,

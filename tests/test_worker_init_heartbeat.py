@@ -292,9 +292,85 @@ def test_setup_liveness_upload_uses_shorter_interval(monkeypatch):
 def test_default_heartbeat_interval_fits_shared_environment_repos():
     import flash.engine.worker as ne
 
-    assert ne._HB_MIN_INTERVAL_S >= 900.0
-    assert ne._HB_MIN_INTERVAL_S < 1200.0
-    assert 180.0 <= ne._HB_SETUP_LIVENESS_INTERVAL_S < 300.0
+    # Steady-state (training) interval stays >=900s so heartbeat+console commits are <=5/hr/run on a
+    # shared env repo (test_live_console_uploads_are_throttled_for_shared_artifact_repos), while
+    # staying under the provider's 1200s training stall window.
+    assert 900.0 <= ne._HB_MIN_INTERVAL_S < 1200.0
+    # Setup interval must be tighter than a typical model download (~145s) so at least one heartbeat
+    # commits DURING the download instead of freezing status for the whole phase. Setup is time-
+    # bounded so this doesn't affect the steady-state commit budget.
+    assert 30.0 <= ne._HB_SETUP_LIVENESS_INTERVAL_S <= 120.0
+    assert ne._HB_SETUP_LIVENESS_INTERVAL_S < 145.0
+
+
+def test_setup_liveness_commits_during_a_download_shorter_than_old_interval(monkeypatch):
+    """The download freeze: a ~145s model download never reached the OLD 240s interval, so NO
+    heartbeat committed for the whole download and `last_heartbeat.ts` froze. At the setup interval
+    a liveness ping must commit mid-download so status keeps advancing."""
+    import json
+
+    import flash.engine.worker as ne
+
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+    now = {"t": 1000.0}
+    uploads: list[dict] = []
+
+    def _capture(local, *a, **k):
+        with open(local) as f:
+            uploads.append(json.load(f))
+
+    monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
+    monkeypatch.setattr(ne, "hf_upload_file", _capture)
+    ne._HB_LAST_UPLOAD = 1000.0
+    ne._HB_LAST_LIVENESS_UPLOAD = 0.0
+
+    # 100s into a download — under the OLD 240s interval (would have stayed frozen), at/over the
+    # new setup interval it commits.
+    now["t"] = 1000.0 + ne._HB_SETUP_LIVENESS_INTERVAL_S + 1.0
+    ne.heartbeat("model_prefetching", liveness=True)
+    assert uploads, "a setup liveness ping must commit within the setup interval (no download freeze)"
+    assert uploads[-1]["stage"] == "model_prefetching"
+
+
+def test_compile_cache_bytes_reports_jit_growth_as_progress(monkeypatch, tmp_path):
+    """sft_initializing/rl_initializing progress signal: growing JIT cache = forward motion, so a
+    10-15 min trainer init never looks like a dead worker. None when no cache dir exists (fast
+    cache-hit init needs no signal)."""
+    hbmod = importlib.import_module("flash.engine.worker.heartbeat")
+
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    assert hbmod.compile_cache_bytes() is None, "no cache dir -> no signal (graceful)"
+
+    triton = tmp_path / "triton"
+    (triton / "sub").mkdir(parents=True)
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(triton))
+    (triton / "sub" / "kernel.cubin").write_bytes(b"x" * 100)
+    first = hbmod.compile_cache_bytes()
+    assert first == 100
+    (triton / "sub" / "kernel2.cubin").write_bytes(b"y" * 50)
+    assert hbmod.compile_cache_bytes() == 150, "the JIT writing more kernels must read as advance"
+
+
+@pytest.mark.parametrize(
+    ("modname", "outer", "stage"),
+    [
+        ("flash.engine.worker.sft", "run_sft", "sft_initializing"),
+        ("flash.engine.worker.rl", "run_rl", "rl_initializing"),
+    ],
+)
+def test_trainer_init_wraps_with_compile_cache_progress(modname, outer, stage):
+    """The long trainer-init wrap must pass progress=compile_cache_bytes so the plane sees forward
+    motion during FA2/torch-compile JIT and never false-stalls a healthy build."""
+    mod = importlib.import_module(modname)
+    src = inspect.getsource(getattr(mod, outer))
+    m = re.search(r"liveness_heartbeat\(\s*\"" + stage + r"\"", src)
+    assert m, f"{outer} must wrap its trainer init in liveness_heartbeat({stage!r})"
+    window = src[m.start() : m.start() + 200]
+    assert "progress=compile_cache_bytes" in window, (
+        f"{outer}'s {stage} wrap must pass progress=compile_cache_bytes (init emits no other "
+        "progress; without it a 10-15 min JIT init can trip a false stall)"
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -373,13 +449,13 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
 def test_rl_init_wraps_trainer_build_in_liveness_heartbeat():
     from flash.engine.worker import rl
 
-    assert 'liveness_heartbeat("rl_initializing")' in inspect.getsource(rl.run_rl)
+    assert 'liveness_heartbeat("rl_initializing"' in inspect.getsource(rl.run_rl)
 
 
 def test_sft_init_wraps_trainer_build_in_liveness_heartbeat():
     from flash.engine.worker import sft
 
-    assert 'liveness_heartbeat("sft_initializing")' in inspect.getsource(sft.run_sft)
+    assert 'liveness_heartbeat("sft_initializing"' in inspect.getsource(sft.run_sft)
 
 
 @pytest.mark.parametrize(

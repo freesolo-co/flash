@@ -148,7 +148,6 @@ def _submit_seed_supervised(
         _update,
         flash_code_prefix,
         get_status,
-        record_attempt,
     )
 
     code_prefix = code_prefix or flash_code_prefix()
@@ -351,16 +350,6 @@ def _submit_seed_supervised(
                 run_spec = _drop_weight_cache(run_spec)
             current_gpu["name"] = chosen.gpu
             current_attempt["value"] = attempt
-            with contextlib.suppress(Exception):
-                record_attempt(
-                    spec.run_id,
-                    {
-                        "attempt": attempt,
-                        "provider": chosen.provider,
-                        "gpu": chosen.gpu,
-                        "ts": time.time(),
-                    },
-                )
             provider = get_provider(chosen.provider)
             try:
                 submit_kwargs = {
@@ -392,12 +381,8 @@ def _submit_seed_supervised(
             _gc_seen_endpoints()
             if chosen is not None and isinstance(res.metrics, dict):
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
-            with contextlib.suppress(Exception):
-                record_attempt(spec.run_id, {"attempt": attempt, "outcome": "ok"})
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
-        with contextlib.suppress(Exception):
-            record_attempt(spec.run_id, {"attempt": attempt, "outcome": str(res.failure or "")})
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
             oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)

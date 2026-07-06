@@ -10,7 +10,7 @@ from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.grpo import resolve_grpo_sleep_mode
-from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.heartbeat import compile_cache_bytes, liveness_heartbeat
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     is_vl_checkpoint,
@@ -573,7 +573,9 @@ def run_rl():
     # GRPOTrainer.__init__ blocks 10-20 min on first use (vLLM build + FA2 compile); the side-thread
     # heartbeat must use the nvidia-smi-only path (include_torch=False) — torch.cuda calls would
     # serialize on the CUDA/allocator locks held by the init thread and false-flag a hang.
-    with liveness_heartbeat("rl_initializing"):
+    # progress=compile_cache_bytes: the long JIT/compile init grows the kernel cache; reporting it as
+    # forward motion keeps the plane from false-stalling a healthy build (see sft.py).
+    with liveness_heartbeat("rl_initializing", progress=compile_cache_bytes):
         trainer = GRPOTrainer(
             model=init_model,
             args=cfg,

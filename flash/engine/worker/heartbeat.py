@@ -277,6 +277,29 @@ _LIVENESS_TICK_S = 30.0
 _STALL_DUMP_S = 1200.0
 
 
+def compile_cache_bytes() -> int | None:
+    """Total bytes in the triton/inductor JIT cache dirs, or None if neither exists yet.
+
+    A forward-motion signal for ``sft_initializing`` / ``rl_initializing``: ``SFTTrainer.__init__``
+    can block 10-15 min on FA2/torch-compile JIT and emits no other progress, so the plane sees
+    "no progress" and can false-stall a perfectly healthy worker. The JIT writes compiled kernels
+    into these cache dirs as it goes, so their growing size proves the init is advancing. Pure
+    filesystem (no CUDA / no torch) so it can't block on the CUDA lock the init thread holds. The
+    dirs are set by ``kernel_warmup.load_mega_cache`` at boot (baked cache, or a JIT scratch dir)."""
+    total = 0
+    seen = False
+    for var in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
+        d = os.environ.get(var)
+        if not d or not os.path.isdir(d):
+            continue
+        seen = True
+        for root, _dirs, files in os.walk(d):
+            for fn in files:
+                with contextlib.suppress(OSError):
+                    total += os.path.getsize(os.path.join(root, fn))
+    return total if seen else None
+
+
 @contextlib.contextmanager
 def liveness_heartbeat(stage, progress=None):
     """Emit liveness pings for ``stage`` while the wrapped block runs on the main thread.
