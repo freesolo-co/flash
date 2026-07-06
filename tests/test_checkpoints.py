@@ -10,7 +10,6 @@ All HF/network boundaries are stubbed; nothing here touches a GPU or the network
 
 from __future__ import annotations
 
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -197,19 +196,20 @@ def test_latest_checkpoint_dir_picks_highest_step(tmp_path):
 def test_on_train_end_flushes_final_deployable_checkpoint(
     tmp_path, monkeypatch, fake_trainer_callback
 ):
-    """A fast RL run can exit before its last save's async (daemon) upload finishes, so
-    on_train_end must SYNCHRONOUSLY publish the latest on-disk checkpoint as a deployable
-    snapshot — otherwise `flash checkpoints` is empty even though the run trained fine."""
+    """on_train_end is the safety net for a final checkpoint the trainer wrote WITHOUT an on_save
+    (e.g. an end-of-training / load_best_model_at_end save). It must publish the latest on-disk
+    checkpoint as a deployable — otherwise `flash checkpoints` is empty even though the run trained
+    fine. (on_save uploads synchronously, so every step it sees is already up by this point.)"""
     import flash.engine.worker as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
     out = tmp_path / "out"
     out.mkdir()
-    _make_ckpt_dir(out, 8)  # last save the trainer wrote locally; its async upload was "lost"
+    _make_ckpt_dir(out, 8)  # a final checkpoint on disk that no on_save uploaded
     cb = worker.make_checkpoint_upload_callback()
 
-    # No on_save uploads recorded (simulating their daemon threads being killed at exit).
+    # No on_save fired for this step, so on_train_end must publish it.
     cb.on_train_end(SimpleNamespace(output_dir=str(out)), None, None)
 
     deployable = [
@@ -217,61 +217,6 @@ def test_on_train_end_flushes_final_deployable_checkpoint(
     ]
     assert len(deployable) == 1, "on_train_end must publish the final deployable checkpoint"
     assert "optimizer.pt" in deployable[0]["ignore_patterns"]
-
-
-def test_on_train_end_publishes_final_deployable_when_lock_is_held(
-    tmp_path, monkeypatch, fake_trainer_callback
-):
-    """Regression: a slow on_save upload can still hold the upload lock at run end (and the final
-    step's own on_save may have been skipped on that busy lock). on_train_end must then publish the
-    final deployable WITHOUT the lock instead of timing out and skipping it — otherwise the worker
-    exits, kills the daemon mid-upload, and `flash checkpoints` is empty despite a successful run."""
-    import threading
-
-    from flash.engine.worker import hf as worker_hf
-
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(worker_hf, "_CKPT_FLUSH_TIMEOUT_S", 0.05)  # give up on the held lock fast
-
-    out = tmp_path / "out"
-    out.mkdir()
-    _make_ckpt_dir(out, 4)  # earlier step; its on_save upload will block, holding the lock
-    _make_ckpt_dir(out, 8)  # the FINAL step (its on_save was skipped on the busy lock)
-
-    holding = threading.Event()
-    release = threading.Event()
-    base_upload = rec.upload_folder
-
-    def upload(**kwargs):
-        base_upload(**kwargs)
-        if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
-            holding.set()  # the resume upload now holds the lock...
-            release.wait(5)  # ...keep holding it across the on_train_end flush
-
-    rec.upload_folder = upload
-
-    started: list = []
-    real_thread = threading.Thread
-    monkeypatch.setattr(
-        worker.threading,
-        "Thread",
-        lambda *a, **k: started.append(real_thread(*a, **k)) or started[-1],
-    )
-
-    cb = worker.make_checkpoint_upload_callback()
-    try:
-        cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-        assert holding.wait(5), "the step-4 upload should be holding the lock"
-        cb.on_train_end(SimpleNamespace(output_dir=str(out)), None, None)
-        deployable = [
-            u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-8/adapter")
-        ]
-        assert len(deployable) == 1, "final deployable must publish even when the lock is held"
-    finally:
-        release.set()
-        for t in started:
-            t.join(5)
 
 
 def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch, fake_trainer_callback):
@@ -287,6 +232,27 @@ def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch, fake_trainer
     assert rec.uploads == []
 
 
+def test_on_save_uploads_synchronously_before_returning(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """Uploads are synchronous: by the time on_save returns, the checkpoint is fully on HF — no
+    background thread is left running. This is what makes "upload busy" impossible by construction:
+    a later save can never find this one still in flight."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)
+    cb = worker.make_checkpoint_upload_callback()
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+    # Fully uploaded the moment on_save returns — no polling, no thread join needed.
+    paths = [u["path_in_repo"] for u in rec.uploads]
+    assert "rl/flash-ckpt-1/checkpoints/step-4/adapter" in paths
+    assert "rl/flash-ckpt-1/checkpoint/checkpoint-4" in paths
+
+
 def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_trainer_callback):
     """The durable, accumulating deployable adapter must be uploaded BEFORE the larger
     latest-only resume checkpoint, so it lands first if the worker is torn down mid-upload."""
@@ -294,25 +260,11 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
-
-    class _SyncThread:  # run the upload body inline so the unit test is deterministic
-        def __init__(self, target=None, daemon=None, **kw):
-            self._target = target
-
-        def start(self):
-            if self._target:
-                self._target()
-
-    monkeypatch.setattr(worker.threading, "Thread", _SyncThread)
     out = tmp_path / "out"
     out.mkdir()
     _make_ckpt_dir(out, 4)
     cb = worker.make_checkpoint_upload_callback()
-    cb.on_save(
-        SimpleNamespace(output_dir=str(out)),
-        SimpleNamespace(global_step=4),
-        None,
-    )
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
     paths = [u["path_in_repo"] for u in rec.uploads]
     assert paths == [
         "rl/flash-ckpt-1/checkpoints/step-4/adapter",  # deployable first
@@ -320,219 +272,61 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
     ]
 
 
-def test_on_save_queues_busy_step_instead_of_skipping(tmp_path, monkeypatch, fake_trainer_callback):
-    """`save_every` must not be advisory: a save that fires while a prior upload is still in
-    flight is queued and uploaded once the in-flight one finishes — previously it was dropped
-    ("upload busy; skipping step N"), leaving a sparse registered step list."""
-    import threading
+def test_consecutive_saves_each_upload_no_coalescing(tmp_path, monkeypatch, fake_trainer_callback):
+    """Every save uploads its own step. Synchronous uploads make "upload busy" coalescing
+    impossible: back-to-back saves each publish their deployable, so the registered step list is
+    never thinned under contention (the old newest-wins slot dropped intermediate steps)."""
+    import flash.engine.worker as worker
 
     rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-
+    _prime_worker(monkeypatch, rec)
     out = tmp_path / "out"
     out.mkdir()
-    _make_ckpt_dir(out, 4)
-    _make_ckpt_dir(out, 8)
-
-    holding = threading.Event()
-    release = threading.Event()
-    base_upload = rec.upload_folder
-
-    def upload(**kwargs):
-        base_upload(**kwargs)
-        if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
-            holding.set()  # the step-4 resume upload now holds the lock...
-            release.wait(5)  # ...until we let it finish
-
-    rec.upload_folder = upload
-
     cb = worker.make_checkpoint_upload_callback()
-    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-    assert holding.wait(5), "the step-4 upload should be holding the lock"
-    # step-8 save fires while step-4 is uploading: it must be queued, not skipped.
-    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=8), None)
-    release.set()
-
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if any(u["path_in_repo"].endswith("checkpoints/step-8/adapter") for u in rec.uploads):
-            break
-        time.sleep(0.02)
-    deployable = [
-        u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-8/adapter")
-    ]
-    assert len(deployable) == 1, "a busy-lock save must be queued and uploaded, not skipped"
-
-
-def test_on_save_survives_trainer_rotation_of_queued_checkpoint(
-    tmp_path, monkeypatch, fake_trainer_callback
-):
-    """`save_total_limit=1` deletes checkpoint-N inside the trainer's NEXT save — before that
-    save's on_save even fires — so a queued upload used to find its dir gone and drop the step.
-    on_save must snapshot the dir while it is alive; the queued step must upload fully from the
-    snapshot even after the live dir is rotated away."""
-    import shutil as _shutil
-    import threading
-
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-
-    out = tmp_path / "out"
-    out.mkdir()
-    _make_ckpt_dir(out, 4)
-    ckpt8 = _make_ckpt_dir(out, 8)
-
-    holding = threading.Event()
-    release = threading.Event()
-    base_upload = rec.upload_folder
-
-    def upload(**kwargs):
-        base_upload(**kwargs)
-        if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
-            holding.set()  # the step-4 resume upload now holds the pump...
-            release.wait(5)  # ...while the trainer rotates step 8's dir away
-
-    rec.upload_folder = upload
-
-    cb = worker.make_checkpoint_upload_callback()
-    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-    assert holding.wait(5), "the step-4 upload should be in flight"
-    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=8), None)
-    _shutil.rmtree(ckpt8)  # save_total_limit rotation: the live dir vanishes while step 8 waits
-    release.set()
-
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if any(u["path_in_repo"].endswith("checkpoint/checkpoint-8") for u in rec.uploads):
-            break
-        time.sleep(0.02)
-    paths = [u["path_in_repo"] for u in rec.uploads]
-    assert "rl/flash-ckpt-1/checkpoints/step-8/adapter" in paths, (
-        "rotated step's deployable must upload from the snapshot"
+    for step in (4, 8, 12):
+        _make_ckpt_dir(out, step)
+        cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=step), None)
+    deployables = sorted(
+        p["path_in_repo"] for p in rec.uploads if p["path_in_repo"].endswith("/adapter")
     )
-    assert "rl/flash-ckpt-1/checkpoint/checkpoint-8" in paths, (
-        "rotated step's resume checkpoint must upload from the snapshot"
-    )
-    staging = out / ".ckpt-upload-staging"
-    deadline = time.time() + 5
-    while time.time() < deadline and any(staging.glob("checkpoint-*")):
-        time.sleep(0.02)
-    assert not any(staging.glob("checkpoint-*")), "uploaded snapshots must be cleaned up"
+    assert deployables == [
+        "rl/flash-ckpt-1/checkpoints/step-12/adapter",
+        "rl/flash-ckpt-1/checkpoints/step-4/adapter",
+        "rl/flash-ckpt-1/checkpoints/step-8/adapter",
+    ], "each save must publish its own deployable — no step coalesced away"
 
 
-def test_upload_pump_no_lost_wakeup(tmp_path):
-    """Regression: a save enqueued in the window where the in-flight upload has passed its own
-    drain check but not yet finished must still be started by done() — with the old two-lock
-    design it could be silently dropped."""
-    from flash.engine.worker.hf import _UploadPump
-
-    ckpt = tmp_path / "checkpoint-8"
-    ckpt.mkdir()
-    started: list[int] = []
-    pump = _UploadPump(lambda step, d: started.append(step))
-    # Simulate an in-flight upload that has already drained the queue (the racy window).
-    pump.uploading = True
-    pump.enqueue(8, str(ckpt))
-    assert started == [], "enqueue while busy must queue, not start"
-    pump.done()  # in-flight finishes: the queued step MUST be pumped, never lost
-    assert started == [8]
-    pump.done()
-    assert started == [8], "queue drained; nothing left to start"
-
-
-def test_upload_pump_keeps_every_step_in_order(tmp_path):
-    """`save_every` is a guarantee: saves that pile up behind a slow upload must ALL upload, in
-    save order — the old newest-wins slot coalesced intermediate steps away, leaving the sparse
-    registered step list `flash checkpoints` showed under upload contention."""
-    from flash.engine.worker.hf import _UploadPump
-
-    started: list[int] = []
-    pump = _UploadPump(lambda step, d: started.append(step))
-    pump.uploading = True  # a slow step-4 upload is in flight
-    pump.enqueue(8, str(tmp_path))
-    pump.enqueue(12, str(tmp_path))
-    assert started == [], "enqueue while busy must queue, not start"
-    pump.done()  # step-4 finishes -> step 8 starts
-    assert started == [8]
-    pump.done()  # step-8 finishes -> step 12 starts (NOT coalesced away by a later enqueue)
-    pump.done()
-    assert started == [8, 12], "every queued step must upload, oldest first"
-
-
-def test_upload_pump_backpressure_blocks_instead_of_dropping(tmp_path):
-    """When pending saves hit the cap, enqueue must BLOCK (stall the training loop) until a slot
-    frees — never drop a step. The blocked save must still land once the uplink drains."""
-    import threading
-
-    from flash.engine.worker import hf as worker_hf
-
-    started: list[int] = []
-    pump = worker_hf._UploadPump(lambda step, d: started.append(step))
-    pump.uploading = True
-    for step in range(1, worker_hf._CKPT_MAX_PENDING + 1):
-        pump.enqueue(step, str(tmp_path))  # fill every waiting slot
-
-    blocked_done = threading.Event()
-    over = worker_hf._CKPT_MAX_PENDING + 1
-    t = threading.Thread(target=lambda: (pump.enqueue(over, str(tmp_path)), blocked_done.set()))
-    t.start()
-    try:
-        assert not blocked_done.wait(0.3), "enqueue past the cap must block, not drop or return"
-        pump.done()  # the in-flight upload finishes: a slot frees and the blocked save queues
-        assert blocked_done.wait(5), "a freed slot must release the blocked enqueue"
-        while len(started) < over:  # drain the rest
-            pump.done()
-        assert started == list(range(1, over + 1)), "the backpressured save must still upload"
-    finally:
-        blocked_done.set()
-        t.join(5)
-
-
-def test_on_train_end_flushes_queued_deployable_without_resume_race(
-    tmp_path, monkeypatch, fake_trainer_callback
-):
-    """A save queued behind a still-in-flight upload at run end must publish its deployable adapter
-    without starting a second resume-checkpoint upload/prune race."""
-    import threading
-
+def test_on_save_retries_transient_upload_error(tmp_path, monkeypatch, fake_trainer_callback):
+    """A transient HF error must not cost the step: the synchronous upload retries until it lands,
+    so `save_every` is a guarantee, not best-effort."""
     from flash.engine.worker import hf as worker_hf
 
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(worker_hf, "_CKPT_FLUSH_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)  # no real sleep between retries
 
     out = tmp_path / "out"
     out.mkdir()
     _make_ckpt_dir(out, 4)
-    _make_ckpt_dir(out, 8)
 
-    holding = threading.Event()
-    release = threading.Event()
+    resume_calls = {"n": 0}
     base_upload = rec.upload_folder
 
-    def upload(**kwargs):
-        base_upload(**kwargs)
+    def flaky(**kwargs):
         if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
-            holding.set()  # the step-4 resume upload is now in flight...
-            release.wait(5)  # ...and stays in flight across on_train_end
+            resume_calls["n"] += 1
+            if resume_calls["n"] == 1:
+                raise RuntimeError("transient 500 from HF")
+        return base_upload(**kwargs)
 
-    rec.upload_folder = upload
+    rec.upload_folder = flaky
 
     cb = worker.make_checkpoint_upload_callback()
-    try:
-        cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-        assert holding.wait(5), "the step-4 upload should be in flight"
-        cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=8), None)
-        cb.on_train_end(SimpleNamespace(output_dir=str(out)), None, None)
-        paths = [u["path_in_repo"] for u in rec.uploads]
-        assert "rl/flash-ckpt-1/checkpoints/step-8/adapter" in paths, (
-            "queued step's deployable must be flushed at train end"
-        )
-        assert "rl/flash-ckpt-1/checkpoint/checkpoint-8" not in paths, (
-            "queued step's resume checkpoint must not race the in-flight resume prune"
-        )
-    finally:
-        release.set()
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+    assert resume_calls["n"] == 2, "the resume upload must be retried after a transient failure"
+    assert any(u["path_in_repo"].endswith("checkpoint/checkpoint-4") for u in rec.uploads), (
+        "the checkpoint must land on retry, not be skipped"
+    )
 
 
 def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
@@ -589,15 +383,6 @@ def test_on_save_skips_deployable_when_vl_recombine_fails(
 
     monkeypatch.setattr(worker, "recombined_warmstart_adapter_dir", _raise)
 
-    class _SyncThread:
-        def __init__(self, target=None, daemon=None, **kw):
-            self._target = target
-
-        def start(self):
-            if self._target:
-                self._target()
-
-    monkeypatch.setattr(worker.threading, "Thread", _SyncThread)
     out = tmp_path / "out"
     out.mkdir()
     _make_ckpt_dir(out, 4)
