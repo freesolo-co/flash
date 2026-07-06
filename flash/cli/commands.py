@@ -818,12 +818,32 @@ def cmd_runs(args) -> int:
 
 
 def cmd_cancel(args) -> int:
-    status = client_from_config().cancel_run(args.run_id)
+    client = client_from_config()
+    status = client.cancel_run(args.run_id)
     payload = {"run_id": args.run_id, "state": status["state"]}
+    # A cancelled run is not necessarily worthless: every completed save interval already streamed
+    # a deployable checkpoint, even though the run shows adapter_ref=null / cost=0. Surface the
+    # surviving steps here so the run isn't discarded unseen. Best-effort: cancel never fails on it.
+    checkpoints: list[dict] = []
+    if payload["state"] == "cancelled":
+        try:
+            checkpoints = client.checkpoints(args.run_id)
+        except Exception:
+            checkpoints = []
     if render.styled():
         print(render.cancelled(payload))
     else:
         print(json.dumps(payload, indent=2))
+    if checkpoints:
+        top = max(c["step"] for c in checkpoints)
+        # stderr in the plain path so the machine-readable stdout JSON stays untouched.
+        out = sys.stdout if render.styled() else sys.stderr
+        msg = (
+            f"{len(checkpoints)} deployable checkpoint(s) survive this cancel — list with "
+            f"`flash checkpoints {args.run_id}`, deploy one with "
+            f"`flash deploy {args.run_id}/step-{top}`."
+        )
+        print(render.note(msg) if render.styled() else msg, file=out)
     return 0
 
 
