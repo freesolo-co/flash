@@ -89,60 +89,63 @@ def run_rl():
     from flash.catalog import MODELS as _CATALOG
 
     _info = _CATALOG.get(model_id)
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    # tokenizer + dataset download + per-prompt budget tokenization of the whole dataset can run
+    # for minutes with no heartbeat in between; keep the channel visibly fresh.
+    with liveness_heartbeat("rl_data_loading"):
+        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
 
-    train = env.dataset()
-    rng = random.Random(_w.SEED)
-    rng.shuffle(train)
-    if conversational:
-        prompts = [{"prompt": env.prompt_messages(ex), "example": ex} for ex in train]
-    else:
-        prompts = [{"prompt": _w.render_prompt(tok, ex), "example": ex} for ex in train]
-    _max_completion = int(
-        gcfg.get("max_tokens")
-        or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
-    )
-    _train_ctx = _t.max_length if (_t and _t.max_length) else 0
-    vllm_max_len = int(_train_ctx or max(1024, rl.max_prompt_len + _max_completion))
-    # Engine must fit completion + some prompt; fail fast rather than OOM mid-rollout.
-    if vllm_max_len <= _max_completion:
-        raise ValueError(
-            f"engine length {vllm_max_len} leaves no room for the {_max_completion}-token "
-            "completion; raise [train].max_length or lower [train].max_tokens"
+        train = env.dataset()
+        rng = random.Random(_w.SEED)
+        rng.shuffle(train)
+        if conversational:
+            prompts = [{"prompt": env.prompt_messages(ex), "example": ex} for ex in train]
+        else:
+            prompts = [{"prompt": _w.render_prompt(tok, ex), "example": ex} for ex in train]
+        _max_completion = int(
+            gcfg.get("max_tokens")
+            or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
         )
-    prompt_budget = vllm_max_len - _max_completion
-
-    # TRL 1.5's GRPOConfig doesn't truncate prompts, so drop over-budget prompts up front (applies
-    # to both string and conversational prompts) before the paid worker rolls out.
-    _oai_tools = (
-        getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
-    )
-
-    def _render_for_budget(p) -> str:
-        """Render a prompt to text EXACTLY as the rollout does (incl. tool schemas)."""
-        if not conversational:
-            return p["prompt"]
-        kw = {"tools": _oai_tools} if _oai_tools else {}
-        try:
-            return tok.apply_chat_template(
-                p["prompt"],
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=_w.THINKING,
-                **kw,
+        _train_ctx = _t.max_length if (_t and _t.max_length) else 0
+        vllm_max_len = int(_train_ctx or max(1024, rl.max_prompt_len + _max_completion))
+        # Engine must fit completion + some prompt; fail fast rather than OOM mid-rollout.
+        if vllm_max_len <= _max_completion:
+            raise ValueError(
+                f"engine length {vllm_max_len} leaves no room for the {_max_completion}-token "
+                "completion; raise [train].max_length or lower [train].max_tokens"
             )
-        except Exception as exc:
-            raise RuntimeError(
-                "failed to render a conversational prompt with this model's chat template "
-                f"(fix the model/template or the env's prompts): {exc}"
-            ) from exc
+        prompt_budget = vllm_max_len - _max_completion
 
-    def _prompt_tokens(p) -> int:
-        return len(tok(_render_for_budget(p), add_special_tokens=False).input_ids)
+        # TRL 1.5's GRPOConfig doesn't truncate prompts, so drop over-budget prompts up front (applies
+        # to both string and conversational prompts) before the paid worker rolls out.
+        _oai_tools = (
+            getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
+        )
 
-    kept = [p for p in prompts if 0 < _prompt_tokens(p) <= prompt_budget]
+        def _render_for_budget(p) -> str:
+            """Render a prompt to text EXACTLY as the rollout does (incl. tool schemas)."""
+            if not conversational:
+                return p["prompt"]
+            kw = {"tools": _oai_tools} if _oai_tools else {}
+            try:
+                return tok.apply_chat_template(
+                    p["prompt"],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=_w.THINKING,
+                    **kw,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "failed to render a conversational prompt with this model's chat template "
+                    f"(fix the model/template or the env's prompts): {exc}"
+                ) from exc
+
+        def _prompt_tokens(p) -> int:
+            return len(tok(_render_for_budget(p), add_special_tokens=False).input_ids)
+
+        kept = [p for p in prompts if 0 < _prompt_tokens(p) <= prompt_budget]
     if len(kept) < len(prompts):
         print(
             f"[rl] dropped {len(prompts) - len(kept)} prompts over the {prompt_budget}-token "
@@ -482,7 +485,10 @@ def run_rl():
                 "vLLM cudagraph_mode (verl rollout default)",
             )
     # Continue the SFT adapter when train.init_from_adapter is set, else a fresh LoRA on the id.
-    init_model, init_peft = _w._init_adapter_model(model_id)
+    # The warm-start path downloads the adapter and (for VL checkpoints) merges it into a full
+    # base-model copy on disk; on a 35B that is many silent minutes.
+    with liveness_heartbeat("rl_adapter_loading"):
+        init_model, init_peft = _w._init_adapter_model(model_id)
     # chalk kernels are applied below against trainer.model (the authoritative target); TRL may
     # rebuild/wrap the PeftModel, and the fresh-LoRA path only passes the model-id string here.
     if init_peft is not None:
@@ -584,8 +590,9 @@ def run_rl():
             callbacks=[hb_cb, _w.make_checkpoint_upload_callback()],
             **extra_trainer_kwargs,
         )
-    # Apply chalk's standalone kernels on trainer.model (the authoritative target).
-    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+        # Apply chalk's standalone kernels on trainer.model (the authoritative target).
+        # inside the liveness wrap: chalk's kernel install can JIT-compile, silent for minutes.
+        _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
     # Activate the weight-sync remap only now, after the initial checkpoint load is built.
     if use_vllm:
         _LM_SYNC_REMAP_ON["on"] = True
@@ -597,7 +604,17 @@ def run_rl():
     t_train = time.time()
     # The cold first GRPO step (~17 min) emits no rl_step; liveness pings keep the stall detector
     # quiet while the real per-step rl_step callback remains the progress signal.
-    with liveness_heartbeat("rl_step"), _sdpa_cudnn_ctx(_attn):
+    # progress + progress_step: step advances emit REAL heartbeats (and stamp the step), so the
+    # daemon can never starve the provider's stall clock by winning the throttled upload slot with
+    # a bare liveness ping while training is healthy.
+    with (
+        liveness_heartbeat(
+            "rl_step",
+            progress=lambda: int(getattr(trainer.state, "global_step", 0) or 0),
+            progress_step=True,
+        ),
+        _sdpa_cudnn_ctx(_attn),
+    ):
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     rl_peak_gpu_gb = _peak_gpu_gb()
@@ -628,39 +645,44 @@ def run_rl():
             f"[resume] no new reward in this worker but resumed checkpoint already reached "
             f"{_steps_run}/{steps} step(s) — finalizing the completed policy instead of failing."
         )
-    adapter_dir = f"{out_dir}/adapter"
-    trainer.model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
-    # VL merge-into-base warm-start (#296) saves a GRPO-ONLY LoRA trained on the SFT-merged base;
-    # deployed on the catalog base it drops the SFT and the served model collapses to ~base. Stack
-    # the original SFT LoRA back in so the DEPLOYED adapter reproduces base+SFT+GRPO on the original
-    # base (no-op for the continued-adapter / fresh-LoRA paths, which already carry the SFT). Both
-    # the default `<prefix>/adapter` upload and the `RUN_ID/step-<final>` deployable below ship the
-    # recombined adapter; the resume checkpoints (`checkpoint/**`) are untouched — they reattach to
-    # the re-merged base on resume.
-    recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
-    deploy_dir = recombined or adapter_dir
-    try:
-        _w.hf_upload_folder(deploy_dir, "adapter", required=True)
-        # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
-        # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
-        # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
-        # doesn't land on one would have NO `RUN_ID/step-N` entry even though it IS the served
-        # default adapter. Publish the just-saved final adapter here, keyed by the true final
-        # global_step: same bytes as `<prefix>/adapter`, so `RUN_ID/step-<final>` always resolves to
-        # exactly the deployed default. Idempotent (content-addressed path) when the step already
-        # aligned, and best-effort (never fails a paid run).
-        if _steps_run:
-            _w.publish_deployable_checkpoint(deploy_dir, _steps_run)
-    finally:
-        # recombined_warmstart_adapter_dir returns a fresh temp dir (flash_recomb_adapter_*); remove
-        # it after the uploads so a finalize that runs more than once per process (tests/refactors)
-        # doesn't grow /tmp. adapter_dir (the real save) is untouched. Mirrors the per-step cleanup.
-        if recombined:
-            import shutil
+    # adapter save + recombine + required upload can take minutes (recombine loads a full base
+    # model on VL warm-starts); keep the heartbeat fresh through the whole finalize.
+    # progress_step stamps the final step on every finalize heartbeat so a cancel landing in this
+    # window still bills the actual steps trained (actual_steps_run reads last_heartbeat.step).
+    with liveness_heartbeat("rl_finalizing", progress=lambda: _steps_run, progress_step=True):
+        adapter_dir = f"{out_dir}/adapter"
+        trainer.model.save_pretrained(adapter_dir)
+        tok.save_pretrained(adapter_dir)
+        # VL merge-into-base warm-start (#296) saves a GRPO-ONLY LoRA trained on the SFT-merged base;
+        # deployed on the catalog base it drops the SFT and the served model collapses to ~base. Stack
+        # the original SFT LoRA back in so the DEPLOYED adapter reproduces base+SFT+GRPO on the original
+        # base (no-op for the continued-adapter / fresh-LoRA paths, which already carry the SFT). Both
+        # the default `<prefix>/adapter` upload and the `RUN_ID/step-<final>` deployable below ship the
+        # recombined adapter; the resume checkpoints (`checkpoint/**`) are untouched — they reattach to
+        # the re-merged base on resume.
+        recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
+        deploy_dir = recombined or adapter_dir
+        try:
+            _w.hf_upload_folder(deploy_dir, "adapter", required=True)
+            # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
+            # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
+            # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
+            # doesn't land on one would have NO `RUN_ID/step-N` entry even though it IS the served
+            # default adapter. Publish the just-saved final adapter here, keyed by the true final
+            # global_step: same bytes as `<prefix>/adapter`, so `RUN_ID/step-<final>` always resolves to
+            # exactly the deployed default. Idempotent (content-addressed path) when the step already
+            # aligned, and best-effort (never fails a paid run).
+            if _steps_run:
+                _w.publish_deployable_checkpoint(deploy_dir, _steps_run)
+        finally:
+            # recombined_warmstart_adapter_dir returns a fresh temp dir (flash_recomb_adapter_*); remove
+            # it after the uploads so a finalize that runs more than once per process (tests/refactors)
+            # doesn't grow /tmp. adapter_dir (the real save) is untouched. Mirrors the per-step cleanup.
+            if recombined:
+                import shutil
 
-            shutil.rmtree(recombined, ignore_errors=True)
-    _w.heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
+                shutil.rmtree(recombined, ignore_errors=True)
+    _w.heartbeat("rl_trained", train_wall=train_wall, step=_steps_run, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens (over-counts; used only for a rough throughput).
     gen_tokens = steps * batching["unique_prompts_per_step"] * group_size * _max_completion

@@ -655,6 +655,13 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         step = heartbeat.get("step")
         if step is not None:
             parts.append(f"step={step}")
+        # live heartbeat age so a long quiet phase reads as "alive, throttled" not "frozen".
+        # minute granularity: the non-TTY follow path prints a line whenever this string changes,
+        # so a seconds-precision age would emit one line per poll.
+        ts = heartbeat.get("ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            mins = int(max(0.0, time.time() - ts) // 60)
+            parts.append(f"hb={mins}m" if mins else "hb=<1m")
     realized = status.get("realized_cost_usd")
     if realized is not None:
         if isinstance(realized, (int, float)):

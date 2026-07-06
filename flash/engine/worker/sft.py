@@ -127,9 +127,6 @@ def run_sft():
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     download_seconds = _w.prefetch_model(model_id)
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
 
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
 
@@ -137,28 +134,40 @@ def run_sft():
         val = getattr(_t, name, None) if _t else None
         return val if val is not None else default
 
-    train = select_sft_examples(env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED)
-    texts = []
-    multiturn_targets = 0
-    for ex in train:
-        completion = env.sft_completion(ex)
-        if len(completion) > 1:
-            multiturn_targets += 1
-        prompt_messages = env.prompt_messages(ex)
-        msgs = [*prompt_messages, *completion]
-        texts.append(
-            {
-                "text": tok.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=False, enable_thinking=_w.THINKING
-                ),
-                "prompt_text": tok.apply_chat_template(
-                    prompt_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=_w.THINKING,
-                ),
-            }
+    # tokenizer + dataset download + O(N) chat-template render can run for minutes on a big
+    # dataset with no heartbeat in between; keep the channel visibly fresh.
+    with liveness_heartbeat("sft_data_loading"):
+        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+        train = select_sft_examples(
+            env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED
         )
+        texts = []
+        multiturn_targets = 0
+        for ex in train:
+            completion = env.sft_completion(ex)
+            if len(completion) > 1:
+                multiturn_targets += 1
+            prompt_messages = env.prompt_messages(ex)
+            msgs = [*prompt_messages, *completion]
+            texts.append(
+                {
+                    "text": tok.apply_chat_template(
+                        msgs,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        enable_thinking=_w.THINKING,
+                    ),
+                    "prompt_text": tok.apply_chat_template(
+                        prompt_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=_w.THINKING,
+                    ),
+                }
+            )
     if multiturn_targets:
         print(
             f"[sft] multi-turn SFT: {multiturn_targets}/{len(train)} rows train on a full target transcript"
@@ -525,36 +534,51 @@ def run_sft():
             data_collator=_collator,
             callbacks=[_w.make_sft_heartbeat_callback(), _w.make_checkpoint_upload_callback()],
         )
-    # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
-    # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
-    # chalk). So the trl SFT path keeps flce OFF and materialises [micro_batch, seq, vocab] logits —
-    # otherwise every large-vocab Qwen3.5 SFT crashes with "'NoneType' object is not subscriptable" once
-    # chalk actually applies flce (#421). Because flce is ALWAYS off here, _sft_fused is False above and
-    # the micro-batch / grad-accum / grad-checkpointing (and the allocator, vram.py) were already sized
-    # for the materialised-logits path UP FRONT — no post-init batch/grad-accum fixup is needed, which
-    # would otherwise mutate grad_accum after the trainer's Accelerator was built from the old value
-    # (codex[bot]). The custom GRPO/opd loops read the fused loss directly, so they keep flce on.
-    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None), fused_ce=False)
+        # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
+        # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
+        # chalk). So the trl SFT path keeps flce OFF and materialises [micro_batch, seq, vocab] logits —
+        # otherwise every large-vocab Qwen3.5 SFT crashes with "'NoneType' object is not subscriptable" once
+        # chalk actually applies flce (#421). Because flce is ALWAYS off here, _sft_fused is False above and
+        # the micro-batch / grad-accum / grad-checkpointing (and the allocator, vram.py) were already sized
+        # for the materialised-logits path UP FRONT — no post-init batch/grad-accum fixup is needed, which
+        # would otherwise mutate grad_accum after the trainer's Accelerator was built from the old value
+        # (codex[bot]). The custom GRPO/opd loops read the fused loss directly, so they keep flce on.
+        # inside the liveness wrap: chalk's kernel install can JIT-compile, silent for minutes.
+        _chalk_report = install_chalk_kernels(getattr(trainer, "model", None), fused_ce=False)
     _chalk_active = active_kernels(_chalk_report)
 
     _reset_peak_gpu()
     _gpu_sampler = _GpuPeakSampler().start()
     t_train = time.time()
-    with liveness_heartbeat("sft_step"), _sdpa_cudnn_ctx(_attn):
+    # progress + progress_step: step advances emit REAL heartbeats (and stamp the step), so the
+    # daemon can never starve the provider's stall clock by winning the throttled upload slot with
+    # a bare liveness ping while training is healthy.
+    with (
+        liveness_heartbeat(
+            "sft_step",
+            progress=lambda: int(getattr(trainer.state, "global_step", 0) or 0),
+            progress_step=True,
+        ),
+        _sdpa_cudnn_ctx(_attn),
+    ):
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     sft_peak_gpu_gb = _peak_gpu_gb()
     sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()
 
-    adapter_dir = f"{out_dir}/adapter"
-    trainer.model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
-    _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-    # Ensure `flash deploy RUN_ID/step-<final>` always resolves: save_steps may not align with the last step.
     _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
-    if _final_step:
-        _w.publish_deployable_checkpoint(adapter_dir, _final_step)
-    _w.heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
+    # adapter save + required upload can take minutes on a slow HF; keep the heartbeat fresh.
+    # progress_step stamps the final step on every finalize heartbeat so a cancel landing in this
+    # window still bills the actual steps trained (actual_steps_run reads last_heartbeat.step).
+    with liveness_heartbeat("sft_finalizing", progress=lambda: _final_step, progress_step=True):
+        adapter_dir = f"{out_dir}/adapter"
+        trainer.model.save_pretrained(adapter_dir)
+        tok.save_pretrained(adapter_dir)
+        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+        # Ensure `flash deploy RUN_ID/step-<final>` always resolves: save_steps may not align with the last step.
+        if _final_step:
+            _w.publish_deployable_checkpoint(adapter_dir, _final_step)
+    _w.heartbeat("sft_trained", train_wall=train_wall, step=_final_step, gpu=gpu_diagnostics())
 
     train_tokens = _total_tok * epochs
     _w.write_train_meta(
