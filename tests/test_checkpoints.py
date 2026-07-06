@@ -364,6 +364,62 @@ def test_on_save_queues_busy_step_instead_of_skipping(tmp_path, monkeypatch, fak
     assert len(deployable) == 1, "a busy-lock save must be queued and uploaded, not skipped"
 
 
+def test_on_save_survives_trainer_rotation_of_queued_checkpoint(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """`save_total_limit=1` deletes checkpoint-N inside the trainer's NEXT save — before that
+    save's on_save even fires — so a queued upload used to find its dir gone and drop the step.
+    on_save must snapshot the dir while it is alive; the queued step must upload fully from the
+    snapshot even after the live dir is rotated away."""
+    import shutil as _shutil
+    import threading
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    _make_ckpt_dir(out, 4)
+    ckpt8 = _make_ckpt_dir(out, 8)
+
+    holding = threading.Event()
+    release = threading.Event()
+    base_upload = rec.upload_folder
+
+    def upload(**kwargs):
+        base_upload(**kwargs)
+        if kwargs["path_in_repo"].endswith("checkpoint/checkpoint-4"):
+            holding.set()  # the step-4 resume upload now holds the pump...
+            release.wait(5)  # ...while the trainer rotates step 8's dir away
+
+    rec.upload_folder = upload
+
+    cb = worker.make_checkpoint_upload_callback()
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+    assert holding.wait(5), "the step-4 upload should be in flight"
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=8), None)
+    _shutil.rmtree(ckpt8)  # save_total_limit rotation: the live dir vanishes while step 8 waits
+    release.set()
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if any(u["path_in_repo"].endswith("checkpoint/checkpoint-8") for u in rec.uploads):
+            break
+        time.sleep(0.02)
+    paths = [u["path_in_repo"] for u in rec.uploads]
+    assert "rl/flash-ckpt-1/checkpoints/step-8/adapter" in paths, (
+        "rotated step's deployable must upload from the snapshot"
+    )
+    assert "rl/flash-ckpt-1/checkpoint/checkpoint-8" in paths, (
+        "rotated step's resume checkpoint must upload from the snapshot"
+    )
+    staging = out / ".ckpt-upload-staging"
+    deadline = time.time() + 5
+    while time.time() < deadline and any(staging.glob("checkpoint-*")):
+        time.sleep(0.02)
+    assert not any(staging.glob("checkpoint-*")), "uploaded snapshots must be cleaned up"
+
+
 def test_upload_pump_no_lost_wakeup(tmp_path):
     """Regression: a save enqueued in the window where the in-flight upload has passed its own
     drain check but not yet finished must still be started by done() — with the old two-lock
@@ -381,7 +437,55 @@ def test_upload_pump_no_lost_wakeup(tmp_path):
     pump.done()  # in-flight finishes: the queued step MUST be pumped, never lost
     assert started == [8]
     pump.done()
-    assert started == [8], "queue is single-slot; nothing left to start"
+    assert started == [8], "queue drained; nothing left to start"
+
+
+def test_upload_pump_keeps_every_step_in_order(tmp_path):
+    """`save_every` is a guarantee: saves that pile up behind a slow upload must ALL upload, in
+    save order — the old newest-wins slot coalesced intermediate steps away, leaving the sparse
+    registered step list `flash checkpoints` showed under upload contention."""
+    from flash.engine.worker.hf import _UploadPump
+
+    started: list[int] = []
+    pump = _UploadPump(lambda step, d: started.append(step))
+    pump.uploading = True  # a slow step-4 upload is in flight
+    pump.enqueue(8, str(tmp_path))
+    pump.enqueue(12, str(tmp_path))
+    assert started == [], "enqueue while busy must queue, not start"
+    pump.done()  # step-4 finishes -> step 8 starts
+    assert started == [8]
+    pump.done()  # step-8 finishes -> step 12 starts (NOT coalesced away by a later enqueue)
+    pump.done()
+    assert started == [8, 12], "every queued step must upload, oldest first"
+
+
+def test_upload_pump_backpressure_blocks_instead_of_dropping(tmp_path):
+    """When pending saves hit the cap, enqueue must BLOCK (stall the training loop) until a slot
+    frees — never drop a step. The blocked save must still land once the uplink drains."""
+    import threading
+
+    from flash.engine.worker import hf as worker_hf
+
+    started: list[int] = []
+    pump = worker_hf._UploadPump(lambda step, d: started.append(step))
+    pump.uploading = True
+    for step in range(1, worker_hf._CKPT_MAX_PENDING + 1):
+        pump.enqueue(step, str(tmp_path))  # fill every waiting slot
+
+    blocked_done = threading.Event()
+    over = worker_hf._CKPT_MAX_PENDING + 1
+    t = threading.Thread(target=lambda: (pump.enqueue(over, str(tmp_path)), blocked_done.set()))
+    t.start()
+    try:
+        assert not blocked_done.wait(0.3), "enqueue past the cap must block, not drop or return"
+        pump.done()  # the in-flight upload finishes: a slot frees and the blocked save queues
+        assert blocked_done.wait(5), "a freed slot must release the blocked enqueue"
+        while len(started) < over:  # drain the rest
+            pump.done()
+        assert started == list(range(1, over + 1)), "the backpressured save must still upload"
+    finally:
+        blocked_done.set()
+        t.join(5)
 
 
 def test_on_train_end_flushes_queued_deployable_without_resume_race(
