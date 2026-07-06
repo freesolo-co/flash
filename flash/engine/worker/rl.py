@@ -683,6 +683,9 @@ def run_rl():
         notes={
             "steps": steps,
             "resumed": bool(resume_ckpt),
+            # "sm90->sm100" when this attempt resumed a checkpoint produced on a different GPU
+            # arch (allowed — kernels re-selected at boot — but must stay auditable), else None.
+            "resume_cross_arch": _w.resume_cross_arch_note(),
             "download_seconds": download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,

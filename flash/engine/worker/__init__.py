@@ -73,6 +73,7 @@ from flash.engine.worker.hf import (
     make_checkpoint_upload_callback,
     prefetch_model,
     publish_deployable_checkpoint,
+    resume_cross_arch_note,
     upload_debug_jsonl,
 )
 from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
@@ -424,6 +425,7 @@ __all__ = [
     "require_active_env",
     "require_vllm_for_rollout_func",
     "resolve_grpo_prompts_per_step",
+    "resume_cross_arch_note",
     "rl_per_device_comps",
     "run_rl",
     "run_sft",

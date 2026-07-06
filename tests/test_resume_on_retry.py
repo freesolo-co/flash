@@ -526,12 +526,13 @@ def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
 
 
 # ============================================================================================
-# 4. GPU-ARCH SAFETY — a resume must never silently cross GPU architectures
+# 4. GPU-ARCH OBSERVABILITY — a resume may cross GPU architectures, but never SILENTLY
 # (2026-07-05 incident: a false-stall retry moved a healthy H200 35B SFT onto a B200 mid-run;
 # the resumed checkpoint then trained every remaining step on sm100's broken GDN backward with
-# grad_norm ~1e7 while loss looked normal. Three layers lock that out: the worker stamps each
-# streamed checkpoint with its arch, the worker refuses to resume a mismatched stamp, and the
-# control plane pins retry candidates to the stamped arch.)
+# grad_norm ~1e7 while loss looked normal — and nothing on the run recorded the switch.
+# Cross-arch resume is ALLOWED because every attempt re-selects its kernel set from the LIVE
+# device at worker boot (see the kernel-swap tests here and in test_worker_stack.py); the stamp
+# + note + attempt trail make any switch auditable.)
 # ============================================================================================
 def test_on_save_stamps_gpu_arch_into_checkpoint(tmp_path, monkeypatch, fake_transformers):
     """Every streamed resume checkpoint carries flash_gpu.json recording the producing arch."""
@@ -604,24 +605,26 @@ def _stamped_snapshot(steps, sm):
     return _dl
 
 
-def test_hf_resume_checkpoint_refuses_cross_arch_stamp(monkeypatch, resume_run_id):
-    """A checkpoint stamped sm90 must NOT resume on an sm100 worker: raise retriable, never train.
-
-    The raise must escape hf_resume_checkpoint's own swallow-everything download handling — a
-    silent None here would restart from scratch and silently discard the run's paid progress,
-    and a silent resume is the corruption the stamp exists to stop."""
+def test_hf_resume_checkpoint_allows_cross_arch_and_flags_it(monkeypatch, resume_run_id, capsys):
+    """A checkpoint stamped sm90 resuming on an sm100 worker RESUMES (kernels are re-selected for
+    the live arch at boot) — but the switch is flagged loudly and recorded for the run's metrics
+    notes. A silent switch is what let the 2026-07-05 corruption go unnoticed."""
     huggingface_hub = pytest.importorskip("huggingface_hub")
 
     from flash.engine.worker import hf as hf_mod
-    from flash.engine.worker.perf import RetriableInfraError
 
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _stamped_snapshot([50], "sm90"))
     monkeypatch.setattr(hf_mod, "_live_gpu_sm", lambda: "sm100")
+    monkeypatch.setattr(hf_mod, "_RESUME_CROSS_ARCH", None)
 
-    with pytest.raises(RetriableInfraError, match=r"sm90.*sm100|sm100.*sm90"):
-        worker.hf_resume_checkpoint()
+    path = worker.hf_resume_checkpoint()
+
+    assert path is not None
+    assert path.endswith("checkpoint-50"), "cross-arch resume must proceed, not restart or refuse"
+    assert hf_mod.resume_cross_arch_note() == "sm90->sm100"
+    assert "CROSS-ARCH RESUME" in capsys.readouterr().out
 
 
 def test_hf_resume_checkpoint_allows_matching_arch_stamp(monkeypatch, resume_run_id):
@@ -633,10 +636,12 @@ def test_hf_resume_checkpoint_allows_matching_arch_stamp(monkeypatch, resume_run
     worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _stamped_snapshot([50], "sm90"))
     monkeypatch.setattr(hf_mod, "_live_gpu_sm", lambda: "sm90")
+    monkeypatch.setattr(hf_mod, "_RESUME_CROSS_ARCH", None)
 
     path = worker.hf_resume_checkpoint()
     assert path is not None
     assert path.endswith("checkpoint-50")
+    assert hf_mod.resume_cross_arch_note() is None
 
 
 def test_hf_resume_checkpoint_allows_unstamped_legacy_checkpoint(monkeypatch, resume_run_id):
@@ -649,10 +654,12 @@ def test_hf_resume_checkpoint_allows_unstamped_legacy_checkpoint(monkeypatch, re
     worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([50]))
     monkeypatch.setattr(hf_mod, "_live_gpu_sm", lambda: "sm100")
+    monkeypatch.setattr(hf_mod, "_RESUME_CROSS_ARCH", None)
 
     path = worker.hf_resume_checkpoint()
     assert path is not None
     assert path.endswith("checkpoint-50")
+    assert hf_mod.resume_cross_arch_note() is None, "no stamp -> nothing to flag (fail-open)"
 
 
 def _alloc_h200_b200():
@@ -667,151 +674,8 @@ def _alloc_h200_b200():
     )
 
 
-def test_retry_pins_resume_arch_instead_of_walking_classes(orch, monkeypatch):
-    """A retry that will resume a stamped checkpoint must stay on the checkpoint's arch, even
-    though the retry walk otherwise PREFERS an untried class — that preference is exactly what
-    moved the incident run H200->B200 mid-run."""
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
-    from flash.runner import lifecycle
-
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc_h200_b200())
-    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: "sm90")
-
-    gpus = []
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
-        if attempt == 0:
-            return PollResult(False, failure="stalled", detail="false stall")
-        return PollResult(True, metrics={"train_tokens": 4096})
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
-    spec = _spec(type="H200")
-    _seed_status(orch, spec)
-    log = io.StringIO()
-
-    metrics = orch._submit_seed_supervised(spec, 0, log)
-
-    assert metrics["train_tokens"] == 4096
-    assert gpus == ["H200", "H200"], "the resume retry must stay on the checkpoint's sm90 arch"
-    assert "pinning to sm90" in log.getvalue()
 
 
-def test_retry_fails_rather_than_resume_cross_arch(orch, monkeypatch):
-    """When NO candidate matches the checkpoint's arch, the retry must fail no_capacity — never
-    silently resume on another arch. Corrupt-but-completed is strictly worse than failed."""
-    from flash.providers import allocator
-    from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.providers.runpod import jobs as rp_jobs
-    from flash.runner import lifecycle
-
-    b200_only = Allocation(
-        provider="runpod",
-        gpu="B200",
-        hourly_usd=5.89,
-        min_vram_gb=100,
-        candidates=(Candidate("runpod", "B200", 5.89, 180),),
-    )
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: b200_only)
-    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: "sm90")
-    # The pin-blocked path deliberately backs off between synthesized no_capacity results (nothing
-    # provisions or waits otherwise); collect instead of sleeping so the test stays fast.
-    sleeps: list[float] = []
-    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: sleeps.append(s))
-
-    submits = []
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        submits.append(attempt)
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
-        return PollResult(False, failure="stalled", detail="false stall")
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
-    spec = _spec(type="B200")
-    _seed_status(orch, spec)
-    log = io.StringIO()
-
-    with pytest.raises(RuntimeError, match="refusing a cross-arch resume"):
-        orch._submit_seed_supervised(spec, 0, log)
-
-    assert submits == [0], "no retry may provision a cross-arch worker for a stamped resume"
-    assert "refusing a cross-arch resume" in log.getvalue()
-    assert sleeps, "pin-blocked retries must back off, not burn the infra budget in seconds"
-
-
-def test_oom_past_largest_same_arch_class_fails_terminally(orch, monkeypatch):
-    """OOM on the biggest GPU of the pinned arch is unwinnable (escalating VRAM means crossing
-    archs, which the resume pin forbids): fail immediately with the real reason, don't spin the
-    budget on synthesized no_capacity with a misleading detail."""
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
-    from flash.runner import lifecycle
-
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc_h200_b200())
-    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: "sm90")
-
-    submits = []
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        submits.append(run_spec.gpu.type)
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
-        return PollResult(False, failure="oom", detail="CUDA out of memory")
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
-    spec = _spec(type="H200")
-    _seed_status(orch, spec)
-    log = io.StringIO()
-
-    with pytest.raises(RuntimeError, match="resubmit the run to restart"):
-        orch._submit_seed_supervised(spec, 0, log)
-
-    assert submits == ["H200"], "the >141GB escalation set is all cross-arch; nothing may submit"
-    assert "pins this run to sm90" in log.getvalue()
-
-
-def test_recovery_attempt0_with_prior_trail_is_arch_pinned(orch, monkeypatch):
-    """Post-restart recovery re-enters with attempt=0 but WILL resume a checkpoint; a persisted
-    attempt trail marks it as a recovery, so attempt 0 must apply the pin instead of provisioning
-    the cheapest (possibly cross-arch) class and burning a paid boot on the worker-side check."""
-    from flash.providers import allocator
-    from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.providers.runpod import jobs as rp_jobs
-    from flash.runner import lifecycle
-
-    # B200 cheapest so an UNpinned attempt 0 would pick it.
-    b200_cheapest = Allocation(
-        provider="runpod",
-        gpu="B200",
-        hourly_usd=3.00,
-        min_vram_gb=100,
-        candidates=(
-            Candidate("runpod", "B200", 3.00, 180),
-            Candidate("runpod", "H200", 4.39, 141),
-        ),
-    )
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: b200_cheapest)
-    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: "sm90")
-
-    gpus = []
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
-        return PollResult(True, metrics={"train_tokens": 4096})
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
-    spec = _spec(type="H200")
-    _seed_status(orch, spec)
-    # The pre-restart life left its trail behind — that's the recovery signal.
-    orch.record_attempt(spec.run_id, {"attempt": 0, "provider": "runpod", "gpu": "H200"})
-
-    orch._submit_seed_supervised(spec, 0, io.StringIO())
-
-    assert gpus == ["H200"], "recovery attempt 0 must pin to the checkpoint's arch"
 
 
 def test_record_attempt_survives_control_plane_restart(orch):
@@ -843,10 +707,8 @@ def test_attempt_trail_records_each_attempts_gpu_and_outcome(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
-    from flash.runner import lifecycle
 
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc_h200_b200())
-    monkeypatch.setattr(lifecycle, "_resume_checkpoint_sm", lambda spec: None)  # unstamped legacy
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
@@ -890,3 +752,37 @@ def test_run_gpu_label_shows_multi_class_trail():
     assert _run_gpu({}, {}, never_ran) == "H200"
     # Malformed on-disk entries (status JSON outlives writers) must not crash `flash runs`.
     assert _run_gpu({}, {}, ["garbage", {"attempt": 1, "gpu": "B200"}]) == "B200"
+
+
+@pytest.mark.parametrize(
+    ("modname", "outer"),
+    [
+        ("flash.engine.worker.sft", "run_sft"),
+        ("flash.engine.worker.rl", "run_rl"),
+    ],
+)
+def test_resume_ckpt_never_feeds_kernel_or_trainer_config(modname, outer):
+    """Wiring pin: the resume checkpoint may only feed ``trainer.train(resume_from_checkpoint=)``
+    and post-hoc bookkeeping — never kernel/attn/packing/trainer configuration. This is the
+    property that makes a cross-arch resume safe: config is derived from the LIVE device every
+    attempt, so a checkpoint produced elsewhere cannot drag its producer's configuration along.
+    If this test fails, a new ``resume_ckpt`` use was added — verify it cannot alter the training
+    setup before allowing it here."""
+    import importlib
+    import inspect
+
+    mod = importlib.import_module(modname)
+    src = inspect.getsource(getattr(mod, outer))
+    allowed = (
+        "resume_ckpt = _w.hf_resume_checkpoint()",  # the assignment
+        "trainer.train(resume_from_checkpoint=resume_ckpt)",  # the ONLY config-adjacent use
+        '"resumed": bool(resume_ckpt)',  # metrics bookkeeping
+        "_grpo_resume_already_complete(resume_ckpt",  # post-training no-op classification (rl)
+        "_grpo_is_no_op_failure(reward_history, resume_ckpt",  # post-training no-op gate (rl)
+    )
+    offending = [
+        line.strip()
+        for line in src.splitlines()
+        if "resume_ckpt" in line and not any(a in line for a in allowed)
+    ]
+    assert not offending, f"new resume_ckpt use(s) need a config-independence review: {offending}"

@@ -133,12 +133,11 @@ def _live_gpu_sm() -> str | None:
 def write_gpu_stamp(ckpt_dir: str) -> None:
     """Record which GPU arch produced this checkpoint (``flash_gpu.json`` inside the checkpoint dir).
 
-    ``hf_resume_checkpoint`` refuses to resume a stamped checkpoint on a different arch: each arch
-    dispatches different kernels, so weights + optimizer state trained under one arch can silently
-    diverge under another (the 2026-07-05 incident: a false-stall retry moved a healthy H200 SFT
-    onto a B200 mid-run, resumed its checkpoint, and sm100's then-broken GDN backward corrupted
-    every step after the resume while loss looked normal). Best-effort: a stamp failure never
-    blocks the save."""
+    ``hf_resume_checkpoint`` reads it back so a resume that lands on a different arch is flagged
+    loudly instead of happening silently (the 2026-07-05 incident: a false-stall retry moved a
+    healthy H200 SFT onto a B200 mid-run, resumed its checkpoint, and sm100's then-broken GDN
+    backward corrupted every step after the resume while loss looked normal — with zero trace of
+    the switch on the run). Best-effort: a stamp failure never blocks the save."""
     try:
         sm = _live_gpu_sm()
         if not sm:
@@ -160,13 +159,28 @@ def write_gpu_stamp(ckpt_dir: str) -> None:
         print("[ckpt] gpu-arch stamp warn:", e)
 
 
-def _check_resume_arch(ckpt_path: str) -> None:
-    """Raise RetriableInfraError when this worker's GPU arch differs from the checkpoint's stamp.
+# "smA->smB" when the current attempt resumed a checkpoint produced on a different GPU arch, else
+# None. Read into the run's DONE metrics notes so a cross-arch resume is auditable on the artifact.
+_RESUME_CROSS_ARCH: str | None = None
 
-    Raising retriable (instead of silently resuming, or discarding the checkpoint) hands the
-    decision back to the control plane, whose retry allocator pins the run's arch — the loop
-    converges onto a matching GPU without ever training a step cross-arch. Unstamped (pre-stamp)
-    checkpoints pass through unchanged."""
+
+def resume_cross_arch_note() -> str | None:
+    """The current attempt's cross-arch resume marker ("sm90->sm100"), or None."""
+    return _RESUME_CROSS_ARCH
+
+
+def _note_resume_arch(ckpt_path: str) -> None:
+    """Loudly record when this worker's GPU arch differs from the resumed checkpoint's stamp.
+
+    Cross-arch resume is ALLOWED: every attempt re-selects its whole kernel set from the LIVE
+    device at worker boot, before any model import (sm100 fla-tilelang opt-out, Blackwell autotune
+    restriction, Hopper fast path, chalk/attn dispatch) — nothing numerical is carried over from
+    the producing arch. What must never happen again is a SILENT switch: the 2026-07-05 incident
+    resumed an H200 checkpoint on a B200 whose GDN backward was broken and trained 271 corrupt
+    steps invisibly. The marker goes to the console AND the run's metrics notes
+    (``resume_cross_arch``) so the artifact stays auditable. Unstamped (pre-stamp) checkpoints and
+    unreadable stamps pass silently — fail-open."""
+    global _RESUME_CROSS_ARCH
     try:
         with open(os.path.join(ckpt_path, GPU_STAMP_FILE)) as f:
             stamp = json.load(f)
@@ -174,23 +188,26 @@ def _check_resume_arch(ckpt_path: str) -> None:
     except FileNotFoundError:
         return
     except Exception as e:
-        print("[resume] gpu-arch stamp unreadable (allowing resume):", e)
+        print("[resume] gpu-arch stamp unreadable:", e)
         return
     live = _live_gpu_sm()
     if not ckpt_sm or live is None or live == ckpt_sm:
         return
-    raise RetriableInfraError(
-        f"resume checkpoint {os.path.basename(ckpt_path)} was trained on {ckpt_sm} "
-        f"({stamp.get('device_name')}, class {stamp.get('gpu_class')}) but this worker is {live}; "
-        "cross-arch resume risks silently divergent gradients — retrying on a matching GPU"
+    _RESUME_CROSS_ARCH = f"{ckpt_sm}->{live}"
+    print(
+        f"[resume] CROSS-ARCH RESUME: checkpoint {os.path.basename(ckpt_path)} was trained on "
+        f"{ckpt_sm} ({stamp.get('device_name')}, class {stamp.get('gpu_class')}); this worker is "
+        f"{live}. Kernel backends were re-selected for {live} at boot; flagging in metrics notes "
+        "(resume_cross_arch) for auditability."
     )
 
 
 def hf_resume_checkpoint() -> str | None:
     """Download the latest streamed trainer checkpoint for this run, or return None.
 
-    Raises RetriableInfraError (never swallowed below) when the checkpoint's GPU-arch stamp does
-    not match the live device — resuming would be silently numerics-unsafe."""
+    A checkpoint stamped with a different GPU arch than the live device still resumes — the
+    kernel set is re-selected per-arch at worker boot — but the switch is flagged loudly (see
+    ``_note_resume_arch``)."""
     if not _w.HF_REPO:
         return None
     try:
@@ -214,7 +231,7 @@ def hf_resume_checkpoint() -> str | None:
     except Exception as e:
         print("hf_resume_checkpoint warn:", e)
         return None
-    _check_resume_arch(path)
+    _note_resume_arch(path)
     print(f"[resume] found streamed checkpoint: {path}")
     return path
 

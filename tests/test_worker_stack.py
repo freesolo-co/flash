@@ -1529,3 +1529,66 @@ def test_non_sm100_fla_tilelang_untouched(monkeypatch, cc):
     perf._force_fla_triton_gdn_on_sm100()
 
     assert "FLA_TILELANG" not in os.environ
+
+
+# --------------------------------------------------------------------------------------------
+# Cross-arch resume safety: a retry (or recovery) may resume a checkpoint on a DIFFERENT GPU
+# arch than the one that produced it. That is safe precisely because the kernel set is a pure
+# function of the LIVE device, re-selected at worker boot BEFORE any model import — nothing a
+# checkpoint carries can influence backend selection. These tests pin that property.
+
+
+def test_fla_backend_selection_ignores_resume_checkpoint_state(monkeypatch, tmp_path):
+    """The sm100 tilelang opt-out keys ONLY off the live device capability: a resume checkpoint
+    stamped with the OTHER arch, sitting on disk exactly where the worker downloads it, must have
+    zero influence. (A B200 resuming an H200-stamped checkpoint still gets Triton GDN backward;
+    an H200 resuming a B200-stamped one still keeps tilelang.)"""
+    import json
+    import os
+
+    stamped = tmp_path / "checkpoint-50"
+    stamped.mkdir()
+    (stamped / "flash_gpu.json").write_text(
+        json.dumps({"sm": "sm90", "device_name": "NVIDIA H200", "gpu_class": "H200"})
+    )
+
+    perf = _patch_arch(monkeypatch, (10, 0))  # live device: B200/sm100
+    monkeypatch.delenv("FLA_TILELANG", raising=False)
+    perf._force_fla_triton_gdn_on_sm100()
+    assert os.environ.get("FLA_TILELANG") == "0", (
+        "an sm90-stamped resume checkpoint must not keep tilelang on for an sm100 worker"
+    )
+
+    (stamped / "flash_gpu.json").write_text(
+        json.dumps({"sm": "sm100", "device_name": "NVIDIA B200", "gpu_class": "B200"})
+    )
+    perf = _patch_arch(monkeypatch, (9, 0))  # live device: H200/sm90
+    monkeypatch.delenv("FLA_TILELANG", raising=False)
+    perf._force_fla_triton_gdn_on_sm100()
+    assert "FLA_TILELANG" not in os.environ, (
+        "an sm100-stamped resume checkpoint must not opt an sm90 worker out of tilelang "
+        "(sm90 NEEDS tilelang, fla #640)"
+    )
+
+
+def test_worker_boot_selects_kernel_backends_before_training_handlers():
+    """Order pin in worker main(): the arch-keyed backend selection (sm100 tilelang opt-out,
+    Hopper fla fast path, Blackwell autotune restriction) runs BEFORE run_sft/run_rl — i.e.
+    before the resume checkpoint is even downloaded. Every attempt, including a cross-arch
+    resume, therefore trains on kernels selected for ITS OWN device."""
+    import inspect
+
+    import flash.engine.worker as worker
+
+    src = inspect.getsource(worker.main)
+    order = [
+        src.index("_force_fla_triton_gdn_on_sm100()"),
+        src.index("_ensure_fla_fastpath_on_hopper()"),
+        src.index("_restrict_fla_gdn_autotune_on_blackwell()"),
+    ]
+    handler_at = src.index("handler()")
+    assert all(i < handler_at for i in order), (
+        "kernel-backend selection must run before the training handler (which downloads the "
+        "resume checkpoint) — a cross-arch resume relies on this ordering"
+    )
+    assert order == sorted(order), "documented boot sequence changed; re-verify the fla ordering"
