@@ -273,11 +273,6 @@ def run_opd():
             )
     else:
         prompt_budget = RECIPE.opd.max_prompt_len
-    # Train-time over-budget drops. Now always 0: the pool below caches renders that ALREADY passed the
-    # budget filter and reuses them at train time (no re-render can newly exceed the budget). Kept for
-    # train_meta-schema stability; filter-time budget drops are counted separately as n_over_budget.
-    dropped_long = 0
-
     def _render_prompt_ids(messages):
         text = tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
@@ -611,7 +606,7 @@ def run_opd():
         # non-default checkpoints already published stay available) and either retry or fail loudly.
         diag = (
             f"opd reached only {opt_steps}/{steps} optimizer updates within {max_iters} iterations "
-            f"({dropped_long} prompts dropped over budget, {truncated_rollouts} non-terminated "
+            f"({n_over_budget} prompts pre-filtered over budget, {truncated_rollouts} non-terminated "
             f"rollouts, {teacher_transient} transient teacher failures)"
         )
         if teacher_transient > 0:
@@ -657,7 +652,7 @@ def run_opd():
             # Optimizer steps actually applied; < steps if any iteration had no usable teacher
             # signal (skipped). loss_curve length == opt_steps, so reporting stays honest.
             "opt_steps": opt_steps,
-            "dropped_long_prompts": dropped_long,  # prompts skipped for exceeding the context budget
+            "dropped_long_prompts": n_over_budget,  # prompts pre-filtered for exceeding the context budget
             "method": "gkd",
             "init_from_adapter": warm_start or None,
             "teacher_model": knobs["teacher_model"],
