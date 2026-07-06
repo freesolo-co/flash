@@ -417,16 +417,9 @@ def _validate_spec(spec: JobSpec) -> None:
         # provisioned (wait_for_gpu + model prefetch + tokenizer/adapter load), instead of failing
         # deterministically only after GPU setup. max_completion resolves exactly as the worker does:
         # explicit [train] max_tokens, else the recipe thinking/non-thinking default.
-        from flash.engine.recipe import RECIPE
+        from flash.engine.vram import opd_completion_len
 
-        max_completion = int(
-            spec.train.max_tokens
-            or (
-                RECIPE.opd.max_completion_len_thinking
-                if spec.thinking
-                else RECIPE.opd.max_completion_len
-            )
-        )
+        max_completion = opd_completion_len(spec.train.max_tokens, spec.thinking)
         if spec.train.max_length - max_completion < 1:
             raise ConfigError(
                 f"[train] max_length ({spec.train.max_length}) leaves no prompt budget after "

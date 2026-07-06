@@ -506,8 +506,7 @@ def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
         prompt_tensor=torch.tensor([[1]]),
         prompt_messages=[{"role": "user", "content": "say hi"}],
         gen_cfg={},
-        knobs={"kl_coef": 1.0, "stop_sequences": ()},
-        torch=torch,
+        knobs=opd_mod.OpdKnobs(kl_coef=1.0, stop_sequences=()),
     )
     assert r.loss is not None
     assert r.loss.requires_grad
@@ -569,8 +568,7 @@ def test_train_one_skips_completion_with_invalid_utf8_replacement_char():
         prompt_tensor=torch.tensor([[1]]),
         prompt_messages=[{"role": "user", "content": "say hi"}],
         gen_cfg={},
-        knobs={"kl_coef": 1.0, "stop_sequences": ()},
-        torch=torch,
+        knobs=opd_mod.OpdKnobs(kl_coef=1.0, stop_sequences=()),
     )
     assert r.loss is None  # skipped, not distilled
     assert r.teacher_status is None  # teacher never reached (else it would have raised)
@@ -633,21 +631,21 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     monkeypatch.setattr(
         opd_mod,
         "_resolve_opd_knobs",
-        lambda: {
-            "teacher_model": "accounts/fireworks/models/glm-5p2",
-            "teacher_base_url": "http://teacher.invalid",
-            "steps": 1,
-            "learning_rate": 1e-4,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "max_completion": 8,
-            "prompts_per_step": 1,
-            "group_size": 1,
-            "kl_coef": 1.0,
-            "save_every": 0,
-            "max_length": 0,
-            "stop_sequences": (),
-        },
+        lambda: opd_mod.OpdKnobs(
+            teacher_model="accounts/fireworks/models/glm-5p2",
+            teacher_base_url="http://teacher.invalid",
+            steps=1,
+            learning_rate=1e-4,
+            temperature=0.0,
+            top_p=1.0,
+            max_completion=8,
+            prompts_per_step=1,
+            group_size=1,
+            kl_coef=1.0,
+            save_every=0,
+            max_length=0,
+            stop_sequences=(),
+        ),
     )
     monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: _Model())
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
@@ -734,21 +732,21 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
     monkeypatch.setattr(
         opd_mod,
         "_resolve_opd_knobs",
-        lambda: {
-            "teacher_model": "accounts/fireworks/models/glm-5p2",
-            "teacher_base_url": "http://teacher.invalid",
-            "steps": steps,
-            "learning_rate": 1e-4,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "max_completion": 8,
-            "prompts_per_step": 1,
-            "group_size": group,
-            "kl_coef": 1.0,
-            "save_every": 0,
-            "max_length": 0,
-            "stop_sequences": (),
-        },
+        lambda: opd_mod.OpdKnobs(
+            teacher_model="accounts/fireworks/models/glm-5p2",
+            teacher_base_url="http://teacher.invalid",
+            steps=steps,
+            learning_rate=1e-4,
+            temperature=0.0,
+            top_p=1.0,
+            max_completion=8,
+            prompts_per_step=1,
+            group_size=group,
+            kl_coef=1.0,
+            save_every=0,
+            max_length=0,
+            stop_sequences=(),
+        ),
     )
     monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: _Model())
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
@@ -1339,21 +1337,21 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     monkeypatch.setattr(
         opd_mod,
         "_resolve_opd_knobs",
-        lambda: {
-            "teacher_model": "accounts/fireworks/models/glm-5p2",
-            "teacher_base_url": "http://teacher.invalid",
-            "steps": 1,
-            "learning_rate": 1e-4,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "max_completion": 8,
-            "prompts_per_step": 1,
-            "group_size": 1,
-            "kl_coef": 1.0,
-            "save_every": 0,
-            "max_length": 0,
-            "stop_sequences": (),
-        },
+        lambda: opd_mod.OpdKnobs(
+            teacher_model="accounts/fireworks/models/glm-5p2",
+            teacher_base_url="http://teacher.invalid",
+            steps=1,
+            learning_rate=1e-4,
+            temperature=0.0,
+            top_p=1.0,
+            max_completion=8,
+            prompts_per_step=1,
+            group_size=1,
+            kl_coef=1.0,
+            save_every=0,
+            max_length=0,
+            stop_sequences=(),
+        ),
     )
 
     def _rec_student(*a, **k):
@@ -1436,21 +1434,21 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     monkeypatch.setattr(
         opd_mod,
         "_resolve_opd_knobs",
-        lambda: {
-            "teacher_model": "accounts/fireworks/models/glm-5p2",
-            "teacher_base_url": "http://teacher.invalid",
-            "steps": 1,
-            "learning_rate": 1e-4,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "max_completion": 8,
-            "prompts_per_step": 1,
-            "group_size": 1,
-            "kl_coef": 1.0,
-            "save_every": 0,
-            "max_length": 0,
-            "stop_sequences": (),
-        },
+        lambda: opd_mod.OpdKnobs(
+            teacher_model="accounts/fireworks/models/glm-5p2",
+            teacher_base_url="http://teacher.invalid",
+            steps=1,
+            learning_rate=1e-4,
+            temperature=0.0,
+            top_p=1.0,
+            max_completion=8,
+            prompts_per_step=1,
+            group_size=1,
+            kl_coef=1.0,
+            save_every=0,
+            max_length=0,
+            stop_sequences=(),
+        ),
     )
 
     def _boom(*a, **k):
@@ -2009,8 +2007,7 @@ def test_train_one_refreshes_stall_clock_between_generation_and_scoring():
         prompt_tensor=torch.tensor([[1]]),
         prompt_messages=[{"role": "user", "content": "hi"}],
         gen_cfg={},
-        knobs={"kl_coef": 1.0, "stop_sequences": ()},
-        torch=torch,
+        knobs=opd_mod.OpdKnobs(kl_coef=1.0, stop_sequences=()),
         on_generated=lambda: order.append("heartbeat"),
     )
     assert order == ["heartbeat", "score"], f"heartbeat must precede teacher scoring; got {order}"
@@ -2317,7 +2314,7 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
         "_w",
         SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=None)), THINKING=False),
     )
-    assert opd_mod._resolve_opd_knobs()["kl_coef"] > 0.0
+    assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
 
 
 def test_gkd_loss_skips_empty_student_group_without_crashing():

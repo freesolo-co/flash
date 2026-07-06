@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
+from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.opd_gkd import (
@@ -54,7 +55,32 @@ from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 
 
-def _resolve_opd_knobs():
+@dataclass(frozen=True)
+class OpdKnobs:
+    """Resolved opd knobs from the JobSpec's [train] table (falling back to RECIPE.opd), returned by
+    ``_resolve_opd_knobs``. A typed container replacing the old stringly-typed dict; field names match
+    the former dict keys one-for-one. The defaults are placeholders only — ``_resolve_opd_knobs``
+    always sets every field explicitly — kept so partial construction stays ergonomic for tests."""
+
+    teacher_model: str = ""
+    teacher_base_url: str = ""
+    steps: int = 0
+    learning_rate: float = 0.0
+    temperature: float = 0.0
+    top_p: float = 1.0
+    max_completion: int = 0
+    prompts_per_step: int = 0
+    group_size: int = 0
+    # gkd reverse-KL scale; reuses the existing [train] kl_penalty_coef knob (default 1.0).
+    kl_coef: float = 1.0
+    save_every: int = 0
+    max_length: int = 0
+    # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher never
+    # scores/trains on text past the intended answer boundary.
+    stop_sequences: tuple = ()
+
+
+def _resolve_opd_knobs() -> OpdKnobs:
     """Resolve every opd knob from the JobSpec's [train] table, falling back to RECIPE.opd."""
     d = RECIPE.opd
     t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
@@ -63,10 +89,6 @@ def _resolve_opd_knobs():
         v = getattr(t, name, None) if t else None
         return v if v is not None else default
 
-    max_completion = int(
-        opt("max_tokens", 0)
-        or (d.max_completion_len_thinking if _w.THINKING else d.max_completion_len)
-    )
     # kl_penalty_coef IS the gkd distillation objective's scale: gkd_loss multiplies every span
     # coefficient by it, so kl_coef=0 makes EVERY backward a zero gradient while the loop still counts
     # opt_steps and would publish/charge a fully-untrained adapter. The shared schema allows 0 for GRPO
@@ -80,28 +102,25 @@ def _resolve_opd_knobs():
             "0 makes every optimizer step a no-op (zero gradient) yet still counts toward `steps` and "
             "publishes an untrained adapter. Omit the field to use the default, or set a positive value."
         )
-    return {
-        "teacher_model": opt("teacher_model", "") or d.teacher_model,
-        "teacher_base_url": d.teacher_base_url,
-        "steps": int(opt("steps", 0) or d.num_steps),
-        "learning_rate": float(opt("learning_rate", 0) or d.learning_rate),
-        "temperature": float(
+    return OpdKnobs(
+        teacher_model=opt("teacher_model", "") or d.teacher_model,
+        teacher_base_url=d.teacher_base_url,
+        steps=int(opt("steps", 0) or d.num_steps),
+        learning_rate=float(opt("learning_rate", 0) or d.learning_rate),
+        temperature=float(
             opt("temperature", None)
             if (t and t.temperature is not None)
             else d.sampling_temperature
         ),
-        "top_p": d.sampling_top_p,
-        "max_completion": max_completion,
-        "prompts_per_step": int(opt("batch_size", 0) or d.prompts_per_step),
-        "group_size": int(opt("group_size", 0) or d.group_size),
-        # gkd reverse-KL scale; reuses the existing [train] kl_penalty_coef knob (default 1.0).
-        "kl_coef": kl_coef,
-        "save_every": int(opt("save_every", 0) or 20),
-        "max_length": int(opt("max_length", 0) or 0),
-        # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher
-        # never scores/trains on text past the intended answer boundary.
-        "stop_sequences": tuple(getattr(t, "stop_sequences", ()) or ()),
-    }
+        top_p=d.sampling_top_p,
+        max_completion=opd_completion_len(opt("max_tokens", 0), _w.THINKING),
+        prompts_per_step=int(opt("batch_size", 0) or d.prompts_per_step),
+        group_size=int(opt("group_size", 0) or d.group_size),
+        kl_coef=kl_coef,
+        save_every=int(opt("save_every", 0) or 20),
+        max_length=int(opt("max_length", 0) or 0),
+        stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
+    )
 
 
 def _thinking_prefill_text(tok) -> str:
@@ -187,6 +206,19 @@ def _student_model(model_id, mik, device):
     return get_peft_model(base, init_peft)
 
 
+def _opd_progress(step: int, done: int) -> None:
+    """Emit the in-loop non-liveness ``opd_step`` progress ping. Pollers ignore liveness heartbeats, so
+    a long teacher-bound step (serial scoring of a large batch/group, or slow/retrying Fireworks) — or a
+    stretch where every sample skips (empty completions, no teacher signal) — would otherwise emit only
+    liveness pings and trip the training stall window. Report ``step`` = optimizer updates COMPLETED so
+    far (opt_steps), NOT the loop index: opd_step is step-gated in the poller (_poll.STEP_GATED_STAGES),
+    so while the FIRST optimizer step is still accumulating (opt_steps==0) these pings keep the WIDE
+    setup grace and must not flip a still-running first step into the tight training window; once a real
+    update has landed (opt_steps>=1) they tighten it as intended, and the throttle bounds the HF upload
+    rate."""
+    _w.heartbeat("opd_step", step=step, samples_done=done)
+
+
 def run_opd():
     import torch
     from transformers import AutoTokenizer
@@ -210,8 +242,8 @@ def run_opd():
     knobs = _resolve_opd_knobs()
     warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     print(
-        f"[opd] gkd (groupwise reverse-KL) teacher={knobs['teacher_model']} "
-        f"steps={knobs['steps']} warm_start={warm_start or 'none'}"
+        f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
+        f"steps={knobs.steps} warm_start={warm_start or 'none'}"
     )
 
     api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
@@ -220,7 +252,7 @@ def run_opd():
             "opd requires the FIREWORKS_API_KEY runtime secret (the GLM teacher); it was not "
             "delivered to the worker. Declare it under [environment] secrets and export it locally."
         )
-    teacher = TeacherClient(api_key, knobs["teacher_base_url"], knobs["teacher_model"])
+    teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
 
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
@@ -255,21 +287,21 @@ def run_opd():
         )
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
-    steps = knobs["steps"]
-    ppl_step = knobs["prompts_per_step"]
-    group = knobs["group_size"]
+    steps = knobs.steps
+    ppl_step = knobs.prompts_per_step
+    group = knobs.group_size
     # Prompt budget mirrors GRPO: DROP (not truncate) prompts over the context budget, so the student
     # never conditions on a truncated prompt the teacher didn't see. Use the configured max_length
     # when set, else the recipe prompt cap.
-    if knobs["max_length"]:
-        prompt_budget = knobs["max_length"] - knobs["max_completion"]
+    if knobs.max_length:
+        prompt_budget = knobs.max_length - knobs.max_completion
         if prompt_budget < 1:
             # A non-positive remainder means max_length <= max_tokens: there is no room for any
             # prompt, so every sample would run generate+loss past the configured context. Reject
             # loudly instead of clamping to a 1-token budget that silently admits over-budget runs.
             raise RuntimeError(
-                f"opd: [train] max_length ({knobs['max_length']}) leaves no prompt budget after "
-                f"max_tokens ({knobs['max_completion']}); set max_length > max_tokens."
+                f"opd: [train] max_length ({knobs.max_length}) leaves no prompt budget after "
+                f"max_tokens ({knobs.max_completion}); set max_length > max_tokens."
             )
     else:
         prompt_budget = RECIPE.opd.max_prompt_len
@@ -307,8 +339,8 @@ def run_opd():
     if not examples:
         raise RuntimeError(
             f"opd: every prompt exceeds the {prompt_budget}-token budget "
-            f"(max_length={knobs['max_length'] or 'unset'}, "
-            f"max_completion={knobs['max_completion']}). Raise [train].max_length or shorten "
+            f"(max_length={knobs.max_length or 'unset'}, "
+            f"max_completion={knobs.max_completion}). Raise [train].max_length or shorten "
             "prompts — failing before the training loop instead of dropping every prompt for "
             "every step and burning the GPU allocation."
         )
@@ -347,7 +379,7 @@ def run_opd():
         if _chalk_active:
             print(f"[opd] chalk kernels active: {', '.join(_chalk_active)}")
         # Engine length gates whether gradient checkpointing is needed for the loss forward.
-        seq_cap = knobs["max_length"] or (RECIPE.opd.max_prompt_len + knobs["max_completion"])
+        seq_cap = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
         if grad_checkpointing_on(model_id, seq_cap):
             # GDN/MoE models MUST use reentrant recompute (parity with sft.py / rl.py). The default
             # non-reentrant path asserts recomputed-activation metadata equality and dies on the FIRST
@@ -366,7 +398,7 @@ def run_opd():
     )
 
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=knobs["learning_rate"]
+        [p for p in model.parameters() if p.requires_grad], lr=knobs.learning_rate
     )
 
     # Initialize W&B if configured ([wandb] config + WANDB_API_KEY). wandb_report_to() CREATES the run
@@ -385,10 +417,10 @@ def run_opd():
     os.makedirs(out_dir, exist_ok=True)
 
     gen_cfg = {
-        "do_sample": knobs["temperature"] > 0,
-        "temperature": max(knobs["temperature"], 1e-5),
-        "top_p": knobs["top_p"],
-        "max_new_tokens": knobs["max_completion"],
+        "do_sample": knobs.temperature > 0,
+        "temperature": max(knobs.temperature, 1e-5),
+        "top_p": knobs.top_p,
+        "max_new_tokens": knobs.max_completion,
         "pad_token_id": tok.pad_token_id,
         # Bound generation WALL-TIME so a degenerate or near-OOM-thrashing generate cannot silently
         # eat the training stall window: a single _train_one blocks the loop while it runs (the
@@ -398,11 +430,11 @@ def run_opd():
         # max_time between token steps, so a thrashing (still-stepping) generate is cut here and the
         # sample returns partial/empty -> the heartbeat resumes. Scale with the completion budget
         # (thinking mode needs longer) but keep it well under the poller's ~1500s training window.
-        "max_time": min(900.0, max(180.0, float(knobs["max_completion"]) * 0.75)),
+        "max_time": min(900.0, max(180.0, float(knobs.max_completion) * 0.75)),
     }
-    if knobs["stop_sequences"]:
+    if knobs.stop_sequences:
         # HF stops generation at any of these strings (needs the tokenizer to match them on decode).
-        gen_cfg["stop_strings"] = list(knobs["stop_sequences"])
+        gen_cfg["stop_strings"] = list(knobs.stop_sequences)
         gen_cfg["tokenizer"] = tok
     loss_curve: list[float] = []
     coverage_curve: list[float] = []
@@ -483,16 +515,12 @@ def run_opd():
                         prompt_messages=prompt_messages,
                         gen_cfg=gen_cfg,
                         knobs=knobs,
-                        torch=torch,
                         thinking_prefill=thinking_prefill,
-                        # Refresh the stall clock between generation and teacher scoring (see
-                        # _train_one): opt_steps step-gates the ping so it keeps the wide setup grace
-                        # during the first step and tightens correctly once a real update lands.
-                        # Bind opt_steps/nseq as defaults (called synchronously inside this iteration,
-                        # so the current values are the right ones) to satisfy the loop-var-capture lint.
-                        on_generated=lambda s=opt_steps, n=nseq: _w.heartbeat(
-                            "opd_step", step=s, samples_done=n
-                        ),
+                        # Refresh the stall clock between generation and teacher scoring (see _train_one
+                        # and _opd_progress). Bind opt_steps/nseq as lambda defaults (called synchronously
+                        # in this iteration, so the current values are the right ones) to satisfy the
+                        # loop-var-capture lint.
+                        on_generated=lambda s=opt_steps, n=nseq: _opd_progress(s, n),
                     )
                     samples_seen += 1  # advances the liveness-thread progress signal
                     if r.teacher_status == "ok":
@@ -502,14 +530,9 @@ def run_opd():
                     if r.truncated:
                         truncated_rollouts += 1
                     if r.loss is None:
-                        # Refresh the stall clock even when a sample yields no teacher signal. The
-                        # success ping below is the only NON-liveness opd_step heartbeat, so a step
-                        # where every sample skips (empty completions, or slow/retrying Fireworks)
-                        # would otherwise emit only liveness pings — which the pollers ignore — and a
-                        # prolonged all-skip stretch on a later step (opt_steps>=1, tight window)
-                        # could be reaped as stalled. Report opt_steps (same step-gating as the
-                        # success ping) so a still-accumulating first step keeps the wide setup grace.
-                        _w.heartbeat("opd_step", step=opt_steps, samples_done=nseq)
+                        # Refresh the stall clock even when a sample yields no teacher signal (rationale
+                        # in _opd_progress) — else an all-skip stretch emits only ignored liveness pings.
+                        _opd_progress(opt_steps, nseq)
                         continue
                     (r.loss / accum_target).backward()
                     step_loss += float(r.loss.detach())
@@ -519,16 +542,8 @@ def run_opd():
                     generated_tokens += r.gen_tokens
                     teacher_input_tokens += r.teacher_tokens
                     nseq += 1
-                    # Non-liveness progress ping WITHIN the step: the pollers ignore liveness
-                    # heartbeats, so a long teacher-bound step (serial scoring of a large
-                    # batch/group, or slow/retrying Fireworks) would otherwise trip the training
-                    # stall window. Report opt_steps (optimizer updates COMPLETED so far), not the
-                    # loop index: opd_step is step-gated in the poller (_poll.STEP_GATED_STAGES), so
-                    # while the FIRST optimizer step is still accumulating (opt_steps==0) these pings
-                    # keep the WIDE setup grace — they must not flip a still-running first step into
-                    # the tight training window. Once a real update has landed (opt_steps>=1) the
-                    # pings tighten it as intended, and the opd_step throttle bounds the HF upload rate.
-                    _w.heartbeat("opd_step", step=opt_steps, samples_done=nseq)
+                    # Non-liveness progress ping WITHIN the step (rationale in _opd_progress).
+                    _opd_progress(opt_steps, nseq)
             if nseq == 0:
                 print(f"[opd] step {it}: no usable teacher signal this step (skipped)")
                 continue
@@ -575,7 +590,7 @@ def run_opd():
             # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
             # contain N real updates (skipped no-signal iterations don't advance opt_steps), else a
             # warm-start/deploy from step-N would use fewer updates than its name implies.
-            if knobs["save_every"] and opt_steps % knobs["save_every"] == 0:
+            if knobs.save_every and opt_steps % knobs.save_every == 0:
                 _save_adapter(model, tok, adapter_dir)
                 # Best-effort: a mid-run recombine/publish failure (e.g. transiently evicted SFT dir)
                 # must not abort the loop after real optimizer steps — the finalize publish is strict.
@@ -655,7 +670,7 @@ def run_opd():
             "dropped_long_prompts": n_over_budget,  # prompts pre-filtered for exceeding the context budget
             "method": "gkd",
             "init_from_adapter": warm_start or None,
-            "teacher_model": knobs["teacher_model"],
+            "teacher_model": knobs.teacher_model,
             "download_seconds": download_seconds,
             "chalk_kernels": _chalk_active or None,
             "thinking": _w.THINKING,
@@ -670,10 +685,10 @@ def run_opd():
             # for a degenerate collapsed alignment, so it can't flag that failure mode.
             "mean_align_granularity": (granularity_sum / granularity_n) if granularity_n else 0.0,
             "teacher_input_tokens": teacher_input_tokens,
-            "temperature": knobs["temperature"],
+            "temperature": knobs.temperature,
             "group_size": group,
             "prompts_per_step": ppl_step,
-            "max_completion_len": knobs["max_completion"],
+            "max_completion_len": knobs.max_completion,
             **_w.wandb_run_info(),
         },
     )
@@ -714,7 +729,6 @@ def _train_one(
     prompt_messages,
     gen_cfg,
     knobs,
-    torch,
     thinking_prefill="",
     on_generated=None,
 ) -> SampleResult:
@@ -727,6 +741,8 @@ def _train_one(
     ping only fires AFTER scoring returns, so without a mid-sample refresh a slow generation followed
     by a teacher outage can span >1200s with no non-liveness heartbeat and be reaped as stalled before
     the transient-teacher handling runs."""
+    import torch
+
     # On-policy: the student samples; the teacher echo-scores that exact completion.
     model.eval()
     model.config.use_cache = True
@@ -751,15 +767,15 @@ def _train_one(
     # config, either of which may be a list) so a model that stops on a secondary eos isn't misread as
     # truncated; a fake/EOS-less tokenizer yields an empty set -> fail-open in the helper.
     if not _rollout_terminated(
-        completion_ids, stop_text, _generation_eos_ids(model, tok), knobs["stop_sequences"]
+        completion_ids, stop_text, _generation_eos_ids(model, tok), knobs.stop_sequences
     ):
         return SampleResult(truncated=True, gen_tokens=len(completion_ids))
     # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter
     # before stopping — trim it from BOTH ids and text (token-level) so the teacher scores/distils
     # only the answer, and ids/text stay consistent for gkd_loss + token counting.
-    if knobs["stop_sequences"]:
+    if knobs.stop_sequences:
         completion_ids, completion_text = _trim_trailing_stop(
-            tok, completion_ids, stop_text, knobs["stop_sequences"]
+            tok, completion_ids, stop_text, knobs.stop_sequences
         )
     gen_tokens = len(completion_ids)
     if not completion_text.strip():
@@ -814,7 +830,7 @@ def _train_one(
     _n_align = sum(1 for st in student_toks if st.end > st.start)
     group_granularity = (_n_align / len(groups)) if groups else 0.0
     return SampleResult(
-        loss=gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs["kl_coef"]),
+        loss=gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs.kl_coef),
         teacher_status="ok",
         coverage=coverage,
         gen_tokens=gen_tokens,

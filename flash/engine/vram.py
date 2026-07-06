@@ -70,6 +70,17 @@ def grpo_rollout_seq_len(
     return int(max_length or max(1024, rl.max_prompt_len + completion))
 
 
+def opd_completion_len(max_tokens: int | None, thinking: bool) -> int:
+    """The completion-token budget an OPD run uses: an explicit ``max_tokens`` else the OPD recipe
+    default (thinking uses the longer ``max_completion_len_thinking``). Single source of truth for the
+    four sites that must resolve the SAME integer — run_opd's knob resolution, ``opd_rollout_seq_len``,
+    ``estimate_vram_gb``'s opd path, and the spec-parse prompt-budget guard."""
+    from flash.engine.recipe import RECIPE
+
+    opd = RECIPE.opd
+    return int(max_tokens or (opd.max_completion_len_thinking if thinking else opd.max_completion_len))
+
+
 def opd_rollout_seq_len(
     max_length: int = 0,
     max_tokens: int | None = None,
@@ -81,11 +92,8 @@ def opd_rollout_seq_len(
     under-sized GPU."""
     from flash.engine.recipe import RECIPE
 
-    opd = RECIPE.opd
-    completion = int(
-        max_tokens or (opd.max_completion_len_thinking if thinking else opd.max_completion_len)
-    )
-    return int(max_length or max(1024, opd.max_prompt_len + completion))
+    completion = opd_completion_len(max_tokens, thinking)
+    return int(max_length or max(1024, RECIPE.opd.max_prompt_len + completion))
 
 
 def _resident_kv_gb(
@@ -325,14 +333,11 @@ def estimate_vram_gb(
         # gathered in fp32 [completion, vocab] for the logsumexp. The SFT fused path budgets ZERO
         # vocab logits for >=3B models, so a long-completion opd job (e.g. max_tokens=8192) would be
         # sized for an under-capacity card and OOM.
-        from flash.engine.recipe import RECIPE
-
+        #
         # Mirror opd_rollout_seq_len / run_opd's completion resolution: explicit max_tokens, else the
         # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
         # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
-        completion = max_tokens or (
-            RECIPE.opd.max_completion_len_thinking if thinking else RECIPE.opd.max_completion_len
-        )
+        completion = opd_completion_len(max_tokens, thinking)
         # run_opd backprops ONE completion at a time (_train_one), so the activations + dense logits
         # are SINGLE-sequence — NOT sft_per_device(batch_size). The batch-size activation term
         # over-budgeted opd and bumped the GPU tier unnecessarily (reported by codex[bot]).
