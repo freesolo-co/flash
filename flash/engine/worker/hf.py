@@ -122,13 +122,17 @@ def hf_resume_checkpoint() -> str | None:
     try:
         from huggingface_hub import snapshot_download
 
-        snapshot_download(
-            repo_id=_w.HF_REPO,
-            repo_type="dataset",
-            allow_patterns=[f"{hf_prefix()}/checkpoint/**"],
-            local_dir="/tmp/resume",
-            token=os.environ.get("HF_TOKEN"),
-        )
+        from flash.engine.worker.heartbeat import liveness_heartbeat
+
+        # resume checkpoints carry the full optimizer state (multi-GB); keep the heartbeat fresh.
+        with liveness_heartbeat("checkpoint_prefetching"):
+            snapshot_download(
+                repo_id=_w.HF_REPO,
+                repo_type="dataset",
+                allow_patterns=[f"{hf_prefix()}/checkpoint/**"],
+                local_dir="/tmp/resume",
+                token=os.environ.get("HF_TOKEN"),
+            )
         base = os.path.join("/tmp/resume", hf_prefix(), "checkpoint")
         if not os.path.isdir(base):
             return None

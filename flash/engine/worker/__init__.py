@@ -149,8 +149,16 @@ PHASE = os.environ.get(
 
 _HB_LAST_UPLOAD = 0.0
 _HB_LAST_PROGRESS_TS = 0.0
+# progress-carry latch: SEQ counts real (non-liveness) heartbeat calls; UPLOADED_SEQ is the newest
+# real call whose snapshot actually committed to HF. SEQ > UPLOADED_SEQ means progress happened that
+# HF has not seen (throttled away or a failed upload), so the next liveness ping is upgraded to a
+# real heartbeat. Without this, a liveness ping can win the shared upload slot and defer the real
+# per-step heartbeat past the provider's stall window, killing a healthy run.
+_HB_PROGRESS_SEQ = 0
+_HB_PROGRESS_UPLOADED_SEQ = 0
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
-# per-repo commit cap while staying under the provider poller's 1200s training stall window.
+# per-repo commit cap while staying under the provider poller's training stall window
+# (STALL_AFTER_S=1500s in flash/providers/_poll.py).
 _HB_MIN_INTERVAL_S = 900.0
 # Setup liveness is the user-visible signal during cold model download/load. Keep it below common
 # external "frozen heartbeat" thresholds without relaxing the noisy per-step training throttle.
@@ -329,6 +337,8 @@ __all__ = [
     "_HB_LAST_UPLOAD",
     "_HB_LOCK",
     "_HB_MIN_INTERVAL_S",
+    "_HB_PROGRESS_SEQ",
+    "_HB_PROGRESS_UPLOADED_SEQ",
     "_HB_SETUP_LIVENESS_INTERVAL_S",
     "_HB_SETUP_LIVENESS_STAGES",
     "_HB_TERMINAL_ONLY",
