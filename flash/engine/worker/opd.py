@@ -45,6 +45,7 @@ from flash.engine.worker.perf import (
     free_gpu,
     gpu_diagnostics,
     grad_checkpointing_on,
+    grpo_use_reentrant,
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -353,9 +354,18 @@ def run_opd():
         # Engine length gates whether gradient checkpointing is needed for the loss forward.
         seq_cap = knobs["max_length"] or (RECIPE.opd.max_prompt_len + knobs["max_completion"])
         if grad_checkpointing_on(model_id, seq_cap):
-            model.gradient_checkpointing_enable()
+            # GDN/MoE models MUST use reentrant recompute (parity with sft.py / rl.py). The default
+            # non-reentrant path asserts recomputed-activation metadata equality and dies on the FIRST
+            # backward for GatedDeltaNet (the fused chunk-scan + chalk Triton kernels save shape-/data-
+            # dependent tensors laid out differently on recompute) -> torch.utils.checkpoint
+            # CheckpointError; its fragmenting alloc pattern also OOMs under non-expandable segments.
+            # See grpo_use_reentrant (#429/#432 fixed this for GRPO; OPD's custom loop never got it).
+            _reentrant = grpo_use_reentrant(model_id)
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": _reentrant}
+            )
             model.enable_input_require_grads()
-            print("[opd] gradient checkpointing enabled")
+            print(f"[opd] gradient checkpointing enabled (use_reentrant={_reentrant})")
     model.config.use_cache = (
         True  # generation needs the KV cache; re-disabled per loss forward below
     )
