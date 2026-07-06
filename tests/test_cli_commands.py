@@ -77,6 +77,10 @@ class _FakeClient:
         self.calls.append(("cancel", run_id))
         return {"run_id": run_id, "state": "cancelled"}
 
+    def checkpoints(self, run_id: str) -> list[dict]:
+        self.calls.append(("checkpoints", run_id))
+        return [{"step": 20}, {"step": 40}]
+
     def deploy(self, run_id: str, **kwargs) -> dict:
         self.calls.append(("deploy", run_id, kwargs))
         return {
@@ -370,6 +374,36 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     assert "stage=rl_step" in err
     assert "step=42" in err
     assert "realized_cost=$1.2346" in err
+
+
+def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
+    """`state=cancelled` + adapter_ref=null + cost=0 reads as discardable, yet the per-step
+    deployable checkpoints streamed before the cancel survive it — the cancel output must say
+    so (on stderr in the plain path, keeping the stdout JSON machine-readable)."""
+    import json as _json
+
+    assert _run(["cancel", "flash-1"]) == 0
+    assert ("checkpoints", "flash-1") in fake_client.calls
+    out, err = capsys.readouterr()
+    assert _json.loads(out)["state"] == "cancelled"  # stdout stays pure JSON in the plain path
+    assert "2 deployable checkpoint(s) survive this cancel" in err
+    assert "flash checkpoints flash-1" in err
+    assert "flash deploy flash-1/step-40" in err  # points at the newest surviving step
+
+
+def test_cancel_hint_is_best_effort_when_checkpoint_listing_fails(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """The surviving-checkpoints lookup must never break `flash cancel` itself."""
+
+    def boom(run_id):
+        raise RuntimeError("backend hiccup")
+
+    monkeypatch.setattr(fake_client, "checkpoints", boom)
+    assert _run(["cancel", "flash-1"]) == 0
+    out, err = capsys.readouterr()
+    assert '"state": "cancelled"' in out
+    assert "deployable checkpoint" not in err
 
 
 def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
