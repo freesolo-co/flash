@@ -67,6 +67,10 @@ class _SyncThread:
         if self._target:
             self._target()
 
+    def join(self, timeout=None):
+        # quack like Thread: liveness_heartbeat joins its daemon on block exit.
+        return None
+
 
 def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", run="flash-resume-1"):
     import flash.engine.worker as worker
