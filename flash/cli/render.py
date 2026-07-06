@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 from flash._channel import CLI_NAME
 
@@ -520,6 +521,47 @@ def _humanize_ts(value) -> str | None:
     return datetime.datetime.fromtimestamp(value, datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _humanize_age(value) -> str | None:
+    """Format an epoch seconds value as a compact age ("3m ago"), None for non-numbers."""
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    secs = max(0.0, time.time() - value)
+    if secs < 90:
+        return f"{int(secs)}s ago"
+    if secs < 5400:
+        return f"{int(secs // 60)}m ago"
+    return f"{secs / 3600:.1f}h ago"
+
+
+# heartbeat age past which the panel reminds that quiet is normal: worker uploads are throttled
+# (240s quiet phases, up to 900s mid-training), so a frozen ts is usually NOT a dead worker.
+_HB_QUIET_HINT_AFTER_S = 300.0
+
+
+def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
+    """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
+    hb = obj.get("last_heartbeat")
+    if not isinstance(hb, dict) or not hb.get("stage"):
+        return []
+    worker = str(hb["stage"])
+    step = hb.get("step")
+    if step is not None:
+        worker += f" · step {step}"
+    if hb.get("liveness"):
+        worker += " · alive ping"
+    pairs = [("worker", worker)]
+    ts = hb.get("ts")
+    age = _humanize_age(ts)
+    if age:
+        running = str(obj.get("state") or "") == "running"
+        if running and isinstance(ts, (int, float)) and (time.time() - ts) > _HB_QUIET_HINT_AFTER_S:
+            age += _dim(
+                "  (heartbeat uploads are throttled; quiet is not dead - check flash log -f <run-id>)"
+            )
+        pairs.append(("heartbeat", age))
+    return pairs
+
+
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
@@ -534,6 +576,7 @@ def run_status(obj: dict) -> str:
     realized = obj.get("realized_cost_usd")
     if realized is not None:
         pairs.append(("realized", money(realized)))
+    pairs += _heartbeat_pairs(obj)
     pairs += [
         ("created", _humanize_ts(obj.get("created_at"))),
         ("updated", _humanize_ts(obj.get("updated_at"))),

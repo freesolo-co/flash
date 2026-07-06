@@ -769,3 +769,32 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
     err = capsys.readouterr().err
     assert "deployment failed: smoke generation failed" in err
     assert "once it is ready" not in err
+
+
+def test_log_follow_progress_includes_heartbeat_age() -> None:
+    """The follow spinner must show a live heartbeat age so a long quiet phase reads as
+    "alive, throttled" instead of a frozen line."""
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_initializing", "step": 3, "ts": _time.time() - 41},
+    }
+    state, progress = _log_follow_progress(status, "unknown")
+    assert state == "running"
+    assert "stage=sft_initializing" in progress
+    assert "step=3" in progress
+    assert "hb=<1m" in progress
+
+    status["last_heartbeat"]["ts"] = _time.time() - 500
+    _, progress = _log_follow_progress(status, "unknown")
+    assert "hb=8m" in progress
+
+    state, progress = _log_follow_progress({"state": "running"}, "unknown")
+    assert "hb=" not in progress  # no heartbeat yet -> no fabricated age
+
+    malformed = {"state": "running", "last_heartbeat": {"stage": "sft_step", "ts": "oops"}}
+    _, progress = _log_follow_progress(malformed, "unknown")
+    assert "hb=" not in progress  # non-numeric ts -> no fabricated age

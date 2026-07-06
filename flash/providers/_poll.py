@@ -233,7 +233,9 @@ def _record_heartbeat(hb: dict) -> None:
 
 
 # Stages emitted during cold-start BEFORE training begins — must not flip stall detection to the tight
-# training window. Canonical here so all instance providers share one definition.
+# training window. Canonical here so all instance providers share one definition. Must cover every
+# pre-training liveness stage the worker can upgrade to a real heartbeat (progress-carry), or a
+# carried setup heartbeat would prematurely tighten the stall window.
 SETUP_HEARTBEAT_STAGES = frozenset(
     {
         "boot",
@@ -241,7 +243,12 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "rl_start",
         "model_prefetching",
         "model_prefetched",
+        "checkpoint_prefetching",
+        "sft_data_loading",
+        "rl_data_loading",
+        "rl_adapter_loading",
         "sft_model_load",
+        "sft_pretokenizing",
         "rl_train_start",
         "sft_initializing",
         "rl_initializing",
