@@ -48,7 +48,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
 
 
 # ---------------------------------------------------------------------------
-# lora_exclude_modules: vision tower excluded for qwen3_5*, none for text models
+# is_vl_checkpoint: qwen3_5* are VL (gates the vLLM text-only patches); text models are not
 # ---------------------------------------------------------------------------
 def _import_worker(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
@@ -69,26 +69,20 @@ def _fake_transformers(monkeypatch, model_type: str):
     monkeypatch.setitem(sys.modules, "transformers", fake_mod)
 
 
-def test_lora_exclude_modules_qwen35(monkeypatch):
-    import re
-
+def test_is_vl_checkpoint_qwen35(monkeypatch):
+    # qwen3_5* stay VL checkpoints WITHOUT the (removed) LoRA module exclusion: this flag
+    # gates the vLLM text-only load + weight-sync patches, so it must not have been coupled
+    # to lora_exclude_modules' (now deleted) exclusion list.
     worker = _import_worker(monkeypatch)
-    _fake_transformers(monkeypatch, "qwen3_5")
-    excl = worker.lora_exclude_modules("Qwen/Qwen3.5-4B")
-    assert excl is not None
-    assert "visual" in excl
-    # peft applies exclude_modules regex with fullmatch on the module path: leaf
-    # modules under the vision tower MUST match (the earlier suffix-list form didn't,
-    # which let LoRA onto visual.* and broke vLLM adapter loading).
-    assert re.fullmatch(excl, "visual.blocks.0.attn.qkv")
-    assert re.fullmatch(excl, "model.visual.blocks.3.mlp.linear_fc1")
-    assert not re.fullmatch(excl, "model.layers.0.self_attn.q_proj")
+    for model_type in ("qwen3_5", "qwen3_5_moe", "qwen3_6"):
+        _fake_transformers(monkeypatch, model_type)
+        assert worker.is_vl_checkpoint("Qwen/Qwen3.5-4B") is True
 
 
-def test_lora_exclude_modules_text_model(monkeypatch):
+def test_is_vl_checkpoint_text_model(monkeypatch):
     worker = _import_worker(monkeypatch)
     _fake_transformers(monkeypatch, "llama")
-    assert worker.lora_exclude_modules("openbmb/MiniCPM5-1B") is None
+    assert worker.is_vl_checkpoint("openbmb/MiniCPM5-1B") is False
 
 
 def _fake_torch(monkeypatch):
@@ -620,7 +614,6 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     monkeypatch.setitem(sys.modules, "peft", fake_peft)
 
     worker = _import_worker(monkeypatch)
-    monkeypatch.setattr(worker, "lora_exclude_modules", lambda m: None)
 
     for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
         captured.clear()

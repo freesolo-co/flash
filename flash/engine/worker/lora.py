@@ -9,43 +9,26 @@ CPU-importable.
 
 from __future__ import annotations
 
-# Module-path segments that must never receive LoRA on natively-multimodal checkpoints
-# trained text-only: the vision tower / projector / MTP head. Critically, adapters that
-# DO touch them cannot be loaded by vLLM in text-only (language_model_only) serving —
-# its LoRA loader rejects "unexpected modules" (observed with Qwen3.5-2B).
-_VL_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "multi_modal_projector", "mtp")
+# Natively-multimodal model types we train (and by default serve) text-only. Their LoRA
+# adapters used to exclude the vision tower / projector / MTP head; those modules now
+# receive LoRA like every other linear (they simply get no gradient on text-only data,
+# so their lora_B stays zero-init). NOTE: vLLM's text-only (language_model_only) serving
+# LoRA loader has historically rejected adapters carrying those keys as "unexpected
+# modules" (observed with Qwen3.5-2B) — verify serving before relying on such adapters.
+_VL_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "qwen3_6")
 
 
-def lora_exclude_modules(model_id: str) -> str | None:
-    """Regex (peft fullmatch semantics) excluding vision-tower modules from LoRA.
-
-    Returns None when no exclusion is needed (pure text architectures). NOTE: peft's
-    list-form exclude_modules uses suffix matching (like target_modules), which does
-    NOT match leaf modules under 'visual.*' — a regex string is required.
-    """
-    excludes = {
-        "qwen3_5": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_5_moe": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_6": _VL_EXCLUDE_SEGMENTS,
-    }
+def is_vl_checkpoint(model_id: str) -> bool:
+    """True for natively-multimodal checkpoints we train/serve text-only (Qwen3.5/3.6)."""
     try:
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         model_type = getattr(cfg, "model_type", "") or ""
     except Exception as e:
-        print("lora_exclude_modules: config probe failed:", e)
-        return None
-    segments = excludes.get(model_type)
-    if not segments:
-        return None
-    alt = "|".join(segments)
-    return rf"(^|.*\.)({alt})(\..*|$)"
-
-
-def is_vl_checkpoint(model_id: str) -> bool:
-    """True for natively-multimodal checkpoints we train/serve text-only (Qwen3.5/3.6)."""
-    return bool(lora_exclude_modules(model_id))
+        print("is_vl_checkpoint: config probe failed:", e)
+        return False
+    return model_type in _VL_MODEL_TYPES
 
 
 def vllm_language_model_only_kwargs(model_id: str) -> dict:
