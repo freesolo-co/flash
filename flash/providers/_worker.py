@@ -112,13 +112,14 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 # Chalk is published to PUBLIC PyPI on every version bump (chalk .github/workflows/publish.yml).
 # Pin the exact PUBLIC version so worker + kernel-cache-bake pods install with NO GitHub auth — the
 # chalk repo is INTERNAL, so a git+https default made installs fail wherever GITHUB_TOKEN is absent
-# (bake pod, tokenless workers). freesolo-chalk 0.5.2 = chalk dev->main sync #44 (standalone, Liger
-# fully replaced; adds arch-TUNED gdn_gated_rmsnorm + lora on sm89/sm90/sm100, MoE grouped-GEMM,
-# serving surface, MiniCPM/Llama kernels). Bump DEFAULT_CHALK_VERSION when the merged kernel surface moves.
-DEFAULT_CHALK_VERSION = "0.5.2"
+# (bake pod, tokenless workers). freesolo-chalk 0.5.3 = chalk dev->main sync #67 (adds the decode
+# serving kernels rope + GDN gated-rmsnorm; GPU-A/B'd launch tuning: flce chunk_mult 16, rope
+# num_warps=2, gdn_conv warps formula, lora fwd autotune candidate; OP_MEAS_OVERRIDE; flce
+# chunk_mult tradeoff docs). Bump DEFAULT_CHALK_VERSION when the merged kernel surface moves.
+DEFAULT_CHALK_VERSION = "0.5.3"
 DEFAULT_CHALK_SPEC = f"freesolo-chalk=={DEFAULT_CHALK_VERSION}"
 # Provenance only (kernel-cache fingerprint / traceability): the chalk commit this version was cut from.
-LATEST_CHALK_MAIN_SHA = "37b2fb9e1a123ceb902ba6ffc4ed182182c6e7d7"
+LATEST_CHALK_MAIN_SHA = "c63f0367e01795006bc0e91e2540ec85e740f19b"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
