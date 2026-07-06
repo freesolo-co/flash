@@ -296,11 +296,18 @@ def test_default_heartbeat_interval_fits_shared_environment_repos():
     # shared env repo (test_live_console_uploads_are_throttled_for_shared_artifact_repos), while
     # staying under the provider's 1200s training stall window.
     assert 900.0 <= ne._HB_MIN_INTERVAL_S < 1200.0
-    # Setup interval must be tighter than a typical model download (~145s) so at least one heartbeat
-    # commits DURING the download instead of freezing status for the whole phase. Setup is time-
-    # bounded so this doesn't affect the steady-state commit budget.
-    assert 30.0 <= ne._HB_SETUP_LIVENESS_INTERVAL_S <= 120.0
+    # Setup interval is small so status stays near-live through a multi-minute cold download/init
+    # (instead of freezing for the whole phase). Setup is time-bounded so it doesn't move the
+    # steady-state commit budget. Must stay well under a typical download so a mid-download commit
+    # always lands, and the liveness ticker must be fast enough to actually realize it.
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+
+    assert 1.0 <= ne._HB_SETUP_LIVENESS_INTERVAL_S <= 30.0
     assert ne._HB_SETUP_LIVENESS_INTERVAL_S < 145.0
+    assert hb._SETUP_LIVENESS_TICK_S <= ne._HB_SETUP_LIVENESS_INTERVAL_S, (
+        "the setup ticker must fire at least as fast as the setup commit interval, or the commit "
+        "cadence is bounded by the slower ticker, not the interval"
+    )
 
 
 def test_setup_liveness_commits_during_a_download_shorter_than_old_interval(monkeypatch):

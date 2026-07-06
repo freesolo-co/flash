@@ -274,6 +274,11 @@ def make_sft_heartbeat_callback():
 
 
 _LIVENESS_TICK_S = 30.0
+# Setup phases (download / tokenize / init) tick FAST so a ~5s commit interval is actually realizable
+# — the commit cadence can't beat the ticker that drives it. Training keeps the 30s tick (its 900s
+# commit throttle makes a faster tick pure nvidia-smi overhead). ``min`` with _LIVENESS_TICK_S so a
+# test that monkeypatches the tick tiny still wins for setup stages too.
+_SETUP_LIVENESS_TICK_S = 5.0
 _STALL_DUMP_S = 1200.0
 
 
@@ -308,6 +313,11 @@ def liveness_heartbeat(stage, progress=None):
     Uses nvidia-smi-only diagnostics (main thread holds CUDA/allocator locks).
     """
     done = threading.Event()
+    tick = (
+        min(_SETUP_LIVENESS_TICK_S, _LIVENESS_TICK_S)
+        if stage in _HB_SETUP_LIVENESS_STAGES
+        else _LIVENESS_TICK_S
+    )
 
     def _loop() -> None:
         # Track the last value the plane actually SAW (committed), not the last one observed: an
@@ -316,7 +326,7 @@ def liveness_heartbeat(stage, progress=None):
         # progress-silent past the plane's stall window and gets killed while healthy.
         committed_val = None
         dumped = False
-        while not done.wait(_LIVENESS_TICK_S):
+        while not done.wait(tick):
             cur = None
             if progress is not None:
                 with contextlib.suppress(Exception):

@@ -160,12 +160,16 @@ _HB_LAST_PROGRESS_TS = 0.0
 # test_live_console_uploads_are_throttled_for_shared_artifact_repos). Every training commit carries
 # the live global_step and the poller's training stall window is 1200s > 900s, so a throttled-but-
 # healthy run is never auto-cancelled.
-_HB_MIN_INTERVAL_S = float(os.environ.get("FLASH_HB_TRAIN_INTERVAL_S") or 900.0)
+_HB_MIN_INTERVAL_S = 900.0
 # SETUP liveness (download / tokenize / trainer-init) is where `last_heartbeat.ts` froze for minutes:
 # a ~145s model download never reached the old 240s interval, so NO heartbeat committed for the whole
-# download. 90s guarantees mid-phase commits so status keeps advancing. Setup is TIME-BOUNDED (a few
-# minutes, then training's 900s takes over), so the tighter rate doesn't move the steady-state budget.
-_HB_SETUP_LIVENESS_INTERVAL_S = float(os.environ.get("FLASH_HB_SETUP_INTERVAL_S") or 90.0)
+# download. 5s makes status near-live through the whole setup. Setup is TIME-BOUNDED (a few minutes,
+# then training's 900s takes over) so it doesn't move the steady-state budget, but the burst IS heavy:
+# a ~250s cold download = ~50 commits, so a shared env repo running 3+ cold setups at the SAME moment
+# could brush the ~128/hr HF cap (a rate-limited heartbeat just fails-soft and retries next tick, so
+# it degrades to slightly-staler status, never a crash). Pairs with _SETUP_LIVENESS_TICK_S so the
+# liveness ticker actually fires this fast during setup.
+_HB_SETUP_LIVENESS_INTERVAL_S = 5.0
 _HB_TERMINAL_ONLY = False
 
 _WANDB_FINISH_WAIT_S = 120.0
