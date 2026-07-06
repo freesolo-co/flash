@@ -272,6 +272,9 @@ def run_opd():
             )
     else:
         prompt_budget = RECIPE.opd.max_prompt_len
+    # Train-time over-budget drops. Now always 0: the pool below caches renders that ALREADY passed the
+    # budget filter and reuses them at train time (no re-render can newly exceed the budget). Kept for
+    # train_meta-schema stability; filter-time budget drops are counted separately as n_over_budget.
     dropped_long = 0
 
     def _render_prompt_ids(messages):
@@ -294,8 +297,15 @@ def run_opd():
     with liveness_heartbeat("opd_filtering_prompts", progress=lambda: _scanned):
         examples = []
         for ex in train:
-            if len(_render_prompt_ids(env.prompt_messages(ex))) <= prompt_budget:
-                examples.append(ex)
+            # Render ONCE here and CACHE (messages + ids) alongside ex. env.prompt_messages can be
+            # stateful/randomized, so re-rendering at train time could yield a DIFFERENT prompt than the
+            # one admitted by this budget filter — an over-budget re-render would then be dropped, so a
+            # pool that PASSED this filter could still yield no usable samples after paying for GPU/model
+            # setup. Reusing this exact render below guarantees every visited prompt fits (codex[bot]).
+            msgs = env.prompt_messages(ex)
+            ids = _render_prompt_ids(msgs)
+            if len(ids) <= prompt_budget:
+                examples.append((ex, msgs, ids))
             _scanned += 1
     n_over_budget = len(train) - len(examples)
     if not examples:
@@ -449,21 +459,13 @@ def run_opd():
             step_loss = 0.0
             step_cov = 0.0
             nseq = 0
-            for ex in batch:
-                prompt_messages = env.prompt_messages(ex)
-                # Render the student prompt from the SAME messages the teacher conditions on;
-                # env.prompt_messages can be stateful/randomized, so re-deriving it via render_prompt
-                # (which calls prompt_messages again) would desync sampling from teacher scoring.
-                prompt_ids = _render_prompt_ids(prompt_messages)
-                # Drop over-budget prompts (like GRPO) rather than truncating: a truncated student
-                # prompt would no longer match the teacher's full-prompt conditioning.
-                if len(prompt_ids) > prompt_budget:
-                    dropped_long += 1
-                    # Refresh the stall clock on the drop (see the no-signal skip below): a
-                    # randomized env can re-render every prompt over budget for a whole step, which
-                    # would otherwise emit no non-liveness ping and leave the stall clock unrefreshed.
-                    _w.heartbeat("opd_step", step=opt_steps, samples_done=nseq)
-                    continue
+            for _ex, prompt_messages, prompt_ids in batch:
+                # Reuse the messages + ids CACHED by the budget filter instead of re-rendering. A fresh
+                # env.prompt_messages(ex) here can (for a stateful/randomized env) both desync student
+                # sampling from teacher scoring AND exceed the budget — dropping a prompt the filter
+                # admitted and starving the step of signal after GPU/model setup. The cached ids already
+                # passed the filter and drive BOTH the student prompt AND the teacher prompt
+                # (_teacher_prompt_text below), so they stay in sync and every visited prompt fits (codex[bot]).
                 prompt_tensor = torch.tensor([prompt_ids], device=device)
                 for _g in range(group):
                     r = _train_one(
