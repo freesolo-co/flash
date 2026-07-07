@@ -77,19 +77,14 @@ from flash.engine.worker.hf import (
 )
 from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
 from flash.engine.worker.lora import (
-    _LM_SYNC_REMAP_ON,
-    _remap_vl_sync_weights,
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
     disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
     patch_grpo_mask_aware_lm_head,
-    patch_vllm_language_model_only,
-    patch_vllm_lm_weight_sync,
     recombine_lora_adapters,
     strip_language_model_infix,
-    vllm_language_model_only_kwargs,
 )
 from flash.engine.worker.perf import (
     RetriableInfraError,
@@ -344,7 +339,6 @@ __all__ = [
     "_HB_TERMINAL_STAGES",
     "_HB_THROTTLED_STAGES",
     "_HB_UPLOAD_LOCK",
-    "_LM_SYNC_REMAP_ON",
     "_SFT_HEARTBEAT_INTERVAL_S",
     "_STEP_GPU_DIAG_INTERVAL_S",
     "_WANDB_FINISH_FAIL_WAIT_S",
@@ -371,7 +365,6 @@ __all__ = [
     "_metric_curve",
     "_neutralize_tilelang_cudart_stub",
     "_peak_gpu_gb",
-    "_remap_vl_sync_weights",
     "_remove_fla_from_disk",
     "_reset_peak_gpu",
     "_resolve_adapter_ref",
@@ -414,8 +407,6 @@ __all__ = [
     "optimal_attn_impl",
     "patch_grpo_mask_aware_lm_head",
     "patch_trl_colocate_llm_kwargs",
-    "patch_vllm_language_model_only",
-    "patch_vllm_lm_weight_sync",
     "prefetch_model",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
@@ -434,7 +425,6 @@ __all__ = [
     "think_token_count",
     "thinking_text",
     "upload_debug_jsonl",
-    "vllm_language_model_only_kwargs",
     "wait_for_gpu",
     "wandb_finish",
     "wandb_report_to",
