@@ -109,8 +109,9 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
 def serving_base_url() -> str:
     """Base URL of the freesolo serving router, taken from the FREESOLO_SERVING_URL env var.
 
-    There is no hardcoded default: serving runs on RunPod pods and there is no stable prod router
-    URL to bake in, so the operator MUST set FREESOLO_SERVING_URL to the deployed serving router.
+    There is no hardcoded default: serving runs on RunPod Serverless and there is no stable prod
+    router URL to bake in, so the operator MUST set FREESOLO_SERVING_URL to the deployed serving
+    router.
     """
     base = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
     if not base:
@@ -250,7 +251,6 @@ def deploy_adapter(
     normalized_org_id = (org_id or "").strip()
     if normalized_org_id:
         body["orgId"] = normalized_org_id
-    previous_record = _registered_adapter(run_id)
     try:
         _post_adapter_or_raise(f"{base}/adapters", body)
     except ServingError as exc:
@@ -265,14 +265,6 @@ def deploy_adapter(
             logger.warning(
                 "POST /adapters for %s failed (%s) but the serving registry shows the adapter "
                 "registered; continuing",
-                run_id,
-                exc,
-            )
-        elif record is not None and recorded is None and previous_record is None:
-            logger.warning(
-                "POST /adapters for %s failed (%s) but the serving registry shows a new adapter "
-                "record without subfolder details; continuing because no prior deployment was "
-                "registered",
                 run_id,
                 exc,
             )
@@ -340,8 +332,7 @@ def _verify_adapter_registered(run_id: str, subfolder: str) -> None:
             continue
         seen = True
         recorded = _record_subfolder(record)
-        # Older serving builds may omit subfolder from the record; presence then has to count.
-        if recorded is None or recorded == subfolder:
+        if recorded == subfolder:
             return
     if seen:
         raise ServingError(
@@ -439,12 +430,4 @@ def chat_stream(
         ) as resp,
     ):
         resp.raise_for_status()
-        if "application/json" in resp.headers.get("content-type", ""):
-            # client.stream() leaves body unread; must call resp.read() before .json().
-            resp.read()
-            payload = resp.json()
-            content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
-            if content:
-                yield str(content)
-            return
         yield from _openai_stream_content(resp.iter_lines())

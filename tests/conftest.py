@@ -51,8 +51,8 @@ def _offline(monkeypatch):
 def _default_serving_url(monkeypatch):
     """Give serving_base_url() a hermetic default.
 
-    serving_base_url() has no baked-in URL anymore (the Modal serving app was deleted; serving
-    moved to RunPod pods with no stable prod router URL to hardcode), so it raises unless
+    serving_base_url() has no baked-in URL anymore (serving moved to RunPod Serverless with no
+    stable prod router URL to hardcode), so it raises unless
     FREESOLO_SERVING_URL is set. Provide a fake default so tests that exercise the serving client
     don't have to; a test that asserts on the URL sets its own value (applied after this fixture,
     so it wins), and the required-env contract test deletes it.

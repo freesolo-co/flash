@@ -284,7 +284,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
     )
     assert seen["json"]["orgId"] == "org-xyz"
 
-    # No org -> the key is omitted entirely (registration shape unchanged for older callers).
+    # No org -> the key is omitted entirely.
     d.deploy_adapter(
         run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-0.8B",
@@ -574,34 +574,3 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
     assert seen["json"]["stream"] is True
     assert seen["json"]["model"] == "flash-7-abcd"
     assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
-
-
-def test_chat_stream_accepts_json_fallback(monkeypatch):
-    """A new Flash server can still talk to an older serving app that ignores stream=true.
-
-    Drives a REAL httpx streaming response (MockTransport) so the read-before-.json() contract is
-    actually exercised — a stub with a bare .json() would mask the ResponseNotRead bug.
-    """
-    import httpx
-
-    import flash.serve.deploy as d
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-
-    def handler(request):
-        return httpx.Response(
-            200, json={"choices": [{"message": {"content": "full reply"}}]}
-        )  # httpx sets content-type: application/json
-
-    transport = httpx.MockTransport(handler)
-    real_client = httpx.Client
-
-    def _client(*args, **kwargs):
-        kwargs["transport"] = transport
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr(d.httpx, "Client", _client)
-
-    assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
-        "full reply"
-    ]

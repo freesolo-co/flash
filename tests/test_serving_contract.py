@@ -13,8 +13,8 @@ from flash.serve.deploy import (
 
 
 def test_serving_base_url_requires_env_and_strips_trailing_slash(monkeypatch):
-    # There is no hardcoded default (the Modal serving app is gone; serving moved to RunPod
-    # pods): serving_base_url() must raise when FREESOLO_SERVING_URL is unset/empty rather than
+    # There is no hardcoded default (serving moved to RunPod Serverless): serving_base_url() must
+    # raise when FREESOLO_SERVING_URL is unset/empty rather than
     # silently pointing flash at a stale URL, and it strips a trailing slash when set.
     monkeypatch.delenv("FREESOLO_SERVING_URL", raising=False)
     with pytest.raises(RuntimeError, match="FREESOLO_SERVING_URL is not set"):
@@ -247,7 +247,7 @@ def test_deploy_reads_registry_back_before_ready(monkeypatch):
 
     dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert dep.state == "ready"
-    assert gets == ["https://serve.example/adapters", "https://serve.example/adapters"]
+    assert gets == ["https://serve.example/adapters"]
 
 
 def test_deploy_registry_readback_falls_back_to_camel_adapter_id(monkeypatch):
@@ -349,22 +349,26 @@ def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatc
     assert dep.state == "ready"
 
 
-def test_deploy_5xx_recovers_when_new_registry_record_omits_subfolder(monkeypatch):
-    """Older serving builds omit subfolder; accept it only when there was no prior deployment."""
+def test_deploy_5xx_rejects_subfolderless_registry_record(monkeypatch):
     import httpx
 
     import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(502, text="bad gateway", request=req)
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
-    responses = iter([_registry_resp([]), _registry_resp([{"adapter_id": "flash-1-abc"}])])
-    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
+    monkeypatch.setattr(
+        deploy_mod.httpx,
+        "get",
+        lambda *a, **k: _registry_resp([{"adapter_id": "flash-1-abc"}]),
+    )
 
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert dep.state == "ready"
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert "without a subfolder" in str(ei.value)
 
 
 def test_deploy_5xx_rejects_subfolderless_record_after_prior_deployment(monkeypatch):
