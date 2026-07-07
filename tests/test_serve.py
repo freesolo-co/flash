@@ -240,7 +240,8 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         "thinking": False,
     }
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
-    # Modal 303-redirects slow requests to an async-result poll URL, so registration follows them.
+    # The serving backend may 303-redirect slow requests to an async-result poll URL, so
+    # registration follows them.
     assert seen["follow_redirects"] is True
     assert dep.openai_model == "flash-7-abcd"
     assert dep.endpoint_name == "https://serve.example"
@@ -388,7 +389,8 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
     assert out == ["flash-7-abcd"]
     assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
-    # Modal 303-redirects slow requests to an async-result poll URL, so undeploy follows them too.
+    # The serving backend may 303-redirect slow requests to an async-result poll URL, so
+    # undeploy follows them too.
     assert seen["follow_redirects"] is True
 
     # A 404 (already gone) returns an empty list, not an error.
@@ -460,8 +462,8 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
             return completion
 
     class _FakeClient:
-        # chat() uses an explicit httpx.Client (context manager) so it can follow Modal's 303
-        # async-result redirects; the fake records the call and the client kwargs.
+        # chat() uses an explicit httpx.Client (context manager) so it can follow the serving
+        # backend's 303 async-result redirects; the fake records the call and the client kwargs.
         def __init__(self, *args, **kwargs):
             seen["client_kwargs"] = kwargs
 
@@ -486,8 +488,8 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
         thinking=True,
     )
     assert seen["url"] == "https://serve.example/v1/chat/completions"
-    # Modal 303-redirects slow ASGI requests to an async-result poll URL, so the chat client
-    # MUST follow redirects (else httpx raises on the 303 mid cold-start).
+    # The serving backend may 303-redirect slow ASGI requests to an async-result poll URL, so the
+    # chat client MUST follow redirects (else httpx raises on the 303 mid cold-start).
     assert seen["client_kwargs"]["follow_redirects"] is True
     assert seen["json"]["model"] == "flash-7-abcd"
     assert seen["json"]["max_tokens"] == 8

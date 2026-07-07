@@ -48,6 +48,19 @@ def _offline(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _default_serving_url(monkeypatch):
+    """Give serving_base_url() a hermetic default.
+
+    serving_base_url() has no baked-in URL anymore (the Modal serving app was deleted; serving
+    moved to RunPod pods with no stable prod router URL to hardcode), so it raises unless
+    FREESOLO_SERVING_URL is set. Provide a fake default so tests that exercise the serving client
+    don't have to; a test that asserts on the URL sets its own value (applied after this fixture,
+    so it wins), and the required-env contract test deletes it.
+    """
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serving.test")
+
+
+@pytest.fixture(autouse=True)
 def _fast_serving_readback(monkeypatch):
     """Zero the deploy read-back backoff so verification polls don't slow the suite."""
     import flash.serve.deploy as _deploy

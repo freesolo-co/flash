@@ -92,7 +92,7 @@ class ModelInfo:
     # 0 = platform default (64 GB) suffices. Runner raises gpu.disk_gb to at least this.
     min_disk_gb: int = 0
     # Deployment capacity of the external freesolo multi-LoRA serving app. This is separate from
-    # Flash's training GPU recommendation above; serving uses Modal/vLLM and sizes hot LoRA buffers
+    # Flash's training GPU recommendation above; serving uses vLLM and sizes hot LoRA buffers
     # by max_loras x max_lora_rank at engine init.
     serving: ServingCapacity | None = None
     # "none" / "hybrid" (Qwen3-style) / "always" (can't disable) / "unknown" (open-model policy)

@@ -3,7 +3,7 @@
 Incident 2026-07-02 (see ISSUE.md): flash flapped Docker-"unhealthy" -> 502 for ~2h while the
 process was alive. Root cause: `/v1/health` was a sync `def` handler, so it shared the single
 anyio threadpool CapacityLimiter (default 40 tokens) with every other sync handler. When slow
-sync handlers (chat->Modal 30-min timeout, auth/billing/HF calls) saturated that limiter under
+sync handlers (chat->serving 30-min timeout, auth/billing/HF calls) saturated that limiter under
 upstream degradation, the trivial health handler was queued and its HEALTHCHECK timed out.
 
 Declaring the handler `async def` makes it run on the event loop and never take a threadpool

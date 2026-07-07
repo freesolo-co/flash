@@ -1,4 +1,4 @@
-"""Thin client for the freesolo multi-LoRA serving app (Modal); no flash-side vLLM."""
+"""Thin client for the freesolo multi-LoRA serving router; no flash-side vLLM."""
 
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ from flash._logging import get_logger
 from flash.lora_rank import rank_from_adapter_config
 
 logger = get_logger(__name__)
-
-DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
 
 # Read-back verification: after POST /adapters, poll the serving registry until the adapter is
 # visible at the requested checkpoint, so "ready" is a registry-backed claim rather than an
@@ -65,7 +63,7 @@ def _serving_request(
     ok_statuses: tuple[int, ...] = (),
 ) -> httpx.Response:
     """Issue a request to the serving backend; translates failures into ServingError."""
-    # follow_redirects: Modal 303-redirects slow requests to an async-result poll URL.
+    # follow_redirects: the serving backend may 303-redirect slow requests to an async-result poll URL.
     kwargs: dict = {"headers": _internal_key_header(), "timeout": 60.0, "follow_redirects": True}
     if json is not None:
         kwargs["json"] = json
@@ -109,8 +107,15 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
 
 
 def serving_base_url() -> str:
-    """Env-overridable serving base URL."""
-    return (os.environ.get("FREESOLO_SERVING_URL") or DEFAULT_FREESOLO_SERVING_URL).rstrip("/")
+    """Base URL of the freesolo serving router, taken from the FREESOLO_SERVING_URL env var.
+
+    There is no hardcoded default: serving runs on RunPod pods and there is no stable prod router
+    URL to bake in, so the operator MUST set FREESOLO_SERVING_URL to the deployed serving router.
+    """
+    base = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
+    if not base:
+        raise RuntimeError("FREESOLO_SERVING_URL is not set — point it at the serving router")
+    return base.rstrip("/")
 
 
 def _internal_key_header() -> dict[str, str]:
@@ -385,8 +390,8 @@ def chat(
         "temperature": float(temperature),
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
-    # follow_redirects + max_redirects=100: Modal 303-redirects slow cold-start requests across
-    # several poll cycles before the result is ready.
+    # follow_redirects + max_redirects=100: the serving backend may 303-redirect slow cold-start
+    # requests across several poll cycles before the result is ready.
     with httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client:
         resp = client.post(f"{base}/v1/chat/completions", json=body, headers=_internal_key_header())
     resp.raise_for_status()

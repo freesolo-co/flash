@@ -12,11 +12,16 @@ from flash.serve.deploy import (
 )
 
 
-def test_serving_base_url_default_and_override(monkeypatch):
-    from flash.serve.deploy import DEFAULT_FREESOLO_SERVING_URL
-
+def test_serving_base_url_requires_env_and_strips_trailing_slash(monkeypatch):
+    # There is no hardcoded default (the Modal serving app is gone; serving moved to RunPod
+    # pods): serving_base_url() must raise when FREESOLO_SERVING_URL is unset/empty rather than
+    # silently pointing flash at a stale URL, and it strips a trailing slash when set.
     monkeypatch.delenv("FREESOLO_SERVING_URL", raising=False)
-    assert serving_base_url() == DEFAULT_FREESOLO_SERVING_URL
+    with pytest.raises(RuntimeError, match="FREESOLO_SERVING_URL is not set"):
+        serving_base_url()
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "   ")
+    with pytest.raises(RuntimeError, match="FREESOLO_SERVING_URL is not set"):
+        serving_base_url()
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/")
     assert serving_base_url() == "https://serve.example"
 
