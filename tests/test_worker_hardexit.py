@@ -58,6 +58,27 @@ def test_worker_hard_exits_zero_on_success(monkeypatch):
     assert raised.code == 0, "must exit 0 on success"
 
 
+def test_worker_dispatches_opd_run_mode(monkeypatch):
+    """RUN_MODE=='opd' must dispatch to run_opd (the third algorithm's worker handler)."""
+    ran = {"v": False}
+
+    def fake_exit(code=0):
+        raise _HardExit(code)
+
+    _patch_common(monkeypatch, fake_exit)
+    monkeypatch.setattr(worker, "RUN_MODE", "opd")
+    monkeypatch.setattr(worker, "run_opd", lambda: ran.__setitem__("v", True))
+
+    raised = None
+    try:
+        worker.main()
+    except _HardExit as e:
+        raised = e
+    assert ran["v"] is True, "RUN_MODE=opd must invoke run_opd"
+    assert raised is not None
+    assert raised.code == 0
+
+
 def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_path):
     """DONE present but a transient HF read of the persisted metrics.json must surface as a RETRIABLE
     RetriableInfraError (so the run reschedules and a fresh worker re-enters the idempotency path) —

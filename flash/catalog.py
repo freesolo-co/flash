@@ -6,7 +6,24 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
-ALGORITHMS = ("sft", "grpo")
+ALGORITHMS = ("sft", "grpo", "opd")
+
+# Algorithms whose training step SAMPLES on-policy student completions (a rollout): GRPO and OPD,
+# versus SFT which trains on a fixed dataset. Single source of truth for the "has rollouts" concept
+# the cost model, VRAM sizing and worker allocator branch on — import ``samples_on_policy`` instead
+# of hand-rolling the ("grpo", "opd") tuple at each site.
+_ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
+
+
+def samples_on_policy(algorithm: str) -> bool:
+    """True when a training step samples on-policy student completions (GRPO or OPD).
+
+    Tolerant of the ``rl`` phase-name alias for grpo (``JobSpec.phase``) so callers that pass a
+    phase rather than an algorithm resolve identically."""
+    algo = (algorithm or "").strip().lower()
+    if algo == "rl":  # phase-name alias for grpo
+        algo = "grpo"
+    return algo in _ON_POLICY_ALGORITHMS
 
 
 def normalize_algorithm(value: str) -> str:
@@ -145,7 +162,7 @@ MODELS: dict[str, ModelInfo] = {
         params="1.2B dense (Llama arch)",
         params_b=1.2,
         vocab_size=130_560,
-        algos=("sft", "grpo"),
+        algos=("sft", "grpo", "opd"),
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
@@ -164,7 +181,7 @@ MODELS: dict[str, ModelInfo] = {
         params="0.9B (text-only fine-tune)",
         params_b=0.9,
         vocab_size=248_320,
-        algos=("sft", "grpo"),
+        algos=("sft", "grpo", "opd"),
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
@@ -183,7 +200,7 @@ MODELS: dict[str, ModelInfo] = {
         params="2.3B (text-only fine-tune)",
         params_b=2.3,
         vocab_size=248_320,
-        algos=("sft", "grpo"),
+        algos=("sft", "grpo", "opd"),
         min_vram_gb=16,
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
@@ -201,7 +218,7 @@ MODELS: dict[str, ModelInfo] = {
         params="4.7B (text-only fine-tune)",
         params_b=4.7,
         vocab_size=248_320,
-        algos=("sft", "grpo"),
+        algos=("sft", "grpo", "opd"),
         min_vram_gb=32,
         recommended_gpu="RTX 5090",
         serving=ServingCapacity(
@@ -223,7 +240,7 @@ MODELS: dict[str, ModelInfo] = {
         params="9.7B (text-only fine-tune)",
         params_b=9.7,
         vocab_size=248_320,
-        algos=("sft", "grpo"),
+        algos=("sft", "grpo", "opd"),
         min_vram_gb=48,
         # NOT QLoRA: peft bnb merge during GRPO rollout diverges trainer precision -> TRL ratio collapses to 0.
         grpo_min_vram_gb=80,
@@ -255,7 +272,7 @@ MODELS: dict[str, ModelInfo] = {
         num_layers=40,
         hidden_size=2048,
         vocab_size=248_320,
-        algos=("sft", "grpo"),
+        algos=("sft", "grpo", "opd"),
         min_vram_gb=141,
         # Floor to 100 GB so SFT lands on H200, not the thin-margin consumer Blackwell or 80 GB H100.
         sft_min_vram_gb=100,
@@ -403,8 +420,9 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     info = get_model(model_id)
     algo = normalize_algorithm(algorithm)
-    required = "grpo" if algo == "grpo" else "sft"
-    if required not in info.algos:
+    # Each algorithm gates on its own capability entry (sft/grpo/opd), so a model must
+    # explicitly opt into opd via its algos tuple — same contract as sft/grpo.
+    if algo not in info.algos:
         allowed = ", ".join(info.algos)
         raise ValueError(f"{model_id} supports {allowed}, not {algo}")
     return info
