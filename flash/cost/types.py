@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from flash.catalog import normalize_algorithm
+from flash.catalog import normalize_algorithm, samples_on_policy
 from flash.engine.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES
 
@@ -14,7 +14,7 @@ class RunConfig:
     """One training run to price. ``None`` knobs resolve to recipe defaults."""
 
     model_id: str
-    method: str  # "sft" | "grpo"
+    method: str  # "sft" | "grpo" | "opd"
     steps: int
 
     # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
@@ -27,6 +27,10 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
+    # OPD only: the Fireworks teacher id, so the teacher-token quote uses the right per-model rate.
+    # "" (the unset sentinel, matching TrainSpec.teacher_model) resolves to the recipe's default
+    # teacher (RECIPE.opd.teacher_model) at the pricing boundary (facts.teacher_price_per_1m).
+    teacher_model: str = ""
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
@@ -61,26 +65,33 @@ class RunConfig:
     def is_grpo(self) -> bool:
         return self.method == "grpo"
 
+    @property
+    def is_opd(self) -> bool:
+        return self.method == "opd"
+
+    @property
+    def has_rollout(self) -> bool:
+        """True when a step samples on-policy student completions (GRPO or opd)."""
+        return samples_on_policy(self.method)
+
     def normalized(self) -> RunConfig:
         """A copy with every ``None`` knob filled from the recipe for this method."""
         lora = self.lora_rank if self.lora_rank is not None else RECIPE.lora.rank
-        if self.is_grpo:
+        if self.has_rollout:
+            # GRPO and opd both sample on-policy: identical sizing, only the recipe table differs.
+            rc = RECIPE.opd if self.is_opd else RECIPE.rl
             comp = self.completion_len
             if comp is None:
-                comp = (
-                    RECIPE.rl.max_completion_len_thinking
-                    if self.thinking
-                    else RECIPE.rl.max_completion_len
-                )
-            # Explicit pin wins; else mirror the allocator's GRPO sizing of an unset max_length:
+                comp = rc.max_completion_len_thinking if self.thinking else rc.max_completion_len
+            # Explicit pin wins; else mirror the allocator's rollout sizing of an unset max_length:
             # max(1024, max_prompt_len + completion), not bare max_prompt_len (which under-sizes).
             seq = (
                 self.seq_len
                 if self.seq_len is not None
-                else max(1024, RECIPE.rl.max_prompt_len + int(comp))
+                else max(1024, rc.max_prompt_len + int(comp))
             )
-            batch = self.batch_size if self.batch_size is not None else RECIPE.rl.prompts_per_step
-            group = self.group_size if self.group_size is not None else RECIPE.rl.group_size
+            batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
+            group = self.group_size if self.group_size is not None else rc.group_size
         else:
             seq = self.seq_len
             if seq is None:
@@ -118,8 +129,10 @@ class RunConfig:
 class CostEstimate:
     """A pre-flight estimate.
 
-    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is
-    reported as elapsed wall time but is not billed to the user estimate.
+    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is reported
+    as elapsed wall time but is not billed to the user estimate. ``teacher_api_usd`` (opd only) is
+    itemized as a diagnostic but NOT part of ``total_usd``: the teacher runs on the user's own
+    Fireworks key, so Fireworks bills them directly.
     """
 
     model_id: str
@@ -136,6 +149,10 @@ class CostEstimate:
     wall_clock_seconds: float
     wall_capped: bool
     total_usd: float
+    # opd only: external Fireworks GLM teacher token spend (0.0 for sft/grpo). Billed by Fireworks
+    # DIRECTLY to the user's FIREWORKS_API_KEY, so it is NOT part of total_usd — shown as its own
+    # itemized diagnostic line only.
+    teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()
 
     @property
@@ -161,8 +178,13 @@ class CostEstimate:
             + ("  [CAPPED at the wall-clock limit]" if self.wall_capped else ""),
             f"Wall clock : {self.wall_clock_hours:.2f} h",
             f"Billable   : {self.billable_hours:.2f} h (training only)",
-            f"TOTAL      : ${self.total_usd:.2f}",
         ]
+        if self.teacher_api_usd > 0:
+            lines.append(
+                f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks GLM token spend on your "
+                "FIREWORKS_API_KEY — billed by Fireworks, NOT included in TOTAL)"
+            )
+        lines.append(f"TOTAL      : ${self.total_usd:.2f}")
         if self.notes:
             lines.append("Notes      :")
             lines.extend(f"  - {n}" for n in self.notes)

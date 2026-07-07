@@ -9,216 +9,24 @@ CPU-importable.
 
 from __future__ import annotations
 
-# Module-path segments that must never receive LoRA on natively-multimodal checkpoints
-# trained text-only: the vision tower / projector / MTP head. Critically, adapters that
-# DO touch them cannot be loaded by vLLM in text-only (language_model_only) serving —
-# its LoRA loader rejects "unexpected modules" (observed with Qwen3.5-2B).
-_VL_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "multi_modal_projector", "mtp")
+# Natively-multimodal model types (Qwen3.5/3.6). Their LoRA adapters adapt the FULL module
+# tree — vision tower / projector / MTP head included, like every other linear (on text-only
+# data those get no gradient, so their lora_B stays zero-init). The engine loads and serves
+# the whole VL model (vision tower included); there is no text-only / language_model_only path.
+_VL_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "qwen3_6")
 
 
-def lora_exclude_modules(model_id: str) -> str | None:
-    """Regex (peft fullmatch semantics) excluding vision-tower modules from LoRA.
-
-    Returns None when no exclusion is needed (pure text architectures). NOTE: peft's
-    list-form exclude_modules uses suffix matching (like target_modules), which does
-    NOT match leaf modules under 'visual.*' — a regex string is required.
-    """
-    excludes = {
-        "qwen3_5": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_5_moe": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_6": _VL_EXCLUDE_SEGMENTS,
-    }
+def is_vl_checkpoint(model_id: str) -> bool:
+    """True for natively-multimodal checkpoints (Qwen3.5/3.6) — routes VL warm-start handling."""
     try:
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         model_type = getattr(cfg, "model_type", "") or ""
     except Exception as e:
-        print("lora_exclude_modules: config probe failed:", e)
-        return None
-    segments = excludes.get(model_type)
-    if not segments:
-        return None
-    alt = "|".join(segments)
-    return rf"(^|.*\.)({alt})(\..*|$)"
-
-
-def is_vl_checkpoint(model_id: str) -> bool:
-    """True for natively-multimodal checkpoints we train/serve text-only (Qwen3.5/3.6)."""
-    return bool(lora_exclude_modules(model_id))
-
-
-def vllm_language_model_only_kwargs(model_id: str) -> dict:
-    """Engine kwargs to skip the vision tower for VL checkpoints (vLLM >= 0.19).
-
-    Besides wasting VRAM, the vision tower's attention path hardcodes vLLM's bundled
-    flash-attn, whose PTX needs a newer driver JIT than many RTX 5090 hosts have
-    ("PTX compiled with unsupported toolchain") — text-only loading sidesteps it and
-    is the officially supported way to run Qwen3.5 as a pure LLM.
-    """
-    return {"language_model_only": True} if is_vl_checkpoint(model_id) else {}
-
-
-def patch_vllm_language_model_only(model_id: str) -> bool:
-    """Force ``language_model_only=True`` on vLLM engines created by third-party code
-    (TRL's colocated GRPO rollout engine) for VL checkpoints. Returns True if patched."""
-    extra = vllm_language_model_only_kwargs(model_id)
-    if not extra:
+        print("is_vl_checkpoint: config probe failed:", e)
         return False
-    try:
-        import vllm
-
-        if getattr(vllm.LLM.__init__, "_flash_lmo_patched", False):
-            return True
-        orig = vllm.LLM.__init__
-
-        def patched(self, *args, **kwargs):
-            kwargs.setdefault("language_model_only", True)
-            return orig(self, *args, **kwargs)
-
-        patched._flash_lmo_patched = True
-        vllm.LLM.__init__ = patched
-        print(f"[vllm] language_model_only patch active for {model_id}")
-        return True
-    except Exception as e:
-        print("patch_vllm_language_model_only warn:", e)
-        return False
-
-
-# Flipped to True only AFTER the GRPO trainer (and its colocated vLLM engine + initial
-# checkpoint load) is constructed, but BEFORE ``trainer.train()`` runs the first weight sync.
-# See ``patch_vllm_lm_weight_sync``. A module dict (not a bare bool) so the gating flag is shared
-# by reference between this module and the worker package that flips it.
-_LM_SYNC_REMAP_ON = {"on": False}
-
-
-def _remap_vl_sync_weights(weights):
-    """Rewrite TRL's trainer weight names to vLLM's VL-engine names for the train-time sync.
-
-    The trainer (built via ``AutoModelForCausalLM``) names its LM params under ``model.*`` while the
-    colocated vLLM engine loaded the same checkpoint as ``Qwen3_5ForConditionalGeneration`` whose LM
-    params live under ``language_model.*``. Each incoming ``(name, tensor)`` is remapped per the form
-    the trainer's checkpoint class produced:
-
-    - peft wrapper: a ``base_model.model.`` prefix (a continued/merged-adapter sync surfacing
-      base-model names through the PeftModel wrapper) is STRIPPED first, so the rules below apply to
-      the unwrapped name.
-    - multimodal-named trainer (``model.language_model.*`` / ``model.visual.*`` / ``lm_head.*`` — what
-      ``AutoModelForCausalLM`` yields when it resolves the FULL ``*ForConditionalGeneration``, e.g. the
-      Qwen3.6-35B-A3B MoE): passed through UNTOUCHED, because vLLM's own ``hf_to_vllm_mapper`` already
-      maps these. Prepending ``language_model.`` here would double the prefix and crash the fused-MoE
-      expert lookup (see the inline comment).
-    - text-only dense trainer (bare ``model.*`` — the dense Qwen3.5 family's ``Qwen3_5ForCausalLM``,
-      no infix, no vision tower): prefixed with ``language_model.`` so it lands under
-      ``language_model.model.*``.
-    - anything already ``language_model.*`` (or otherwise unmatched): passed through untouched.
-
-    A generator so vLLM's loader still streams one (name, tensor) at a time.
-    """
-    for name, tensor in weights:
-        # A continued-adapter (PeftModel) sync can surface names through the peft wrapper as
-        # ``base_model.model.model.layers.*`` / ``base_model.model.lm_head.*``; strip the wrapper
-        # so the same model./lm_head. rule applies.
-        if name.startswith("base_model.model."):
-            name = name[len("base_model.model.") :]
-        # MULTIMODAL-named trainers: when AutoModelForCausalLM resolves the checkpoint to the FULL
-        # ``*ForConditionalGeneration`` (the Qwen3.6-35B-A3B MoE does — its params are
-        # ``model.language_model.*`` / ``model.visual.*`` / ``lm_head.*``), the vLLM engine's OWN
-        # ``hf_to_vllm_mapper`` already maps these (``model.language_model.`` -> ``language_model.model.``,
-        # ``model.visual.`` -> ``visual.``, ``lm_head.`` -> ``language_model.lm_head.``). Pass them
-        # through UNTOUCHED so the sync is byte-identical to the proven initial on-disk load.
-        # Prepending ``language_model.`` here would yield ``language_model.model.language_model.*``,
-        # which the mapper's ``startswith("model.language_model.")`` rule no longer matches -> the
-        # fused-MoE expert lookup then crashes with
-        # ``KeyError: 'language_model.layers.N.mlp.experts.w13_weight'`` (the ``.model.`` segment is
-        # lost in the AutoWeightsLoader recursion).
-        if name.startswith(("model.language_model.", "model.visual.", "lm_head.")):
-            yield name, tensor
-            continue
-        # TEXT-ONLY trainers: the dense Qwen3.5 family resolves to ``Qwen3_5ForCausalLM``
-        # (``model.layers.*`` / ``model.norm`` / ``model.embed_tokens``, no infix, no vision tower).
-        # The mapper has NO bare-``model.`` rule, so prepend ``language_model.`` ourselves to land
-        # them under ``language_model.model.*`` (unchanged behavior for dense GRPO).
-        if name.startswith("model."):
-            name = "language_model." + name
-        yield name, tensor
-
-
-def patch_vllm_lm_weight_sync(model_id: str) -> bool:
-    """Make TRL's GRPO ``sync_weights`` work for ``*ForConditionalGeneration`` checkpoints
-    (the whole Qwen3.5/3.6 family). Returns True if any vLLM model class was patched.
-
-    The trainer loads via ``AutoModelForCausalLM`` so its params are named ``model.layers.*`` /
-    ``model.norm`` / ``model.embed_tokens`` / ``lm_head.*``. vLLM loads the same checkpoint as
-    ``Qwen3_5ForConditionalGeneration`` whose LM params live under ``language_model.*``. TRL's
-    ``sync_weights`` pushes the trainer names verbatim, so vLLM's loader raises "There is no module
-    or parameter named 'model' in Qwen3_5ForConditionalGeneration" at the first generation step and
-    GRPO dies (even with ``language_model_only=True``: that only skips loading the vision tower, it
-    does NOT rename the surviving LM params out from under ``language_model.``).
-
-    The fix wraps the vLLM model class ``load_weights`` to remap incoming ``model.``/``lm_head.``
-    names to ``language_model.*`` (see ``_remap_vl_sync_weights``) — but ONLY while
-    ``_LM_SYNC_REMAP_ON`` is set. The INITIAL checkpoint load (during trainer construction) runs
-    with it OFF, so vLLM's own ``hf_to_vllm_mapper`` handles the on-disk checkpoint untouched; the
-    remap activates only for the train-time TRL syncs. The flag is flipped on between trainer
-    construction and ``train()``. Works for BOTH from-base and warm-started (init_from_adapter)
-    GRPO. No-op for non-VL checkpoints."""
-    if not is_vl_checkpoint(model_id):
-        return False
-    patched_any = False
-    try:
-        import importlib
-
-        # The dense class is REQUIRED for the whole Qwen3.5/3.6 family — if its module/class can't
-        # be imported (vLLM not installed where it should be, or the class renamed in a new vLLM)
-        # we must NOT silently no-op: the run would crash again at the first ``sync_weights()`` with
-        # a far less actionable error. Log loudly for the required one; the MoE class is OPTIONAL
-        # (only some models are MoE, and older vLLM lacks the module) so its absence stays quiet.
-        for mod_name, cls_name, required in (
-            ("vllm.model_executor.models.qwen3_5", "Qwen3_5ForConditionalGeneration", True),
-            # NB: the MoE class lives in the SAME ``qwen3_5`` module (there is no ``qwen3_5_moe``
-            # module). It also inherits the dense class's (patched) ``load_weights``, but patch it
-            # explicitly too so the remap is guaranteed active for the MoE rollout engine.
-            ("vllm.model_executor.models.qwen3_5", "Qwen3_5MoeForConditionalGeneration", False),
-        ):
-            try:
-                mod = importlib.import_module(mod_name)
-            except Exception as e:
-                mod = None
-                if required:
-                    print(
-                        f"[vllm] WARN patch_vllm_lm_weight_sync: could not import required module "
-                        f"{mod_name} ({e!r}); GRPO weight-sync will NOT be remapped and the run may "
-                        f"crash at the first sync_weights() for this VL checkpoint."
-                    )
-            cls = getattr(mod, cls_name, None) if mod is not None else None
-            if cls is None:
-                if required and mod is not None:
-                    print(
-                        f"[vllm] WARN patch_vllm_lm_weight_sync: module {mod_name} imported but has "
-                        f"no {cls_name} (vLLM API changed?); GRPO weight-sync will NOT be remapped "
-                        f"and the run may crash at the first sync_weights() for this VL checkpoint."
-                    )
-                continue
-            if getattr(cls.load_weights, "_flash_sync_patched", False):
-                continue
-            orig_load = cls.load_weights
-
-            def _make_patched(orig):
-                def patched(self, weights, *args, **kwargs):
-                    if _LM_SYNC_REMAP_ON["on"]:
-                        weights = _remap_vl_sync_weights(weights)
-                    return orig(self, weights, *args, **kwargs)
-
-                patched._flash_sync_patched = True
-                return patched
-
-            cls.load_weights = _make_patched(orig_load)
-            patched_any = True
-            print(f"[vllm] LM weight-sync name patch installed for {cls_name} (gated)")
-    except Exception as e:
-        print("patch_vllm_lm_weight_sync warn:", e)
-    return patched_any
+    return model_type in _VL_MODEL_TYPES
 
 
 def patch_grpo_mask_aware_lm_head(trainer) -> bool:
@@ -361,22 +169,18 @@ def disable_liger_grpo_torch_compile(trainer) -> bool:
 
 
 # --------------------------------------------------------------------------------------------
-# Warm-start (init_from_adapter) SFT-adapter key remap for VL checkpoints.
+# Warm-start (init_from_adapter) SFT-adapter key namespace for VL checkpoints.
 #
 # SFT (run_sft) trains the FULL multimodal model: ``SFTTrainer(model=model_id,
 # peft_config=make_lora(...))`` loads ``Qwen3_5ForConditionalGeneration`` whose LM modules live
 # under ``language_model.``, so the SAVED adapter's keys are
-# ``base_model.model.model.language_model.layers.X...``. But warm-started GRPO
-# (``_init_adapter_model``) loads the base via ``AutoModelForCausalLM`` — a TEXT-ONLY module tree
-# whose LoRA targets are named ``base_model.model.model.layers.X...`` (no ``language_model.``
-# infix). ``PeftModel.from_pretrained`` then can't match the SFT keys: peft logs a *warning* about
-# missing adapter keys and SILENTLY keeps the fresh zero-init LoRA, so the SFT is thrown away and
-# GRPO restarts from the base model (observed: linkd-search warm-start reward ~= 0.001).
-#
-# Stripping the ``.language_model.`` infix from the saved adapter keys makes them line up with the
-# ``AutoModelForCausalLM`` trainer (proven workaround: remapped adapters train correctly). We keep
-# the trainer as ``AutoModelForCausalLM`` so the train-time vLLM weight-sync remap
-# (``patch_vllm_lm_weight_sync`` / ``_remap_vl_sync_weights``) stays consistent.
+# ``base_model.model.model.language_model.layers.X...``. Warm-started GRPO (``_init_adapter_model``)
+# loads the base via ``AutoModelForCausalLM``; when that resolves to the TEXT-ONLY module tree its
+# LoRA targets are named ``base_model.model.model.layers.X...`` (no ``language_model.`` infix), so
+# the two adapters name the SAME modules differently. ``strip_language_model_infix`` lines them up
+# for the ``recombine_lora_adapters`` SFT⊕GRPO stacking (deploy-time), then the recombine re-emits
+# the serving ``language_model`` namespace. ``_LANGUAGE_MODEL_INFIX`` is also the signal
+# ``adapter_is_vl_warmstart`` reads to detect a VL warm-start adapter from its keys.
 
 _LANGUAGE_MODEL_INFIX = ".language_model."
 
@@ -536,68 +340,65 @@ def adapter_lora_rank(adapter_dir: str) -> int:
 
 
 def validate_recombined_lora_rank(
-    sft_dir: str,
-    grpo_rank: int,
+    old_dir: str,
+    new_rank: int,
     *,
     max_rank: int | None,
+    algo: str = "GRPO",
 ) -> tuple[int, int, int]:
-    """Fail before training when a VL SFT+GRPO recombine would exceed serving's rank cap."""
+    """Fail before training when a VL warm-start recombine would exceed serving's rank cap.
+
+    ``old_dir`` is the prior ``init_from_adapter`` adapter (produced by ANY algorithm); ``new_rank``
+    is this run's fresh LoRA rank; ``algo`` labels this run for the error guidance. Returns
+    ``(old_rank, new_rank, recombined_rank)``. Shares the recombine arithmetic + guidance ladder with
+    the control-plane preflight via :func:`flash.lora_rank.check_recombined_lora_rank`."""
+    from flash.lora_rank import check_recombined_lora_rank
+
     try:
-        grpo_rank = int(grpo_rank)
+        new_rank = int(new_rank)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "VL warm-start rank preflight: GRPO train.lora_rank must be an integer"
+            f"VL warm-start rank preflight: {algo} train.lora_rank must be an integer"
         ) from exc
-    if grpo_rank <= 0:
+    if new_rank <= 0:
         raise ValueError(
-            f"VL warm-start rank preflight: GRPO train.lora_rank must be positive, got {grpo_rank}"
+            f"VL warm-start rank preflight: {algo} train.lora_rank must be positive, got {new_rank}"
         )
 
-    sft_rank = adapter_lora_rank(sft_dir)
-    recombined_rank = sft_rank + grpo_rank
-    if max_rank is None:
-        return sft_rank, grpo_rank, recombined_rank
-    max_rank = int(max_rank)
-    if recombined_rank <= max_rank:
-        return sft_rank, grpo_rank, recombined_rank
-
-    allowed_grpo_rank = max_rank - sft_rank
-    if allowed_grpo_rank >= 1:
-        guidance = f"set GRPO train.lora_rank <= {allowed_grpo_rank}"
-    else:
-        allowed_sft_rank = max_rank - grpo_rank
-        if allowed_sft_rank >= 1:
-            guidance = f"retrain the SFT adapter at rank <= {allowed_sft_rank}"
-        else:
-            guidance = f"lower both SFT and GRPO ranks so their sum is <= {max_rank}"
-    raise ValueError(
-        "VL warm-start rank preflight failed: recombined SFT+GRPO adapter would be "
-        f"rank {recombined_rank} (SFT rank {sft_rank} + GRPO rank {grpo_rank}), "
-        f"exceeding the serving LoRA rank cap {max_rank}. Because this warm-start path "
-        f"rank-stacks the adapters for deploy, {guidance}."
-    )
+    old_rank = adapter_lora_rank(old_dir)
+    try:
+        recombined_rank = check_recombined_lora_rank(
+            old_rank, new_rank, None if max_rank is None else int(max_rank), algo=algo
+        )
+    except ValueError as exc:
+        raise ValueError(f"VL warm-start rank preflight failed: {exc}") from exc
+    return old_rank, new_rank, recombined_rank
 
 
 def recombine_lora_adapters(
-    sft_dir: str, grpo_dir: str, out_dir: str, *, model_id: str | None = None
+    old_dir: str, new_dir: str, out_dir: str, *, model_id: str | None = None
 ) -> int:
-    """Stack two LoRA adapters (SFT ⊕ GRPO) into ONE rank-(r_sft+r_grpo) adapter in ``out_dir``.
+    """Stack two LoRA adapters (warm-start ⊕ fresh) into ONE rank-(r_old+r_new) adapter in ``out_dir``.
 
-    The VL warm-start path (#296) MERGES the SFT into the base and trains a FRESH LoRA on the merged
-    weights, so the saved GRPO adapter is a delta RELATIVE TO base+SFT. Deploying it alone on the
-    catalog base drops the SFT entirely (served output collapses to ~base). Concatenating the two
-    LoRAs reproduces ``base + SFT_delta + GRPO_delta`` — the exact model GRPO trained — on the
-    ORIGINAL base: for each module, ``A_out = cat([A_sft, A_grpo], 0)`` and
-    ``B_out = cat([s_sft·B_sft, s_grpo·B_grpo], 1)`` with each adapter's own scale (``alpha/r``, or
-    ``alpha/√r`` under rsLoRA) BAKED into its ``B`` and the combined adapter set to unit scale
-    (``alpha=r`` ⇒ ``alpha/r=1``). Then ``delta_out = B_out @ A_out = s_sft·B_sft@A_sft +
-    s_grpo·B_grpo@A_grpo`` exactly, for ANY input scales. Returns the combined rank.
+    The VL warm-start path (#296) MERGES the prior (warm-start) adapter into the base and trains a
+    FRESH LoRA on the merged weights, so the saved fresh adapter is a delta RELATIVE TO base+prior.
+    Deploying it alone on the catalog base drops the prior adapter entirely (served output collapses
+    to ~base). Concatenating the two LoRAs reproduces ``base + old_delta + new_delta`` — the exact
+    model the fresh run trained — on the ORIGINAL base: for each module,
+    ``A_out = cat([A_old, A_new], 0)`` and ``B_out = cat([s_old·B_old, s_new·B_new], 1)`` with each
+    adapter's own scale (``alpha/r``, or ``alpha/√r`` under rsLoRA) BAKED into its ``B`` and the
+    combined adapter set to unit scale (``alpha=r`` ⇒ ``alpha/r=1``). Then
+    ``delta_out = B_out @ A_out = s_old·B_old@A_old + s_new·B_new@A_new`` exactly, for ANY input
+    scales. Returns the combined rank.
 
-    Both adapters must target the SAME modules (true for managed flash: target_modules is
-    model-derived, not user-set) and be plain LoRA — DoRA / ``modules_to_save`` / non-LoRA tensors
-    raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead). ``model_id`` is the
-    selected GRPO job model when known; passing it keeps this finalize guard on the same serving cap
-    the init-time preflight used, even if the SFT adapter config lacks base metadata.
+    Either adapter can come from ANY algorithm — the warm-start base and the fresh run are each any
+    of SFT/GRPO/OPD (e.g. OPD→SFT), since recombine is a property of the VL model's warm-start path,
+    not the training algorithm. Both adapters must target the SAME modules (true for managed flash:
+    target_modules is model-derived, not user-set) and be plain LoRA — DoRA / ``modules_to_save`` /
+    non-LoRA tensors raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead).
+    ``model_id`` is the selected fresh-run job model when known; passing it keeps this finalize guard
+    on the same serving cap the init-time preflight used, even if the warm-start adapter config lacks
+    base metadata.
     """
     import json
     import math
@@ -646,18 +447,17 @@ def recombine_lora_adapters(
         with open(cfg_path) as f:
             return json.load(f), sd
 
-    sft_cfg, sft_sd = _load(sft_dir)
-    grpo_cfg, grpo_sd = _load(grpo_dir)
+    old_cfg, old_sd = _load(old_dir)
+    new_cfg, new_sd = _load(new_dir)
 
     # Normalize the ``.language_model.`` infix on BOTH adapters' keys before comparing/stacking.
-    # The VL merge warm-start (#296) trains the SFT against the FULL multimodal model, so the SFT
-    # adapter's keys carry the infix (``base_model.model.model.language_model.layers...``), while the
-    # fresh GRPO LoRA is saved by the text-only ``AutoModelForCausalLM`` trainer with no infix
-    # (``base_model.model.model.layers...`` — see _remap_vl_sync_weights / the warm-start remap note).
-    # Without this, the equivalent LM modules compare as DIFFERENT targets and the recombine wrongly
-    # aborts for the default Qwen3.5 warm-start path. The normalized form is only an INTERNAL math key:
-    # if either source adapter used the VL ``language_model`` namespace for a tensor, the recombined
-    # output uses that same serving-compatible key instead of the stripped text-only key.
+    # The VL merge warm-start (#296) trains the prior adapter against the FULL multimodal model, so the
+    # warm-start adapter's keys carry the infix (``base_model.model.model.language_model.layers...``),
+    # while a fresh LoRA saved by the text-only ``AutoModelForCausalLM`` trainer has no infix
+    # (``base_model.model.model.layers...``). Without this, the equivalent LM modules compare as
+    # DIFFERENT targets and the recombine wrongly aborts. The normalized form is only an INTERNAL math
+    # key: if either source adapter used the VL ``language_model`` namespace for a tensor, the
+    # recombined output uses that same serving-compatible key instead of the stripped text-only key.
     def _normalize_infix(sd, which):
         norm: dict = {}
         infixed_keys: dict[str, str] = {}
@@ -677,13 +477,13 @@ def recombine_lora_adapters(
                 infixed_keys[nk] = k
         return norm, infixed_keys
 
-    sft_sd, sft_infixed_keys = _normalize_infix(sft_sd, "SFT")
-    grpo_sd, grpo_infixed_keys = _normalize_infix(grpo_sd, "GRPO")
+    old_sd, old_infixed_keys = _normalize_infix(old_sd, "warm-start")
+    new_sd, new_infixed_keys = _normalize_infix(new_sd, "fresh")
 
     def _output_key(k: str) -> str:
-        return sft_infixed_keys.get(k) or grpo_infixed_keys.get(k) or k
+        return old_infixed_keys.get(k) or new_infixed_keys.get(k) or k
 
-    for name, cfg in (("SFT", sft_cfg), ("GRPO", grpo_cfg)):
+    for name, cfg in (("warm-start", old_cfg), ("fresh", new_cfg)):
         # peft_type defaults to LORA for older configs that omit it; anything else (e.g. ADALORA)
         # has different tensor/scale semantics the cat-recombine math doesn't model.
         peft_type = (cfg.get("peft_type") or "LORA").upper()
@@ -722,27 +522,27 @@ def recombine_lora_adapters(
     def _ab(sd):
         return {k for k in sd if _is_lora_a(k) or _is_lora_b(k)}
 
-    sft_ab, grpo_ab = _ab(sft_sd), _ab(grpo_sd)
-    extra = (set(sft_sd) - sft_ab) | (set(grpo_sd) - grpo_ab)
+    old_ab, new_ab = _ab(old_sd), _ab(new_sd)
+    extra = (set(old_sd) - old_ab) | (set(new_sd) - new_ab)
     if extra:
         raise ValueError(
             f"recombine: non-LoRA tensors present (e.g. {sorted(extra)[:4]}) — only plain "
             "lora_A/lora_B adapters can be recombined"
         )
-    if sft_ab != grpo_ab:
-        only_sft, only_grpo = sorted(sft_ab - grpo_ab)[:3], sorted(grpo_ab - sft_ab)[:3]
+    if old_ab != new_ab:
+        only_old, only_new = sorted(old_ab - new_ab)[:3], sorted(new_ab - old_ab)[:3]
         raise ValueError(
-            "recombine: SFT and GRPO adapters target DIFFERENT modules "
-            f"(only-SFT={only_sft}, only-GRPO={only_grpo}); their target_modules must match for a "
-            "rank-stacked recombine"
+            "recombine: warm-start and fresh adapters target DIFFERENT modules "
+            f"(only-warm-start={only_old}, only-fresh={only_new}); their target_modules must match "
+            "for a rank-stacked recombine"
         )
     # Symmetric to the per-A pairing guard in the loop below: the loop iterates only lora_A keys, so a
     # lora_B with no paired lora_A would be silently DROPPED from the output (an incomplete adapter),
     # not caught by the equal-key-set check above. Fail loudly, like the A-without-B case.
     orphan_b = sorted(
         bk
-        for bk in sft_ab
-        if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in sft_ab
+        for bk in old_ab
+        if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in old_ab
     )
     if orphan_b:
         raise ValueError(
@@ -754,31 +554,31 @@ def recombine_lora_adapters(
         r, alpha = int(cfg["r"]), float(cfg["lora_alpha"])
         return alpha / math.sqrt(r) if cfg.get("use_rslora") else alpha / r
 
-    s_sft, s_grpo = _scale(sft_cfg), _scale(grpo_cfg)
-    r_sft, r_grpo = int(sft_cfg["r"]), int(grpo_cfg["r"])
-    r_out = r_sft + r_grpo
+    s_old, s_new = _scale(old_cfg), _scale(new_cfg)
+    r_old, r_new = int(old_cfg["r"]), int(new_cfg["r"])
+    r_out = r_old + r_new
     from flash.catalog import serving_lora_rank_cap
 
-    max_rank = serving_lora_rank_cap(model_id or sft_cfg.get("base_model_name_or_path"))
+    max_rank = serving_lora_rank_cap(model_id or old_cfg.get("base_model_name_or_path"))
     if max_rank is not None and r_out > max_rank:
         raise ValueError(
-            "recombine: rank-stacked SFT+GRPO adapter would be "
-            f"rank {r_out} (SFT rank {r_sft} + GRPO rank {r_grpo}), exceeding the serving "
-            f"LoRA rank cap {max_rank}"
+            "recombine: rank-stacked deploy adapter would be "
+            f"rank {r_out} (warm-start adapter rank {r_old} + fresh rank {r_new}), exceeding the "
+            f"serving LoRA rank cap {max_rank}"
         )
 
     out: dict[str, torch.Tensor] = {}
     # Sorted so ``out``'s insertion order — and thus the serialized safetensors byte layout — is
-    # deterministic across runs (``sft_ab`` is a set; its iteration order is not). Stable output
+    # deterministic across runs (``old_ab`` is a set; its iteration order is not). Stable output
     # keeps the recombined adapter content-addressable for uploads/caching.
-    for ak in sorted(k for k in sft_ab if _is_lora_a(k)):
+    for ak in sorted(k for k in old_ab if _is_lora_a(k)):
         # Pair B by swapping the A/B marker — robust to the ``.default.`` adapter-name segment that
         # bare ``lora_A.weight`` -> ``lora_B.weight`` suffix slicing would miss.
         bk = ak.replace(".lora_A.", ".lora_B.", 1)
         # Both adapters carry the same A/B key set (asserted above), but a malformed adapter could
         # have a lora_A with no paired lora_B — name the missing key rather than throw a bare
-        # KeyError on the indexing below. (``bk in sft_ab`` ⇒ present in both state dicts.)
-        if bk not in sft_ab:
+        # KeyError on the indexing below. (``bk in old_ab`` ⇒ present in both state dicts.)
+        if bk not in old_ab:
             raise ValueError(
                 f"recombine: lora_A key {ak!r} has no matching lora_B key {bk!r} — the adapter is "
                 "malformed (unpaired LoRA tensors)"
@@ -791,38 +591,39 @@ def recombine_lora_adapters(
                 f"(A={out_ak!r}, B={out_bk!r})"
             )
         # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
-        out[out_ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
+        out[out_ak] = torch.cat([old_sd[ak], new_sd[ak]], dim=0).contiguous()
         # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
         # combined adapter carries unit scale, so the per-component scales survive intact.
-        # Promote to the higher of the two input dtypes (don't force the SFT's, which would downcast a
-        # higher-precision GRPO B); A is cat'd as-is and auto-promotes the same way, so A/B stay consistent.
-        dt = torch.promote_types(sft_sd[bk].dtype, grpo_sd[bk].dtype)
-        b_sft = sft_sd[bk].to(torch.float32) * s_sft
-        b_grpo = grpo_sd[bk].to(torch.float32) * s_grpo
-        out[out_bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
+        # Promote to the higher of the two input dtypes (don't force the warm-start's, which would
+        # downcast a higher-precision fresh B); A is cat'd as-is and auto-promotes the same way, so
+        # A/B stay consistent.
+        dt = torch.promote_types(old_sd[bk].dtype, new_sd[bk].dtype)
+        b_old = old_sd[bk].to(torch.float32) * s_old
+        b_new = new_sd[bk].to(torch.float32) * s_new
+        out[out_bk] = torch.cat([b_old, b_new], dim=1).to(dt).contiguous()
 
-    if sft_infixed_keys or grpo_infixed_keys:
+    if old_infixed_keys or new_infixed_keys:
         plain_layer_keys = sorted(k for k in out if k.startswith("base_model.model.model.layers."))
         if plain_layer_keys:
             raise ValueError(
                 "recombine: VL warm-start output would use plain model.layers LoRA keys "
                 f"(e.g. {plain_layer_keys[:3]}). Serving expects the language_model namespace; "
-                "refusing to write a known-bad GRPO artifact."
+                "refusing to write a known-bad deploy artifact."
             )
 
-    out_cfg = dict(grpo_cfg)
+    out_cfg = dict(new_cfg)
     out_cfg["r"] = r_out
     out_cfg["lora_alpha"] = r_out  # alpha/r == 1.0 (scales already baked into each B block)
     out_cfg["use_rslora"] = False
     out_cfg["rank_pattern"] = {}
     out_cfg["alpha_pattern"] = {}
-    # The GRPO adapter was trained on the ephemeral SFT-merged temp dir, so out_cfg (copied from
-    # grpo_cfg) still names that temp path as base_model_name_or_path. Replace it with the real catalog
-    # base from the SFT config; if the SFT config carries none (e.g. an external/legacy adapter), DROP
-    # the field rather than ship a deployed config pointing at a now-deleted temp dir.
-    sft_base = sft_cfg.get("base_model_name_or_path")
-    if sft_base:
-        out_cfg["base_model_name_or_path"] = sft_base
+    # The fresh adapter was trained on the ephemeral warm-start-merged temp dir, so out_cfg (copied
+    # from new_cfg) still names that temp path as base_model_name_or_path. Replace it with the real
+    # catalog base from the warm-start config; if that config carries none (e.g. an external/legacy
+    # adapter), DROP the field rather than ship a deployed config pointing at a now-deleted temp dir.
+    old_base = old_cfg.get("base_model_name_or_path")
+    if old_base:
+        out_cfg["base_model_name_or_path"] = old_base
     else:
         out_cfg.pop("base_model_name_or_path", None)
 

@@ -1,6 +1,7 @@
 # Flash
 
-Managed LoRA post-training service: SFT and GRPO on managed Flash GPUs.
+Managed LoRA post-training service: SFT, GRPO, and on-policy distillation (from a
+Fireworks-hosted GLM teacher) on managed Flash GPUs.
 The allocator picks the cheapest validated managed GPU class that fits the run.
 
 ## Scope
@@ -28,8 +29,9 @@ The allocator picks the cheapest validated managed GPU class that fits the run.
 - `flash/providers/` — managed GPU substrate code (pricing, GPU classes, durable
   submit/poll, preflight) behind the `base.Provider` protocol, with an
   `allocator.py` that picks the cheapest fitting managed GPU class
-- `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
-  shared recipe; SFT targets and RL rewards route through the active environment
+- `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts; distillation
+  scores on-policy student samples against a remote GLM teacher) and the shared
+  recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
 - `flash/envs/` — environment machinery: registry and the adapter that loads
   Freesolo SDK environments onto the worker's interface

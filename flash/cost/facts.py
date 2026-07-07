@@ -159,3 +159,46 @@ def reward_seconds_per_completion(override: float | None = None) -> float:
     if override is not None:
         return max(0.0, override)
     return AVG_REWARD_SECONDS_PER_COMPLETION
+
+
+# Fireworks serverless pricing for the on-policy-distillation GLM teacher, $/1M tokens as
+# (input, output). Static like gpu_hourly_usd so cost estimation is deterministic/offline and needs
+# NO FIREWORKS_API_KEY. Source: https://fireworks.ai/models/fireworks/glm-5p2 lists
+# $1.40 / $0.14 / $4.40 (input / cached input / output) per 1M. opd echo-scores completions
+# (max_tokens=0), so only INPUT tokens are billed (the teacher never generates) — but the table keeps
+# both so a mispriced entry is obvious. glm-5p1 shares the GLM-5 serverless rate.
+TEACHER_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "accounts/fireworks/models/glm-5p2": (1.40, 4.40),
+    "accounts/fireworks/models/glm-5p1": (1.40, 4.40),
+}
+# Fireworks echo-scoring round-trip per completion (wall time, concurrency-bound like reward grading).
+AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
+
+
+def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
+    """(input, output) $/1M tokens for a teacher model.
+
+    The empty-string sentinel (an opd run that OMITS [train] teacher_model) resolves to the recipe's
+    default teacher (``RECIPE.opd.teacher_model``) — the SINGLE source of "who is the default
+    teacher" — so the quote uses that model's real rate with no forked default-price constant. An
+    unknown non-default teacher falls back to the default teacher's rate (spec-parse already rejects
+    an unpriced teacher_model, so this is only a defensive backstop)."""
+    from flash.engine.recipe import RECIPE
+
+    default = TEACHER_USD_PER_1M[RECIPE.opd.teacher_model]
+    return TEACHER_USD_PER_1M.get(teacher_model or RECIPE.opd.teacher_model, default)
+
+
+def teacher_token_cost_usd(
+    input_tokens: float, output_tokens: float = 0.0, teacher_model: str = ""
+) -> float:
+    """External teacher-API dollar cost for a token count. Deterministic; no network."""
+    inp, outp = teacher_price_per_1m(teacher_model)
+    return (max(0.0, input_tokens) * inp + max(0.0, output_tokens) * outp) / 1_000_000.0
+
+
+def teacher_seconds_per_completion(override: float | None = None) -> float:
+    """Per-completion teacher-scoring latency (s): the explicit override, else the average."""
+    if override is not None:
+        return max(0.0, override)
+    return AVG_TEACHER_SECONDS_PER_COMPLETION
