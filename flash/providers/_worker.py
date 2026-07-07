@@ -128,7 +128,7 @@ DEFAULT_CHALK_SPEC = f"freesolo-chalk=={DEFAULT_CHALK_VERSION}"
 if CHANNEL == "dev":
     DEFAULT_CHALK_SPEC = f"freesolo-chalk-dev>={DEFAULT_CHALK_VERSION}"
 # Provenance only (kernel-cache fingerprint / traceability): the chalk commit this version was cut from.
-LATEST_CHALK_MAIN_SHA = "c63f0367e01795006bc0e91e2540ec85e740f19b"
+LATEST_CHALK_MAIN_SHA = "7c0a4725111279217427870d8e598fc439982500"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
