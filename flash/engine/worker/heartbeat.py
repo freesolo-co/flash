@@ -17,26 +17,11 @@ import time
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
 
-# Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled.
-_HB_THROTTLED_STAGES = frozenset(
-    {
-        "rl_step",
-        "sft_step",
-        "model_prefetching",
-        "checkpoint_prefetching",
-        "sft_data_loading",
-        "rl_data_loading",
-        "rl_adapter_loading",
-        "sft_pretokenizing",
-        "sft_initializing",
-        "rl_initializing",
-        "sft_finalizing",
-        "rl_finalizing",
-    }
-)
-# quiet phases where the liveness daemon is the only signal; upload at the faster setup cadence so
-# run status stays visibly fresh. every stage here must also be in _HB_THROTTLED_STAGES (the daemon
-# re-emits the same stage every 30s, which would otherwise commit unthrottled).
+# Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
+# cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
+# (parity with sft_pretokenizing) so the stall detector stays fed while nothing is training yet.
+# _HB_THROTTLED_STAGES is DERIVED from this set below (⊇ dev #442's explicit list) so the union of
+# per-arch stages stays single-source.
 _HB_SETUP_LIVENESS_STAGES = frozenset(
     {
         "model_prefetching",
@@ -45,15 +30,29 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         "rl_data_loading",
         "rl_adapter_loading",
         "sft_pretokenizing",
+        "opd_filtering_prompts",
         "sft_initializing",
         "rl_initializing",
+        "opd_initializing",
         "sft_finalizing",
         "rl_finalizing",
     }
 )
+# Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled. Every
+# setup-liveness stage is throttled (⊂) PLUS the per-step training stages: opd_filtering_prompts alone
+# emits a REAL (non-liveness) heartbeat every scan tick — ~120/hr on a large split before model load —
+# so unthrottled the setup stages blow the cap; throttle them exactly like their sft_pretokenizing
+# analogue (codex[bot]).
+_HB_THROTTLED_STAGES = _HB_SETUP_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "opd_step"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
+
+
+def _is_critical_stage(stage: str) -> bool:
+    """A terminal transition or an error is CRITICAL: never throttled (the commit must land) and
+    given the longer upload-lock timeout, because no later heartbeat can repair a missed one."""
+    return stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
 
 # Guards throttle bookkeeping; slow HF commit runs outside this lock so trainer callbacks don't
 # block on the network.
@@ -80,15 +79,22 @@ def _dump_thread_stacks(reason: str) -> None:
         faulthandler.dump_traceback(all_threads=True)
 
 
-def _rollback_throttle_slot(my_claim: int, prev_last_upload: float) -> None:
+def _rollback_throttle_slot(
+    my_claim: int, prev_last_upload: float, prev_last_step: int, prev_last_forced: float
+) -> None:
     """Restore the throttle slot after a failed/abandoned upload, but only if this heartbeat still
-    owns the latest claim — a newer heartbeat that bumped the slot after us must not be rolled back."""
+    owns the latest claim — a newer heartbeat that bumped the slot after us must not be rolled back.
+    Restores the committed-step marker too, so a failed forced commit doesn't permanently record its
+    step as committed (which would wrongly stop the retry from forcing through), and the forced-commit
+    clock, so a failed forced commit doesn't start the floor window (which would delay the retry)."""
     with _HB_LOCK:
         if my_claim == _HB_CLAIM_SEQ:
             _w._HB_LAST_UPLOAD = prev_last_upload
+            _w._HB_LAST_COMMITTED_STEP = prev_last_step
+            _w._HB_LAST_FORCED_UPLOAD = prev_last_forced
 
 
-def heartbeat(stage: str, *, liveness: bool = False, **kw):
+def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
     global _HB_CLAIM_SEQ
     ts = time.time()
     # liveness pings don't count as progress; provider stall detection skips them.
@@ -121,7 +127,7 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
     snapshot = json.dumps(payload)
     with _HB_LOCK:
         now = time.time()
-        if stage in _HB_TERMINAL_STAGES or stage.startswith("error_"):
+        if _is_critical_stage(stage):
             upload_due = True  # never miss a terminal transition
         elif _w._HB_TERMINAL_ONLY:
             upload_due = (
@@ -134,13 +140,50 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
             if stage in _HB_SETUP_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
             upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
+            # ``force`` bypasses the per-stage throttle (but not TERMINAL_ONLY mode, handled above) when
+            # THIS heartbeat's payload must be the one on record and a throttled drop would leave a STALE
+            # value committed -- opd's post-optimizer-step ping forces so a mid-step progress ping
+            # (carrying the previous opt_steps) that just claimed the slot can't suppress the stepped
+            # commit (else a cancel is billed from the stale step). Force is gated on STEP ADVANCE (this
+            # payload's ``step`` exceeds the last committed step) AND a per-force time floor measured from
+            # the last FORCED commit. The floor throttles only a SUB-FLOOR BURST of step advances (a
+            # tiny/fast OPD config landing many optimizer updates per minute, which unthrottled would blow
+            # the HF per-repo commit cap before the final adapter/DONE upload, codex[bot]); because the
+            # floor keys off the last forced commit -- not the last upload of any kind -- a force still
+            # punches through IMMEDIATELY after a liveness/mid-step ping stole the slot, and steps spaced
+            # farther apart than the floor (the normal teacher-round-trip-gated regime) each still commit
+            # exactly once, so a cancel there still bills the true latest step. The bounded cost is that a
+            # cancel DURING a sub-floor burst under-bills by up to one floor-window of steps -- acceptable
+            # (it favours the customer) and unavoidable once steps outrun the commit cap.
+            if force and not upload_due:
+                fstep = kw.get("step")
+                if (
+                    isinstance(fstep, (int, float))
+                    and fstep > _w._HB_LAST_COMMITTED_STEP
+                    and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
+                ):
+                    upload_due = True
         prev_last_upload = _w._HB_LAST_UPLOAD
+        prev_last_step = _w._HB_LAST_COMMITTED_STEP
+        prev_last_forced = _w._HB_LAST_FORCED_UPLOAD
         if upload_due:
             _HB_CLAIM_SEQ += 1
             my_claim = _HB_CLAIM_SEQ
             _w._HB_LAST_UPLOAD = now
+            # Arm the forced-commit floor on ANY committing force=True heartbeat -- not only ones the
+            # force branch let through. A force=True ping that commits because the regular throttle was
+            # already due (900s elapsed) still refreshed the persisted step, so the NEXT sub-floor
+            # forced ping must be coalesced; keying this off the force branch alone left the clock stale
+            # and defeated the burst throttle that protects the HF commit cap (cursor[bot]). A non-forced
+            # liveness/mid-step commit deliberately does NOT arm it, so a post-update force still punches
+            # through immediately after one steals the slot.
+            if force:
+                _w._HB_LAST_FORCED_UPLOAD = now
+            _committed_step = kw.get("step")
+            if isinstance(_committed_step, (int, float)) and _committed_step > _w._HB_LAST_COMMITTED_STEP:
+                _w._HB_LAST_COMMITTED_STEP = int(_committed_step)
     if upload_due:
-        critical = stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
+        critical = _is_critical_stage(stage)
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
         if _HB_UPLOAD_LOCK.acquire(timeout=lock_timeout):
             try:
@@ -154,7 +197,7 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
                         os.remove(up)
                 if committed is False:
                     # ``is False`` (not falsy) so a mock/None never trips the rollback.
-                    _rollback_throttle_slot(my_claim, prev_last_upload)
+                    _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
                 elif not liveness:
                     # this committed snapshot carried real progress; settle the progress-carry
@@ -166,7 +209,7 @@ def heartbeat(stage: str, *, liveness: bool = False, **kw):
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
-            _rollback_throttle_slot(my_claim, prev_last_upload)
+            _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", snapshot)
 
@@ -248,13 +291,21 @@ _STALL_DUMP_S = 1200.0
 
 
 @contextlib.contextmanager
-def liveness_heartbeat(stage, progress=None, progress_step=False):
+def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False):
     """Emit liveness pings for ``stage`` while the wrapped block runs on the main thread.
 
     ``progress``: optional ``() -> float | None`` monotonic counter; advances emit a REAL heartbeat.
+    ``fields``: optional ``() -> dict`` of EXTRA payload fields merged into every emission (liveness
+    and progress alike). Use it to carry the billing/stall ``step`` on a stage the poller step-gates:
+    without it this thread emits ``stage=<stage>`` with NO ``step``, and because it shares the
+    ``opd_step`` upload-throttle slot it can win the slot and overwrite the main thread's stepped
+    heartbeat -- ``actual_steps_run`` then sees a training-stage heartbeat with no step and floors a
+    cancelled run to 1 step, mis-billing it (codex[bot]).
     ``progress_step``: the counter IS the trainer global step; stamp it as ``step`` on every emit so
     the poller's step gate and cancel billing see the true step even when this daemon wins the
-    upload slot ahead of the trainer's own per-step callback.
+    upload slot ahead of the trainer's own per-step callback (dev #442). ``fields`` (OPD's custom
+    loop) and ``progress_step`` (sft/rl trainers) are complementary ways to carry the step; both are
+    applied below, with ``progress_step`` winning if a caller somehow set both.
     Uses nvidia-smi-only diagnostics (main thread holds CUDA/allocator locks).
     """
     done = threading.Event()
@@ -286,6 +337,9 @@ def liveness_heartbeat(stage, progress=None, progress_step=False):
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
             extra = {}
+            if fields is not None:
+                with contextlib.suppress(Exception):
+                    extra = fields() or {}
             if progress_step and last_val is not None:
                 extra["step"] = int(last_val)
             _w.heartbeat(stage, liveness=not made_progress, gpu=gpu, **extra)

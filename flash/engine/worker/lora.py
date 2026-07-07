@@ -340,68 +340,65 @@ def adapter_lora_rank(adapter_dir: str) -> int:
 
 
 def validate_recombined_lora_rank(
-    sft_dir: str,
-    grpo_rank: int,
+    old_dir: str,
+    new_rank: int,
     *,
     max_rank: int | None,
+    algo: str = "GRPO",
 ) -> tuple[int, int, int]:
-    """Fail before training when a VL SFT+GRPO recombine would exceed serving's rank cap."""
+    """Fail before training when a VL warm-start recombine would exceed serving's rank cap.
+
+    ``old_dir`` is the prior ``init_from_adapter`` adapter (produced by ANY algorithm); ``new_rank``
+    is this run's fresh LoRA rank; ``algo`` labels this run for the error guidance. Returns
+    ``(old_rank, new_rank, recombined_rank)``. Shares the recombine arithmetic + guidance ladder with
+    the control-plane preflight via :func:`flash.lora_rank.check_recombined_lora_rank`."""
+    from flash.lora_rank import check_recombined_lora_rank
+
     try:
-        grpo_rank = int(grpo_rank)
+        new_rank = int(new_rank)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "VL warm-start rank preflight: GRPO train.lora_rank must be an integer"
+            f"VL warm-start rank preflight: {algo} train.lora_rank must be an integer"
         ) from exc
-    if grpo_rank <= 0:
+    if new_rank <= 0:
         raise ValueError(
-            f"VL warm-start rank preflight: GRPO train.lora_rank must be positive, got {grpo_rank}"
+            f"VL warm-start rank preflight: {algo} train.lora_rank must be positive, got {new_rank}"
         )
 
-    sft_rank = adapter_lora_rank(sft_dir)
-    recombined_rank = sft_rank + grpo_rank
-    if max_rank is None:
-        return sft_rank, grpo_rank, recombined_rank
-    max_rank = int(max_rank)
-    if recombined_rank <= max_rank:
-        return sft_rank, grpo_rank, recombined_rank
-
-    allowed_grpo_rank = max_rank - sft_rank
-    if allowed_grpo_rank >= 1:
-        guidance = f"set GRPO train.lora_rank <= {allowed_grpo_rank}"
-    else:
-        allowed_sft_rank = max_rank - grpo_rank
-        if allowed_sft_rank >= 1:
-            guidance = f"retrain the SFT adapter at rank <= {allowed_sft_rank}"
-        else:
-            guidance = f"lower both SFT and GRPO ranks so their sum is <= {max_rank}"
-    raise ValueError(
-        "VL warm-start rank preflight failed: recombined SFT+GRPO adapter would be "
-        f"rank {recombined_rank} (SFT rank {sft_rank} + GRPO rank {grpo_rank}), "
-        f"exceeding the serving LoRA rank cap {max_rank}. Because this warm-start path "
-        f"rank-stacks the adapters for deploy, {guidance}."
-    )
+    old_rank = adapter_lora_rank(old_dir)
+    try:
+        recombined_rank = check_recombined_lora_rank(
+            old_rank, new_rank, None if max_rank is None else int(max_rank), algo=algo
+        )
+    except ValueError as exc:
+        raise ValueError(f"VL warm-start rank preflight failed: {exc}") from exc
+    return old_rank, new_rank, recombined_rank
 
 
 def recombine_lora_adapters(
-    sft_dir: str, grpo_dir: str, out_dir: str, *, model_id: str | None = None
+    old_dir: str, new_dir: str, out_dir: str, *, model_id: str | None = None
 ) -> int:
-    """Stack two LoRA adapters (SFT ⊕ GRPO) into ONE rank-(r_sft+r_grpo) adapter in ``out_dir``.
+    """Stack two LoRA adapters (warm-start ⊕ fresh) into ONE rank-(r_old+r_new) adapter in ``out_dir``.
 
-    The VL warm-start path (#296) MERGES the SFT into the base and trains a FRESH LoRA on the merged
-    weights, so the saved GRPO adapter is a delta RELATIVE TO base+SFT. Deploying it alone on the
-    catalog base drops the SFT entirely (served output collapses to ~base). Concatenating the two
-    LoRAs reproduces ``base + SFT_delta + GRPO_delta`` — the exact model GRPO trained — on the
-    ORIGINAL base: for each module, ``A_out = cat([A_sft, A_grpo], 0)`` and
-    ``B_out = cat([s_sft·B_sft, s_grpo·B_grpo], 1)`` with each adapter's own scale (``alpha/r``, or
-    ``alpha/√r`` under rsLoRA) BAKED into its ``B`` and the combined adapter set to unit scale
-    (``alpha=r`` ⇒ ``alpha/r=1``). Then ``delta_out = B_out @ A_out = s_sft·B_sft@A_sft +
-    s_grpo·B_grpo@A_grpo`` exactly, for ANY input scales. Returns the combined rank.
+    The VL warm-start path (#296) MERGES the prior (warm-start) adapter into the base and trains a
+    FRESH LoRA on the merged weights, so the saved fresh adapter is a delta RELATIVE TO base+prior.
+    Deploying it alone on the catalog base drops the prior adapter entirely (served output collapses
+    to ~base). Concatenating the two LoRAs reproduces ``base + old_delta + new_delta`` — the exact
+    model the fresh run trained — on the ORIGINAL base: for each module,
+    ``A_out = cat([A_old, A_new], 0)`` and ``B_out = cat([s_old·B_old, s_new·B_new], 1)`` with each
+    adapter's own scale (``alpha/r``, or ``alpha/√r`` under rsLoRA) BAKED into its ``B`` and the
+    combined adapter set to unit scale (``alpha=r`` ⇒ ``alpha/r=1``). Then
+    ``delta_out = B_out @ A_out = s_old·B_old@A_old + s_new·B_new@A_new`` exactly, for ANY input
+    scales. Returns the combined rank.
 
-    Both adapters must target the SAME modules (true for managed flash: target_modules is
-    model-derived, not user-set) and be plain LoRA — DoRA / ``modules_to_save`` / non-LoRA tensors
-    raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead). ``model_id`` is the
-    selected GRPO job model when known; passing it keeps this finalize guard on the same serving cap
-    the init-time preflight used, even if the SFT adapter config lacks base metadata.
+    Either adapter can come from ANY algorithm — the warm-start base and the fresh run are each any
+    of SFT/GRPO/OPD (e.g. OPD→SFT), since recombine is a property of the VL model's warm-start path,
+    not the training algorithm. Both adapters must target the SAME modules (true for managed flash:
+    target_modules is model-derived, not user-set) and be plain LoRA — DoRA / ``modules_to_save`` /
+    non-LoRA tensors raise (a wrong recombine would silently mis-deploy, so fail LOUDLY instead).
+    ``model_id`` is the selected fresh-run job model when known; passing it keeps this finalize guard
+    on the same serving cap the init-time preflight used, even if the warm-start adapter config lacks
+    base metadata.
     """
     import json
     import math
@@ -450,13 +447,13 @@ def recombine_lora_adapters(
         with open(cfg_path) as f:
             return json.load(f), sd
 
-    sft_cfg, sft_sd = _load(sft_dir)
-    grpo_cfg, grpo_sd = _load(grpo_dir)
+    old_cfg, old_sd = _load(old_dir)
+    new_cfg, new_sd = _load(new_dir)
 
     # Normalize the ``.language_model.`` infix on BOTH adapters' keys before comparing/stacking.
-    # The VL merge warm-start (#296) trains the SFT against the FULL multimodal model, so the SFT
-    # adapter's keys carry the infix (``base_model.model.model.language_model.layers...``), while a
-    # GRPO LoRA saved by the text-only ``AutoModelForCausalLM`` trainer has no infix
+    # The VL merge warm-start (#296) trains the prior adapter against the FULL multimodal model, so the
+    # warm-start adapter's keys carry the infix (``base_model.model.model.language_model.layers...``),
+    # while a fresh LoRA saved by the text-only ``AutoModelForCausalLM`` trainer has no infix
     # (``base_model.model.model.layers...``). Without this, the equivalent LM modules compare as
     # DIFFERENT targets and the recombine wrongly aborts. The normalized form is only an INTERNAL math
     # key: if either source adapter used the VL ``language_model`` namespace for a tensor, the
@@ -480,13 +477,13 @@ def recombine_lora_adapters(
                 infixed_keys[nk] = k
         return norm, infixed_keys
 
-    sft_sd, sft_infixed_keys = _normalize_infix(sft_sd, "SFT")
-    grpo_sd, grpo_infixed_keys = _normalize_infix(grpo_sd, "GRPO")
+    old_sd, old_infixed_keys = _normalize_infix(old_sd, "warm-start")
+    new_sd, new_infixed_keys = _normalize_infix(new_sd, "fresh")
 
     def _output_key(k: str) -> str:
-        return sft_infixed_keys.get(k) or grpo_infixed_keys.get(k) or k
+        return old_infixed_keys.get(k) or new_infixed_keys.get(k) or k
 
-    for name, cfg in (("SFT", sft_cfg), ("GRPO", grpo_cfg)):
+    for name, cfg in (("warm-start", old_cfg), ("fresh", new_cfg)):
         # peft_type defaults to LORA for older configs that omit it; anything else (e.g. ADALORA)
         # has different tensor/scale semantics the cat-recombine math doesn't model.
         peft_type = (cfg.get("peft_type") or "LORA").upper()
@@ -525,27 +522,27 @@ def recombine_lora_adapters(
     def _ab(sd):
         return {k for k in sd if _is_lora_a(k) or _is_lora_b(k)}
 
-    sft_ab, grpo_ab = _ab(sft_sd), _ab(grpo_sd)
-    extra = (set(sft_sd) - sft_ab) | (set(grpo_sd) - grpo_ab)
+    old_ab, new_ab = _ab(old_sd), _ab(new_sd)
+    extra = (set(old_sd) - old_ab) | (set(new_sd) - new_ab)
     if extra:
         raise ValueError(
             f"recombine: non-LoRA tensors present (e.g. {sorted(extra)[:4]}) — only plain "
             "lora_A/lora_B adapters can be recombined"
         )
-    if sft_ab != grpo_ab:
-        only_sft, only_grpo = sorted(sft_ab - grpo_ab)[:3], sorted(grpo_ab - sft_ab)[:3]
+    if old_ab != new_ab:
+        only_old, only_new = sorted(old_ab - new_ab)[:3], sorted(new_ab - old_ab)[:3]
         raise ValueError(
-            "recombine: SFT and GRPO adapters target DIFFERENT modules "
-            f"(only-SFT={only_sft}, only-GRPO={only_grpo}); their target_modules must match for a "
-            "rank-stacked recombine"
+            "recombine: warm-start and fresh adapters target DIFFERENT modules "
+            f"(only-warm-start={only_old}, only-fresh={only_new}); their target_modules must match "
+            "for a rank-stacked recombine"
         )
     # Symmetric to the per-A pairing guard in the loop below: the loop iterates only lora_A keys, so a
     # lora_B with no paired lora_A would be silently DROPPED from the output (an incomplete adapter),
     # not caught by the equal-key-set check above. Fail loudly, like the A-without-B case.
     orphan_b = sorted(
         bk
-        for bk in sft_ab
-        if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in sft_ab
+        for bk in old_ab
+        if _is_lora_b(bk) and bk.replace(".lora_B.", ".lora_A.", 1) not in old_ab
     )
     if orphan_b:
         raise ValueError(
@@ -557,31 +554,31 @@ def recombine_lora_adapters(
         r, alpha = int(cfg["r"]), float(cfg["lora_alpha"])
         return alpha / math.sqrt(r) if cfg.get("use_rslora") else alpha / r
 
-    s_sft, s_grpo = _scale(sft_cfg), _scale(grpo_cfg)
-    r_sft, r_grpo = int(sft_cfg["r"]), int(grpo_cfg["r"])
-    r_out = r_sft + r_grpo
+    s_old, s_new = _scale(old_cfg), _scale(new_cfg)
+    r_old, r_new = int(old_cfg["r"]), int(new_cfg["r"])
+    r_out = r_old + r_new
     from flash.catalog import serving_lora_rank_cap
 
-    max_rank = serving_lora_rank_cap(model_id or sft_cfg.get("base_model_name_or_path"))
+    max_rank = serving_lora_rank_cap(model_id or old_cfg.get("base_model_name_or_path"))
     if max_rank is not None and r_out > max_rank:
         raise ValueError(
-            "recombine: rank-stacked SFT+GRPO adapter would be "
-            f"rank {r_out} (SFT rank {r_sft} + GRPO rank {r_grpo}), exceeding the serving "
-            f"LoRA rank cap {max_rank}"
+            "recombine: rank-stacked deploy adapter would be "
+            f"rank {r_out} (warm-start adapter rank {r_old} + fresh rank {r_new}), exceeding the "
+            f"serving LoRA rank cap {max_rank}"
         )
 
     out: dict[str, torch.Tensor] = {}
     # Sorted so ``out``'s insertion order — and thus the serialized safetensors byte layout — is
-    # deterministic across runs (``sft_ab`` is a set; its iteration order is not). Stable output
+    # deterministic across runs (``old_ab`` is a set; its iteration order is not). Stable output
     # keeps the recombined adapter content-addressable for uploads/caching.
-    for ak in sorted(k for k in sft_ab if _is_lora_a(k)):
+    for ak in sorted(k for k in old_ab if _is_lora_a(k)):
         # Pair B by swapping the A/B marker — robust to the ``.default.`` adapter-name segment that
         # bare ``lora_A.weight`` -> ``lora_B.weight`` suffix slicing would miss.
         bk = ak.replace(".lora_A.", ".lora_B.", 1)
         # Both adapters carry the same A/B key set (asserted above), but a malformed adapter could
         # have a lora_A with no paired lora_B — name the missing key rather than throw a bare
-        # KeyError on the indexing below. (``bk in sft_ab`` ⇒ present in both state dicts.)
-        if bk not in sft_ab:
+        # KeyError on the indexing below. (``bk in old_ab`` ⇒ present in both state dicts.)
+        if bk not in old_ab:
             raise ValueError(
                 f"recombine: lora_A key {ak!r} has no matching lora_B key {bk!r} — the adapter is "
                 "malformed (unpaired LoRA tensors)"
@@ -594,38 +591,39 @@ def recombine_lora_adapters(
                 f"(A={out_ak!r}, B={out_bk!r})"
             )
         # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
-        out[out_ak] = torch.cat([sft_sd[ak], grpo_sd[ak]], dim=0).contiguous()
+        out[out_ak] = torch.cat([old_sd[ak], new_sd[ak]], dim=0).contiguous()
         # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
         # combined adapter carries unit scale, so the per-component scales survive intact.
-        # Promote to the higher of the two input dtypes (don't force the SFT's, which would downcast a
-        # higher-precision GRPO B); A is cat'd as-is and auto-promotes the same way, so A/B stay consistent.
-        dt = torch.promote_types(sft_sd[bk].dtype, grpo_sd[bk].dtype)
-        b_sft = sft_sd[bk].to(torch.float32) * s_sft
-        b_grpo = grpo_sd[bk].to(torch.float32) * s_grpo
-        out[out_bk] = torch.cat([b_sft, b_grpo], dim=1).to(dt).contiguous()
+        # Promote to the higher of the two input dtypes (don't force the warm-start's, which would
+        # downcast a higher-precision fresh B); A is cat'd as-is and auto-promotes the same way, so
+        # A/B stay consistent.
+        dt = torch.promote_types(old_sd[bk].dtype, new_sd[bk].dtype)
+        b_old = old_sd[bk].to(torch.float32) * s_old
+        b_new = new_sd[bk].to(torch.float32) * s_new
+        out[out_bk] = torch.cat([b_old, b_new], dim=1).to(dt).contiguous()
 
-    if sft_infixed_keys or grpo_infixed_keys:
+    if old_infixed_keys or new_infixed_keys:
         plain_layer_keys = sorted(k for k in out if k.startswith("base_model.model.model.layers."))
         if plain_layer_keys:
             raise ValueError(
                 "recombine: VL warm-start output would use plain model.layers LoRA keys "
                 f"(e.g. {plain_layer_keys[:3]}). Serving expects the language_model namespace; "
-                "refusing to write a known-bad GRPO artifact."
+                "refusing to write a known-bad deploy artifact."
             )
 
-    out_cfg = dict(grpo_cfg)
+    out_cfg = dict(new_cfg)
     out_cfg["r"] = r_out
     out_cfg["lora_alpha"] = r_out  # alpha/r == 1.0 (scales already baked into each B block)
     out_cfg["use_rslora"] = False
     out_cfg["rank_pattern"] = {}
     out_cfg["alpha_pattern"] = {}
-    # The GRPO adapter was trained on the ephemeral SFT-merged temp dir, so out_cfg (copied from
-    # grpo_cfg) still names that temp path as base_model_name_or_path. Replace it with the real catalog
-    # base from the SFT config; if the SFT config carries none (e.g. an external/legacy adapter), DROP
-    # the field rather than ship a deployed config pointing at a now-deleted temp dir.
-    sft_base = sft_cfg.get("base_model_name_or_path")
-    if sft_base:
-        out_cfg["base_model_name_or_path"] = sft_base
+    # The fresh adapter was trained on the ephemeral warm-start-merged temp dir, so out_cfg (copied
+    # from new_cfg) still names that temp path as base_model_name_or_path. Replace it with the real
+    # catalog base from the warm-start config; if that config carries none (e.g. an external/legacy
+    # adapter), DROP the field rather than ship a deployed config pointing at a now-deleted temp dir.
+    old_base = old_cfg.get("base_model_name_or_path")
+    if old_base:
+        out_cfg["base_model_name_or_path"] = old_base
     else:
         out_cfg.pop("base_model_name_or_path", None)
 

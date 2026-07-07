@@ -11,7 +11,16 @@ from flash.engine.worker.perf import gpu_diagnostics
 
 
 def write_train_meta(
-    phase, adapter_dir, model_id, train_wall, setup_seconds, train_tokens, generated_tokens, notes
+    phase,
+    adapter_dir,
+    model_id,
+    train_wall,
+    setup_seconds,
+    train_tokens,
+    generated_tokens,
+    notes,
+    *,
+    step=None,
 ):
     env = _w.require_active_env()
     meta = {
@@ -27,14 +36,22 @@ def write_train_meta(
     with open("/tmp/train_meta.json", "w") as f:
         json.dump(meta, f)
     _w.hf_upload_file("/tmp/train_meta.json", "train_meta.json")
+    # Carry the completed optimizer ``step`` (when the caller supplies it) so this final pre-DONE
+    # heartbeat doesn't clobber the last stepped training ping with a stepless one -- a cancel between
+    # here and DONE would otherwise re-price a fully-trained run to 0 steps (codex[bot]).
+    _step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
     _w.heartbeat(
         f"{phase}_train_done",
+        **_step_field,
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
         gpu=gpu_diagnostics(),
     )
     m = RunMetrics(
         arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
+        # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None). _finalize
+        # reads metrics.step to carry the true step onto the terminal `done` heartbeat.
+        step=step,
         seed=_w.SEED,
         model_id=model_id,
         wall_seconds=train_wall,

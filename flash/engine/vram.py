@@ -70,6 +70,32 @@ def grpo_rollout_seq_len(
     return int(max_length or max(1024, rl.max_prompt_len + completion))
 
 
+def opd_completion_len(max_tokens: int | None, thinking: bool) -> int:
+    """The completion-token budget an OPD run uses: an explicit ``max_tokens`` else the OPD recipe
+    default (thinking uses the longer ``max_completion_len_thinking``). Single source of truth for the
+    four sites that must resolve the SAME integer — run_opd's knob resolution, ``opd_rollout_seq_len``,
+    ``estimate_vram_gb``'s opd path, and the spec-parse prompt-budget guard."""
+    from flash.engine.recipe import RECIPE
+
+    opd = RECIPE.opd
+    return int(max_tokens or (opd.max_completion_len_thinking if thinking else opd.max_completion_len))
+
+
+def opd_rollout_seq_len(
+    max_length: int = 0,
+    max_tokens: int | None = None,
+    thinking: bool = False,
+) -> int:
+    """Sequence length an OPD run uses, mirroring run_opd()'s ``seq_cap``: the loss forward runs
+    ``model(prompt_ids + student_ids)`` over prompt+completion, so size for both — else a raised
+    ``max_tokens`` (unset ``max_length``) is sized as an SFT 1024-token job and OOMs on an
+    under-sized GPU."""
+    from flash.engine.recipe import RECIPE
+
+    completion = opd_completion_len(max_tokens, thinking)
+    return int(max_length or max(1024, RECIPE.opd.max_prompt_len + completion))
+
+
 def _resident_kv_gb(
     params_b: float | None, vllm_max_len: int, num_generations: int = 8, fp8_kv: bool = False
 ) -> float:
@@ -112,7 +138,9 @@ def colocate_kv_util(
     copy + KV; the non-sleep path uses the leaner resident-KV target (_KV_CAP). MEASURED at
     4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward byte-identical, train_wall neutral; a
     tighter 12 GB budget preempts, confirming this as the floor."""
-    weights_gb = max(0.5, float(params_b or 1.0)) * 2.0  # vLLM's bf16 weight copy lives in the budget
+    weights_gb = (
+        max(0.5, float(params_b or 1.0)) * 2.0
+    )  # vLLM's bf16 weight copy lives in the budget
     # MoE: the KV pool scales with the per-token COMPUTE width (the ~3B active backbone), NOT the 35B
     # total — exactly the split estimate_vram_gb/grpo_fits_resident use (active for KV, full for the
     # weight copy). Keying the KV off total here would budget a LARGER pool than the resident-fit gate
@@ -144,7 +172,9 @@ def colocate_kv_util(
         # context + group (floored at _KV_CAP for the validated short-context lean point, bounded by
         # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
         # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
-        kv_gb = max(_KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations, fp8_kv=fp8_kv))
+        kv_gb = max(
+            _KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations, fp8_kv=fp8_kv)
+        )
         return max(0.10, min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
@@ -274,6 +304,7 @@ def estimate_vram_gb(
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp
     eff_b = float(active_params_b) if active_params_b else params_b
+    is_opd = (algorithm or "").lower() == "opd"
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
     width = math.sqrt(max(eff_b, 0.1))
     lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * eff_b)
@@ -284,7 +315,9 @@ def estimate_vram_gb(
         if use_vllm:
             _kv_fp8_factor = 0.5 if fp8_kv else 1.0  # fp8 KV halves bytes/token (cc>=8.9)
             if sleep_offload:
-                rollout = weights + min(_KV_COEF * (seq_len / 1024.0) * width * _kv_fp8_factor, _KV_CAP)
+                rollout = weights + min(
+                    _KV_COEF * (seq_len / 1024.0) * width * _kv_fp8_factor, _KV_CAP
+                )
             else:
                 rollout = weights + _resident_kv_gb(eff_b, seq_len, group_size, fp8_kv=fp8_kv)
         group_factor = max(1.0, (max(1, group_size) / 4.0) ** 0.5)
@@ -294,6 +327,37 @@ def estimate_vram_gb(
         logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + (max(rollout, train) if sleep_offload else rollout + train)
+    if is_opd:
+        # opd's gkd loss forward materializes DENSE logits — there is NO fused cross-entropy: the
+        # student forward yields full-sequence bf16 logits [seq, vocab], then the completion rows are
+        # gathered in fp32 [completion, vocab] for the logsumexp. The SFT fused path budgets ZERO
+        # vocab logits for >=3B models, so a long-completion opd job (e.g. max_tokens=8192) would be
+        # sized for an under-capacity card and OOM.
+        #
+        # Mirror opd_rollout_seq_len / run_opd's completion resolution: explicit max_tokens, else the
+        # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
+        # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
+        completion = opd_completion_len(max_tokens, thinking)
+        # run_opd backprops ONE completion at a time (_train_one), so the activations + dense logits
+        # are SINGLE-sequence — NOT sft_per_device(batch_size). The batch-size activation term
+        # over-budgeted opd and bumped the GPU tier unnecessarily (reported by codex[bot]).
+        activations = _ACT_COEF * (seq_len / 1024.0) * width
+        # Dense-logit peak spans BOTH the forward and the loss BACKWARD (gkd_loss has no fused CE):
+        #   - forward:  bf16 full-sequence logits [seq, vocab]        (seq * 2)
+        #               fp32 completion rows [completion, vocab] for logsumexp, saved for backward
+        #                                                             (completion * 4)
+        #   - backward: fp32 gradient of those completion rows [completion, vocab]
+        #                                                             (completion * 4)
+        #               bf16 gradient scattered back into the full logits [seq, vocab] to reach lm_head
+        #                                                             (seq * 2)
+        # All four coexist at the backward peak. The old formula counted only the two FORWARD buffers,
+        # so a long-completion / large-vocab (248k) opd job under-budgeted the loss backward by
+        # ~(completion*4 + seq*2)*vocab bytes and could route to a GPU that OOMs in gkd_loss.backward
+        # (codex[bot]). Mirror the SFT dense-logit sizing by budgeting the backward buffers too.
+        logits_fwd = (seq_len * 2 + completion * 4) * vocab
+        logits_bwd = (seq_len * 2 + completion * 4) * vocab
+        logits = (logits_fwd + logits_bwd) / 1e9
+        return base + activations + logits
     fused = sft_logits_fused(params_b, seq_len) if sft_fused_ce is None else bool(sft_fused_ce)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
@@ -453,11 +517,15 @@ def model_required_vram_gb(
             return default
 
     max_tokens = _pos_int(_g(train, "max_tokens"), None)
-    if (algorithm or "").lower() in ("grpo", "rl"):
-        _grpo_default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
+    _algo = (algorithm or "").lower()
+    if _algo in ("grpo", "rl"):
+        _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
+    elif _algo == "opd":
+        # OPD generates on-policy like GRPO, so size for prompt+completion, not the SFT 1024 default.
+        _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
-        _grpo_default_len = 1024
-    seq_len = _pos_int(_g(train, "max_length"), _grpo_default_len)
+        _default_len = 1024
+    seq_len = _pos_int(_g(train, "max_length"), _default_len)
     lora_rank = _pos_int(_g(train, "lora_rank"), 32)
     group_size = _pos_int(_g(train, "group_size"), 8)
     batch_size = _pos_int(_g(train, "batch_size"), _sft_per_device_bs())
@@ -560,15 +628,18 @@ def model_required_vram_gb(
             # memory for the cache blocks") on a card the training-peak estimate accepted.
             need = max(
                 need,
-                grpo_kv_floor_gb(
-                    params_b or 4.0, seq_len, group_size, active_params_b=active_b
-                ),
+                grpo_kv_floor_gb(params_b or 4.0, seq_len, group_size, active_params_b=active_b),
             )
         return need
     params_b = fetch_hf_params_b(model_id)
     if params_b is None:
         return 24
-    need = _need(params_b, "grpo", vocab=model_vocab)
+    # Size the uncataloged (model_policy="allow") fallback with the ACTUAL algorithm, not a hardcoded
+    # "grpo". An open-model OPD run was quoted/allocated as a colocated-vLLM GRPO job, so the new OPD
+    # dense-logit estimator (estimate_vram_gb's is_opd path) was never applied -- rejecting fitting runs
+    # or routing them to pricier GPUs. The cataloged path above already threads `algorithm` through
+    # _need; do the same here (codex[bot]). The grpo-only escalations below stay gated on is_grpo.
+    need = _need(params_b, algorithm, vocab=model_vocab)
     if is_grpo:
         need += grpo_seq_escalation_gb(params_b, seq_len)
         need = max(need, grpo_kv_floor_gb(params_b, seq_len, group_size))
@@ -580,9 +651,7 @@ def fetch_hf_params_b(model_id: str) -> float | None:
     try:
         from huggingface_hub import HfApi
 
-        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
-            model_id, expand=["safetensors"]
-        )
+        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(model_id, expand=["safetensors"])
         total = getattr(getattr(info, "safetensors", None), "total", None)
         if total:
             return float(total) / 1e9
