@@ -8,6 +8,23 @@ from typing import Any
 
 ALGORITHMS = ("sft", "grpo", "opd")
 
+# Algorithms whose training step SAMPLES on-policy student completions (a rollout): GRPO and OPD,
+# versus SFT which trains on a fixed dataset. Single source of truth for the "has rollouts" concept
+# the cost model, VRAM sizing and worker allocator branch on — import ``samples_on_policy`` instead
+# of hand-rolling the ("grpo", "opd") tuple at each site.
+_ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
+
+
+def samples_on_policy(algorithm: str) -> bool:
+    """True when a training step samples on-policy student completions (GRPO or OPD).
+
+    Tolerant of the ``rl`` phase-name alias for grpo (``JobSpec.phase``) so callers that pass a
+    phase rather than an algorithm resolve identically."""
+    algo = (algorithm or "").strip().lower()
+    if algo == "rl":  # phase-name alias for grpo
+        algo = "grpo"
+    return algo in _ON_POLICY_ALGORITHMS
+
 
 def normalize_algorithm(value: str) -> str:
     """Canonical (lowercased, validated) algorithm name."""

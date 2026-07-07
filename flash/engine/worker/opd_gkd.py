@@ -3,9 +3,8 @@
 Extracted from ``opd.py`` to keep that module under the size bar and make the cross-tokenizer
 alignment + GKD loss an independently unit-testable unit. Every function here is PURE: it takes the
 tokenizer / ids / model as arguments and touches NO worker (``_w``) globals, recipe, or run state.
-See ``opd.py`` for the orchestration (``run_opd`` / ``_train_one``) and docs/on-policy-distillation.md
-for the method. ``opd.py`` re-imports these names, so existing ``from ...opd import <fn>`` call sites
-(and tests) are unaffected.
+See ``opd.py`` for the orchestration (``run_opd`` / ``_train_one``). ``opd.py`` re-imports these names,
+so existing ``from ...opd import <fn>`` call sites (and tests) are unaffected.
 """
 
 from __future__ import annotations
@@ -118,7 +117,7 @@ def student_tokens_with_offsets(tok, completion_ids, completion_text: str):
     the SHARED completed-char span to every byte-id in it, so both halves share a ``start`` and land in
     the same alignment group. A normal (already-complete) token is a window of one — identical to the
     old per-token length measurement."""
-    ids = [int(t) for t in completion_ids]
+    ids = list(completion_ids)  # already a CPU int list from _to_cpu_ids upstream (no re-coercion)
     toks: list[StudentToken] = []
     prev = 0
     n = len(completion_text)
@@ -169,7 +168,7 @@ def _trim_trailing_stop(tok, completion_ids, stop_text: str, stops):
     so a special-token delimiter (e.g. ``<|im_end|>``) is visible for the trailing match; the returned
     text is the KEPT ids decoded WITHOUT special tokens (the teacher/alignment text). Returns
     ``(ids, clean_text)`` (a list + str)."""
-    ids = [int(t) for t in completion_ids]
+    ids = list(completion_ids)  # already a CPU int list from _to_cpu_ids upstream (no re-coercion)
     # Pick the LONGEST configured stop that is a trailing match (the earliest stop boundary in the
     # text). Overlapping delimiters like ["\n", "\n\n"] would otherwise trim only the first-listed
     # shorter suffix off a "\n\n" tail, leaving one newline for the teacher to score/distil; taking
@@ -223,19 +222,34 @@ def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     ids_t = torch.tensor(student_ids, device=logits.device)
     rows = logits.index_select(0, pos).float()  # [C, V]
     sp_t = rows.gather(1, ids_t.unsqueeze(1)).squeeze(1) - torch.logsumexp(rows, dim=-1)  # [C]
-    terms = []
+    sp_det = sp_t.detach()
+    # The per-token loss coefficient is CONSTANT within an alignment group (it depends only on the
+    # group's DETACHED student logprob sum, its teacher logprob sum, and its size), so the loss is
+    # mean over tokens of coeff[token] * sp_t[token]. Build the per-token coefficient VECTOR once and
+    # multiply the whole [C]-vector in one shot, instead of materializing thousands of tiny per-token
+    # autograd tensors and torch.stack-ing them (a Python double-loop that dominated CPU on long
+    # samples). All the coefficient math is on DETACHED tensors and Python floats, so it never leaves
+    # the device and forces no CUDA->CPU sync; the only sync is the final .mean().
+    flat_idx: list[int] = []  # student token indices, in group order (the reference term order)
+    coeffs: list = []  # one 0-dim detached coefficient per non-empty group
+    seg_lens: list[int] = []  # tokens in each group -> how many times to repeat its coefficient
     for s_idx, teacher_logsum in groups:
         if not s_idx:  # defensive: a teacher-only span carries no student token to supervise
             continue
-        # Keep the detached group logprob sum ON-DEVICE — NO float(): float() forces a CUDA->CPU sync
-        # per alignment group, i.e. thousands of tiny device syncs on a long sample (reported by
-        # codex[bot]). teacher_logsum is a Python float, so (device tensor - float) stays a 0-dim
-        # device tensor and coeff * sp_t[j] never leaves the GPU; the only sync is the final .mean().
-        student_logsum_det = sum(sp_t[j].detach() for j in s_idx)
+        idx = torch.tensor(s_idx, device=sp_t.device)
+        student_logsum_det = sp_det.index_select(0, idx).sum()
         # coeff > 0 where the student is MORE confident than the teacher on the span (push down);
         # coeff < 0 where the teacher is more confident (push up). Gradient = reverse-KL gradient.
-        coeff = kl_coef * (student_logsum_det - teacher_logsum) / len(s_idx)
-        terms.extend(coeff * sp_t[j] for j in s_idx)
-    if not terms:
+        coeffs.append(kl_coef * (student_logsum_det - teacher_logsum) / len(s_idx))
+        flat_idx.extend(s_idx)
+        seg_lens.append(len(s_idx))
+    if not flat_idx:
         return None
-    return torch.stack(terms).mean()
+    # Broadcast each group's coefficient across its tokens (repeat_interleave), select the matching
+    # differentiable student logprobs in the same order, and take the per-term mean -- numerically the
+    # SAME value the old torch.stack(terms).mean() reference produced.
+    coeff_vec = torch.repeat_interleave(
+        torch.stack(coeffs), torch.tensor(seg_lens, device=sp_t.device)
+    )
+    sp_sel = sp_t.index_select(0, torch.tensor(flat_idx, device=sp_t.device))
+    return (coeff_vec * sp_sel).mean()

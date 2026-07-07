@@ -48,6 +48,12 @@ _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
 
+
+def _is_critical_stage(stage: str) -> bool:
+    """A terminal transition or an error is CRITICAL: never throttled (the commit must land) and
+    given the longer upload-lock timeout, because no later heartbeat can repair a missed one."""
+    return stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
+
 # Guards throttle bookkeeping; slow HF commit runs outside this lock so trainer callbacks don't
 # block on the network.
 _HB_LOCK = threading.Lock()
@@ -121,7 +127,7 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
     snapshot = json.dumps(payload)
     with _HB_LOCK:
         now = time.time()
-        if stage in _HB_TERMINAL_STAGES or stage.startswith("error_"):
+        if _is_critical_stage(stage):
             upload_due = True  # never miss a terminal transition
         elif _w._HB_TERMINAL_ONLY:
             upload_due = (
@@ -177,7 +183,7 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             if isinstance(_committed_step, (int, float)) and _committed_step > _w._HB_LAST_COMMITTED_STEP:
                 _w._HB_LAST_COMMITTED_STEP = int(_committed_step)
     if upload_due:
-        critical = stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
+        critical = _is_critical_stage(stage)
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
         if _HB_UPLOAD_LOCK.acquire(timeout=lock_timeout):
             try:

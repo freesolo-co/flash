@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 
+from flash.catalog import samples_on_policy
 from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
 
@@ -95,7 +96,7 @@ def runconfig_from_spec(spec) -> RunConfig:
     t, g = spec.train, spec.gpu
     # Both grpo and opd sample on-policy student completions, so both carry the rollout
     # dimensions (completion length + group size) into the cost model.
-    has_rollout = spec.algorithm in ("grpo", "opd")
+    has_rollout = samples_on_policy(spec.algorithm)
     return RunConfig(
         model_id=spec.model,
         method=spec.algorithm,
@@ -109,7 +110,9 @@ def runconfig_from_spec(spec) -> RunConfig:
         provider="auto",
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
-        teacher_model=(t.teacher_model or None) if spec.algorithm == "opd" else None,
+        # "" is the unset sentinel (RunConfig.teacher_model); facts.teacher_price_per_1m resolves it
+        # to the recipe default. Non-opd carries no teacher.
+        teacher_model=t.teacher_model if spec.algorithm == "opd" else "",
     )
 
 

@@ -10,8 +10,7 @@ directly. We align by SHARED DECODED-TEXT SPANS — the coarsest common refineme
 tokenizations (a group boundary is any character offset that begins a token in BOTH tokenizers) — and
 apply reverse-KL per span using only the REALIZED-token logprobs on each side (the collinear-ai
 *spider* / Tinker method). No top-k candidates, no surface->vocab projection, so it is exact across
-arbitrary tokenizer mismatch and covers every student token. See ``tokenizer_align`` and
-docs/on-policy-distillation.md.
+arbitrary tokenizer mismatch and covers every student token. See ``tokenizer_align``.
 
 There is NO local reference model and NO colocated vLLM engine: sampling is HF ``generate`` on the
 resident student (so the VRAM profile matches SFT), and the teacher lives behind the API. All heavy
@@ -24,6 +23,7 @@ import contextlib
 import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
@@ -53,6 +53,11 @@ from flash.engine.worker.perf import (
 )
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
+
+# Upper bound on teacher-scoring HTTP calls fired concurrently within one optimizer step. Generation
+# (GPU) and the gkd loss forward/backward stay serial on the main thread; only the (dominant) teacher
+# Fireworks round-trips for a step's samples are overlapped, so this caps the fan-out into the API.
+_TEACHER_SCORE_MAX_WORKERS = 8  # bound concurrent GLM/Fireworks scoring calls per step
 
 
 @dataclass(frozen=True)
@@ -208,8 +213,10 @@ def _student_model(model_id, mik, device):
 
 def _opd_progress(step: int, done: int) -> None:
     """Emit the in-loop non-liveness ``opd_step`` progress ping. Pollers ignore liveness heartbeats, so
-    a long teacher-bound step (serial scoring of a large batch/group, or slow/retrying Fireworks) — or a
-    stretch where every sample skips (empty completions, no teacher signal) — would otherwise emit only
+    a long teacher-bound step (the bounded-concurrency teacher scoring of a large batch/group, or a
+    slow/retrying Fireworks endpoint that stalls even the overlapped calls; also the serial on-policy
+    generation preceding it) — or a stretch where every sample skips (empty completions, no teacher
+    signal) — would otherwise emit only
     liveness pings and trip the training stall window. Report ``step`` = optimizer updates COMPLETED so
     far (opt_steps), NOT the loop index: opd_step is step-gated in the poller (_poll.STEP_GATED_STAGES),
     so while the FIRST optimizer step is still accumulating (opt_steps==0) these pings keep the WIDE
@@ -463,6 +470,43 @@ def run_opd():
     teacher_ok = 0
     teacher_transient = 0
 
+    # Concurrent teacher scoring needs a REAL student that samples on-policy (model.generate) so the
+    # step's rollouts can be produced up front (serial GPU) and then scored all at once (Phase 1/2/3
+    # below). Every HF/Peft catalog model has generate(); CPU unit-test stand-ins without it drive the
+    # equivalent per-sample _train_one path (the serial fallback), keeping _train_one the single stub
+    # point those tests inject. The model does not change across steps, so decide once.
+    _parallel_scoring = hasattr(model, "generate") and hasattr(model, "eval")
+
+    def _account(r):
+        """Consume one sample's SampleResult: tally teacher health / truncations, backprop a distilled
+        sample (scaled 1/accum_target for gradient accumulation), advance the step aggregates, and
+        refresh the stall clock. Shared by the concurrent-scoring path's Phase 3 and the serial
+        fallback so both keep the pre-parallelization per-sample bookkeeping byte-for-byte identical.
+        ``samples_seen`` is advanced by the caller (once per GENERATION) so its timing is unchanged."""
+        nonlocal teacher_ok, teacher_transient, truncated_rollouts, step_loss, step_cov
+        nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
+        if r.teacher_status == "ok":
+            teacher_ok += 1
+        elif r.teacher_status == "transient":
+            teacher_transient += 1
+        if r.truncated:
+            truncated_rollouts += 1
+        if r.loss is None:
+            # Refresh the stall clock even when a sample yields no teacher signal (rationale in
+            # _opd_progress) — else an all-skip stretch emits only ignored liveness pings.
+            _opd_progress(opt_steps, nseq)
+            return
+        (r.loss / accum_target).backward()
+        step_loss += float(r.loss.detach())
+        step_cov += r.coverage
+        granularity_sum += r.group_granularity
+        granularity_n += 1
+        generated_tokens += r.gen_tokens
+        teacher_input_tokens += r.teacher_tokens
+        nseq += 1
+        # Non-liveness progress ping WITHIN the step (rationale in _opd_progress).
+        _opd_progress(opt_steps, nseq)
+
     t_train = time.time()
     # Drive the loop by optimizer UPDATES, not raw iterations. A no-signal iteration (empty
     # completions / a flaky teacher) skips optimizer.step() below, so `for step in range(steps)` could
@@ -496,54 +540,111 @@ def run_opd():
             step_loss = 0.0
             step_cov = 0.0
             nseq = 0
-            for _ex, prompt_messages, prompt_ids in batch:
-                # Reuse the messages + ids CACHED by the budget filter instead of re-rendering. A fresh
-                # env.prompt_messages(ex) here can (for a stateful/randomized env) both desync student
-                # sampling from teacher scoring AND exceed the budget — dropping a prompt the filter
-                # admitted and starving the step of signal after GPU/model setup. The cached ids already
-                # passed the filter and drive BOTH the student prompt AND the teacher prompt
-                # (_teacher_prompt_text below), so they stay in sync and every visited prompt fits (codex[bot]).
-                prompt_tensor = torch.tensor([prompt_ids], device=device)
-                for _g in range(group):
-                    r = _train_one(
-                        model=model,
-                        tok=tok,
-                        teacher=teacher,
-                        device=device,
-                        prompt_ids=prompt_ids,
-                        prompt_tensor=prompt_tensor,
-                        prompt_messages=prompt_messages,
-                        gen_cfg=gen_cfg,
-                        knobs=knobs,
-                        thinking_prefill=thinking_prefill,
-                        # Refresh the stall clock between generation and teacher scoring (see _train_one
-                        # and _opd_progress). Bind opt_steps/nseq as lambda defaults (called synchronously
-                        # in this iteration, so the current values are the right ones) to satisfy the
-                        # loop-var-capture lint.
-                        on_generated=lambda s=opt_steps, n=nseq: _opd_progress(s, n),
-                    )
-                    samples_seen += 1  # advances the liveness-thread progress signal
-                    if r.teacher_status == "ok":
-                        teacher_ok += 1
-                    elif r.teacher_status == "transient":
-                        teacher_transient += 1
-                    if r.truncated:
-                        truncated_rollouts += 1
-                    if r.loss is None:
-                        # Refresh the stall clock even when a sample yields no teacher signal (rationale
-                        # in _opd_progress) — else an all-skip stretch emits only ignored liveness pings.
+            if _parallel_scoring:
+                # Concurrent-scoring step in three phases. Behavior-preserving vs. the old per-sample
+                # loop: SAME samples in the SAME generation order (RNG untouched), SAME per-sample
+                # losses, SAME gradient accumulation — only the teacher's Fireworks HTTP round-trips
+                # (the dominant per-step cost, previously issued one-at-a-time) are overlapped.
+                #
+                # Phase 1 (serial, GPU eval): sample every completion on-policy, IN ORDER, caching the
+                # prompt context each one needs downstream. The cached messages/ids from the budget
+                # filter drive BOTH the student prompt AND the teacher prompt, so student sampling and
+                # teacher scoring stay in sync and every visited prompt fits (codex[bot]).
+                pending: list[_Pending] = []
+                for _ex, prompt_messages, prompt_ids in batch:
+                    prompt_tensor = torch.tensor([prompt_ids], device=device)
+                    for _g in range(group):
+                        gen = _generate_one(
+                            model=model,
+                            tok=tok,
+                            device=device,
+                            prompt_tensor=prompt_tensor,
+                            gen_cfg=gen_cfg,
+                            knobs=knobs,
+                        )
+                        pending.append(
+                            _Pending(
+                                gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
+                            )
+                        )
+                        samples_seen += 1  # advances the liveness-thread progress signal
+                        # Feed the stall clock during the (serial, up-to-~900s-each) generations; nseq
+                        # is still 0 here since no loss has landed yet this step.
                         _opd_progress(opt_steps, nseq)
-                        continue
-                    (r.loss / accum_target).backward()
-                    step_loss += float(r.loss.detach())
-                    step_cov += r.coverage
-                    granularity_sum += r.group_granularity
-                    granularity_n += 1
-                    generated_tokens += r.gen_tokens
-                    teacher_input_tokens += r.teacher_tokens
-                    nseq += 1
-                    # Non-liveness progress ping WITHIN the step (rationale in _opd_progress).
-                    _opd_progress(opt_steps, nseq)
+                # Phase 2 (concurrent, NETWORK only): fire the teacher scoring calls for every scorable
+                # rollout at once, bounded by _TEACHER_SCORE_MAX_WORKERS. _score_one touches only the
+                # stateless teacher HTTP client + Python strings (no torch/model/shared mutable state),
+                # so the round-trips overlap safely; truncated/empty/U+FFFD rollouts are never scored.
+                scorable = [i for i, p in enumerate(pending) if not (p.gen.skip or p.gen.truncated)]
+                _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
+                if scorable:
+                    permanent_err = None
+                    with ThreadPoolExecutor(
+                        max_workers=min(len(scorable), _TEACHER_SCORE_MAX_WORKERS)
+                    ) as pool:
+                        fut_to_idx = {
+                            pool.submit(
+                                _score_one,
+                                teacher,
+                                pending[i].gen,
+                                prompt_messages=pending[i].prompt_messages,
+                                thinking_prefill=thinking_prefill,
+                            ): i
+                            for i in scorable
+                        }
+                        for fut in as_completed(fut_to_idx):
+                            i = fut_to_idx[fut]
+                            try:
+                                pending[i].score = fut.result()
+                            except TeacherError as e:
+                                # _score_one only propagates a PERMANENT teacher error (bad key / model
+                                # id / malformed echo); transient/other failures return a status. Capture
+                                # the first and re-raise AFTER the pool drains so the run aborts exactly
+                                # as the serial path did over one un-scorable sample (codex[bot]).
+                                if permanent_err is None:
+                                    permanent_err = e
+                    if permanent_err is not None:
+                        raise permanent_err
+                _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
+                # Phase 3 (serial, GPU train): resolve each rollout IN ORDER into the exact SampleResult
+                # the old serial path produced, then run the gkd loss forward + backward serially on the
+                # main thread (via _account) so gradient accumulation is unchanged.
+                for p in pending:
+                    _account(
+                        _resolve_sample(model, tok, device, p.gen, p.score, p.prompt_ids, knobs)
+                    )
+            else:
+                # Serial fallback: the student stand-in cannot generate on-policy (a CPU unit-test fake
+                # without .generate), so there is nothing to overlap — drive the original per-sample
+                # path so _train_one stays the single injection point those tests stub.
+                for _ex, prompt_messages, prompt_ids in batch:
+                    # Reuse the messages + ids CACHED by the budget filter instead of re-rendering. A
+                    # fresh env.prompt_messages(ex) here can (for a stateful/randomized env) both desync
+                    # student sampling from teacher scoring AND exceed the budget — dropping a prompt the
+                    # filter admitted and starving the step of signal after GPU/model setup. The cached
+                    # ids already passed the filter and drive BOTH the student prompt AND the teacher
+                    # prompt, so they stay in sync and every visited prompt fits (codex[bot]).
+                    prompt_tensor = torch.tensor([prompt_ids], device=device)
+                    for _g in range(group):
+                        r = _train_one(
+                            model=model,
+                            tok=tok,
+                            teacher=teacher,
+                            device=device,
+                            prompt_ids=prompt_ids,
+                            prompt_tensor=prompt_tensor,
+                            prompt_messages=prompt_messages,
+                            gen_cfg=gen_cfg,
+                            knobs=knobs,
+                            thinking_prefill=thinking_prefill,
+                            # Refresh the stall clock between generation and teacher scoring (see
+                            # _train_one and _opd_progress). Bind opt_steps/nseq as lambda defaults
+                            # (called synchronously in this iteration, so the current values are the
+                            # right ones) to satisfy the loop-var-capture lint.
+                            on_generated=lambda s=opt_steps, n=nseq: _opd_progress(s, n),
+                        )
+                        samples_seen += 1  # advances the liveness-thread progress signal
+                        _account(r)
             if nseq == 0:
                 print(f"[opd] step {it}: no usable teacher signal this step (skipped)")
                 continue
@@ -718,29 +819,50 @@ class SampleResult:
     group_granularity: float = 0.0
 
 
-def _train_one(
-    *,
-    model,
-    tok,
-    teacher,
-    device,
-    prompt_ids,
-    prompt_tensor,
-    prompt_messages,
-    gen_cfg,
-    knobs,
-    thinking_prefill="",
-    on_generated=None,
-) -> SampleResult:
-    """Sample one student completion on-policy, score it with the teacher, and return a
-    ``SampleResult`` carrying the groupwise reverse-KL loss (or None) plus per-sequence stats.
-    ``thinking_prefill`` is appended to the teacher prompt so it conditions on the same trailing
-    context the student sampled after in thinking mode. ``on_generated`` (optional) is called AFTER
-    generation and BEFORE teacher scoring to refresh the stall clock: both the max_time-bounded
-    generate and the retrying teacher call block for a long time and the caller's per-sample progress
-    ping only fires AFTER scoring returns, so without a mid-sample refresh a slow generation followed
-    by a teacher outage can span >1200s with no non-liveness heartbeat and be reaped as stalled before
-    the transient-teacher handling runs."""
+@dataclass(frozen=True)
+class _GenResult:
+    """One student rollout produced by ``_generate_one`` (serial, GPU eval): the sampled completion
+    plus the skip/truncated verdicts the old serial ``_train_one`` computed inline. ``truncated``
+    (max_new_tokens cap hit OR max_time cut, no EOS/stop) and ``skip`` (empty or U+FFFD completion)
+    mean the rollout is dropped BEFORE teacher scoring; otherwise ``completion_ids``/``completion_text``
+    carry the trimmed on-policy answer to score + distil. Torch-free (completion_ids is a CPU list) so
+    it can be handed to the model-free scoring thread pool."""
+
+    completion_ids: object = None
+    completion_text: str = ""
+    gen_tokens: int = 0
+    truncated: bool = False
+    skip: bool = False
+
+
+@dataclass(frozen=True)
+class _ScoreResult:
+    """Teacher-scoring outcome from ``_score_one`` (RUN IN THE THREAD POOL). ``status`` is "ok"
+    (``teacher_toks`` populated), "transient" (retryable teacher outage -> sample skipped + counted),
+    or "error" (any other exception -> sample skipped, teacher uncounted). A PERMANENT ``TeacherError``
+    is NOT represented here — ``_score_one`` re-raises it so the run aborts, exactly as before."""
+
+    teacher_toks: object = None
+    status: str = "ok"
+
+
+@dataclass
+class _Pending:
+    """A Phase-1 rollout awaiting concurrent scoring (Phase 2) then loss (Phase 3), carrying the prompt
+    context both need. Mutable: ``score`` is filled in by the thread pool for scorable rollouts."""
+
+    gen: _GenResult
+    prompt_ids: object
+    prompt_messages: object
+    score: object = None
+
+
+def _generate_one(*, model, tok, device, prompt_tensor, gen_cfg, knobs) -> _GenResult:
+    """[SERIAL, GPU eval] Sample one student completion on-policy and apply the pre-scoring gates:
+    reject a rollout that did not terminate naturally (``truncated``), an empty completion or one
+    carrying U+FFFD (``skip``), and trim trailing stop delimiters. Touches only the torch model +
+    tokenizer; the returned ``_GenResult`` is torch-free so it can be handed to the (model-free)
+    scoring thread pool. Mirrors the generation half of the old serial ``_train_one`` exactly."""
     import torch
 
     # On-policy: the student samples; the teacher echo-scores that exact completion.
@@ -769,7 +891,7 @@ def _train_one(
     if not _rollout_terminated(
         completion_ids, stop_text, _generation_eos_ids(model, tok), knobs.stop_sequences
     ):
-        return SampleResult(truncated=True, gen_tokens=len(completion_ids))
+        return _GenResult(truncated=True, gen_tokens=len(completion_ids))
     # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter
     # before stopping — trim it from BOTH ids and text (token-level) so the teacher scores/distils
     # only the answer, and ids/text stay consistent for gkd_loss + token counting.
@@ -779,46 +901,63 @@ def _train_one(
         )
     gen_tokens = len(completion_ids)
     if not completion_text.strip():
-        return SampleResult(gen_tokens=gen_tokens)
+        return _GenResult(skip=True, gen_tokens=gen_tokens)
     # A completion carrying U+FFFD (the Unicode replacement char) decoded a PARTIAL/invalid UTF-8 byte
     # sequence — the student emitted a lone byte-level BPE token that is not a whole character. Echo-
-    # scoring it is impossible: '�' does not re-tokenize to the same char span, so teacher.score fails
-    # its char-for-char tiling check and raises a PERMANENT TeacherError that would abort the ENTIRE run
-    # over one un-scorable on-policy sample. On-policy sampling (esp. at temperature 1.0) occasionally
-    # emits these, so skip the rollout like a truncated/empty one and keep training; the shortfall guard
-    # still fails the run if too many samples end up unusable.
+    # scoring it is impossible: the replacement char does not re-tokenize to the same char span, so
+    # teacher.score fails its char-for-char tiling check and raises a PERMANENT TeacherError that would
+    # abort the ENTIRE run over one un-scorable on-policy sample. On-policy sampling (esp. at temperature
+    # 1.0) occasionally emits these, so skip the rollout like a truncated/empty one and keep training;
+    # the shortfall guard still fails the run if too many samples end up unusable.
     if "\ufffd" in completion_text:  # U+FFFD replacement char
-        return SampleResult(gen_tokens=gen_tokens)
+        return _GenResult(skip=True, gen_tokens=gen_tokens)
+    return _GenResult(
+        completion_ids=completion_ids, completion_text=completion_text, gen_tokens=gen_tokens
+    )
 
-    # Refresh the stall clock between the (gen_cfg.max_time-bounded, up to ~900s) generation and the
-    # retrying teacher call (up to four ~90s timeouts): both block, and the caller only emits its
-    # per-sample opd_step ping AFTER scoring returns, so a slow generation + a teacher outage could
-    # otherwise span >1200s with no non-liveness heartbeat and be reaped as stalled once opt_steps>=1
-    # (codex[bot]). Splitting the gap here keeps each blocking phase under the training stall window.
-    if on_generated is not None:
-        on_generated()
 
+def _score_one(teacher, gen_result, *, prompt_messages, thinking_prefill) -> _ScoreResult:
+    """[THREAD POOL — network only] Build the teacher prompt and echo-score the completion over the
+    API. MUST NOT touch the torch model or any shared mutable state — it reads only the completion
+    string + prompt messages and calls the stateless teacher HTTP client, so it is safe to run
+    concurrently for every scorable sample in a step. ``thinking_prefill`` is appended to the teacher
+    prompt so it conditions on the same trailing context the student sampled after in thinking mode.
+    Error semantics match the old serial ``_train_one`` exactly (same print messages): a PERMANENT
+    ``TeacherError`` propagates (the run aborts), a transient one -> status "transient", any other
+    exception -> status "error"; both leave the sample skipped with no teacher signal."""
     teacher_prompt = _teacher_prompt_text(prompt_messages, thinking_prefill)
     try:
-        teacher_toks = teacher.score(teacher_prompt, completion_text)
+        teacher_toks = teacher.score(teacher_prompt, gen_result.completion_text)
     except TeacherError as e:
         if e.permanent:  # bad key / model id / malformed -> abort now, don't burn the whole run
             raise
         print(f"[opd] teacher score failed (transient, skipping sample): {e}")
-        return SampleResult(teacher_status="transient", gen_tokens=gen_tokens)
+        return _ScoreResult(status="transient")
     except Exception as e:
         print(f"[opd] teacher score failed (skipping sample): {e}")
-        return SampleResult(gen_tokens=gen_tokens)
-    teacher_tokens = len(prompt_ids) + gen_tokens
+        return _ScoreResult(status="error")
+    return _ScoreResult(teacher_toks=teacher_toks, status="ok")
 
-    student_ids, student_toks = student_tokens_with_offsets(tok, completion_ids, completion_text)
+
+def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -> SampleResult:
+    """[SERIAL, GPU train] Turn one scored rollout into the differentiable groupwise reverse-KL loss.
+    Runs the model in train mode with use_cache=False and reproduces the loss half of the old serial
+    ``_train_one``: student token offsets, groupwise alignment / coverage / granularity, and gkd_loss.
+    Returns a ``SampleResult`` with identical fields — loss=None (teacher_status "ok") when the
+    completion yields no alignable student tokens, else the loss tensor plus per-sequence stats."""
+    teacher_tokens = len(prompt_ids) + gen_result.gen_tokens
+    student_ids, student_toks = student_tokens_with_offsets(
+        tok, gen_result.completion_ids, gen_result.completion_text
+    )
     if not student_ids:
-        return SampleResult(teacher_status="ok", gen_tokens=gen_tokens, teacher_tokens=teacher_tokens)
+        return SampleResult(
+            teacher_status="ok", gen_tokens=gen_result.gen_tokens, teacher_tokens=teacher_tokens
+        )
 
     model.train()
     model.config.use_cache = False
     # gkd — groupwise reverse-KL (spider/Tinker); covers every token from the realized logprobs.
-    groups = groupwise_alignment(student_toks, teacher_toks)
+    groups = groupwise_alignment(student_toks, score_result.teacher_toks)
     # Coverage = alignable (non-zero-width) student tokens that landed in a group / alignable total,
     # so it stays in [0, 1] (a zero-width eos/partial-byte token riding along in a group no longer
     # inflates it past 100%).
@@ -833,11 +972,69 @@ def _train_one(
         loss=gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs.kl_coef),
         teacher_status="ok",
         coverage=coverage,
-        gen_tokens=gen_tokens,
+        gen_tokens=gen_result.gen_tokens,
         teacher_tokens=teacher_tokens,
         group_granularity=group_granularity,
     )
 
+
+def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs) -> SampleResult:
+    """Map a generated (and, when scorable, teacher-scored) rollout to its ``SampleResult`` — the single
+    truncated/skip/transient/error/ok decision shared by ``run_opd``'s concurrent Phase 3 and the serial
+    ``_train_one``, so the two paths can never drift apart on skip semantics. ``score`` is consulted only
+    for a rollout that was actually scored (not truncated, not skip); callers pass ``None`` for the rest."""
+    if gen.truncated:
+        # Didn't terminate naturally (cap/max_time cut) — skipped, not distilled.
+        return SampleResult(truncated=True, gen_tokens=gen.gen_tokens)
+    if gen.skip:  # empty completion or U+FFFD — skipped before scoring
+        return SampleResult(gen_tokens=gen.gen_tokens)
+    if score.status == "transient":  # retryable teacher outage — skipped + counted
+        return SampleResult(teacher_status="transient", gen_tokens=gen.gen_tokens)
+    if score.status != "ok":  # any other teacher exception — skipped, teacher uncounted
+        return SampleResult(gen_tokens=gen.gen_tokens)
+    return _loss_one(model, tok, device, gen, score, prompt_ids, knobs)
+
+
+def _train_one(
+    *,
+    model,
+    tok,
+    teacher,
+    device,
+    prompt_ids,
+    prompt_tensor,
+    prompt_messages,
+    gen_cfg,
+    knobs,
+    thinking_prefill="",
+    on_generated=None,
+) -> SampleResult:
+    """Sample one student completion on-policy, score it with the teacher, and return a
+    ``SampleResult`` carrying the groupwise reverse-KL loss (or None) plus per-sequence stats. This is
+    the SERIAL composition of the three phase helpers — ``_generate_one`` -> ``_score_one`` ->
+    ``_loss_one`` — that ``run_opd`` runs as OVERLAPPED phases across a whole step (generate every
+    rollout serially on the GPU, score them all concurrently over the API, then run each loss serially).
+    Kept as the single-sample entry point for the unit tests and the fallback for a student that cannot
+    batch-generate. ``thinking_prefill`` is appended to the teacher prompt so it conditions on the same
+    trailing context the student sampled after in thinking mode. ``on_generated`` (optional) is called
+    AFTER generation and BEFORE teacher scoring to refresh the stall clock: both the max_time-bounded
+    generate and the retrying teacher call block for a long time and the caller's per-sample progress
+    ping only fires AFTER scoring returns, so without a mid-sample refresh a slow generation followed by
+    a teacher outage can span >1200s with no non-liveness heartbeat and be reaped as stalled before the
+    transient-teacher handling runs."""
+    gen = _generate_one(
+        model=model, tok=tok, device=device, prompt_tensor=prompt_tensor, gen_cfg=gen_cfg, knobs=knobs
+    )
+    if gen.truncated or gen.skip:  # dropped before scoring (see _resolve_sample); score unused
+        return _resolve_sample(model, tok, device, gen, None, prompt_ids, knobs)
+    # Refresh the stall clock between the (bounded, up to ~900s) generation and the retrying teacher
+    # call (up to four ~90s timeouts); both block and the caller only pings AFTER scoring returns.
+    if on_generated is not None:
+        on_generated()
+    score = _score_one(
+        teacher, gen, prompt_messages=prompt_messages, thinking_prefill=thinking_prefill
+    )
+    return _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs)
 
 def _save_adapter(model, tok, adapter_dir: str) -> None:
     """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""

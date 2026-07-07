@@ -82,6 +82,14 @@ def setup_seconds(config: RunConfig) -> float:
     return s
 
 
+def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
+    """(completions per step, prompt+completion tokens per step) for one OPD step, from a NORMALIZED
+    config. completions = batch x group; each is billed over the FULL n.seq_len (prompt+completion,
+    not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
+    completions = n.batch_size * n.group_size
+    return completions, completions * n.seq_len
+
+
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
     """Steady-state wall time for one optimizer step on ``gpu``."""
     n = config.normalized()
@@ -93,16 +101,12 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     if n.is_opd:
         # OPD step = on-policy student rollout (like GRPO) + remote teacher scoring (serial
         # Fireworks round-trips, replaces reward grading) + policy update (fwd+bwd only, NO local
-        # reference forward — the teacher is the API).
-        completions = n.batch_size * n.group_size
-        # Bill local compute on the FULL prompt+completion sequence (n.seq_len = prompt budget +
-        # completion), not completion-only: the loss forward runs model(prompt_ids + student_ids)
-        # over the whole sequence, and generation prefills the prompt before decoding. Completion-
-        # only underquoted GPU time for long-prompt opd jobs (the default admits ~1024 prompt tokens).
-        seq_tokens = completions * n.seq_len
+        # reference forward — the teacher is the API). Bill local compute on the FULL prompt+completion
+        # sequence (see _opd_step_shape), not completion-only, or long-prompt opd is underquoted.
+        completions, seq_tokens = _opd_step_shape(n)
         gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
         update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_TRAIN)
-        teacher_lat = teacher_seconds_per_completion(config.reward_seconds_per_completion)
+        teacher_lat = teacher_seconds_per_completion()
         # run_opd scores each completion serially (nested prompt/group loops each await
         # teacher.score before the next), so the wall cost is the full serial sum — do NOT divide
         # by a concurrency factor or the quote materially understates teacher-bound steps.
@@ -161,8 +165,8 @@ def _notes(
     if (quant := model_quant(n.model_id)) != "bf16":
         notes.append(f"{quant}: smaller VRAM footprint -> cheaper GPU class fits")
     if n.is_opd:
-        comps = n.batch_size * n.group_size
-        tsec = teacher_seconds_per_completion(n.reward_seconds_per_completion)
+        comps, _ = _opd_step_shape(n)
+        tsec = teacher_seconds_per_completion()
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
             f"@ {n.completion_len} tok + GLM teacher scoring ({tsec:.2f}s/completion) + policy "
@@ -233,11 +237,9 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     if config.is_opd:
         n = config.normalized()
         effective_steps = (train / sps) if sps > 0 else config.steps
-        completions_per_step = n.batch_size * n.group_size
-        teacher_input_tokens = effective_steps * completions_per_step * n.seq_len
-        teacher_api_usd = teacher_token_cost_usd(
-            teacher_input_tokens, 0.0, config.teacher_model or ""
-        )
+        _, tokens_per_step = _opd_step_shape(n)
+        teacher_input_tokens = effective_steps * tokens_per_step
+        teacher_api_usd = teacher_token_cost_usd(teacher_input_tokens, 0.0, config.teacher_model)
 
     return CostEstimate(
         model_id=config.model_id,

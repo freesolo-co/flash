@@ -32,25 +32,29 @@ class TeacherError(RuntimeError):
         self.permanent = permanent
 
 
-def _validate_echo(tokens, token_logprobs, offsets, full, plen) -> None:
+def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int]]:
     """Validate a teacher echo response's contract before the completion tokens are emitted.
     Raises a PERMANENT ``TeacherError`` on any malformed shape — non-list fields, a length
     disagreement, a non-numeric/non-finite/fractional/out-of-range/out-of-order text_offset, an
     echo that does not start at offset 0, a non-numeric/non-finite/positive token_logprob, or
-    tokens that do not tile ``full`` char-for-char. Returns None when the echo is well-formed.
-    A pure extraction of ``score``'s validation gauntlet (the SAME checks in the SAME order);
-    ``plen`` is accepted for signature symmetry with the emit stage that consumes it."""
+    tokens that do not tile ``full`` char-for-char. Returns the per-token ``(start, end)`` character
+    spans (computed ONCE from the validated offsets) for ``score``'s emit loop to reuse, so the span
+    arithmetic is not recomputed there. A pure extraction of ``score``'s validation gauntlet (the
+    SAME checks in the SAME order)."""
+
+    def _bad(m):
+        raise TeacherError(m, permanent=True)
+
     # The length checks and index loop below assume these are sequences. A malformed 200 with
     # token_logprobs=null or a scalar text_offset would make len()/indexing raise TypeError HERE,
     # OUTSIDE the guard above — _train_one then swallows it as a generic (transient) skipped sample
     # without setting last_teacher_status, so a consistently malformed teacher burns every OPD step
     # before the no-signal failure. Reject non-list fields up front as a PERMANENT contract break.
     if not all(isinstance(v, list) for v in (tokens, token_logprobs, offsets)):
-        raise TeacherError(
+        _bad(
             "teacher echo response logprobs fields are not all lists "
             f"(tokens={type(tokens).__name__}, token_logprobs={type(token_logprobs).__name__}, "
-            f"text_offset={type(offsets).__name__})",
-            permanent=True,
+            f"text_offset={type(offsets).__name__})"
         )
     n = len(tokens)
     # A well-formed echo response returns tokens / token_logprobs / text_offset of EQUAL length,
@@ -62,10 +66,9 @@ def _validate_echo(tokens, token_logprobs, offsets, full, plen) -> None:
     # completion and training on the wrong logprob. Both are a broken teacher contract that won't
     # fix itself on retry, so reject any length disagreement as PERMANENT and abort now (codex[bot]).
     if len(token_logprobs) != n or len(offsets) != n:
-        raise TeacherError(
+        _bad(
             f"teacher echo response arrays disagree in length: tokens={n}, "
-            f"token_logprobs={len(token_logprobs)}, text_offset={len(offsets)}",
-            permanent=True,
+            f"token_logprobs={len(token_logprobs)}, text_offset={len(offsets)}"
         )
     # The loop coerces each offset with int(offsets[i]). A malformed 200 can still put a
     # non-numeric value in text_offset (e.g. [0, null] or [0, "bad"]) that passes the list/length
@@ -77,10 +80,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full, plen) -> None:
     full_len = len(full)
     for o in offsets[:n]:
         if isinstance(o, bool) or not isinstance(o, (int, float)):
-            raise TeacherError(
-                f"teacher echo response text_offset has a non-numeric value: {o!r}",
-                permanent=True,
-            )
+            _bad(f"teacher echo response text_offset has a non-numeric value: {o!r}")
         # int(offsets[i]) below coerces each offset to a character index into `full`. A value that
         # is merely numeric still corrupts the alignment three ways that the check above misses:
         # NaN/inf makes int() RAISE (outside any TeacherError -> _train_one swallows it as an
@@ -89,22 +89,14 @@ def _validate_echo(tokens, token_logprobs, offsets, full, plen) -> None:
         # it. Require a FINITE INTEGER within range up front and reject as PERMANENT (codex[bot]).
         # isfinite() must precede int() -- int(NaN) raises -- so the order here is load-bearing.
         if not math.isfinite(o):
-            raise TeacherError(
-                f"teacher echo response text_offset is not finite: {o!r}", permanent=True
-            )
+            _bad(f"teacher echo response text_offset is not finite: {o!r}")
         if o != int(o):
-            raise TeacherError(
-                f"teacher echo response text_offset is not an integer: {o!r}", permanent=True
-            )
+            _bad(f"teacher echo response text_offset is not an integer: {o!r}")
         if o < 0 or o > full_len:
-            raise TeacherError(
-                f"teacher echo response text_offset {o!r} is outside [0, {full_len}]",
-                permanent=True,
-            )
+            _bad(f"teacher echo response text_offset {o!r} is outside [0, {full_len}]")
         if prev_off is not None and o < prev_off:
-            raise TeacherError(
-                f"teacher echo response text_offset is not non-decreasing: {prev_off!r} -> {o!r}",
-                permanent=True,
+            _bad(
+                f"teacher echo response text_offset is not non-decreasing: {prev_off!r} -> {o!r}"
             )
         prev_off = o
     # Tiling from offsets[0] only proves coverage of full[offsets[0]:], so the echo must START at 0.
@@ -113,10 +105,9 @@ def _validate_echo(tokens, token_logprobs, offsets, full, plen) -> None:
     # TRUNCATED prompt -- the gkd signal would be scored against context the student never saw. Require
     # the first offset to be 0 for a non-empty echo and reject a dropped prefix as PERMANENT (codex[bot]).
     if n and int(offsets[0]) != 0:
-        raise TeacherError(
+        _bad(
             f"teacher echo does not start at offset 0 (first text_offset={int(offsets[0])}); it "
-            "dropped a prompt prefix, so every completion logprob is conditioned on a truncated prompt.",
-            permanent=True,
+            "dropped a prompt prefix, so every completion logprob is conditioned on a truncated prompt."
         )
     # token_logprobs[i] is coerced with float(...) below (None -> 0.0 for a null realized logprob,
     # e.g. the first token). A malformed 200 can still put a non-numeric value (e.g. a "NaN" string)
@@ -130,15 +121,9 @@ def _validate_echo(tokens, token_logprobs, offsets, full, plen) -> None:
         if lp is None:
             continue
         if isinstance(lp, bool) or not isinstance(lp, (int, float)):
-            raise TeacherError(
-                f"teacher echo response token_logprobs has a non-numeric value: {lp!r}",
-                permanent=True,
-            )
+            _bad(f"teacher echo response token_logprobs has a non-numeric value: {lp!r}")
         if not math.isfinite(lp):
-            raise TeacherError(
-                f"teacher echo response token_logprobs has a non-finite value: {lp!r}",
-                permanent=True,
-            )
+            _bad(f"teacher echo response token_logprobs has a non-finite value: {lp!r}")
         if lp > 1e-6:
             # A log-probability cannot exceed 0. A malformed 200 with a POSITIVE value is a
             # probability > 1: summed into teacher_logsum it poisons the reverse-KL coefficient
@@ -146,10 +131,9 @@ def _validate_echo(tokens, token_logprobs, offsets, full, plen) -> None:
             # train on a bogus signal instead of aborting like the other contract violations. Reject
             # as PERMANENT. The 1e-6 tolerance absorbs float rounding of a ~0 logprob on a
             # near-deterministic token (codex[bot]).
-            raise TeacherError(
+            _bad(
                 f"teacher echo response token_logprobs has a positive value {lp!r} "
-                "(a log-probability cannot exceed 0).",
-                permanent=True,
+                "(a log-probability cannot exceed 0)."
             )
     # The echoed tokens must TILE `full` contiguously: each token's TEXT must equal the substring it
     # claims to span, full[offsets[i] : offsets[i+1]] (the last token to len(full)). The emit loop
@@ -162,17 +146,20 @@ def _validate_echo(tokens, token_logprobs, offsets, full, plen) -> None:
     # literal substrings tiling char-for-char (a split char appears as zero-width tokens at the
     # shared offset), so this does NOT false-positive on real completions; a mismatch is a broken
     # teacher contract, rejected as PERMANENT (codex[bot]).
-    for i in range(n):
-        start = int(offsets[i])
-        boundary = int(offsets[i + 1]) if i + 1 < n else full_len
+    # The per-token (start, end) character spans, computed ONCE from the now-validated offsets. Both
+    # the tiling check below and score()'s emit loop consume this list, so the int(offsets[i]) and the
+    # last-token len(full) fallback arithmetic is not recomputed (it previously ran HERE and AGAIN in
+    # the emit loop).
+    spans = [(int(offsets[i]), int(offsets[i + 1]) if i + 1 < n else full_len) for i in range(n)]
+    for i, (start, boundary) in enumerate(spans):
         expected = full[start:boundary]
         if str(tokens[i]) != expected:
-            raise TeacherError(
+            _bad(
                 f"teacher echo does not tile the input at token {i}: token text "
                 f"{str(tokens[i])!r} != echoed substring full[{start}:{boundary}]={expected!r} "
-                "(gap/overlap/truncation or a non-literal echo); its span would be fabricated.",
-                permanent=True,
+                "(gap/overlap/truncation or a non-literal echo); its span would be fabricated."
             )
+    return spans
 
 
 class TeacherClient:
@@ -280,12 +267,9 @@ class TeacherClient:
             raise TeacherError(
                 f"teacher echo response missing logprobs: {e}", permanent=True
             ) from e
-        _validate_echo(tokens, token_logprobs, offsets, full, plen)
-        n = len(tokens)
+        spans = _validate_echo(tokens, token_logprobs, offsets, full)
         out: list[TeacherToken] = []
-        for i in range(n):
-            start = int(offsets[i])
-            end = int(offsets[i + 1]) if i + 1 < n else len(full)
+        for i, (start, end) in enumerate(spans):
             # Drop tokens that lie ENTIRELY in the prompt (end <= plen). KEEP a token that CROSSES
             # the prompt/completion boundary (start < plen < end): when the prompt ends in whitespace
             # (``Assistant: ``), a leading-space teacher tokenizer merges that trailing space with the

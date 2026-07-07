@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from flash.catalog import normalize_algorithm
+from flash.catalog import normalize_algorithm, samples_on_policy
 from flash.engine.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES
 
@@ -27,9 +27,10 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
-    # OPD only: the Fireworks teacher id, so the teacher-token quote uses the right per-model rate
-    # (None/"" -> the default GLM rate).
-    teacher_model: str | None = None
+    # OPD only: the Fireworks teacher id, so the teacher-token quote uses the right per-model rate.
+    # "" (the unset sentinel, matching TrainSpec.teacher_model) resolves to the recipe's default
+    # teacher (RECIPE.opd.teacher_model) at the pricing boundary (facts.teacher_price_per_1m).
+    teacher_model: str = ""
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
@@ -71,7 +72,7 @@ class RunConfig:
     @property
     def has_rollout(self) -> bool:
         """True when a step samples on-policy student completions (GRPO or opd)."""
-        return self.is_grpo or self.is_opd
+        return samples_on_policy(self.method)
 
     def normalized(self) -> RunConfig:
         """A copy with every ``None`` knob filled from the recipe for this method."""

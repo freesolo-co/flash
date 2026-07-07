@@ -171,16 +171,22 @@ TEACHER_USD_PER_1M: dict[str, tuple[float, float]] = {
     "accounts/fireworks/models/glm-5p2": (1.40, 4.40),
     "accounts/fireworks/models/glm-5p1": (1.40, 4.40),
 }
-# Representative default = the GLM-5 serverless rate. The recipe's default teacher is glm-5p2, so an
-# opd run that OMITS [train] teacher_model (priced through this fallback) still quotes the real rate.
-_DEFAULT_TEACHER_USD_PER_1M = (1.40, 4.40)
 # Fireworks echo-scoring round-trip per completion (wall time, concurrency-bound like reward grading).
 AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
 
 
 def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
-    """(input, output) $/1M tokens for a teacher model; falls back to a representative default."""
-    return TEACHER_USD_PER_1M.get(teacher_model or "", _DEFAULT_TEACHER_USD_PER_1M)
+    """(input, output) $/1M tokens for a teacher model.
+
+    The empty-string sentinel (an opd run that OMITS [train] teacher_model) resolves to the recipe's
+    default teacher (``RECIPE.opd.teacher_model``) — the SINGLE source of "who is the default
+    teacher" — so the quote uses that model's real rate with no forked default-price constant. An
+    unknown non-default teacher falls back to the default teacher's rate (spec-parse already rejects
+    an unpriced teacher_model, so this is only a defensive backstop)."""
+    from flash.engine.recipe import RECIPE
+
+    default = TEACHER_USD_PER_1M[RECIPE.opd.teacher_model]
+    return TEACHER_USD_PER_1M.get(teacher_model or RECIPE.opd.teacher_model, default)
 
 
 def teacher_token_cost_usd(

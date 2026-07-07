@@ -8,6 +8,7 @@ import tomllib
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.engine.recipe import FIREWORKS_API_KEY_SECRET
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -215,6 +216,19 @@ _TRAIN_KEYS = frozenset(
     }
 )
 
+# Secrets an algorithm cannot run without — auto-declared (name-only) on the [environment].secrets
+# tuple so a keyless run fails fast in the client/server runtime-secret gate before any GPU is
+# provisioned. OPD needs the Fireworks teacher key. Values stay out-of-band (never in the spec).
+# Each gate unions the spec's declared secrets on top of the global default (which no longer carries
+# the teacher key, so SFT/GRPO don't receive it).
+_REQUIRED_SECRETS: dict[str, tuple[str, ...]] = {"opd": (FIREWORKS_API_KEY_SECRET,)}
+
+
+def _with_required_secrets(algorithm: str, declared: tuple[str, ...]) -> tuple[str, ...]:
+    """Append any secrets ``algorithm`` requires that the config didn't already declare."""
+    missing = tuple(s for s in _REQUIRED_SECRETS.get(algorithm, ()) if s not in declared)
+    return (*declared, *missing)
+
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
@@ -270,15 +284,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError("[environment] pip must be a list of strings")
     if env_raw.get("pip") is not None and not all(isinstance(p, str) for p in env_raw["pip"]):
         raise ConfigError("[environment] pip entries must be strings")
-    environment_secrets = _environment_secrets(env_raw.get("secrets"))
-    if algorithm == "opd" and "FIREWORKS_API_KEY" not in environment_secrets:
-        # OPD cannot run without the teacher key, so make it a REQUIRED declared secret: the
-        # client (runtime_secrets_from_local_env) and server (_runtime_secrets) both raise on a
-        # missing required secret, so a keyless opd run fails fast before any GPU is provisioned.
-        # It is a name-only declaration (value stays out-of-band). This declaration is how the key
-        # is collected/allowed for opd — each gate unions the spec's declared secrets on top of the
-        # global default, which no longer carries FIREWORKS_API_KEY (so SFT/GRPO don't receive it).
-        environment_secrets = (*environment_secrets, "FIREWORKS_API_KEY")
+    environment_secrets = _with_required_secrets(
+        algorithm, _environment_secrets(env_raw.get("secrets"))
+    )
     train_raw = raw.get("train")
     if train_raw is None:
         train_raw = {}
@@ -290,18 +298,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"[train] unknown key(s): {', '.join(unknown_train)} "
             f"(allowed: {', '.join(sorted(_TRAIN_KEYS))})"
         )
-    _teacher = _train_str(train_raw, "teacher_model")
-    if algorithm == "opd" and _teacher:
-        # Reject an unpriced teacher override at parse time: falling back to the default rate would
-        # make both the submit-time quote and the final charge wrong for a differently-priced model.
-        from flash.cost.facts import TEACHER_USD_PER_1M
-
-        if _teacher not in TEACHER_USD_PER_1M:
-            raise ConfigError(
-                f"[train] teacher_model {_teacher!r} has no pricing entry, so its cost quote and "
-                f"charge would silently use the default rate. Use a priced teacher "
-                f"({', '.join(sorted(TEACHER_USD_PER_1M))}) or add an entry in flash/cost/facts.py."
-            )
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
         gpu_raw = {}
@@ -392,26 +388,43 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     return spec
 
 
-def _validate_spec(spec: JobSpec) -> None:
-    try:
-        canonical_gpu(spec.gpu.type)
-    except UnsupportedGpuError as exc:
-        raise ConfigError(str(exc)) from exc
-    if spec.algorithm == "grpo" and spec.train.steps is not None and spec.train.steps <= 0:
-        raise ConfigError("train.steps must be positive for GRPO")
-    if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
+def _validate_sft(spec: JobSpec) -> None:
+    """SFT contract: positive epochs, and a positive row count to price/train against."""
+    if spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
-    if spec.algorithm == "sft" and int(spec.train.max_examples or 0) <= 0:
+    if int(spec.train.max_examples or 0) <= 0:
         raise ConfigError(
             "train.max_examples must be set to a positive row count for SFT "
             "(use the full dataset row count for an uncapped run)"
         )
-    if spec.algorithm == "opd" and spec.train.steps is not None and spec.train.steps <= 0:
-        # OPD is step-driven (on-policy sampling), like GRPO — not epoch-driven. The teacher
-        # key (FIREWORKS_API_KEY) is auto-declared as a required secret in spec_from_dict, so a
-        # keyless opd run already fails fast in the client/server runtime-secret gate.
+
+
+def _validate_grpo(spec: JobSpec) -> None:
+    """GRPO contract: step-driven, so steps (when pinned) must be positive."""
+    if spec.train.steps is not None and spec.train.steps <= 0:
+        raise ConfigError("train.steps must be positive for GRPO")
+
+
+def _validate_opd(spec: JobSpec) -> None:
+    """OPD contract: step-driven (positive steps), a priced teacher, and a usable prompt budget.
+
+    The teacher key (FIREWORKS_API_KEY) is auto-declared as a required secret in spec_from_dict, so a
+    keyless opd run already fails fast in the client/server runtime-secret gate."""
+    if spec.train.steps is not None and spec.train.steps <= 0:
+        # OPD is step-driven (on-policy sampling), like GRPO — not epoch-driven.
         raise ConfigError("train.steps must be positive for opd")
-    if spec.algorithm == "opd" and spec.train.max_length:
+    if spec.train.teacher_model:
+        # Reject an unpriced teacher override at parse time: falling back to the default rate would
+        # make both the submit-time quote and the final charge wrong for a differently-priced model.
+        from flash.cost.facts import TEACHER_USD_PER_1M
+
+        if spec.train.teacher_model not in TEACHER_USD_PER_1M:
+            raise ConfigError(
+                f"[train] teacher_model {spec.train.teacher_model!r} has no pricing entry, so its "
+                f"cost quote and charge would silently use the default rate. Use a priced teacher "
+                f"({', '.join(sorted(TEACHER_USD_PER_1M))}) or add an entry in flash/cost/facts.py."
+            )
+    if spec.train.max_length:
         # Mirror run_opd's prompt-budget guard at PARSE time: a max_length that leaves no room for
         # any prompt after the completion budget is rejected here, BEFORE a paid worker is
         # provisioned (wait_for_gpu + model prefetch + tokenizer/adapter load), instead of failing
@@ -426,6 +439,21 @@ def _validate_spec(spec: JobSpec) -> None:
                 f"max_tokens ({max_completion}) for opd; set max_length > max_tokens. Rejected at "
                 f"parse time so an invalid budget fails before a GPU worker is provisioned."
             )
+
+
+# Each algorithm's spec-level contract lives in ONE validator, dispatched by name so a new algorithm
+# adds a function + a map entry rather than another scattered ``if spec.algorithm == ...`` block.
+_ALGO_VALIDATORS = {"sft": _validate_sft, "grpo": _validate_grpo, "opd": _validate_opd}
+
+
+def _validate_spec(spec: JobSpec) -> None:
+    try:
+        canonical_gpu(spec.gpu.type)
+    except UnsupportedGpuError as exc:
+        raise ConfigError(str(exc)) from exc
+    validator = _ALGO_VALIDATORS.get(spec.algorithm)
+    if validator is not None:
+        validator(spec)
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
