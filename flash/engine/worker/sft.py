@@ -568,9 +568,14 @@ def run_sft():
 
     _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
     # adapter save + required upload can take minutes on a slow HF; keep the heartbeat fresh.
+    # keepalive=True: _final_step is CONSTANT here (training is done), so without it every finalize
+    # ping is a bare liveness that does NOT advance the provider's stall clock — a finalize outlasting
+    # STALL_AFTER_S (1500s) would be killed at the finish line. keepalive forces a REAL heartbeat/tick.
     # progress_step stamps the final step on every finalize heartbeat so a cancel landing in this
     # window still bills the actual steps trained (actual_steps_run reads last_heartbeat.step).
-    with liveness_heartbeat("sft_finalizing", progress=lambda: _final_step, progress_step=True):
+    with liveness_heartbeat(
+        "sft_finalizing", progress=lambda: _final_step, progress_step=True, keepalive=True
+    ):
         adapter_dir = f"{out_dir}/adapter"
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
