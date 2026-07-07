@@ -391,6 +391,12 @@ far more sample-efficient than reward-based RL and with no reward to design. It 
   KL using only realized-token logprobs — no vocabulary projection, so it covers every token exactly
   and works for any student tokenizer. When the tokenizers happen to agree it reduces to plain
   per-token reverse KL (Thinking Machines, *On-Policy Distillation*). Nothing to configure.
+- **Works for multi-turn envs too.** Against an `EnvironmentMultiTurn`, opd rolls out each episode
+  (driving `step_episode` / observations just like GRPO) and distils EVERY assistant turn against the
+  teacher, each conditioned on the transcript up to that turn — the episode's total reverse-KL over
+  the student's generated tokens is the sum of its per-turn reverse-KLs. Env/observation tokens are
+  never distilled (they're context, not the student's output). Set `[train] max_length` to bound the
+  transcript; the teacher must cover it (GLM-5.2's context far exceeds the default budget).
 - **Judge it like SFT.** Distillation logs a falling per-token loss; a low loss alone is not proof.
   Keep a held-out split, `flash deploy` the adapter, and score it — confirm the student actually
   moved toward the teacher's behavior, not just its surface tokens.
