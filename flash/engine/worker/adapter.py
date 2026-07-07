@@ -19,7 +19,8 @@ from flash.engine.worker.perf import optimal_attn_impl
 
 
 def make_lora(model_id: str | None = None):
-    """Build LoRA config targeting all linear layers; vision tower excluded for VL models."""
+    """Build LoRA config targeting all linear layers (VL models included: the vision tower /
+    projector / MTP linears are adapted too; on text-only data they simply get no gradient)."""
     from peft import LoraConfig
 
     targets = "all-linear"
@@ -39,11 +40,6 @@ def make_lora(model_id: str | None = None):
     )
     # rsLoRA removed: ~5.6x effective LR inflation with catalog LRs causes SFT divergence + serve corruption.
     kwargs["use_rslora"] = False
-    if model_id and targets == "all-linear":
-        exclude = _w.lora_exclude_modules(model_id)
-        if exclude:
-            kwargs["exclude_modules"] = exclude
-            print(f"[lora] excluding modules for {model_id}: {exclude}")
     return LoraConfig(**kwargs)
 
 
