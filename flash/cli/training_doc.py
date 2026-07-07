@@ -382,9 +382,10 @@ each of *its own* completions, and a dense per-token loss teaches the student to
 far more sample-efficient than reward-based RL and with no reward to design. It is **step-driven**
 (`steps`) and produces a LoRA served exactly like SFT.
 
-- **Provide the teacher key.** Distillation needs `FIREWORKS_API_KEY` at submit time. List it under
-  `[environment] secrets = ["FIREWORKS_API_KEY"]` and export it in your shell / local `.env`; the
-  value travels out-of-band and is never stored in the spec or needed at serving time.
+- **No teacher key to set up.** The Fireworks key for the GLM teacher is platform-managed: the
+  service supplies its own key to every opd run, so there is nothing to export or declare — an opd
+  run submits like any other. (Bring-your-own teacher keys are not supported; a `FIREWORKS_API_KEY`
+  in your shell is simply ignored.) The key is never stored in the spec or needed at serving time.
 - **The student (Qwen / MiniCPM / Kimi) and the teacher (GLM) have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai *spider* / Tinker
   method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
@@ -408,7 +409,6 @@ algorithm = "opd"
 
 [environment]
 id = "your-org/my-env"
-secrets = ["FIREWORKS_API_KEY"]
 
 [train]
 steps = 100

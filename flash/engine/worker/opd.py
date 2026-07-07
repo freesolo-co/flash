@@ -255,11 +255,14 @@ def run_opd():
         f"mode={'multi-turn' if multi_turn else 'single-turn'}"
     )
 
+    # The GLM teacher key is a platform-owned credential the control plane injects into the worker
+    # env (like HF_TOKEN); users never supply it. Read it like any other flash-used key.
     api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(
-            "opd requires the FIREWORKS_API_KEY runtime secret (the GLM teacher); it was not "
-            "delivered to the worker. Declare it under [environment] secrets and export it locally."
+            "no FIREWORKS_API_KEY (the GLM teacher key) in the opd worker env. It is platform-"
+            "managed and injected by the control plane, so this means the deployment has no "
+            "FIREWORKS_API_KEY configured in its environment."
         )
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
 
