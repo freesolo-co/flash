@@ -507,11 +507,16 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "private environment-scoped repo" in sft.read_text()
     opd = tmp_path / "configs/opd.toml"
     assert opd.is_file()
-    assert 'algorithm = "opd"' in opd.read_text()
-    assert "steps = 100" in opd.read_text()
-    assert "FIREWORKS_API_KEY" in opd.read_text()
+    opd_text = opd.read_text()
+    assert 'algorithm = "opd"' in opd_text
+    assert "steps = 100" in opd_text
+    # The teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
+    # the user to export it, so the generated config must not mention FIREWORKS_API_KEY at all.
+    assert "FIREWORKS_API_KEY" not in opd_text
+    assert "secrets" not in opd_text
+    assert "platform-managed" in opd_text
     # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
-    assert "fail fast" not in opd.read_text()
+    assert "fail fast" not in opd_text
     training = tmp_path / "TRAINING.md"
     assert training.is_file()
     training_text = training.read_text(encoding="utf-8")

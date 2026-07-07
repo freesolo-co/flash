@@ -150,8 +150,9 @@ class CostEstimate:
     wall_capped: bool
     total_usd: float
     # opd only: external Fireworks GLM teacher token spend (0.0 for sft/grpo). Billed by Fireworks
-    # DIRECTLY to the user's FIREWORKS_API_KEY, so it is NOT part of total_usd — shown as its own
-    # itemized diagnostic line only.
+    # to the platform-managed teacher key (users don't supply one), tracked separately from the
+    # platform-billed GPU charge — so it is NOT part of total_usd; shown as its own itemized
+    # diagnostic line only.
     teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()
 
@@ -181,8 +182,8 @@ class CostEstimate:
         ]
         if self.teacher_api_usd > 0:
             lines.append(
-                f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks GLM token spend on your "
-                "FIREWORKS_API_KEY — billed by Fireworks, NOT included in TOTAL)"
+                f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks GLM token spend on the "
+                "platform-managed teacher key — tracked separately, NOT included in TOTAL)"
             )
         lines.append(f"TOTAL      : ${self.total_usd:.2f}")
         if self.notes:
