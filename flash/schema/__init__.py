@@ -8,7 +8,6 @@ import tomllib
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
-from flash.engine.recipe import FIREWORKS_API_KEY_SECRET
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -216,20 +215,6 @@ _TRAIN_KEYS = frozenset(
     }
 )
 
-# Secrets an algorithm cannot run without — auto-declared (name-only) on the [environment].secrets
-# tuple so a keyless run fails fast in the client/server runtime-secret gate before any GPU is
-# provisioned. OPD needs the Fireworks teacher key. Values stay out-of-band (never in the spec).
-# Each gate unions the spec's declared secrets on top of the global default (which no longer carries
-# the teacher key, so SFT/GRPO don't receive it).
-_REQUIRED_SECRETS: dict[str, tuple[str, ...]] = {"opd": (FIREWORKS_API_KEY_SECRET,)}
-
-
-def _with_required_secrets(algorithm: str, declared: tuple[str, ...]) -> tuple[str, ...]:
-    """Append any secrets ``algorithm`` requires that the config didn't already declare."""
-    missing = tuple(s for s in _REQUIRED_SECRETS.get(algorithm, ()) if s not in declared)
-    return (*declared, *missing)
-
-
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
@@ -284,9 +269,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError("[environment] pip must be a list of strings")
     if env_raw.get("pip") is not None and not all(isinstance(p, str) for p in env_raw["pip"]):
         raise ConfigError("[environment] pip entries must be strings")
-    environment_secrets = _with_required_secrets(
-        algorithm, _environment_secrets(env_raw.get("secrets"))
-    )
+    environment_secrets = _environment_secrets(env_raw.get("secrets"))
     train_raw = raw.get("train")
     if train_raw is None:
         train_raw = {}
@@ -408,8 +391,8 @@ def _validate_grpo(spec: JobSpec) -> None:
 def _validate_opd(spec: JobSpec) -> None:
     """OPD contract: step-driven (positive steps), a priced teacher, and a usable prompt budget.
 
-    The teacher key (FIREWORKS_API_KEY) is auto-declared as a required secret in spec_from_dict, so a
-    keyless opd run already fails fast in the client/server runtime-secret gate."""
+    The teacher key (FIREWORKS_API_KEY) is a platform-owned credential the control plane injects into
+    the worker env (build_worker_env), like HF_TOKEN — never a user-declared secret."""
     if spec.train.steps is not None and spec.train.steps <= 0:
         # OPD is step-driven (on-policy sampling), like GRPO — not epoch-driven.
         raise ConfigError("train.steps must be positive for opd")

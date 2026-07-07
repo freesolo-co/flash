@@ -1002,6 +1002,32 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     assert meta["step"] == 1  # one optimizer update over the two turn-losses
 
 
+def test_opd_passes_worker_env_teacher_key_to_client(monkeypatch):
+    """run_opd reads the platform-injected FIREWORKS_API_KEY from the worker env and uses it to
+    construct the TeacherClient."""
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip)  # sets FIREWORKS_API_KEY=unit-test-teacher-key
+    captured = {}
+    import flash.engine.worker.teacher as tmod
+
+    def _capture_client(api_key, *a, **k):
+        captured["key"] = api_key
+        return object()
+
+    monkeypatch.setattr(tmod, "TeacherClient", _capture_client)
+    with pytest.raises(RuntimeError):  # all-skip -> no trained step, after TeacherClient is built
+        opd_mod.run_opd()
+    assert captured["key"] == "unit-test-teacher-key"
+
+
+def test_opd_missing_teacher_key_raises_platform_managed_error(monkeypatch):
+    """With no key in the worker env, run_opd fails with the platform-managed diagnostic (a
+    platform-side injection failure), not the old 'declare and export it' message."""
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip)
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="platform-managed"):
+        opd_mod.run_opd()
+
+
 def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
     """Regression (codex[bot], opd.py): opd must hand liveness_heartbeat a progress callback (parity
     with sft/rl) so its thread emits REAL progress on sample advance instead of pure liveness=true
@@ -2591,8 +2617,9 @@ def test_opd_spec_json_round_trip():
     assert restored == spec
     assert restored.phase == "opd"
     assert restored.train.teacher_model == "accounts/fireworks/models/glm-5p1"
-    # FIREWORKS_API_KEY is auto-declared a required secret for opd.
-    assert "FIREWORKS_API_KEY" in restored.environment.secrets
+    # The teacher key is platform-managed (control-plane-injected into the worker env, like
+    # HF_TOKEN) — NOT a user secret, so it is never added to environment.secrets.
+    assert "FIREWORKS_API_KEY" not in restored.environment.secrets
 
 
 def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
@@ -2614,8 +2641,8 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     est = estimate_for_spec(spec)
     assert est.method == "opd"
     assert est.teacher_api_usd > 0.0  # external teacher token spend is itemized (diagnostic)
-    # Teacher tokens are billed by Fireworks to the user's own key, so they are NOT in the charge:
-    # total_usd is GPU (platform-billed) time only, never total + teacher (codex[bot]).
+    # Teacher tokens are billed by Fireworks to the platform-managed teacher key, tracked separately
+    # from the GPU charge: total_usd is GPU (platform-billed) time only, never total + teacher.
     assert est.total_usd == pytest.approx(est.billable_hours * est.gpu_hourly_usd)
     assert "opd step" in " ".join(est.notes)
 
