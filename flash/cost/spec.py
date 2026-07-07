@@ -110,9 +110,6 @@ def runconfig_from_spec(spec) -> RunConfig:
         provider="auto",
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
-        # "" is the unset sentinel (RunConfig.teacher_model); facts.teacher_price_per_1m resolves it
-        # to the recipe default. Non-opd carries no teacher.
-        teacher_model=t.teacher_model if spec.algorithm == "opd" else "",
     )
 
 
