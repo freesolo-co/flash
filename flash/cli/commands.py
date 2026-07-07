@@ -217,7 +217,7 @@ All three algorithms train off this file:
   `output` for a single gold assistant turn.
 - OPD (configs/opd.toml) rolls out each episode and distils EVERY assistant turn against
   the Fireworks GLM teacher, conditioned on the transcript so far — the multi-turn
-  on-policy-distillation objective. Set FIREWORKS_API_KEY (the teacher key).
+  on-policy-distillation objective. The teacher key is platform-managed (nothing to set).
 """
 
 from __future__ import annotations
@@ -507,10 +507,9 @@ def cmd_env_setup(args) -> int:
             'algorithm = "opd"   # on-policy distillation from a Fireworks GLM teacher\n\n'
             "# Environment: upload this project folder with\n"
             "# `flash env push --name my-env .`, then paste the returned id below.\n"
-            "# FIREWORKS_API_KEY (the GLM teacher key) is read from your shell/.env at submit time.\n"
+            "# The GLM teacher key is platform-managed — nothing to set up or export.\n"
             "[environment]\n"
-            'id = ""\n'
-            'secrets = ["FIREWORKS_API_KEY"]\n\n'
+            'id = ""\n\n'
             "[train]\n"
             "steps = 100                     # opd is step-driven (like GRPO)\n"
             "lora_rank = 32\n"
