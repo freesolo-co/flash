@@ -406,6 +406,26 @@ def test_cancel_hint_is_best_effort_when_checkpoint_listing_fails(
     assert "deployable checkpoint" not in err
 
 
+def test_cancel_hint_survives_malformed_checkpoint_shape(fake_client, capsys, monkeypatch) -> None:
+    """A checkpoint dict missing 'step' (or carrying a non-orderable value) must NOT crash a cancel
+    that already succeeded — the max(step) hint is best-effort. A recoverable step still drives the
+    deploy example; when none is recoverable the example is simply dropped (no crash, no bogus step)."""
+    monkeypatch.setattr(
+        fake_client, "checkpoints", lambda run_id: [{"no_step": 1}, {"step": None}, {"step": 7}]
+    )
+    assert _run(["cancel", "flash-1"]) == 0  # did not raise on the malformed entries
+    out, err = capsys.readouterr()
+    assert '"state": "cancelled"' in out
+    assert "3 deployable checkpoint(s) survive this cancel" in err
+    assert "flash deploy flash-1/step-7" in err  # max of the RECOVERABLE steps
+
+    monkeypatch.setattr(fake_client, "checkpoints", lambda run_id: [{"no_step": 1}])
+    assert _run(["cancel", "flash-1"]) == 0
+    _, err2 = capsys.readouterr()
+    assert "1 deployable checkpoint(s) survive this cancel" in err2
+    assert "flash deploy" not in err2
+
+
 def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["cancel", "flash-1"]) == 0
     assert ("cancel", "flash-1") in fake_client.calls
