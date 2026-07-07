@@ -35,6 +35,7 @@ from flash.engine.worker.decoding import (
 from flash.engine.worker.finalize import write_train_meta
 from flash.engine.worker.gpu_setup import (
     finalize_alloc_conf_for_sleep,
+    force_vit_sdpa_on_blackwell,
     force_vllm_backend_for_sm120,
     patch_trl_colocate_llm_kwargs,
 )
@@ -416,6 +417,7 @@ __all__ = [
     "disable_liger_grpo_torch_compile",
     "error_artifact_name",
     "finalize_alloc_conf_for_sleep",
+    "force_vit_sdpa_on_blackwell",
     "force_vllm_backend_for_sm120",
     "free_gpu",
     "fused_optim_name",
