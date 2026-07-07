@@ -270,3 +270,35 @@ def test_nonpositive_run_knobs_rejected(knob, bad):
     # A <= 0 run knob produces a bogus quote, so it's rejected up front (like steps >= 1).
     with pytest.raises(ValueError, match=f"{knob} must be"):
         RunConfig(MID, "grpo", 100, **{knob: bad})
+
+
+def test_opd_teacher_scoring_is_billed_in_concurrency_waves_not_serially():
+    # Teacher scoring runs CONCURRENTLY in run_opd (up to TEACHER_CONCURRENCY Fireworks calls per
+    # step), so a step's teacher wall is ceil(completions / slots) waves x latency, NOT the full
+    # serial sum. Isolate the teacher term by holding seq_tokens (hence gen_s/update_s) constant while
+    # doubling completions across a wave boundary: TEACHER_CONCURRENCY completions = 1 wave, 2x = 2
+    # waves, so the per-step delta is exactly ONE teacher latency -- not the ~8x a serial
+    # (completions x latency) model would add.
+    from flash.cost.analytical import TEACHER_CONCURRENCY, seconds_per_step
+    from flash.cost.facts import teacher_seconds_per_completion
+
+    gpu = "RTX 5090"
+    teacher_lat = teacher_seconds_per_completion()
+    assert teacher_lat > 0  # else the assertion below is vacuous
+    slots = int(TEACHER_CONCURRENCY)
+    # completions x seq_len is identical (slots*2048 == 2*slots*1024), so only the wave count differs.
+    one_wave = RunConfig(MID, "opd", 10, batch_size=slots, group_size=1, seq_len=2048)
+    two_waves = RunConfig(MID, "opd", 10, batch_size=slots * 2, group_size=1, seq_len=1024)
+    delta = seconds_per_step(two_waves, gpu) - seconds_per_step(one_wave, gpu)
+    assert delta == pytest.approx(teacher_lat), (
+        "crossing one concurrency wave must add exactly one teacher latency, not one per completion"
+    )
+
+
+def test_opd_teacher_concurrency_matches_worker_pool():
+    # The cost model's TEACHER_CONCURRENCY must track the worker's actual pool size, or quotes drift
+    # from real runs. Guard the two constants against silent divergence.
+    from flash.cost.analytical import TEACHER_CONCURRENCY
+    from flash.engine.worker.opd import _TEACHER_SCORE_MAX_WORKERS
+
+    assert TEACHER_CONCURRENCY == _TEACHER_SCORE_MAX_WORKERS
