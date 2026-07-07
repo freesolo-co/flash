@@ -632,10 +632,15 @@ def run_rl():
             f"{_steps_run}/{steps} step(s) — finalizing the completed policy instead of failing."
         )
     # adapter save + recombine + required upload can take minutes (recombine loads a full base
-    # model on VL warm-starts); keep the heartbeat fresh through the whole finalize.
+    # model on VL warm-starts); keep the heartbeat fresh through the whole finalize. keepalive=True:
+    # _steps_run is CONSTANT here (training is done), so without it every finalize ping is a bare
+    # liveness that does NOT advance the provider's stall clock — a finalize outlasting STALL_AFTER_S
+    # (1500s) would be killed at the finish line. keepalive forces a REAL heartbeat each tick.
     # progress_step stamps the final step on every finalize heartbeat so a cancel landing in this
     # window still bills the actual steps trained (actual_steps_run reads last_heartbeat.step).
-    with liveness_heartbeat("rl_finalizing", progress=lambda: _steps_run, progress_step=True):
+    with liveness_heartbeat(
+        "rl_finalizing", progress=lambda: _steps_run, progress_step=True, keepalive=True
+    ):
         adapter_dir = f"{out_dir}/adapter"
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)

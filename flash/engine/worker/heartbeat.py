@@ -38,12 +38,21 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         "rl_finalizing",
     }
 )
+# Mid-training the per-step checkpoint upload runs SYNCHRONOUSLY on the trainer thread (dev #445),
+# which freezes the trainer's global_step — so the ``rl_step``/``sft_step`` liveness daemon can only
+# emit bare liveness pings for the whole upload, and those DON'T advance the provider's stall clock.
+# A ``checkpoint_uploading`` keepalive daemon (liveness_heartbeat(keepalive=True)) wraps the upload to
+# keep that clock fed; it rides the SAME tight, throttled cadence as a setup stage. Kept OUT of
+# _HB_SETUP_LIVENESS_STAGES so that set's "setup-phase" meaning (and its tests) stay honest.
+_HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
+# Liveness stages that ride the tighter setup-liveness upload interval (setup + mid-train upload).
+_HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
 # Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled. Every
-# setup-liveness stage is throttled (⊂) PLUS the per-step training stages: opd_filtering_prompts alone
+# tight-liveness stage is throttled (⊂) PLUS the per-step training stages: opd_filtering_prompts alone
 # emits a REAL (non-liveness) heartbeat every scan tick — ~120/hr on a large split before model load —
 # so unthrottled the setup stages blow the cap; throttle them exactly like their sft_pretokenizing
-# analogue (codex[bot]).
-_HB_THROTTLED_STAGES = _HB_SETUP_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "opd_step"})
+# analogue (codex[bot]). checkpoint_uploading keepalive re-emits every 30s too, so it MUST be throttled.
+_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "opd_step"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
@@ -137,7 +146,7 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
         else:
             throttled = stage in _HB_THROTTLED_STAGES
             interval_s = _w._HB_MIN_INTERVAL_S
-            if stage in _HB_SETUP_LIVENESS_STAGES:
+            if stage in _HB_TIGHT_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
             upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
             # ``force`` bypasses the per-stage throttle (but not TERMINAL_ONLY mode, handled above) when
@@ -291,8 +300,17 @@ _STALL_DUMP_S = 1200.0
 
 
 @contextlib.contextmanager
-def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False):
+def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, keepalive=False):
     """Emit liveness pings for ``stage`` while the wrapped block runs on the main thread.
+
+    ``keepalive``: the wrapped block is legitimate BLOCKING I/O with no per-step progress signal the
+    daemon can observe — a synchronous checkpoint/adapter upload (dev #445) or the finalize upload —
+    so EVERY tick emits a REAL (non-liveness) heartbeat instead of a bare ping. Bare liveness pings do
+    NOT advance the provider's stall clock (`_poll.surface_heartbeat` returns stage=None for them), so
+    without this a healthy multi-minute upload that outlasts STALL_AFTER_S (1500s) is wrongly killed
+    mid-save. Safe because a genuinely wedged upload surfaces as an EXCEPTION through its own retry
+    budget (ending this context), not an infinite silent hang — so it does not mask a real stall. Pair
+    with a throttled stage (see _HB_UPLOAD_LIVENESS_STAGES) so the 30s re-emit can't blow the HF cap.
 
     ``progress``: optional ``() -> float | None`` monotonic counter; advances emit a REAL heartbeat.
     ``fields``: optional ``() -> dict`` of EXTRA payload fields merged into every emission (liveness
@@ -342,7 +360,9 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False):
                     extra = fields() or {}
             if progress_step and last_val is not None:
                 extra["step"] = int(last_val)
-            _w.heartbeat(stage, liveness=not made_progress, gpu=gpu, **extra)
+            # keepalive: a legitimate blocking upload IS progress the daemon can't sample per-step, so
+            # force a REAL heartbeat every tick to keep the provider's stall clock fed (see docstring).
+            _w.heartbeat(stage, liveness=(not made_progress) and not keepalive, gpu=gpu, **extra)
             last_progress = float(getattr(_w, "_HB_LAST_PROGRESS_TS", 0.0) or 0.0)
             if not dumped and last_progress and (time.time() - last_progress) > _STALL_DUMP_S:
                 _dump_thread_stacks(f"{stage}: no progress for >{_STALL_DUMP_S:.0f}s")
