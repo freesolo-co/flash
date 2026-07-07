@@ -44,11 +44,6 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # wall is ceil(completions / slots) waves x latency, not completions x latency.
 REWARD_CONCURRENCY = 16.0
 
-# Teacher scoring is CONCURRENT too: run_opd's primary path fans a step's completions across up to
-# TEACHER_CONCURRENCY Fireworks calls (mirror of opd.py _TEACHER_SCORE_MAX_WORKERS), so the teacher
-# wall is ceil(completions / slots) waves x latency, not completions x latency.
-TEACHER_CONCURRENCY = 8.0
-
 # Cold-start overhead (seconds): container boot + deps + model load (+ vLLM init for GRPO).
 #
 # Calibrated against a real fresh-worker run (0.8B SFT, RTX 3090 @ $0.239/hr) whose elapsed wall
@@ -112,11 +107,12 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
         update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_TRAIN)
         teacher_lat = teacher_seconds_per_completion()
-        # run_opd's primary path scores a step's completions CONCURRENTLY over Fireworks, bounded by
-        # TEACHER_CONCURRENCY workers (opd.py _TEACHER_SCORE_MAX_WORKERS), so the teacher wall is
-        # ceil(completions / slots) waves x latency — NOT the full serial sum (that describes only the
-        # CPU-test fallback that can't batch-generate). ceil keeps a partial last wave at one latency.
-        teacher_s = math.ceil(completions / TEACHER_CONCURRENCY) * teacher_lat
+        # run_opd's primary path scores a step's completions CONCURRENTLY over Fireworks with a fan-out
+        # cap of the step's OWN completion count (prompts_per_step * group_size, opd.py Phase 2), so
+        # every completion in a step is scored in ONE parallel wave — the teacher wall is a single
+        # latency, NOT the full serial sum (that describes only the CPU-test fallback that can't
+        # batch-generate). The teacher endpoint's rate limit is the real ceiling on this fan-out.
+        teacher_s = teacher_lat if completions else 0.0
         return gen_s + teacher_s + update_s
 
     if not n.is_grpo:
