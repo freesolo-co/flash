@@ -385,6 +385,8 @@ def make_checkpoint_upload_callback():
     """
     from transformers import TrainerCallback
 
+    from flash.engine.worker.heartbeat import liveness_heartbeat
+
     def _publish_deployable_recombined(
         ckpt_dir: str, step: int, *, with_retry: bool = False
     ) -> None:
@@ -442,24 +444,37 @@ def make_checkpoint_upload_callback():
     uploaded_steps: set[int] = set()
 
     def _upload_with_retries(step: int, ckpt_dir: str) -> bool:
-        """Run the full upload for `step`, retrying transient failures; True once it lands."""
-        for attempt in range(_CKPT_UPLOAD_RETRIES):
-            try:
-                _upload_once(step, ckpt_dir)
-                uploaded_steps.add(step)
-                return True
-            except Exception as e:
-                if attempt + 1 < _CKPT_UPLOAD_RETRIES:
-                    print(
-                        f"[ckpt] step {step} upload retry {attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
-                    )
-                    time.sleep(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1))
-                else:
-                    print(
-                        f"[ckpt] step {step} upload FAILED after {_CKPT_UPLOAD_RETRIES} attempts: {e}"
-                    )
-                    with contextlib.suppress(Exception):
-                        _w.heartbeat("checkpoint_upload_failed", step=step)
+        """Run the full upload for `step`, retrying transient failures; True once it lands.
+
+        The upload blocks the trainer thread SYNCHRONOUSLY, freezing global_step for its whole
+        duration, so the outer rl_step/sft_step liveness daemon can only emit bare liveness pings —
+        which do NOT advance the provider's stall clock. Without a keepalive a healthy multi-minute
+        upload that outlasts STALL_AFTER_S (1500s) — big model, slow HF, or several backed-off retries —
+        is wrongly killed mid-save. Wrap the whole retry budget in a ``checkpoint_uploading`` keepalive
+        daemon so every 30s tick lands a REAL, stall-clock-advancing heartbeat (stamped with the step so
+        a cancel here still bills it). A genuinely wedged upload still surfaces as the exception that
+        exhausts the retries and returns False, so this masks no real stall.
+        """
+        with liveness_heartbeat(
+            "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
+        ):
+            for attempt in range(_CKPT_UPLOAD_RETRIES):
+                try:
+                    _upload_once(step, ckpt_dir)
+                    uploaded_steps.add(step)
+                    return True
+                except Exception as e:
+                    if attempt + 1 < _CKPT_UPLOAD_RETRIES:
+                        print(
+                            f"[ckpt] step {step} upload retry {attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
+                        )
+                        time.sleep(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1))
+                    else:
+                        print(
+                            f"[ckpt] step {step} upload FAILED after {_CKPT_UPLOAD_RETRIES} attempts: {e}"
+                        )
+                        with contextlib.suppress(Exception):
+                            _w.heartbeat("checkpoint_upload_failed", step=step)
         return False
 
     class _CheckpointUpload(TrainerCallback):
@@ -476,7 +491,17 @@ def make_checkpoint_upload_callback():
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
             if not os.path.isdir(ckpt_dir):
                 return
-            _upload_with_retries(step, ckpt_dir)
+            if not _upload_with_retries(step, ckpt_dir):
+                # The synchronous design promises every save_every lands durably; a retry-exhausted
+                # upload breaks that for THIS step. Don't abort a long paid run over a transient HF
+                # failure, but don't let it pass unremarked either: a checkpoint_upload_failed
+                # heartbeat is already emitted, and durability is still backstopped — the deployable
+                # adapter is published first, the next save_every retries, and on_train_end re-flushes
+                # the latest un-uploaded step (this step is NOT in uploaded_steps, so it will).
+                print(
+                    f"[ckpt] step {step} not durable on HF after retries — training continues; "
+                    "on_train_end will re-flush the latest checkpoint."
+                )
 
         def on_train_end(self, args, state, control, **kwargs):
             # Safety net for a final checkpoint the trainer wrote without an on_save (e.g. a
@@ -490,6 +515,9 @@ def make_checkpoint_upload_callback():
             step, ckpt_dir = latest
             if step in uploaded_steps:
                 return
-            _upload_with_retries(step, ckpt_dir)
+            if not _upload_with_retries(step, ckpt_dir):
+                # Last-resort flush of the final checkpoint failed too — a checkpoint_upload_failed
+                # heartbeat is already out; surface it here so the run's tail isn't silently non-durable.
+                print(f"[ckpt] final checkpoint step {step} not durable on HF after retries.")
 
     return _CheckpointUpload()
