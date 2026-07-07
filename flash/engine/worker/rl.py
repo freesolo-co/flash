@@ -11,12 +11,6 @@ from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.grpo import resolve_grpo_sleep_mode
 from flash.engine.worker.heartbeat import liveness_heartbeat
-from flash.engine.worker.lora import (
-    _LM_SYNC_REMAP_ON,
-    is_vl_checkpoint,
-    patch_vllm_language_model_only,
-    patch_vllm_lm_weight_sync,
-)
 from flash.engine.worker.perf import (
     _GpuPeakSampler,
     _metric_curve,
@@ -531,12 +525,9 @@ def run_rl():
     setup_seconds = time.time() - t_start
     _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
-    # VL checkpoints train text-only: make the colocated rollout engine skip the vision tower.
-    if use_vllm:
-        patch_vllm_language_model_only(model_id)
-        # Install (but don't yet activate) the TRL->vLLM weight-sync name remap for VL checkpoints;
-        # activated below, after the trainer's initial checkpoint load is built.
-        patch_vllm_lm_weight_sync(model_id)
+    # VL checkpoints roll out on the FULL multimodal engine (vision tower included) — the colocated
+    # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
+    # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
     hb_cb = _w.make_reward_heartbeat_callback()
     # Tool envs hand TRL the tool callables; pure multi-turn envs hand TRL a rollout_func.
     extra_trainer_kwargs: dict = {}
@@ -593,11 +584,6 @@ def run_rl():
         # Apply chalk's standalone kernels on trainer.model (the authoritative target).
         # inside the liveness wrap: chalk's kernel install can JIT-compile, silent for minutes.
         _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
-    # Activate the weight-sync remap only now, after the initial checkpoint load is built.
-    if use_vllm:
-        _LM_SYNC_REMAP_ON["on"] = True
-        if is_vl_checkpoint(model_id):
-            print("[vllm] LM weight-sync remap activated for training syncs")
     # Mid-run eval is intentionally skipped: held-out eval happens deploy-side, keeping training pure.
     _reset_peak_gpu()
     _gpu_sampler = _GpuPeakSampler().start()
