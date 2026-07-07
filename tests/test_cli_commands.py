@@ -77,6 +77,10 @@ class _FakeClient:
         self.calls.append(("cancel", run_id))
         return {"run_id": run_id, "state": "cancelled"}
 
+    def checkpoints(self, run_id: str) -> list[dict]:
+        self.calls.append(("checkpoints", run_id))
+        return [{"step": 20}, {"step": 40}]
+
     def deploy(self, run_id: str, **kwargs) -> dict:
         self.calls.append(("deploy", run_id, kwargs))
         return {
@@ -372,6 +376,56 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     assert "realized_cost=$1.2346" in err
 
 
+def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
+    """`state=cancelled` + adapter_ref=null + cost=0 reads as discardable, yet the per-step
+    deployable checkpoints streamed before the cancel survive it — the cancel output must say
+    so (on stderr in the plain path, keeping the stdout JSON machine-readable)."""
+    import json as _json
+
+    assert _run(["cancel", "flash-1"]) == 0
+    assert ("checkpoints", "flash-1") in fake_client.calls
+    out, err = capsys.readouterr()
+    assert _json.loads(out)["state"] == "cancelled"  # stdout stays pure JSON in the plain path
+    assert "2 deployable checkpoint(s) survive this cancel" in err
+    assert "flash checkpoints flash-1" in err
+    assert "flash deploy flash-1/step-40" in err  # points at the newest surviving step
+
+
+def test_cancel_hint_is_best_effort_when_checkpoint_listing_fails(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """The surviving-checkpoints lookup must never break `flash cancel` itself."""
+
+    def boom(run_id):
+        raise RuntimeError("backend hiccup")
+
+    monkeypatch.setattr(fake_client, "checkpoints", boom)
+    assert _run(["cancel", "flash-1"]) == 0
+    out, err = capsys.readouterr()
+    assert '"state": "cancelled"' in out
+    assert "deployable checkpoint" not in err
+
+
+def test_cancel_hint_survives_malformed_checkpoint_shape(fake_client, capsys, monkeypatch) -> None:
+    """A checkpoint dict missing 'step' (or carrying a non-orderable value) must NOT crash a cancel
+    that already succeeded — the max(step) hint is best-effort. A recoverable step still drives the
+    deploy example; when none is recoverable the example is simply dropped (no crash, no bogus step)."""
+    monkeypatch.setattr(
+        fake_client, "checkpoints", lambda run_id: [{"no_step": 1}, {"step": None}, {"step": 7}]
+    )
+    assert _run(["cancel", "flash-1"]) == 0  # did not raise on the malformed entries
+    out, err = capsys.readouterr()
+    assert '"state": "cancelled"' in out
+    assert "3 deployable checkpoint(s) survive this cancel" in err
+    assert "flash deploy flash-1/step-7" in err  # max of the RECOVERABLE steps
+
+    monkeypatch.setattr(fake_client, "checkpoints", lambda run_id: [{"no_step": 1}])
+    assert _run(["cancel", "flash-1"]) == 0
+    _, err2 = capsys.readouterr()
+    assert "1 deployable checkpoint(s) survive this cancel" in err2
+    assert "flash deploy" not in err2
+
+
 def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["cancel", "flash-1"]) == 0
     assert ("cancel", "flash-1") in fake_client.calls
@@ -451,6 +505,13 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "max_examples = 2" in sft.read_text()
     assert "cheapest fitting managed class" in sft.read_text()
     assert "private environment-scoped repo" in sft.read_text()
+    opd = tmp_path / "configs/opd.toml"
+    assert opd.is_file()
+    assert 'algorithm = "opd"' in opd.read_text()
+    assert "steps = 100" in opd.read_text()
+    assert "FIREWORKS_API_KEY" in opd.read_text()
+    # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
+    assert "fail fast" not in opd.read_text()
     training = tmp_path / "TRAINING.md"
     assert training.is_file()
     training_text = training.read_text(encoding="utf-8")
@@ -472,7 +533,32 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     out = capsys.readouterr().out
     assert "dataset/train.jsonl" in out
     assert "configs/rl.toml" in out
+    assert "configs/opd.toml" in out
     assert "TRAINING.md" in out
+
+
+def test_env_setup_multi_turn_scaffolds_opd_with_single_turn_warning(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`flash env setup --multi-turn` scaffolds all three configs (sft/rl/opd) so opd.toml is present
+    in both modes — but opd is single-turn only (run_opd rejects multi-turn), so the multi-turn opd.toml
+    and the starter env docstring must say so loudly rather than hand the user a config that fails fast."""
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup", "--multi-turn"]) == 0
+
+    env_py = (tmp_path / "environment.py").read_text()
+    assert "EnvironmentMultiTurn" in env_py  # genuinely a multi-turn scaffold
+    assert "OPD (configs/opd.toml)" in env_py  # docstring documents opd's single-turn limitation
+    # all three algorithm configs are scaffolded in multi-turn mode too
+    for name in ("configs/sft.toml", "configs/rl.toml", "configs/opd.toml"):
+        assert (tmp_path / name).is_file(), name
+    opd_text = (tmp_path / "configs/opd.toml").read_text()
+    assert 'algorithm = "opd"' in opd_text
+    # ...but the multi-turn opd.toml warns it is single-turn only and will fail fast on this env
+    assert "SINGLE-TURN only" in opd_text
+    assert "fail fast" in opd_text
+    assert "configs/opd.toml" in capsys.readouterr().out
 
 
 def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
@@ -703,3 +789,32 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
     err = capsys.readouterr().err
     assert "deployment failed: smoke generation failed" in err
     assert "once it is ready" not in err
+
+
+def test_log_follow_progress_includes_heartbeat_age() -> None:
+    """The follow spinner must show a live heartbeat age so a long quiet phase reads as
+    "alive, throttled" instead of a frozen line."""
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {
+        "state": "running",
+        "last_heartbeat": {"stage": "sft_initializing", "step": 3, "ts": _time.time() - 41},
+    }
+    state, progress = _log_follow_progress(status, "unknown")
+    assert state == "running"
+    assert "stage=sft_initializing" in progress
+    assert "step=3" in progress
+    assert "hb=<1m" in progress
+
+    status["last_heartbeat"]["ts"] = _time.time() - 500
+    _, progress = _log_follow_progress(status, "unknown")
+    assert "hb=8m" in progress
+
+    state, progress = _log_follow_progress({"state": "running"}, "unknown")
+    assert "hb=" not in progress  # no heartbeat yet -> no fabricated age
+
+    malformed = {"state": "running", "last_heartbeat": {"stage": "sft_step", "ts": "oops"}}
+    _, progress = _log_follow_progress(malformed, "unknown")
+    assert "hb=" not in progress  # non-numeric ts -> no fabricated age
