@@ -27,9 +27,8 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
-    # OPD only: the Fireworks teacher id, so the teacher-token quote uses the right per-model rate.
-    # "" (the unset sentinel, matching TrainSpec.teacher_model) resolves to the recipe's default
-    # teacher (RECIPE.opd.teacher_model) at the pricing boundary (facts.teacher_price_per_1m).
+    # OPD only: internal Fireworks teacher id for teacher-token diagnostics. User configs cannot
+    # override this; an empty value resolves to the recipe's fixed GLM 5.2 teacher.
     teacher_model: str = ""
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h

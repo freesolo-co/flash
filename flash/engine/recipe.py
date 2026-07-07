@@ -50,9 +50,8 @@ class OPDConfig:
     """On-policy distillation: student samples, a remote teacher scores its tokens, and a groupwise
     reverse-KL loss (the collinear-ai spider / Tinker cross-tokenizer method) trains the student."""
 
-    # Fireworks-hosted teacher reached over the OpenAI-compatible API; overridable via
-    # [train].teacher_model. GLM-5.2 is a strong reasoning model whose per-token logprobs
-    # supervise the (much smaller) student.
+    # Fixed Fireworks-hosted GLM 5.2 teacher reached over the OpenAI-compatible API. This is
+    # platform-managed and intentionally not configurable from [train].
     teacher_model: str = "accounts/fireworks/models/glm-5p2"
     teacher_base_url: str = "https://api.fireworks.ai/inference/v1"
     # OPD is step-driven like GRPO (on-policy sampling), not epoch-driven like SFT.
