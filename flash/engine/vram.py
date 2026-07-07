@@ -328,6 +328,13 @@ def estimate_vram_gb(
         train = activations + logits
         return base + (max(rollout, train) if sleep_offload else rollout + train)
     if is_opd:
+        # OPD always samples the student through a resident colocated vLLM engine, while the HF/PEFT
+        # trainer model stays resident for the GKD loss forward/backward. Budget the second bf16
+        # weight copy plus a viable KV pool through the training step. ``use_vllm`` is intentionally
+        # ignored for OPD; it only exists for legacy GRPO sizing callers.
+        rollout = weights + max(
+            _KV_CAP, _resident_kv_gb(eff_b, seq_len, group_size, fp8_kv=fp8_kv)
+        )
         # opd's gkd loss forward materializes DENSE logits — there is NO fused cross-entropy: the
         # student forward yields full-sequence bf16 logits [seq, vocab], then the completion rows are
         # gathered in fp32 [completion, vocab] for the logsumexp. The SFT fused path budgets ZERO
@@ -357,7 +364,7 @@ def estimate_vram_gb(
         logits_fwd = (seq_len * 2 + completion * 4) * vocab
         logits_bwd = (seq_len * 2 + completion * 4) * vocab
         logits = (logits_fwd + logits_bwd) / 1e9
-        return base + activations + logits
+        return base + rollout + activations + logits
     fused = sft_logits_fused(params_b, seq_len) if sft_fused_ce is None else bool(sft_fused_ce)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
@@ -562,6 +569,7 @@ def model_required_vram_gb(
     info = MODELS.get(model_id)
     model_vocab = vocab_size_for(model_id)
     is_grpo = (algorithm or "").lower() in ("grpo", "rl")
+    is_vllm_rollout = is_grpo or (algorithm or "").lower() == "opd"
     sft_fused_ce = (
         None
         if is_grpo
@@ -620,7 +628,7 @@ def model_required_vram_gb(
             else:
                 floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
         need = max(need, floor)
-        if is_grpo and use_vllm:
+        if is_vllm_rollout and use_vllm:
             floor_gb = 24 if (params_b or 0.0) <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
             need = max(need, floor_gb)
             # vLLM KV-cache init preflight: the card must leave a viable cache-block pool
@@ -635,13 +643,13 @@ def model_required_vram_gb(
     if params_b is None:
         return 24
     # Size the uncataloged (model_policy="allow") fallback with the ACTUAL algorithm, not a hardcoded
-    # "grpo". An open-model OPD run was quoted/allocated as a colocated-vLLM GRPO job, so the new OPD
-    # dense-logit estimator (estimate_vram_gb's is_opd path) was never applied -- rejecting fitting runs
-    # or routing them to pricier GPUs. The cataloged path above already threads `algorithm` through
-    # _need; do the same here (codex[bot]). The grpo-only escalations below stay gated on is_grpo.
+    # "grpo". The cataloged path above already threads `algorithm` through _need; do the same here so
+    # open-model OPD uses its own dense-logit + colocated-vLLM estimator. The grpo-only sequence
+    # escalation stays gated on is_grpo.
     need = _need(params_b, algorithm, vocab=model_vocab)
     if is_grpo:
         need += grpo_seq_escalation_gb(params_b, seq_len)
+    if is_vllm_rollout:
         need = max(need, grpo_kv_floor_gb(params_b, seq_len, group_size))
     return need
 

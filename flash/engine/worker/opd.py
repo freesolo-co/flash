@@ -12,9 +12,10 @@ apply reverse-KL per span using only the REALIZED-token logprobs on each side (t
 *spider* / Tinker method). No top-k candidates, no surface->vocab projection, so it is exact across
 arbitrary tokenizer mismatch and covers every student token. See ``tokenizer_align``.
 
-There is NO local reference model and NO colocated vLLM engine: sampling is HF ``generate`` on the
-resident student (so the VRAM profile matches SFT), and the teacher lives behind the API. All heavy
-imports (torch/transformers/peft) are inside functions, so importing this module is CPU/offline-safe.
+There is NO local reference model: the teacher lives behind the API. Sampling uses a colocated vLLM
+engine loaded with the student LoRA and refreshed after each optimizer step, matching GRPO's rollout
+shape. All heavy imports (torch/transformers/peft/vllm) are inside functions, so importing this module
+is CPU/offline-safe.
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.gpu_setup import (
+    force_vit_sdpa_on_blackwell,
+    force_vllm_backend_for_sm120,
+)
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.opd_gkd import (
     _generation_eos_ids,
@@ -40,6 +45,7 @@ from flash.engine.worker.opd_gkd import (
     gkd_loss,
     student_tokens_with_offsets,
 )
+from flash.engine.worker.opd_vllm import OpdVllmOutput, OpdVllmRolloutEngine
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _sdpa_cudnn_ctx,
@@ -176,11 +182,12 @@ def _thinking_prefill_text(tok) -> str:
 
 
 def _student_model(model_id, mik, device):
-    """Build the trainable student LoRA. Warm-starts from ``train.init_from_adapter`` when set —
-    continuing a prior run's adapter (e.g. an SFT checkpoint), the same path GRPO uses via
-    ``_init_adapter_model`` — otherwise a fresh LoRA on the base. This makes an SFT->opd pipeline a
-    genuine continuation (the opd stage keeps the SFT behavior) rather than silently restarting from
-    base.
+    """Build the trainable student LoRA and return ``(model, rollout_model_source)``.
+
+    Warm-starts from ``train.init_from_adapter`` when set — continuing a prior run's adapter (e.g. an
+    SFT checkpoint), the same path GRPO uses via ``_init_adapter_model`` — otherwise a fresh LoRA on
+    the base. This makes an SFT->opd pipeline a genuine continuation (the opd stage keeps the SFT
+    behavior) rather than silently restarting from base.
 
     Two warm-start shapes, both from ``_init_adapter_model`` (parity with GRPO):
       - non-VL (e.g. MiniCPM): a trainable PeftModel that CONTINUES the SFT adapter in place
@@ -193,7 +200,7 @@ def _student_model(model_id, mik, device):
     init_model, init_peft = _w._init_adapter_model(model_id)
     if init_peft is None:
         # init_model is already a trainable PeftModel continuing the prior (e.g. SFT) adapter.
-        return init_model.to(device)
+        return init_model.to(device), model_id
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM
 
@@ -208,7 +215,89 @@ def _student_model(model_id, mik, device):
     # init_model is the base id (fresh run) or the VL SFT-merged dir. Non-VL runs keep the lighter
     # causal-LM loader; VL runs load the full multimodal model so all-linear LoRA sees every target.
     base = model_cls.from_pretrained(init_model, trust_remote_code=True, **mik).to(device)
-    return get_peft_model(base, init_peft)
+    return get_peft_model(base, init_peft), str(init_model)
+
+
+def _opd_lora_rank(model, default: int = 32) -> int:
+    """Best-effort PEFT LoRA rank for vLLM's max_lora_rank."""
+    cfgs = getattr(model, "peft_config", None) or {}
+    cfg_iter = cfgs.values() if isinstance(cfgs, dict) else (cfgs,)
+    for cfg in cfg_iter:
+        rank = getattr(cfg, "r", None)
+        if isinstance(rank, dict):
+            vals = [int(v) for v in rank.values() if isinstance(v, int) and v > 0]
+            if vals:
+                return max(vals)
+        if isinstance(rank, int) and rank > 0:
+            return rank
+    try:
+        return max(1, int(default))
+    except (TypeError, ValueError):
+        return 32
+
+
+def _opd_vllm_kwargs(model_id: str, knobs: OpdKnobs, seq_cap: int) -> dict:
+    """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
+    kwargs: dict = {
+        "gpu_memory_utilization": 0.10,
+        "kv_cache_dtype": None,
+        "max_num_batched_tokens": None,
+        "attention_backend": None,
+        "mm_encoder_attn_backend": None,
+        "enforce_eager": None,
+    }
+    try:
+        import torch
+
+        cc = torch.cuda.get_device_capability()
+        card_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    except Exception:
+        cc, card_gb = (0, 0), 0.0
+
+    fp8_kv = bool(cc >= (8, 9))
+    kwargs["kv_cache_dtype"] = "fp8" if fp8_kv else None
+    kwargs["max_num_batched_tokens"] = max(8192, int(seq_cap)) if card_gb >= 140 else None
+
+    if card_gb > 0:
+        try:
+            from flash.catalog import MODELS
+            from flash.engine.vram import colocate_kv_util, resolve_params_b
+
+            info = MODELS.get(model_id)
+            active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
+            kwargs["gpu_memory_utilization"] = colocate_kv_util(
+                resolve_params_b(model_id),
+                int(seq_cap),
+                card_gb,
+                False,
+                num_generations=max(1, int(knobs.group_size)),
+                active_params_b=active_b,
+                fp8_kv=fp8_kv,
+            )
+        except Exception as exc:
+            print(f"[opd] vLLM memory-util sizing failed; using 0.10: {exc}")
+
+    attention_backend = force_vllm_backend_for_sm120()
+    if attention_backend:
+        kwargs["attention_backend"] = attention_backend
+    if cc and cc[0] in (10, 12):
+        force_vit_sdpa_on_blackwell()
+        kwargs["mm_encoder_attn_backend"] = "TORCH_SDPA"
+
+    try:
+        import vllm as _vllm_mod
+
+        ver_base = _vllm_mod.__version__.split("+")[0]
+        vllm_ver = tuple(int(x) for x in ver_base.split(".")[:3])
+        if vllm_ver > (0, 19, 0) and cc != (10, 0):
+            kwargs["enforce_eager"] = True
+            print(
+                f"[opd][warn] enforce_eager=True on the vLLM rollout (cc={cc[0]}.{cc[1]} -> "
+                "prevent 0.19.1 aot_compile/slot-mapping crash; B200/sm100 keeps CUDA graphs)"
+            )
+    except Exception:
+        pass
+    return kwargs
 
 
 def _opd_progress(step: int, done: int) -> None:
@@ -235,7 +324,7 @@ def run_opd():
     env = _w.require_active_env()
     if getattr(env, "is_tool_env", False):
         # Tool envs need TRL's native tool-call loop (rl.py hands the tool schemas + callables to the
-        # trainer); opd's HF-generate rollout can't drive that, so it stays unsupported. Pure
+        # trainer); opd's owned vLLM rollout loop can't drive that, so it stays unsupported. Pure
         # multi-turn (episode) envs ARE supported below via the per-turn rollout path.
         raise RuntimeError(
             "opd does not support tool-calling environments yet: it cannot drive TRL's tool-call "
@@ -370,9 +459,9 @@ def run_opd():
     # Seed torch/CUDA BEFORE constructing the student LoRA: get_peft_model samples the LoRA A matrix
     # (init_lora_weights=True) from the torch default generator, so seeding must precede _student_model
     # for the fixed Flash seed to reproduce the same adapter init run-to-run (the fresh-LoRA and VL
-    # warm-start paths both build a fresh LoRA). It also makes the later model.generate(do_sample=True)
-    # completions reproducible. The prompt shuffle above uses a SEPARATE random.Random(_w.SEED), so its
-    # ordering is unaffected by where torch is seeded.
+    # warm-start paths both build a fresh LoRA). The colocated vLLM rollout engine receives the same
+    # seed below. The prompt shuffle above uses a SEPARATE random.Random(_w.SEED), so its ordering is
+    # unaffected by where torch is seeded.
     torch.manual_seed(_w.SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(_w.SEED)
@@ -380,11 +469,11 @@ def run_opd():
     setup_seconds = time.time() - t_start
     _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
     with liveness_heartbeat("opd_initializing"):
-        model = _student_model(model_id, mik, device)
+        model, rollout_model_source = _student_model(model_id, mik, device)
         # Apply chalk standalone kernels to the student, exactly as sft/rl do after building their
-        # trainer. The student drives BOTH on-policy generation and the loss forward, so without this
-        # the default Qwen3.5/3.6 catalog model silently falls back to eager GDN/RMSNorm/RoPE/LoRA
-        # kernels and a long distillation runs much slower than the rest of the stack (codex[bot]).
+        # trainer. The HF/PEFT student remains the GKD loss target, so without this the default
+        # Qwen3.5/3.6 catalog model silently falls back to eager GDN/RMSNorm/RoPE/LoRA kernels and a
+        # long distillation runs much slower than the rest of the stack (codex[bot]).
         # No-op ({}) when freesolo-chalk isn't installed or the arch is unsupported.
         _chalk_report = install_chalk_kernels(model)
         _chalk_active = active_kernels(_chalk_report)
@@ -405,9 +494,30 @@ def run_opd():
             )
             model.enable_input_require_grads()
             print(f"[opd] gradient checkpointing enabled (use_reentrant={_reentrant})")
-    model.config.use_cache = (
-        True  # generation needs the KV cache; re-disabled per loss forward below
+    # The HF/PEFT model only handles differentiable loss forwards; the colocated vLLM engine owns
+    # KV-cached student rollout generation.
+    model.config.use_cache = False
+
+    vllm_kwargs = _opd_vllm_kwargs(model_id, knobs, seq_cap)
+    lora_rank = _opd_lora_rank(
+        model, getattr(_w.JOB_SPEC.train, "lora_rank", 32) if _w.JOB_SPEC else 32
     )
+    print(
+        f"[opd] rollout backend: colocated vLLM model={rollout_model_source} "
+        f"ctx={seq_cap} lora_rank={lora_rank} util={vllm_kwargs['gpu_memory_utilization']:.2f}"
+    )
+    with liveness_heartbeat("opd_vllm_initializing"):
+        vllm_rollout = OpdVllmRolloutEngine(
+            model_source=rollout_model_source,
+            max_model_len=seq_cap,
+            temperature=knobs.temperature,
+            top_p=knobs.top_p,
+            stop_sequences=tuple(str(s) for s in knobs.stop_sequences),
+            lora_rank=lora_rank,
+            seed=_w.SEED,
+            **vllm_kwargs,
+        )
+        vllm_rollout.sync_from_model(model)
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=knobs.learning_rate
@@ -428,26 +538,6 @@ def run_opd():
     adapter_dir = f"{out_dir}/adapter"
     os.makedirs(out_dir, exist_ok=True)
 
-    gen_cfg = {
-        "do_sample": knobs.temperature > 0,
-        "temperature": max(knobs.temperature, 1e-5),
-        "top_p": knobs.top_p,
-        "max_new_tokens": knobs.max_completion,
-        "pad_token_id": tok.pad_token_id,
-        # Bound generation WALL-TIME so a degenerate or near-OOM-thrashing generate cannot silently
-        # eat the training stall window: a single _train_one blocks the loop while it runs (the
-        # per-sample opd_step heartbeat only fires AFTER it returns), so an unbounded generate that
-        # stops making progress emits no non-liveness ping and the poller reaps the whole attempt as
-        # "stalled" (observed on the OPD-16 linkd e2e: one step wedged >1500s at 93% VRAM). HF checks
-        # max_time between token steps, so a thrashing (still-stepping) generate is cut here and the
-        # sample returns partial/empty -> the heartbeat resumes. Scale with the completion budget
-        # (thinking mode needs longer) but keep it well under the poller's ~1500s training window.
-        "max_time": min(900.0, max(180.0, float(knobs.max_completion) * 0.75)),
-    }
-    if knobs.stop_sequences:
-        # HF stops generation at any of these strings (needs the tokenizer to match them on decode).
-        gen_cfg["stop_strings"] = list(knobs.stop_sequences)
-        gen_cfg["tokenizer"] = tok
     loss_curve: list[float] = []
     coverage_curve: list[float] = []
     generated_tokens = 0
@@ -475,20 +565,8 @@ def run_opd():
     teacher_ok = 0
     teacher_transient = 0
 
-    # Concurrent teacher scoring needs a REAL student that samples on-policy (model.generate) so the
-    # step's rollouts can be produced up front (serial GPU) and then scored all at once (Phase 1/2/3
-    # below). Every HF/Peft catalog model has generate(); CPU unit-test stand-ins without it drive the
-    # equivalent per-sample _train_one path (the serial fallback), keeping _train_one the single stub
-    # point those tests inject. The model does not change across steps, so decide once.
-    _parallel_scoring = hasattr(model, "generate") and hasattr(model, "eval")
-    if multi_turn and not _parallel_scoring:
-        # Multi-turn distillation IS the on-policy rollout: it must sample each turn with the real
-        # student (model.generate), so a stand-in without generate has nothing to roll out. The serial
-        # _train_one fallback is single-turn only.
-        raise RuntimeError(
-            "opd multi-turn requires a student that can sample on-policy (model.generate); the "
-            "loaded model exposes none."
-        )
+    # OPD rollouts always use the colocated vLLM engine. The HF model remains the authoritative
+    # training target for the GKD loss forward/backward; vLLM only samples the current LoRA.
 
     # Multi-turn per-turn rollout wiring (built once; unused for single-turn). Each episode is driven
     # by rollout_one_records, which reuses the SAME env turn loop + tokenizer-sensitive glue/seam logic
@@ -518,28 +596,16 @@ def run_opd():
             )
 
         def generate_fn(prefix_ids, max_new):
-            """One turn's generation: HF model.generate over the transcript-so-far ``prefix_ids``,
-            bounded to ``max_new`` (the per-turn cap the driver already shrank to the remaining engine
-            budget), reusing _generate_one so the termination / trailing-stop-trim / empty / U+FFFD
-            gates apply per turn exactly as they do single-turn."""
-            turn_cfg = dict(gen_cfg)
-            turn_cfg["max_new_tokens"] = max(1, int(max_new))
-            prompt_tensor = torch.tensor([prefix_ids], device=device)
-            return _generate_one(
-                model=model,
-                tok=tok,
-                device=device,
-                prompt_tensor=prompt_tensor,
-                gen_cfg=turn_cfg,
-                knobs=knobs,
-            )
+            """One turn's generation through the colocated vLLM engine."""
+            return _generate_many_vllm(
+                vllm_rollout, tok, [prefix_ids], knobs, max_tokens=max(1, int(max_new))
+            )[0]
 
     def _account(r):
         """Consume one sample's SampleResult: tally teacher health / truncations, backprop a distilled
         sample (scaled 1/accum_target for gradient accumulation), advance the step aggregates, and
-        refresh the stall clock. Shared by the concurrent-scoring path's Phase 3 and the serial
-        fallback so both keep the pre-parallelization per-sample bookkeeping byte-for-byte identical.
-        ``samples_seen`` is advanced by the caller (once per GENERATION) so its timing is unchanged."""
+        refresh the stall clock. Called after vLLM generation and teacher scoring; ``samples_seen`` is
+        advanced by the caller once per generated rollout so its timing is unchanged."""
         nonlocal teacher_ok, teacher_transient, truncated_rollouts, step_loss, step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
         if r.teacher_status == "ok":
@@ -597,155 +663,89 @@ def run_opd():
             step_loss = 0.0
             step_cov = 0.0
             nseq = 0
-            if _parallel_scoring:
-                # Concurrent-scoring step in three phases. Behavior-preserving vs. the old per-sample
-                # loop: SAME samples in the SAME generation order (RNG untouched), SAME per-sample
-                # losses, SAME gradient accumulation — only the teacher's Fireworks HTTP round-trips
-                # (the dominant per-step cost, previously issued one-at-a-time) are overlapped.
-                #
-                # Phase 1 (serial, GPU eval): sample every completion on-policy, IN ORDER, caching the
-                # prompt context each one needs downstream. The cached messages/ids from the budget
-                # filter drive BOTH the student prompt AND the teacher prompt, so student sampling and
-                # teacher scoring stay in sync and every visited prompt fits (codex[bot]).
-                pending: list[_Pending] = []
-                if multi_turn:
-                    # Multi-turn Phase 1: drive an EPISODE per (prompt x group), each yielding one
-                    # per-turn record. Every assistant turn becomes a _Pending distilled independently
-                    # against its transcript-so-far prefix — so a group-of-3 over a 4-turn episode
-                    # produces up to 12 turn-samples, all scored + lossed by the SAME Phase 2/3 below.
-                    # Bind opt_steps/nseq as defaults (nseq is 0 all of Phase 1; opt_steps is fixed
-                    # until Phase 3's optimizer.step) to satisfy the loop-var-capture lint — same
-                    # pattern as the serial fallback's on_generated below. Called synchronously per
-                    # turn inside rollout_one_records, so these are the right current-iteration values.
-                    def _on_turn(_s=opt_steps, _n=nseq):
-                        # Advance the liveness progress signal and refresh the stall clock after each
-                        # turn's (serial, up-to-~900s) generation, before the next turn / teacher call.
-                        nonlocal samples_seen
-                        samples_seen += 1
-                        _opd_progress(_s, _n)
+            # Step in three phases. Phase 1 uses the colocated vLLM engine for every student rollout.
+            # Phase 2 overlaps teacher network calls for all scorable completions. Phase 3 runs the
+            # differentiable GKD loss serially on the training model.
+            pending: list[_Pending] = []
+            if multi_turn:
+                # Multi-turn Phase 1: drive an EPISODE per (prompt x group), each yielding one
+                # per-turn record. Every assistant turn becomes a _Pending distilled independently
+                # against its transcript-so-far prefix.
+                def _on_turn(_s=opt_steps, _n=nseq):
+                    nonlocal samples_seen
+                    samples_seen += 1
+                    _opd_progress(_s, _n)
 
-                    for _ex, _prompt_messages, _prompt_ids in batch:
-                        for _g in range(group):
-                            records = rollout_one_records(
-                                example=_ex,
-                                active_env=env,
-                                render=render_fn,
-                                generate=generate_fn,
-                                env_glue=env_glue_fn,
-                                max_turns=mt_max_turns,
-                                per_turn_max_tokens=knobs.max_completion,
-                                engine_max_len=mt_engine_max_len,
-                                on_turn_generated=_on_turn,
-                            )
-                            episodes_seen += 1
-                            mt_turn_records += len(records)
-                            pending.extend(
-                                _Pending(
-                                    gen=rec["gen"],
-                                    prompt_ids=rec["prefix_ids"],
-                                    prompt_messages=rec["context_messages"],
-                                )
-                                for rec in records
-                            )
-                else:
-                    for _ex, prompt_messages, prompt_ids in batch:
-                        prompt_tensor = torch.tensor([prompt_ids], device=device)
-                        for _g in range(group):
-                            gen = _generate_one(
-                                model=model,
-                                tok=tok,
-                                device=device,
-                                prompt_tensor=prompt_tensor,
-                                gen_cfg=gen_cfg,
-                                knobs=knobs,
-                            )
-                            pending.append(
-                                _Pending(
-                                    gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
-                                )
-                            )
-                            samples_seen += 1  # advances the liveness-thread progress signal
-                            # Feed the stall clock during the (serial, up-to-~900s-each) generations;
-                            # nseq is still 0 here since no loss has landed yet this step.
-                            _opd_progress(opt_steps, nseq)
-                # Phase 2 (concurrent, NETWORK only): fire the teacher scoring calls for EVERY scorable
-                # rollout at once — the fan-out cap is the step's own completion count
-                # (prompts_per_step * group_size), so every sample in a step is scored in parallel (one
-                # round-trip of wall time) and the concurrency self-scales when group_size is raised
-                # (no queueing 8-at-a-time). The teacher endpoint's own rate limit is the real ceiling;
-                # 429s retry inside _score_one. _score_one touches only the stateless teacher HTTP client
-                # + Python strings (no torch/model/shared mutable state), so the round-trips overlap
-                # safely; truncated/empty/U+FFFD rollouts are never scored.
-                scorable = [i for i, p in enumerate(pending) if not (p.gen.skip or p.gen.truncated)]
-                _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
-                if scorable:
-                    permanent_err = None
-                    with ThreadPoolExecutor(
-                        max_workers=min(len(scorable), knobs.prompts_per_step * knobs.group_size)
-                    ) as pool:
-                        fut_to_idx = {
-                            pool.submit(
-                                _score_one,
-                                teacher,
-                                pending[i].gen,
-                                prompt_messages=pending[i].prompt_messages,
-                                thinking_prefill=thinking_prefill,
-                            ): i
-                            for i in scorable
-                        }
-                        for fut in as_completed(fut_to_idx):
-                            i = fut_to_idx[fut]
-                            try:
-                                pending[i].score = fut.result()
-                            except TeacherError as e:
-                                # _score_one only propagates a PERMANENT teacher error (bad key / model
-                                # id / malformed echo); transient/other failures return a status. Capture
-                                # the first and re-raise AFTER the pool drains so the run aborts exactly
-                                # as the serial path did over one un-scorable sample (codex[bot]).
-                                if permanent_err is None:
-                                    permanent_err = e
-                    if permanent_err is not None:
-                        raise permanent_err
-                _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
-                # Phase 3 (serial, GPU train): resolve each rollout IN ORDER into the exact SampleResult
-                # the old serial path produced, then run the gkd loss forward + backward serially on the
-                # main thread (via _account) so gradient accumulation is unchanged.
-                for p in pending:
-                    _account(
-                        _resolve_sample(model, tok, device, p.gen, p.score, p.prompt_ids, knobs)
-                    )
-            else:
-                # Serial fallback: the student stand-in cannot generate on-policy (a CPU unit-test fake
-                # without .generate), so there is nothing to overlap — drive the original per-sample
-                # path so _train_one stays the single injection point those tests stub.
-                for _ex, prompt_messages, prompt_ids in batch:
-                    # Reuse the messages + ids CACHED by the budget filter instead of re-rendering. A
-                    # fresh env.prompt_messages(ex) here can (for a stateful/randomized env) both desync
-                    # student sampling from teacher scoring AND exceed the budget — dropping a prompt the
-                    # filter admitted and starving the step of signal after GPU/model setup. The cached
-                    # ids already passed the filter and drive BOTH the student prompt AND the teacher
-                    # prompt, so they stay in sync and every visited prompt fits (codex[bot]).
-                    prompt_tensor = torch.tensor([prompt_ids], device=device)
+                for _ex, _prompt_messages, _prompt_ids in batch:
                     for _g in range(group):
-                        r = _train_one(
-                            model=model,
-                            tok=tok,
-                            teacher=teacher,
-                            device=device,
-                            prompt_ids=prompt_ids,
-                            prompt_tensor=prompt_tensor,
-                            prompt_messages=prompt_messages,
-                            gen_cfg=gen_cfg,
-                            knobs=knobs,
-                            thinking_prefill=thinking_prefill,
-                            # Refresh the stall clock between generation and teacher scoring (see
-                            # _train_one and _opd_progress). Bind opt_steps/nseq as lambda defaults
-                            # (called synchronously in this iteration, so the current values are the
-                            # right ones) to satisfy the loop-var-capture lint.
-                            on_generated=lambda s=opt_steps, n=nseq: _opd_progress(s, n),
+                        records = rollout_one_records(
+                            example=_ex,
+                            active_env=env,
+                            render=render_fn,
+                            generate=generate_fn,
+                            env_glue=env_glue_fn,
+                            max_turns=mt_max_turns,
+                            per_turn_max_tokens=knobs.max_completion,
+                            engine_max_len=mt_engine_max_len,
+                            on_turn_generated=_on_turn,
                         )
-                        samples_seen += 1  # advances the liveness-thread progress signal
-                        _account(r)
+                        episodes_seen += 1
+                        mt_turn_records += len(records)
+                        pending.extend(
+                            _Pending(
+                                gen=rec["gen"],
+                                prompt_ids=rec["prefix_ids"],
+                                prompt_messages=rec["context_messages"],
+                            )
+                            for rec in records
+                        )
+            else:
+                contexts: list[tuple[list[int], object]] = []
+                prompts: list[list[int]] = []
+                for _ex, prompt_messages, prompt_ids in batch:
+                    for _g in range(group):
+                        contexts.append((prompt_ids, prompt_messages))
+                        prompts.append(prompt_ids)
+                gens = _generate_many_vllm(
+                    vllm_rollout, tok, prompts, knobs, max_tokens=knobs.max_completion
+                )
+                for gen, (prompt_ids, prompt_messages) in zip(gens, contexts, strict=True):
+                    pending.append(
+                        _Pending(gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages)
+                    )
+                    samples_seen += 1  # advances the liveness-thread progress signal
+                    _opd_progress(opt_steps, nseq)
+
+            scorable = [i for i, p in enumerate(pending) if not (p.gen.skip or p.gen.truncated)]
+            _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
+            if scorable:
+                permanent_err = None
+                with ThreadPoolExecutor(
+                    max_workers=min(len(scorable), knobs.prompts_per_step * knobs.group_size)
+                ) as pool:
+                    fut_to_idx = {
+                        pool.submit(
+                            _score_one,
+                            teacher,
+                            pending[i].gen,
+                            prompt_messages=pending[i].prompt_messages,
+                            thinking_prefill=thinking_prefill,
+                        ): i
+                        for i in scorable
+                    }
+                    for fut in as_completed(fut_to_idx):
+                        i = fut_to_idx[fut]
+                        try:
+                            pending[i].score = fut.result()
+                        except TeacherError as e:
+                            if permanent_err is None:
+                                permanent_err = e
+                if permanent_err is not None:
+                    raise permanent_err
+            _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
+
+            for p in pending:
+                _account(_resolve_sample(model, tok, device, p.gen, p.score, p.prompt_ids, knobs))
             if nseq == 0:
                 print(f"[opd] step {it}: no usable teacher signal this step (skipped)")
                 continue
@@ -760,6 +760,11 @@ def run_opd():
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             optimizer.step()
             opt_steps += 1
+            # On-policy means the next rollout must sample from the just-updated student LoRA.
+            with liveness_heartbeat(
+                "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
+            ):
+                vllm_rollout.sync_from_model(model)
             avg_loss = step_loss / nseq
             avg_cov = step_cov / nseq
             loss_curve.append(avg_loss)
@@ -891,6 +896,13 @@ def run_opd():
             "group_size": group,
             "prompts_per_step": ppl_step,
             "max_completion_len": knobs.max_completion,
+            "rollout_backend": "vllm",
+            "vllm_model": getattr(vllm_rollout, "model_source", None),
+            "vllm_max_model_len": getattr(vllm_rollout, "max_model_len", None),
+            "vllm_gpu_memory_utilization": getattr(vllm_rollout, "gpu_memory_utilization", None),
+            "vllm_kv_cache_dtype": vllm_kwargs.get("kv_cache_dtype"),
+            "vllm_max_num_batched_tokens": vllm_kwargs.get("max_num_batched_tokens"),
+            "vllm_lora_syncs": getattr(vllm_rollout, "sync_count", None),
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
             # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
             # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
@@ -904,6 +916,7 @@ def run_opd():
             **_w.wandb_run_info(),
         },
     )
+    vllm_rollout.close()
     free_gpu(model)
 
 
@@ -972,8 +985,8 @@ def _generate_one(*, model, tok, device, prompt_tensor, gen_cfg, knobs) -> _GenR
     """[SERIAL, GPU eval] Sample one student completion on-policy and apply the pre-scoring gates:
     reject a rollout that did not terminate naturally (``truncated``), an empty completion or one
     carrying U+FFFD (``skip``), and trim trailing stop delimiters. Touches only the torch model +
-    tokenizer; the returned ``_GenResult`` is torch-free so it can be handed to the (model-free)
-    scoring thread pool. Mirrors the generation half of the old serial ``_train_one`` exactly."""
+    tokenizer; the returned ``_GenResult`` is torch-free. Kept for direct unit tests; ``run_opd`` uses
+    colocated vLLM generation."""
     import torch
 
     # On-policy: the student samples; the teacher echo-scores that exact completion.
@@ -1025,6 +1038,41 @@ def _generate_one(*, model, tok, device, prompt_tensor, gen_cfg, knobs) -> _GenR
     return _GenResult(
         completion_ids=completion_ids, completion_text=completion_text, gen_tokens=gen_tokens
     )
+
+
+def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
+    """Apply OPD's pre-scoring gates to one vLLM completion."""
+    completion_ids = [int(t) for t in out.token_ids]
+    completion_text = out.text or tok.decode(completion_ids, skip_special_tokens=True)
+    if not out.terminated:
+        return _GenResult(truncated=True, gen_tokens=len(completion_ids))
+    if knobs.stop_sequences:
+        stop_text = tok.decode(completion_ids, skip_special_tokens=False)
+        # vLLM may strip stop strings unless include_stop_str_in_output is supported. Trim when the
+        # delimiter is present; otherwise keep the already-stripped ids/text.
+        if any(stop_text.endswith(s) or completion_text.endswith(s) for s in knobs.stop_sequences):
+            completion_ids, completion_text = _trim_trailing_stop(
+                tok, completion_ids, stop_text, knobs.stop_sequences
+            )
+    gen_tokens = len(completion_ids)
+    if not completion_text.strip():
+        return _GenResult(skip=True, gen_tokens=gen_tokens)
+    if "\ufffd" in completion_text:
+        return _GenResult(skip=True, gen_tokens=gen_tokens)
+    return _GenResult(
+        completion_ids=completion_ids,
+        completion_text=completion_text,
+        gen_tokens=gen_tokens,
+    )
+
+
+def _generate_many_vllm(
+    rollout: OpdVllmRolloutEngine, tok, prompt_ids_batch: list[list[int]], knobs, *, max_tokens: int
+) -> list[_GenResult]:
+    return [
+        _gen_from_vllm_output(out, tok, knobs)
+        for out in rollout.generate(prompt_ids_batch, max_tokens=max_tokens)
+    ]
 
 
 def _score_one(teacher, gen_result, *, prompt_messages, thinking_prefill) -> _ScoreResult:
@@ -1121,18 +1169,12 @@ def _train_one(
     on_generated=None,
 ) -> SampleResult:
     """Sample one student completion on-policy, score it with the teacher, and return a
-    ``SampleResult`` carrying the groupwise reverse-KL loss (or None) plus per-sequence stats. This is
-    the SERIAL composition of the three phase helpers — ``_generate_one`` -> ``_score_one`` ->
-    ``_loss_one`` — that ``run_opd`` runs as OVERLAPPED phases across a whole step (generate every
-    rollout serially on the GPU, score them all concurrently over the API, then run each loss serially).
-    Kept as the single-sample entry point for the unit tests and the fallback for a student that cannot
-    batch-generate. ``thinking_prefill`` is appended to the teacher prompt so it conditions on the same
-    trailing context the student sampled after in thinking mode. ``on_generated`` (optional) is called
-    AFTER generation and BEFORE teacher scoring to refresh the stall clock: both the max_time-bounded
-    generate and the retrying teacher call block for a long time and the caller's per-sample progress
-    ping only fires AFTER scoring returns, so without a mid-sample refresh a slow generation followed by
-    a teacher outage can span >1200s with no non-liveness heartbeat and be reaped as stalled before the
-    transient-teacher handling runs."""
+    ``SampleResult`` carrying the groupwise reverse-KL loss (or None) plus per-sequence stats. This
+    direct single-sample composition is kept for unit tests that exercise HF generation edge cases;
+    ``run_opd`` always uses the colocated vLLM rollout path. ``thinking_prefill`` is appended to the
+    teacher prompt so it conditions on the same trailing context the student sampled after in thinking
+    mode. ``on_generated`` (optional) is called AFTER generation and BEFORE teacher scoring to refresh
+    the stall clock in those direct tests."""
     gen = _generate_one(
         model=model, tok=tok, device=device, prompt_tensor=prompt_tensor, gen_cfg=gen_cfg, knobs=knobs
     )

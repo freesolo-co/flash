@@ -11,6 +11,7 @@ import json
 import sys
 import types
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -100,9 +101,12 @@ def test_opd_vl_warmstart_loads_merged_base_with_multimodal_loader(monkeypatch):
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
 
-    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+    model, rollout_model_source = opd_mod._student_model(
+        "Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda"
+    )
 
     assert model == {"loader": "vl", "peft_config": "fresh-lora-config"}
+    assert rollout_model_source == "/tmp/flash_sft_merged"
     assert calls[0] == (
         "vl",
         ("/tmp/flash_sft_merged",),
@@ -124,9 +128,12 @@ def test_opd_fresh_lora_keeps_causal_loader(monkeypatch):
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
 
-    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+    model, rollout_model_source = opd_mod._student_model(
+        "Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda"
+    )
 
     assert model == {"loader": "causal", "peft_config": "fresh-lora-config"}
+    assert rollout_model_source == "Qwen/Qwen3.5-4B"
     assert calls[0] == (
         "causal",
         ("Qwen/Qwen3.5-4B",),
@@ -148,9 +155,12 @@ def test_opd_fresh_vl_lora_uses_multimodal_loader(monkeypatch):
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
 
-    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+    model, rollout_model_source = opd_mod._student_model(
+        "Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda"
+    )
 
     assert model == {"loader": "vl", "peft_config": "fresh-lora-config"}
+    assert rollout_model_source == "Qwen/Qwen3.5-4B"
     assert calls[0] == (
         "vl",
         ("Qwen/Qwen3.5-4B",),
@@ -158,6 +168,67 @@ def test_opd_fresh_vl_lora_uses_multimodal_loader(monkeypatch):
     )
     assert ("to", "vl", "cuda") in calls
     assert not any(kind == "causal" for kind, *_ in calls)
+
+
+def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, train_one=None, outputs=None):
+    """Patch run_opd's mandatory vLLM engine with a CPU fake.
+
+    When train_one is supplied, the fake preserves legacy harness behavior by returning that
+    SampleResult from _resolve_sample after the vLLM-shaped generation/scoring phases have run.
+    """
+
+    monkeypatch.setattr(
+        opd_mod,
+        "_opd_vllm_kwargs",
+        lambda *a, **k: {
+            "gpu_memory_utilization": 0.10,
+            "kv_cache_dtype": None,
+            "max_num_batched_tokens": None,
+            "attention_backend": None,
+            "mm_encoder_attn_backend": None,
+            "enforce_eager": None,
+        },
+    )
+    queued = list(outputs or [])
+
+    class _FakeOpdVllmRolloutEngine:
+        instances: ClassVar[list] = []
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.sync_count = 0
+            self.closed = False
+            _FakeOpdVllmRolloutEngine.instances.append(self)
+
+        def sync_from_model(self, model):
+            self.model = model
+            self.sync_count += 1
+
+        def generate(self, prompt_ids_batch, *, max_tokens):
+            out = []
+            for _prompt_ids in prompt_ids_batch:
+                if queued:
+                    out.append(queued.pop(0))
+                else:
+                    out.append(opd_mod.OpdVllmOutput([3], "x", finish_reason="stop"))
+            return out
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(opd_mod, "OpdVllmRolloutEngine", _FakeOpdVllmRolloutEngine)
+    if train_one is not None:
+        monkeypatch.setattr(
+            opd_mod,
+            "_score_one",
+            lambda *a, **k: opd_mod._ScoreResult(teacher_toks=[], status="ok"),
+        )
+
+        def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs):
+            return train_one(model=model, tok=tok, device=device, prompt_ids=prompt_ids, knobs=knobs)
+
+        monkeypatch.setattr(opd_mod, "_resolve_sample", _resolve_sample)
+    return _FakeOpdVllmRolloutEngine
 
 
 # --------------------------------------------------------------------------------------------------
@@ -526,6 +597,130 @@ def test_generation_eos_ids_unions_tokenizer_and_generation_config_lists():
     assert _generation_eos_ids(SimpleNamespace(), SimpleNamespace(eos_token_id=True)) == frozenset()
 
 
+def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_path):
+    """OPD's vLLM engine must generate with the latest saved adapter, not a stale LoRA."""
+    import sys
+    import types
+
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    class _SamplingParams:
+        last_kwargs: ClassVar[dict] = {}
+
+        def __init__(self, **kwargs):
+            _SamplingParams.last_kwargs = dict(kwargs)
+
+    class _LoRARequest:
+        def __init__(self, lora_name, lora_int_id, lora_path):
+            self.lora_name = lora_name
+            self.lora_int_id = lora_int_id
+            self.lora_path = lora_path
+
+    class _FakeLLM:
+        last_kwargs: ClassVar[dict] = {}
+        last_generate: ClassVar[dict] = {}
+
+        def __init__(self, **kwargs):
+            _FakeLLM.last_kwargs = dict(kwargs)
+            self.removed = []
+            self.llm_engine = SimpleNamespace(remove_lora=self.removed.append)
+
+        def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
+            _FakeLLM.last_generate = {
+                "prompts": prompts,
+                "sampling_params": sampling_params,
+                "lora_request": lora_request,
+                "use_tqdm": use_tqdm,
+            }
+            comp = SimpleNamespace(
+                token_ids=[3, 4],
+                text="ok",
+                finish_reason="stop",
+                stop_reason=None,
+            )
+            return [SimpleNamespace(outputs=[comp])]
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM = _FakeLLM
+    vllm.SamplingParams = _SamplingParams
+    lora_pkg = types.ModuleType("vllm.lora")
+    req_mod = types.ModuleType("vllm.lora.request")
+    req_mod.LoRARequest = _LoRARequest
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.lora", lora_pkg)
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", req_mod)
+
+    class _Model:
+        def save_pretrained(self, path):
+            (tmp_path / "seen.txt").write_text(path)
+
+    engine = OpdVllmRolloutEngine(
+        model_source="base-or-merged",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        stop_sequences=("</answer>",),
+        lora_rank=16,
+        gpu_memory_utilization=0.42,
+        kv_cache_dtype="fp8",
+        max_num_batched_tokens=8192,
+        attention_backend="TRITON_ATTN",
+        mm_encoder_attn_backend="TORCH_SDPA",
+        enforce_eager=True,
+        seed=123,
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    first = engine._lora_request
+    engine.sync_from_model(_Model())
+    second = engine._lora_request
+    out = engine.generate([[1, 2]], max_tokens=5)
+
+    assert _FakeLLM.last_kwargs["model"] == "base-or-merged"
+    assert _FakeLLM.last_kwargs["enable_lora"] is True
+    assert _FakeLLM.last_kwargs["max_lora_rank"] == 16
+    assert _FakeLLM.last_kwargs["gpu_memory_utilization"] == 0.42
+    assert _FakeLLM.last_kwargs["kv_cache_dtype"] == "fp8"
+    assert _FakeLLM.last_kwargs["max_num_batched_tokens"] == 8192
+    assert _FakeLLM.last_kwargs["attention_backend"] == "TRITON_ATTN"
+    assert _FakeLLM.last_kwargs["mm_encoder_attn_backend"] == "TORCH_SDPA"
+    assert _FakeLLM.last_kwargs["enforce_eager"] is True
+    assert _FakeLLM.last_kwargs["seed"] == 123
+    assert first.lora_int_id == 1
+    assert second.lora_int_id == 2
+    assert second.lora_path.endswith("adapter-000002")
+    assert _FakeLLM.last_generate["prompts"] == [{"prompt_token_ids": [1, 2]}]
+    assert _FakeLLM.last_generate["lora_request"] is second
+    assert _FakeLLM.last_generate["use_tqdm"] is False
+    assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]
+    assert _SamplingParams.last_kwargs["include_stop_str_in_output"] is True
+    assert out[0].token_ids == [3, 4]
+    assert out[0].terminated is True
+
+
+def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
+    from flash.engine.worker.opd import OpdKnobs, _gen_from_vllm_output
+    from flash.engine.worker.opd_vllm import OpdVllmOutput
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({1: "ok", 2: "</answer>"}.get(int(i), "") for i in ids)
+
+    knobs = OpdKnobs(stop_sequences=("</answer>",))
+    truncated = _gen_from_vllm_output(
+        OpdVllmOutput([1], "ok", finish_reason="length"), _Tok(), knobs
+    )
+    assert truncated.truncated is True
+
+    stopped = _gen_from_vllm_output(
+        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="stop"), _Tok(), knobs
+    )
+    assert stopped.truncated is False
+    assert stopped.skip is False
+    assert stopped.completion_ids == [1]
+    assert stopped.completion_text == "ok"
+
+
 def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     # OPD generates on-policy (loss forward runs model(prompt+completion)), so allocator sizing must
     # use the prompt+completion budget, not the SFT 1024 default — else a raised max_tokens OOMs an
@@ -773,7 +968,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod, "_train_one", _skip)  # EVERY sample skips
+    _patch_opd_run_vllm_stub(monkeypatch, opd_mod, train_one=_skip)  # EVERY sample skips
 
     import transformers
 
@@ -802,7 +997,8 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
 
 def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, group=1):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
-    loop and install the caller's _train_one stub. Returns the opd module."""
+    loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
+    module."""
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
 
@@ -874,7 +1070,7 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod, "_train_one", train_one)
+    _patch_opd_run_vllm_stub(monkeypatch, opd_mod, train_one=train_one)
     if liveness is not None:
         monkeypatch.setattr(opd_mod, "liveness_heartbeat", liveness)
     import transformers
@@ -888,8 +1084,8 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
 
 
 def test_opd_rejects_tool_environments(monkeypatch):
-    """opd cannot drive TRL's native tool-call loop (it rolls out with HF model.generate), so a
-    tool-calling env must still fail fast. Pure multi-turn (episode) envs ARE supported now — see
+    """opd owns its vLLM rollout loop instead of TRL's native tool-call loop, so a tool-calling env
+    must still fail fast. Pure multi-turn (episode) envs ARE supported now — see
     test_opd_multi_turn_distills_every_assistant_turn."""
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
@@ -1084,6 +1280,14 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     monkeypatch.setattr(opd_mod, "install_chalk_kernels", lambda *a, **k: {})
     monkeypatch.setattr(opd_mod, "active_kernels", lambda *a, **k: [])
     monkeypatch.setattr(opd_mod, "free_gpu", lambda *a, **k: None)
+    _patch_opd_run_vllm_stub(
+        monkeypatch,
+        opd_mod,
+        outputs=[
+            opd_mod.OpdVllmOutput([*tok._enc("42"), tok.eos_token_id], "42", finish_reason="stop"),
+            opd_mod.OpdVllmOutput([*tok._enc("ok"), tok.eos_token_id], "ok", finish_reason="stop"),
+        ],
+    )
     import transformers
 
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tok)
@@ -1531,8 +1735,8 @@ def test_groupwise_alignment_cursor_walk_groups_denser_student_span():
 
 
 def test_opd_installs_chalk_kernels_on_student(monkeypatch):
-    """Regression (codex[bot], opd.py:433): the OPD student drives BOTH on-policy generation and the
-    loss forward, so it must get chalk kernels like sft/rl build after their trainer — else the default
+    """Regression (codex[bot], opd.py:433): the OPD HF/PEFT student drives the loss forward, so it
+    must get chalk kernels like sft/rl build after their trainer — else the default
     Qwen catalog model silently runs eager and the distillation is much slower. Assert run_opd calls
     install_chalk_kernels on the built student model."""
     from flash.engine.worker import opd as _opd
@@ -1722,7 +1926,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
 
     def _rec_student(*a, **k):
         order.append("student_model")
-        return _Model()
+        return _Model(), "fake/model"
 
     monkeypatch.setattr(opd_mod, "_student_model", _rec_student)
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
@@ -1730,7 +1934,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod, "_train_one", _skip)
+    _patch_opd_run_vllm_stub(monkeypatch, opd_mod, train_one=_skip)
 
     real_manual_seed = torch.manual_seed
 
@@ -1860,8 +2064,9 @@ def test_student_model_accepts_vl_warmstart_without_raising(monkeypatch):
     monkeypatch.setattr(opd_mod._w, "_init_adapter_model", _fake_init_adapter_model, raising=False)
     calls = _install_student_loader_fakes(monkeypatch, causal_raises=True)
 
-    out = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
+    out, rollout_model_source = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
     assert out == {"loader": "vl", "peft_config": fake_lora}  # wrapped the merged base in PEFT
+    assert rollout_model_source == "/tmp/merged_vl_dir"  # vLLM must load the same merged base
     assert calls[0] == (
         "vl",
         ("/tmp/merged_vl_dir",),
@@ -1960,6 +2165,31 @@ def test_opd_vram_reserves_dense_logits_unlike_fused_sft():
     sft = estimate_vram_gb(4.0, "sft", "bf16", **kw)  # >=3B fuses CE -> 0 logits budgeted
     opd = estimate_vram_gb(4.0, "opd", "bf16", **kw)  # dense logits reserved (fwd + bwd)
     assert opd > sft + 10  # dense logits for opd vs 0 for fused SFT
+
+
+def test_opd_vram_reserves_colocated_vllm_rollout_copy():
+    """OPD student generation uses a resident vLLM engine, so VRAM includes a second weight/KV copy."""
+    from flash.engine.vram import estimate_vram_gb
+
+    kw = {"seq_len": 1536, "max_tokens": 512, "vocab": 248_320, "lora_rank": 16}
+    grpo_without_vllm = estimate_vram_gb(4.0, "grpo", "bf16", use_vllm=False, **kw)
+    opd_with_vllm = estimate_vram_gb(4.0, "opd", "bf16", use_vllm=True, **kw)
+    opd_flag_ignored = estimate_vram_gb(4.0, "opd", "bf16", use_vllm=False, **kw)
+    assert opd_with_vllm > grpo_without_vllm + 8.0  # second bf16 4B copy plus KV
+    assert opd_flag_ignored == opd_with_vllm
+    assert estimate_vram_gb(4.0, "opd", "bf16", **kw) == opd_with_vllm
+
+
+def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
+    """35B OPD with colocated student vLLM routes above the old H200-sized OPD estimate."""
+    from flash.engine.vram import model_required_vram_gb
+
+    need = model_required_vram_gb(
+        "Qwen/Qwen3.6-35B-A3B",
+        "opd",
+        train={"max_length": 1536, "max_tokens": 512, "group_size": 8, "lora_rank": 16},
+    )
+    assert 141 < need <= 180
 
 
 def test_opd_vram_budgets_dense_logit_backward_buffers():
