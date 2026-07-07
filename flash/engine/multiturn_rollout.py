@@ -27,6 +27,26 @@ class RolloutResult(TypedDict):
     reward: float
 
 
+class TurnRecord(TypedDict):
+    """One assistant turn of a multi-turn episode, as :func:`rollout_one_records` emits it.
+
+    ``prefix_ids`` are the student token ids of the whole transcript BEFORE this turn (initial prompt
+    + every prior assistant turn + every inter-turn env "glue"), i.e. the exact on-policy context the
+    student sampled this turn's completion after. ``context_messages`` is the parallel message list at
+    the same point (prompt + prior turns + prior env replies), for callers that render a separate
+    teacher/scoring prompt from it. ``gen`` is whatever the injected ``generate`` callable returned for
+    this turn (opaque to the driver beyond the four attributes it reads: ``completion_ids``,
+    ``completion_text``, ``truncated``, ``skip``) — e.g. OPD hands back its ``_GenResult`` so the
+    per-turn record feeds straight into the existing single-turn scoring/loss path. Distilling each
+    turn against ``prefix_ids`` is the multi-turn on-policy-distillation objective: the episode's total
+    reverse-KL over student-generated tokens is the sum of per-turn reverse-KLs, each conditioned on the
+    transcript so far."""
+
+    prefix_ids: list[int]
+    gen: object
+    context_messages: list[dict]
+
+
 _ROLLOUT_FIELDS: tuple[str, ...] = (
     "prompt_ids",
     "completion_ids",
@@ -99,6 +119,20 @@ def index_collisions(rows: list[dict], prompt_of: Callable[[dict], object]) -> i
     return len(rows) - len({_prompt_key(prompt_of(r)) for r in rows})
 
 
+def _dedup_seam_terminator(prev_completion_ids: list[int], glue: list[int]) -> list[int]:
+    """Collapse a duplicate turn terminator at the turn/env seam.
+
+    ``env_glue`` leads with the assistant turn's terminator (e.g. ``<|im_end|>``), which a
+    naturally-stopped assistant turn also keeps as its final token — so the raw stream would carry two.
+    When the previous turn's last token equals ``glue[0]`` drop the glue copy, keeping the assistant's
+    own token (real logprob / model-generated) so the stream has exactly one terminator per turn,
+    matching the chat template + SFT transcripts. Shared by :func:`rollout_one`,
+    :func:`_advance_after_turn`, and :func:`rollout_one_records` so the three paths can't drift."""
+    if glue and prev_completion_ids and prev_completion_ids[-1] == glue[0]:
+        return glue[1:]
+    return glue
+
+
 def rollout_one(
     *,
     example: dict,
@@ -152,13 +186,7 @@ def rollout_one(
         if active_env.rollout_done(state, max_turns):
             break
 
-        glue = env_glue(env_msgs)
-        # Collapse a duplicate turn terminator at the seam: env_glue leads with the assistant turn's
-        # terminator (e.g. <|im_end|>), which vLLM also keeps as the last token of a naturally-stopped
-        # turn — keep the assistant's own (env_mask=1, real logprob) over the env copy. See
-        # _advance_after_turn (the rollout_async twin) for the same fix.
-        if glue and completion_ids and completion_ids[-1] == glue[0]:
-            glue = glue[1:]
+        glue = _dedup_seam_terminator(completion_ids, env_glue(env_msgs))
         if token_budget is not None and len(completion_ids) + len(glue) > token_budget:
             break
         completion_ids.extend(glue)
@@ -174,6 +202,102 @@ def rollout_one(
         "env_mask": env_mask,
         "reward": float(reward),
     }
+
+
+def rollout_one_records(
+    *,
+    example: dict,
+    active_env,
+    render: Callable[[list, bool], list[int]],
+    generate: Callable[[list, int], object],
+    env_glue: Callable[[list], list[int]],
+    max_turns: int,
+    per_turn_max_tokens: int,
+    engine_max_len: int | None = None,
+    on_turn_generated: Callable[[], None] | None = None,
+) -> list[TurnRecord]:
+    """Drive one multi-turn episode and return a per-turn :class:`TurnRecord` list (NOT a flat masked
+    sequence like :func:`rollout_one`). Used by OPD, which distils each assistant turn as an independent
+    single-turn sample conditioned on the transcript so far.
+
+    The env turn loop is identical to :func:`rollout_one` (``new_rollout_state`` → generate →
+    ``record_model_turn`` → ``rollout_done`` → ``env_reply`` → glue), and the tokenizer-sensitive seam
+    dedup / engine-budget accounting reuse the same helpers, so the two paths can't drift. The
+    differences are all OPD-shaped:
+
+    - ``generate(prefix_ids, max_new)`` returns an OBJECT (opaque here) exposing ``completion_ids``
+      (``list[int] | None``), ``completion_text`` (``str``), ``truncated`` (``bool``) and ``skip``
+      (``bool``) — OPD passes its ``_GenResult`` from ``_generate_one`` (termination/trim/U+FFFD gates
+      already applied), so the record drops straight into the existing teacher-scoring + gkd-loss path.
+    - Every turn (including a truncated/empty one) is recorded so the caller counts it; a
+      truncated/skip turn ENDS the episode (a student that didn't terminate its turn, or emitted an
+      empty/invalid completion, can't meaningfully continue — and its bad turn is skipped, not
+      distilled, by the caller's ``_resolve_sample``).
+    - ``on_turn_generated`` (optional) fires AFTER each turn's generation to refresh the worker stall
+      clock and advance the sample counter — a many-turn episode is a long serial stretch of GPU
+      generates + teacher-less env steps that would otherwise emit no progress ping.
+
+    ``prefix_ids`` and ``context_messages`` are snapshotted BEFORE generation, so each record carries
+    the exact student-token and message context the teacher must condition on for that turn.
+    """
+    state = active_env.new_rollout_state(example)
+    initial_messages = state.get("prompt") or state.get("messages")
+    if not isinstance(initial_messages, list):
+        raise KeyError("multi-turn rollout state must include prompt or messages")
+    messages = [dict(m) for m in initial_messages]
+    prompt_ids = render(messages, True)
+    cur_ids = list(prompt_ids)  # invariant: cur_ids == prompt_ids + completion tokens so far
+    token_budget = (engine_max_len - len(prompt_ids) - 8) if engine_max_len else None
+    records: list[TurnRecord] = []
+
+    turns = 0
+    while True:
+        completion_so_far = len(cur_ids) - len(prompt_ids)
+        max_new = per_turn_max_tokens
+        if token_budget is not None:
+            remaining = token_budget - completion_so_far
+            if remaining <= 0:
+                break
+            max_new = min(max_new, remaining)
+        # Snapshot the student-token prefix and message context BEFORE generation: this is what the
+        # teacher must condition on to score THIS turn (the transcript up to, but excluding, the turn).
+        prefix_ids = list(cur_ids)
+        context_messages = [dict(m) for m in messages]
+        gen = generate(prefix_ids, max(1, max_new))
+        if on_turn_generated is not None:
+            on_turn_generated()
+        records.append(
+            {"prefix_ids": prefix_ids, "gen": gen, "context_messages": context_messages}
+        )
+        text = getattr(gen, "completion_text", "") or ""
+        active_env.record_model_turn(state, text)
+        messages.append({"role": "assistant", "content": text})
+        turns += 1
+        # A turn that didn't terminate naturally (truncated) or produced no usable text (skip) ends the
+        # episode: it's recorded (counted) but not distilled, and continuing from a broken turn is
+        # pointless (the student can't end its turn / said nothing).
+        if getattr(gen, "truncated", False) or getattr(gen, "skip", False):
+            break
+        asst_ids = getattr(gen, "completion_ids", None) or []
+        cur_ids.extend(asst_ids)
+        completion_so_far = len(cur_ids) - len(prompt_ids)
+        if token_budget is not None and completion_so_far >= token_budget:
+            break
+        if turns >= max_turns or active_env.rollout_done(state, max_turns):
+            break
+        env_msgs = active_env.env_reply(messages, state)
+        if not env_msgs:
+            break
+        messages.extend(env_msgs)
+        # Don't append glue if the env step finished — no next model turn.
+        if active_env.rollout_done(state, max_turns):
+            break
+        glue = _dedup_seam_terminator(asst_ids, env_glue(env_msgs))
+        if token_budget is not None and completion_so_far + len(glue) > token_budget:
+            break
+        cur_ids.extend(glue)
+
+    return records
 
 
 class _RolloutState:
@@ -248,13 +372,7 @@ def _advance_after_turn(
     if active_env.rollout_done(r.state, max_turns):
         r.done = True
         return
-    glue = env_glue(env_msgs)
-    # env_glue's text starts at the assistant turn's terminator (e.g. <|im_end|>); vLLM also keeps that
-    # terminator as the final token of a naturally-stopped turn (it's in asst_ids). Collapse the duplicate
-    # at the seam so the stream has exactly one terminator per turn (matches the chat template + SFT
-    # transcripts), keeping the assistant's own token (env_mask=1, real logprob) over the env copy.
-    if glue and r.completion_ids and r.completion_ids[-1] == glue[0]:
-        glue = glue[1:]
+    glue = _dedup_seam_terminator(r.completion_ids, env_glue(env_msgs))
     if r.budget is not None and len(r.completion_ids) + len(glue) > r.budget:
         r.done = True
         return
@@ -429,6 +547,47 @@ def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: 
     return [int(t) for t in tok(text, add_special_tokens=False).input_ids]
 
 
+def make_env_glue(tok, *, thinking: bool, cache_size: int = 8192) -> Callable[[list], list[int]]:
+    """Build the inter-turn "glue" tokenizer used by both the GRPO rollout (:func:`build_rollout_func`)
+    and OPD's per-turn rollout (:func:`rollout_one_records`).
+
+    Given the env's reply messages for a turn, returns the token ids that sit BETWEEN the assistant
+    turn and the next assistant generation prompt (the turn terminator + the env/observation messages +
+    the next assistant header). Computed with the probe trick — render ``[{assistant: PROBE}, *env]``
+    with ``add_generation_prompt=True`` and take everything after the probe — so the history is never
+    re-rendered (Qwen3's template doesn't round-trip a re-rendered transcript). Results are LRU-cached
+    by the env messages. Raises ``ValueError`` if the model's chat template doesn't insert assistant
+    content verbatim (token-aligned multi-turn is then unsupported for that model)."""
+    cache = _LRUCache(cache_size)
+    probe = "flash-env-glue-probe"
+
+    def env_glue(env_messages: list) -> list[int]:
+        cache_key = json.dumps(env_messages, sort_keys=True, default=str)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+        text = tok.apply_chat_template(
+            [{"role": "assistant", "content": probe}, *env_messages],
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=thinking,
+        )
+        first = text.find(probe)
+        if first == -1 or text.find(probe, first + len(probe)) != -1:
+            raise ValueError(
+                "multi-turn env_glue could not uniquely locate its probe in the rendered chat "
+                "template; this model's template does not insert assistant content verbatim, so "
+                "token-aligned multi-turn rollout is unsupported for it (use a single-turn/tool "
+                "env or a different model)."
+            )
+        glue_text = text[first + len(probe) :]
+        glue = [int(t) for t in tok(glue_text, add_special_tokens=False).input_ids]
+        cache.put(cache_key, glue)
+        return glue
+
+    return env_glue
+
+
 def _engine_vocab_size(engine) -> int | None:
     """Best-effort vocab size from the colocate vLLM engine, or None. Never raises."""
     try:
@@ -482,34 +641,7 @@ def build_rollout_func(
         _render_cache.put(cache_key, ids)
         return ids
 
-    _glue_cache = _LRUCache(8192)
-
-    def env_glue(env_messages: list) -> list[int]:
-        cache_key = json.dumps(env_messages, sort_keys=True, default=str)
-        cached = _glue_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        # Render a probe assistant turn + env messages, then take everything after the probe
-        # to get the inter-turn glue without re-rendering history (Qwen3 doesn't round-trip).
-        probe = "flash-env-glue-probe"
-        text = tok.apply_chat_template(
-            [{"role": "assistant", "content": probe}, *env_messages],
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=thinking,
-        )
-        first = text.find(probe)
-        if first == -1 or text.find(probe, first + len(probe)) != -1:
-            raise ValueError(
-                "multi-turn env_glue could not uniquely locate its probe in the rendered chat "
-                "template; this model's template does not insert assistant content verbatim, so "
-                "token-aligned multi-turn rollout is unsupported for it (use a single-turn/tool "
-                "env or a different model)."
-            )
-        glue_text = text[first + len(probe) :]
-        glue = [int(t) for t in tok(glue_text, add_special_tokens=False).input_ids]
-        _glue_cache.put(cache_key, glue)
-        return glue
+    env_glue = make_env_glue(tok, thinking=thinking)
 
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
