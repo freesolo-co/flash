@@ -96,6 +96,39 @@ def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
     assert build_worker_env(_spec(), 0).get("GITHUB_TOKEN") == "ghp-secret"
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+
+def test_build_worker_env_forwards_managed_teacher_key_for_opd_only(monkeypatch):
+    """The opd GLM teacher key is a platform-owned credential injected from the control-plane env
+    (like GITHUB_TOKEN) — but ONLY for opd runs, since only opd uses it. sft/grpo workers never
+    receive it."""
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
+    opd_spec = JobSpec(
+        model="Qwen/Qwen3.5-4B", algorithm="opd", train=TrainSpec(steps=10, hf_repo="owner/runs")
+    )
+    assert build_worker_env(opd_spec, 0).get("FIREWORKS_API_KEY") == "platform-managed-teacher"
+    # grpo/sft don't use a teacher, so the key is not forwarded to those workers.
+    assert "FIREWORKS_API_KEY" not in build_worker_env(_spec(), 0)
+
+
+def test_build_worker_env_managed_teacher_key_is_authoritative_no_byo(monkeypatch):
+    """Bring-your-own is not supported: even if a user routes a FIREWORKS_API_KEY runtime_secret
+    (by declaring it in [environment].secrets), the control-plane value wins — it is applied last."""
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
+    opd_spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=EnvironmentSpec(id="org/env", secrets=("FIREWORKS_API_KEY",)),
+        train=TrainSpec(steps=10, hf_repo="owner/runs"),
+    )
+    env = build_worker_env(opd_spec, 0, runtime_secrets={"FIREWORKS_API_KEY": "byo-user-key"})
+    assert env["FIREWORKS_API_KEY"] == "platform-managed-teacher"
     assert "GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
 
 
