@@ -6,6 +6,7 @@ import os
 import time
 from io import BytesIO
 
+from flash._channel import CHALK_DIST, CHANNEL
 from flash._logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.envs.registry import FREESOLO_WORKER_SPEC
@@ -117,7 +118,15 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 # num_warps=2, gdn_conv warps formula, lora fwd autotune candidate; OP_MEAS_OVERRIDE; flce
 # chunk_mult tradeoff docs). Bump DEFAULT_CHALK_VERSION when the merged kernel surface moves.
 DEFAULT_CHALK_VERSION = "0.5.3"
-DEFAULT_CHALK_SPEC = f"freesolo-chalk=={DEFAULT_CHALK_VERSION}"
+# CHALK_DIST switches the package name per channel (freesolo-chalk / freesolo-chalk-dev); the dev
+# wheel (freesolo-flash-dev) gets CHANNEL=='dev' from build_dev_dist.py. Prod pins an exact chalk;
+# the dev channel tracks the latest freesolo-chalk-dev at/above the baseline so staging always
+# exercises the newest dev kernels. FLASH_CHALK_SPEC still overrides both.
+DEFAULT_CHALK_SPEC = (
+    f"{CHALK_DIST}>={DEFAULT_CHALK_VERSION}"
+    if CHANNEL == "dev"
+    else f"{CHALK_DIST}=={DEFAULT_CHALK_VERSION}"
+)
 # Provenance only (kernel-cache fingerprint / traceability): the chalk commit this version was cut from.
 LATEST_CHALK_MAIN_SHA = "c63f0367e01795006bc0e91e2540ec85e740f19b"
 
