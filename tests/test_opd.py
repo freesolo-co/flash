@@ -767,19 +767,239 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
     return opd_mod
 
 
-def test_opd_rejects_multi_turn_and_tool_environments(monkeypatch):
-    """Regression (codex[bot], opd.py): opd samples one completion per prompt and cannot drive the
-    turn/tool loop, so it must fail fast on a multi-turn or tool-calling env instead of silently
-    distilling only the first assistant turn."""
+def test_opd_rejects_tool_environments(monkeypatch):
+    """opd cannot drive TRL's native tool-call loop (it rolls out with HF model.generate), so a
+    tool-calling env must still fail fast. Pure multi-turn (episode) envs ARE supported now — see
+    test_opd_multi_turn_distills_every_assistant_turn."""
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
     from flash.engine.worker import opd as opd_mod
 
-    for attr in ("multi_turn", "is_tool_env"):
-        env = SimpleNamespace(**{attr: True})
-        monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(require_active_env=lambda e=env: e))
-        with pytest.raises(RuntimeError, match="multi-turn or tool"):
-            opd_mod.run_opd()
+    env = SimpleNamespace(is_tool_env=True)
+    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(require_active_env=lambda e=env: e))
+    with pytest.raises(RuntimeError, match="tool-calling"):
+        opd_mod.run_opd()
+
+
+class _CharTok:
+    """A tiny char-level chat tokenizer for the multi-turn e2e test. Every char in a rendered/encoded
+    string is one id (its index in ``alpha``); a reserved ``eos_token_id`` decodes to "" so a completion
+    ending in it reads as a NATURAL termination and as a zero-width alignment token. ``apply_chat_template``
+    inserts message content VERBATIM (``role:content|``), so make_env_glue's probe resolves — the
+    load-bearing property real Qwen templates also have."""
+
+    alpha = "uas:|gn42ok "
+
+    def __init__(self):
+        self.eos_token_id = len(self.alpha)
+        self.pad_token_id = self.eos_token_id
+        self.pad_token = "<pad>"
+        self.eos_token = "<eos>"
+
+    def _enc(self, text):
+        return [self.alpha.index(c) for c in text]
+
+    def __call__(self, text, add_special_tokens=False):
+        return SimpleNamespace(input_ids=self._enc(text))
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(self.alpha[int(i)] for i in ids if int(i) != self.eos_token_id)
+
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
+    ):
+        text = "".join(f"{str(m.get('role', 'user'))[0]}:{m.get('content', '')}|" for m in messages)
+        if add_generation_prompt:
+            text += "a:"
+        return text
+
+    def save_pretrained(self, *a, **k):
+        pass
+
+
+def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
+    """END-TO-END proof that multi-turn opd distils EACH assistant turn against the teacher, conditioned
+    on the growing transcript. Drives the REAL run_opd -> rollout_one_records -> _generate_one ->
+    _score_one -> _loss_one -> gkd_loss path on CPU with a scripted 2-turn "guess" episode: a fake
+    student that generates a distinct completion per turn and a fake teacher that echo-scores each. We
+    assert (1) two turns were distilled with real gradients, (2) the second turn's teacher prompt and
+    loss prefix strictly GREW over the first (per-turn transcript conditioning, not a re-scored first
+    turn), and (3) train_meta reports the multi-turn shape."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    tok = _CharTok()
+    V = len(tok.alpha) + 1  # +1 for the eos id (== len(alpha))
+
+    class _MTModel(_TinyLM):
+        """Scripted generating student: turn t emits guesses[t] + eos; per-position logits for the loss."""
+
+        def __init__(self, guesses):
+            super().__init__(torch, T=256, V=V)
+            self.config = SimpleNamespace(use_cache=False)
+            self._guesses = guesses
+            self._i = 0
+
+        def eval(self):
+            return self
+
+        def train(self):
+            return self
+
+        def to(self, device):
+            return self
+
+        def generate(self, prompt_tensor, **cfg):
+            guess = self._guesses[min(self._i, len(self._guesses) - 1)]
+            self._i += 1
+            comp = [*tok._enc(guess), tok.eos_token_id]
+            comp_t = torch.tensor([comp], dtype=prompt_tensor.dtype)
+            return torch.cat([prompt_tensor, comp_t], dim=1)
+
+        def save_pretrained(self, *a, **k):
+            pass
+
+    model = _MTModel(["42", "ok"])
+
+    teacher_calls = []
+
+    class _CountingTeacher:
+        def score(self, prompt, completion):
+            teacher_calls.append((prompt, completion))
+            # One teacher token tiling the whole completion -> a single alignment group.
+            return [TeacherToken(text=completion, logprob=-1.0, start=0, end=len(completion))]
+
+    class _GuessEnv:
+        """Two-assistant-turn episode: guess -> env nudge -> guess -> done."""
+
+        multi_turn = True
+        is_tool_env = False
+        max_turns = 4
+
+        def dataset(self):
+            return [{"input": "guess", "output": "42", "id": "e0"}]
+
+        def prompt_messages(self, ex):
+            return [{"role": "user", "content": "g"}]
+
+        def new_rollout_state(self, ex):
+            return {
+                "prompt": [{"role": "user", "content": "g"}],
+                "messages": [{"role": "user", "content": "g"}],
+                "turn": 0,
+                "done": False,
+            }
+
+        def record_model_turn(self, state, content):
+            state["last"] = content
+
+        def env_reply(self, messages, state):
+            state["turn"] += 1
+            if state["turn"] >= 2:
+                state["done"] = True
+                return []
+            return [{"role": "user", "content": "n"}]
+
+        def rollout_done(self, state, max_turns=None):
+            return bool(state.get("done")) or state["turn"] >= (max_turns or 4)
+
+    env = _GuessEnv()
+
+    loss_calls = []
+    real_loss_one = opd_mod._loss_one
+
+    def _spy_loss_one(model, tok_, device, gen, score, prompt_ids, knobs):
+        r = real_loss_one(model, tok_, device, gen, score, prompt_ids, knobs)
+        loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
+        return r
+
+    monkeypatch.setattr(opd_mod, "_loss_one", _spy_loss_one)
+
+    meta = {}
+    fake_w = SimpleNamespace(
+        require_active_env=lambda: env,
+        JOB_SPEC=SimpleNamespace(
+            train=SimpleNamespace(init_from_adapter=""),
+            model="fake/model",
+            gpu=SimpleNamespace(type=None),
+        ),
+        THINKING=False,
+        SEED=0,
+        heartbeat=lambda stage, **kw: None,
+        prefetch_model=lambda mid: 0.0,
+        hf_resume_checkpoint=lambda: "",
+        publish_deployable_checkpoint=lambda *a, **k: None,
+        hf_upload_folder=lambda *a, **k: None,
+        recombined_warmstart_adapter_dir=lambda d: None,
+        write_train_meta=lambda **k: meta.update(k),
+        wandb_report_to=lambda: [],
+        wandb_run_info=lambda: {},
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: opd_mod.OpdKnobs(
+            teacher_model="accounts/fireworks/models/glm-5p2",
+            teacher_base_url="http://teacher.invalid",
+            steps=1,
+            learning_rate=1e-4,
+            temperature=0.0,
+            top_p=1.0,
+            max_completion=8,
+            prompts_per_step=1,
+            group_size=1,
+            kl_coef=1.0,
+            save_every=0,
+            max_length=128,
+            stop_sequences=(),
+        ),
+    )
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: model)
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(opd_mod, "install_chalk_kernels", lambda *a, **k: {})
+    monkeypatch.setattr(opd_mod, "active_kernels", lambda *a, **k: [])
+    monkeypatch.setattr(opd_mod, "free_gpu", lambda *a, **k: None)
+    import transformers
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tok)
+    import flash.engine.worker.teacher as tmod
+
+    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: _CountingTeacher())
+    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+
+    # Snapshot the trainable weight so we can prove the optimizer actually moved it.
+    before = model.w.detach().clone()
+
+    opd_mod.run_opd()
+
+    # (1) Both assistant turns were distilled with a real (non-None) loss, texts in generation order.
+    assert len(loss_calls) == 2, f"expected 2 per-turn losses, got {loss_calls}"
+    assert [c[1] for c in loss_calls] == ["42", "ok"]
+    assert all(c[2] for c in loss_calls), "every distilled turn must produce a real loss"
+    # The second turn's loss prefix (transcript so far) is strictly LONGER than the first's.
+    assert loss_calls[1][0] > loss_calls[0][0]
+
+    # (2) The teacher was called once per turn, each conditioned on the growing transcript: turn 2's
+    # prompt contains the prior assistant answer ("Assistant: 42") AND the env nudge ("User: n");
+    # turn 1's flat prompt is just the opening user turn with neither.
+    assert len(teacher_calls) == 2
+    assert "Assistant: 42" not in teacher_calls[0][0]
+    assert "User: n" not in teacher_calls[0][0]
+    assert "Assistant: 42" in teacher_calls[1][0]
+    assert "User: n" in teacher_calls[1][0]
+
+    # (3) A real optimizer step landed and moved the weights; train_meta shows the multi-turn shape.
+    assert not torch.equal(before, model.w.detach())
+    assert meta["notes"]["multi_turn"] is True
+    assert meta["notes"]["episodes"] == 1
+    assert meta["notes"]["mean_turns_per_episode"] == 2.0
+    assert meta["notes"]["max_turns"] == 4
+    assert meta["step"] == 1  # one optimizer update over the two turn-losses
 
 
 def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
