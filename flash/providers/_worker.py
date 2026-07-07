@@ -265,6 +265,12 @@ def build_worker_env(
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
             env[k] = str(v)
+    # The opd GLM teacher key is a platform-owned credential injected from the control-plane env for
+    # opd runs — like HF_TOKEN/GITHUB_TOKEN above, not a user secret. Set it LAST so the platform
+    # value is authoritative: bring-your-own teacher keys are not supported, so no user-routed
+    # runtime_secret can override it.
+    if str(getattr(spec, "algorithm", "")).lower() == "opd" and os.environ.get("FIREWORKS_API_KEY"):
+        env["FIREWORKS_API_KEY"] = os.environ["FIREWORKS_API_KEY"]
     return env
 
 

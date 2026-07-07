@@ -30,8 +30,9 @@ def test_opd_algorithm_accepted():
     assert spec.algorithm == "opd"
     # phase drives RUN_MODE + the artifact path segment; grpo->rl, everything else->itself.
     assert spec.phase == "opd"
-    # opd hard-requires the teacher key, auto-declared as a required runtime secret.
-    assert "FIREWORKS_API_KEY" in spec.environment.secrets
+    # The teacher key is platform-managed (injected into the worker env by the control plane, like
+    # HF_TOKEN) — NOT a user-declared secret, so it must not be auto-added to environment.secrets.
+    assert "FIREWORKS_API_KEY" not in spec.environment.secrets
 
 
 def test_opd_capability_gated_per_model():
