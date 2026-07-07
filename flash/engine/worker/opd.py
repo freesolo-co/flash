@@ -54,11 +54,6 @@ from flash.engine.worker.perf import (
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 
-# Upper bound on teacher-scoring HTTP calls fired concurrently within one optimizer step. Generation
-# (GPU) and the gkd loss forward/backward stay serial on the main thread; only the (dominant) teacher
-# Fireworks round-trips for a step's samples are overlapped, so this caps the fan-out into the API.
-_TEACHER_SCORE_MAX_WORKERS = 8  # bound concurrent GLM/Fireworks scoring calls per step
-
 
 @dataclass(frozen=True)
 class OpdKnobs:
@@ -668,16 +663,20 @@ def run_opd():
                             # Feed the stall clock during the (serial, up-to-~900s-each) generations;
                             # nseq is still 0 here since no loss has landed yet this step.
                             _opd_progress(opt_steps, nseq)
-                # Phase 2 (concurrent, NETWORK only): fire the teacher scoring calls for every scorable
-                # rollout at once, bounded by _TEACHER_SCORE_MAX_WORKERS. _score_one touches only the
-                # stateless teacher HTTP client + Python strings (no torch/model/shared mutable state),
-                # so the round-trips overlap safely; truncated/empty/U+FFFD rollouts are never scored.
+                # Phase 2 (concurrent, NETWORK only): fire the teacher scoring calls for EVERY scorable
+                # rollout at once — the fan-out cap is the step's own completion count
+                # (prompts_per_step * group_size), so every sample in a step is scored in parallel (one
+                # round-trip of wall time) and the concurrency self-scales when group_size is raised
+                # (no queueing 8-at-a-time). The teacher endpoint's own rate limit is the real ceiling;
+                # 429s retry inside _score_one. _score_one touches only the stateless teacher HTTP client
+                # + Python strings (no torch/model/shared mutable state), so the round-trips overlap
+                # safely; truncated/empty/U+FFFD rollouts are never scored.
                 scorable = [i for i, p in enumerate(pending) if not (p.gen.skip or p.gen.truncated)]
                 _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
                 if scorable:
                     permanent_err = None
                     with ThreadPoolExecutor(
-                        max_workers=min(len(scorable), _TEACHER_SCORE_MAX_WORKERS)
+                        max_workers=min(len(scorable), knobs.prompts_per_step * knobs.group_size)
                     ) as pool:
                         fut_to_idx = {
                             pool.submit(
