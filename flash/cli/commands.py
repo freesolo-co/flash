@@ -504,16 +504,15 @@ def cmd_env_setup(args) -> int:
         opd.write_text(
             f"{opd_multiturn_note}"
             'model = "Qwen/Qwen3.5-4B"\n'
-            'algorithm = "opd"   # on-policy distillation from a Fireworks GLM teacher\n\n'
+            'algorithm = "opd"   # on-policy distillation from the managed GLM 5.2 teacher\n\n'
             "# Environment: upload this project folder with\n"
             "# `flash env push --name my-env .`, then paste the returned id below.\n"
-            "# The GLM teacher key is platform-managed — nothing to set up or export.\n"
+            "# The GLM 5.2 teacher and key are platform-managed — nothing to set up or export.\n"
             "[environment]\n"
             'id = ""\n\n'
             "[train]\n"
             "steps = 100                     # opd is step-driven (like GRPO)\n"
             "lora_rank = 32\n"
-            '# teacher_model = "accounts/fireworks/models/glm-5p2"   # Fireworks GLM teacher (default)\n'
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
