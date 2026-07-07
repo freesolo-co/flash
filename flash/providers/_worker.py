@@ -6,6 +6,7 @@ import os
 import time
 from io import BytesIO
 
+from flash._channel import CHANNEL
 from flash._logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.envs.registry import FREESOLO_WORKER_SPEC
@@ -112,14 +113,23 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 # Chalk is published to PUBLIC PyPI on every version bump (chalk .github/workflows/publish.yml).
 # Pin the exact PUBLIC version so worker + kernel-cache-bake pods install with NO GitHub auth — the
 # chalk repo is INTERNAL, so a git+https default made installs fail wherever GITHUB_TOKEN is absent
-# (bake pod, tokenless workers). freesolo-chalk 0.5.3 = chalk dev->main sync #67 (adds the decode
-# serving kernels rope + GDN gated-rmsnorm; GPU-A/B'd launch tuning: flce chunk_mult 16, rope
-# num_warps=2, gdn_conv warps formula, lora fwd autotune candidate; OP_MEAS_OVERRIDE; flce
-# chunk_mult tradeoff docs). Bump DEFAULT_CHALK_VERSION when the merged kernel surface moves.
-DEFAULT_CHALK_VERSION = "0.5.3"
+# (bake pod, tokenless workers). freesolo-chalk 0.5.7 = the chalk 0.5.7 release: swiglu@sm100
+# arch-tuned kernel (verified 1.106x beats-portable on B200); token-major qkv + flce fuzz-shape-cap
+# verifier fixes; graduate-or-delete arch-tree cleanup + removal of non-working / non-flash-used code
+# (rejected GDN gate cluster, NotImplementedError arch stubs); + order-reversed verifier timing
+# (#75, dev-tooling only, wheel identical to 0.5.6). Bump DEFAULT_CHALK_VERSION when the
+# merged kernel surface moves.
+DEFAULT_CHALK_VERSION = "0.5.7"
+# Prod pins an exact chalk; the dev channel (freesolo-flash-dev, CHANNEL=='dev' via
+# build_dev_dist.py) installs the dev-channel build freesolo-chalk-dev, floored so staging always
+# exercises the newest dev kernels. FLASH_CHALK_SPEC still overrides both. NOTE: the prod form is a
+# plain top-level assignment so docker/kernel_fingerprint.py's static parser reads it; the dev
+# override lives in the if-block, which that parser skips.
 DEFAULT_CHALK_SPEC = f"freesolo-chalk=={DEFAULT_CHALK_VERSION}"
+if CHANNEL == "dev":
+    DEFAULT_CHALK_SPEC = f"freesolo-chalk-dev>={DEFAULT_CHALK_VERSION}"
 # Provenance only (kernel-cache fingerprint / traceability): the chalk commit this version was cut from.
-LATEST_CHALK_MAIN_SHA = "c63f0367e01795006bc0e91e2540ec85e740f19b"
+LATEST_CHALK_MAIN_SHA = "e89b52145778102418f00e2b99d27968577ca43a"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
