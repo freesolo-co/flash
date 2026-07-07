@@ -124,6 +124,8 @@ class TrainSpec:
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
+    # On-policy distillation (algorithm="opd"). None/"" => worker resolves the recipe default.
+    teacher_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -210,6 +212,7 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
+                teacher_model=str(train.get("teacher_model") or ""),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

@@ -15,7 +15,11 @@ class RunMetrics:
     """Standard metrics record written per phase."""
 
     arm: str = "runpod"
-    phase: str = ""  # "sft" | "rl"
+    phase: str = ""  # "sft" | "rl" | "opd"
+    # Completed optimizer updates (opd sets this; None for phases without a step count). Read by
+    # _finalize to carry the true step onto the terminal `done` heartbeat so a cancel racing the DONE
+    # upload doesn't re-price a fully-trained run to 0 steps.
+    step: int | None = None
     seed: int = 0
     model_id: str = ""
     wall_seconds: float = 0.0  # training-loop wall time used for customer cost

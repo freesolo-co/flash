@@ -20,6 +20,8 @@ from .facts import (
     model_quant,
     pick_gpu,
     reward_seconds_per_completion,
+    teacher_seconds_per_completion,
+    teacher_token_cost_usd,
     total_params_b,
 )
 from .types import CostEstimate, RunConfig
@@ -28,6 +30,9 @@ from .types import CostEstimate, RunConfig
 SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
+# OPD's update is policy fwd+bwd ONLY (6): the teacher's per-token logprobs come from the
+# Fireworks API, so there is NO local frozen-reference forward (GRPO's extra 2).
+OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 6.0
 
 # Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
 # wall clock. LoRA + small batches sit well below dense-pretraining MFU.
@@ -77,6 +82,14 @@ def setup_seconds(config: RunConfig) -> float:
     return s
 
 
+def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
+    """(completions per step, prompt+completion tokens per step) for one OPD step, from a NORMALIZED
+    config. completions = batch x group; each is billed over the FULL n.seq_len (prompt+completion,
+    not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
+    completions = n.batch_size * n.group_size
+    return completions, completions * n.seq_len
+
+
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
     """Steady-state wall time for one optimizer step on ``gpu``."""
     n = config.normalized()
@@ -84,6 +97,21 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     # experts); for a dense model this equals the total. Memory/size terms below keep total_params_b.
     params = active_params_b(n.model_id) * 1e9
     peak = gpu_tflops(gpu) * 1e12  # FLOP/s
+
+    if n.is_opd:
+        # OPD step = on-policy student rollout (like GRPO) + remote teacher scoring (serial
+        # Fireworks round-trips, replaces reward grading) + policy update (fwd+bwd only, NO local
+        # reference forward — the teacher is the API). Bill local compute on the FULL prompt+completion
+        # sequence (see _opd_step_shape), not completion-only, or long-prompt opd is underquoted.
+        completions, seq_tokens = _opd_step_shape(n)
+        gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
+        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_TRAIN)
+        teacher_lat = teacher_seconds_per_completion()
+        # run_opd scores each completion serially (nested prompt/group loops each await
+        # teacher.score before the next), so the wall cost is the full serial sum — do NOT divide
+        # by a concurrency factor or the quote materially understates teacher-bound steps.
+        teacher_s = completions * teacher_lat
+        return gen_s + teacher_s + update_s
 
     if not n.is_grpo:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
@@ -95,7 +123,9 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_TRAIN)
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
-    reward_s = math.ceil(completions / REWARD_CONCURRENCY) * latency  # ceil: a partial wave still costs one latency
+    reward_s = (
+        math.ceil(completions / REWARD_CONCURRENCY) * latency
+    )  # ceil: a partial wave still costs one latency
     return gen_s + reward_s + update_s
 
 def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> float:
@@ -114,7 +144,9 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
     it considers every fitting class, validated or not — so the estimate reflects the cheapest
     card that *could* run the job. The live allocator restricts to the validated pool, so the
     actually-provisioned class can be pricier than this. Catalog sizing is offline/deterministic."""
-    total_params_b(config.model_id)  # catalog-only: reject a non-catalog model before any (HF) sizing
+    total_params_b(
+        config.model_id
+    )  # catalog-only: reject a non-catalog model before any (HF) sizing
     need = required_vram_gb(
         config.model_id,
         config.method,
@@ -125,12 +157,22 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
     return gpu, need
 
 
-def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: float) -> tuple[str, ...]:
+def _notes(
+    config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: float
+) -> tuple[str, ...]:
     n = config.normalized()
     notes: list[str] = []
     if (quant := model_quant(n.model_id)) != "bf16":
         notes.append(f"{quant}: smaller VRAM footprint -> cheaper GPU class fits")
-    if n.is_grpo:
+    if n.is_opd:
+        comps, _ = _opd_step_shape(n)
+        tsec = teacher_seconds_per_completion()
+        notes.append(
+            f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
+            f"@ {n.completion_len} tok + GLM teacher scoring ({tsec:.2f}s/completion) + policy "
+            "update (no local reference forward)"
+        )
+    elif n.is_grpo:
         comps = n.batch_size * n.group_size
         rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)
         notes.append(
@@ -187,6 +229,18 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     train = max(0.0, cap_s - setup) if wall_capped else raw_train
     wall = setup + train
 
+    # OPD: add the external Fireworks teacher token spend. The teacher echo-scores every
+    # sampled completion (input ~ prompt+completion per completion), so bill INPUT tokens over the
+    # EFFECTIVE (wall-capped) step count — not the uncapped `steps` — so a wall-capped run's teacher
+    # bill tracks the GPU time it is actually billed for.
+    teacher_api_usd = 0.0
+    if config.is_opd:
+        n = config.normalized()
+        effective_steps = (train / sps) if sps > 0 else config.steps
+        _, tokens_per_step = _opd_step_shape(n)
+        teacher_input_tokens = effective_steps * tokens_per_step
+        teacher_api_usd = teacher_token_cost_usd(teacher_input_tokens, 0.0, config.teacher_model)
+
     return CostEstimate(
         model_id=config.model_id,
         method=config.method,
@@ -201,6 +255,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         train_seconds=train,
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
+        # GPU (platform-billed) time only. OPD's teacher tokens are billed by Fireworks DIRECTLY to
+        # the user's FIREWORKS_API_KEY (a user-supplied [environment].secret), so folding
+        # teacher_api_usd into the charged total would bill it a second time — keep it itemized as a
+        # diagnostic instead (codex[bot]).
         total_usd=train / 3600.0 * hourly,
+        teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),
     )
