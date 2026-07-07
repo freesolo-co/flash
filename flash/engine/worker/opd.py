@@ -233,24 +233,26 @@ def run_opd():
     from flash.engine.worker.teacher import TeacherClient
 
     env = _w.require_active_env()
-    if getattr(env, "multi_turn", False) or getattr(env, "is_tool_env", False):
-        # opd distills a SINGLE model.generate() over env.prompt_messages() and never drives the
-        # turn loop (env.new_rollout_state / env.env_reply) or hands tool schemas to generation — GRPO
-        # does, in rl.py. On a multi-turn / tool-calling env opd would silently distill only the FIRST
-        # assistant turn, so fail fast at setup (before any GPU work) rather than train a wrong
-        # objective. (Reported by codex[bot]; drop this guard once opd implements the rollout path.)
+    if getattr(env, "is_tool_env", False):
+        # Tool envs need TRL's native tool-call loop (rl.py hands the tool schemas + callables to the
+        # trainer); opd's HF-generate rollout can't drive that, so it stays unsupported. Pure
+        # multi-turn (episode) envs ARE supported below via the per-turn rollout path.
         raise RuntimeError(
-            "opd does not support multi-turn or tool-calling environments yet: it samples one "
-            "completion per prompt and cannot drive the turn/tool loop, so it would distill only "
-            "the first assistant turn. Use grpo for this environment, or a single-turn env for opd."
+            "opd does not support tool-calling environments yet: it cannot drive TRL's tool-call "
+            "loop. Use grpo for a tool env, or a single-turn / pure multi-turn env for opd."
         )
+    # Multi-turn (episode) envs distil EACH assistant turn as an independent on-policy sample
+    # conditioned on the transcript so far (see _run_multi_turn_step / rollout_one_records). A
+    # single-turn env keeps the original one-generate-per-prompt path.
+    multi_turn = bool(getattr(env, "multi_turn", False))
     t_start = time.time()
     _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     knobs = _resolve_opd_knobs()
     warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     print(
         f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
-        f"steps={knobs.steps} warm_start={warm_start or 'none'}"
+        f"steps={knobs.steps} warm_start={warm_start or 'none'} "
+        f"mode={'multi-turn' if multi_turn else 'single-turn'}"
     )
 
     api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
@@ -476,6 +478,58 @@ def run_opd():
     # equivalent per-sample _train_one path (the serial fallback), keeping _train_one the single stub
     # point those tests inject. The model does not change across steps, so decide once.
     _parallel_scoring = hasattr(model, "generate") and hasattr(model, "eval")
+    if multi_turn and not _parallel_scoring:
+        # Multi-turn distillation IS the on-policy rollout: it must sample each turn with the real
+        # student (model.generate), so a stand-in without generate has nothing to roll out. The serial
+        # _train_one fallback is single-turn only.
+        raise RuntimeError(
+            "opd multi-turn requires a student that can sample on-policy (model.generate); the "
+            "loaded model exposes none."
+        )
+
+    # Multi-turn per-turn rollout wiring (built once; unused for single-turn). Each episode is driven
+    # by rollout_one_records, which reuses the SAME env turn loop + tokenizer-sensitive glue/seam logic
+    # as GRPO's rollout_one (flash/engine/multiturn_rollout.py) but yields per-turn records instead of a
+    # flat masked sequence. engine_max_len bounds the transcript to the same seq cap the VRAM estimate
+    # and grad-checkpointing gate were sized for (seq_cap above), so every per-turn loss forward
+    # (prompt+turn) fits; per_turn_max_tokens caps a single turn.
+    mt_max_turns = 0
+    mt_engine_max_len = 0
+    generate_fn = env_glue_fn = render_fn = None
+    episodes_seen = 0
+    mt_turn_records = 0  # total per-turn records produced across all episodes (multi-turn only)
+    if multi_turn:
+        from flash.engine.multiturn_rollout import (
+            make_env_glue,
+            render_message_ids,
+            rollout_one_records,
+        )
+
+        mt_max_turns = int(getattr(env, "max_turns", 10) or 10)
+        mt_engine_max_len = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
+        env_glue_fn = make_env_glue(tok, thinking=_w.THINKING)
+
+        def render_fn(messages, add_generation_prompt):
+            return render_message_ids(
+                tok, messages, add_generation_prompt, thinking=_w.THINKING
+            )
+
+        def generate_fn(prefix_ids, max_new):
+            """One turn's generation: HF model.generate over the transcript-so-far ``prefix_ids``,
+            bounded to ``max_new`` (the per-turn cap the driver already shrank to the remaining engine
+            budget), reusing _generate_one so the termination / trailing-stop-trim / empty / U+FFFD
+            gates apply per turn exactly as they do single-turn."""
+            turn_cfg = dict(gen_cfg)
+            turn_cfg["max_new_tokens"] = max(1, int(max_new))
+            prompt_tensor = torch.tensor([prefix_ids], device=device)
+            return _generate_one(
+                model=model,
+                tok=tok,
+                device=device,
+                prompt_tensor=prompt_tensor,
+                gen_cfg=turn_cfg,
+                knobs=knobs,
+            )
 
     def _account(r):
         """Consume one sample's SampleResult: tally teacher health / truncations, backprop a distilled
@@ -551,26 +605,66 @@ def run_opd():
                 # filter drive BOTH the student prompt AND the teacher prompt, so student sampling and
                 # teacher scoring stay in sync and every visited prompt fits (codex[bot]).
                 pending: list[_Pending] = []
-                for _ex, prompt_messages, prompt_ids in batch:
-                    prompt_tensor = torch.tensor([prompt_ids], device=device)
-                    for _g in range(group):
-                        gen = _generate_one(
-                            model=model,
-                            tok=tok,
-                            device=device,
-                            prompt_tensor=prompt_tensor,
-                            gen_cfg=gen_cfg,
-                            knobs=knobs,
-                        )
-                        pending.append(
-                            _Pending(
-                                gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
+                if multi_turn:
+                    # Multi-turn Phase 1: drive an EPISODE per (prompt x group), each yielding one
+                    # per-turn record. Every assistant turn becomes a _Pending distilled independently
+                    # against its transcript-so-far prefix — so a group-of-3 over a 4-turn episode
+                    # produces up to 12 turn-samples, all scored + lossed by the SAME Phase 2/3 below.
+                    # Bind opt_steps/nseq as defaults (nseq is 0 all of Phase 1; opt_steps is fixed
+                    # until Phase 3's optimizer.step) to satisfy the loop-var-capture lint — same
+                    # pattern as the serial fallback's on_generated below. Called synchronously per
+                    # turn inside rollout_one_records, so these are the right current-iteration values.
+                    def _on_turn(_s=opt_steps, _n=nseq):
+                        # Advance the liveness progress signal and refresh the stall clock after each
+                        # turn's (serial, up-to-~900s) generation, before the next turn / teacher call.
+                        nonlocal samples_seen
+                        samples_seen += 1
+                        _opd_progress(_s, _n)
+
+                    for _ex, _prompt_messages, _prompt_ids in batch:
+                        for _g in range(group):
+                            records = rollout_one_records(
+                                example=_ex,
+                                active_env=env,
+                                render=render_fn,
+                                generate=generate_fn,
+                                env_glue=env_glue_fn,
+                                max_turns=mt_max_turns,
+                                per_turn_max_tokens=knobs.max_completion,
+                                engine_max_len=mt_engine_max_len,
+                                on_turn_generated=_on_turn,
                             )
-                        )
-                        samples_seen += 1  # advances the liveness-thread progress signal
-                        # Feed the stall clock during the (serial, up-to-~900s-each) generations; nseq
-                        # is still 0 here since no loss has landed yet this step.
-                        _opd_progress(opt_steps, nseq)
+                            episodes_seen += 1
+                            mt_turn_records += len(records)
+                            pending.extend(
+                                _Pending(
+                                    gen=rec["gen"],
+                                    prompt_ids=rec["prefix_ids"],
+                                    prompt_messages=rec["context_messages"],
+                                )
+                                for rec in records
+                            )
+                else:
+                    for _ex, prompt_messages, prompt_ids in batch:
+                        prompt_tensor = torch.tensor([prompt_ids], device=device)
+                        for _g in range(group):
+                            gen = _generate_one(
+                                model=model,
+                                tok=tok,
+                                device=device,
+                                prompt_tensor=prompt_tensor,
+                                gen_cfg=gen_cfg,
+                                knobs=knobs,
+                            )
+                            pending.append(
+                                _Pending(
+                                    gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
+                                )
+                            )
+                            samples_seen += 1  # advances the liveness-thread progress signal
+                            # Feed the stall clock during the (serial, up-to-~900s-each) generations;
+                            # nseq is still 0 here since no loss has landed yet this step.
+                            _opd_progress(opt_steps, nseq)
                 # Phase 2 (concurrent, NETWORK only): fire the teacher scoring calls for every scorable
                 # rollout at once, bounded by _TEACHER_SCORE_MAX_WORKERS. _score_one touches only the
                 # stateless teacher HTTP client + Python strings (no torch/model/shared mutable state),
@@ -790,6 +884,16 @@ def run_opd():
             "group_size": group,
             "prompts_per_step": ppl_step,
             "max_completion_len": knobs.max_completion,
+            # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
+            # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
+            # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
+            # student never continued) is visible. Single-turn: mode="single-turn", episodes==0.
+            "multi_turn": multi_turn,
+            "max_turns": mt_max_turns if multi_turn else None,
+            "episodes": episodes_seen if multi_turn else None,
+            "mean_turns_per_episode": (
+                (mt_turn_records / episodes_seen) if (multi_turn and episodes_seen) else None
+            ),
             **_w.wandb_run_info(),
         },
     )
