@@ -49,6 +49,45 @@ def force_vllm_backend_for_sm120() -> str | None:
     return backend
 
 
+def force_vit_sdpa_on_blackwell() -> bool:
+    """Force the VISION-encoder (ViT) attention backend to TORCH_SDPA on Blackwell (sm100/sm120).
+
+    Qwen3.6-35B-A3B is a VL model, so vLLM builds its vision tower even for a text-only GRPO rollout
+    and runs a ViT attention during engine init/profiling. On Blackwell vLLM 0.19.1 routes the ViT to
+    its CUTE flash-attn (``vit_flash_attn_wrapper`` -> ``flash_attn_varlen_func`` ->
+    ``vllm.vllm_flash_attn.cute``), which is UNIMPORTABLE against every published ``nvidia-cutlass-dsl``:
+    the vendored cute references ``cutlass.cute.core.ThrMma`` (present only <=4.5.x) while
+    ``vit_attn_wrappers`` also imports ``cutlass._mlir_helpers`` (present only >=4.6.0) — the two symbols
+    never coexist, so the first ViT attention call aborts with
+    ``AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'`` (4.6.0) or
+    ``ModuleNotFoundError: cutlass._mlir_helpers`` (<=4.5.2), crashing EVERY B200 GRPO rollout (a
+    version pin cannot fix it — measured 2026-07-07). ``get_vit_attn_backend`` honors
+    ``MultiModalConfig.mm_encoder_attn_backend`` UNCONDITIONALLY, and TORCH_SDPA is a supported ViT
+    backend on cc>=8.0, so pinning it sidesteps the CUTE import entirely (the LM/decoder attention is
+    unaffected — that path is FLASHINFER/flash-attn, chosen separately).
+
+    * Injected as a colocate ``LLM(...)`` kwarg (``EngineArgs.mm_encoder_attn_backend``, str-typed),
+      composing with the other overrides; must run BEFORE ``GRPOTrainer.__init__`` builds the engine.
+    * No-op off Blackwell and on non-multimodal models (a text-only model simply never builds a ViT).
+    Returns True iff the override was injected."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] not in (10, 12):
+            return False
+    except Exception as e:
+        print("[rl] ViT-SDPA Blackwell probe skipped:", e)
+        return False
+    ok = patch_trl_colocate_llm_kwargs(mm_encoder_attn_backend="TORCH_SDPA")
+    if ok:
+        print(
+            "[rl] Blackwell (sm100/sm120): mm_encoder_attn_backend=TORCH_SDPA on the colocate rollout "
+            "engine (vLLM 0.19.1 ViT CUTE flash-attn is unimportable vs every nvidia-cutlass-dsl: "
+            "cute.core.ThrMma <=4.5.x XOR cutlass._mlir_helpers >=4.6.0 -> crashes the B200 rollout)"
+        )
+    return ok
+
+
 def finalize_alloc_conf_for_sleep() -> None:
     """Sync PYTORCH_ALLOC_CONF with the resolved GRPO sleep mode (RL only).
 
@@ -76,6 +115,7 @@ def patch_trl_colocate_llm_kwargs(
     max_num_batched_tokens: int | None = None,
     enforce_eager: bool | None = None,
     attention_backend: str | None = None,
+    mm_encoder_attn_backend: str | None = None,
 ) -> bool:
     """Inject vLLM ``LLM(...)`` kwargs into TRL's colocated rollout engine that can't be expressed via
     ``GRPOConfig`` or the (pinned) vLLM env registry — must run BEFORE ``GRPOTrainer.__init__`` builds
@@ -105,6 +145,10 @@ def patch_trl_colocate_llm_kwargs(
     * ``attention_backend="FLASHINFER"|"TRITON_ATTN"``: pin a PTX-independent decoder attention backend
       (consumer-Blackwell sm120) — the SUPPORTED replacement for the removed ``VLLM_ATTENTION_BACKEND``
       env. ``EngineArgs`` coerces the bare member name through ``AttentionConfig.validate_backend_before``.
+    * ``mm_encoder_attn_backend="TORCH_SDPA"``: force the VISION-encoder (ViT) attention backend for a
+      multimodal model (Qwen3.6-35B-A3B is VL) off vLLM's CUTE flash-attn path — see
+      ``force_vit_sdpa_on_blackwell``. Maps to ``MultiModalConfig.mm_encoder_attn_backend``, which
+      ``get_vit_attn_backend`` honors unconditionally.
 
     Repeated calls COMPOSE: run_rl injects the attention backend, the KV/prefill knobs, and eager mode
     at three SEPARATE points, so each call merges its kwargs into one accumulated module-level override
@@ -120,6 +164,8 @@ def patch_trl_colocate_llm_kwargs(
         new_overrides["enforce_eager"] = bool(enforce_eager)
     if attention_backend is not None:
         new_overrides["attention_backend"] = attention_backend
+    if mm_encoder_attn_backend is not None:
+        new_overrides["mm_encoder_attn_backend"] = mm_encoder_attn_backend
     if not new_overrides:
         return False
     try:
