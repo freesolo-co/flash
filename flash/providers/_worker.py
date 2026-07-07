@@ -113,12 +113,13 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 # Chalk is published to PUBLIC PyPI on every version bump (chalk .github/workflows/publish.yml).
 # Pin the exact PUBLIC version so worker + kernel-cache-bake pods install with NO GitHub auth — the
 # chalk repo is INTERNAL, so a git+https default made installs fail wherever GITHUB_TOKEN is absent
-# (bake pod, tokenless workers). freesolo-chalk 0.5.6 = the chalk 0.5.6 release: swiglu@sm100
+# (bake pod, tokenless workers). freesolo-chalk 0.5.7 = the chalk 0.5.7 release: swiglu@sm100
 # arch-tuned kernel (verified 1.106x beats-portable on B200); token-major qkv + flce fuzz-shape-cap
 # verifier fixes; graduate-or-delete arch-tree cleanup + removal of non-working / non-flash-used code
-# (rejected GDN gate cluster, NotImplementedError arch stubs). Bump DEFAULT_CHALK_VERSION when the
+# (rejected GDN gate cluster, NotImplementedError arch stubs); + order-reversed verifier timing
+# (#75, dev-tooling only, wheel identical to 0.5.6). Bump DEFAULT_CHALK_VERSION when the
 # merged kernel surface moves.
-DEFAULT_CHALK_VERSION = "0.5.6"
+DEFAULT_CHALK_VERSION = "0.5.7"
 # Prod pins an exact chalk; the dev channel (freesolo-flash-dev, CHANNEL=='dev' via
 # build_dev_dist.py) installs the dev-channel build freesolo-chalk-dev, floored so staging always
 # exercises the newest dev kernels. FLASH_CHALK_SPEC still overrides both. NOTE: the prod form is a
@@ -128,7 +129,7 @@ DEFAULT_CHALK_SPEC = f"freesolo-chalk=={DEFAULT_CHALK_VERSION}"
 if CHANNEL == "dev":
     DEFAULT_CHALK_SPEC = f"freesolo-chalk-dev>={DEFAULT_CHALK_VERSION}"
 # Provenance only (kernel-cache fingerprint / traceability): the chalk commit this version was cut from.
-LATEST_CHALK_MAIN_SHA = "7c0a4725111279217427870d8e598fc439982500"
+LATEST_CHALK_MAIN_SHA = "e89b52145778102418f00e2b99d27968577ca43a"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
