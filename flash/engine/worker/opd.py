@@ -197,12 +197,17 @@ def _student_model(model_id, mik, device):
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM
 
-    # init_model is the base id (fresh run) or the VL SFT-merged dir; both load as a causal LM — the
-    # merged dir preserves the catalog arch + remote code, so this matches the base load the fresh
-    # path already uses on Qwen3.5. The fresh LoRA excludes vision modules via make_lora.
-    base = AutoModelForCausalLM.from_pretrained(init_model, trust_remote_code=True, **mik).to(
-        device
-    )
+    model_cls = AutoModelForCausalLM
+    if getattr(_w, "_VL_WARMSTART_SFT_DIR", None) or _w.is_vl_checkpoint(model_id):
+        # VL checkpoints are trained/served on the full multimodal tree, including visual linears.
+        # The warm-start recombine path also requires the fresh OPD adapter to target that same tree.
+        from transformers import AutoModelForImageTextToText
+
+        model_cls = AutoModelForImageTextToText
+
+    # init_model is the base id (fresh run) or the VL SFT-merged dir. Non-VL runs keep the lighter
+    # causal-LM loader; VL runs load the full multimodal model so all-linear LoRA sees every target.
+    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **mik).to(device)
     return get_peft_model(base, init_peft)
 
 
