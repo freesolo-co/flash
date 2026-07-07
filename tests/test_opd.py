@@ -8,6 +8,8 @@ CI, which has the training stack).
 from __future__ import annotations
 
 import json
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +39,125 @@ def _skip(**k):
     from flash.engine.worker.opd import SampleResult
 
     return SampleResult()
+
+
+def _install_student_loader_fakes(monkeypatch, *, causal_raises=False, vl_raises=False):
+    """Install tiny peft/transformers fakes for _student_model loader-selection tests."""
+    calls = []
+
+    class _Base:
+        def __init__(self, loader):
+            self.loader = loader
+
+        def to(self, device):
+            calls.append(("to", self.loader, device))
+            return self
+
+    class _Causal:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            calls.append(("causal", args, kwargs))
+            if causal_raises:
+                raise AssertionError("AutoModelForCausalLM should not be used")
+            return _Base("causal")
+
+    class _ImageText:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            calls.append(("vl", args, kwargs))
+            if vl_raises:
+                raise AssertionError("AutoModelForImageTextToText should not be used")
+            return _Base("vl")
+
+    def get_peft_model(base, peft_config):
+        calls.append(("peft", base.loader, peft_config))
+        return {"loader": base.loader, "peft_config": peft_config}
+
+    peft = types.ModuleType("peft")
+    peft.get_peft_model = get_peft_model
+    transformers = types.ModuleType("transformers")
+    transformers.AutoModelForCausalLM = _Causal
+    transformers.AutoModelForImageTextToText = _ImageText
+    monkeypatch.setitem(sys.modules, "peft", peft)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    return calls
+
+
+def test_opd_vl_warmstart_loads_merged_base_with_multimodal_loader(monkeypatch):
+    """Regression: OPD warm-started from a VL SFT must train its fresh LoRA on the full VL module tree.
+
+    The SFT adapter includes vision-tower LoRA keys. Loading the SFT-merged temp dir through
+    AutoModelForCausalLM creates a text-only OPD adapter, and final warm-start⊕OPD rank-stacking aborts
+    because the target module sets differ. The VL warm-start marker from _init_adapter_model should
+    switch OPD to the multimodal loader.
+    """
+    from flash.engine.worker import opd as opd_mod
+
+    calls = _install_student_loader_fakes(monkeypatch, causal_raises=True)
+    fake_w = SimpleNamespace(
+        _VL_WARMSTART_SFT_DIR="/tmp/sft-adapter",
+        _init_adapter_model=lambda model_id: ("/tmp/flash_sft_merged", "fresh-lora-config"),
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+
+    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+
+    assert model == {"loader": "vl", "peft_config": "fresh-lora-config"}
+    assert calls[0] == (
+        "vl",
+        ("/tmp/flash_sft_merged",),
+        {"trust_remote_code": True, "dtype": "bf16"},
+    )
+    assert ("to", "vl", "cuda") in calls
+    assert not any(kind == "causal" for kind, *_ in calls)
+
+
+def test_opd_fresh_lora_keeps_causal_loader(monkeypatch):
+    """Fresh OPD runs still use the lighter causal-LM loader."""
+    from flash.engine.worker import opd as opd_mod
+
+    calls = _install_student_loader_fakes(monkeypatch, vl_raises=True)
+    fake_w = SimpleNamespace(
+        _VL_WARMSTART_SFT_DIR=None,
+        is_vl_checkpoint=lambda model_id: False,
+        _init_adapter_model=lambda model_id: (model_id, "fresh-lora-config"),
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+
+    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+
+    assert model == {"loader": "causal", "peft_config": "fresh-lora-config"}
+    assert calls[0] == (
+        "causal",
+        ("Qwen/Qwen3.5-4B",),
+        {"trust_remote_code": True, "dtype": "bf16"},
+    )
+    assert ("to", "causal", "cuda") in calls
+    assert not any(kind == "vl" for kind, *_ in calls)
+
+
+def test_opd_fresh_vl_lora_uses_multimodal_loader(monkeypatch):
+    """Fresh OPD on a VL checkpoint should still train LoRA on the full multimodal tree."""
+    from flash.engine.worker import opd as opd_mod
+
+    calls = _install_student_loader_fakes(monkeypatch, causal_raises=True)
+    fake_w = SimpleNamespace(
+        _VL_WARMSTART_SFT_DIR=None,
+        is_vl_checkpoint=lambda model_id: True,
+        _init_adapter_model=lambda model_id: (model_id, "fresh-lora-config"),
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+
+    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+
+    assert model == {"loader": "vl", "peft_config": "fresh-lora-config"}
+    assert calls[0] == (
+        "vl",
+        ("Qwen/Qwen3.5-4B",),
+        {"trust_remote_code": True, "dtype": "bf16"},
+    )
+    assert ("to", "vl", "cuda") in calls
+    assert not any(kind == "causal" for kind, *_ in calls)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1727,21 +1848,9 @@ def test_student_model_accepts_vl_warmstart_without_raising(monkeypatch):
     GRPO — instead of raising. _init_adapter_model returns (merged_dir, fresh_lora) and records the
     VL merge; _student_model must LOAD the merged dir and wrap it in a PeftModel (run_opd then
     recombines SFT⊕opd at publish)."""
-    pytest.importorskip("torch")  # AutoModelForCausalLM (patched below) needs torch present
-    pytest.importorskip("transformers")
-    import sys
-    import types
-
     from flash.engine.worker import opd as opd_mod
 
-    sentinel = object()
     fake_lora = object()
-    seen = {}
-
-    class _Base:
-        def to(self, device):
-            seen["device"] = device
-            return self
 
     def _fake_init_adapter_model(model_id):
         opd_mod._w._VL_WARMSTART_SFT_DIR = "/tmp/fake_sft_dir"  # the VL merge path records this
@@ -1749,26 +1858,16 @@ def test_student_model_accepts_vl_warmstart_without_raising(monkeypatch):
 
     monkeypatch.setattr(opd_mod._w, "_VL_WARMSTART_SFT_DIR", None, raising=False)
     monkeypatch.setattr(opd_mod._w, "_init_adapter_model", _fake_init_adapter_model, raising=False)
-
-    import transformers
-
-    def _fake_from_pretrained(path, **kw):
-        seen["path"] = path
-        return _Base()
-
-    monkeypatch.setattr(
-        transformers.AutoModelForCausalLM, "from_pretrained", staticmethod(_fake_from_pretrained)
-    )
-    # _student_model does `from peft import get_peft_model`; peft is a worker-only dep, so inject a
-    # stub module (works with or without a real peft install — hermetic local + CI).
-    fake_peft = types.ModuleType("peft")
-    fake_peft.get_peft_model = lambda base, cfg: (sentinel, base, cfg)
-    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+    calls = _install_student_loader_fakes(monkeypatch, causal_raises=True)
 
     out = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
-    assert out[0] is sentinel  # did NOT raise; wrapped the merged base in a PeftModel
-    assert out[2] is fake_lora  # used the fresh LoRA from _init_adapter_model
-    assert seen["path"] == "/tmp/merged_vl_dir"  # loaded the MERGED dir, not the raw base id
+    assert out == {"loader": "vl", "peft_config": fake_lora}  # wrapped the merged base in PEFT
+    assert calls[0] == (
+        "vl",
+        ("/tmp/merged_vl_dir",),
+        {"trust_remote_code": True, "dtype": "bf16"},
+    )
+    assert ("to", "vl", "cpu") in calls
 
 
 def test_publish_opd_deployable_recombines_for_vl_and_cleans_up(tmp_path, monkeypatch):
