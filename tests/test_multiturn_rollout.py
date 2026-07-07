@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,8 +18,10 @@ from flash.engine.multiturn_rollout import (
     _prompt_key,
     build_examples_index,
     index_collisions,
+    make_env_glue,
     rollout_async,
     rollout_one,
+    rollout_one_records,
 )
 
 
@@ -833,3 +836,101 @@ def test_examples_index_and_collisions():
     from flash.engine.multiturn_rollout import _prompt_key
 
     assert idx[_prompt_key([{"role": "user", "content": "a"}])]["answer"] == "3"
+
+
+# --- rollout_one_records: the per-turn record driver OPD distils each turn from -----------------
+
+
+def _gen_obj(completion_ids, completion_text, *, truncated=False, skip=False):
+    """A minimal stand-in for OPD's _GenResult: the four attributes rollout_one_records reads."""
+    return SimpleNamespace(
+        completion_ids=completion_ids,
+        completion_text=completion_text,
+        gen_tokens=len(completion_ids or []),
+        truncated=truncated,
+        skip=skip,
+    )
+
+
+def _records_generator(turns):
+    """generate(prefix_ids, max_new) -> a _GenResult-shaped object, one per turn (list order)."""
+    seq = iter(turns)
+
+    def generate(prefix_ids, max_new):
+        return next(seq)
+
+    return generate
+
+
+def test_rollout_one_records_grows_prefix_with_verbatim_sampled_tokens():
+    """The multi-turn OPD prefix MUST be the accumulated on-policy TOKEN STREAM, not a re-render of the
+    message history — a re-render would strip prior-turn reasoning on non-round-tripping templates and
+    desync the student's loss prefix from what it actually sampled. Assert each turn's prefix_ids grows
+    and literally CONTAINS the previous turn's sampled ids + the deduped env glue."""
+    env = FakeEnv()  # 1 env (user) turn, stops after 2 assistant turns
+    gen = _records_generator(
+        [_gen_obj([CONTENT["a1"], END], "a1"), _gen_obj([CONTENT["GOOD"], END], "GOOD")]
+    )
+    records = rollout_one_records(
+        example={"answer": "GOOD"},
+        active_env=env,
+        render=render,
+        generate=gen,
+        env_glue=realistic_env_glue,  # LEADS with END -> exercises the seam dedup
+        max_turns=8,
+        per_turn_max_tokens=16,
+    )
+    assert len(records) == 2
+    p0, p1 = records[0]["prefix_ids"], records[1]["prefix_ids"]
+    # turn 0 prefix = the initial rendered prompt (no completion yet).
+    assert p0 == render([{"role": "user", "content": "u1"}], True)
+    # turn 1 prefix strictly extends turn 0 with the VERBATIM sampled turn-0 ids, then the env glue with
+    # its duplicate LEADING terminator collapsed: realistic_env_glue([u2]) is [END, *render([u2],True)],
+    # and the leading END dups a1's own END so it is dropped, leaving exactly render([u2], True).
+    assert p1 == [*p0, CONTENT["a1"], END, *render([{"role": "user", "content": "u2"}], True)]
+    assert len(p1) > len(p0)
+    # context_messages is the parallel TEXT history the teacher conditions on, growing per turn.
+    assert records[0]["context_messages"] == [{"role": "user", "content": "u1"}]
+    assert {"role": "assistant", "content": "a1"} in records[1]["context_messages"]
+
+
+def test_rollout_one_records_truncated_turn_halts_episode():
+    """A turn that did not terminate naturally (truncated) is RECORDED (so the caller counts it) but
+    ENDS the episode — a student that can't end its turn shouldn't keep generating, and its broken turn
+    must not pollute a later turn's context. env_reply is never reached."""
+    calls = {"env_reply": 0}
+
+    class _Env(FakeEnv):
+        def env_reply(self, messages, state):
+            calls["env_reply"] += 1
+            return super().env_reply(messages, state)
+
+    env = _Env()
+    gen = _records_generator([_gen_obj(None, "", truncated=True)])
+    records = rollout_one_records(
+        example={"answer": "GOOD"},
+        active_env=env,
+        render=render,
+        generate=gen,
+        env_glue=realistic_env_glue,
+        max_turns=8,
+        per_turn_max_tokens=16,
+    )
+    assert len(records) == 1
+    assert records[0]["gen"].truncated is True
+    assert calls["env_reply"] == 0  # halted before the env stepped
+
+
+def test_make_env_glue_rejects_non_verbatim_template():
+    """make_env_glue's probe trick only works when the chat template inserts assistant content
+    verbatim; a template that doesn't (so the probe can't be located) must HARD-FAIL, never silently
+    produce skewed glue. This is the load-bearing guard that keeps a non-round-tripping model from
+    training/serving skew."""
+
+    class _BadTok:
+        def apply_chat_template(self, messages, **kw):
+            return "template-that-drops-assistant-content"
+
+    glue = make_env_glue(_BadTok(), thinking=False)
+    with pytest.raises(ValueError, match="could not uniquely locate its probe"):
+        glue([{"role": "user", "content": "obs"}])
