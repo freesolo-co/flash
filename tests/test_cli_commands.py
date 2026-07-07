@@ -517,27 +517,30 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "TRAINING.md" in out
 
 
-def test_env_setup_multi_turn_scaffolds_opd_with_single_turn_warning(
+def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """`flash env setup --multi-turn` scaffolds all three configs (sft/rl/opd) so opd.toml is present
-    in both modes — but opd is single-turn only (run_opd rejects multi-turn), so the multi-turn opd.toml
-    and the starter env docstring must say so loudly rather than hand the user a config that fails fast."""
+    """`flash env setup --multi-turn` scaffolds all three configs (sft/rl/opd). opd now supports
+    multi-turn (it rolls out each episode and distils every assistant turn), so the multi-turn opd.toml
+    and the starter env docstring must NOT warn it is single-turn only / fails fast."""
     monkeypatch.chdir(tmp_path)
 
     assert _run(["env", "setup", "--multi-turn"]) == 0
 
     env_py = (tmp_path / "environment.py").read_text()
     assert "EnvironmentMultiTurn" in env_py  # genuinely a multi-turn scaffold
-    assert "OPD (configs/opd.toml)" in env_py  # docstring documents opd's single-turn limitation
+    # the docstring documents all three algorithms train off the multi-turn env (no opd carve-out)
+    assert "distils EVERY assistant turn" in env_py
+    assert "single-turn only" not in env_py
     # all three algorithm configs are scaffolded in multi-turn mode too
     for name in ("configs/sft.toml", "configs/rl.toml", "configs/opd.toml"):
         assert (tmp_path / name).is_file(), name
     opd_text = (tmp_path / "configs/opd.toml").read_text()
     assert 'algorithm = "opd"' in opd_text
-    # ...but the multi-turn opd.toml warns it is single-turn only and will fail fast on this env
-    assert "SINGLE-TURN only" in opd_text
-    assert "fail fast" in opd_text
+    # ...and the multi-turn opd.toml notes it distils every assistant turn, with NO fail-fast warning
+    assert "distils EVERY assistant turn" in opd_text
+    assert "SINGLE-TURN only" not in opd_text
+    assert "fail fast" not in opd_text
     assert "configs/opd.toml" in capsys.readouterr().out
 
 
