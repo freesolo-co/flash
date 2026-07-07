@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import re
 import sys
 import threading
 import time
@@ -188,6 +189,41 @@ def test_liveness_heartbeat_first_progress_sample_is_baseline_not_progress(monke
         "a never-advancing counter must emit only liveness pings"
     )
     assert all(step == 57 for _, step in seen), "pings still stamp the baseline step"
+
+
+def test_liveness_heartbeat_keepalive_forces_real_heartbeats_on_constant_progress(monkeypatch):
+    """keepalive=True: a synchronous checkpoint/finalize upload freezes global_step (a CONSTANT
+    counter), which — per the test above — would emit ONLY liveness pings, and those do NOT advance
+    the provider's stall clock (surface_heartbeat returns stage=None for them). A healthy upload that
+    outlasts STALL_AFTER_S would then be killed mid-save. keepalive forces a REAL (liveness=False)
+    heartbeat every tick, still stamped with the step so a cancel landing here still bills it."""
+    hb, w, _ = _liveness_env(monkeypatch)
+    seen: list = []
+    monkeypatch.setattr(w, "heartbeat", lambda s, **k: seen.append((k.get("liveness"), k.get("step"))))
+    with hb.liveness_heartbeat(
+        "checkpoint_uploading", progress=lambda: 42, progress_step=True, keepalive=True
+    ):
+        time.sleep(0.2)
+    assert seen, "must emit while alive"
+    assert all(liveness is False for liveness, _ in seen), (
+        "keepalive must emit REAL (stall-clock-advancing) heartbeats even when progress never advances"
+    )
+    assert all(step == 42 for _, step in seen), "keepalive still stamps the step for cancel billing"
+
+
+def test_checkpoint_uploading_keepalive_stage_is_throttled_on_tight_cadence():
+    """The checkpoint-upload keepalive daemon re-emits a REAL heartbeat every 30s, so it MUST be
+    throttled (else ~120/hr blows the HF commit cap) AND ride the tighter setup-liveness interval, so
+    the provider stall clock is refreshed well inside STALL_AFTER_S rather than every _HB_MIN_INTERVAL_S."""
+    import flash.engine.worker as ne
+    from flash.providers._poll import STALL_AFTER_S
+
+    assert "checkpoint_uploading" in ne._HB_UPLOAD_LIVENESS_STAGES
+    assert "checkpoint_uploading" in ne._HB_TIGHT_LIVENESS_STAGES
+    assert "checkpoint_uploading" in ne._HB_THROTTLED_STAGES
+    assert ne._HB_UPLOAD_LIVENESS_STAGES <= ne._HB_THROTTLED_STAGES
+    # tight interval must leave margin under the training stall window (a single refresh must land).
+    assert ne._HB_SETUP_LIVENESS_INTERVAL_S < STALL_AFTER_S
 
 
 def test_liveness_heartbeat_survives_inline_thread_stub(monkeypatch):
@@ -785,7 +821,11 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
     mod = importlib.import_module(modname)
     src = inspect.getsource(getattr(mod, outer))
     for stage in stages:
-        assert f'liveness_heartbeat("{stage}"' in src, f"{outer} must wrap the {stage} phase"
+        # Formatting-robust: the stage string may sit on the next line when the call wraps to fit the
+        # line length (e.g. once keepalive=True is added to the finalize wrap).
+        assert re.search(rf'liveness_heartbeat\(\s*"{re.escape(stage)}"', src), (
+            f"{outer} must wrap the {stage} phase"
+        )
 
 
 def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():

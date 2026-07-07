@@ -839,13 +839,25 @@ def cmd_cancel(args) -> int:
     else:
         print(json.dumps(payload, indent=2))
     if checkpoints:
-        top = max(c["step"] for c in checkpoints)
+        # Best-effort hint (the cancel already succeeded), so never crash on a malformed checkpoint
+        # shape: coerce steps defensively — a dict missing 'step' or carrying a non-int must not raise
+        # a traceback here. Only surface the `step-N` deploy example when we recovered a real step.
+        steps = []
+        for c in checkpoints:
+            try:
+                steps.append(int(c["step"]))
+            except (KeyError, TypeError, ValueError):
+                continue
         # stderr in the plain path so the machine-readable stdout JSON stays untouched.
         out = sys.stdout if render.styled() else sys.stderr
-        msg = (
+        base = (
             f"{len(checkpoints)} deployable checkpoint(s) survive this cancel — list with "
-            f"`flash checkpoints {args.run_id}`, deploy one with "
-            f"`flash deploy {args.run_id}/step-{top}`."
+            f"`flash checkpoints {args.run_id}`"
+        )
+        msg = (
+            f"{base}, deploy one with `flash deploy {args.run_id}/step-{max(steps)}`."
+            if steps
+            else f"{base}."
         )
         print(render.note(msg) if render.styled() else msg, file=out)
     return 0
