@@ -19,7 +19,8 @@ from flash.engine.worker.perf import optimal_attn_impl
 
 
 def make_lora(model_id: str | None = None):
-    """Build LoRA config targeting all linear layers; vision tower excluded for VL models."""
+    """Build LoRA config targeting all linear layers (VL models included: the vision tower /
+    projector / MTP linears are adapted too; on text-only data they simply get no gradient)."""
     from peft import LoraConfig
 
     targets = "all-linear"
@@ -39,11 +40,6 @@ def make_lora(model_id: str | None = None):
     )
     # rsLoRA removed: ~5.6x effective LR inflation with catalog LRs causes SFT divergence + serve corruption.
     kwargs["use_rslora"] = False
-    if model_id and targets == "all-linear":
-        exclude = _w.lora_exclude_modules(model_id)
-        if exclude:
-            kwargs["exclude_modules"] = exclude
-            print(f"[lora] excluding modules for {model_id}: {exclude}")
     return LoraConfig(**kwargs)
 
 
@@ -135,15 +131,16 @@ def _init_adapter_model(model_id: str):
     attn_kw = {"attn_implementation": _attn} if _attn else {}
 
     if adapter_is_vl_warmstart(adir, model_id):
-        grpo_rank = _w.JOB_SPEC.train.lora_rank if _w.JOB_SPEC else RECIPE.lora.rank
+        algo = (getattr(_w.JOB_SPEC, "algorithm", None) or "grpo").upper()
+        new_rank = _w.JOB_SPEC.train.lora_rank if _w.JOB_SPEC else RECIPE.lora.rank
         max_rank = serving_lora_rank_cap(model_id)
-        sft_rank, grpo_rank, recombined_rank = validate_recombined_lora_rank(
-            adir, grpo_rank, max_rank=max_rank
+        old_rank, new_rank, recombined_rank = validate_recombined_lora_rank(
+            adir, new_rank, max_rank=max_rank, algo=algo
         )
         cap_note = f"serving cap {max_rank}" if max_rank is not None else "no catalog serving cap"
         print(
             "[init-adapter] VL warm-start rank preflight: "
-            f"SFT rank {sft_rank} + GRPO rank {grpo_rank} = deploy rank {recombined_rank} "
+            f"warm-start rank {old_rank} + {algo} rank {new_rank} = deploy rank {recombined_rank} "
             f"({cap_note})"
         )
         merged_dir = _merge_vl_warmstart_adapter(adir, model_id, attn_kw)

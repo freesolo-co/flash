@@ -54,6 +54,8 @@ from flash.engine.worker.heartbeat import (
     _HB_TERMINAL_ONLY_INTERVAL_S,
     _HB_TERMINAL_STAGES,
     _HB_THROTTLED_STAGES,
+    _HB_TIGHT_LIVENESS_STAGES,
+    _HB_UPLOAD_LIVENESS_STAGES,
     _HB_UPLOAD_LOCK,
     _SFT_HEARTBEAT_INTERVAL_S,
     _STEP_GPU_DIAG_INTERVAL_S,
@@ -77,22 +79,16 @@ from flash.engine.worker.hf import (
 )
 from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
 from flash.engine.worker.lora import (
-    _LM_SYNC_REMAP_ON,
-    _VL_EXCLUDE_SEGMENTS,
-    _remap_vl_sync_weights,
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
     disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
-    lora_exclude_modules,
     patch_grpo_mask_aware_lm_head,
-    patch_vllm_language_model_only,
-    patch_vllm_lm_weight_sync,
     recombine_lora_adapters,
     strip_language_model_infix,
-    vllm_language_model_only_kwargs,
 )
+from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,
@@ -144,14 +140,43 @@ ATTEMPT = os.environ.get("ATTEMPT", "")
 JOB_SPEC = load_job_spec_from_env()
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl") else "sft"),
+    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
 
 _HB_LAST_UPLOAD = 0.0
 _HB_LAST_PROGRESS_TS = 0.0
+# progress-carry latch: SEQ counts real (non-liveness) heartbeat calls; UPLOADED_SEQ is the newest
+# real call whose snapshot actually committed to HF. SEQ > UPLOADED_SEQ means progress happened that
+# HF has not seen (throttled away or a failed upload), so the next liveness ping is upgraded to a
+# real heartbeat. Without this, a liveness ping can win the shared upload slot and defer the real
+# per-step heartbeat past the provider's stall window, killing a healthy run.
+_HB_PROGRESS_SEQ = 0
+_HB_PROGRESS_UPLOADED_SEQ = 0
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
-# per-repo commit cap while staying under the provider poller's 1200s training stall window.
+# per-repo commit cap while staying under the provider poller's training stall window
+# (STALL_AFTER_S=1500s in flash/providers/_poll.py).
 _HB_MIN_INTERVAL_S = 900.0
+# Highest optimizer step whose heartbeat has been COMMITTED. A force=True heartbeat (opd's
+# post-optimizer-step ping) bypasses the 900s throttle iff its step exceeds this — i.e. force is gated
+# on STEP ADVANCE, not elapsed time. That lands every distinct completed step exactly once (so a cancel
+# always bills the true latest step, never a stale one a mid-step progress ping left behind) while
+# self-limiting forced commits to the actual optimizer-step rate: redundant same-step/liveness pings
+# stay throttled below, and opd_step advances are teacher-round-trip-gated (minutes apart), so forced
+# commits stay far under the HF per-repo cap without a time floor that would blind-spot fast steps.
+_HB_LAST_COMMITTED_STEP = 0
+# A forced (post-optimizer-step) commit bypasses the 900s throttle on STEP ADVANCE so a cancel bills the
+# true latest step. But a tiny/smoke OPD config (batch=1, group=1, small student, fast/cached teacher)
+# can land optimizer steps many times per MINUTE, and forcing every one would blow the HF per-repo commit
+# cap before the final adapter/DONE upload. So forced commits are additionally throttled to at most one
+# per _HB_FORCE_MIN_INTERVAL_S -- but the floor is measured from the last FORCED commit
+# (_HB_LAST_FORCED_UPLOAD), not any upload, so a force still punches through IMMEDIATELY after an
+# unrelated (liveness / mid-step) commit stole the slot carrying a stale step (exactly when force is
+# needed). Net: when steps are farther apart than the floor (the normal teacher-round-trip-gated regime)
+# every distinct step still commits exactly once (exact cancel-billing preserved); only a sub-floor BURST
+# is coalesced, bounding the cancel under-bill to one floor-window of steps while keeping forced commits
+# under the HF cap (codex[bot]).
+_HB_LAST_FORCED_UPLOAD = 0.0
+_HB_FORCE_MIN_INTERVAL_S = 60.0
 # Setup liveness is the user-visible signal during cold model download/load. Keep it below common
 # external "frozen heartbeat" thresholds without relaxing the noisy per-step training throttle.
 _HB_SETUP_LIVENESS_INTERVAL_S = 240.0
@@ -220,7 +245,14 @@ def _finalize(metrics: RunMetrics):
     with open("/tmp/DONE", "w") as f:
         f.write(str(time.time()))
     hf_upload_file("/tmp/DONE", "DONE", required=True)
-    heartbeat("done", gpu=gpu_diagnostics())
+    # Carry the completed optimizer step onto the terminal `done` heartbeat. Without it, a cancel that
+    # races the DONE upload (this stepless `done` heartbeat recorded, but the poller hasn't transitioned
+    # the run to done yet) prices from actual_steps_run(), which treats `done` as a non-training stage
+    # with no step and floors a fully-trained run to 0 (codex[bot]). RunMetrics.step carries the
+    # completed optimizer updates for opd; None (other phases) -> stepless as before.
+    _step = metrics.step
+    _step_field = {"step": int(_step)} if isinstance(_step, (int, float)) and _step > 0 else {}
+    heartbeat("done", **_step_field, gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
 
 
@@ -282,6 +314,7 @@ def main():
         modes = {
             "sft": run_sft,
             "rl": run_rl,
+            "opd": run_opd,
         }
         handler = modes.get(RUN_MODE)
         if handler is None:
@@ -325,21 +358,26 @@ __all__ = [
     "RUN_MODE",
     "SEED",
     "THINKING",
+    "_HB_FORCE_MIN_INTERVAL_S",
+    "_HB_LAST_COMMITTED_STEP",
+    "_HB_LAST_FORCED_UPLOAD",
     "_HB_LAST_PROGRESS_TS",
     "_HB_LAST_UPLOAD",
     "_HB_LOCK",
     "_HB_MIN_INTERVAL_S",
+    "_HB_PROGRESS_SEQ",
+    "_HB_PROGRESS_UPLOADED_SEQ",
     "_HB_SETUP_LIVENESS_INTERVAL_S",
     "_HB_SETUP_LIVENESS_STAGES",
     "_HB_TERMINAL_ONLY",
     "_HB_TERMINAL_ONLY_INTERVAL_S",
     "_HB_TERMINAL_STAGES",
     "_HB_THROTTLED_STAGES",
+    "_HB_TIGHT_LIVENESS_STAGES",
+    "_HB_UPLOAD_LIVENESS_STAGES",
     "_HB_UPLOAD_LOCK",
-    "_LM_SYNC_REMAP_ON",
     "_SFT_HEARTBEAT_INTERVAL_S",
     "_STEP_GPU_DIAG_INTERVAL_S",
-    "_VL_EXCLUDE_SEGMENTS",
     "_WANDB_FINISH_FAIL_WAIT_S",
     "_WANDB_FINISH_WAIT_S",
     "RetriableInfraError",
@@ -364,7 +402,6 @@ __all__ = [
     "_metric_curve",
     "_neutralize_tilelang_cudart_stub",
     "_peak_gpu_gb",
-    "_remap_vl_sync_weights",
     "_remove_fla_from_disk",
     "_reset_peak_gpu",
     "_resolve_adapter_ref",
@@ -398,7 +435,6 @@ __all__ = [
     "is_vl_checkpoint",
     "liger_on",
     "load_mega_cache",
-    "lora_exclude_modules",
     "loraplus_optimizer_cls",
     "main",
     "make_checkpoint_upload_callback",
@@ -408,8 +444,6 @@ __all__ = [
     "optimal_attn_impl",
     "patch_grpo_mask_aware_lm_head",
     "patch_trl_colocate_llm_kwargs",
-    "patch_vllm_language_model_only",
-    "patch_vllm_lm_weight_sync",
     "prefetch_model",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
@@ -420,6 +454,7 @@ __all__ = [
     "require_vllm_for_rollout_func",
     "resolve_grpo_prompts_per_step",
     "rl_per_device_comps",
+    "run_opd",
     "run_rl",
     "run_sft",
     "setup_perf_backends",
@@ -428,7 +463,6 @@ __all__ = [
     "think_token_count",
     "thinking_text",
     "upload_debug_jsonl",
-    "vllm_language_model_only_kwargs",
     "wait_for_gpu",
     "wandb_finish",
     "wandb_report_to",

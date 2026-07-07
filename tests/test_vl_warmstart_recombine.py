@@ -199,7 +199,7 @@ def test_recombine_rejects_rank_above_serving_cap(tmp_path):
     _write_adapter(grpo, modules=MODULES, r=16, alpha=32, seed=2)
     _set_base(sft, "Qwen/Qwen3.5-4B")
 
-    with pytest.raises(ValueError, match=r"rank-stacked SFT\+GRPO adapter would be rank 72"):
+    with pytest.raises(ValueError, match=r"rank-stacked deploy adapter would be rank 72"):
         recombine_lora_adapters(sft, grpo, out)
 
 
@@ -220,7 +220,9 @@ def test_init_adapter_model_preflights_vl_recombined_rank_before_model_load(tmp_
     import flash.engine.worker.adapter as worker_adapter
 
     sft = str(tmp_path / "sft")
-    _write_adapter(sft, modules=MODULES, r=24, alpha=48, seed=1)
+    # 4B serving cap is 64: warm-start rank 56 + GRPO rank 16 = 72 > 64, so the preflight must REJECT
+    # before ever loading the model (the fake ``peft`` below would fail if we reached the merge).
+    _write_adapter(sft, modules=MODULES, r=56, alpha=112, seed=1)
     peft = types.ModuleType("peft")
     peft.PeftModel = object
     monkeypatch.setitem(sys.modules, "peft", peft)
@@ -239,7 +241,7 @@ def test_init_adapter_model_preflights_vl_recombined_rank_before_model_load(tmp_
         raising=False,
     )
 
-    with pytest.raises(ValueError, match=r"SFT rank 24 \+ GRPO rank 16"):
+    with pytest.raises(ValueError, match=r"warm-start adapter rank 56 \+ GRPO rank 16"):
         worker_adapter._init_adapter_model("Qwen/Qwen3.5-4B")
 
 

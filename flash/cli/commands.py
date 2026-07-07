@@ -210,11 +210,14 @@ A managed run should use the returned [environment] id from
 This starter implements a tiny "guess the secret number" game so you can see the
 episode hooks wired end-to-end. Replace it with your real task before a real run.
 
-Both SFT and GRPO train off this file:
+SFT and GRPO train off this file; OPD (configs/opd.toml) does NOT support multi-turn:
 - GRPO (configs/rl.toml) rolls out full episodes and optimizes `score_episode`.
 - SFT (configs/sft.toml) learns the gold trajectory. Provide it per row as
   `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
   `output` for a single gold assistant turn.
+- OPD (configs/opd.toml) distils one sampled completion per prompt and cannot drive the
+  turn loop, so it is single-turn only — `flash train configs/opd.toml` fails fast here.
+  Use OPD with a single-turn env (`flash env setup --single-turn`).
 """
 
 from __future__ import annotations
@@ -487,6 +490,37 @@ def cmd_env_setup(args) -> int:
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
+    opd = Path("configs/opd.toml")
+    if not opd.exists():
+        # opd (on-policy distillation) is SINGLE-TURN only: it samples one completion per prompt and
+        # cannot drive a multi-turn/tool episode loop, so `flash train configs/opd.toml` FAILS FAST on a
+        # multi-turn env (run_opd rejects it at setup). Scaffold it in both modes for reference, but say
+        # so loudly in the multi-turn one so the config isn't a footgun.
+        opd_multiturn_note = (
+            "# NOTE: opd is SINGLE-TURN only — it distils one sampled completion per prompt and cannot\n"
+            "# drive this multi-turn environment's episode loop, so `flash train configs/opd.toml` will\n"
+            "# fail fast here. Use configs/rl.toml (grpo) or configs/sft.toml for multi-turn; keep opd for\n"
+            "# a single-turn env (`flash env setup --single-turn`).\n\n"
+            if multi_turn
+            else ""
+        )
+        opd.write_text(
+            f"{opd_multiturn_note}"
+            'model = "Qwen/Qwen3.5-4B"\n'
+            'algorithm = "opd"   # on-policy distillation from a Fireworks GLM teacher (single-turn only)\n\n'
+            "# Environment: upload this project folder with\n"
+            "# `flash env push --name my-env .`, then paste the returned id below.\n"
+            "# FIREWORKS_API_KEY (the GLM teacher key) is read from your shell/.env at submit time.\n"
+            "[environment]\n"
+            'id = ""\n'
+            'secrets = ["FIREWORKS_API_KEY"]\n\n'
+            "[train]\n"
+            "steps = 100                     # opd is step-driven (like GRPO)\n"
+            "lora_rank = 32\n"
+            '# teacher_model = "accounts/fireworks/models/glm-5p2"   # Fireworks GLM teacher (default)\n'
+            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
+        )
     training = Path("TRAINING.md")
     if not training.exists():
         # Explicit UTF-8: TRAINING_MD has non-ASCII chars that raise UnicodeEncodeError under a non-UTF-8 locale.
@@ -496,6 +530,7 @@ def cmd_env_setup(args) -> int:
         "dataset/train.jsonl",
         "configs/sft.toml",
         "configs/rl.toml",
+        "configs/opd.toml",
         "TRAINING.md",
     ]
     if render.styled():
@@ -655,6 +690,13 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         step = heartbeat.get("step")
         if step is not None:
             parts.append(f"step={step}")
+        # live heartbeat age so a long quiet phase reads as "alive, throttled" not "frozen".
+        # minute granularity: the non-TTY follow path prints a line whenever this string changes,
+        # so a seconds-precision age would emit one line per poll.
+        ts = heartbeat.get("ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            mins = int(max(0.0, time.time() - ts) // 60)
+            parts.append(f"hb={mins}m" if mins else "hb=<1m")
     realized = status.get("realized_cost_usd")
     if realized is not None:
         if isinstance(realized, (int, float)):
@@ -783,12 +825,44 @@ def cmd_runs(args) -> int:
 
 
 def cmd_cancel(args) -> int:
-    status = client_from_config().cancel_run(args.run_id)
+    client = client_from_config()
+    status = client.cancel_run(args.run_id)
     payload = {"run_id": args.run_id, "state": status["state"]}
+    # A cancelled run is not necessarily worthless: every completed save interval already streamed
+    # a deployable checkpoint, even though the run shows adapter_ref=null / cost=0. Surface the
+    # surviving steps here so the run isn't discarded unseen. Best-effort: cancel never fails on it.
+    checkpoints: list[dict] = []
+    if payload["state"] == "cancelled":
+        try:
+            checkpoints = client.checkpoints(args.run_id)
+        except Exception:
+            checkpoints = []
     if render.styled():
         print(render.cancelled(payload))
     else:
         print(json.dumps(payload, indent=2))
+    if checkpoints:
+        # Best-effort hint (the cancel already succeeded), so never crash on a malformed checkpoint
+        # shape: coerce steps defensively — a dict missing 'step' or carrying a non-int must not raise
+        # a traceback here. Only surface the `step-N` deploy example when we recovered a real step.
+        steps = []
+        for c in checkpoints:
+            try:
+                steps.append(int(c["step"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        # stderr in the plain path so the machine-readable stdout JSON stays untouched.
+        out = sys.stdout if render.styled() else sys.stderr
+        base = (
+            f"{len(checkpoints)} deployable checkpoint(s) survive this cancel — list with "
+            f"`flash checkpoints {args.run_id}`"
+        )
+        msg = (
+            f"{base}, deploy one with `flash deploy {args.run_id}/step-{max(steps)}`."
+            if steps
+            else f"{base}."
+        )
+        print(render.note(msg) if render.styled() else msg, file=out)
     return 0
 
 
@@ -797,7 +871,7 @@ def cmd_checkpoints(args) -> int:
     if not checkpoints:
         message = (
             f"no deployable checkpoints for {args.run_id} yet "
-            "(RL streams one per save interval; SFT-only runs have none)."
+            "(RL/opd stream one per save interval; SFT-only runs have none)."
         )
         if render.styled():
             print(render.empty("checkpoints", "0 deployable", message))

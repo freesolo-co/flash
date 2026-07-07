@@ -168,3 +168,5 @@ def test_worker_phase_matches_agent_algorithm_enum() -> None:
 
     assert JobSpec(algorithm="grpo").phase == "rl"
     assert JobSpec(algorithm="sft").phase == "sft"
+    # opd's phase is its own name (only grpo is special-cased to 'rl').
+    assert JobSpec(algorithm="opd").phase == "opd"
