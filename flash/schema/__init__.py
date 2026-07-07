@@ -21,7 +21,6 @@ from flash.schema.fields import (
     _train_float,
     _train_int,
     _train_stops,
-    _train_str,
     _wandb_spec,
     _worker_env,
 )
