@@ -210,8 +210,6 @@ _TRAIN_KEYS = frozenset(
         "stop_sequences",
         "max_steps",
         "max_examples",
-        # on-policy distillation (algorithm="opd")
-        "teacher_model",
     }
 )
 
@@ -222,7 +220,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):
             hint = (
-                " — GRPO/SFT/opd knobs (group_size, batch_size, max_tokens, teacher_model, …) "
+                " — GRPO/SFT/opd knobs (group_size, batch_size, max_tokens, …) "
                 "belong under [train], not a [grpo]/[sft]/[opd] table"
             )
         raise ConfigError(
@@ -358,7 +356,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
-            teacher_model=_train_str(train_raw, "teacher_model"),
         ),
         gpu=GpuSpec(type=gpu_type),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
@@ -389,24 +386,13 @@ def _validate_grpo(spec: JobSpec) -> None:
 
 
 def _validate_opd(spec: JobSpec) -> None:
-    """OPD contract: step-driven (positive steps), a priced teacher, and a usable prompt budget.
+    """OPD contract: step-driven (positive steps) with a usable prompt budget.
 
     The teacher key (FIREWORKS_API_KEY) is a platform-owned credential the control plane injects into
     the worker env (build_worker_env), like HF_TOKEN — never a user-declared secret."""
     if spec.train.steps is not None and spec.train.steps <= 0:
         # OPD is step-driven (on-policy sampling), like GRPO — not epoch-driven.
         raise ConfigError("train.steps must be positive for opd")
-    if spec.train.teacher_model:
-        # Reject an unpriced teacher override at parse time: falling back to the default rate would
-        # make both the submit-time quote and the final charge wrong for a differently-priced model.
-        from flash.cost.facts import TEACHER_USD_PER_1M
-
-        if spec.train.teacher_model not in TEACHER_USD_PER_1M:
-            raise ConfigError(
-                f"[train] teacher_model {spec.train.teacher_model!r} has no pricing entry, so its "
-                f"cost quote and charge would silently use the default rate. Use a priced teacher "
-                f"({', '.join(sorted(TEACHER_USD_PER_1M))}) or add an entry in flash/cost/facts.py."
-            )
     if spec.train.max_length:
         # Mirror run_opd's prompt-budget guard at PARSE time: a max_length that leaves no room for
         # any prompt after the completion budget is rejected here, BEFORE a paid worker is
