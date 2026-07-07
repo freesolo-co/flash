@@ -155,6 +155,42 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
         assert out.gpu_status["gpu_util_pct"] == 94
 
 
+def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch):
+    """The finalize-phase daemon pings (liveness=True, stage sft_finalizing, step stamped) must
+    land in status.last_heartbeat intact: cancel billing reads .step from the freshest persisted
+    heartbeat, and the CLI reads .stage/.ts/.liveness for the status panel."""
+    with tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        from flash.spec import JobSpec, TrainSpec
+
+        status = runner.submit_job(
+            JobSpec(
+                run_id="hbf",
+                model="Qwen/Qwen3.5-4B",
+                algorithm="sft",
+                train=TrainSpec(max_examples=8),
+            ),
+            dry_run=True,
+        )
+        status.state = "running"
+        runner._save_status(status)
+
+        runner.record_heartbeat(
+            "hbf",
+            {"stage": "sft_finalizing", "step": 126, "ts": 123.0, "liveness": True},
+        )
+        out = runner.get_status("hbf")
+        assert out.last_heartbeat["stage"] == "sft_finalizing"
+        assert out.last_heartbeat["step"] == 126
+        assert out.last_heartbeat["liveness"] is True
+        assert runner.actual_steps_run(out) == 126, (
+            "a cancel during finalize must bill the actual steps trained"
+        )
+
+
 def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypatch):
     """finished_at freezes the training-teardown time on the FIRST terminal transition and is NOT
     moved by later updated_at bumps (heartbeat/deploy/reconcile) — so reconciliation has an
