@@ -9,216 +9,24 @@ CPU-importable.
 
 from __future__ import annotations
 
-# Module-path segments that must never receive LoRA on natively-multimodal checkpoints
-# trained text-only: the vision tower / projector / MTP head. Critically, adapters that
-# DO touch them cannot be loaded by vLLM in text-only (language_model_only) serving —
-# its LoRA loader rejects "unexpected modules" (observed with Qwen3.5-2B).
-_VL_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "multi_modal_projector", "mtp")
+# Natively-multimodal model types (Qwen3.5/3.6). Their LoRA adapters adapt the FULL module
+# tree — vision tower / projector / MTP head included, like every other linear (on text-only
+# data those get no gradient, so their lora_B stays zero-init). The engine loads and serves
+# the whole VL model (vision tower included); there is no text-only / language_model_only path.
+_VL_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "qwen3_6")
 
 
-def lora_exclude_modules(model_id: str) -> str | None:
-    """Regex (peft fullmatch semantics) excluding vision-tower modules from LoRA.
-
-    Returns None when no exclusion is needed (pure text architectures). NOTE: peft's
-    list-form exclude_modules uses suffix matching (like target_modules), which does
-    NOT match leaf modules under 'visual.*' — a regex string is required.
-    """
-    excludes = {
-        "qwen3_5": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_5_moe": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_6": _VL_EXCLUDE_SEGMENTS,
-    }
+def is_vl_checkpoint(model_id: str) -> bool:
+    """True for natively-multimodal checkpoints (Qwen3.5/3.6) — routes VL warm-start handling."""
     try:
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         model_type = getattr(cfg, "model_type", "") or ""
     except Exception as e:
-        print("lora_exclude_modules: config probe failed:", e)
-        return None
-    segments = excludes.get(model_type)
-    if not segments:
-        return None
-    alt = "|".join(segments)
-    return rf"(^|.*\.)({alt})(\..*|$)"
-
-
-def is_vl_checkpoint(model_id: str) -> bool:
-    """True for natively-multimodal checkpoints we train/serve text-only (Qwen3.5/3.6)."""
-    return bool(lora_exclude_modules(model_id))
-
-
-def vllm_language_model_only_kwargs(model_id: str) -> dict:
-    """Engine kwargs to skip the vision tower for VL checkpoints (vLLM >= 0.19).
-
-    Besides wasting VRAM, the vision tower's attention path hardcodes vLLM's bundled
-    flash-attn, whose PTX needs a newer driver JIT than many RTX 5090 hosts have
-    ("PTX compiled with unsupported toolchain") — text-only loading sidesteps it and
-    is the officially supported way to run Qwen3.5 as a pure LLM.
-    """
-    return {"language_model_only": True} if is_vl_checkpoint(model_id) else {}
-
-
-def patch_vllm_language_model_only(model_id: str) -> bool:
-    """Force ``language_model_only=True`` on vLLM engines created by third-party code
-    (TRL's colocated GRPO rollout engine) for VL checkpoints. Returns True if patched."""
-    extra = vllm_language_model_only_kwargs(model_id)
-    if not extra:
+        print("is_vl_checkpoint: config probe failed:", e)
         return False
-    try:
-        import vllm
-
-        if getattr(vllm.LLM.__init__, "_flash_lmo_patched", False):
-            return True
-        orig = vllm.LLM.__init__
-
-        def patched(self, *args, **kwargs):
-            kwargs.setdefault("language_model_only", True)
-            return orig(self, *args, **kwargs)
-
-        patched._flash_lmo_patched = True
-        vllm.LLM.__init__ = patched
-        print(f"[vllm] language_model_only patch active for {model_id}")
-        return True
-    except Exception as e:
-        print("patch_vllm_language_model_only warn:", e)
-        return False
-
-
-# Flipped to True only AFTER the GRPO trainer (and its colocated vLLM engine + initial
-# checkpoint load) is constructed, but BEFORE ``trainer.train()`` runs the first weight sync.
-# See ``patch_vllm_lm_weight_sync``. A module dict (not a bare bool) so the gating flag is shared
-# by reference between this module and the worker package that flips it.
-_LM_SYNC_REMAP_ON = {"on": False}
-
-
-def _remap_vl_sync_weights(weights):
-    """Rewrite TRL's trainer weight names to vLLM's VL-engine names for the train-time sync.
-
-    The trainer (built via ``AutoModelForCausalLM``) names its LM params under ``model.*`` while the
-    colocated vLLM engine loaded the same checkpoint as ``Qwen3_5ForConditionalGeneration`` whose LM
-    params live under ``language_model.*``. Each incoming ``(name, tensor)`` is remapped per the form
-    the trainer's checkpoint class produced:
-
-    - peft wrapper: a ``base_model.model.`` prefix (a continued/merged-adapter sync surfacing
-      base-model names through the PeftModel wrapper) is STRIPPED first, so the rules below apply to
-      the unwrapped name.
-    - multimodal-named trainer (``model.language_model.*`` / ``model.visual.*`` / ``lm_head.*`` — what
-      ``AutoModelForCausalLM`` yields when it resolves the FULL ``*ForConditionalGeneration``, e.g. the
-      Qwen3.6-35B-A3B MoE): passed through UNTOUCHED, because vLLM's own ``hf_to_vllm_mapper`` already
-      maps these. Prepending ``language_model.`` here would double the prefix and crash the fused-MoE
-      expert lookup (see the inline comment).
-    - text-only dense trainer (bare ``model.*`` — the dense Qwen3.5 family's ``Qwen3_5ForCausalLM``,
-      no infix, no vision tower): prefixed with ``language_model.`` so it lands under
-      ``language_model.model.*``.
-    - anything already ``language_model.*`` (or otherwise unmatched): passed through untouched.
-
-    A generator so vLLM's loader still streams one (name, tensor) at a time.
-    """
-    for name, tensor in weights:
-        # A continued-adapter (PeftModel) sync can surface names through the peft wrapper as
-        # ``base_model.model.model.layers.*`` / ``base_model.model.lm_head.*``; strip the wrapper
-        # so the same model./lm_head. rule applies.
-        if name.startswith("base_model.model."):
-            name = name[len("base_model.model.") :]
-        # MULTIMODAL-named trainers: when AutoModelForCausalLM resolves the checkpoint to the FULL
-        # ``*ForConditionalGeneration`` (the Qwen3.6-35B-A3B MoE does — its params are
-        # ``model.language_model.*`` / ``model.visual.*`` / ``lm_head.*``), the vLLM engine's OWN
-        # ``hf_to_vllm_mapper`` already maps these (``model.language_model.`` -> ``language_model.model.``,
-        # ``model.visual.`` -> ``visual.``, ``lm_head.`` -> ``language_model.lm_head.``). Pass them
-        # through UNTOUCHED so the sync is byte-identical to the proven initial on-disk load.
-        # Prepending ``language_model.`` here would yield ``language_model.model.language_model.*``,
-        # which the mapper's ``startswith("model.language_model.")`` rule no longer matches -> the
-        # fused-MoE expert lookup then crashes with
-        # ``KeyError: 'language_model.layers.N.mlp.experts.w13_weight'`` (the ``.model.`` segment is
-        # lost in the AutoWeightsLoader recursion).
-        if name.startswith(("model.language_model.", "model.visual.", "lm_head.")):
-            yield name, tensor
-            continue
-        # TEXT-ONLY trainers: the dense Qwen3.5 family resolves to ``Qwen3_5ForCausalLM``
-        # (``model.layers.*`` / ``model.norm`` / ``model.embed_tokens``, no infix, no vision tower).
-        # The mapper has NO bare-``model.`` rule, so prepend ``language_model.`` ourselves to land
-        # them under ``language_model.model.*`` (unchanged behavior for dense GRPO).
-        if name.startswith("model."):
-            name = "language_model." + name
-        yield name, tensor
-
-
-def patch_vllm_lm_weight_sync(model_id: str) -> bool:
-    """Make TRL's GRPO ``sync_weights`` work for ``*ForConditionalGeneration`` checkpoints
-    (the whole Qwen3.5/3.6 family). Returns True if any vLLM model class was patched.
-
-    The trainer loads via ``AutoModelForCausalLM`` so its params are named ``model.layers.*`` /
-    ``model.norm`` / ``model.embed_tokens`` / ``lm_head.*``. vLLM loads the same checkpoint as
-    ``Qwen3_5ForConditionalGeneration`` whose LM params live under ``language_model.*``. TRL's
-    ``sync_weights`` pushes the trainer names verbatim, so vLLM's loader raises "There is no module
-    or parameter named 'model' in Qwen3_5ForConditionalGeneration" at the first generation step and
-    GRPO dies (even with ``language_model_only=True``: that only skips loading the vision tower, it
-    does NOT rename the surviving LM params out from under ``language_model.``).
-
-    The fix wraps the vLLM model class ``load_weights`` to remap incoming ``model.``/``lm_head.``
-    names to ``language_model.*`` (see ``_remap_vl_sync_weights``) — but ONLY while
-    ``_LM_SYNC_REMAP_ON`` is set. The INITIAL checkpoint load (during trainer construction) runs
-    with it OFF, so vLLM's own ``hf_to_vllm_mapper`` handles the on-disk checkpoint untouched; the
-    remap activates only for the train-time TRL syncs. The flag is flipped on between trainer
-    construction and ``train()``. Works for BOTH from-base and warm-started (init_from_adapter)
-    GRPO. No-op for non-VL checkpoints."""
-    if not is_vl_checkpoint(model_id):
-        return False
-    patched_any = False
-    try:
-        import importlib
-
-        # The dense class is REQUIRED for the whole Qwen3.5/3.6 family — if its module/class can't
-        # be imported (vLLM not installed where it should be, or the class renamed in a new vLLM)
-        # we must NOT silently no-op: the run would crash again at the first ``sync_weights()`` with
-        # a far less actionable error. Log loudly for the required one; the MoE class is OPTIONAL
-        # (only some models are MoE, and older vLLM lacks the module) so its absence stays quiet.
-        for mod_name, cls_name, required in (
-            ("vllm.model_executor.models.qwen3_5", "Qwen3_5ForConditionalGeneration", True),
-            # NB: the MoE class lives in the SAME ``qwen3_5`` module (there is no ``qwen3_5_moe``
-            # module). It also inherits the dense class's (patched) ``load_weights``, but patch it
-            # explicitly too so the remap is guaranteed active for the MoE rollout engine.
-            ("vllm.model_executor.models.qwen3_5", "Qwen3_5MoeForConditionalGeneration", False),
-        ):
-            try:
-                mod = importlib.import_module(mod_name)
-            except Exception as e:
-                mod = None
-                if required:
-                    print(
-                        f"[vllm] WARN patch_vllm_lm_weight_sync: could not import required module "
-                        f"{mod_name} ({e!r}); GRPO weight-sync will NOT be remapped and the run may "
-                        f"crash at the first sync_weights() for this VL checkpoint."
-                    )
-            cls = getattr(mod, cls_name, None) if mod is not None else None
-            if cls is None:
-                if required and mod is not None:
-                    print(
-                        f"[vllm] WARN patch_vllm_lm_weight_sync: module {mod_name} imported but has "
-                        f"no {cls_name} (vLLM API changed?); GRPO weight-sync will NOT be remapped "
-                        f"and the run may crash at the first sync_weights() for this VL checkpoint."
-                    )
-                continue
-            if getattr(cls.load_weights, "_flash_sync_patched", False):
-                continue
-            orig_load = cls.load_weights
-
-            def _make_patched(orig):
-                def patched(self, weights, *args, **kwargs):
-                    if _LM_SYNC_REMAP_ON["on"]:
-                        weights = _remap_vl_sync_weights(weights)
-                    return orig(self, weights, *args, **kwargs)
-
-                patched._flash_sync_patched = True
-                return patched
-
-            cls.load_weights = _make_patched(orig_load)
-            patched_any = True
-            print(f"[vllm] LM weight-sync name patch installed for {cls_name} (gated)")
-    except Exception as e:
-        print("patch_vllm_lm_weight_sync warn:", e)
-    return patched_any
+    return model_type in _VL_MODEL_TYPES
 
 
 def patch_grpo_mask_aware_lm_head(trainer) -> bool:
@@ -361,22 +169,18 @@ def disable_liger_grpo_torch_compile(trainer) -> bool:
 
 
 # --------------------------------------------------------------------------------------------
-# Warm-start (init_from_adapter) SFT-adapter key remap for VL checkpoints.
+# Warm-start (init_from_adapter) SFT-adapter key namespace for VL checkpoints.
 #
 # SFT (run_sft) trains the FULL multimodal model: ``SFTTrainer(model=model_id,
 # peft_config=make_lora(...))`` loads ``Qwen3_5ForConditionalGeneration`` whose LM modules live
 # under ``language_model.``, so the SAVED adapter's keys are
-# ``base_model.model.model.language_model.layers.X...``. But warm-started GRPO
-# (``_init_adapter_model``) loads the base via ``AutoModelForCausalLM`` — a TEXT-ONLY module tree
-# whose LoRA targets are named ``base_model.model.model.layers.X...`` (no ``language_model.``
-# infix). ``PeftModel.from_pretrained`` then can't match the SFT keys: peft logs a *warning* about
-# missing adapter keys and SILENTLY keeps the fresh zero-init LoRA, so the SFT is thrown away and
-# GRPO restarts from the base model (observed: linkd-search warm-start reward ~= 0.001).
-#
-# Stripping the ``.language_model.`` infix from the saved adapter keys makes them line up with the
-# ``AutoModelForCausalLM`` trainer (proven workaround: remapped adapters train correctly). We keep
-# the trainer as ``AutoModelForCausalLM`` so the train-time vLLM weight-sync remap
-# (``patch_vllm_lm_weight_sync`` / ``_remap_vl_sync_weights``) stays consistent.
+# ``base_model.model.model.language_model.layers.X...``. Warm-started GRPO (``_init_adapter_model``)
+# loads the base via ``AutoModelForCausalLM``; when that resolves to the TEXT-ONLY module tree its
+# LoRA targets are named ``base_model.model.model.layers.X...`` (no ``language_model.`` infix), so
+# the two adapters name the SAME modules differently. ``strip_language_model_infix`` lines them up
+# for the ``recombine_lora_adapters`` SFT⊕GRPO stacking (deploy-time), then the recombine re-emits
+# the serving ``language_model`` namespace. ``_LANGUAGE_MODEL_INFIX`` is also the signal
+# ``adapter_is_vl_warmstart`` reads to detect a VL warm-start adapter from its keys.
 
 _LANGUAGE_MODEL_INFIX = ".language_model."
 
@@ -651,13 +455,12 @@ def recombine_lora_adapters(
 
     # Normalize the ``.language_model.`` infix on BOTH adapters' keys before comparing/stacking.
     # The VL merge warm-start (#296) trains the SFT against the FULL multimodal model, so the SFT
-    # adapter's keys carry the infix (``base_model.model.model.language_model.layers...``), while the
-    # fresh GRPO LoRA is saved by the text-only ``AutoModelForCausalLM`` trainer with no infix
-    # (``base_model.model.model.layers...`` — see _remap_vl_sync_weights / the warm-start remap note).
-    # Without this, the equivalent LM modules compare as DIFFERENT targets and the recombine wrongly
-    # aborts for the default Qwen3.5 warm-start path. The normalized form is only an INTERNAL math key:
-    # if either source adapter used the VL ``language_model`` namespace for a tensor, the recombined
-    # output uses that same serving-compatible key instead of the stripped text-only key.
+    # adapter's keys carry the infix (``base_model.model.model.language_model.layers...``), while a
+    # GRPO LoRA saved by the text-only ``AutoModelForCausalLM`` trainer has no infix
+    # (``base_model.model.model.layers...``). Without this, the equivalent LM modules compare as
+    # DIFFERENT targets and the recombine wrongly aborts. The normalized form is only an INTERNAL math
+    # key: if either source adapter used the VL ``language_model`` namespace for a tensor, the
+    # recombined output uses that same serving-compatible key instead of the stripped text-only key.
     def _normalize_infix(sd, which):
         norm: dict = {}
         infixed_keys: dict[str, str] = {}
