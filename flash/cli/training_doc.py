@@ -377,15 +377,16 @@ SFT is **epoch-driven** (`epochs`); GRPO is **step-driven** (`steps`).
 ## On-policy distillation (`algorithm = "opd"`)
 
 Pick distillation when a much stronger **teacher** model can grade your student's work
-token-by-token. The student samples on-policy (like GRPO), a Fireworks-hosted GLM teacher scores
+token-by-token. The student samples on-policy (like GRPO), the managed GLM 5.2 teacher scores
 each of *its own* completions, and a dense per-token loss teaches the student to match the teacher —
 far more sample-efficient than reward-based RL and with no reward to design. It is **step-driven**
 (`steps`) and produces a LoRA served exactly like SFT.
 
-- **No teacher key to set up.** The Fireworks key for the GLM teacher is platform-managed: the
+- **No teacher key or model override to set up.** The GLM 5.2 teacher and its Fireworks key are platform-managed: the
   service supplies its own key to every opd run, so there is nothing to export or declare — an opd
-  run submits like any other. (Bring-your-own teacher keys are not supported; a `FIREWORKS_API_KEY`
-  in your shell is simply ignored.) The key is never stored in the spec or needed at serving time.
+  run submits like any other. Bring-your-own teacher models and keys are not supported; a
+  `FIREWORKS_API_KEY` in your shell is simply ignored. The key is never stored in the spec or
+  needed at serving time.
 - **The student (Qwen / MiniCPM / Kimi) and the teacher (GLM) have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai *spider* / Tinker
   method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
@@ -413,7 +414,6 @@ id = "your-org/my-env"
 [train]
 steps = 100
 lora_rank = 32
-# teacher_model = "accounts/fireworks/models/glm-5p2"   # Fireworks GLM teacher (default)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 ```
 

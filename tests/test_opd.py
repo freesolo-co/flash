@@ -537,23 +537,22 @@ def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     assert opd_rollout_seq_len(4096, 8192, False) == 4096  # explicit max_length pins the sequence
 
 
-def test_opd_rejects_unpriced_teacher_model_but_accepts_priced():
+def test_opd_rejects_teacher_model_override():
     from flash.schema import ConfigError, spec_from_dict
 
-    def _spec(teacher):
-        return spec_from_dict(
+    with pytest.raises(ConfigError, match="teacher_model"):
+        spec_from_dict(
             {
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"steps": 5, "hf_repo": "owner/runs", "teacher_model": teacher},
+                "train": {
+                    "steps": 5,
+                    "teacher_model": "accounts/fireworks/models/glm-5p2",
+                },
             },
             run_id="x",
         )
-
-    _spec("accounts/fireworks/models/glm-5p2")  # priced -> ok
-    with pytest.raises(ConfigError):
-        _spec("accounts/fireworks/models/mystery-9000")  # unpriced override -> reject at parse
 
 
 def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
@@ -2706,7 +2705,6 @@ def test_opd_spec_json_round_trip():
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {
                 "steps": 25,
-                "teacher_model": "accounts/fireworks/models/glm-5p1",
                 "hf_repo": "owner/runs",
             },
         },
@@ -2715,7 +2713,6 @@ def test_opd_spec_json_round_trip():
     restored = JobSpec.from_json(spec.to_json())
     assert restored == spec
     assert restored.phase == "opd"
-    assert restored.train.teacher_model == "accounts/fireworks/models/glm-5p1"
     # The teacher key is platform-managed (control-plane-injected into the worker env, like
     # HF_TOKEN) — NOT a user secret, so it is never added to environment.secrets.
     assert "FIREWORKS_API_KEY" not in restored.environment.secrets

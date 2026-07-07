@@ -103,7 +103,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
             "publishes an untrained adapter. Omit the field to use the default, or set a positive value."
         )
     return OpdKnobs(
-        teacher_model=opt("teacher_model", "") or d.teacher_model,
+        teacher_model=d.teacher_model,
         teacher_base_url=d.teacher_base_url,
         steps=int(opt("steps", 0) or d.num_steps),
         learning_rate=float(opt("learning_rate", 0) or d.learning_rate),
