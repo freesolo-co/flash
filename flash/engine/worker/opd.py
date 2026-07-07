@@ -54,11 +54,6 @@ from flash.engine.worker.perf import (
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 
-# Upper bound on teacher-scoring HTTP calls fired concurrently within one optimizer step. Generation
-# (GPU) and the gkd loss forward/backward stay serial on the main thread; only the (dominant) teacher
-# Fireworks round-trips for a step's samples are overlapped, so this caps the fan-out into the API.
-_TEACHER_SCORE_MAX_WORKERS = 8  # bound concurrent GLM/Fireworks scoring calls per step
-
 
 @dataclass(frozen=True)
 class OpdKnobs:
@@ -108,7 +103,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
             "publishes an untrained adapter. Omit the field to use the default, or set a positive value."
         )
     return OpdKnobs(
-        teacher_model=opt("teacher_model", "") or d.teacher_model,
+        teacher_model=d.teacher_model,
         teacher_base_url=d.teacher_base_url,
         steps=int(opt("steps", 0) or d.num_steps),
         learning_rate=float(opt("learning_rate", 0) or d.learning_rate),
@@ -202,12 +197,17 @@ def _student_model(model_id, mik, device):
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM
 
-    # init_model is the base id (fresh run) or the VL SFT-merged dir; both load as a causal LM — the
-    # merged dir preserves the catalog arch + remote code, so this matches the base load the fresh
-    # path already uses on Qwen3.5. The fresh LoRA excludes vision modules via make_lora.
-    base = AutoModelForCausalLM.from_pretrained(init_model, trust_remote_code=True, **mik).to(
-        device
-    )
+    model_cls = AutoModelForCausalLM
+    if getattr(_w, "_VL_WARMSTART_SFT_DIR", None) or _w.is_vl_checkpoint(model_id):
+        # VL checkpoints are trained/served on the full multimodal tree, including visual linears.
+        # The warm-start recombine path also requires the fresh OPD adapter to target that same tree.
+        from transformers import AutoModelForImageTextToText
+
+        model_cls = AutoModelForImageTextToText
+
+    # init_model is the base id (fresh run) or the VL SFT-merged dir. Non-VL runs keep the lighter
+    # causal-LM loader; VL runs load the full multimodal model so all-linear LoRA sees every target.
+    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **mik).to(device)
     return get_peft_model(base, init_peft)
 
 
@@ -668,16 +668,20 @@ def run_opd():
                             # Feed the stall clock during the (serial, up-to-~900s-each) generations;
                             # nseq is still 0 here since no loss has landed yet this step.
                             _opd_progress(opt_steps, nseq)
-                # Phase 2 (concurrent, NETWORK only): fire the teacher scoring calls for every scorable
-                # rollout at once, bounded by _TEACHER_SCORE_MAX_WORKERS. _score_one touches only the
-                # stateless teacher HTTP client + Python strings (no torch/model/shared mutable state),
-                # so the round-trips overlap safely; truncated/empty/U+FFFD rollouts are never scored.
+                # Phase 2 (concurrent, NETWORK only): fire the teacher scoring calls for EVERY scorable
+                # rollout at once — the fan-out cap is the step's own completion count
+                # (prompts_per_step * group_size), so every sample in a step is scored in parallel (one
+                # round-trip of wall time) and the concurrency self-scales when group_size is raised
+                # (no queueing 8-at-a-time). The teacher endpoint's own rate limit is the real ceiling;
+                # 429s retry inside _score_one. _score_one touches only the stateless teacher HTTP client
+                # + Python strings (no torch/model/shared mutable state), so the round-trips overlap
+                # safely; truncated/empty/U+FFFD rollouts are never scored.
                 scorable = [i for i, p in enumerate(pending) if not (p.gen.skip or p.gen.truncated)]
                 _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
                 if scorable:
                     permanent_err = None
                     with ThreadPoolExecutor(
-                        max_workers=min(len(scorable), _TEACHER_SCORE_MAX_WORKERS)
+                        max_workers=min(len(scorable), knobs.prompts_per_step * knobs.group_size)
                     ) as pool:
                         fut_to_idx = {
                             pool.submit(
