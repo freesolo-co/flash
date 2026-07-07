@@ -307,6 +307,147 @@ def test_sft_step_liveness_upload_is_throttled(monkeypatch):
     assert len(uploads) == 1, "sft_step uploads must be throttled to one per _HB_MIN_INTERVAL_S"
 
 
+def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
+    """Regression (codex[bot], heartbeat.py/opd.py): a mid-step opd_step progress ping (carrying the
+    PREVIOUS opt_steps) can claim the throttle slot immediately before the post-update ping (the
+    incremented step). Without force the stepped commit is throttled out, so a cancellation is billed
+    from the STALE step even though the update landed. heartbeat(force=True) must upload within the
+    throttle interval; a NON-forced opd_step in the same window is still throttled."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+    ne.heartbeat("opd_step", step=5, samples_done=1)  # mid-step ping claims the slot (stale step 5)
+    assert len(uploads) == 1
+    ne.heartbeat("opd_step", step=6, samples_done=2)  # normal ping within 60s -> throttled out
+    assert len(uploads) == 1, "a non-forced opd_step within the interval must be throttled"
+    ne.heartbeat("opd_step", step=6, loss=0.1, coverage=1.0, force=True)  # post-update forces through
+    assert len(uploads) == 2, "force=True must commit the stepped post-update ping despite the throttle"
+
+
+def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
+    """Regression (cursor[bot], heartbeat.py): when optimizer steps land FARTHER apart than the force
+    floor (the normal teacher-round-trip-gated regime), every DISTINCT completed step still commits
+    exactly once within the 900s throttle window, so a cancel always bills the true latest step — none
+    is dropped. (A sub-floor BURST is instead coalesced to protect the HF commit cap; see the burst test
+    below.) Modelled with a zero force floor: each advancing step exceeds it, so none is floored out."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+    for stepv in (1, 2, 3, 4):
+        ne.heartbeat("opd_step", step=stepv, loss=0.1, force=True)
+    assert len(uploads) == 4, "each distinct forced step advance beyond the floor must commit"
+    assert ne._HB_LAST_COMMITTED_STEP == 4
+
+
+def test_forced_opd_step_burst_within_floor_coalesces_to_protect_commit_cap(monkeypatch):
+    """Regression (codex[bot], heartbeat.py): a tiny/fast OPD config (batch=1, group=1, small student,
+    cached teacher) can land optimizer updates many times per minute. Unthrottled, force=True would turn
+    every post-step ping into an HF commit and blow the per-repo commit cap before the final adapter/DONE
+    upload. Forced commits are floored: the FIRST advance in a sub-floor burst commits, the rest within
+    _HB_FORCE_MIN_INTERVAL_S coalesce (the persisted step then lags by at most one floor window — a
+    bounded, customer-favouring cancel under-bill)."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = time.time()  # a recent upload -> the 900s regular throttle blocks every ping
+    ne._HB_LAST_FORCED_UPLOAD = 0.0  # forced clock cold -> only the first advance punches through
+    ne._HB_LAST_COMMITTED_STEP = 0
+    for stepv in (1, 2, 3, 4, 5):
+        ne.heartbeat("opd_step", step=stepv, loss=0.1, force=True)
+    assert len(uploads) == 1, "a sub-floor burst of forced step-advances must commit once, not per step"
+    assert ne._HB_LAST_COMMITTED_STEP == 1
+
+
+def test_force_commit_via_regular_throttle_arms_the_floor(monkeypatch):
+    """Regression (cursor[bot], heartbeat.py): a force=True heartbeat that commits because the regular
+    throttle was ALREADY due (not because the force branch bypassed it) must STILL arm the forced-commit
+    clock — else the clock stays stale and a following sub-floor forced ping punches through, defeating
+    the burst coalescing that protects the HF commit cap."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0  # regular throttle is DUE -> the first force commits via it, not the bypass
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+    ne.heartbeat("opd_step", step=1, loss=0.1, force=True)  # commits via the elapsed regular throttle
+    assert len(uploads) == 1
+    ne.heartbeat("opd_step", step=2, loss=0.1, force=True)  # sub-floor advance -> must be COALESCED now
+    assert len(uploads) == 1, "the regular-path force commit must arm the floor so the next is coalesced"
+    assert ne._HB_LAST_COMMITTED_STEP == 1
+
+
+def test_forced_opd_step_repeated_same_step_does_not_recommit(monkeypatch):
+    """Self-limiting counterpart: a forced ping whose step does NOT advance past the last committed step
+    (a redundant post-update carrying the same opt_steps, or a retry) stays throttled. So forcing can't
+    inflate commits beyond the actual optimizer-step rate and blow the HF per-repo commit cap."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+    ne.heartbeat("opd_step", step=7, loss=0.1, force=True)  # first commit at step 7
+    assert len(uploads) == 1
+    for _ in range(3):  # same step, within throttle -> force must NOT re-commit
+        ne.heartbeat("opd_step", step=7, loss=0.1, force=True)
+    assert len(uploads) == 1, "forced pings that don't advance the step must not re-commit"
+    assert ne._HB_LAST_COMMITTED_STEP == 7
+
+
+def test_forced_opd_step_commit_failure_rolls_back_committed_step(monkeypatch):
+    """If a forced commit's upload FAILS, the committed-step marker AND the forced-commit clock roll back
+    with the throttle slot — so the retry at the same step still forces through (fstep must again exceed
+    the last committed step, and the floor must not treat the failed attempt as a landed forced commit
+    that delays the retry). Otherwise the failed step would be recorded as committed / the retry would be
+    floored out, and a cancel would bill the stale prior step. (Force floor zeroed so the two forced
+    attempts here aren't coalesced — that path is the burst test.)"""
+    import flash.engine.worker as ne
+
+    attempts: list = []
+    fail = {"on": False}
+
+    def _upload(local, *a, **k):
+        attempts.append(1)
+        return not fail["on"]
+
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ne, "hf_upload_file", _upload)
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+    ne.heartbeat("opd_step", step=2, force=True)  # succeeds -> committed step = 2, slot claimed
+    assert ne._HB_LAST_COMMITTED_STEP == 2
+    forced_clock_after_2 = ne._HB_LAST_FORCED_UPLOAD  # any force=True commit arms the forced clock
+    fail["on"] = True
+    ne.heartbeat("opd_step", step=3, force=True)  # forces (3>2) within throttle, but upload FAILS
+    assert ne._HB_LAST_COMMITTED_STEP == 2, "a failed forced commit must roll back the committed step"
+    assert forced_clock_after_2 == ne._HB_LAST_FORCED_UPLOAD, "and roll back the forced clock"
+    fail["on"] = False
+    ne.heartbeat("opd_step", step=3, force=True)  # retry: still throttled by time, must force on 3>2
+    assert ne._HB_LAST_COMMITTED_STEP == 3
+    assert len(attempts) == 3, "the retry must re-attempt the upload, not be throttled/blocked out"
+
+
 def test_setup_liveness_upload_uses_shorter_interval(monkeypatch):
     """Setup liveness must refresh public status before a 300s external frozen-heartbeat watchdog,
     while training-step liveness stays under the normal shared-repo throttle."""
@@ -512,11 +653,14 @@ def test_is_training_heartbeat_gates_setup_vs_training():
     # the silent cold first step keeps setup grace.
     assert is_training_heartbeat("rl_step", 0) is False
     assert is_training_heartbeat("sft_step", 0) is False
+    assert is_training_heartbeat("opd_step", 0) is False  # opd first-step in-progress ping (opt_steps==0)
     assert is_training_heartbeat("rl_step", 1) is True
     assert is_training_heartbeat("sft_step", 3) is True
+    assert is_training_heartbeat("opd_step", 1) is True  # tightens once a real optimizer update lands
     # A malformed/missing step on a per-step stage is treated as 0 (must not raise) -> stays setup.
     assert is_training_heartbeat("rl_step", None) is False
     assert is_training_heartbeat("sft_step", "not-a-number") is False
+    assert is_training_heartbeat("opd_step", None) is False
     # POST-training stages carry NO step but mean training is DONE -> tighten so a hung teardown/DONE
     # upload falls under the tight window, not the wide setup grace (the MqsTh fix).
     assert is_training_heartbeat("rl_trained", None) is True

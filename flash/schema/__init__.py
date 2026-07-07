@@ -8,6 +8,7 @@ import tomllib
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.engine.recipe import FIREWORKS_API_KEY_SECRET
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -21,6 +22,7 @@ from flash.schema.fields import (
     _train_float,
     _train_int,
     _train_stops,
+    _train_str,
     _wandb_spec,
     _worker_env,
 )
@@ -35,7 +37,7 @@ _CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
-    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl)/"
+    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|opd)/"
     rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
 )
 
@@ -209,8 +211,23 @@ _TRAIN_KEYS = frozenset(
         "stop_sequences",
         "max_steps",
         "max_examples",
+        # on-policy distillation (algorithm="opd")
+        "teacher_model",
     }
 )
+
+# Secrets an algorithm cannot run without — auto-declared (name-only) on the [environment].secrets
+# tuple so a keyless run fails fast in the client/server runtime-secret gate before any GPU is
+# provisioned. OPD needs the Fireworks teacher key. Values stay out-of-band (never in the spec).
+# Each gate unions the spec's declared secrets on top of the global default (which no longer carries
+# the teacher key, so SFT/GRPO don't receive it).
+_REQUIRED_SECRETS: dict[str, tuple[str, ...]] = {"opd": (FIREWORKS_API_KEY_SECRET,)}
+
+
+def _with_required_secrets(algorithm: str, declared: tuple[str, ...]) -> tuple[str, ...]:
+    """Append any secrets ``algorithm`` requires that the config didn't already declare."""
+    missing = tuple(s for s in _REQUIRED_SECRETS.get(algorithm, ()) if s not in declared)
+    return (*declared, *missing)
 
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
@@ -218,10 +235,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
     if unknown:
         hint = ""
-        if {"grpo", "sft"} & set(unknown):
+        if {"grpo", "sft", "opd"} & set(unknown):
             hint = (
-                " — GRPO/SFT knobs (group_size, batch_size, max_tokens, …) belong under [train], "
-                "not a [grpo]/[sft] table"
+                " — GRPO/SFT/opd knobs (group_size, batch_size, max_tokens, teacher_model, …) "
+                "belong under [train], not a [grpo]/[sft]/[opd] table"
             )
         raise ConfigError(
             f"unknown config section(s): {', '.join(unknown)} "
@@ -267,7 +284,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError("[environment] pip must be a list of strings")
     if env_raw.get("pip") is not None and not all(isinstance(p, str) for p in env_raw["pip"]):
         raise ConfigError("[environment] pip entries must be strings")
-    environment_secrets = _environment_secrets(env_raw.get("secrets"))
+    environment_secrets = _with_required_secrets(
+        algorithm, _environment_secrets(env_raw.get("secrets"))
+    )
     train_raw = raw.get("train")
     if train_raw is None:
         train_raw = {}
@@ -356,6 +375,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
+            teacher_model=_train_str(train_raw, "teacher_model"),
         ),
         gpu=GpuSpec(type=gpu_type),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
@@ -368,20 +388,72 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     return spec
 
 
+def _validate_sft(spec: JobSpec) -> None:
+    """SFT contract: positive epochs, and a positive row count to price/train against."""
+    if spec.train.epochs is not None and spec.train.epochs <= 0:
+        raise ConfigError("train.epochs must be positive for SFT")
+    if int(spec.train.max_examples or 0) <= 0:
+        raise ConfigError(
+            "train.max_examples must be set to a positive row count for SFT "
+            "(use the full dataset row count for an uncapped run)"
+        )
+
+
+def _validate_grpo(spec: JobSpec) -> None:
+    """GRPO contract: step-driven, so steps (when pinned) must be positive."""
+    if spec.train.steps is not None and spec.train.steps <= 0:
+        raise ConfigError("train.steps must be positive for GRPO")
+
+
+def _validate_opd(spec: JobSpec) -> None:
+    """OPD contract: step-driven (positive steps), a priced teacher, and a usable prompt budget.
+
+    The teacher key (FIREWORKS_API_KEY) is auto-declared as a required secret in spec_from_dict, so a
+    keyless opd run already fails fast in the client/server runtime-secret gate."""
+    if spec.train.steps is not None and spec.train.steps <= 0:
+        # OPD is step-driven (on-policy sampling), like GRPO — not epoch-driven.
+        raise ConfigError("train.steps must be positive for opd")
+    if spec.train.teacher_model:
+        # Reject an unpriced teacher override at parse time: falling back to the default rate would
+        # make both the submit-time quote and the final charge wrong for a differently-priced model.
+        from flash.cost.facts import TEACHER_USD_PER_1M
+
+        if spec.train.teacher_model not in TEACHER_USD_PER_1M:
+            raise ConfigError(
+                f"[train] teacher_model {spec.train.teacher_model!r} has no pricing entry, so its "
+                f"cost quote and charge would silently use the default rate. Use a priced teacher "
+                f"({', '.join(sorted(TEACHER_USD_PER_1M))}) or add an entry in flash/cost/facts.py."
+            )
+    if spec.train.max_length:
+        # Mirror run_opd's prompt-budget guard at PARSE time: a max_length that leaves no room for
+        # any prompt after the completion budget is rejected here, BEFORE a paid worker is
+        # provisioned (wait_for_gpu + model prefetch + tokenizer/adapter load), instead of failing
+        # deterministically only after GPU setup. max_completion resolves exactly as the worker does:
+        # explicit [train] max_tokens, else the recipe thinking/non-thinking default.
+        from flash.engine.vram import opd_completion_len
+
+        max_completion = opd_completion_len(spec.train.max_tokens, spec.thinking)
+        if spec.train.max_length - max_completion < 1:
+            raise ConfigError(
+                f"[train] max_length ({spec.train.max_length}) leaves no prompt budget after "
+                f"max_tokens ({max_completion}) for opd; set max_length > max_tokens. Rejected at "
+                f"parse time so an invalid budget fails before a GPU worker is provisioned."
+            )
+
+
+# Each algorithm's spec-level contract lives in ONE validator, dispatched by name so a new algorithm
+# adds a function + a map entry rather than another scattered ``if spec.algorithm == ...`` block.
+_ALGO_VALIDATORS = {"sft": _validate_sft, "grpo": _validate_grpo, "opd": _validate_opd}
+
+
 def _validate_spec(spec: JobSpec) -> None:
     try:
         canonical_gpu(spec.gpu.type)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
-    if spec.algorithm == "grpo" and spec.train.steps is not None and spec.train.steps <= 0:
-        raise ConfigError("train.steps must be positive for GRPO")
-    if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
-        raise ConfigError("train.epochs must be positive for SFT")
-    if spec.algorithm == "sft" and int(spec.train.max_examples or 0) <= 0:
-        raise ConfigError(
-            "train.max_examples must be set to a positive row count for SFT "
-            "(use the full dataset row count for an uncapped run)"
-        )
+    validator = _ALGO_VALIDATORS.get(spec.algorithm)
+    if validator is not None:
+        validator(spec)
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
