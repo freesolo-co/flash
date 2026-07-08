@@ -561,6 +561,7 @@ def run_opd():
         f"ctx={seq_cap} lora_rank={lora_rank} util={vllm_kwargs['gpu_memory_utilization']:.2f} "
         f"rollout_batch={vllm_kwargs.get('rollout_batch_size') or 'auto'}"
     )
+    t_vllm_init = time.time()
     with liveness_heartbeat("opd_vllm_initializing"):
         vllm_rollout = OpdVllmRolloutEngine(
             model_source=rollout_model_source,
@@ -573,6 +574,8 @@ def run_opd():
             **vllm_kwargs,
         )
         vllm_rollout.sync_from_model(model)
+    vllm_init_seconds = time.time() - t_vllm_init
+    print(f"[opd] vLLM rollout initialized in {vllm_init_seconds:.1f}s")
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=knobs.learning_rate
@@ -1079,6 +1082,9 @@ def run_opd():
             "vllm_kv_cache_dtype": vllm_kwargs.get("kv_cache_dtype"),
             "vllm_rollout_batch_size": vllm_kwargs.get("rollout_batch_size"),
             "vllm_max_num_batched_tokens": vllm_kwargs.get("max_num_batched_tokens"),
+            "vllm_enforce_eager": vllm_kwargs.get("enforce_eager"),
+            "vllm_compilation_config": vllm_kwargs.get("compilation_config"),
+            "vllm_init_seconds": vllm_init_seconds,
             "vllm_lora_syncs": getattr(vllm_rollout, "sync_count", None),
             "opd_rollout_pipeline_chunks": (
                 _opd_rollout_pipeline_chunks(ppl_step * group) if not multi_turn else None
