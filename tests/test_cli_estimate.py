@@ -22,8 +22,8 @@ GRPO_RAW = {
         "steps": 50,
         "group_size": 8,
         "batch_size": 16,
-        "max_tokens": 512,
-        "max_length": 2048,
+        "max_completion_tokens": 512,
+        "max_context_tokens": 2048,
         "hf_repo": "owner/runs",
     },
     "gpu": {"type": "RTX 5090"},
@@ -49,7 +49,7 @@ def test_runconfig_from_grpo_spec_maps_fields():
     assert cfg.steps == 50
     assert cfg.batch_size == 16
     assert cfg.group_size == 8
-    assert cfg.completion_len == 512  # GRPO max_tokens
+    assert cfg.completion_len == 512  # GRPO max_completion_tokens
     assert cfg.seq_len == 2048
     assert cfg.environment == "github:freesolo-co/envs@main:gsm8k/environment.py"
 
@@ -185,7 +185,7 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
         "train": {
             "hf_repo": "owner/runs",
-            "max_examples": 320, "batch_size": 6, "epochs": 2, "max_length": 1024,
+            "max_examples": 320, "batch_size": 6, "epochs": 2, "max_context_tokens": 1024,
         },
         "gpu": {"type": "RTX 4090"},
     }

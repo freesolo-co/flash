@@ -24,8 +24,8 @@ def _sft_seq_len(spec) -> int:
 
     t = spec.train
     return (
-        int(t.max_length)
-        if t.max_length is not None
+        int(t.max_context_tokens)
+        if t.max_context_tokens is not None
         else (RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
     )
 
@@ -101,8 +101,8 @@ def runconfig_from_spec(spec) -> RunConfig:
         model_id=spec.model,
         method=spec.algorithm,
         steps=spec_steps(spec),
-        seq_len=t.max_length,
-        completion_len=t.max_tokens if has_rollout else None,
+        seq_len=t.max_context_tokens,
+        completion_len=t.max_completion_tokens if has_rollout else None,
         batch_size=t.batch_size,
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,

@@ -18,7 +18,7 @@ def test_required_vram_catalog_and_open(monkeypatch):
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 4.0)
     est = vram.estimate_vram_gb(4.0, "grpo")
 
-    # Default GRPO (no [train].max_length) sizes at the run's REAL engine length, mirroring
+    # Default GRPO (no [train].max_context_tokens) sizes at the run's REAL engine length, mirroring
     # run_rl()'s max(1024, rl.max_prompt_len + completion) = 2048 + 320 = 2368 tokens (NOT a flat
     # 1024). At 2368 the 4.7B param estimate is ~31.8 GB raw -> 35 GB with headroom, so a 32 GB card
     # is no longer a safe fit and the allocator escalates to the cheapest validated >=35 GB class.
@@ -58,7 +58,7 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
 
     # 4B SFT (seq 1024, rank 8) down-routes below 24 GB in the matrix (see test_required_vram_*).
     a = allocator.allocate(
-        "Qwen/Qwen3.5-4B", "sft", train={"max_length": 1024, "lora_rank": 8}
+        "Qwen/Qwen3.5-4B", "sft", train={"max_context_tokens": 1024, "lora_rank": 8}
     )
     assert a.min_vram_gb < 24  # a sub-24 GB run the synthetic unvalidated card also fits
     # The synthetic class is cheaper and fits, yet is excluded because it is unvalidated.
@@ -228,27 +228,27 @@ def test_required_vram_policy_floors_and_downrouting():
 
     m4 = "Qwen/Qwen3.5-4B"
     # context length lifts GRPO need monotonically
-    short = need(m4, "grpo", train={"max_length": 1024, "max_tokens": 256})
-    long = need(m4, "grpo", train={"max_length": 16384, "max_tokens": 4096})
+    short = need(m4, "grpo", train={"max_context_tokens": 1024, "max_completion_tokens": 256})
+    long = need(m4, "grpo", train={"max_context_tokens": 16384, "max_completion_tokens": 4096})
     assert long > short
     # sub-1B GRPO fits a 24 GB card; 2B GRPO OOMs 24 (MEASURED) -> needs the 32 tier; small SFT
     # drops below the catalog default (32)
     assert need("Qwen/Qwen3.5-0.8B", "grpo") <= 24
     assert 24 < need("Qwen/Qwen3.5-2B", "grpo") <= 32
-    assert need(m4, "sft", train={"max_length": 1024, "lora_rank": 8}) < 32
+    assert need(m4, "sft", train={"max_context_tokens": 1024, "lora_rank": 8}) < 32
     # 9B GRPO is bf16 (QLoRA dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
     # importance ratio -> no learning), so colocated GRPO needs an 80GB-class card.
     assert need("Qwen/Qwen3.5-9B", "grpo") >= 80  # bf16 colocate: 80GB floor
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 8192, "max_tokens": 2048, "group_size": 8}) >= 80
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 4096, "group_size": 8}) >= 80
+    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 2048, "group_size": 8}) >= 80
+    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 4096, "group_size": 8}) >= 80
     # group size and thinking never DECREASE the requirement
-    base = need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 4})
-    assert need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 16}) >= base
-    assert need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 4}, thinking=True) >= base
+    base = need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4})
+    assert need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 16}) >= base
+    assert need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4}, thinking=True) >= base
     # max_tokens (completion length) lifts the fp32-logits term -> a longer completion never sizes
     # DOWN, and a much longer one sizes UP (the term the estimator previously ignored).
-    short_c = need(m4, "grpo", train={"max_length": 8192, "max_tokens": 256, "group_size": 8})
-    long_c = need(m4, "grpo", train={"max_length": 8192, "max_tokens": 8192, "group_size": 8})
+    short_c = need(m4, "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 256, "group_size": 8})
+    long_c = need(m4, "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 8192, "group_size": 8})
     assert long_c >= short_c
 
 
@@ -315,7 +315,7 @@ def test_open_model_opd_uses_opd_sizing_not_grpo(monkeypatch):
     fake_id = "test-org/uncataloged-7b"
     assert fake_id not in MODELS  # ensure it takes the open-model (info is None) fallback
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 7.0)
-    train = {"max_length": 8192, "max_tokens": 8192, "lora_rank": 16}
+    train = {"max_context_tokens": 8192, "max_completion_tokens": 8192, "lora_rank": 16}
     opd_need = model_required_vram_gb(fake_id, "opd", train=train)
     grpo_need = model_required_vram_gb(fake_id, "grpo", train=train)
     # Before the fix these were IDENTICAL (opd fell through to the hardcoded grpo sizing); now opd uses
@@ -333,7 +333,7 @@ def test_open_model_opd_applies_colocated_vllm_floor(monkeypatch):
 
     fake_id = "test-org/uncataloged-small-opd"
     assert fake_id not in MODELS
-    train = {"max_length": 1536, "max_tokens": 128, "batch_size": 1, "group_size": 1}
+    train = {"max_context_tokens": 1536, "max_completion_tokens": 128, "batch_size": 1, "group_size": 1}
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _model_id, **_kwargs: 0.8)
     assert model_required_vram_gb(fake_id, "opd", train=train, headroom=1.0) >= 24
@@ -349,10 +349,10 @@ def test_vram_headroom_consistent_across_sizing_paths():
 
     assert allocator.vram_headroom() == 1.1
     # both paths feed model_required_vram_gb the same headroom -> identical sizing
-    a_need = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_length": 4096})
+    a_need = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096})
     from flash.engine.vram import model_required_vram_gb
 
-    direct = model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_length": 4096}, headroom=1.1)
+    direct = model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}, headroom=1.1)
     assert a_need == direct
 
 
@@ -364,17 +364,17 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     from flash.providers.base import get_gpu_info
 
     grid = [
-        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_length": 1024, "group_size": 4}),
-        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_length": 32768, "group_size": 16}),
+        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
+        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 32768, "group_size": 16}),
         # un-fused big-vocab SFT (the documented OOM case): a <3B model at a <2048-token ctx, where
         # the lm_head materializes the [per_device, seq, ~248k] fp32 logits the SFT branch once ignored.
-        ("Qwen/Qwen3.5-0.8B", "sft", {"max_length": 1024}),
-        ("Qwen/Qwen3.5-2B", "sft", {"max_length": 1536}),  # near the Liger threshold
-        ("Qwen/Qwen3.5-2B", "sft", {"max_length": 8192}),
-        ("Qwen/Qwen3.5-4B", "grpo", {"max_length": 1024, "group_size": 4}),
-        ("Qwen/Qwen3.5-4B", "grpo", {"max_length": 16384, "max_tokens": 4096, "group_size": 8}),
-        ("Qwen/Qwen3.5-4B", "sft", {"max_length": 32768}),
-        ("Qwen/Qwen3.5-9B", "grpo", {"max_length": 8192, "group_size": 8}),
+        ("Qwen/Qwen3.5-0.8B", "sft", {"max_context_tokens": 1024}),
+        ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 1536}),  # near the Liger threshold
+        ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 8192}),
+        ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
+        ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 16384, "max_completion_tokens": 4096, "group_size": 8}),
+        ("Qwen/Qwen3.5-4B", "sft", {"max_context_tokens": 32768}),
+        ("Qwen/Qwen3.5-9B", "grpo", {"max_context_tokens": 8192, "group_size": 8}),
     ]
     for model, algo, tr in grid:
         need = required_vram_gb(model, algo, train=tr)
@@ -394,7 +394,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
     from flash.providers.base import get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    train = {"steps": 60, "max_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
+    train = {"steps": 60, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
 
     need = required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train)
     assert need > 40
@@ -434,8 +434,8 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     train = {
         "steps": 1,
-        "max_length": 8192,
-        "max_tokens": 128,
+        "max_context_tokens": 8192,
+        "max_completion_tokens": 128,
         "lora_rank": 32,
         "lora_alpha": 64,
     }
@@ -489,7 +489,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         # Matches the failed continuation shape from the OPD/vLLM RTX 5090 report.
         "observed_2b_128tok_r32": {
             "steps": 1,
-            "max_tokens": 128,
+            "max_completion_tokens": 128,
             "lora_rank": 32,
             "lora_alpha": 64,
         },
@@ -498,32 +498,32 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "steps": 1,
             "batch_size": 8,
             "group_size": 1,
-            "max_length": 1536,
-            "max_tokens": 512,
+            "max_context_tokens": 1536,
+            "max_completion_tokens": 512,
             "lora_rank": 16,
         },
         "longer_context": {
             "steps": 1,
             "batch_size": 8,
             "group_size": 1,
-            "max_length": 4096,
-            "max_tokens": 512,
+            "max_context_tokens": 4096,
+            "max_completion_tokens": 512,
             "lora_rank": 16,
         },
         "longer_completion": {
             "steps": 1,
             "batch_size": 1,
             "group_size": 1,
-            "max_length": 4096,
-            "max_tokens": 2048,
+            "max_context_tokens": 4096,
+            "max_completion_tokens": 2048,
             "lora_rank": 16,
         },
         "wide_rollout_batch": {
             "steps": 1,
             "batch_size": 8,
             "group_size": 4,
-            "max_length": 4096,
-            "max_tokens": 512,
+            "max_context_tokens": 4096,
+            "max_completion_tokens": 512,
             "lora_rank": 16,
         },
     }
@@ -539,8 +539,8 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
                 model_id,
                 "opd",
                 int(train.get("steps", 1)),
-                seq_len=train.get("max_length"),
-                completion_len=train.get("max_tokens"),
+                seq_len=train.get("max_context_tokens"),
+                completion_len=train.get("max_completion_tokens"),
                 batch_size=train.get("batch_size"),
                 group_size=train.get("group_size"),
                 lora_rank=train.get("lora_rank"),
@@ -759,14 +759,14 @@ def test_required_vram_sft_small_model_includes_big_vocab_logits():
     the term remains present at longer context too."""
     from flash.providers.allocator import required_vram_gb
 
-    n_short = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_length": 1024})
+    n_short = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_context_tokens": 1024})
     assert n_short >= 12  # base+act (~7) + capped logits (~4), x1.1 -- well above the pre-fix ~8
-    n_long = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_length": 2048})
+    n_long = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_context_tokens": 2048})
     assert n_long >= n_short  # no long-context fused-CE shortcut in the real SFT worker
 
 
 def test_observed_qwen4b_sft_8192_routes_off_32gb_cards(monkeypatch):
-    """Regression: Qwen3.5-4B SFT at max_length=8192 failed first backward on RTX 5090.
+    """Regression: Qwen3.5-4B SFT at max_context_tokens=8192 failed first backward on RTX 5090.
 
     TRL SFT runs with fused CE disabled, so the allocator must reserve dense logits even at long
     context and route this shape to an 80 GB class instead of a 32 GB consumer GPU."""
@@ -776,7 +776,7 @@ def test_observed_qwen4b_sft_8192_routes_off_32gb_cards(monkeypatch):
     from flash.providers.base import get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    train = {"epochs": 1, "max_examples": 4020, "max_length": 8192, "lora_rank": 32}
+    train = {"epochs": 1, "max_examples": 4020, "max_context_tokens": 8192, "lora_rank": 32}
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "sft", train=train)
     assert need > 40
@@ -810,13 +810,13 @@ def test_required_vram_sft_uses_chalk_model_support_gate():
 
     mid = "openbmb/MiniCPM5-1B"
     info = MODELS[mid]
-    train = {"max_length": 4096, "batch_size": 4}
+    train = {"max_context_tokens": 4096, "batch_size": 4}
     need = model_required_vram_gb(mid, "sft", train=train, headroom=1.0)
     unfused = math.ceil(
         estimate_vram_gb(
             info.params_b,
             "sft",
-            seq_len=train["max_length"],
+            seq_len=train["max_context_tokens"],
             batch_size=train["batch_size"],
             vocab=vocab_size_for(mid),
             sft_fused_ce=False,
@@ -826,7 +826,7 @@ def test_required_vram_sft_uses_chalk_model_support_gate():
         estimate_vram_gb(
             info.params_b,
             "sft",
-            seq_len=train["max_length"],
+            seq_len=train["max_context_tokens"],
             batch_size=train["batch_size"],
             vocab=vocab_size_for(mid),
             sft_fused_ce=True,
@@ -874,7 +874,7 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
         for seq in (512, 1024, 1536, 2047, 2048, 4096, 32768):
             for bs in (1, 4, 8, 32):
                 for rank in (8, 32, 128):
-                    tr = {"max_length": seq, "batch_size": bs, "lora_rank": rank}
+                    tr = {"max_context_tokens": seq, "batch_size": bs, "lora_rank": rank}
                     need = required_vram_gb(mid, "sft", train=tr)
                     peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs, active_b) * 1.1)
                     # The conservative estimate must always cover the honest peak (universal).

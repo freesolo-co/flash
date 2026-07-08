@@ -547,7 +547,7 @@ def model_required_vram_gb(
         except (TypeError, ValueError):
             return default
 
-    max_tokens = _pos_int(_g(train, "max_tokens"), None)
+    max_tokens = _pos_int(_g(train, "max_completion_tokens"), None)
     _algo = (algorithm or "").lower()
     if _algo in ("grpo", "rl"):
         _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
@@ -556,7 +556,7 @@ def model_required_vram_gb(
         _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
         _default_len = 1024
-    seq_len = _pos_int(_g(train, "max_length"), _default_len)
+    seq_len = _pos_int(_g(train, "max_context_tokens"), _default_len)
     lora_rank = _pos_int(_g(train, "lora_rank"), 32)
     if _algo == "opd":
         from flash.engine.recipe import RECIPE

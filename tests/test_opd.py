@@ -488,7 +488,7 @@ def test_stop_detection_and_trim_handle_special_token_delimiter():
 def test_trim_trailing_stop_scans_from_end_not_quadratically():
     """Regression (codex[bot], opd.py:153): trimming the stop must scan from the END (a few decodes of
     the dropped tail), not decode every growing prefix ids[:1..n] — which was O(completion^2) and could
-    dominate CPU before teacher scoring once [train].max_tokens is raised. Assert decode is called only
+    dominate CPU before teacher scoring once [train].max_completion_tokens is raised. Assert decode is called only
     a bounded number of times, independent of completion length."""
     from flash.engine.worker.opd import _trim_trailing_stop
 
@@ -518,7 +518,7 @@ def test_trim_trailing_stop_scans_from_end_not_quadratically():
 def test_opd_sampled_ids_moved_off_gpu_in_one_transfer():
     """Regression (codex[bot], opd.py:113): model.generate returns the sampled ids on the GPU;
     _to_cpu_ids must do ONE detach().cpu().tolist() bulk copy, not a per-token int(t) CUDA->CPU scalar
-    sync (thousands of tiny syncs per sample once [train].max_tokens is raised)."""
+    sync (thousands of tiny syncs per sample once [train].max_completion_tokens is raised)."""
     from flash.engine.worker.opd import _to_cpu_ids
 
     class _FakeGpuTensor:
@@ -627,7 +627,7 @@ def test_opd_rejects_teacher_model_override():
 
 
 def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
-    """max_length <= max_tokens leaves no prompt budget; opd must reject it at spec-parse time
+    """max_context_tokens <= max_completion_tokens leaves no prompt budget; opd must reject it at spec-parse time
     (before a paid worker is provisioned), not only inside run_opd after GPU setup."""
     from flash.schema import ConfigError, spec_from_dict
 
@@ -642,14 +642,14 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
             run_id="x",
         )
 
-    # max_length leaves room after an explicit max_tokens -> ok.
-    _spec({"max_length": 2048, "max_tokens": 512})
-    # max_length <= max_tokens -> no prompt budget -> reject at parse.
+    # max_context_tokens leaves room after an explicit max_completion_tokens -> ok.
+    _spec({"max_context_tokens": 2048, "max_completion_tokens": 512})
+    # max_context_tokens <= max_completion_tokens -> no prompt budget -> reject at parse.
     with pytest.raises(ConfigError, match="prompt budget"):
-        _spec({"max_length": 400, "max_tokens": 512})
-    # max_tokens omitted -> resolves to the opd recipe default (512); max_length below it -> reject.
+        _spec({"max_context_tokens": 400, "max_completion_tokens": 512})
+    # max_completion_tokens omitted -> resolves to the opd recipe default (512); context below it -> reject.
     with pytest.raises(ConfigError, match="prompt budget"):
-        _spec({"max_length": 256})
+        _spec({"max_context_tokens": 256})
 
 
 def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():

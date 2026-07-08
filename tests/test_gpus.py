@@ -199,7 +199,7 @@ def test_grpo_kv_floor_escalates_large_group_long_context():
     # live under 0.45 x 32 GB, so the requirement must exceed the RTX 5090 class.
     assert grpo_kv_floor_gb(4.0, 4096, 16) > 32
     need = model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "grpo", train={"group_size": 16, "max_length": 4096}
+        "Qwen/Qwen3.5-4B", "grpo", train={"group_size": 16, "max_context_tokens": 4096}
     )
     assert need >= grpo_kv_floor_gb(4.0, 4096, 16)
 

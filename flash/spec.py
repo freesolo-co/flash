@@ -113,13 +113,13 @@ class TrainSpec:
     # None -> worker's tuned recipe default.
     learning_rate: float | None = None
     batch_size: int | None = None
-    max_length: int | None = None
+    max_context_tokens: int | None = None
     save_every: int | None = None
     max_steps: int | None = None
     max_examples: int | None = None
     group_size: int | None = None
     temperature: float | None = None
-    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
     kl_penalty_coef: float | None = None
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
@@ -199,13 +199,13 @@ class JobSpec:
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
                 batch_size=_opt_int(train.get("batch_size")),
-                max_length=_opt_int(train.get("max_length")),
+                max_context_tokens=_opt_int(train.get("max_context_tokens")),
                 save_every=_opt_int(train.get("save_every")),
                 max_steps=_opt_int(train.get("max_steps")),
                 max_examples=_opt_int(train.get("max_examples")),
                 group_size=_opt_int(train.get("group_size")),
                 temperature=_opt_float(train.get("temperature")),
-                max_tokens=_opt_int(train.get("max_tokens")),
+                max_completion_tokens=_opt_int(train.get("max_completion_tokens")),
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),

@@ -71,7 +71,9 @@ def _raw(**overrides) -> dict:
         # The classic footgun: rollout knobs under a [grpo] table instead of [train].
         ({"grpo.group_size": 4}, "unknown config section"),
         ({"sft.epochs": 3}, r"under \[train\]"),
-        ({"train.max_token": 256}, "unknown key"),  # typo of max_tokens
+        ({"train.max_token": 256}, "unknown key"),  # typo of max_completion_tokens
+        ({"train.max_length": 256}, "unknown key"),
+        ({"train.max_tokens": 256}, "unknown key"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
