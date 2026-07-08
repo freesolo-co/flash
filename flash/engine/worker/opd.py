@@ -70,6 +70,7 @@ from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_c
 OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
 OPD_TEACHER_BATCH_SIZE = 8
+OPD_SMALL_MODEL_LOSS_MICROBATCH_SIZE = 16
 OPD_LOSS_MICROBATCH_SIZE = 4
 
 
@@ -170,9 +171,14 @@ def _opd_loss_microbatch_size(model_id: str, total_samples: int) -> int:
         params_b = float(resolve_params_b(model_id) or 0.0)
     except Exception:
         params_b = 0.0
-    # The dense vocab logits from GKD are the peak. Batch small/medium dense models, but keep 35B-class
-    # OPD serial by default so the B200 path does not trade speed for OOM risk.
-    default = OPD_LOSS_MICROBATCH_SIZE if params_b and params_b <= 10.0 else 1
+    # The dense vocab logits from GKD are the peak. RunPod H200 telemetry for 2B OPD leaves enough
+    # trainer headroom to reduce forward/backward launches, while 9B/35B-class jobs stay conservative.
+    if params_b and params_b <= 4.0:
+        default = OPD_SMALL_MODEL_LOSS_MICROBATCH_SIZE
+    elif params_b and params_b <= 10.0:
+        default = OPD_LOSS_MICROBATCH_SIZE
+    else:
+        default = 1
     return max(1, min(total, default))
 
 

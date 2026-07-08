@@ -1458,7 +1458,7 @@ def test_opd_teacher_batch_size_and_workers_can_be_overridden(monkeypatch):
     assert opd_mod._opd_teacher_workers(64, 8) == 8
 
     monkeypatch.delenv("FLASH_OPD_LOSS_MICROBATCH_SIZE", raising=False)
-    assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.5-2B", 64) == 4
+    assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.5-2B", 64) == 16
     assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.6-35B-A3B", 64) == 1
     monkeypatch.setenv("FLASH_OPD_LOSS_MICROBATCH_SIZE", "8")
     assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.6-35B-A3B", 64) == 8
