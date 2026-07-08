@@ -452,15 +452,17 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
     # a too-small GPU that then OOMs at the default micro-batch 4.
     from flash.engine import vram
 
-    at_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=4)
-    above_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
+    # Use a tiny vocab so this isolates the managed micro-batch cap rather than the dense-logits
+    # per-device cap, which can floor both batch sizes to the same per-device value.
+    at_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=4, vocab=1)
+    above_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32, vocab=1)
     assert above_cap == at_cap  # batch_size above the per-device 4 is capped, not sized up
-    below_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=1)
+    below_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=1, vocab=1)
     assert below_cap < at_cap  # micro-batch 1 reserves less activation VRAM
     # the removed env no longer changes the estimate (fully managed), whatever its value
     for val in ("8", "1", "not-an-int"):
         monkeypatch.setenv("SFT_PER_DEVICE_BS", val)
-        assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == at_cap
+        assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32, vocab=1) == at_cap
 
 
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:

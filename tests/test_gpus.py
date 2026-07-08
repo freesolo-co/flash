@@ -168,9 +168,9 @@ def test_config_defaults_gpu_from_model():
         "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # 9B is bf16 (QLoRA dropped): bf16 SFT needs ~29 GB, so the cheapest validated class that fits
-    # is the 32 GB RTX 5090.
-    assert spec.gpu.type == "RTX 5090"
+    # 9B is bf16 (QLoRA dropped), and real TRL SFT materializes dense logits, so the cheapest
+    # validated class that fits is now the 80 GB A100 tier.
+    assert spec.gpu.type == "A100 PCIe"
 
 
 def test_build_worker_env():

@@ -1925,6 +1925,60 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         assert gpus_seen[0] == "RTX 4090"
 
 
+def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
+    """An OOM retry must not re-roll the same VRAM class; it walks to a strictly larger card."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.providers.base import Allocation, Candidate
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        candidates = (
+            Candidate("runpod", "A100 SXM 40GB", 1.00, 40),
+            Candidate("runpod", "A100 SXM 40GB", 1.01, 40),
+            Candidate("runpod", "A100 PCIe", 1.39, 80),
+        )
+
+        monkeypatch.setattr(
+            allocator,
+            "allocate",
+            lambda *a, **k: Allocation(
+                provider="runpod",
+                gpu="A100 SXM 40GB",
+                hourly_usd=1.00,
+                min_vram_gb=40,
+                candidates=candidates,
+            ),
+        )
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
+            if attempt == 0:
+                return jobs.PollResult(False, failure="oom", detail="vLLM free-memory preflight")
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="oom-walk",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="opd",
+            train=TrainSpec(steps=1),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("oom-walk").state == "done"
+        assert gpus_seen == ["A100 SXM 40GB", "A100 PCIe"]
+
+
 def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
     # A plain job_failed (no retriable flag — a genuine code crash) is NOT retried: the retry
     # budget exists only for infra-shaped failures, not code bugs.

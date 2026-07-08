@@ -790,6 +790,9 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
         def __call__(self, text, add_special_tokens=False):
             return SimpleNamespace(input_ids=[1, 2])  # 2 tokens, well within budget
 
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join("x" for _ in ids)
+
     class _Model(_TinyLM):
         def __init__(self):
             super().__init__(torch, T=4, V=8)
@@ -888,6 +891,9 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
 
         def __call__(self, text, add_special_tokens=False):
             return SimpleNamespace(input_ids=[1, 2])
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join("x" for _ in ids)
 
     class _Model(_TinyLM):
         def __init__(self):
@@ -1239,7 +1245,7 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
 
     @contextlib.contextmanager
     def _fake_liveness(stage, progress=None, fields=None, **_kwargs):
-        if stage == "opd_step":
+        if stage == "opd_step" and progress is not None:
             captured["stage"] = stage
             captured["progress"] = progress
         yield
@@ -1796,6 +1802,9 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
         def __call__(self, text, add_special_tokens=False):
             return SimpleNamespace(input_ids=[1, 2])  # within budget
 
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join("x" for _ in ids)
+
     class _Model(_TinyLM):
         def __init__(self):
             super().__init__(torch, T=4, V=8)
@@ -2190,9 +2199,9 @@ def test_opd_vram_is_single_sequence_not_batch_scaled():
     opd_bs1 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, group_size=1, **kw)
     opd_bs16 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=16, group_size=1, **kw)
     assert opd_bs1 == opd_bs16  # batch_size does not scale the single-sequence training term
-    # contrast: SFT at the same short seq DOES scale with the micro-batch, so the invariant is meaningful.
-    sft_bs1 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=1, **kw)
-    sft_bs16 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=16, **kw)
+    # contrast: SFT DOES scale with the micro-batch when it is not floored by the dense-logits cap.
+    sft_bs1 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=1, seq_len=1024, vocab=1, lora_rank=16)
+    sft_bs16 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=16, seq_len=1024, vocab=1, lora_rank=16)
     assert sft_bs16 > sft_bs1
 
 
