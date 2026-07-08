@@ -71,7 +71,6 @@ OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
 OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
-OPD_BATCHED_LOGPROB_TOKEN_LIMIT = 512
 
 
 def _opd_env_int(name: str) -> int | None:
@@ -99,13 +98,6 @@ def _opd_env_bool(name: str, default: bool) -> bool:
 
 def _opd_completion_logits_only_enabled() -> bool:
     return _opd_env_bool("FLASH_OPD_COMPLETION_LOGITS_ONLY", False)
-
-
-def _opd_batched_logprob_token_limit() -> int:
-    override = _opd_env_int("FLASH_OPD_BATCHED_LOGPROB_TOKEN_LIMIT")
-    if override is not None:
-        return max(0, override)
-    return OPD_BATCHED_LOGPROB_TOKEN_LIMIT
 
 
 def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:
@@ -1166,13 +1158,6 @@ def run_opd():
                 model, "_flash_opd_completion_logits_suffix_batches", 0
             ),
             "opd_full_logits_batches": getattr(model, "_flash_opd_full_logits_batches", 0),
-            "opd_batched_logprob_token_limit": _opd_batched_logprob_token_limit(),
-            "opd_batched_logprob_batches": getattr(
-                model, "_flash_opd_batched_logprob_batches", 0
-            ),
-            "opd_per_sample_logprob_batches": getattr(
-                model, "_flash_opd_per_sample_logprob_batches", 0
-            ),
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
             # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
             # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
@@ -1556,52 +1541,6 @@ def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
     return (coeff_vec * sp_sel).mean()
 
 
-def _gkd_losses_from_logits_batch(logits, chunk: list[_PreparedLoss], *, completion_suffix: bool, kl_coef=1.0):
-    import torch
-    import torch.nn.functional as F
-
-    if not chunk:
-        return []
-    max_comp = max(len(p.student_ids) for p in chunk)
-    if max_comp <= 0:
-        return None
-    if len(chunk) * max_comp > _opd_batched_logprob_token_limit():
-        return None
-    device = logits.device
-    batch = len(chunk)
-    target_ids = torch.full((batch, max_comp), -100, dtype=torch.long, device=device)
-    row_idx = torch.zeros((batch, max_comp), dtype=torch.long, device=device)
-    for row, p in enumerate(chunk):
-        comp_len = len(p.student_ids)
-        ids_t = torch.tensor(p.student_ids, dtype=torch.long, device=device)
-        if completion_suffix:
-            out_start = max_comp - comp_len
-            row_idx[row, out_start:max_comp] = torch.arange(
-                out_start, max_comp, dtype=torch.long, device=device
-            )
-            target_ids[row, out_start:max_comp] = ids_t
-        else:
-            pred_start = len(p.prompt_ids) - 1
-            row_idx[row, :comp_len] = torch.arange(
-                pred_start, pred_start + comp_len, dtype=torch.long, device=device
-            )
-            target_ids[row, :comp_len] = ids_t
-    batch_idx = torch.arange(batch, dtype=torch.long, device=device).unsqueeze(1).expand_as(row_idx)
-    rows = logits[batch_idx, row_idx].reshape(batch * max_comp, logits.shape[-1]).float()
-    sp_all = -F.cross_entropy(
-        rows,
-        target_ids.reshape(-1),
-        ignore_index=-100,
-        reduction="none",
-    ).reshape(batch, max_comp)
-    losses = []
-    for row, p in enumerate(chunk):
-        comp_len = len(p.student_ids)
-        sp_t = sp_all[row, -comp_len:] if completion_suffix else sp_all[row, :comp_len]
-        losses.append(_gkd_loss_from_logps(sp_t, p.groups, kl_coef=kl_coef))
-    return losses
-
-
 def _forward_logits(
     model, input_ids, attention_mask=None, *, position_ids=None, logits_to_keep=None
 ):
@@ -1807,31 +1746,17 @@ def _resolve_samples_batched(
                     )
                     attention_mask[row, : len(seq)] = 1
                 logits = _forward_logits(model, input_ids, attention_mask)
-            losses = _gkd_losses_from_logits_batch(
-                logits,
-                chunk,
-                completion_suffix=completion_suffix,
-                kl_coef=knobs.kl_coef,
-            )
-            if losses is not None:
-                _bump_model_counter(model, "_flash_opd_batched_logprob_batches")
-            else:
-                _bump_model_counter(model, "_flash_opd_per_sample_logprob_batches")
-                losses = []
-                for row, p in enumerate(chunk):
-                    prompt_len = len(p.prompt_ids)
-                    comp_len = len(p.student_ids)
-                    rows = (
-                        logits[row, -comp_len:]
-                        if completion_suffix
-                        else logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
-                    )
-                    losses.append(
-                        _gkd_loss_from_logits_rows(
-                            rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
-                        )
-                    )
-            for p, loss in zip(chunk, losses, strict=True):
+            for row, p in enumerate(chunk):
+                prompt_len = len(p.prompt_ids)
+                comp_len = len(p.student_ids)
+                rows = (
+                    logits[row, -comp_len:]
+                    if completion_suffix
+                    else logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
+                )
+                loss = _gkd_loss_from_logits_rows(
+                    rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
+                )
                 if loss is None:
                     results[p.idx] = SampleResult(
                         teacher_status="ok",
