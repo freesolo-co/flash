@@ -67,54 +67,15 @@ from flash.engine.worker.perf import (
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 
-OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
-OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
-
-
-def _opd_env_int(name: str) -> int | None:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        print(f"[opd] ignoring invalid {name}={raw!r}")
-        return None
-
-
-def _opd_rollout_pipeline_chunks(total_prompts: int) -> int:
-    """Number of single-turn rollout chunks in one OPD step.
-
-    Small steps still split once so teacher scoring can overlap later vLLM generation. Larger steps
-    target moderately sized vLLM batches, which starts remote teacher scoring earlier without reducing
-    rollout generation to one request per prompt.
-    """
-    total = max(1, int(total_prompts))
-    override = _opd_env_int("FLASH_OPD_ROLLOUT_PIPELINE_CHUNKS")
-    if override is not None:
-        return max(1, min(total, override))
-    if total < 8:
-        return 1
-    chunks = (total + OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE - 1) // (
-        OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE
-    )
-    return max(2, min(OPD_ROLLOUT_PIPELINE_MAX_CHUNKS, chunks))
+OPD_ROLLOUT_PIPELINE_CHUNKS = 2
 
 
 def _opd_rollout_chunk_size(total_prompts: int) -> int:
     """Split a single OPD step into a small number of rollout chunks so remote teacher scoring for
     earlier chunks overlaps with vLLM generation for later chunks without collapsing vLLM batching."""
     total = max(1, int(total_prompts))
-    chunks = _opd_rollout_pipeline_chunks(total)
+    chunks = max(1, OPD_ROLLOUT_PIPELINE_CHUNKS)
     return max(1, (total + chunks - 1) // chunks)
-
-
-def _opd_teacher_workers(total_samples: int) -> int:
-    total = max(1, int(total_samples))
-    override = _opd_env_int("FLASH_OPD_TEACHER_WORKERS")
-    if override is not None:
-        return max(1, min(total, override))
-    return total
 
 
 @dataclass(frozen=True)
@@ -662,7 +623,7 @@ def run_opd():
     step = 0
     max_iters = 3 * steps + 10
     max_no_signal_attempts = 3
-    max_teacher_workers = _opd_teacher_workers(knobs.prompts_per_step * knobs.group_size)
+    max_teacher_workers = max(1, knobs.prompts_per_step * knobs.group_size)
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
     # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
@@ -997,13 +958,6 @@ def run_opd():
             "vllm_rollout_batch_size": vllm_kwargs.get("rollout_batch_size"),
             "vllm_max_num_batched_tokens": vllm_kwargs.get("max_num_batched_tokens"),
             "vllm_lora_syncs": getattr(vllm_rollout, "sync_count", None),
-            "opd_rollout_pipeline_chunks": (
-                _opd_rollout_pipeline_chunks(ppl_step * group) if not multi_turn else None
-            ),
-            "opd_rollout_chunk_size": (
-                _opd_rollout_chunk_size(ppl_step * group) if not multi_turn else None
-            ),
-            "opd_teacher_workers": max_teacher_workers,
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
             # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
             # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
