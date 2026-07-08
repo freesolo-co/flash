@@ -322,6 +322,24 @@ def test_open_model_opd_uses_opd_sizing_not_grpo(monkeypatch):
     assert opd_need > 0
 
 
+def test_open_model_opd_applies_colocated_vllm_floor(monkeypatch):
+    """Uncataloged OPD still starts a resident colocated vLLM engine, so it must keep the same minimum
+    GPU floor the curated path uses instead of admitting a tiny training estimate."""
+    from flash.catalog import MODELS
+    from flash.engine import vram
+    from flash.engine.vram import model_required_vram_gb
+
+    fake_id = "test-org/uncataloged-small-opd"
+    assert fake_id not in MODELS
+    train = {"max_length": 1536, "max_tokens": 128, "batch_size": 1, "group_size": 1}
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _model_id, **_kwargs: 0.8)
+    assert model_required_vram_gb(fake_id, "opd", train=train, headroom=1.0) >= 24
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _model_id, **_kwargs: 1.1)
+    assert model_required_vram_gb(fake_id, "opd", train=train, headroom=1.0) >= 28
+
+
 def test_vram_headroom_consistent_across_sizing_paths():
     """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree (PR #176 review)."""
