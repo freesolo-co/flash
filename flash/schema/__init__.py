@@ -382,6 +382,11 @@ def _validate_grpo(spec: JobSpec) -> None:
     """GRPO contract: step-driven, so steps (when pinned) must be positive."""
     if spec.train.steps is not None and spec.train.steps <= 0:
         raise ConfigError("train.steps must be positive for GRPO")
+    if spec.train.group_size is not None and spec.train.group_size < 2:
+        raise ConfigError(
+            "train.group_size must be >= 2 for GRPO (TRL needs at least two generations "
+            "per prompt to calculate advantages)"
+        )
 
 
 def _validate_opd(spec: JobSpec) -> None:
