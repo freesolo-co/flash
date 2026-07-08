@@ -73,7 +73,11 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
     if card_gb > 0:
         try:
             from flash.catalog import MODELS
-            from flash.engine.vram import colocate_kv_util, resolve_params_b
+            from flash.engine.vram import (
+                colocate_kv_util,
+                opd_rollout_concurrency,
+                resolve_params_b,
+            )
 
             info = MODELS.get(model_id)
             active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
@@ -82,7 +86,10 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                 int(seq_cap),
                 card_gb,
                 False,
-                num_generations=max(1, int(knobs.group_size)),
+                num_generations=opd_rollout_concurrency(
+                    getattr(knobs, "prompts_per_step", 1),
+                    getattr(knobs, "group_size", 1),
+                ),
                 active_params_b=active_b,
                 fp8_kv=fp8_kv,
             )
@@ -184,6 +191,7 @@ class OpdVllmRolloutEngine:
     def sync_from_model(self, model) -> None:
         """Save the current PEFT adapter and make future generations use that exact version."""
         old_lora_id = self._lora_int_id
+        old_adapter_dir = self._sync_dirs[-1] if self._sync_dirs else None
         self._version += 1
         adapter_dir = os.path.join(self.adapter_root, f"adapter-{self._version:06d}")
         os.makedirs(adapter_dir, exist_ok=True)
@@ -193,20 +201,22 @@ class OpdVllmRolloutEngine:
         self._lora_request = self._LoRARequest(
             f"opd-step-{self._version}", self._lora_int_id, adapter_dir
         )
-        if old_lora_id is not None:
-            self._remove_lora(old_lora_id)
+        if old_adapter_dir and old_lora_id is not None and self._remove_lora(old_lora_id):
+            shutil.rmtree(old_adapter_dir, ignore_errors=True)
+            self._sync_dirs = [d for d in self._sync_dirs if d != old_adapter_dir]
 
-    def _remove_lora(self, lora_id: int) -> None:
+    def _remove_lora(self, lora_id: int) -> bool:
         """Best-effort dynamic-LoRA cache cleanup across vLLM API variants."""
         for obj in (getattr(self, "llm", None), getattr(getattr(self, "llm", None), "llm_engine", None)):
             remover = getattr(obj, "remove_lora", None)
             if callable(remover):
                 try:
                     remover(lora_id)
-                    return
+                    return True
                 except Exception as exc:
                     print(f"[opd] vLLM remove_lora({lora_id}) failed; continuing: {exc}")
-                    return
+                    return False
+        return False
 
     def _sampling_params(self, max_tokens: int):
         kwargs = {

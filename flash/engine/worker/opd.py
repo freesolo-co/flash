@@ -629,9 +629,14 @@ def run_opd():
                     for _g in range(group):
                         contexts.append((prompt_ids, prompt_messages))
                         prompts.append(prompt_ids)
-                gens = _generate_many_vllm(
-                    vllm_rollout, tok, prompts, knobs, max_tokens=knobs.max_completion
-                )
+                with liveness_heartbeat(
+                    "opd_vllm_generating",
+                    fields=lambda _step=opt_steps: {"step": _step},
+                    keepalive=True,
+                ):
+                    gens = _generate_many_vllm(
+                        vllm_rollout, tok, prompts, knobs, max_tokens=knobs.max_completion
+                    )
                 for gen, (prompt_ids, prompt_messages) in zip(gens, contexts, strict=True):
                     pending.append(
                         _Pending(gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages)
@@ -967,16 +972,25 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
     """Apply OPD's pre-scoring gates to one vLLM completion."""
     completion_ids = [int(t) for t in out.token_ids]
     completion_text = out.text or tok.decode(completion_ids, skip_special_tokens=True)
-    if not out.terminated:
+    stop_text = tok.decode(completion_ids, skip_special_tokens=False)
+    if not (
+        out.terminated
+        or _rollout_terminated(
+            completion_ids,
+            stop_text,
+            _generation_eos_ids(None, tok),
+            knobs.stop_sequences,
+        )
+    ):
         return _GenResult(truncated=True, gen_tokens=len(completion_ids))
-    if knobs.stop_sequences:
-        stop_text = tok.decode(completion_ids, skip_special_tokens=False)
-        # vLLM may strip stop strings unless include_stop_str_in_output is supported. Trim when the
-        # delimiter is present; otherwise keep the already-stripped ids/text.
-        if any(stop_text.endswith(s) or completion_text.endswith(s) for s in knobs.stop_sequences):
-            completion_ids, completion_text = _trim_trailing_stop(
-                tok, completion_ids, stop_text, knobs.stop_sequences
-            )
+    # vLLM may strip stop strings unless include_stop_str_in_output is supported. Trim when the
+    # delimiter is present; otherwise keep the already-stripped ids/text.
+    if knobs.stop_sequences and any(
+        stop_text.endswith(s) or completion_text.endswith(s) for s in knobs.stop_sequences
+    ):
+        completion_ids, completion_text = _trim_trailing_stop(
+            tok, completion_ids, stop_text, knobs.stop_sequences
+        )
     gen_tokens = len(completion_ids)
     if not completion_text.strip():
         return _GenResult(skip=True, gen_tokens=gen_tokens)

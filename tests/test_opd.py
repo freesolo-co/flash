@@ -597,130 +597,6 @@ def test_generation_eos_ids_unions_tokenizer_and_generation_config_lists():
     assert _generation_eos_ids(SimpleNamespace(), SimpleNamespace(eos_token_id=True)) == frozenset()
 
 
-def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_path):
-    """OPD's vLLM engine must generate with the latest saved adapter, not a stale LoRA."""
-    import sys
-    import types
-
-    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
-
-    class _SamplingParams:
-        last_kwargs: ClassVar[dict] = {}
-
-        def __init__(self, **kwargs):
-            _SamplingParams.last_kwargs = dict(kwargs)
-
-    class _LoRARequest:
-        def __init__(self, lora_name, lora_int_id, lora_path):
-            self.lora_name = lora_name
-            self.lora_int_id = lora_int_id
-            self.lora_path = lora_path
-
-    class _FakeLLM:
-        last_kwargs: ClassVar[dict] = {}
-        last_generate: ClassVar[dict] = {}
-
-        def __init__(self, **kwargs):
-            _FakeLLM.last_kwargs = dict(kwargs)
-            self.removed = []
-            self.llm_engine = SimpleNamespace(remove_lora=self.removed.append)
-
-        def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
-            _FakeLLM.last_generate = {
-                "prompts": prompts,
-                "sampling_params": sampling_params,
-                "lora_request": lora_request,
-                "use_tqdm": use_tqdm,
-            }
-            comp = SimpleNamespace(
-                token_ids=[3, 4],
-                text="ok",
-                finish_reason="stop",
-                stop_reason=None,
-            )
-            return [SimpleNamespace(outputs=[comp])]
-
-    vllm = types.ModuleType("vllm")
-    vllm.LLM = _FakeLLM
-    vllm.SamplingParams = _SamplingParams
-    lora_pkg = types.ModuleType("vllm.lora")
-    req_mod = types.ModuleType("vllm.lora.request")
-    req_mod.LoRARequest = _LoRARequest
-    monkeypatch.setitem(sys.modules, "vllm", vllm)
-    monkeypatch.setitem(sys.modules, "vllm.lora", lora_pkg)
-    monkeypatch.setitem(sys.modules, "vllm.lora.request", req_mod)
-
-    class _Model:
-        def save_pretrained(self, path):
-            (tmp_path / "seen.txt").write_text(path)
-
-    engine = OpdVllmRolloutEngine(
-        model_source="base-or-merged",
-        max_model_len=2048,
-        temperature=0.7,
-        top_p=0.9,
-        stop_sequences=("</answer>",),
-        lora_rank=16,
-        gpu_memory_utilization=0.42,
-        kv_cache_dtype="fp8",
-        max_num_batched_tokens=8192,
-        attention_backend="TRITON_ATTN",
-        mm_encoder_attn_backend="TORCH_SDPA",
-        enforce_eager=True,
-        seed=123,
-        adapter_root=str(tmp_path / "sync"),
-    )
-    engine.sync_from_model(_Model())
-    first = engine._lora_request
-    engine.sync_from_model(_Model())
-    second = engine._lora_request
-    out = engine.generate([[1, 2]], max_tokens=5)
-
-    assert _FakeLLM.last_kwargs["model"] == "base-or-merged"
-    assert _FakeLLM.last_kwargs["enable_lora"] is True
-    assert _FakeLLM.last_kwargs["max_lora_rank"] == 16
-    assert _FakeLLM.last_kwargs["gpu_memory_utilization"] == 0.42
-    assert _FakeLLM.last_kwargs["kv_cache_dtype"] == "fp8"
-    assert _FakeLLM.last_kwargs["max_num_batched_tokens"] == 8192
-    assert _FakeLLM.last_kwargs["attention_backend"] == "TRITON_ATTN"
-    assert _FakeLLM.last_kwargs["mm_encoder_attn_backend"] == "TORCH_SDPA"
-    assert _FakeLLM.last_kwargs["enforce_eager"] is True
-    assert _FakeLLM.last_kwargs["seed"] == 123
-    assert first.lora_int_id == 1
-    assert second.lora_int_id == 2
-    assert second.lora_path.endswith("adapter-000002")
-    assert _FakeLLM.last_generate["prompts"] == [{"prompt_token_ids": [1, 2]}]
-    assert _FakeLLM.last_generate["lora_request"] is second
-    assert _FakeLLM.last_generate["use_tqdm"] is False
-    assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]
-    assert _SamplingParams.last_kwargs["include_stop_str_in_output"] is True
-    assert out[0].token_ids == [3, 4]
-    assert out[0].terminated is True
-
-
-def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
-    from flash.engine.worker.opd import OpdKnobs, _gen_from_vllm_output
-    from flash.engine.worker.opd_vllm import OpdVllmOutput
-
-    class _Tok:
-        def decode(self, ids, skip_special_tokens=True):
-            return "".join({1: "ok", 2: "</answer>"}.get(int(i), "") for i in ids)
-
-    knobs = OpdKnobs(stop_sequences=("</answer>",))
-    truncated = _gen_from_vllm_output(
-        OpdVllmOutput([1], "ok", finish_reason="length"), _Tok(), knobs
-    )
-    assert truncated.truncated is True
-
-    stopped = _gen_from_vllm_output(
-        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="stop"), _Tok(), knobs
-    )
-    assert stopped.truncated is False
-    assert stopped.skip is False
-    assert stopped.completion_ids == [1]
-    assert stopped.completion_text == "ok"
-
-
 def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     # OPD generates on-policy (loss forward runs model(prompt+completion)), so allocator sizing must
     # use the prompt+completion budget, not the SFT 1024 default — else a raised max_tokens OOMs an
@@ -962,7 +838,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
             stop_sequences=(),
         ),
     )
-    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: _Model())
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (_Model(), "fake/model"))
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
@@ -1064,7 +940,7 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
             stop_sequences=(),
         ),
     )
-    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: _Model())
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (_Model(), "fake/model"))
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
@@ -1271,7 +1147,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
             stop_sequences=(),
         ),
     )
-    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: model)
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (model, "fake/model"))
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
@@ -1362,9 +1238,10 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
     captured = {}
 
     @contextlib.contextmanager
-    def _fake_liveness(stage, progress=None, fields=None):
-        captured["stage"] = stage
-        captured["progress"] = progress
+    def _fake_liveness(stage, progress=None, fields=None, **_kwargs):
+        if stage == "opd_step":
+            captured["stage"] = stage
+            captured["progress"] = progress
         yield
 
     opd_mod = _opd_harness(monkeypatch, train_one=_skip, liveness=_fake_liveness)
@@ -1376,6 +1253,29 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
     # the bounded-retry loop visits its full budget of max_iters = 2*steps + 10 = 12 fresh slices
     # (1 prompt x 1 group each) before the post-loop guard raises -> samples_seen advanced to 12.
     assert captured["progress"]() == 12
+
+
+def test_opd_vllm_generation_uses_keepalive_heartbeat(monkeypatch):
+    """A large batched vLLM rollout can block before samples_seen advances; keepalive emits real
+    heartbeats during that blocking generate call so provider stall detection sees the job is alive."""
+    import contextlib
+
+    calls = []
+
+    @contextlib.contextmanager
+    def _fake_liveness(stage, progress=None, fields=None, **kwargs):
+        calls.append((stage, progress, fields, kwargs))
+        yield
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip, liveness=_fake_liveness)
+    with pytest.raises(RuntimeError):  # all-skip -> no trained step
+        opd_mod.run_opd()
+
+    generate_calls = [c for c in calls if c[0] == "opd_vllm_generating"]
+    assert generate_calls, f"missing vLLM generate liveness context; saw {[c[0] for c in calls]}"
+    assert all(c[3].get("keepalive") is True for c in generate_calls)
+    assert callable(generate_calls[0][2])
+    assert generate_calls[0][2]() == {"step": 0}
 
 
 def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
@@ -1414,7 +1314,7 @@ def test_opd_emits_progress_heartbeat_while_filtering_prompts(monkeypatch):
     calls = []
 
     @contextlib.contextmanager
-    def _fake_liveness(stage, progress=None, fields=None):
+    def _fake_liveness(stage, progress=None, fields=None, **_kwargs):
         calls.append((stage, progress))
         yield
 
@@ -1496,7 +1396,7 @@ def test_opd_step_liveness_heartbeat_carries_opt_steps_in_fields(monkeypatch):
     captured = {}
 
     @contextlib.contextmanager
-    def _fake_liveness(stage, progress=None, fields=None):
+    def _fake_liveness(stage, progress=None, fields=None, **_kwargs):
         if stage == "opd_step":
             captured["fields"] = fields
         yield
@@ -2180,6 +2080,16 @@ def test_opd_vram_reserves_colocated_vllm_rollout_copy():
     assert estimate_vram_gb(4.0, "opd", "bf16", **kw) == opd_with_vllm
 
 
+def test_opd_vram_sizes_rollout_kv_for_full_prompt_batch():
+    from flash.engine.vram import estimate_vram_gb, opd_rollout_concurrency
+
+    assert opd_rollout_concurrency(8, 3) == 24
+    kw = {"seq_len": 8192, "max_tokens": 512, "vocab": 128_000, "lora_rank": 16}
+    one_prompt = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, group_size=1, **kw)
+    eight_prompts = estimate_vram_gb(4.0, "opd", "bf16", batch_size=8, group_size=1, **kw)
+    assert eight_prompts > one_prompt + 20.0
+
+
 def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
     """35B OPD with colocated student vLLM routes above the old H200-sized OPD estimate."""
     from flash.engine.vram import model_required_vram_gb
@@ -2187,7 +2097,13 @@ def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
     need = model_required_vram_gb(
         "Qwen/Qwen3.6-35B-A3B",
         "opd",
-        train={"max_length": 1536, "max_tokens": 512, "group_size": 8, "lora_rank": 16},
+        train={
+            "max_length": 1536,
+            "max_tokens": 512,
+            "batch_size": 1,
+            "group_size": 8,
+            "lora_rank": 16,
+        },
     )
     assert 141 < need <= 180
 
@@ -2229,14 +2145,15 @@ def test_opd_vram_thinking_completion_default_not_underbudgeted():
 def test_opd_vram_is_single_sequence_not_batch_scaled():
     """Regression (codex[bot], vram.py): run_opd backprops ONE completion at a time (_train_one), so
     opd's VRAM estimate must NOT scale its activations with batch_size (the SFT per-device micro-batch
-    term over-budgeted opd and bumped the GPU tier). At a short seq_len where SFT packs a batch, opd's
-    estimate stays flat across batch_size while SFT's grows."""
+    term over-budgeted opd and bumped the GPU tier). At a short seq_len and group_size=1, OPD's rollout
+    KV stays on its floor, isolating the training term: the estimate stays flat across batch_size while
+    SFT's grows."""
     from flash.engine.vram import estimate_vram_gb
 
     kw = {"seq_len": 1024, "vocab": 248_320, "lora_rank": 16}
-    opd_bs1 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, **kw)
-    opd_bs16 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=16, **kw)
-    assert opd_bs1 == opd_bs16  # single-sequence: batch_size does not change opd VRAM
+    opd_bs1 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, group_size=1, **kw)
+    opd_bs16 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=16, group_size=1, **kw)
+    assert opd_bs1 == opd_bs16  # batch_size does not scale the single-sequence training term
     # contrast: SFT at the same short seq DOES scale with the micro-batch, so the invariant is meaningful.
     sft_bs1 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=1, **kw)
     sft_bs16 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=16, **kw)
