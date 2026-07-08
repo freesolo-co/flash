@@ -420,6 +420,133 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
     assert get_gpu_info(preview_gpu).vram_gb >= need
 
 
+@pytest.mark.parametrize(
+    ("label", "train", "expected_gpu"),
+    [
+        (
+            "max_completion_128",
+            {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64},
+            "A100 PCIe",
+        ),
+        (
+            "max_completion_256",
+            {"epochs": 1, "max_completion_tokens": 256, "lora_rank": 32, "lora_alpha": 64},
+            "A100 PCIe",
+        ),
+        (
+            "max_completion_512",
+            {"epochs": 1, "max_completion_tokens": 512, "lora_rank": 32, "lora_alpha": 64},
+            "A100 PCIe",
+        ),
+        (
+            "max_completion_1024",
+            {"epochs": 1, "max_completion_tokens": 1024, "lora_rank": 32, "lora_alpha": 64},
+            "A100 PCIe",
+        ),
+        (
+            "max_context_2048",
+            {
+                "epochs": 1,
+                "max_context_tokens": 2048,
+                "max_completion_tokens": 128,
+                "lora_rank": 32,
+                "lora_alpha": 64,
+            },
+            "A100 PCIe",
+        ),
+        (
+            "max_context_8192",
+            {
+                "epochs": 1,
+                "max_context_tokens": 8192,
+                "max_completion_tokens": 128,
+                "lora_rank": 32,
+                "lora_alpha": 64,
+            },
+            "A100 PCIe",
+        ),
+        (
+            "max_context_16384",
+            {
+                "epochs": 1,
+                "max_context_tokens": 16384,
+                "max_completion_tokens": 128,
+                "lora_rank": 32,
+                "lora_alpha": 64,
+            },
+            "RTX Pro 6000",
+        ),
+        (
+            "max_context_24576",
+            {
+                "epochs": 1,
+                "max_context_tokens": 24576,
+                "max_completion_tokens": 128,
+                "lora_rank": 32,
+                "lora_alpha": 64,
+            },
+            "H200",
+        ),
+        (
+            "group_size_8",
+            {"epochs": 1, "group_size": 8, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64},
+            "A100 PCIe",
+        ),
+    ],
+)
+def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(monkeypatch, label, train, expected_gpu):
+    """Attachment regression: 2B OPD/vLLM dry-runs stayed on 4090/5090-class GPUs.
+
+    The submitted worker then OOMed during vLLM rollout initialization. These are the same sweep axes
+    from the report: completion length, context length, and group size. All control-plane views must
+    agree on a >40 GB requirement and a fitting non-consumer GPU before any paid worker is created.
+    """
+    from flash.cost import RunConfig, estimate_cost
+    from flash.providers import allocator
+    from flash.providers.allocator import required_vram_gb
+    from flash.providers.base import get_gpu_info, provisional_gpu
+    from flash.schema import spec_from_dict
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+
+    model = "Qwen/Qwen3.5-2B"
+    need = required_vram_gb(model, "opd", train=train)
+    preview_gpu = provisional_gpu(model, "opd", train=train)
+    alloc = allocator.allocate(model, "opd", train=train)
+    estimate = estimate_cost(
+        RunConfig(
+            model,
+            "opd",
+            int(train.get("epochs", 1)),
+            seq_len=train.get("max_context_tokens"),
+            completion_len=train.get("max_completion_tokens"),
+            group_size=train.get("group_size"),
+            lora_rank=train.get("lora_rank"),
+            provider="runpod",
+        )
+    )
+    spec = spec_from_dict(
+        {
+            "model": model,
+            "algorithm": "opd",
+            "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+            "train": dict(train),
+            "gpu": {"type": "RTX 5090"},
+        },
+        run_id=f"opd-sweep-{label}",
+    )
+
+    assert need > 40
+    assert preview_gpu == expected_gpu
+    assert alloc.gpu == expected_gpu
+    assert estimate.gpu == expected_gpu
+    assert spec.gpu.type == expected_gpu
+    assert alloc.min_vram_gb == need
+    assert estimate.required_vram_gb == need
+    assert get_gpu_info(expected_gpu).vram_gb >= need
+    assert get_gpu_info(expected_gpu).vram_gb > 40
+
+
 def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch):
     """Regression: Qwen3.5-4B OPD at 8k ctx / 128 rollout tokens failed vLLM startup on 40 GB.
 
