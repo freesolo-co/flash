@@ -168,9 +168,9 @@ def test_config_defaults_gpu_from_model():
         "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # 9B is bf16 (QLoRA dropped): bf16 SFT needs ~29 GB, so the cheapest validated class that fits
-    # is the 32 GB RTX 5090.
-    assert spec.gpu.type == "RTX 5090"
+    # 9B is bf16 (QLoRA dropped), and real TRL SFT materializes dense logits, so the cheapest
+    # validated class that fits is now the 80 GB A100 tier.
+    assert spec.gpu.type == "A100 PCIe"
 
 
 def test_build_worker_env():
@@ -199,7 +199,7 @@ def test_grpo_kv_floor_escalates_large_group_long_context():
     # live under 0.45 x 32 GB, so the requirement must exceed the RTX 5090 class.
     assert grpo_kv_floor_gb(4.0, 4096, 16) > 32
     need = model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "grpo", train={"group_size": 16, "max_length": 4096}
+        "Qwen/Qwen3.5-4B", "grpo", train={"group_size": 16, "max_context_tokens": 4096}
     )
     assert need >= grpo_kv_floor_gb(4.0, 4096, 16)
 

@@ -447,11 +447,11 @@ def cmd_env_setup(args) -> int:
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
     # `thinking = true` opts the run into reasoning mode. Reasoning shares the generation budget with
-    # the answer, so GRPO also gets a raised max_tokens. These strings are empty when reasoning is
-    # off, keeping the default scaffold byte-for-byte identical.
+    # the answer, so GRPO also gets a raised completion budget. These strings are empty when reasoning
+    # is off, keeping the default scaffold byte-for-byte identical.
     thinking_line = "thinking = true\n" if reasoning else ""
     rl_reasoning_train = (
-        "max_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"
+        "max_completion_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"
         if reasoning
         else ""
     )

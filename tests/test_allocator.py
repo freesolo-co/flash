@@ -13,12 +13,12 @@ def test_required_vram_catalog_and_open(monkeypatch):
     # MEASURED: tiny-model GRPO OOMs a 20 GB card (vLLM-colocate engine overhead the param
     # estimate missed); floored to the 24 GB vLLM-colocate minimum (_VLLM_COLOCATE_FLOOR_GB).
     assert required_vram_gb("Qwen/Qwen3.5-0.8B", "grpo") == 24
-    assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 17  # matrix: 4B SFT seq1k down-routes (rank32 default)
+    assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 21  # 4B SFT seq1k still down-routes below 24 GB
     # open model: sized for GRPO (the heavier phase of the usual SFT+GRPO run) + headroom
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 4.0)
     est = vram.estimate_vram_gb(4.0, "grpo")
 
-    # Default GRPO (no [train].max_length) sizes at the run's REAL engine length, mirroring
+    # Default GRPO (no [train].max_context_tokens) sizes at the run's REAL engine length, mirroring
     # run_rl()'s max(1024, rl.max_prompt_len + completion) = 2048 + 320 = 2368 tokens (NOT a flat
     # 1024). At 2368 the 4.7B param estimate is ~31.8 GB raw -> 35 GB with headroom, so a 32 GB card
     # is no longer a safe fit and the allocator escalates to the cheapest validated >=35 GB class.
@@ -58,7 +58,7 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
 
     # 4B SFT (seq 1024, rank 8) down-routes below 24 GB in the matrix (see test_required_vram_*).
     a = allocator.allocate(
-        "Qwen/Qwen3.5-4B", "sft", train={"max_length": 1024, "lora_rank": 8}
+        "Qwen/Qwen3.5-4B", "sft", train={"max_context_tokens": 1024, "lora_rank": 8}
     )
     assert a.min_vram_gb < 24  # a sub-24 GB run the synthetic unvalidated card also fits
     # The synthetic class is cheaper and fits, yet is excluded because it is unvalidated.
@@ -203,12 +203,14 @@ def test_estimator_matches_measured_seq_boundaries():
     estimate_vram_gb is the accurate estimate; model_required adds the safety headroom."""
     from flash.engine.vram import estimate_vram_gb as e
 
-    # 0.8B (0.9B): seq up to 32k fits the cheapest 24 GB card, both algos (measured on a 24 GB card)
+    # 0.8B (0.9B): GRPO seq up to 32k fits the cheapest 24 GB card. Real SFT materializes
+    # dense logits, so only a shorter context stays in that class.
     assert e(0.9, "grpo", seq_len=4096) <= 24
     assert e(0.9, "grpo", seq_len=32768) <= 24
-    assert e(0.9, "sft", seq_len=32768) <= 24
-    # 4B (4.7B) SFT: seq 32k fits a 32 GB card (measured: 5090)
-    assert e(4.7, "sft", seq_len=32768) <= 32
+    assert e(0.9, "sft", seq_len=4096) <= 24
+    # SFT's TRL path disables fused CE, so long-context Qwen SFT materializes dense logits and must
+    # not look like it fits a consumer card.
+    assert e(4.7, "sft", seq_len=8192, vocab=248_320) > 32
     # 4B GRPO: default + seq 16k fit a 32 GB card, seq 32k steps OVER it (measured boundary)
     assert e(4.7, "grpo", seq_len=1024, max_tokens=256) <= 32
     assert e(4.7, "grpo", seq_len=16384, max_tokens=4096) <= 32
@@ -226,27 +228,27 @@ def test_required_vram_policy_floors_and_downrouting():
 
     m4 = "Qwen/Qwen3.5-4B"
     # context length lifts GRPO need monotonically
-    short = need(m4, "grpo", train={"max_length": 1024, "max_tokens": 256})
-    long = need(m4, "grpo", train={"max_length": 16384, "max_tokens": 4096})
+    short = need(m4, "grpo", train={"max_context_tokens": 1024, "max_completion_tokens": 256})
+    long = need(m4, "grpo", train={"max_context_tokens": 16384, "max_completion_tokens": 4096})
     assert long > short
     # sub-1B GRPO fits a 24 GB card; 2B GRPO OOMs 24 (MEASURED) -> needs the 32 tier; small SFT
     # drops below the catalog default (32)
     assert need("Qwen/Qwen3.5-0.8B", "grpo") <= 24
     assert 24 < need("Qwen/Qwen3.5-2B", "grpo") <= 32
-    assert need(m4, "sft", train={"max_length": 1024, "lora_rank": 8}) < 32
+    assert need(m4, "sft", train={"max_context_tokens": 1024, "lora_rank": 8}) < 32
     # 9B GRPO is bf16 (QLoRA dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
     # importance ratio -> no learning), so colocated GRPO needs an 80GB-class card.
     assert need("Qwen/Qwen3.5-9B", "grpo") >= 80  # bf16 colocate: 80GB floor
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 8192, "max_tokens": 2048, "group_size": 8}) >= 80
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 4096, "group_size": 8}) >= 80
+    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 2048, "group_size": 8}) >= 80
+    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 4096, "group_size": 8}) >= 80
     # group size and thinking never DECREASE the requirement
-    base = need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 4})
-    assert need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 16}) >= base
-    assert need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 4}, thinking=True) >= base
+    base = need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4})
+    assert need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 16}) >= base
+    assert need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4}, thinking=True) >= base
     # max_tokens (completion length) lifts the fp32-logits term -> a longer completion never sizes
     # DOWN, and a much longer one sizes UP (the term the estimator previously ignored).
-    short_c = need(m4, "grpo", train={"max_length": 8192, "max_tokens": 256, "group_size": 8})
-    long_c = need(m4, "grpo", train={"max_length": 8192, "max_tokens": 8192, "group_size": 8})
+    short_c = need(m4, "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 256, "group_size": 8})
+    long_c = need(m4, "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 8192, "group_size": 8})
     assert long_c >= short_c
 
 
@@ -313,7 +315,7 @@ def test_open_model_opd_uses_opd_sizing_not_grpo(monkeypatch):
     fake_id = "test-org/uncataloged-7b"
     assert fake_id not in MODELS  # ensure it takes the open-model (info is None) fallback
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 7.0)
-    train = {"max_length": 8192, "max_tokens": 8192, "lora_rank": 16}
+    train = {"max_context_tokens": 8192, "max_completion_tokens": 8192, "lora_rank": 16}
     opd_need = model_required_vram_gb(fake_id, "opd", train=train)
     grpo_need = model_required_vram_gb(fake_id, "grpo", train=train)
     # Before the fix these were IDENTICAL (opd fell through to the hardcoded grpo sizing); now opd uses
@@ -331,7 +333,7 @@ def test_open_model_opd_applies_colocated_vllm_floor(monkeypatch):
 
     fake_id = "test-org/uncataloged-small-opd"
     assert fake_id not in MODELS
-    train = {"max_length": 1536, "max_tokens": 128, "batch_size": 1, "group_size": 1}
+    train = {"max_context_tokens": 1536, "max_completion_tokens": 128, "batch_size": 1, "group_size": 1}
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda _model_id, **_kwargs: 0.8)
     assert model_required_vram_gb(fake_id, "opd", train=train, headroom=1.0) >= 24
@@ -347,10 +349,10 @@ def test_vram_headroom_consistent_across_sizing_paths():
 
     assert allocator.vram_headroom() == 1.1
     # both paths feed model_required_vram_gb the same headroom -> identical sizing
-    a_need = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_length": 4096})
+    a_need = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096})
     from flash.engine.vram import model_required_vram_gb
 
-    direct = model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_length": 4096}, headroom=1.1)
+    direct = model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}, headroom=1.1)
     assert a_need == direct
 
 
@@ -362,22 +364,244 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     from flash.providers.base import get_gpu_info
 
     grid = [
-        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_length": 1024, "group_size": 4}),
-        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_length": 32768, "group_size": 16}),
+        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
+        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 32768, "group_size": 16}),
         # un-fused big-vocab SFT (the documented OOM case): a <3B model at a <2048-token ctx, where
         # the lm_head materializes the [per_device, seq, ~248k] fp32 logits the SFT branch once ignored.
-        ("Qwen/Qwen3.5-0.8B", "sft", {"max_length": 1024}),
-        ("Qwen/Qwen3.5-2B", "sft", {"max_length": 1536}),  # near the Liger threshold
-        ("Qwen/Qwen3.5-2B", "sft", {"max_length": 8192}),
-        ("Qwen/Qwen3.5-4B", "grpo", {"max_length": 1024, "group_size": 4}),
-        ("Qwen/Qwen3.5-4B", "grpo", {"max_length": 16384, "max_tokens": 4096, "group_size": 8}),
-        ("Qwen/Qwen3.5-4B", "sft", {"max_length": 32768}),
-        ("Qwen/Qwen3.5-9B", "grpo", {"max_length": 8192, "group_size": 8}),
+        ("Qwen/Qwen3.5-0.8B", "sft", {"max_context_tokens": 1024}),
+        ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 1536}),  # near the Liger threshold
+        ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 8192}),
+        ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
+        ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 16384, "max_completion_tokens": 4096, "group_size": 8}),
+        ("Qwen/Qwen3.5-4B", "sft", {"max_context_tokens": 32768}),
+        ("Qwen/Qwen3.5-9B", "grpo", {"max_context_tokens": 8192, "group_size": 8}),
     ]
     for model, algo, tr in grid:
         need = required_vram_gb(model, algo, train=tr)
         alloc = allocate(model, algo, train=tr)
         assert get_gpu_info(alloc.gpu).vram_gb >= need, (model, algo, tr, alloc.gpu, need)
+
+
+def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
+    """Regression: Qwen3.5-2B OPD with the vLLM rollout engine failed startup on RTX 5090.
+
+    The aggregate estimate said the run needed only the 28 GB colocate floor, but vLLM initializes
+    after the HF/PEFT student is already resident and requires its executor budget to be free. Keep
+    this observed shape off consumer 32 GB cards and 40 GB fallback classes."""
+    from flash.cost import RunConfig, estimate_cost
+    from flash.providers import allocator
+    from flash.providers.allocator import required_vram_gb
+    from flash.providers.base import get_gpu_info, provisional_gpu
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    train = {"steps": 60, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
+
+    need = required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train)
+    assert need > 40
+
+    preview_gpu = provisional_gpu("Qwen/Qwen3.5-2B", "opd", train=train)
+    alloc = allocator.allocate("Qwen/Qwen3.5-2B", "opd", train=train)
+    estimate = estimate_cost(
+        RunConfig(
+            "Qwen/Qwen3.5-2B",
+            "opd",
+            60,
+            completion_len=128,
+            lora_rank=32,
+            provider="runpod",
+        )
+    )
+
+    assert preview_gpu == "A100 PCIe"
+    assert alloc.gpu == preview_gpu
+    assert alloc.min_vram_gb == need
+    assert estimate.required_vram_gb == need
+    assert estimate.gpu == preview_gpu
+    assert get_gpu_info(preview_gpu).vram_gb >= need
+
+
+def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch):
+    """Regression: Qwen3.5-4B OPD at 8k ctx / 128 rollout tokens failed vLLM startup on 40 GB.
+
+    The trainer is resident before the colocated vLLM engine initializes, so the allocator must not
+    consider the 40 GB A100 class viable even though the rollout token budget is intentionally small.
+    """
+    from flash.cost import RunConfig, estimate_cost
+    from flash.providers import allocator
+    from flash.providers.allocator import required_vram_gb
+    from flash.providers.base import get_gpu_info, provisional_gpu
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    train = {
+        "steps": 1,
+        "max_context_tokens": 8192,
+        "max_completion_tokens": 128,
+        "lora_rank": 32,
+        "lora_alpha": 64,
+    }
+
+    need = required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train)
+    assert 40 < need <= 80
+
+    preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "opd", train=train)
+    alloc = allocator.allocate("Qwen/Qwen3.5-4B", "opd", train=train)
+    estimate = estimate_cost(
+        RunConfig(
+            "Qwen/Qwen3.5-4B",
+            "opd",
+            1,
+            seq_len=8192,
+            completion_len=128,
+            lora_rank=32,
+            provider="runpod",
+        )
+    )
+
+    assert preview_gpu == "A100 PCIe"
+    assert alloc.gpu == preview_gpu
+    assert alloc.min_vram_gb == need
+    assert estimate.required_vram_gb == need
+    assert estimate.gpu == preview_gpu
+    assert get_gpu_info(preview_gpu).vram_gb >= need
+
+
+def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch):
+    """OPD-specific matrix guard: each catalog OPD model across representative train configs must
+    resolve to a GPU that satisfies the shared VRAM requirement, or reject before provisioning when
+    the config exceeds every managed single-GPU class."""
+    from flash.catalog import MODELS
+    from flash.cost import RunConfig, estimate_cost
+    from flash.providers import allocator
+    from flash.providers.allocator import required_vram_gb
+    from flash.providers.base import (
+        GPU_INFO,
+        UnsupportedGpuError,
+        get_gpu_info,
+        providers_for,
+        provisional_gpu,
+    )
+    from flash.schema import spec_from_dict
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    max_managed_vram = max(g.vram_gb for g in GPU_INFO.values() if g.validated)
+    configured_gpu_types = tuple(GPU_INFO)
+    configs = {
+        # Matches the failed continuation shape from the OPD/vLLM RTX 5090 report.
+        "observed_2b_128tok_r32": {
+            "steps": 1,
+            "max_completion_tokens": 128,
+            "lora_rank": 32,
+            "lora_alpha": 64,
+        },
+        "recipe_default": {"steps": 1},
+        "opd_prompt_batch": {
+            "steps": 1,
+            "batch_size": 8,
+            "group_size": 1,
+            "max_context_tokens": 1536,
+            "max_completion_tokens": 512,
+            "lora_rank": 16,
+        },
+        "longer_context": {
+            "steps": 1,
+            "batch_size": 8,
+            "group_size": 1,
+            "max_context_tokens": 4096,
+            "max_completion_tokens": 512,
+            "lora_rank": 16,
+        },
+        "longer_completion": {
+            "steps": 1,
+            "batch_size": 1,
+            "group_size": 1,
+            "max_context_tokens": 4096,
+            "max_completion_tokens": 2048,
+            "lora_rank": 16,
+        },
+        "wide_rollout_batch": {
+            "steps": 1,
+            "batch_size": 8,
+            "group_size": 4,
+            "max_context_tokens": 4096,
+            "max_completion_tokens": 512,
+            "lora_rank": 16,
+        },
+    }
+    checked: set[tuple[str, str]] = set()
+    rejected: set[tuple[str, str]] = set()
+
+    for model_id, info in MODELS.items():
+        if "opd" not in info.algos:
+            continue
+        for label, train in configs.items():
+            need = required_vram_gb(model_id, "opd", train=train)
+            rc = RunConfig(
+                model_id,
+                "opd",
+                int(train.get("steps", 1)),
+                seq_len=train.get("max_context_tokens"),
+                completion_len=train.get("max_completion_tokens"),
+                batch_size=train.get("batch_size"),
+                group_size=train.get("group_size"),
+                lora_rank=train.get("lora_rank"),
+                provider="runpod",
+            )
+
+            if need > max_managed_vram:
+                with pytest.raises(UnsupportedGpuError):
+                    allocator.allocate(model_id, "opd", train=train)
+                with pytest.raises(ValueError, match="no GPU class fits"):
+                    estimate_cost(rc)
+                rejected.add((model_id, label))
+                continue
+
+            preview_gpu = provisional_gpu(model_id, "opd", train=train)
+            preview_info = get_gpu_info(preview_gpu)
+            assert preview_info.validated
+            assert preview_info.vram_gb >= need, (model_id, label, preview_gpu, need)
+
+            alloc = allocator.allocate(model_id, "opd", train=train)
+            alloc_info = get_gpu_info(alloc.gpu)
+            assert alloc.provider == "runpod"
+            assert alloc.min_vram_gb == need
+            assert alloc.gpu == preview_gpu
+            assert alloc_info.validated
+            assert alloc_info.vram_gb >= need, (model_id, label, alloc.gpu, need)
+            assert all(c.vram_gb >= need for c in alloc.candidates)
+
+            estimate = estimate_cost(rc)
+            assert estimate.required_vram_gb == need
+            assert estimate.gpu == preview_gpu
+            assert estimate.gpu_vram_gb >= need, (model_id, label, estimate.gpu, need)
+
+            for configured_gpu in configured_gpu_types:
+                spec = spec_from_dict(
+                    {
+                        "model": model_id,
+                        "algorithm": "opd",
+                        "environment": {
+                            "id": "github:freesolo-co/envs@main:gsm8k/environment.py"
+                        },
+                        "train": dict(train),
+                        "gpu": {"type": configured_gpu},
+                    },
+                    run_id="opd-matrix",
+                )
+                assert spec.gpu.type == preview_gpu, (model_id, label, configured_gpu, preview_gpu)
+                assert providers_for(spec.gpu.type)
+                assert get_gpu_info(spec.gpu.type).vram_gb >= need
+
+            checked.add((model_id, label))
+
+    expected = {
+        (model_id, label)
+        for model_id, info in MODELS.items()
+        if "opd" in info.algos
+        for label in configs
+    }
+    assert checked | rejected == expected
+    assert checked
+    assert rejected
 
 
 def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch):
@@ -482,9 +706,9 @@ def test_catalog_model_algorithm_config_gpu_matrix_resolves_to_fitting_cards(mon
 
 def test_sft_big_vocab_logits_term_present_and_bounded():
     """SFT must reserve the [per_device, seq, vocab] fp32-logits VRAM whenever the worker's fused CE
-    is OFF (a <3B model AND a <2048-token ctx) -- the big-vocab SFT OOM driver the SFT branch
-    previously ignored entirely. The term is bounded by the logits budget (the per-device cap keeps
-    it there) and VANISHES once the worker fuses the CE, so it can't OOM and never over-reserves."""
+    is OFF -- the big-vocab SFT OOM driver the SFT branch previously ignored entirely. The term is
+    bounded by the logits budget when the per-device cap can reduce the micro-batch. It vanishes only
+    in the explicit theoretical fused-CE estimate; the real SFT worker keeps fused CE off."""
     from flash.engine import vram
     from flash.engine.vram import estimate_vram_gb as e
 
@@ -495,10 +719,16 @@ def test_sft_big_vocab_logits_term_present_and_bounded():
     assert with_logits > no_logits
     # ... but never by more than the budget (the per-device cap bounds the term, like GRPO)
     assert with_logits - no_logits <= vram._LOGITS_BUDGET_GB + 1e-6
-    # fused gate: at seq >= 2048 the fused CE removes the term -> vocab no longer moves the estimate
-    assert e(0.9, "sft", seq_len=2048, vocab=V) == e(0.9, "sft", seq_len=2048, vocab=1)
-    # ... and a >= 3B model fuses at any ctx -> vocab-independent there too (unchanged from before)
-    assert e(4.7, "sft", seq_len=1024, vocab=V) == e(4.7, "sft", seq_len=1024, vocab=1)
+    # Real SFT keeps fused CE off, so long context and >=3B models still carry vocab-sized logits.
+    assert e(0.9, "sft", seq_len=2048, vocab=V) > e(0.9, "sft", seq_len=2048, vocab=1)
+    assert e(4.7, "sft", seq_len=1024, vocab=V) > e(4.7, "sft", seq_len=1024, vocab=1)
+    # The theoretical fused path is still available for comparison and is vocab-independent.
+    assert e(0.9, "sft", seq_len=2048, vocab=V, sft_fused_ce=True) == e(
+        0.9, "sft", seq_len=2048, vocab=1, sft_fused_ce=True
+    )
+    assert e(4.7, "sft", seq_len=1024, vocab=V, sft_fused_ce=True) == e(
+        4.7, "sft", seq_len=1024, vocab=1, sft_fused_ce=True
+    )
 
 
 def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
@@ -525,13 +755,51 @@ def test_required_vram_sft_small_model_includes_big_vocab_logits():
     """REGRESSION (big-vocab SFT OOM): a sub-3B short-ctx SFT on a ~248k-vocab model must size for
     its lm_head logits. Pre-fix the SFT branch ignored them (need ~8 GB for a ~17 GB real peak that
     OOMs a 24 GB card near the Liger threshold); now the equation reserves the logits-inclusive need
-    so the allocator can't under-provision. A >=2048 ctx fuses the CE, dropping the term back out."""
+    so the allocator can't under-provision. TRL SFT keeps fused CE disabled even above 2048 ctx, so
+    the term remains present at longer context too."""
     from flash.providers.allocator import required_vram_gb
 
-    n_short = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_length": 1024})
+    n_short = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_context_tokens": 1024})
     assert n_short >= 12  # base+act (~7) + capped logits (~4), x1.1 -- well above the pre-fix ~8
-    n_fused = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_length": 2048})
-    assert n_fused < n_short  # the fused CE removes the logits term at >= 2048 ctx
+    n_long = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_context_tokens": 2048})
+    assert n_long >= n_short  # no long-context fused-CE shortcut in the real SFT worker
+
+
+def test_observed_qwen4b_sft_8192_routes_off_32gb_cards(monkeypatch):
+    """Regression: Qwen3.5-4B SFT at max_context_tokens=8192 failed first backward on RTX 5090.
+
+    TRL SFT runs with fused CE disabled, so the allocator must reserve dense logits even at long
+    context and route this shape to an 80 GB class instead of a 32 GB consumer GPU."""
+    from flash.cost import RunConfig, estimate_cost
+    from flash.providers import allocator
+    from flash.providers.allocator import required_vram_gb
+    from flash.providers.base import get_gpu_info, provisional_gpu
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    train = {"epochs": 1, "max_examples": 4020, "max_context_tokens": 8192, "lora_rank": 32}
+
+    need = required_vram_gb("Qwen/Qwen3.5-4B", "sft", train=train)
+    assert need > 40
+
+    preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "sft", train=train)
+    alloc = allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=train)
+    estimate = estimate_cost(
+        RunConfig(
+            "Qwen/Qwen3.5-4B",
+            "sft",
+            1,
+            seq_len=8192,
+            lora_rank=32,
+            provider="runpod",
+        )
+    )
+
+    assert preview_gpu == "A100 PCIe"
+    assert alloc.gpu == preview_gpu
+    assert alloc.min_vram_gb == need
+    assert estimate.required_vram_gb == need
+    assert estimate.gpu == preview_gpu
+    assert get_gpu_info(preview_gpu).vram_gb >= need
 
 
 def test_required_vram_sft_uses_chalk_model_support_gate():
@@ -542,13 +810,13 @@ def test_required_vram_sft_uses_chalk_model_support_gate():
 
     mid = "openbmb/MiniCPM5-1B"
     info = MODELS[mid]
-    train = {"max_length": 4096, "batch_size": 4}
+    train = {"max_context_tokens": 4096, "batch_size": 4}
     need = model_required_vram_gb(mid, "sft", train=train, headroom=1.0)
     unfused = math.ceil(
         estimate_vram_gb(
             info.params_b,
             "sft",
-            seq_len=train["max_length"],
+            seq_len=train["max_context_tokens"],
             batch_size=train["batch_size"],
             vocab=vocab_size_for(mid),
             sft_fused_ce=False,
@@ -558,7 +826,7 @@ def test_required_vram_sft_uses_chalk_model_support_gate():
         estimate_vram_gb(
             info.params_b,
             "sft",
-            seq_len=train["max_length"],
+            seq_len=train["max_context_tokens"],
             batch_size=train["batch_size"],
             vocab=vocab_size_for(mid),
             sft_fused_ce=True,
@@ -570,15 +838,14 @@ def test_required_vram_sft_uses_chalk_model_support_gate():
 
 
 def test_sft_equation_covers_honest_peak_across_seq_boundary():
-    """Boundary regression: for EVERY catalog SFT model across the seq grid (straddling the 2048
-    Liger threshold) x batch x rank, the equation must reserve >= the INDEPENDENT honest peak (incl.
-    the capped big-vocab logits), and a validated card must fit. This is the in-CI distillation of
-    the 148k-config offline sweep -- if the SFT logits term is ever dropped again, this fails."""
+    """Boundary regression: for EVERY catalog SFT model across the seq grid x batch x rank, the
+    equation must reserve >= the INDEPENDENT worker peak with fused CE disabled (incl. the capped
+    big-vocab logits), and a validated card must fit."""
     import math
 
     from flash.catalog import MODELS, vocab_size_for
     from flash.engine import vram
-    from flash.engine.vram import sft_logits_fused, sft_per_device
+    from flash.engine.vram import sft_per_device
     from flash.providers.allocator import required_vram_gb
     from flash.providers.base import GPU_INFO
 
@@ -592,7 +859,7 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
         eff = float(active_b) if active_b else pb
         width = math.sqrt(max(eff, 0.1))
         base = pb * bpp + vram._BASE_OVERHEAD_GB + (rank / 16.0) * (0.3 + 0.04 * eff)
-        fused = sft_logits_fused(pb, seq)
+        fused = False  # worker/sft.py passes fused_ce=False to chalk for TRL SFT
         pd = sft_per_device(bs, seq_len=seq, vocab=vocab, fused=fused)
         act = vram._ACT_COEF * pd * (seq / 1024.0) * width
         logits = 0.0 if fused else pd * seq * vocab * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
@@ -607,15 +874,21 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
         for seq in (512, 1024, 1536, 2047, 2048, 4096, 32768):
             for bs in (1, 4, 8, 32):
                 for rank in (8, 32, 128):
-                    tr = {"max_length": seq, "batch_size": bs, "lora_rank": rank}
+                    tr = {"max_context_tokens": seq, "batch_size": bs, "lora_rank": rank}
                     need = required_vram_gb(mid, "sft", train=tr)
                     peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs, active_b) * 1.1)
                     # The conservative estimate must always cover the honest peak (universal).
                     assert need >= peak, (mid, seq, bs, rank, need, peak)
-                    # Every catalog SFT model must fit some validated card at every (seq,bs,rank).
-                    # The 35B-A3B MoE included: with MoE-aware sizing its SFT is ~82 GB flat (active-3B
-                    # activations/KV are tiny, so even 32k context fits), landing on the 141 GB H200.
-                    assert any(gb >= need for gb in validated), (mid, seq, bs, rank, need)
+                    # Fitting configs must have a validated target; configs above every managed
+                    # single-GPU class are still safe because schema/allocation rejects them before
+                    # provisioning.
+                    assert need > max(validated) or any(gb >= need for gb in validated), (
+                        mid,
+                        seq,
+                        bs,
+                        rank,
+                        need,
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -658,8 +931,8 @@ def test_sft_logits_cap_no_regression_small_vocab_or_fused():
 
 
 def test_sft_logits_fused_gate_mirrors_worker():
-    """sft_logits_fused mirrors the worker's liger_on(_memory_mode): fused for a >=3B model OR a
-    >=2048-token context; a small short-context run is NOT fused (so the cap applies there)."""
+    """sft_logits_fused captures the theoretical fused-CE eligibility heuristic; real TRL SFT keeps
+    fused CE disabled, but the helper is still used for explicit comparison paths."""
     from flash.engine.vram import sft_logits_fused
 
     assert sft_logits_fused(0.8, 1024) is False  # small + short -> not fused -> cap applies
@@ -670,8 +943,8 @@ def test_sft_logits_fused_gate_mirrors_worker():
 
 def test_sft_estimate_includes_capped_logits_term():
     """The SFT VRAM estimate must include the big-vocab logits term (previously ignored), but
-    bounded by the per-device logits cap so it never over-reserves — and a long context that
-    fuses the CE drops the term entirely."""
+    bounded by the per-device logits cap so it never over-reserves. Real TRL SFT keeps fused CE
+    disabled at long context too; only the explicit theoretical fused estimate drops the term."""
     from flash.engine.vram import _LOGITS_BUDGET_GB
     from flash.engine.vram import estimate_vram_gb as e
 
@@ -680,9 +953,13 @@ def test_sft_estimate_includes_capped_logits_term():
     assert big > small  # the big-vocab logits term is real and now counted
     # bounded: the per-device cap keeps the logits term within the budget (plus the activation diff)
     assert big - small <= _LOGITS_BUDGET_GB + 2.0
-    # >=2048 ctx fuses the CE -> no logits term -> big vocab no longer inflates the estimate
-    fused_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8)
-    fused_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8)
+    # Real SFT still carries the logits term at >=2048 ctx.
+    long_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8)
+    long_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8)
+    assert long_big > long_small
+    # Explicit theoretical fused-CE comparison remains vocab-independent.
+    fused_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8, sft_fused_ce=True)
+    fused_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8, sft_fused_ce=True)
     assert abs(fused_big - fused_small) < 1e-6
 
 

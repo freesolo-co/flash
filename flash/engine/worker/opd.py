@@ -124,12 +124,12 @@ def _resolve_opd_knobs() -> OpdKnobs:
             else d.sampling_temperature
         ),
         top_p=d.sampling_top_p,
-        max_completion=opd_completion_len(opt("max_tokens", 0), _w.THINKING),
+        max_completion=opd_completion_len(opt("max_completion_tokens", 0), _w.THINKING),
         prompts_per_step=int(opt("batch_size", 0) or d.prompts_per_step),
         group_size=int(opt("group_size", 0) or d.group_size),
         kl_coef=kl_coef,
         save_every=int(opt("save_every", 0) or 20),
-        max_length=int(opt("max_length", 0) or 0),
+        max_length=int(opt("max_context_tokens", 0) or 0),
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
     )
 
@@ -315,17 +315,19 @@ def run_opd():
     ppl_step = knobs.prompts_per_step
     group = knobs.group_size
     # Prompt budget mirrors GRPO: DROP (not truncate) prompts over the context budget, so the student
-    # never conditions on a truncated prompt the teacher didn't see. Use the configured max_length
-    # when set, else the recipe prompt cap.
+    # never conditions on a truncated prompt the teacher didn't see. Use the configured context
+    # budget when set, else the recipe prompt cap.
     if knobs.max_length:
         prompt_budget = knobs.max_length - knobs.max_completion
         if prompt_budget < 1:
-            # A non-positive remainder means max_length <= max_tokens: there is no room for any
-            # prompt, so every sample would run generate+loss past the configured context. Reject
-            # loudly instead of clamping to a 1-token budget that silently admits over-budget runs.
+            # A non-positive remainder means the total context budget is no larger than the
+            # completion budget: there is no room for any prompt, so every sample would run
+            # generate+loss past the configured context. Reject loudly instead of clamping to a
+            # 1-token budget that silently admits over-budget runs.
             raise RuntimeError(
-                f"opd: [train] max_length ({knobs.max_length}) leaves no prompt budget after "
-                f"max_tokens ({knobs.max_completion}); set max_length > max_tokens."
+                f"opd: [train] max_context_tokens ({knobs.max_length}) leaves no prompt budget "
+                f"after max_completion_tokens ({knobs.max_completion}); set "
+                f"max_context_tokens > max_completion_tokens."
             )
     else:
         prompt_budget = RECIPE.opd.max_prompt_len
@@ -363,8 +365,8 @@ def run_opd():
     if not examples:
         raise RuntimeError(
             f"opd: every prompt exceeds the {prompt_budget}-token budget "
-            f"(max_length={knobs.max_length or 'unset'}, "
-            f"max_completion={knobs.max_completion}). Raise [train].max_length or shorten "
+            f"(max_context_tokens={knobs.max_length or 'unset'}, "
+            f"max_completion={knobs.max_completion}). Raise [train].max_context_tokens or shorten "
             "prompts — failing before the training loop instead of dropping every prompt for "
             "every step and burning the GPU allocation."
         )

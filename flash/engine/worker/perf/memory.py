@@ -161,7 +161,7 @@ def grpo_sleep_mode(
             raise ValueError(
                 f"{model_id}: GRPO config (engine context ~{seq_len} tok, group={group_size}) does NOT "
                 f"fit RESIDENT on {card_vram_gb:.0f} GB and vLLM sleep mode HANGS this model "
-                f"(resident-only). Reduce [train].max_length and/or group_size to fit resident."
+                f"(resident-only). Reduce [train].max_context_tokens and/or group_size to fit resident."
             )
         return False
     return True
