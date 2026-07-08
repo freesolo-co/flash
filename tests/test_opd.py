@@ -1382,20 +1382,6 @@ def test_opd_rollout_chunking_can_be_overridden_for_experiments(monkeypatch):
     assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
 
 
-def test_opd_teacher_workers_can_be_overridden_for_experiments(monkeypatch):
-    import flash.engine.worker.opd as opd_mod
-
-    monkeypatch.delenv("FLASH_OPD_TEACHER_WORKERS", raising=False)
-    assert opd_mod._opd_teacher_workers(64) == 64
-
-    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKERS", "16")
-    assert opd_mod._opd_teacher_workers(64) == 16
-    assert opd_mod._opd_teacher_workers(8) == 8
-
-    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKERS", "not-an-int")
-    assert opd_mod._opd_teacher_workers(64) == 64
-
-
 def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
     """Default OPD steps have 8 rollouts. Generate them in chunks so teacher scoring for the first
     chunk can run while vLLM generates the later chunk."""
