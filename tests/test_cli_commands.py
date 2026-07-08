@@ -578,7 +578,7 @@ def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
     sft = (tmp_path / "configs/sft.toml").read_text()
     assert "thinking = true" not in rl
     assert "thinking = true" not in sft
-    assert "max_tokens" not in rl
+    assert "max_completion_tokens" not in rl
     assert "EnvironmentSingleTurn" in (tmp_path / "environment.py").read_text()
 
 
@@ -590,10 +590,10 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     assert "thinking = true" in rl
     assert "thinking = true" in sft
     # GRPO raises the generation budget so reasoning does not truncate the answer.
-    assert "max_tokens = 2048" in rl
+    assert "max_completion_tokens = 2048" in rl
     # SFT can't share a token budget it doesn't generate; it gets the gold think-tag guidance instead.
     assert "warn_missing_think_tags" in sft
-    assert "max_tokens" not in sft
+    assert "max_completion_tokens" not in sft
 
 
 def test_env_setup_no_reasoning_flag_is_explicit_off(monkeypatch, tmp_path) -> None:
@@ -623,7 +623,7 @@ def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp
     assert "EnvironmentMultiTurn" in (tmp_path / "environment.py").read_text()
     rl = (tmp_path / "configs/rl.toml").read_text()
     assert "thinking = true" in rl
-    assert "max_tokens = 2048" in rl
+    assert "max_completion_tokens = 2048" in rl
 
 
 def test_env_setup_interactive_enter_takes_defaults(monkeypatch, tmp_path) -> None:

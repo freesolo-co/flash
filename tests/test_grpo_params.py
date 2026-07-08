@@ -2,7 +2,7 @@
 
 The SDK ships the GRPO recipe knobs (group_size/temperature/advantage_clip/
 kl_penalty_coef/thinking_length_penalty_coef) plus the optimizer/batching knobs
-(learning_rate/batch_size/max_length/save_every) in the job spec's ``[train]`` table
+(learning_rate/batch_size/max_context_tokens/save_every) in the job spec's ``[train]`` table
 (TrainSpec) — NOT ``[environment.params]``, which is forwarded verbatim to the Freesolo
 env's ``load_environment`` — and an optional ``train.init_from_adapter``; these tests
 cover the pure plumbing the worker uses to honor them (the GPU trainer wiring itself is
@@ -39,7 +39,7 @@ def test_think_token_count_counts_the_think_span() -> None:
     # before that close (without this the penalty no-ops on the common enable_thinking=true path).
     assert w.think_token_count('a b c d</think>{"x": 1}', tok) == 4
     assert w.think_token_count("</think>just the answer", tok) == 0
-    # case 3: prompt-opened thinking that NEVER closes (ran out of max_tokens) — no tags at all. With
+    # case 3: prompt-opened thinking that NEVER closes (ran out of max_completion_tokens) — no tags at all. With
     # prompt_opened_thinking the WHOLE completion is unterminated reasoning and is counted, so the
     # longest rambles can't dodge the penalty; without the flag a tag-less completion is plain text (0).
     assert w.think_token_count("rambling on and on forever", tok, prompt_opened_thinking=True) == 5
@@ -116,25 +116,30 @@ def test_graded_text_hides_tagless_prompt_opened_reasoning(monkeypatch) -> None:
 def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     import flash.engine.worker as w
 
-    knobs = {
+    train_knobs = {
         "group_size": 4,
         "temperature": 0.7,
-        "max_tokens": 256,
+        "max_completion_tokens": 256,
         "advantage_clip": 1.5,
         "kl_penalty_coef": 0.02,
         "thinking_length_penalty_coef": 0.001,
     }
+    grpo_knobs = {
+        **train_knobs,
+        "max_tokens": train_knobs["max_completion_tokens"],
+    }
+    del grpo_knobs["max_completion_tokens"]
     # GRPO knobs live in [train]/TrainSpec, NOT [environment.params].
     spec = JobSpec.from_dict(
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {**knobs},
+            "train": {**train_knobs},
         }
     )
     monkeypatch.setattr(w, "JOB_SPEC", spec)
-    assert w.grpo_overrides() == knobs
+    assert w.grpo_overrides() == grpo_knobs
     # A leftover grpo_config in environment.params must NOT be read by the worker.
     poisoned = JobSpec.from_dict(
         {
@@ -142,7 +147,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "algorithm": "grpo",
             "environment": {
                 "id": "github:owner/repo@main:env/environment.py",
-                "params": {"grpo_config": knobs},
+                "params": {"grpo_config": grpo_knobs},
             },
             "train": {},
         }
@@ -188,7 +193,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
             "hf_repo": "owner/runs",
             "group_size": 4,
             "temperature": 0.7,
-            "max_tokens": 256,
+            "max_completion_tokens": 256,
             "kl_penalty_coef": 0.02,
             "advantage_clip": 1.5,
             "thinking_length_penalty_coef": 0.001,
@@ -197,7 +202,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     spec = spec_from_dict(raw, run_id="grpo-x")
     assert spec.train.group_size == 4
     assert spec.train.temperature == 0.7
-    assert spec.train.max_tokens == 256
+    assert spec.train.max_completion_tokens == 256
     assert spec.train.kl_penalty_coef == 0.02
     assert spec.train.advantage_clip == 1.5
     assert spec.train.thinking_length_penalty_coef == 0.001
@@ -365,9 +370,9 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
             "hf_repo": "owner/runs",
             "learning_rate": 3e-5,
             "batch_size": 16,
-            "max_length": 2048,
+            "max_context_tokens": 2048,
             "save_every": 5,
-            "max_tokens": 512,
+            "max_completion_tokens": 512,
             "stop_sequences": ["</answer>", "\n\n"],
         },
     }
@@ -375,9 +380,9 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     for s in (spec, JobSpec.from_dict(spec.to_dict())):  # server parse + worker re-parse
         assert s.train.learning_rate == 3e-5
         assert s.train.batch_size == 16
-        assert s.train.max_length == 2048
+        assert s.train.max_context_tokens == 2048
         assert s.train.save_every == 5
-        assert s.train.max_tokens == 512
+        assert s.train.max_completion_tokens == 512
         assert s.train.stop_sequences == ("</answer>", "\n\n")
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
     bare = spec_from_dict({**raw, "train": {"hf_repo": "owner/runs"}}, run_id="grpo-w")
@@ -607,7 +612,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
     bad_cases = [
         {"batch_size": 0},  # must be >= 1
         {"batch_size": -4},
-        {"max_length": 0},
+        {"max_context_tokens": 0},
         {"save_every": 0},
         {"group_size": 0},
         {"learning_rate": 0},  # must be > 0
@@ -623,7 +628,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         {"learning_rate": float("inf")},
         {"temperature": float("inf")},
         {"batch_size": float("inf")},  # int knob: must 400, not OverflowError(500) from int(inf)
-        {"max_tokens": float("nan")},
+        {"max_completion_tokens": float("nan")},
     ]
     for bad in bad_cases:
         with pytest.raises(ConfigError):

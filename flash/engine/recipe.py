@@ -36,7 +36,7 @@ class RLConfig:
     learning_rate: float = 1e-5
     max_prompt_len: int = 2048
     max_completion_len: int = 320
-    # 320 is too short for <think> blocks; overridable via [train].max_tokens.
+    # 320 is too short for <think> blocks; overridable via [train].max_completion_tokens.
     max_completion_len_thinking: int = 1536
     prompts_per_step: int = 64
     group_size: int = 8
@@ -59,7 +59,7 @@ class OPDConfig:
     learning_rate: float = 1e-5
     max_prompt_len: int = 1024
     max_completion_len: int = 512
-    # 512 is short for <think> traces; overridable via [train].max_tokens.
+    # 512 is short for <think> traces; overridable via [train].max_completion_tokens.
     max_completion_len_thinking: int = 1536
     prompts_per_step: int = 8
     # Student samples per prompt. 1 is enough for a direct KD loss (no group-relative baseline
