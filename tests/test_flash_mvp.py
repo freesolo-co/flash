@@ -44,7 +44,8 @@ def test_config_to_job_spec():
                 "[environment]\n"
                 'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
                 "[train]\n"
-                "steps = 10\n"
+                "epochs = 1\n"
+                "max_examples = 10\n"
                 'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
                 'type = "RTX 5090"\n'
@@ -90,7 +91,8 @@ def test_cli_train_dry_run():
                 # A user-set [train] hf_repo is silently ignored (platform-managed, assigned
                 # per-run); the dry-run still validates and the resolved hf_repo comes back blank.
                 "[train]\n"
-                "steps = 1\n"
+                "epochs = 1\n"
+                "max_examples = 1\n"
                 'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
                 'type = "RTX 5090"\n'

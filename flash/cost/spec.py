@@ -10,6 +10,7 @@ import math
 from flash.catalog import samples_on_policy
 from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
+from flash.engine.steps import on_policy_steps
 
 
 def _sft_epochs(spec) -> int:
@@ -19,13 +20,21 @@ def _sft_epochs(spec) -> int:
     return int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
 
 
+def _on_policy_epochs(spec) -> int:
+    from flash.engine.recipe import RECIPE
+
+    t = spec.train
+    default = RECIPE.rl.num_epochs if spec.algorithm == "grpo" else RECIPE.opd.num_epochs
+    return int(t.epochs) if t.epochs is not None else default
+
+
 def _sft_seq_len(spec) -> int:
     from flash.engine.recipe import RECIPE
 
     t = spec.train
     return (
-        int(t.max_length)
-        if t.max_length is not None
+        int(t.max_context_tokens)
+        if t.max_context_tokens is not None
         else (RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
     )
 
@@ -39,6 +48,43 @@ def _sft_example_count(spec) -> int:
         "cannot estimate SFT cost without [train].max_examples; set it to the number "
         "of rows to price (use the full dataset row count for an uncapped run)"
     )
+
+
+def _on_policy_example_count(spec) -> int:
+    t = spec.train
+    pinned_examples = int(t.max_examples) if t.max_examples else 0
+    if pinned_examples > 0:
+        return pinned_examples
+    env_examples = _env_max_examples(spec)
+    if env_examples > 0:
+        return env_examples
+    return _on_policy_requested_prompts_per_step(spec)
+
+
+def _env_max_examples(spec) -> int:
+    params = getattr(getattr(spec, "environment", None), "params", {}) or {}
+    if not isinstance(params, dict):
+        return 0
+    try:
+        value = int(params.get("max_examples") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def _on_policy_requested_prompts_per_step(spec) -> int:
+    from flash.engine.recipe import RECIPE
+
+    t = spec.train
+    default = (
+        RECIPE.rl.prompts_per_step if spec.algorithm == "grpo" else RECIPE.opd.prompts_per_step
+    )
+    return max(1, int(t.batch_size) if t.batch_size is not None else default)
+
+
+def _on_policy_prompts_per_step(spec, examples: int) -> int:
+    requested = _on_policy_requested_prompts_per_step(spec)
+    return max(1, min(requested, max(1, int(examples))))
 
 
 def _sft_realized_batch(spec) -> int:
@@ -68,22 +114,26 @@ def _sft_steps_from_examples(spec, examples: int, *, apply_cap: bool) -> int:
 
 
 def spec_steps(spec) -> int:
-    """Per-seed optimizer steps implied by a train spec (mirrors the worker). GRPO: ``train.steps``
-    (else recipe default). SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by
-    ``max_steps``, where ``num_examples`` must be pinned by ``max_examples``."""
-    from flash.engine.recipe import RECIPE
+    """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
-    t = spec.train
+    SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by ``max_steps``. GRPO/OPD:
+    ``epochs`` means passes over ``max_examples`` rows when pinned, otherwise the estimate uses one
+    prompt batch per epoch.
+    """
     if spec.algorithm == "grpo":
-        if t.steps is not None:
-            return max(1, int(t.steps))
-        return RECIPE.rl.num_steps
+        examples = _on_policy_example_count(spec)
+        return on_policy_steps(
+            epochs=_on_policy_epochs(spec),
+            prompt_count=examples,
+            prompts_per_step=_on_policy_prompts_per_step(spec, examples),
+        )
     if spec.algorithm == "opd":
-        # Step-driven like GRPO (on-policy sampling), NOT example-driven — so a opd quote never
-        # demands [train].max_examples (the SFT fallback below would raise).
-        if t.steps is not None:
-            return max(1, int(t.steps))
-        return RECIPE.opd.num_steps
+        examples = _on_policy_example_count(spec)
+        return on_policy_steps(
+            epochs=_on_policy_epochs(spec),
+            prompt_count=examples,
+            prompts_per_step=_on_policy_prompts_per_step(spec, examples),
+        )
     # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
     # don't let max_examples=0 price a single step.
     return _sft_steps_from_examples(spec, _sft_example_count(spec), apply_cap=True)
@@ -101,8 +151,8 @@ def runconfig_from_spec(spec) -> RunConfig:
         model_id=spec.model,
         method=spec.algorithm,
         steps=spec_steps(spec),
-        seq_len=t.max_length,
-        completion_len=t.max_tokens if has_rollout else None,
+        seq_len=t.max_context_tokens,
+        completion_len=t.max_completion_tokens if has_rollout else None,
         batch_size=t.batch_size,
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,

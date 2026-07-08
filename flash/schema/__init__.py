@@ -190,7 +190,6 @@ _TOP_LEVEL_KEYS = frozenset(
 )
 _TRAIN_KEYS = frozenset(
     {
-        "steps",
         "epochs",
         "lora_rank",
         "lora_alpha",
@@ -198,11 +197,11 @@ _TRAIN_KEYS = frozenset(
         "hf_repo",
         "learning_rate",
         "batch_size",
-        "max_length",
+        "max_context_tokens",
         "save_every",
         "group_size",
         "temperature",
-        "max_tokens",
+        "max_completion_tokens",
         "kl_penalty_coef",
         "advantage_clip",
         "thinking_length_penalty_coef",
@@ -219,7 +218,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):
             hint = (
-                " — GRPO/SFT/opd knobs (group_size, batch_size, max_tokens, …) "
+                " — GRPO/SFT/opd knobs (group_size, batch_size, max_completion_tokens, …) "
                 "belong under [train], not a [grpo]/[sft]/[opd] table"
             )
         raise ConfigError(
@@ -333,7 +332,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             secrets=environment_secrets,
         ),
         train=TrainSpec(
-            steps=_train_int(train_raw, "steps", minimum=1),
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
@@ -341,11 +339,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
-            max_length=_train_int(train_raw, "max_length", minimum=1),
+            max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),
             save_every=_train_int(train_raw, "save_every", minimum=1),
             group_size=_train_int(train_raw, "group_size", minimum=1),
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
-            max_tokens=_train_int(train_raw, "max_tokens", minimum=1),
+            max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
             advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
             thinking_length_penalty_coef=_train_float(
@@ -379,9 +377,7 @@ def _validate_sft(spec: JobSpec) -> None:
 
 
 def _validate_grpo(spec: JobSpec) -> None:
-    """GRPO contract: step-driven, so steps (when pinned) must be positive."""
-    if spec.train.steps is not None and spec.train.steps <= 0:
-        raise ConfigError("train.steps must be positive for GRPO")
+    """GRPO contract: epochs derive passes over retained prompts."""
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
             "train.group_size must be >= 2 for GRPO (TRL needs at least two generations "
@@ -390,27 +386,25 @@ def _validate_grpo(spec: JobSpec) -> None:
 
 
 def _validate_opd(spec: JobSpec) -> None:
-    """OPD contract: step-driven (positive steps) with a usable prompt budget.
+    """OPD contract: epochs derive passes over retained prompts.
 
     The teacher key (FIREWORKS_API_KEY) is a platform-owned credential the control plane injects into
     the worker env (build_worker_env), like HF_TOKEN — never a user-declared secret."""
-    if spec.train.steps is not None and spec.train.steps <= 0:
-        # OPD is step-driven (on-policy sampling), like GRPO — not epoch-driven.
-        raise ConfigError("train.steps must be positive for opd")
-    if spec.train.max_length:
-        # Mirror run_opd's prompt-budget guard at PARSE time: a max_length that leaves no room for
-        # any prompt after the completion budget is rejected here, BEFORE a paid worker is
+    if spec.train.max_context_tokens:
+        # Mirror run_opd's prompt-budget guard at PARSE time: a context budget that leaves no room
+        # for any prompt after the completion budget is rejected here, BEFORE a paid worker is
         # provisioned (wait_for_gpu + model prefetch + tokenizer/adapter load), instead of failing
         # deterministically only after GPU setup. max_completion resolves exactly as the worker does:
-        # explicit [train] max_tokens, else the recipe thinking/non-thinking default.
+        # explicit [train] max_completion_tokens, else the recipe thinking/non-thinking default.
         from flash.engine.vram import opd_completion_len
 
-        max_completion = opd_completion_len(spec.train.max_tokens, spec.thinking)
-        if spec.train.max_length - max_completion < 1:
+        max_completion = opd_completion_len(spec.train.max_completion_tokens, spec.thinking)
+        if spec.train.max_context_tokens - max_completion < 1:
             raise ConfigError(
-                f"[train] max_length ({spec.train.max_length}) leaves no prompt budget after "
-                f"max_tokens ({max_completion}) for opd; set max_length > max_tokens. Rejected at "
-                f"parse time so an invalid budget fails before a GPU worker is provisioned."
+                f"[train] max_context_tokens ({spec.train.max_context_tokens}) leaves no prompt budget "
+                f"after max_completion_tokens ({max_completion}) for opd; set "
+                f"max_context_tokens > max_completion_tokens. Rejected at parse time so an "
+                f"invalid budget fails before a GPU worker is provisioned."
             )
 
 

@@ -217,10 +217,10 @@ def test_35b_moe_long_context_grpo_sized_past_the_b200():
     moe = "Qwen/Qwen3.6-35B-A3B"
     # default + moderate context fit the single B200 (<= 180 GB).
     assert alloc_required_vram_gb(moe, "grpo", train={}, thinking=False) <= 180
-    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 4096}, thinking=False) <= 180
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 4096}, thinking=False) <= 180
     # past the resident wall -> sized ABOVE the 180 GB B200 -> rejected (NOT routed to broken sleep).
-    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 8192}, thinking=False) > 180
-    assert alloc_required_vram_gb(moe, "grpo", train={"max_length": 32768}, thinking=False) > 180
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 8192}, thinking=False) > 180
+    assert alloc_required_vram_gb(moe, "grpo", train={"max_context_tokens": 32768}, thinking=False) > 180
     # The GRPO escalation is GRPO-only: default SFT stays at its 180 GB floor (fits the B200). (Long-
     # context SFT has its OWN large-vocab fp32-logits growth, independent of this grpo escalation.)
     assert alloc_required_vram_gb(moe, "sft", train={}, thinking=False) <= 180
@@ -233,25 +233,25 @@ def test_invalid_config_rejected():
         RunConfig(MID, "ppo", 100)
 
 
-def test_omitted_grpo_max_length_sizes_like_the_real_allocator():
-    # An omitted GRPO max_length mirrors the worker's max(1024, max_prompt_len + completion), not
+def test_omitted_grpo_context_sizes_like_the_real_allocator():
+    # An omitted GRPO context mirrors the worker's max(1024, max_prompt_len + completion), not
     # bare max_prompt_len -- else the estimate under-sizes VRAM by the completion budget.
     from flash.engine.recipe import RECIPE
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
-    cfg = RunConfig(MID, "grpo", 100)  # max_length / seq_len omitted
+    cfg = RunConfig(MID, "grpo", 100)  # max_context_tokens / seq_len omitted
     worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
     assert cfg.normalized().seq_len == worker_len
-    assert cfg.train_knobs()["max_length"] == worker_len
+    assert cfg.train_knobs()["max_context_tokens"] == worker_len
     _, need = select_gpu(cfg)
     real = alloc_required_vram_gb(MID, "grpo", train={}, thinking=False)
     assert need == real
     # ...and never under-sizes vs the old bare-max_prompt_len default.
-    old = alloc_required_vram_gb(MID, "grpo", train={"max_length": RECIPE.rl.max_prompt_len}, thinking=False)
+    old = alloc_required_vram_gb(MID, "grpo", train={"max_context_tokens": RECIPE.rl.max_prompt_len}, thinking=False)
     assert need >= old
 
 
-def test_omitted_grpo_max_length_mirrors_worker_with_thinking():
+def test_omitted_grpo_context_mirrors_worker_with_thinking():
     # The thinking completion budget (larger) feeds the same worker-mirrored default.
     from flash.engine.recipe import RECIPE
 
@@ -261,16 +261,16 @@ def test_omitted_grpo_max_length_mirrors_worker_with_thinking():
     assert worker_len > max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
 
 
-def test_explicit_grpo_max_length_still_wins():
+def test_explicit_grpo_context_still_wins():
     # An explicitly pinned seq_len (engine length) is honored verbatim, not overridden by the
-    # worker-mirrored default, and matches the allocator at that same pinned max_length.
+    # worker-mirrored default, and matches the allocator at that same pinned context.
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "grpo", 100, seq_len=8192)
     assert cfg.normalized().seq_len == 8192
-    assert cfg.train_knobs()["max_length"] == 8192
+    assert cfg.train_knobs()["max_context_tokens"] == 8192
     _, need = select_gpu(cfg)
-    real = alloc_required_vram_gb(MID, "grpo", train={"max_length": 8192}, thinking=False)
+    real = alloc_required_vram_gb(MID, "grpo", train={"max_context_tokens": 8192}, thinking=False)
     assert need == real
 
 

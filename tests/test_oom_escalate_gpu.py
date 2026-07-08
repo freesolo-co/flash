@@ -12,10 +12,19 @@ def test_is_cuda_oom_is_structured(monkeypatch):
     # try/except, so the counter + MemoryError paths classify without it.
     from flash.engine.worker.perf import lifecycle as lc
 
-    # NO string matching: a RuntimeError that SAYS "out of memory" is not an OOM without a real signal
+    # A generic RuntimeError that SAYS "out of memory" is not an OOM without a real signal.
     monkeypatch.setattr(lc, "cuda_oom_count", lambda: 0)
     assert lc.is_cuda_oom(RuntimeError("Triton Error [CUDA]: out of memory")) is False
     assert lc.is_cuda_oom(ValueError("bad config")) is False
+    # vLLM can reject startup before torch records an allocator OOM; those deterministic memory
+    # preflight messages must still trigger the larger-GPU walk.
+    assert lc.is_cuda_oom(
+        RuntimeError(
+            "Free memory on device cuda:0 (2.42/31.36 GiB) on startup is less than "
+            "desired GPU memory utilization (0.37421194528246804, 11.73 GiB)"
+        )
+    ) is True
+    assert lc.is_cuda_oom(RuntimeError("No available memory for the cache blocks")) is True
     # torch's allocator counter advancing is the structured "error code"
     monkeypatch.setattr(lc, "cuda_oom_count", lambda: 2)
     assert lc.is_cuda_oom(RuntimeError("whatever")) is True
