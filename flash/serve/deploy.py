@@ -207,11 +207,13 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str) -> None:
             raise AdapterTensorMissing(message) from exc
         raise ServingError(message) from exc
 
+    tensor_paths: list[str] = []
     zero_byte_tensor_paths: list[str] = []
     for entry in entries:
         path = str(getattr(entry, "path", "") or "")
         if not _is_adapter_tensor_filename(path):
             continue
+        tensor_paths.append(path)
         size = getattr(entry, "size", None)
         try:
             if size is not None and int(size) <= 0:
@@ -219,14 +221,15 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str) -> None:
                 continue
         except (TypeError, ValueError):
             pass
-        return
 
     location = f"{hf_repo}:{subfolder}"
     if zero_byte_tensor_paths:
         raise AdapterTensorMissing(
-            f"could not verify adapter tensors: {location} only has zero-byte adapter tensor "
+            f"could not verify adapter tensors: {location} has zero-byte adapter tensor "
             f"file(s): {', '.join(zero_byte_tensor_paths)}"
         )
+    if tensor_paths:
+        return
     raise AdapterTensorMissing(
         f"could not verify adapter tensors: {location} has no adapter_model tensor file"
     )
