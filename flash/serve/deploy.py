@@ -36,6 +36,17 @@ class AdapterConfigMissing(ServingError):
     """The adapter's adapter_config.json could not be read from HF (artifact likely absent)."""
 
 
+class AdapterTensorMissing(ServingError):
+    """The adapter artifact has metadata but no loadable LoRA tensor file."""
+
+
+def _is_adapter_tensor_filename(filename: str) -> bool:
+    name = filename.rsplit("/", 1)[-1]
+    if name in {"adapter_model.safetensors", "adapter_model.bin"}:
+        return True
+    return name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
+
+
 def _is_hf_not_found_error(exc: Exception) -> bool:
     try:
         import huggingface_hub.errors as hf_errors  # type: ignore[import-not-found]
@@ -172,8 +183,57 @@ def _rank_from_adapter_config(config: dict, *, source: str) -> int:
     return rank_from_adapter_config(config, source=source)
 
 
+def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str) -> None:
+    """Confirm the adapter has tensor weights before registering it with serving."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
+        raise ServingError(
+            "could not verify adapter tensors: huggingface_hub is not installed"
+        ) from exc
+    try:
+        entries = list(
+            HfApi().list_repo_tree(
+                repo_id=hf_repo,
+                path_in_repo=subfolder.rstrip("/"),
+                repo_type="dataset",
+                recursive=False,
+                token=os.environ.get("HF_TOKEN"),
+            )
+        )
+    except Exception as exc:
+        message = f"could not verify adapter tensors: failed to list {hf_repo}:{subfolder}"
+        if _is_hf_not_found_error(exc):
+            raise AdapterTensorMissing(message) from exc
+        raise ServingError(message) from exc
+
+    zero_byte_tensor_paths: list[str] = []
+    for entry in entries:
+        path = str(getattr(entry, "path", "") or "")
+        if not _is_adapter_tensor_filename(path):
+            continue
+        size = getattr(entry, "size", None)
+        try:
+            if size is not None and int(size) <= 0:
+                zero_byte_tensor_paths.append(path)
+                continue
+        except (TypeError, ValueError):
+            pass
+        return
+
+    location = f"{hf_repo}:{subfolder}"
+    if zero_byte_tensor_paths:
+        raise AdapterTensorMissing(
+            f"could not verify adapter tensors: {location} only has zero-byte adapter tensor "
+            f"file(s): {', '.join(zero_byte_tensor_paths)}"
+        )
+    raise AdapterTensorMissing(
+        f"could not verify adapter tensors: {location} has no adapter_model tensor file"
+    )
+
+
 def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
-    """Read the deployed adapter's actual rank from HF artifact metadata."""
+    """Read rank metadata and verify the adapter has tensor weights."""
     filename = f"{subfolder.rstrip('/')}/adapter_config.json"
     try:
         from huggingface_hub import hf_hub_download
@@ -204,6 +264,7 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
         raise ValueError(
             f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
         )
+    _verify_adapter_artifact_tensors(hf_repo, subfolder)
     return _rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
