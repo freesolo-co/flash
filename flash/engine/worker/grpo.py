@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 from flash.engine.worker._pkg import W as _w
 
 
@@ -85,17 +83,6 @@ def rl_per_device_comps(
     Falls back to default (8, or 2 with thinking) with no live card.
     """
     default = 2 if _w.THINKING else 8
-
-    _ovr = os.environ.get("FLASH_RL_PER_DEVICE_COMPS", "").strip()
-    if _ovr:
-        try:
-            forced = int(_ovr)
-            if forced >= 1:
-                print(f"rl_per_device_comps: FLASH_RL_PER_DEVICE_COMPS override -> per_device={forced}")
-                return forced
-            print(f"rl_per_device_comps: ignoring non-positive FLASH_RL_PER_DEVICE_COMPS={_ovr!r}")
-        except ValueError:
-            print(f"rl_per_device_comps: ignoring non-integer FLASH_RL_PER_DEVICE_COMPS={_ovr!r}")
 
     logits_cap = _RL_PER_DEVICE_MAX
     if completion_len > 0 and not fused_logits:
