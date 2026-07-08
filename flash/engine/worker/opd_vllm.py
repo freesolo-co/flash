@@ -48,6 +48,37 @@ def opd_lora_rank(model, default: int = 32) -> int:
         return 32
 
 
+def _startup_oom_error(
+    *,
+    free_gb: float,
+    total_gb: float,
+    requested_util: float,
+    margin_gb: float,
+    rollout_batch_size: int,
+) -> BaseException:
+    requested_gb = float(requested_util) * float(total_gb)
+    msg = (
+        "Free memory on device cuda:0 "
+        f"({free_gb:.2f}/{total_gb:.2f} GiB) on startup is less than desired GPU "
+        f"memory utilization ({requested_util:.6f} -> {requested_gb:.2f} GiB) "
+        f"with {margin_gb:.2f} GiB startup margin after reducing OPD rollout_batch_size "
+        f"to {rollout_batch_size}. Retry on a larger GPU."
+    )
+    try:
+        import torch
+
+        return torch.cuda.OutOfMemoryError(msg)
+    except Exception:
+        return RuntimeError(msg)
+
+
+def _decode_only_compilation_config() -> dict[str, Any]:
+    return {
+        "mode": 0,  # CompilationMode.NONE: no torch.compile/AOT.
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+    }
+
+
 def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
     """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
     kwargs: dict[str, Any] = {
@@ -62,6 +93,7 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
         "compilation_config": None,
     }
     free_gb = 0.0
+    startup_oom: BaseException | None = None
     try:
         import torch
 
@@ -117,7 +149,7 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                 # largest rollout chunk that fits the observed residual memory instead of reserving for
                 # every prompt in the optimizer step.
                 startup_margin_gb = max(1.0, min(4.0, card_gb * 0.03))
-                max_startup_util = max(0.10, (free_gb - startup_margin_gb) / max(1.0, card_gb))
+                max_startup_util = max(0.0, (free_gb - startup_margin_gb) / max(1.0, card_gb))
                 while rollout_concurrency > 1 and util > max_startup_util:
                     rollout_concurrency -= 1
                     util = _util_for(rollout_concurrency)
@@ -128,11 +160,21 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                         f"(free={free_gb:.1f} GiB, request={util * card_gb:.1f} GiB, "
                         f"margin={startup_margin_gb:.1f} GiB)"
                     )
+                if util > max_startup_util:
+                    startup_oom = _startup_oom_error(
+                        free_gb=free_gb,
+                        total_gb=card_gb,
+                        requested_util=util,
+                        margin_gb=startup_margin_gb,
+                        rollout_batch_size=rollout_concurrency,
+                    )
             kwargs["gpu_memory_utilization"] = util
             kwargs["max_num_seqs"] = rollout_concurrency
             kwargs["rollout_batch_size"] = rollout_concurrency
         except Exception as exc:
             print(f"[opd] vLLM memory-util sizing failed; using 0.10: {exc}")
+    if startup_oom is not None:
+        raise startup_oom
 
     from flash.engine.worker.gpu_setup import (
         force_vit_sdpa_on_blackwell,
@@ -168,10 +210,7 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
         # compile/slot-mapping path but still exercises CUDA graphs on B200/RTX 5090.
         if vllm_ver >= (0, 19, 0) and blackwell_inproc_v1:
             kwargs["enforce_eager"] = False
-            kwargs["compilation_config"] = {
-                "mode": 0,  # CompilationMode.NONE: no torch.compile/AOT.
-                "cudagraph_mode": "FULL_DECODE_ONLY",
-            }
+            kwargs["compilation_config"] = _decode_only_compilation_config()
             print(
                 f"[opd] cc={cc[0]}.{cc[1]}: using decode-only vLLM CUDA graphs for OPD rollout "
                 "(torch.compile disabled, V1 EngineCore in-process)"
