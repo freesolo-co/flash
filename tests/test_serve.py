@@ -235,6 +235,31 @@ def test_deploy_adapter_zero_byte_tensor_file_is_adapter_tensor_missing(monkeypa
         )
 
 
+def test_deploy_adapter_rejects_zero_byte_sharded_tensor(monkeypatch, tmp_path):
+    import flash.serve.deploy as d
+
+    _stub_adapter_config(
+        monkeypatch,
+        tmp_path,
+        tensor_files={
+            "adapter_model-00001-of-00002.safetensors": 456,
+            "adapter_model-00002-of-00002.safetensors": 0,
+        },
+    )
+
+    with pytest.raises(
+        d.AdapterTensorMissing, match=r"adapter_model-00002-of-00002\.safetensors"
+    ):
+        d.deploy_adapter(
+            run_id="r-empty-shard",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-empty-shard/seed0",
+            dry_run=False,
+            lora_rank=32,
+        )
+
+
 def test_deploy_accepts_legacy_bin_adapter_tensor(monkeypatch, tmp_path):
     from flash.serve.deploy import adapter_artifact_lora_rank
 

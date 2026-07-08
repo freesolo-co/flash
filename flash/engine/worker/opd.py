@@ -782,11 +782,14 @@ def run_opd():
                         scored_samples.append((p.gen, score, p.prompt_ids))
                     loss_started = time.perf_counter()
                     resolved = _resolve_samples_batched(
-                        model, tok, device, scored_samples, knobs, loss_microbatch_size
+                        model,
+                        tok,
+                        device,
+                        scored_samples,
+                        knobs,
+                        loss_microbatch_size,
+                        backward_scale=1.0 / _accum_target,
                     )
-                    losses = [r.loss for r in resolved if r.loss is not None]
-                    if losses:
-                        (sum(losses) / _accum_target).backward()
                     opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
                     opd_phase_counts["loss_batches"] += 1
                     for r in resolved:
@@ -1454,7 +1457,14 @@ def _bump_model_counter(model, name: str, inc: int = 1) -> None:
 
 
 def _resolve_samples_batched(
-    model, tok, device, samples: list[tuple[_GenResult, _ScoreResult, object]], knobs, microbatch: int
+    model,
+    tok,
+    device,
+    samples: list[tuple[_GenResult, _ScoreResult, object]],
+    knobs,
+    microbatch: int,
+    *,
+    backward_scale: float | None = None,
 ) -> list[SampleResult]:
     import torch
 
@@ -1526,6 +1536,7 @@ def _resolve_samples_batched(
                 )
                 attention_mask[row, : len(seq)] = 1
             logits = _forward_logits(model, input_ids, attention_mask)
+            losses = []
             for row, p in enumerate(chunk):
                 prompt_len = len(p.prompt_ids)
                 comp_len = len(p.student_ids)
@@ -1543,14 +1554,20 @@ def _resolve_samples_batched(
                         skip_reason="alignment_empty",
                     )
                 else:
+                    loss_for_result = loss
+                    if backward_scale is not None:
+                        losses.append(loss)
+                        loss_for_result = loss.detach()
                     results[p.idx] = SampleResult(
-                        loss=loss,
+                        loss=loss_for_result,
                         teacher_status="ok",
                         coverage=p.coverage,
                         gen_tokens=p.gen_tokens,
                         teacher_tokens=p.teacher_tokens,
                         group_granularity=p.group_granularity,
                     )
+            if losses:
+                (sum(losses) * float(backward_scale)).backward()
 
     return [r if r is not None else SampleResult(skip_reason="teacher_error") for r in results]
 
