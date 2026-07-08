@@ -58,7 +58,7 @@ def test_patch_injects_kv_cache_dtype_and_overrides_max_num_batched_tokens(fake_
 
 
 def test_big_card_batched_tokens_default_covers_engine_length():
-    """A big-card GRPO run whose [train].max_length exceeds 8192 must NOT pin
+    """A big-card GRPO run whose [train].max_context_tokens exceeds 8192 must NOT pin
     max_num_batched_tokens to a fixed 8192: vLLM validates the scheduler token budget against the
     engine's max model length at colocate init, so 8192 < max_model_len (e.g. 16k) fails engine
     startup. The big-card default must therefore derive from vllm_max_len, not a fixed 8192. (The

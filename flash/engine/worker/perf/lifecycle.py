@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 
 RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
 
@@ -30,7 +31,12 @@ def cuda_oom_count() -> int:
 
 
 def is_cuda_oom(exc: BaseException | None) -> bool:
-    """Whether a failure was a CUDA OOM, without message parsing."""
+    """Whether a failure was a CUDA OOM.
+
+    Prefer structured torch allocator signals. Also classify vLLM's deterministic startup memory
+    preflight errors: those can fail before torch records a CUDA OOM counter, but a larger GPU is the
+    correct retry action.
+    """
     if exc is None or isinstance(exc, MemoryError):
         return False
     try:
@@ -40,6 +46,12 @@ def is_cuda_oom(exc: BaseException | None) -> bool:
             return True
     except Exception:
         pass
+    msg = str(exc).lower()
+    if (
+        re.search(r"free memory on device\s+cuda:\d+.*less than desired gpu memory utilization", msg)
+        or "no available memory for the cache blocks" in msg
+    ):
+        return True
     return cuda_oom_count() > 0
 
 
