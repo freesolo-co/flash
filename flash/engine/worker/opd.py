@@ -1475,12 +1475,13 @@ class _PreparedLoss:
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
     import torch
+    import torch.nn.functional as F
 
     if not student_ids or not groups:
         return None
     rows = rows.float()
     ids_t = torch.tensor(student_ids, device=rows.device)
-    sp_t = rows.gather(1, ids_t.unsqueeze(1)).squeeze(1) - torch.logsumexp(rows, dim=-1)
+    sp_t = -F.cross_entropy(rows, ids_t, reduction="none")
     sp_det = sp_t.detach()
     flat_idx: list[int] = []
     coeffs: list = []

@@ -3570,6 +3570,32 @@ def test_resolve_samples_batched_can_disable_completion_suffix_logits(monkeypatc
     assert model._flash_opd_full_logits_batches == 1
 
 
+def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    rows = torch.tensor(
+        [[0.2, -0.3, 0.7], [-0.5, 1.0, 0.1]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    student_ids = [2, 1]
+    groups = [([0, 1], -0.75)]
+
+    loss = opd_mod._gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=0.5)
+    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(1) - torch.logsumexp(
+        rows, dim=-1
+    )
+    coeff = 0.5 * (manual_logps.detach().sum() - groups[0][1]) / 2
+    expected = (coeff * manual_logps).mean()
+
+    assert loss is not None
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert rows.grad is not None
+    assert rows.grad.abs().sum() > 0
+
+
 def test_gkd_loss_none_without_groups_or_tokens():
     torch = pytest.importorskip("torch")
     from flash.engine.worker.opd import gkd_loss

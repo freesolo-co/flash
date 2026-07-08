@@ -207,6 +207,7 @@ def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     ``kl_coef`` scales the objective (``[train] kl_penalty_coef``). Scalar loss or None.
     """
     import torch
+    import torch.nn.functional as F
 
     if not student_ids or not groups:
         return None
@@ -221,7 +222,7 @@ def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     pos = torch.arange(P - 1, P - 1 + len(student_ids), device=logits.device)
     ids_t = torch.tensor(student_ids, device=logits.device)
     rows = logits.index_select(0, pos).float()  # [C, V]
-    sp_t = rows.gather(1, ids_t.unsqueeze(1)).squeeze(1) - torch.logsumexp(rows, dim=-1)  # [C]
+    sp_t = -F.cross_entropy(rows, ids_t, reduction="none")  # [C]
     sp_det = sp_t.detach()
     # The per-token loss coefficient is CONSTANT within an alignment group (it depends only on the
     # group's DETACHED student logprob sum, its teacher logprob sum, and its size), so the loss is
