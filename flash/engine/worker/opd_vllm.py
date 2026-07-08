@@ -72,6 +72,13 @@ def _startup_oom_error(
         return RuntimeError(msg)
 
 
+def _decode_only_compilation_config() -> dict[str, Any]:
+    return {
+        "mode": 0,  # CompilationMode.NONE: no torch.compile/AOT.
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+    }
+
+
 def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
     """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
     kwargs: dict[str, Any] = {
@@ -203,10 +210,7 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
         # compile/slot-mapping path but still exercises CUDA graphs on B200/RTX 5090.
         if vllm_ver >= (0, 19, 0) and blackwell_inproc_v1:
             kwargs["enforce_eager"] = False
-            kwargs["compilation_config"] = {
-                "mode": 0,  # CompilationMode.NONE: no torch.compile/AOT.
-                "cudagraph_mode": "FULL_DECODE_ONLY",
-            }
+            kwargs["compilation_config"] = _decode_only_compilation_config()
             print(
                 f"[opd] cc={cc[0]}.{cc[1]}: using decode-only vLLM CUDA graphs for OPD rollout "
                 "(torch.compile disabled, V1 EngineCore in-process)"
