@@ -69,6 +69,8 @@ from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_c
 
 OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
+OPD_TEACHER_BATCH_SIZE = 8
+OPD_LOSS_MICROBATCH_SIZE = 4
 
 
 def _opd_rollout_pipeline_chunks(total_prompts: int) -> int:
@@ -93,6 +95,51 @@ def _opd_rollout_chunk_size(total_prompts: int) -> int:
     total = max(1, int(total_prompts))
     chunks = _opd_rollout_pipeline_chunks(total)
     return max(1, (total + chunks - 1) // chunks)
+
+
+def _opd_env_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[opd] ignoring invalid {name}={raw!r}")
+        return None
+
+
+def _opd_teacher_batch_size(total_samples: int) -> int:
+    total = max(1, int(total_samples))
+    override = _opd_env_int("FLASH_OPD_TEACHER_BATCH_SIZE")
+    if override is not None:
+        return max(1, min(total, override))
+    return max(1, min(total, OPD_TEACHER_BATCH_SIZE))
+
+
+def _opd_teacher_workers(total_samples: int, batch_size: int) -> int:
+    total = max(1, int(total_samples))
+    batches = max(1, (total + max(1, int(batch_size)) - 1) // max(1, int(batch_size)))
+    override = _opd_env_int("FLASH_OPD_TEACHER_WORKERS")
+    if override is not None:
+        return max(1, min(batches, override))
+    return batches
+
+
+def _opd_loss_microbatch_size(model_id: str, total_samples: int) -> int:
+    total = max(1, int(total_samples))
+    override = _opd_env_int("FLASH_OPD_LOSS_MICROBATCH_SIZE")
+    if override is not None:
+        return max(1, min(total, override))
+    try:
+        from flash.engine.vram import resolve_params_b
+
+        params_b = float(resolve_params_b(model_id) or 0.0)
+    except Exception:
+        params_b = 0.0
+    # The dense vocab logits from GKD are the peak. Batch small/medium dense models, but keep 35B-class
+    # OPD serial by default so the B200 path does not trade speed for OOM risk.
+    default = OPD_LOSS_MICROBATCH_SIZE if params_b and params_b <= 10.0 else 1
+    return max(1, min(total, default))
 
 
 @dataclass(frozen=True)
@@ -593,7 +640,7 @@ def run_opd():
                 vllm_rollout, tok, [prefix_ids], knobs, max_tokens=max(1, int(max_new))
             )[0]
 
-    def _account(r):
+    def _account(r, *, backward: bool = True):
         """Consume one sample's SampleResult: tally teacher health / truncations, backprop a distilled
         sample (scaled 1/accum_target for gradient accumulation), advance the step aggregates, and
         refresh the stall clock. Called after vLLM generation and teacher scoring; ``samples_seen`` is
@@ -616,7 +663,8 @@ def run_opd():
             # _opd_progress) — else an all-skip stretch emits only ignored liveness pings.
             _opd_progress(opt_steps, nseq)
             return
-        (r.loss / accum_target).backward()
+        if backward:
+            (r.loss / accum_target).backward()
         step_loss += float(r.loss.detach())
         step_cov += r.coverage
         granularity_sum += r.group_granularity
@@ -640,7 +688,13 @@ def run_opd():
     step = 0
     max_iters = 3 * steps + 10
     max_no_signal_attempts = 3
-    max_teacher_workers = max(1, knobs.prompts_per_step * knobs.group_size)
+    teacher_batch_size = _opd_teacher_batch_size(knobs.prompts_per_step * knobs.group_size)
+    loss_microbatch_size = _opd_loss_microbatch_size(
+        model_id, knobs.prompts_per_step * knobs.group_size
+    )
+    max_teacher_workers = _opd_teacher_workers(
+        knobs.prompts_per_step * knobs.group_size, teacher_batch_size
+    )
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
     # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
@@ -675,43 +729,70 @@ def run_opd():
                 # differentiable GKD losses as soon as they finish. This preserves one optimizer update
                 # per OPD step, but removes the old "wait for every teacher response before any loss"
                 # barrier.
-                teacher_futures: dict[Future, _Pending] = {}
+                teacher_futures: dict[Future, list[_Pending]] = {}
+
+                def _queue_teacher_batch(
+                    pendings: list[_Pending],
+                    *,
+                    _teacher_futures: dict[Future, list[_Pending]] = teacher_futures,
+                ) -> None:
+                    for i in range(0, len(pendings), teacher_batch_size):
+                        batch = pendings[i : i + teacher_batch_size]
+                        if batch:
+                            _teacher_futures[
+                                teacher_pool.submit(
+                                    _score_many,
+                                    teacher,
+                                    batch,
+                                    thinking_prefill=thinking_prefill,
+                                )
+                            ] = batch
 
                 def _queue_or_account(
-                    p: _Pending, *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+                    p: _Pending, *, _teacher_futures: dict[Future, list[_Pending]] = teacher_futures
                 ) -> None:
                     if p.gen.skip or p.gen.truncated:
                         _account(_resolve_sample(model, tok, device, p.gen, None, p.prompt_ids, knobs))
                         return
-                    _teacher_futures[
-                        teacher_pool.submit(
-                            _score_one,
-                            teacher,
-                            p.gen,
-                            prompt_messages=p.prompt_messages,
-                            thinking_prefill=thinking_prefill,
-                        )
-                    ] = p
+                    _queue_teacher_batch([p])
 
                 def _cancel_pending_teacher_futures(
-                    *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+                    *, _teacher_futures: dict[Future, list[_Pending]] = teacher_futures
                 ) -> None:
                     for other in _teacher_futures:
                         other.cancel()
 
                 def _consume_teacher_future(
-                    fut: Future, *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+                    fut: Future,
+                    *,
+                    _teacher_futures: dict[Future, list[_Pending]] = teacher_futures,
+                    _accum_target=accum_target,
                 ) -> None:
-                    p = _teacher_futures.pop(fut)
+                    batch = _teacher_futures.pop(fut)
                     try:
-                        p.score = fut.result()
+                        scores = fut.result()
                     except TeacherError:
                         _cancel_pending_teacher_futures()
                         raise
-                    _account(_resolve_sample(model, tok, device, p.gen, p.score, p.prompt_ids, knobs))
+                    if len(scores) != len(batch):
+                        raise RuntimeError(
+                            f"opd teacher batch returned {len(scores)} score(s) for {len(batch)} sample(s)"
+                        )
+                    scored_samples = []
+                    for p, score in zip(batch, scores, strict=True):
+                        p.score = score
+                        scored_samples.append((p.gen, score, p.prompt_ids))
+                    resolved = _resolve_samples_batched(
+                        model, tok, device, scored_samples, knobs, loss_microbatch_size
+                    )
+                    losses = [r.loss for r in resolved if r.loss is not None]
+                    if losses:
+                        (sum(losses) / _accum_target).backward()
+                    for r in resolved:
+                        _account(r, backward=False)
 
                 def _drain_ready_teacher_futures(
-                    *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+                    *, _teacher_futures: dict[Future, list[_Pending]] = teacher_futures
                 ) -> None:
                     for fut in list(_teacher_futures):
                         if fut.done():
@@ -775,16 +856,22 @@ def run_opd():
                                 knobs,
                                 max_tokens=knobs.max_completion,
                             )
+                        scorable: list[_Pending] = []
                         for gen, (prompt_ids, prompt_messages) in zip(
                             gens, chunk_contexts, strict=True
                         ):
-                            _queue_or_account(
-                                _Pending(
-                                    gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
-                                )
+                            p = _Pending(
+                                gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
                             )
+                            if gen.skip or gen.truncated:
+                                _account(
+                                    _resolve_sample(model, tok, device, gen, None, prompt_ids, knobs)
+                                )
+                            else:
+                                scorable.append(p)
                             samples_seen += 1  # advances the liveness-thread progress signal
                             _opd_progress(opt_steps, nseq)
+                        _queue_teacher_batch(scorable)
                         _drain_ready_teacher_futures()
 
                 _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
@@ -982,6 +1069,8 @@ def run_opd():
                 _opd_rollout_chunk_size(ppl_step * group) if not multi_turn else None
             ),
             "opd_teacher_workers": max_teacher_workers,
+            "opd_teacher_batch_size": teacher_batch_size,
+            "opd_loss_microbatch_size": loss_microbatch_size,
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
             # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
             # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
@@ -1226,6 +1315,113 @@ def _score_one(
     return _ScoreResult(status="error", error="teacher scoring attempts exhausted")
 
 
+def _score_many(
+    teacher, pendings: list[_Pending], *, thinking_prefill, max_attempts: int = 2
+) -> list[_ScoreResult]:
+    """[THREAD POOL — network only] Batch teacher echo-scoring for one chunk of scorable samples."""
+    if not pendings:
+        return []
+    prompts = [
+        (_teacher_prompt_text(p.prompt_messages, thinking_prefill), p.gen.completion_text)
+        for p in pendings
+    ]
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            scored = teacher.score_many(prompts)
+        except AttributeError:
+            return [
+                _score_one(
+                    teacher,
+                    p.gen,
+                    prompt_messages=p.prompt_messages,
+                    thinking_prefill=thinking_prefill,
+                    max_attempts=max_attempts,
+                )
+                for p in pendings
+            ]
+        except TeacherError as e:
+            if e.permanent:
+                raise
+            if attempt < attempts:
+                print(
+                    f"[opd] teacher batch failed (transient, retrying batch {attempt}/{attempts}, "
+                    f"samples={len(pendings)}): {e}"
+                )
+                continue
+            print(
+                f"[opd] teacher batch failed (transient, skipping batch, samples={len(pendings)}): {e}"
+            )
+            return [_ScoreResult(status="transient", error=str(e)) for _ in pendings]
+        except Exception as e:
+            if attempt < attempts:
+                print(
+                    f"[opd] teacher batch failed (retrying batch {attempt}/{attempts}, "
+                    f"samples={len(pendings)}): {e}"
+                )
+                continue
+            print(f"[opd] teacher batch failed (skipping batch, samples={len(pendings)}): {e}")
+            return [_ScoreResult(status="error", error=str(e)) for _ in pendings]
+        if len(scored) != len(pendings):
+            return [
+                _ScoreResult(
+                    status="error",
+                    error=f"teacher batch returned {len(scored)} score(s) for {len(pendings)} sample(s)",
+                )
+                for _ in pendings
+            ]
+        return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
+    return [_ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings]
+
+
+@dataclass(frozen=True)
+class _PreparedLoss:
+    idx: int
+    prompt_ids: object
+    student_ids: object
+    groups: object
+    coverage: float
+    gen_tokens: int
+    teacher_tokens: int
+    group_granularity: float
+
+
+def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
+    import torch
+
+    if not student_ids or not groups:
+        return None
+    rows = rows.float()
+    ids_t = torch.tensor(student_ids, device=rows.device)
+    sp_t = rows.gather(1, ids_t.unsqueeze(1)).squeeze(1) - torch.logsumexp(rows, dim=-1)
+    sp_det = sp_t.detach()
+    flat_idx: list[int] = []
+    coeffs: list = []
+    seg_lens: list[int] = []
+    for s_idx, teacher_logsum in groups:
+        if not s_idx:
+            continue
+        idx = torch.tensor(s_idx, device=sp_t.device)
+        student_logsum_det = sp_det.index_select(0, idx).sum()
+        coeffs.append(kl_coef * (student_logsum_det - teacher_logsum) / len(s_idx))
+        flat_idx.extend(s_idx)
+        seg_lens.append(len(s_idx))
+    if not flat_idx:
+        return None
+    coeff_vec = torch.repeat_interleave(
+        torch.stack(coeffs), torch.tensor(seg_lens, device=sp_t.device)
+    )
+    sp_sel = sp_t.index_select(0, torch.tensor(flat_idx, device=sp_t.device))
+    return (coeff_vec * sp_sel).mean()
+
+
+def _forward_logits(model, input_ids, attention_mask):
+    try:
+        return model(input_ids, attention_mask=attention_mask).logits
+    except TypeError:
+        return model(input_ids).logits
+
+
 def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -> SampleResult:
     """[SERIAL, GPU train] Turn one scored rollout into the differentiable groupwise reverse-KL loss.
     Runs the model in train mode with use_cache=False and reproduces the loss half of the old serial
@@ -1276,6 +1472,102 @@ def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -
         teacher_tokens=teacher_tokens,
         group_granularity=group_granularity,
     )
+
+
+def _resolve_samples_batched(
+    model, tok, device, samples: list[tuple[_GenResult, _ScoreResult, object]], knobs, microbatch: int
+) -> list[SampleResult]:
+    import torch
+
+    if not samples:
+        return []
+    results: list[SampleResult | None] = [None] * len(samples)
+    prepared: list[_PreparedLoss] = []
+    for idx, (gen, score, prompt_ids) in enumerate(samples):
+        if gen.truncated or gen.skip or score is None or score.status != "ok":
+            results[idx] = _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs)
+            continue
+        teacher_tokens = len(prompt_ids) + gen.gen_tokens
+        student_ids, student_toks = student_tokens_with_offsets(
+            tok, gen.completion_ids, gen.completion_text
+        )
+        if not student_ids:
+            results[idx] = SampleResult(
+                teacher_status="ok",
+                gen_tokens=gen.gen_tokens,
+                teacher_tokens=teacher_tokens,
+                skip_reason="student_tokens_empty",
+            )
+            continue
+        groups = groupwise_alignment(student_toks, score.teacher_toks)
+        coverage = groupwise_coverage(groups, student_toks)
+        n_align = sum(1 for st in student_toks if st.end > st.start)
+        group_granularity = (n_align / len(groups)) if groups else 0.0
+        if not groups:
+            results[idx] = SampleResult(
+                teacher_status="ok",
+                coverage=coverage,
+                gen_tokens=gen.gen_tokens,
+                teacher_tokens=teacher_tokens,
+                group_granularity=group_granularity,
+                skip_reason="alignment_empty",
+            )
+            continue
+        prepared.append(
+            _PreparedLoss(
+                idx=idx,
+                prompt_ids=prompt_ids,
+                student_ids=student_ids,
+                groups=groups,
+                coverage=coverage,
+                gen_tokens=gen.gen_tokens,
+                teacher_tokens=teacher_tokens,
+                group_granularity=group_granularity,
+            )
+        )
+
+    if prepared:
+        model.train()
+        model.config.use_cache = False
+        pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
+        mb = max(1, int(microbatch))
+        for start in range(0, len(prepared), mb):
+            chunk = prepared[start : start + mb]
+            seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
+            max_len = max(len(seq) for seq in seqs)
+            input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+            attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
+            for row, seq in enumerate(seqs):
+                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+                attention_mask[row, : len(seq)] = 1
+            logits = _forward_logits(model, input_ids, attention_mask)
+            for row, p in enumerate(chunk):
+                prompt_len = len(p.prompt_ids)
+                comp_len = len(p.student_ids)
+                rows = logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
+                loss = _gkd_loss_from_logits_rows(
+                    rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
+                )
+                if loss is None:
+                    results[p.idx] = SampleResult(
+                        teacher_status="ok",
+                        coverage=p.coverage,
+                        gen_tokens=p.gen_tokens,
+                        teacher_tokens=p.teacher_tokens,
+                        group_granularity=p.group_granularity,
+                        skip_reason="alignment_empty",
+                    )
+                else:
+                    results[p.idx] = SampleResult(
+                        loss=loss,
+                        teacher_status="ok",
+                        coverage=p.coverage,
+                        gen_tokens=p.gen_tokens,
+                        teacher_tokens=p.teacher_tokens,
+                        group_granularity=p.group_granularity,
+                    )
+
+    return [r if r is not None else SampleResult(skip_reason="teacher_error") for r in results]
 
 
 def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs) -> SampleResult:

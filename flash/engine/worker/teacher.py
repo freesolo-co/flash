@@ -238,18 +238,22 @@ class TeacherClient:
         raise last_err or TeacherError(f"teacher call to {path} failed")
 
     # -- echo scoring (gkd) ----------------------------------------------------------------------
-    def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
-        """Echo-score ``prompt_text + completion_text`` and return the teacher tokens that fall in
-        the COMPLETION region, each with its realized logprob and char offsets rebased to the
-        completion (0 = first completion char). ``max_tokens=0`` so this pays for input tokens only
-        (no generation); gkd needs only the realized per-token logprob (no top-k candidates)."""
-        full = prompt_text + completion_text
-        plen = len(prompt_text)
+    def score_many(self, items: list[tuple[str, str]]) -> list[list[TeacherToken]]:
+        """Batch echo-score ``[(prompt_text, completion_text), ...]``.
+
+        Fireworks' OpenAI-compatible completions endpoint accepts ``prompt`` as a list while still
+        honoring ``echo=true`` and ``max_tokens=0``. OPD's hot path uses this to collapse many remote
+        teacher round-trips into one request without changing the per-sample GKD signal.
+        """
+        if not items:
+            return []
+        fulls = [prompt_text + completion_text for prompt_text, completion_text in items]
+        plens = [len(prompt_text) for prompt_text, _completion_text in items]
         resp = self._post(
             "/completions",
             {
                 "model": self.model,
-                "prompt": full,
+                "prompt": fulls if len(fulls) > 1 else fulls[0],
                 "max_tokens": 0,
                 "echo": True,
                 # logprobs=1 is the minimum that returns per-token `token_logprobs` from the echo
@@ -258,8 +262,48 @@ class TeacherClient:
                 "temperature": 0,
             },
         )
+        choices = resp.get("choices")
+        if not isinstance(choices, list) or len(choices) != len(fulls):
+            raise TeacherError(
+                "teacher echo response returned the wrong number of choices "
+                f"(expected {len(fulls)}, got {len(choices) if isinstance(choices, list) else type(choices).__name__})",
+                permanent=True,
+            )
+        by_index: dict[int, dict] = {}
+        for pos, choice in enumerate(choices):
+            if not isinstance(choice, dict):
+                raise TeacherError(
+                    f"teacher echo response choice {pos} is not an object", permanent=True
+                )
+            idx = choice.get("index", pos)
+            if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0 or idx >= len(fulls):
+                raise TeacherError(
+                    f"teacher echo response choice {pos} has invalid index {idx!r}",
+                    permanent=True,
+                )
+            if idx in by_index:
+                raise TeacherError(
+                    f"teacher echo response duplicated choice index {idx}", permanent=True
+                )
+            by_index[idx] = choice
+        if len(by_index) != len(fulls):
+            missing = sorted(set(range(len(fulls))) - set(by_index))
+            raise TeacherError(
+                f"teacher echo response missing choice index(es): {missing}", permanent=True
+            )
+        return [
+            self._tokens_from_choice(by_index[i], full=fulls[i], plen=plens[i])
+            for i in range(len(fulls))
+        ]
+
+    def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
+        """Echo-score one completion and return completion-region teacher tokens."""
+        return self.score_many([(prompt_text, completion_text)])[0]
+
+    def _tokens_from_choice(self, choice: dict, *, full: str, plen: int) -> list[TeacherToken]:
+        completion_text = full[plen:]
         try:
-            lp = resp["choices"][0]["logprobs"]
+            lp = choice["logprobs"]
             tokens = lp["tokens"]
             token_logprobs = lp["token_logprobs"]
             offsets = lp["text_offset"]

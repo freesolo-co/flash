@@ -1416,6 +1416,62 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
     assert first_score < second_generate
 
 
+def test_opd_teacher_batch_size_and_workers_can_be_overridden(monkeypatch):
+    import flash.engine.worker.opd as opd_mod
+
+    monkeypatch.delenv("FLASH_OPD_TEACHER_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("FLASH_OPD_TEACHER_WORKERS", raising=False)
+    assert opd_mod._opd_teacher_batch_size(64) == 8
+    assert opd_mod._opd_teacher_workers(64, 8) == 8
+
+    monkeypatch.setenv("FLASH_OPD_TEACHER_BATCH_SIZE", "16")
+    assert opd_mod._opd_teacher_batch_size(64) == 16
+    assert opd_mod._opd_teacher_workers(64, 16) == 4
+
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKERS", "2")
+    assert opd_mod._opd_teacher_workers(64, 16) == 2
+
+    monkeypatch.setenv("FLASH_OPD_TEACHER_BATCH_SIZE", "not-an-int")
+    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKERS", "not-an-int")
+    assert opd_mod._opd_teacher_batch_size(64) == 8
+    assert opd_mod._opd_teacher_workers(64, 8) == 8
+
+    monkeypatch.delenv("FLASH_OPD_LOSS_MICROBATCH_SIZE", raising=False)
+    assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.5-2B", 64) == 4
+    assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.6-35B-A3B", 64) == 1
+    monkeypatch.setenv("FLASH_OPD_LOSS_MICROBATCH_SIZE", "8")
+    assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.6-35B-A3B", 64) == 8
+
+
+def test_opd_scores_generated_chunk_in_teacher_batches(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip, epochs=1, group=8)
+    monkeypatch.setattr(opd_mod, "_opd_teacher_batch_size", lambda _total: 4)
+    monkeypatch.setattr(opd_mod, "_opd_teacher_workers", lambda _total, _batch: 2)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    batches: list[int] = []
+
+    def _score_many(_teacher, pendings, **_kwargs):
+        batches.append(len(pendings))
+        return [opd_mod._ScoreResult(teacher_toks=[], status="ok") for _ in pendings]
+
+    def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs):
+        loss = model.w.float().sum() * 1e-6
+        return opd_mod.SampleResult(
+            loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
+        )
+
+    monkeypatch.setattr(opd_mod, "_score_many", _score_many)
+    monkeypatch.setattr(opd_mod, "_resolve_sample", _resolve_sample)
+
+    opd_mod.run_opd()
+
+    assert batches == [4, 4]
+
+
 def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
     """Regression (codex[bot], opd.py): a run where EVERY teacher.score fails transiently (a Fireworks
     outage spanning the run) and none succeed must raise a RetriableInfraError so the supervisor
@@ -2568,6 +2624,38 @@ def test_teacher_score_returns_completion_region_with_rebased_offsets_and_logpro
     assert capture["body"]["logprobs"] == 1
 
 
+def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatch):
+    payload = {
+        "choices": [
+            {
+                "index": 1,
+                "logprobs": {
+                    "tokens": ["Q", "2", "B"],
+                    "token_logprobs": [0.0, -1.0, -0.2],
+                    "text_offset": [0, 1, 2],
+                },
+            },
+            {
+                "index": 0,
+                "logprobs": {
+                    "tokens": ["Q", "1", "A"],
+                    "token_logprobs": [0.0, -1.0, -0.1],
+                    "text_offset": [0, 1, 2],
+                },
+            },
+        ]
+    }
+    capture = {}
+    _mock_urlopen(monkeypatch, payload, capture)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+
+    out = client.score_many([("Q1", "A"), ("Q2", "B")])
+
+    assert capture["body"]["prompt"] == ["Q1A", "Q2B"]
+    assert [[t.text for t in toks] for toks in out] == [["A"], ["B"]]
+    assert [out[0][0].logprob, out[1][0].logprob] == [-0.1, -0.2]
+
+
 def test_teacher_score_keeps_boundary_crossing_token_clamped_to_completion(monkeypatch):
     # Prompt ends in whitespace ("P: ", plen=3); the teacher emits a leading-space merge token
     # " hi" that starts at char 2 (inside the prompt) and ends at 5 (inside the completion). Rather
@@ -3285,8 +3373,9 @@ class _TinyLM:
         self.w = torch.zeros(T, V, requires_grad=True)
 
     def __call__(self, input_ids):
+        B = input_ids.shape[0]
         T = input_ids.shape[1]
-        return SimpleNamespace(logits=self.w[:T].unsqueeze(0))
+        return SimpleNamespace(logits=self.w[:T].unsqueeze(0).expand(B, -1, -1))
 
     def parameters(self):
         return [self.w]
@@ -3309,6 +3398,39 @@ def test_gkd_loss_backpropagates_over_grouped_spans():
     # logits at index P+j-1 predict completion token j: index 0 -> tok 0, index 1 -> tok 1.
     assert model.w.grad[0].abs().sum() > 0
     assert model.w.grad[1].abs().sum() > 0
+
+
+def test_resolve_samples_batched_returns_differentiable_gkd_losses():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
+
+    model = _TinyLM(torch, T=3, V=8)
+    knobs = SimpleNamespace(kl_coef=1.0)
+    samples = [
+        (
+            opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+            [1],
+        ),
+        (
+            opd_mod._GenResult(completion_ids=[3], completion_text="b", gen_tokens=1),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("b", -0.7, 0, 1)], status="ok"),
+            [1],
+        ),
+    ]
+
+    out = opd_mod._resolve_samples_batched(model, _Tok(), "cpu", samples, knobs, microbatch=2)
+
+    assert len(out) == 2
+    assert all(r.loss is not None and r.loss.requires_grad for r in out)
+    (sum(r.loss for r in out if r.loss is not None) / 2).backward()
+    assert model.w.grad[0].abs().sum() > 0
 
 
 def test_gkd_loss_none_without_groups_or_tokens():
