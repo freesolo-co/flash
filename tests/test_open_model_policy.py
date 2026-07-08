@@ -59,7 +59,7 @@ def test_allow_policy_unknown_size_warns_but_allows(monkeypatch, capsys):
     [
         (4.0, "grpo", "bf16", "RTX 5090", "fits"),  # Qwen3-4B colocate on 32 GB (measured)
         (4.0, "sft", "bf16", "RTX 4090", "fits"),
-        (9.65, "sft", "bf16", "RTX 5090", "fits"),  # Qwen3.5-9B SFT
+        (9.65, "sft", "bf16", "RTX 5090", "tight"),  # Qwen3.5-9B SFT real logits peak
         (36.0, "sft", "bf16", "RTX 5090", "too_big"),  # 72 GB of weights
         (36.0, "grpo", "bf16", "RTX 5090", "too_big"),  # 2 bf16 copies + KV >> 32 GB
     ],

@@ -17,7 +17,7 @@ BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k"},
-    "train": {"steps": 10, "lora_rank": 8, "hf_repo": "owner/runs"},
+    "train": {"epochs": 1, "max_examples": 10, "lora_rank": 8, "hf_repo": "owner/runs"},
     "gpu": {"type": "RTX 4090"},
 }
 
@@ -44,7 +44,6 @@ def _raw(**overrides) -> dict:
         # `seeds` is no longer a valid [train] key (multi-seed removed); it's now rejected
         # as an unknown key rather than seed-validated.
         ({"train.seeds": [0]}, "unknown key"),
-        ({"train.steps": 0}, "steps must be >= 1"),
         # lora_rank/alpha now parse via _train_int(minimum=1), so out-of-range values
         # are rejected at parse time with the shared ">= 1" message (a non-positive int
         # never reaches the later "must be positive" guard).
@@ -71,7 +70,9 @@ def _raw(**overrides) -> dict:
         # The classic footgun: rollout knobs under a [grpo] table instead of [train].
         ({"grpo.group_size": 4}, "unknown config section"),
         ({"sft.epochs": 3}, r"under \[train\]"),
-        ({"train.max_token": 256}, "unknown key"),  # typo of max_tokens
+        ({"train.max_token": 256}, "unknown key"),  # typo of max_completion_tokens
+        ({"train.max_length": 256}, "unknown key"),
+        ({"train.max_tokens": 256}, "unknown key"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
@@ -117,7 +118,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     # required NOR honored from a user config: a config without it parses fine, and a user-
     # supplied value is ignored (left blank for the control plane to assign at submit).
     raw = _raw()
-    raw["train"] = {"steps": 10, "lora_rank": 8}
+    raw["train"] = {"epochs": 1, "max_examples": 10, "lora_rank": 8}
     assert spec_from_dict(raw).train.hf_repo == ""
     raw["train"]["hf_repo"] = "someone-else/their-repo"
     assert spec_from_dict(raw).train.hf_repo == ""
@@ -452,15 +453,17 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
     # a too-small GPU that then OOMs at the default micro-batch 4.
     from flash.engine import vram
 
-    at_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=4)
-    above_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
+    # Use a tiny vocab so this isolates the managed micro-batch cap rather than the dense-logits
+    # per-device cap, which can floor both batch sizes to the same per-device value.
+    at_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=4, vocab=1)
+    above_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32, vocab=1)
     assert above_cap == at_cap  # batch_size above the per-device 4 is capped, not sized up
-    below_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=1)
+    below_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=1, vocab=1)
     assert below_cap < at_cap  # micro-batch 1 reserves less activation VRAM
     # the removed env no longer changes the estimate (fully managed), whatever its value
     for val in ("8", "1", "not-an-int"):
         monkeypatch.setenv("SFT_PER_DEVICE_BS", val)
-        assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == at_cap
+        assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32, vocab=1) == at_cap
 
 
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:

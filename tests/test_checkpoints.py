@@ -26,7 +26,7 @@ SPEC_DICT = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "hf_repo": "org/test-runs"},
+    "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
     "run_id": "flash-ckpt-1",
 }
@@ -510,7 +510,7 @@ def test_list_checkpoints_skips_step_without_weights(monkeypatch):
 
 
 def test_list_checkpoints_no_repo(monkeypatch):
-    spec = JobSpec.from_dict({**SPEC_DICT, "train": {"steps": 1, "hf_repo": ""}})
+    spec = JobSpec.from_dict({**SPEC_DICT, "train": {"epochs": 1, "max_examples": 1, "hf_repo": ""}})
     assert list_checkpoints(spec) == []
 
 
