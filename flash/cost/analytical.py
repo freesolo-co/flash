@@ -73,11 +73,11 @@ def _fmt_duration(seconds: float) -> str:
 
 def setup_seconds(config: RunConfig) -> float:
     """Cold-start wall time before the first optimizer step: container boot + deps + model load
-    (a fixed deserialize/placement/init base + a size-scaled download), plus vLLM init for GRPO.
+    (a fixed deserialize/placement/init base + a size-scaled download), plus vLLM init for rollouts.
     This elapsed setup time is reported but not included in customer-facing cost."""
     model_load = MODEL_LOAD_BASE_S + download_weight_gb(config.model_id) / DOWNLOAD_RATE_GBPS
     s = WORKER_BOOT_S + DEPS_INSTALL_S + model_load
-    if config.is_grpo:
+    if config.has_rollout:
         s += VLLM_INIT_S
     return s
 

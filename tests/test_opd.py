@@ -11,6 +11,7 @@ import json
 import sys
 import types
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -100,9 +101,12 @@ def test_opd_vl_warmstart_loads_merged_base_with_multimodal_loader(monkeypatch):
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
 
-    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+    model, rollout_model_source = opd_mod._student_model(
+        "Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda"
+    )
 
     assert model == {"loader": "vl", "peft_config": "fresh-lora-config"}
+    assert rollout_model_source == "/tmp/flash_sft_merged"
     assert calls[0] == (
         "vl",
         ("/tmp/flash_sft_merged",),
@@ -124,9 +128,12 @@ def test_opd_fresh_lora_keeps_causal_loader(monkeypatch):
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
 
-    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+    model, rollout_model_source = opd_mod._student_model(
+        "Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda"
+    )
 
     assert model == {"loader": "causal", "peft_config": "fresh-lora-config"}
+    assert rollout_model_source == "Qwen/Qwen3.5-4B"
     assert calls[0] == (
         "causal",
         ("Qwen/Qwen3.5-4B",),
@@ -148,9 +155,12 @@ def test_opd_fresh_vl_lora_uses_multimodal_loader(monkeypatch):
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
 
-    model = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda")
+    model, rollout_model_source = opd_mod._student_model(
+        "Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cuda"
+    )
 
     assert model == {"loader": "vl", "peft_config": "fresh-lora-config"}
+    assert rollout_model_source == "Qwen/Qwen3.5-4B"
     assert calls[0] == (
         "vl",
         ("Qwen/Qwen3.5-4B",),
@@ -158,6 +168,67 @@ def test_opd_fresh_vl_lora_uses_multimodal_loader(monkeypatch):
     )
     assert ("to", "vl", "cuda") in calls
     assert not any(kind == "causal" for kind, *_ in calls)
+
+
+def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, train_one=None, outputs=None):
+    """Patch run_opd's mandatory vLLM engine with a CPU fake.
+
+    When train_one is supplied, the fake preserves legacy harness behavior by returning that
+    SampleResult from _resolve_sample after the vLLM-shaped generation/scoring phases have run.
+    """
+
+    monkeypatch.setattr(
+        opd_mod,
+        "_opd_vllm_kwargs",
+        lambda *a, **k: {
+            "gpu_memory_utilization": 0.10,
+            "kv_cache_dtype": None,
+            "max_num_batched_tokens": None,
+            "attention_backend": None,
+            "mm_encoder_attn_backend": None,
+            "enforce_eager": None,
+        },
+    )
+    queued = list(outputs or [])
+
+    class _FakeOpdVllmRolloutEngine:
+        instances: ClassVar[list] = []
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.sync_count = 0
+            self.closed = False
+            _FakeOpdVllmRolloutEngine.instances.append(self)
+
+        def sync_from_model(self, model):
+            self.model = model
+            self.sync_count += 1
+
+        def generate(self, prompt_ids_batch, *, max_tokens):
+            out = []
+            for _prompt_ids in prompt_ids_batch:
+                if queued:
+                    out.append(queued.pop(0))
+                else:
+                    out.append(opd_mod.OpdVllmOutput([3], "x", finish_reason="stop"))
+            return out
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(opd_mod, "OpdVllmRolloutEngine", _FakeOpdVllmRolloutEngine)
+    if train_one is not None:
+        monkeypatch.setattr(
+            opd_mod,
+            "_score_one",
+            lambda *a, **k: opd_mod._ScoreResult(teacher_toks=[], status="ok"),
+        )
+
+        def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs):
+            return train_one(model=model, tok=tok, device=device, prompt_ids=prompt_ids, knobs=knobs)
+
+        monkeypatch.setattr(opd_mod, "_resolve_sample", _resolve_sample)
+    return _FakeOpdVllmRolloutEngine
 
 
 # --------------------------------------------------------------------------------------------------
@@ -767,13 +838,13 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
             stop_sequences=(),
         ),
     )
-    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: _Model())
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (_Model(), "fake/model"))
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod, "_train_one", _skip)  # EVERY sample skips
+    _patch_opd_run_vllm_stub(monkeypatch, opd_mod, train_one=_skip)  # EVERY sample skips
 
     import transformers
 
@@ -802,7 +873,8 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
 
 def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, group=1):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
-    loop and install the caller's _train_one stub. Returns the opd module."""
+    loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
+    module."""
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
 
@@ -868,13 +940,13 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
             stop_sequences=(),
         ),
     )
-    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: _Model())
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (_Model(), "fake/model"))
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod, "_train_one", train_one)
+    _patch_opd_run_vllm_stub(monkeypatch, opd_mod, train_one=train_one)
     if liveness is not None:
         monkeypatch.setattr(opd_mod, "liveness_heartbeat", liveness)
     import transformers
@@ -888,8 +960,8 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
 
 
 def test_opd_rejects_tool_environments(monkeypatch):
-    """opd cannot drive TRL's native tool-call loop (it rolls out with HF model.generate), so a
-    tool-calling env must still fail fast. Pure multi-turn (episode) envs ARE supported now — see
+    """opd owns its vLLM rollout loop instead of TRL's native tool-call loop, so a tool-calling env
+    must still fail fast. Pure multi-turn (episode) envs ARE supported now — see
     test_opd_multi_turn_distills_every_assistant_turn."""
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
@@ -1075,7 +1147,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
             stop_sequences=(),
         ),
     )
-    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: model)
+    monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (model, "fake/model"))
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
@@ -1084,6 +1156,14 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     monkeypatch.setattr(opd_mod, "install_chalk_kernels", lambda *a, **k: {})
     monkeypatch.setattr(opd_mod, "active_kernels", lambda *a, **k: [])
     monkeypatch.setattr(opd_mod, "free_gpu", lambda *a, **k: None)
+    _patch_opd_run_vllm_stub(
+        monkeypatch,
+        opd_mod,
+        outputs=[
+            opd_mod.OpdVllmOutput([*tok._enc("42"), tok.eos_token_id], "42", finish_reason="stop"),
+            opd_mod.OpdVllmOutput([*tok._enc("ok"), tok.eos_token_id], "ok", finish_reason="stop"),
+        ],
+    )
     import transformers
 
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tok)
@@ -1158,9 +1238,10 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
     captured = {}
 
     @contextlib.contextmanager
-    def _fake_liveness(stage, progress=None, fields=None):
-        captured["stage"] = stage
-        captured["progress"] = progress
+    def _fake_liveness(stage, progress=None, fields=None, **_kwargs):
+        if stage == "opd_step":
+            captured["stage"] = stage
+            captured["progress"] = progress
         yield
 
     opd_mod = _opd_harness(monkeypatch, train_one=_skip, liveness=_fake_liveness)
@@ -1172,6 +1253,49 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
     # the bounded-retry loop visits its full budget of max_iters = 2*steps + 10 = 12 fresh slices
     # (1 prompt x 1 group each) before the post-loop guard raises -> samples_seen advanced to 12.
     assert captured["progress"]() == 12
+
+
+def test_opd_vllm_generation_uses_keepalive_heartbeat(monkeypatch):
+    """A large batched vLLM rollout can block before samples_seen advances; keepalive emits real
+    opd_step heartbeats during that blocking generate call so provider stall detection sees the job is
+    alive and actual_steps_run floors a cancellation during first-step GPU work to one step."""
+    import contextlib
+
+    calls = []
+
+    @contextlib.contextmanager
+    def _fake_liveness(stage, progress=None, fields=None, **kwargs):
+        calls.append((stage, progress, fields, kwargs))
+        yield
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip, liveness=_fake_liveness)
+    with pytest.raises(RuntimeError):  # all-skip -> no trained step
+        opd_mod.run_opd()
+
+    generate_calls = [c for c in calls if c[0] == "opd_step" and c[3].get("keepalive") is True]
+    assert generate_calls, f"missing vLLM generate keepalive context; saw {[c[0] for c in calls]}"
+    assert all(c[3].get("keepalive") is True for c in generate_calls)
+    assert callable(generate_calls[0][2])
+    assert generate_calls[0][2]() == {"step": 0}
+
+
+def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        loss = model.w.float().sum() * 1e-6
+        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update, steps=1, group=1)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    opd_mod.run_opd()
+
+    engine = opd_mod.OpdVllmRolloutEngine.instances[0]
+    assert engine.sync_count == 1  # initial LoRA sync only; no rollout remains after step 1
 
 
 def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
@@ -1210,7 +1334,7 @@ def test_opd_emits_progress_heartbeat_while_filtering_prompts(monkeypatch):
     calls = []
 
     @contextlib.contextmanager
-    def _fake_liveness(stage, progress=None, fields=None):
+    def _fake_liveness(stage, progress=None, fields=None, **_kwargs):
         calls.append((stage, progress))
         yield
 
@@ -1292,7 +1416,7 @@ def test_opd_step_liveness_heartbeat_carries_opt_steps_in_fields(monkeypatch):
     captured = {}
 
     @contextlib.contextmanager
-    def _fake_liveness(stage, progress=None, fields=None):
+    def _fake_liveness(stage, progress=None, fields=None, **_kwargs):
         if stage == "opd_step":
             captured["fields"] = fields
         yield
@@ -1531,8 +1655,8 @@ def test_groupwise_alignment_cursor_walk_groups_denser_student_span():
 
 
 def test_opd_installs_chalk_kernels_on_student(monkeypatch):
-    """Regression (codex[bot], opd.py:433): the OPD student drives BOTH on-policy generation and the
-    loss forward, so it must get chalk kernels like sft/rl build after their trainer — else the default
+    """Regression (codex[bot], opd.py:433): the OPD HF/PEFT student drives the loss forward, so it
+    must get chalk kernels like sft/rl build after their trainer — else the default
     Qwen catalog model silently runs eager and the distillation is much slower. Assert run_opd calls
     install_chalk_kernels on the built student model."""
     from flash.engine.worker import opd as _opd
@@ -1722,7 +1846,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
 
     def _rec_student(*a, **k):
         order.append("student_model")
-        return _Model()
+        return _Model(), "fake/model"
 
     monkeypatch.setattr(opd_mod, "_student_model", _rec_student)
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
@@ -1730,7 +1854,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod, "_train_one", _skip)
+    _patch_opd_run_vllm_stub(monkeypatch, opd_mod, train_one=_skip)
 
     real_manual_seed = torch.manual_seed
 
@@ -1860,8 +1984,9 @@ def test_student_model_accepts_vl_warmstart_without_raising(monkeypatch):
     monkeypatch.setattr(opd_mod._w, "_init_adapter_model", _fake_init_adapter_model, raising=False)
     calls = _install_student_loader_fakes(monkeypatch, causal_raises=True)
 
-    out = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
+    out, rollout_model_source = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
     assert out == {"loader": "vl", "peft_config": fake_lora}  # wrapped the merged base in PEFT
+    assert rollout_model_source == "/tmp/merged_vl_dir"  # vLLM must load the same merged base
     assert calls[0] == (
         "vl",
         ("/tmp/merged_vl_dir",),
@@ -1962,6 +2087,63 @@ def test_opd_vram_reserves_dense_logits_unlike_fused_sft():
     assert opd > sft + 10  # dense logits for opd vs 0 for fused SFT
 
 
+def test_opd_vram_reserves_colocated_vllm_rollout_copy():
+    """OPD student generation uses a resident vLLM engine, so VRAM includes a second weight/KV copy."""
+    from flash.engine.vram import estimate_vram_gb
+
+    kw = {"seq_len": 1536, "max_tokens": 512, "vocab": 248_320, "lora_rank": 16}
+    grpo_without_vllm = estimate_vram_gb(4.0, "grpo", "bf16", use_vllm=False, **kw)
+    opd_with_vllm = estimate_vram_gb(4.0, "opd", "bf16", use_vllm=True, **kw)
+    opd_flag_ignored = estimate_vram_gb(4.0, "opd", "bf16", use_vllm=False, **kw)
+    assert opd_with_vllm > grpo_without_vllm + 8.0  # second bf16 4B copy plus KV
+    assert opd_flag_ignored == opd_with_vllm
+    assert estimate_vram_gb(4.0, "opd", "bf16", **kw) == opd_with_vllm
+
+
+def test_opd_vram_sizes_rollout_kv_for_full_prompt_batch():
+    from flash.engine.vram import estimate_vram_gb, opd_rollout_concurrency
+
+    assert opd_rollout_concurrency(8, 3) == 24
+    kw = {"seq_len": 8192, "max_tokens": 512, "vocab": 128_000, "lora_rank": 16}
+    one_prompt = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, group_size=1, **kw)
+    eight_prompts = estimate_vram_gb(4.0, "opd", "bf16", batch_size=8, group_size=1, **kw)
+    assert eight_prompts > one_prompt + 20.0
+
+
+def test_model_required_vram_uses_opd_group_default_not_grpo_default():
+    from flash.engine.vram import model_required_vram_gb
+
+    train = {"max_length": 8192, "max_tokens": 512, "batch_size": 8, "lora_rank": 16}
+    default_group = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train, headroom=1.0)
+    explicit_opd_default = model_required_vram_gb(
+        "Qwen/Qwen3.5-4B", "opd", train={**train, "group_size": 1}, headroom=1.0
+    )
+    grpo_default_group = model_required_vram_gb(
+        "Qwen/Qwen3.5-4B", "opd", train={**train, "group_size": 8}, headroom=1.0
+    )
+
+    assert default_group == explicit_opd_default
+    assert grpo_default_group > default_group
+
+
+def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
+    """35B OPD with colocated student vLLM routes above the old H200-sized OPD estimate."""
+    from flash.engine.vram import model_required_vram_gb
+
+    need = model_required_vram_gb(
+        "Qwen/Qwen3.6-35B-A3B",
+        "opd",
+        train={
+            "max_length": 1536,
+            "max_tokens": 512,
+            "batch_size": 1,
+            "group_size": 8,
+            "lora_rank": 16,
+        },
+    )
+    assert 141 < need <= 180
+
+
 def test_opd_vram_budgets_dense_logit_backward_buffers():
     """Regression (codex[bot], vram.py): gkd_loss has no fused CE and, at the loss BACKWARD peak, holds
     the fp32 completion rows + their fp32 gradient AND the bf16 full-sequence logits + their bf16
@@ -1999,14 +2181,15 @@ def test_opd_vram_thinking_completion_default_not_underbudgeted():
 def test_opd_vram_is_single_sequence_not_batch_scaled():
     """Regression (codex[bot], vram.py): run_opd backprops ONE completion at a time (_train_one), so
     opd's VRAM estimate must NOT scale its activations with batch_size (the SFT per-device micro-batch
-    term over-budgeted opd and bumped the GPU tier). At a short seq_len where SFT packs a batch, opd's
-    estimate stays flat across batch_size while SFT's grows."""
+    term over-budgeted opd and bumped the GPU tier). At a short seq_len and group_size=1, OPD's rollout
+    KV stays on its floor, isolating the training term: the estimate stays flat across batch_size while
+    SFT's grows."""
     from flash.engine.vram import estimate_vram_gb
 
     kw = {"seq_len": 1024, "vocab": 248_320, "lora_rank": 16}
-    opd_bs1 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, **kw)
-    opd_bs16 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=16, **kw)
-    assert opd_bs1 == opd_bs16  # single-sequence: batch_size does not change opd VRAM
+    opd_bs1 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, group_size=1, **kw)
+    opd_bs16 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=16, group_size=1, **kw)
+    assert opd_bs1 == opd_bs16  # batch_size does not scale the single-sequence training term
     # contrast: SFT at the same short seq DOES scale with the micro-batch, so the invariant is meaningful.
     sft_bs1 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=1, **kw)
     sft_bs16 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=16, **kw)
