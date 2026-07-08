@@ -227,12 +227,12 @@ def rollout_one_records(
 
     - ``generate(prefix_ids, max_new)`` returns an OBJECT (opaque here) exposing ``completion_ids``
       (``list[int] | None``), ``completion_text`` (``str``), ``truncated`` (``bool``) and ``skip``
-      (``bool``) — OPD passes its ``_GenResult`` from ``_generate_one`` (termination/trim/U+FFFD gates
-      already applied), so the record drops straight into the existing teacher-scoring + gkd-loss path.
+      (``bool``) — OPD passes its ``_GenResult`` after termination/trim/U+FFFD gates have already been
+      applied, so the record drops straight into the existing teacher-scoring + batched-loss path.
     - Every turn (including a truncated/empty one) is recorded so the caller counts it; a
       truncated/skip turn ENDS the episode (a student that didn't terminate its turn, or emitted an
       empty/invalid completion, can't meaningfully continue — and its bad turn is skipped, not
-      distilled, by the caller's ``_resolve_sample``).
+      distilled, by the caller's no-loss sample handling).
     - ``on_turn_generated`` (optional) fires AFTER each turn's generation to refresh the worker stall
       clock and advance the sample counter — a many-turn episode is a long serial stretch of GPU
       generates + teacher-less env steps that would otherwise emit no progress ping.

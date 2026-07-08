@@ -53,8 +53,8 @@ def groupwise_alignment(
     to matching decoded text.
 
     Returns ``[(student_indices, teacher_logprob_sum), ...]`` — for each group the student token
-    indices in it and the summed teacher logprob over that span (``log P_teacher(span)``). The loss
-    (``opd.gkd_loss``) pairs this with the differentiable ``log P_student(span)`` for reverse-KL.
+    indices in it and the summed teacher logprob over that span (``log P_teacher(span)``). OPD's
+    batched loss pairs this with the differentiable ``log P_student(span)`` for reverse-KL.
     """
     if not student_toks or not teacher_toks:
         return []
