@@ -713,6 +713,8 @@ def run_opd():
         _opd_progress(opt_steps, nseq)
 
     t_train = time.time()
+    opd_phase_seconds: Counter[str] = Counter()
+    opd_phase_counts: Counter[str] = Counter()
     # Drive the loop by optimizer UPDATES, not raw iterations. A no-signal iteration (empty
     # completions / a flaky teacher) skips optimizer.step() below, so `for step in range(steps)` could
     # exit with opt_steps < steps -- shipping an under-trained adapter as the served DEFAULT while the
@@ -773,17 +775,19 @@ def run_opd():
                     *,
                     _teacher_futures: dict[Future, list[_Pending]] = teacher_futures,
                 ) -> None:
+                    def _score_many_timed(batch: list[_Pending]):
+                        started = time.perf_counter()
+                        scores = _score_many(
+                            teacher,
+                            batch,
+                            thinking_prefill=thinking_prefill,
+                        )
+                        return scores, time.perf_counter() - started
+
                     for i in range(0, len(pendings), teacher_batch_size):
                         batch = pendings[i : i + teacher_batch_size]
                         if batch:
-                            _teacher_futures[
-                                teacher_pool.submit(
-                                    _score_many,
-                                    teacher,
-                                    batch,
-                                    thinking_prefill=thinking_prefill,
-                                )
-                            ] = batch
+                            _teacher_futures[teacher_pool.submit(_score_many_timed, batch)] = batch
 
                 def _queue_or_account(
                     p: _Pending, *, _teacher_futures: dict[Future, list[_Pending]] = teacher_futures
@@ -807,10 +811,12 @@ def run_opd():
                 ) -> None:
                     batch = _teacher_futures.pop(fut)
                     try:
-                        scores = fut.result()
+                        scores, teacher_rpc_seconds = fut.result()
                     except TeacherError:
                         _cancel_pending_teacher_futures()
                         raise
+                    opd_phase_seconds["teacher_rpc_sum"] += teacher_rpc_seconds
+                    opd_phase_counts["teacher_batches"] += 1
                     if len(scores) != len(batch):
                         raise RuntimeError(
                             f"opd teacher batch returned {len(scores)} score(s) for {len(batch)} sample(s)"
@@ -819,12 +825,15 @@ def run_opd():
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
                         scored_samples.append((p.gen, score, p.prompt_ids))
+                    loss_started = time.perf_counter()
                     resolved = _resolve_samples_batched(
                         model, tok, device, scored_samples, knobs, loss_microbatch_size
                     )
                     losses = [r.loss for r in resolved if r.loss is not None]
                     if losses:
                         (sum(losses) / _accum_target).backward()
+                    opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
+                    opd_phase_counts["loss_batches"] += 1
                     for r in resolved:
                         _account(r, backward=False)
 
@@ -886,6 +895,7 @@ def run_opd():
                             fields=lambda _step=opt_steps: {"step": _step},
                             keepalive=True,
                         ):
+                            rollout_started = time.perf_counter()
                             gens = _generate_many_vllm(
                                 vllm_rollout,
                                 tok,
@@ -893,6 +903,10 @@ def run_opd():
                                 knobs,
                                 max_tokens=knobs.max_completion,
                             )
+                            opd_phase_seconds["rollout_generate"] += (
+                                time.perf_counter() - rollout_started
+                            )
+                            opd_phase_counts["rollout_generate_calls"] += 1
                         scorable: list[_Pending] = []
                         for gen, (prompt_ids, prompt_messages) in zip(
                             gens, chunk_contexts, strict=True
@@ -912,9 +926,12 @@ def run_opd():
                         _drain_ready_teacher_futures()
 
                 _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
+                wait_started = time.perf_counter()
                 for fut in as_completed(list(teacher_futures)):
+                    opd_phase_seconds["teacher_wait"] += time.perf_counter() - wait_started
                     if fut in teacher_futures:
                         _consume_teacher_future(fut)
+                    wait_started = time.perf_counter()
                 _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
 
                 if nseq:
@@ -940,8 +957,11 @@ def run_opd():
                 for p in model.parameters():
                     if p.grad is not None:
                         p.grad.mul_(scale)
+            optimizer_started = time.perf_counter()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             optimizer.step()
+            opd_phase_seconds["optimizer_step"] += time.perf_counter() - optimizer_started
+            opd_phase_counts["optimizer_steps"] += 1
             opt_steps += 1
             # On-policy means the next rollout must sample from the just-updated student LoRA.
             # The final trained adapter is saved from the HF/PEFT model below, so skip a useless
@@ -950,7 +970,10 @@ def run_opd():
                 with liveness_heartbeat(
                     "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
                 ):
+                    sync_started = time.perf_counter()
                     vllm_rollout.sync_from_model(model)
+                    opd_phase_seconds["vllm_sync"] += time.perf_counter() - sync_started
+                    opd_phase_counts["vllm_syncs"] += 1
             avg_loss = step_loss / nseq
             avg_cov = step_cov / nseq
             loss_curve.append(avg_loss)
@@ -1102,6 +1125,17 @@ def run_opd():
             "vllm_compilation_config": vllm_kwargs.get("compilation_config"),
             "vllm_init_seconds": vllm_init_seconds,
             "vllm_lora_syncs": getattr(vllm_rollout, "sync_count", None),
+            "opd_phase_rollout_generate_seconds": float(opd_phase_seconds["rollout_generate"]),
+            "opd_phase_teacher_rpc_sum_seconds": float(opd_phase_seconds["teacher_rpc_sum"]),
+            "opd_phase_teacher_wait_seconds": float(opd_phase_seconds["teacher_wait"]),
+            "opd_phase_loss_backward_seconds": float(opd_phase_seconds["loss_backward"]),
+            "opd_phase_optimizer_step_seconds": float(opd_phase_seconds["optimizer_step"]),
+            "opd_phase_vllm_sync_seconds": float(opd_phase_seconds["vllm_sync"]),
+            "opd_phase_rollout_generate_calls": int(opd_phase_counts["rollout_generate_calls"]),
+            "opd_phase_teacher_batches": int(opd_phase_counts["teacher_batches"]),
+            "opd_phase_loss_batches": int(opd_phase_counts["loss_batches"]),
+            "opd_phase_optimizer_steps": int(opd_phase_counts["optimizer_steps"]),
+            "opd_phase_vllm_syncs": int(opd_phase_counts["vllm_syncs"]),
             "opd_rollout_pipeline_chunks": (
                 _opd_rollout_pipeline_chunks(ppl_step * group) if not multi_turn else None
             ),
