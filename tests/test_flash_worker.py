@@ -1,8 +1,7 @@
 """Regression tests for the Flash worker plumbing fixed in this PR.
 
 Covers:
-- build_worker_env forwards the documented RL/vLLM tuning knobs to the GPU worker
-  (they were silently dropped) and sets a fragmentation-safe allocator default;
+- build_worker_env sets managed worker defaults without forwarding removed tuning knobs;
 - the runpod_flash backoff OverflowError that aborted long runs is patched;
 - per-phase error artifact names don't collide (train error survives a later eval error).
 """
@@ -22,8 +21,8 @@ def _spec():
     )
 
 
-def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
-    """The worker-side knobs the worker / vLLM actually read are forwarded to the GPU worker."""
+def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
+    """Flash is managed: process-env tuning toggles do not change worker behavior."""
     from flash.providers.runpod.train import build_worker_env
 
     knobs = {
@@ -34,8 +33,8 @@ def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
         monkeypatch.setenv(k, v)
 
     env = build_worker_env(_spec(), 0)
-    for k, v in knobs.items():
-        assert env.get(k) == v, f"{k} not forwarded to worker"
+    for k in knobs:
+        assert k not in env, f"{k} should not be forwarded to worker"
     # fragmentation-safe allocator default is always set
     assert "PYTORCH_CUDA_ALLOC_CONF" in env
 
@@ -277,6 +276,8 @@ def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "VLLM_ATTENTION_BACKEND": "FLASHINFER",
             "VLLM_FLASH_ATTN_VERSION": "2",
+            "VLLM_USE_V1": "0",
+            "SFT_PER_DEVICE_BS": "1",
             "TORCHDYNAMO_DISABLE": "1",
             "FLASH_DISABLE_FA2": "1",
             "RL_VLLM_SLEEP": "0",
@@ -295,6 +296,8 @@ def test_build_worker_env_filters_removed_optimization_toggles(monkeypatch):
     for stripped in (
         "VLLM_ATTENTION_BACKEND",
         "VLLM_FLASH_ATTN_VERSION",
+        "VLLM_USE_V1",
+        "SFT_PER_DEVICE_BS",
         "TORCHDYNAMO_DISABLE",
         "FLASH_DISABLE_FA2",
         "RL_VLLM_SLEEP",

@@ -1355,6 +1355,20 @@ def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
     assert events.index(("resolve", 1)) < events.index(("score", 0))
 
 
+def test_opd_rollout_chunking_scales_for_heavy_steps():
+    import flash.engine.worker.opd as opd_mod
+
+    assert opd_mod._opd_rollout_pipeline_chunks(1) == 1
+    assert opd_mod._opd_rollout_pipeline_chunks(7) == 1
+    assert opd_mod._opd_rollout_pipeline_chunks(8) == 2
+    assert opd_mod._opd_rollout_chunk_size(8) == 4
+    assert opd_mod._opd_rollout_pipeline_chunks(32) == 2
+    assert opd_mod._opd_rollout_chunk_size(32) == 16
+    assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
+    assert opd_mod._opd_rollout_chunk_size(64) == 16
+    assert opd_mod._opd_rollout_pipeline_chunks(256) == 8
+
+
 def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
     """Default OPD steps have 8 rollouts. Generate them in chunks so teacher scoring for the first
     chunk can run while vLLM generates the later chunk."""
