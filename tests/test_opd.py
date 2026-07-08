@@ -1362,13 +1362,13 @@ def test_opd_rollout_chunking_scales_for_heavy_steps(monkeypatch):
     monkeypatch.delenv("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS", raising=False)
     assert opd_mod._opd_rollout_pipeline_chunks(1) == 1
     assert opd_mod._opd_rollout_pipeline_chunks(7) == 1
-    assert opd_mod._opd_rollout_pipeline_chunks(8) == 2
-    assert opd_mod._opd_rollout_chunk_size(8) == 4
-    assert opd_mod._opd_rollout_pipeline_chunks(32) == 2
-    assert opd_mod._opd_rollout_chunk_size(32) == 16
-    assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
-    assert opd_mod._opd_rollout_chunk_size(64) == 16
-    assert opd_mod._opd_rollout_pipeline_chunks(256) == 8
+    assert opd_mod._opd_rollout_pipeline_chunks(8) == 1
+    assert opd_mod._opd_rollout_chunk_size(8) == 8
+    assert opd_mod._opd_rollout_pipeline_chunks(32) == 1
+    assert opd_mod._opd_rollout_chunk_size(32) == 32
+    assert opd_mod._opd_rollout_pipeline_chunks(64) == 1
+    assert opd_mod._opd_rollout_chunk_size(64) == 64
+    assert opd_mod._opd_rollout_pipeline_chunks(256) == 4
 
     monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "32")
     assert opd_mod._opd_rollout_pipeline_target_chunk_size(64) == 32
@@ -1387,17 +1387,17 @@ def test_opd_rollout_chunking_scales_for_heavy_steps(monkeypatch):
 
     monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "not-an-int")
     monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS", "not-an-int")
-    assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
+    assert opd_mod._opd_rollout_pipeline_chunks(64) == 1
 
 
 def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
-    """Default OPD steps have 8 rollouts. Generate them in chunks so teacher scoring for the first
-    chunk can run while vLLM generates the later chunk."""
+    """When configured to chunk, score the first rollout chunk while vLLM generates the later chunk."""
     import threading
 
     torch = pytest.importorskip("torch")
 
     opd_mod = _opd_harness(monkeypatch, train_one=_skip, epochs=1, group=8)
+    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "4")
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
 
@@ -3575,25 +3575,32 @@ def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
     from flash.engine.worker import opd as opd_mod
 
     rows = torch.tensor(
-        [[0.2, -0.3, 0.7], [-0.5, 1.0, 0.1]],
+        [[0.2, -0.3, 0.7], [-0.5, 1.0, 0.1], [0.4, -0.2, 0.3]],
         dtype=torch.float32,
         requires_grad=True,
     )
-    student_ids = [2, 1]
-    groups = [([0, 1], -0.75)]
+    student_ids = [2, 1, 0]
+    groups = [([0, 1], -0.75), ([2], -0.25)]
 
     loss = opd_mod._gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=0.5)
     manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(1) - torch.logsumexp(
         rows, dim=-1
     )
-    coeff = 0.5 * (manual_logps.detach().sum() - groups[0][1]) / 2
-    expected = (coeff * manual_logps).mean()
+    coeff0 = 0.5 * (manual_logps[:2].detach().sum() - groups[0][1]) / 2
+    coeff1 = 0.5 * (manual_logps[2:].detach().sum() - groups[1][1])
+    expected = torch.stack([coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]).mean()
 
     assert loss is not None
     torch.testing.assert_close(loss, expected)
     loss.backward()
     assert rows.grad is not None
     assert rows.grad.abs().sum() > 0
+
+    rows2 = rows.detach().clone().requires_grad_(True)
+    prepared = opd_mod._prepare_gkd_groups(groups)
+    prepared_loss = opd_mod._gkd_loss_from_logits_rows(rows2, student_ids, prepared, kl_coef=0.5)
+    assert prepared_loss is not None
+    torch.testing.assert_close(prepared_loss, expected.detach())
 
 
 def test_gkd_loss_none_without_groups_or_tokens():

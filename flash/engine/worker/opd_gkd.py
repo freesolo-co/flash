@@ -232,25 +232,30 @@ def gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=1.0):
     # samples). All the coefficient math is on DETACHED tensors and Python floats, so it never leaves
     # the device and forces no CUDA->CPU sync; the only sync is the final .mean().
     flat_idx: list[int] = []  # student token indices, in group order (the reference term order)
-    coeffs: list = []  # one 0-dim detached coefficient per non-empty group
     seg_lens: list[int] = []  # tokens in each group -> how many times to repeat its coefficient
+    teacher_logsums: list[float] = []
     for s_idx, teacher_logsum in groups:
         if not s_idx:  # defensive: a teacher-only span carries no student token to supervise
             continue
-        idx = torch.tensor(s_idx, device=sp_t.device)
-        student_logsum_det = sp_det.index_select(0, idx).sum()
-        # coeff > 0 where the student is MORE confident than the teacher on the span (push down);
-        # coeff < 0 where the teacher is more confident (push up). Gradient = reverse-KL gradient.
-        coeffs.append(kl_coef * (student_logsum_det - teacher_logsum) / len(s_idx))
-        flat_idx.extend(s_idx)
+        flat_idx.extend(int(i) for i in s_idx)
         seg_lens.append(len(s_idx))
+        teacher_logsums.append(float(teacher_logsum))
     if not flat_idx:
         return None
     # Broadcast each group's coefficient across its tokens (repeat_interleave), select the matching
     # differentiable student logprobs in the same order, and take the per-term mean -- numerically the
     # SAME value the old torch.stack(terms).mean() reference produced.
-    coeff_vec = torch.repeat_interleave(
-        torch.stack(coeffs), torch.tensor(seg_lens, device=sp_t.device)
+    flat_idx_t = torch.tensor(flat_idx, device=sp_t.device)
+    seg_lens_t = torch.tensor(seg_lens, device=sp_t.device)
+    group_ids_t = torch.repeat_interleave(
+        torch.arange(len(seg_lens), device=sp_t.device), seg_lens_t
     )
-    sp_sel = sp_t.index_select(0, torch.tensor(flat_idx, device=sp_t.device))
+    student_group_logsum = sp_det.new_zeros(len(seg_lens))
+    student_group_logsum.index_add_(0, group_ids_t, sp_det.index_select(0, flat_idx_t))
+    teacher_logsum_t = torch.tensor(teacher_logsums, dtype=sp_t.dtype, device=sp_t.device)
+    # coeff > 0 where the student is MORE confident than the teacher on the span (push down);
+    # coeff < 0 where the teacher is more confident (push up). Gradient = reverse-KL gradient.
+    coeffs = kl_coef * (student_group_logsum - teacher_logsum_t) / seg_lens_t.to(dtype=sp_t.dtype)
+    coeff_vec = coeffs.index_select(0, group_ids_t)
+    sp_sel = sp_t.index_select(0, flat_idx_t)
     return (coeff_vec * sp_sel).mean()

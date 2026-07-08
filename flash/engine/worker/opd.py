@@ -67,7 +67,7 @@ from flash.engine.worker.perf import (
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 
-OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
+OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 64
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
 OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
@@ -129,6 +129,8 @@ def _opd_rollout_pipeline_chunks(total_prompts: int) -> int:
     target_chunk = _opd_rollout_pipeline_target_chunk_size(total)
     max_chunks = _opd_rollout_pipeline_max_chunks(total)
     chunks = (total + target_chunk - 1) // target_chunk
+    if chunks <= 1:
+        return 1
     if max_chunks == 1:
         return 1
     return max(2, min(max_chunks, chunks))
@@ -1462,11 +1464,37 @@ def _score_many(
 
 
 @dataclass(frozen=True)
+class _PreparedGkdGroups:
+    token_indices: tuple[int, ...]
+    group_lengths: tuple[int, ...]
+    teacher_logsums: tuple[float, ...]
+
+
+def _prepare_gkd_groups(groups) -> _PreparedGkdGroups | None:
+    token_indices: list[int] = []
+    group_lengths: list[int] = []
+    teacher_logsums: list[float] = []
+    for s_idx, teacher_logsum in groups:
+        if not s_idx:
+            continue
+        token_indices.extend(int(i) for i in s_idx)
+        group_lengths.append(len(s_idx))
+        teacher_logsums.append(float(teacher_logsum))
+    if not token_indices:
+        return None
+    return _PreparedGkdGroups(
+        token_indices=tuple(token_indices),
+        group_lengths=tuple(group_lengths),
+        teacher_logsums=tuple(teacher_logsums),
+    )
+
+
+@dataclass(frozen=True)
 class _PreparedLoss:
     idx: int
     prompt_ids: object
     student_ids: object
-    groups: object
+    groups: _PreparedGkdGroups
     coverage: float
     gen_tokens: int
     teacher_tokens: int
@@ -1479,27 +1507,28 @@ def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
 
     if not student_ids or not groups:
         return None
+    prepared = groups if isinstance(groups, _PreparedGkdGroups) else _prepare_gkd_groups(groups)
+    if prepared is None:
+        return None
     rows = rows.float()
     ids_t = torch.tensor(student_ids, device=rows.device)
     sp_t = -F.cross_entropy(rows, ids_t, reduction="none")
     sp_det = sp_t.detach()
-    flat_idx: list[int] = []
-    coeffs: list = []
-    seg_lens: list[int] = []
-    for s_idx, teacher_logsum in groups:
-        if not s_idx:
-            continue
-        idx = torch.tensor(s_idx, device=sp_t.device)
-        student_logsum_det = sp_det.index_select(0, idx).sum()
-        coeffs.append(kl_coef * (student_logsum_det - teacher_logsum) / len(s_idx))
-        flat_idx.extend(s_idx)
-        seg_lens.append(len(s_idx))
-    if not flat_idx:
-        return None
-    coeff_vec = torch.repeat_interleave(
-        torch.stack(coeffs), torch.tensor(seg_lens, device=sp_t.device)
+    flat_idx_t = torch.tensor(prepared.token_indices, device=sp_t.device)
+    group_lengths_t = torch.tensor(prepared.group_lengths, device=sp_t.device)
+    group_ids_t = torch.repeat_interleave(
+        torch.arange(len(prepared.group_lengths), device=sp_t.device), group_lengths_t
     )
-    sp_sel = sp_t.index_select(0, torch.tensor(flat_idx, device=sp_t.device))
+    student_group_logsum = sp_det.new_zeros(len(prepared.group_lengths))
+    student_group_logsum.index_add_(0, group_ids_t, sp_det.index_select(0, flat_idx_t))
+    teacher_logsum_t = torch.tensor(
+        prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device
+    )
+    coeffs = kl_coef * (
+        student_group_logsum - teacher_logsum_t
+    ) / group_lengths_t.to(dtype=sp_t.dtype)
+    coeff_vec = coeffs.index_select(0, group_ids_t)
+    sp_sel = sp_t.index_select(0, flat_idx_t)
     return (coeff_vec * sp_sel).mean()
 
 
@@ -1651,7 +1680,8 @@ def _resolve_samples_batched(
         coverage = groupwise_coverage(groups, student_toks)
         n_align = sum(1 for st in student_toks if st.end > st.start)
         group_granularity = (n_align / len(groups)) if groups else 0.0
-        if not groups:
+        prepared_groups = _prepare_gkd_groups(groups)
+        if prepared_groups is None:
             results[idx] = SampleResult(
                 teacher_status="ok",
                 coverage=coverage,
@@ -1666,7 +1696,7 @@ def _resolve_samples_batched(
                 idx=idx,
                 prompt_ids=prompt_ids,
                 student_ids=student_ids,
-                groups=groups,
+                groups=prepared_groups,
                 coverage=coverage,
                 gen_tokens=gen.gen_tokens,
                 teacher_tokens=teacher_tokens,
