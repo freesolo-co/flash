@@ -410,6 +410,58 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
     assert {algo for _, algo in checked} == set(ALGORITHMS)
 
 
+def test_catalog_model_algorithm_config_gpu_matrix_resolves_to_fitting_cards(monkeypatch):
+    """Every model x algorithm x configured GPU class must still resolve through the no-pin policy
+    to a validated, provider-backed card with enough VRAM."""
+    from flash.catalog import ALGORITHMS, MODELS
+    from flash.providers import allocator
+    from flash.providers.base import GPU_INFO, get_gpu_info, providers_for, provisional_gpu
+    from flash.schema import spec_from_dict
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    configured_gpu_types = tuple(GPU_INFO)
+    expected = {
+        (model_id, algo, configured_gpu)
+        for model_id, info in MODELS.items()
+        for algo in ALGORITHMS
+        if algo in info.algos
+        for configured_gpu in configured_gpu_types
+    }
+    checked = set()
+
+    for model_id, info in MODELS.items():
+        for algo in ALGORITHMS:
+            if algo not in info.algos:
+                continue
+            train = {"epochs": 1, "max_examples": 8} if algo == "sft" else {"steps": 1}
+            need = allocator.required_vram_gb(model_id, algo, train=train, thinking=False)
+            expected_gpu = provisional_gpu(model_id, algo, train=train, thinking=False)
+
+            for configured_gpu in configured_gpu_types:
+                spec = spec_from_dict(
+                    {
+                        "model": model_id,
+                        "algorithm": algo,
+                        "environment": {
+                            "id": "github:freesolo-co/envs@main:gsm8k/environment.py"
+                        },
+                        "train": train,
+                        "gpu": {"type": configured_gpu},
+                    },
+                    run_id="matrix",
+                )
+                # gpu.type is compatibility input, not a pin. The schema resolves every spelling to
+                # the same cheapest fitting class that submit-time allocation will use.
+                assert spec.gpu.type == expected_gpu, (model_id, algo, configured_gpu, expected_gpu)
+                resolved_info = get_gpu_info(spec.gpu.type)
+                assert resolved_info.validated
+                assert providers_for(spec.gpu.type)
+                assert resolved_info.vram_gb >= need, (model_id, algo, configured_gpu, spec.gpu.type, need)
+                checked.add((model_id, algo, configured_gpu))
+
+    assert checked == expected
+
+
 def test_sft_big_vocab_logits_term_present_and_bounded():
     """SFT must reserve the [per_device, seq, vocab] fp32-logits VRAM whenever the worker's fused CE
     is OFF (a <3B model AND a <2048-token ctx) -- the big-vocab SFT OOM driver the SFT branch
