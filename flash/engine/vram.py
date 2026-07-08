@@ -366,11 +366,12 @@ def estimate_vram_gb(
         # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
         # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
         completion = opd_completion_len(max_tokens, thinking)
-        # run_opd backprops ONE completion at a time (_train_one), so the activations + dense logits
-        # are SINGLE-sequence — NOT sft_per_device(batch_size). The batch-size activation term
-        # over-budgeted opd and bumped the GPU tier unnecessarily (reported by codex[bot]).
+        # run_opd backprops a small loss microbatch, but OPD's placement budget stays conservative by
+        # treating activations + dense logits as SINGLE-sequence — NOT sft_per_device(batch_size). The
+        # batch-size activation term over-budgeted opd and bumped the GPU tier unnecessarily (reported by
+        # codex[bot]).
         activations = _ACT_COEF * (seq_len / 1024.0) * width
-        # Dense-logit peak spans BOTH the forward and the loss BACKWARD (gkd_loss has no fused CE):
+        # Dense-logit peak spans BOTH the forward and the loss BACKWARD (OPD has no fused CE):
         #   - forward:  bf16 full-sequence logits [seq, vocab]        (seq * 2)
         #               fp32 completion rows [completion, vocab] for logsumexp, saved for backward
         #                                                             (completion * 4)
@@ -380,7 +381,7 @@ def estimate_vram_gb(
         #                                                             (seq * 2)
         # All four coexist at the backward peak. The old formula counted only the two FORWARD buffers,
         # so a long-completion / large-vocab (248k) opd job under-budgeted the loss backward by
-        # ~(completion*4 + seq*2)*vocab bytes and could route to a GPU that OOMs in gkd_loss.backward
+        # ~(completion*4 + seq*2)*vocab bytes and could route to a GPU that OOMs in OPD loss backward
         # (codex[bot]). Mirror the SFT dense-logit sizing by budgeting the backward buffers too.
         logits_fwd = (seq_len * 2 + completion * 4) * vocab
         logits_bwd = (seq_len * 2 + completion * 4) * vocab
