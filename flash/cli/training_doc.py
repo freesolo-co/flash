@@ -103,7 +103,7 @@ id = "your-org/my-env"      # the id printed by `flash env push`
                                    # never stored in the spec
 
 [train]
-epochs = 1                  # SFT is epoch-driven; GRPO is step-driven (steps = N)
+epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 lora_rank = 32
 lora_alpha = 64
@@ -114,7 +114,7 @@ GPU and HF artifacts are **fully managed** — do not pick `gpu.type` or set
 `train.hf_repo`; the allocator picks the cheapest validated managed GPU class that fits,
 and run artifacts are stored in a private environment-scoped repo with content-addressed
 Flash code snapshots. Compose or tweak configs without editing files: `--config
-extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.steps=300`).
+extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
 
 ### 4. Submit
 
@@ -201,20 +201,20 @@ spending another GPU run:
 | --- | --- | --- |
 | Environment id is blank or stale | `flash train --dry-run` fails, or the worker uses old reward/data | Run `flash env push --name my-env .` after every environment/data edit and paste the returned id into every config you submit. |
 | Local-only env path in config | Config validation says there is no local path mode | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths. |
-| Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `steps`, `epochs`, `group_size`, `max_tokens`, `temperature`, `max_length`, LoRA, and other training knobs under `[train]`. |
+| Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`. |
 | Trying to pin managed infrastructure | `gpu.type`, `train.hf_repo`, or `model_policy` changes do not do what you expected | Treat GPU choice, model policy, and the run artifact repo as managed. Tune the model, algorithm, environment, and `[train]` knobs instead. |
 | Secrets are not available on the worker | Reward code works locally but remote logs show missing API keys or auth failures | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never put secret values in `[worker_env]` or hard-code them in the config. |
 | Wrong model / thinking setting | Config validation fails, or chat behavior does not match the run | Use `flash models`; set `thinking = true` only for supported models. Thinking is a training-time/run-level choice and serving preserves that parity, so `flash chat` does not expose an override flag. |
 | Thinking reward grades the wrong text | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields. |
 | All-zero or flat GRPO reward | `reward_mean` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
 | Reward rises but behavior is worse | Short, templated, malformed, or reward-hacked outputs score well | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string. |
-| Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_tokens` for GRPO rollouts or `max_length` for SFT only after seeing truncation. Oversizing them by default just burns memory/cost. |
-| Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash log <run-id>`, reduce footprint (`max_length`, `max_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
+| Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_completion_tokens` for GRPO/OPD rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost. |
+| Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash log <run-id>`, reduce footprint (`max_context_tokens`, `max_completion_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
 | Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash log <run-id> --follow` to reattach, `flash log <run-id>` for the console/error output, or `flash cancel <run-id>` if you intentionally want to stop it. |
 | Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash checkpoints <run-id>`, deploy a specific step with `flash deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter. |
 | Export fails before upload | CLI says no HuggingFace token | Pass `flash export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`. |
 | SFT loss improves but quality does not | Train loss falls while held-out behavior stalls or degrades | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes. |
-| Cost surprises | A quick experiment uses more GPU time than intended | Start with `--dry-run` and `--cost`, cap steps/epochs for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time. |
+| Cost surprises | A quick experiment uses more GPU time than intended | Start with `--dry-run` and `--cost`, keep `epochs` and `max_examples` small for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time. |
 
 ---
 
@@ -335,8 +335,8 @@ Pick SFT when you already have good answers and want the model to imitate them.
   split the run never trains on, then **deploy the adapter and score it on that split**
   (`flash deploy` + `flash chat`). If held-out quality stalls or drops while train loss
   keeps falling, reduce `epochs` or add more data — not more passes.
-- **Start `max_length` small and grow it on evidence.** Begin from the smallest
-  `max_length` that plausibly fits prompt + completion, and only raise it when you see
+- **Start `max_context_tokens` small and grow it on evidence.** Begin from the smallest
+  `max_context_tokens` that plausibly fits prompt + completion, and only raise it when you see
   truncation (outputs cut off mid-thought, degraded loss). A bigger context just costs
   more.
 - **For Qwen3.5 thinking multi-turn SFT, put reasoning only in the final assistant
@@ -370,7 +370,9 @@ lora_rank = 16     # for VL warm-starts, SFT rank + GRPO rank must fit the effec
 lora_alpha = 32
 ```
 
-SFT is **epoch-driven** (`epochs`); GRPO is **step-driven** (`steps`).
+SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
+an epoch is one pass over the retained prompt pool after `max_examples` and prompt-budget filtering;
+optimizer-step counts are derived from those epochs.
 
 ---
 
@@ -379,8 +381,8 @@ SFT is **epoch-driven** (`epochs`); GRPO is **step-driven** (`steps`).
 Pick distillation when a much stronger **teacher** model can grade your student's work
 token-by-token. The student samples on-policy (like GRPO), the managed GLM 5.2 teacher scores
 each of *its own* completions, and a dense per-token loss teaches the student to match the teacher —
-far more sample-efficient than reward-based RL and with no reward to design. It is **step-driven**
-(`steps`) and produces a LoRA served exactly like SFT.
+far more sample-efficient than reward-based RL and with no reward to design. It supports `epochs`
+like SFT/GRPO and produces a LoRA served exactly like SFT.
 
 - **No teacher key or model override to set up.** The GLM 5.2 teacher and its Fireworks key are platform-managed: the
   service supplies its own key to every opd run, so there is nothing to export or declare — an opd
@@ -397,7 +399,7 @@ far more sample-efficient than reward-based RL and with no reward to design. It 
   (driving `step_episode` / observations just like GRPO) and distils EVERY assistant turn against the
   teacher, each conditioned on the transcript up to that turn — the episode's total reverse-KL over
   the student's generated tokens is the sum of its per-turn reverse-KLs. Env/observation tokens are
-  never distilled (they're context, not the student's output). Set `[train] max_length` to bound the
+  never distilled (they're context, not the student's output). Set `[train] max_context_tokens` to bound the
   transcript; the teacher must cover it (GLM-5.2's context far exceeds the default budget).
 - **Judge it like SFT.** Distillation logs a falling per-token loss; a low loss alone is not proof.
   Keep a held-out split, `flash deploy` the adapter, and score it — confirm the student actually
@@ -412,7 +414,8 @@ algorithm = "opd"
 id = "your-org/my-env"
 
 [train]
-steps = 100
+epochs = 1
+max_examples = 2
 lora_rank = 32
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 ```
@@ -427,7 +430,7 @@ in a sensible value, so only override with a reason.
 | Knob | Convention |
 | --- | --- |
 | `group_size` | Completions sampled per prompt (default 8). More = more signal and more cost; drop to 4 to trim cost. The group needs *within-group variance* for an advantage to exist. |
-| `max_tokens` | Completion budget per rollout. Size it to the expected output length — too small silently truncates good answers and poisons the reward; too large just costs more. |
+| `max_completion_tokens` | Completion budget per rollout. Size it to the expected output length — too small silently truncates good answers and poisons the reward; too large just costs more. |
 | `temperature` | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups. |
 | `kl_penalty_coef` | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move. |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy. |
@@ -449,7 +452,7 @@ rollouts score somewhere between all-fail and all-pass — is where GRPO has the
 signal.
 
 - If nearly every prompt is solved (most groups score ~1.0): **increase difficulty** —
-  harder prompts, tighter format/reward, more steps.
+  harder prompts, tighter format/reward, more epochs, or more data.
 - If nearly nothing is solved (most groups score ~0.0): **decrease difficulty** —
   easier or few-shot prompts, a more lenient (denser) reward, or warm-start with SFT.
 - In between: good signal — keep iterating at this difficulty.
@@ -468,7 +471,7 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 | --- | --- | --- |
 | Repetition / looping collapse | the same phrase repeats until truncation | repetition or length penalty; lower `temperature` |
 | Overthinking / verbose reasoning | reasoning eats the whole token budget | `thinking_length_penalty_coef`; tighten the prompt |
-| Max-token truncation | answers cut off mid-thought | raise `max_tokens` / `max_length` |
+| Completion truncation | answers cut off mid-thought | raise `max_completion_tokens` / `max_context_tokens` |
 | Unparsed / over-escaped output | reward can't read the answer | robust parser; return `0.0` on parse fail; format gate |
 | Wrapper / markdown around structured output | prose around the JSON/answer | a format gate; `stop_sequences` |
 | Uniform-reward groups | every rollout in a group scores the same → no gradient | shape the reward for partial credit; raise `temperature` |
@@ -500,8 +503,8 @@ on a beyond-noise improvement.
 
 ## Scale the evidence
 
-- **A smoke test is not proof.** A single-digit `steps`, a tiny dataset, or a handful
-  of rollouts only validates the wiring. Scale `steps` / `epochs`, the dataset size,
+- **A smoke test is not proof.** A single-digit derived step count, a tiny dataset, or a handful
+  of rollouts only validates the wiring. Scale `epochs`, the dataset size,
   and `group_size` to the model and the data you actually have before you trust a
   result. Don't cite budget alone as the reason for an underpowered run.
 - **Use the data you have.** Deliberately assign every usable row to training or to a
@@ -513,7 +516,7 @@ on a beyond-noise improvement.
 ## Treat crashes as infra, not model size
 
 > A CUDA / OOM / vLLM / kernel / infrastructure error is an **infrastructure** problem, not a
-> sign the model is too big. Lower `max_length`, `max_tokens`, or `group_size` to shrink
+> sign the model is too big. Lower `max_context_tokens`, `max_completion_tokens`, or `group_size` to shrink
 > the run's footprint and let the allocator retry onto the next fitting GPU class — do
 > **not** switch to a smaller model to make a crash disappear. That silently destroys
 > quality.

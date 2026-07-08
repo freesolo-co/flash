@@ -11,7 +11,7 @@ BASE = (
     'model = "Qwen/Qwen3.5-4B"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-    '[train]\nsteps = 100\nhf_repo = "owner/runs"\n'
+    '[train]\nepochs = 1\nmax_examples = 100\nhf_repo = "owner/runs"\n'
     '[gpu]\ntype = "RTX 5090"\n'
 )
 
@@ -31,9 +31,13 @@ def test_set_overrides_scalar_and_list():
         spec = spec_from_file(
             cfg,
             run_id="x",
-            overrides=["train.steps=7", "gpu.type=RTX 4090", "train.stop_sequences=[STOP1,STOP2]"],
+            overrides=[
+                "train.epochs=3",
+                "gpu.type=RTX 4090",
+                "train.stop_sequences=[STOP1,STOP2]",
+            ],
         )
-        assert spec.train.steps == 7
+        assert spec.train.epochs == 3
         assert spec.train.stop_sequences == ("STOP1", "STOP2")
         # GPU pinning is gone: a gpu.type override is parsed but IGNORED — the schema always
         # resolves the cheapest fitting VALIDATED class for the model (4B GRPO ~35 GB -> the 80 GB
@@ -46,9 +50,9 @@ def test_composed_config_deep_merge():
 
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
-        override = _write(tmp, "prod.toml", '[train]\nsteps = 250\n[gpu]\ntype = "RTX 4090"\n')
+        override = _write(tmp, "prod.toml", '[train]\nmax_examples = 250\n[gpu]\ntype = "RTX 4090"\n')
         spec = spec_from_file(base, run_id="x", extra_configs=[override])
-        assert spec.train.steps == 250  # deep-merged override of a scalar
+        assert spec.train.max_examples == 250  # deep-merged override of a scalar
         assert spec.environment.id == "github:freesolo-co/envs@main:gsm8k/environment.py"  # untouched key preserved
         # The merged [gpu] type is IGNORED (no pin): the schema resolves the cheapest fitting
         # VALIDATED class for the model (4B GRPO ~35 GB -> the 80 GB A100 PCIe @ $1.39), regardless

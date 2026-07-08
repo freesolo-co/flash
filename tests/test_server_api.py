@@ -28,7 +28,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"steps": 1, "hf_repo": "org/test-runs"},
+    "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 
@@ -1642,7 +1642,7 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "nohandle-1",
     }
@@ -1712,7 +1712,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "phantom-1",
     }
@@ -1775,7 +1775,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "unconf-1",
     }
@@ -1831,7 +1831,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "queued-1",
     }
@@ -1894,7 +1894,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "novast-1",
     }
@@ -1942,7 +1942,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "newvast-1",
     }
@@ -2005,7 +2005,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "retry-1",
     }
@@ -2065,7 +2065,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
     spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "seeds": [0]},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "clear-1",
     }
@@ -2123,14 +2123,14 @@ def test_recover_runs_resolves_init_ref_for_no_handle_resubmit(monkeypatch, tmp_
     source_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "hf_repo": "org/source-runs"},
+        "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/source-runs"},
         "gpu": {"type": "RTX 5090"},
         "run_id": "source-run",
     }
     warm_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1, "init_from_adapter": "source-run"},
+        "train": {"epochs": 1, "max_examples": 1, "init_from_adapter": "source-run"},
         "gpu": {"type": "RTX 5090"},
         "run_id": "nohandle-warm",
     }
@@ -2183,7 +2183,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
-        "train": {"steps": 1},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "bad-1",
     }
@@ -2191,7 +2191,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     good_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 1},
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "good-2",
     }

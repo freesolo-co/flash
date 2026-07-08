@@ -18,7 +18,7 @@ def _spec():
     return JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, hf_repo="owner/runs"),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
     )
 
 
@@ -64,7 +64,7 @@ def test_build_worker_env_opd_uses_expandable_allocator(monkeypatch):
     opd_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
-        train=TrainSpec(steps=10, hf_repo="owner/runs"),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
     )
     env = build_worker_env(opd_spec, 0)
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
@@ -107,7 +107,7 @@ def test_build_worker_env_forwards_managed_teacher_key_for_opd_only(monkeypatch)
 
     monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B", algorithm="opd", train=TrainSpec(steps=10, hf_repo="owner/runs")
+        model="Qwen/Qwen3.5-4B", algorithm="opd", train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs")
     )
     assert build_worker_env(opd_spec, 0).get("FIREWORKS_API_KEY") == "platform-managed-teacher"
     # grpo/sft don't use a teacher, so the key is not forwarded to those workers.
@@ -125,7 +125,7 @@ def test_build_worker_env_managed_teacher_key_is_authoritative_no_byo(monkeypatc
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=EnvironmentSpec(id="org/env", secrets=("FIREWORKS_API_KEY",)),
-        train=TrainSpec(steps=10, hf_repo="owner/runs"),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
     )
     env = build_worker_env(opd_spec, 0, runtime_secrets={"FIREWORKS_API_KEY": "byo-user-key"})
     assert env["FIREWORKS_API_KEY"] == "platform-managed-teacher"
@@ -156,7 +156,7 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
-        train=TrainSpec(steps=10, hf_repo="owner/runs"),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
     )
 
     env = build_worker_env(
@@ -243,7 +243,7 @@ def _spec_worker_env(worker_env: dict):
     return JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, hf_repo="owner/runs"),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         worker_env=dict(worker_env),
     )
 
@@ -318,7 +318,7 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     per_run = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=10, hf_repo="myorg/runs"),
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="myorg/runs"),
     )
     assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
     # still the per-run value even with no operator HF_REPO at all
@@ -348,7 +348,7 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(steps=2))
+    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(epochs=1, max_examples=2))
     env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 

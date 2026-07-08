@@ -447,11 +447,11 @@ def cmd_env_setup(args) -> int:
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
     # `thinking = true` opts the run into reasoning mode. Reasoning shares the generation budget with
-    # the answer, so GRPO also gets a raised max_tokens. These strings are empty when reasoning is
-    # off, keeping the default scaffold byte-for-byte identical.
+    # the answer, so GRPO also gets a raised completion budget. These strings are empty when reasoning
+    # is off, keeping the default scaffold byte-for-byte identical.
     thinking_line = "thinking = true\n" if reasoning else ""
     rl_reasoning_train = (
-        "max_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"
+        "max_completion_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"
         if reasoning
         else ""
     )
@@ -469,7 +469,8 @@ def cmd_env_setup(args) -> int:
             "\n"
             f"{env_comment}"
             "[train]\n"
-            "steps = 150\n"
+            "epochs = 1\n"
+            "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
             f"{rl_reasoning_train}"
             "lora_rank = 32\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
@@ -511,7 +512,8 @@ def cmd_env_setup(args) -> int:
             "[environment]\n"
             'id = ""\n\n'
             "[train]\n"
-            "steps = 100                     # opd is step-driven (like GRPO)\n"
+            "epochs = 1\n"
+            "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
             "lora_rank = 32\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"

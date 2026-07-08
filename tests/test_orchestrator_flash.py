@@ -47,7 +47,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             run_id="flash-run",
             model="Qwen/Qwen3.5-4B",
             algorithm="grpo",
-            train=TrainSpec(steps=2),
+            train=TrainSpec(epochs=1, max_examples=2),
             gpu=GpuSpec(type="RTX 4090"),
         )
         status = runner.submit_job(spec, dry_run=False, background=False)
