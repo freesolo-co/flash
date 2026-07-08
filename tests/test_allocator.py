@@ -477,8 +477,8 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         GPU_INFO,
         UnsupportedGpuError,
         get_gpu_info,
-        provisional_gpu,
         providers_for,
+        provisional_gpu,
     )
     from flash.schema import spec_from_dict
 
