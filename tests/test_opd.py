@@ -1464,6 +1464,28 @@ def test_opd_teacher_batch_size_and_workers_can_be_overridden(monkeypatch):
     assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.6-35B-A3B", 64) == 8
 
 
+def test_opd_loss_seq_cap_uses_actual_single_turn_prompt_lengths():
+    import flash.engine.worker.opd as opd_mod
+
+    examples = [
+        (object(), [], [1] * 128),
+        (object(), [], [1] * 640),
+    ]
+
+    assert (
+        opd_mod._opd_loss_seq_cap(4096, 128, examples, multi_turn=False)
+        == 768
+    )
+    assert (
+        opd_mod._opd_loss_seq_cap(700, 128, examples, multi_turn=False)
+        == 700
+    )
+    assert (
+        opd_mod._opd_loss_seq_cap(4096, 128, examples, multi_turn=True)
+        == 4096
+    )
+
+
 def test_opd_scores_generated_chunk_in_teacher_batches(monkeypatch):
     torch = pytest.importorskip("torch")
 

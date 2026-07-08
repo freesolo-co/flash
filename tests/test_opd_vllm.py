@@ -381,7 +381,8 @@ def test_opd_vllm_kwargs_raises_oom_when_single_rollout_cannot_fit(monkeypatch):
         opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
 
 
-def test_opd_vllm_kwargs_keeps_cuda_graphs_on_a100(monkeypatch):
+@pytest.mark.parametrize("cc", [(8, 0), (9, 0)])
+def test_opd_vllm_kwargs_keeps_cuda_graphs_on_datacenter_cards(monkeypatch, cc):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
     from flash.engine.worker.opd_vllm import opd_vllm_kwargs
@@ -389,7 +390,7 @@ def test_opd_vllm_kwargs_keeps_cuda_graphs_on_a100(monkeypatch):
     class _Cuda:
         @staticmethod
         def get_device_capability():
-            return (8, 0)
+            return cc
 
         @staticmethod
         def get_device_properties(_idx):
@@ -410,40 +411,6 @@ def test_opd_vllm_kwargs_keeps_cuda_graphs_on_a100(monkeypatch):
 
     assert out["enforce_eager"] is None
     assert out["compilation_config"] is None
-
-
-def test_opd_vllm_kwargs_uses_decode_cuda_graphs_on_hopper(monkeypatch):
-    from flash.engine import vram
-    from flash.engine.worker import gpu_setup
-    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
-
-    class _Cuda:
-        @staticmethod
-        def get_device_capability():
-            return (9, 0)
-
-        @staticmethod
-        def get_device_properties(_idx):
-            return SimpleNamespace(total_memory=140e9)
-
-    torch_mod = types.ModuleType("torch")
-    torch_mod.cuda = _Cuda
-    vllm_mod = types.ModuleType("vllm")
-    vllm_mod.__version__ = "0.19.1"
-    monkeypatch.setitem(sys.modules, "torch", torch_mod)
-    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
-    monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: None)
-    monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
-    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.0)
-    monkeypatch.setattr(vram, "colocate_kv_util", lambda *a, **k: 0.37)
-
-    out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
-
-    assert out["enforce_eager"] is False
-    assert out["compilation_config"] == {
-        "mode": 0,
-        "cudagraph_mode": "FULL_DECODE_ONLY",
-    }
 
 
 @pytest.mark.parametrize(

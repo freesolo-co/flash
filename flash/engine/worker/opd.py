@@ -176,6 +176,21 @@ def _opd_loss_microbatch_size(model_id: str, total_samples: int) -> int:
     return max(1, min(total, default))
 
 
+def _opd_loss_seq_cap(
+    seq_cap: int,
+    max_completion: int,
+    examples: list[tuple[object, object, object]],
+    *,
+    multi_turn: bool,
+) -> int:
+    """Upper-bound the actual sequence length used by differentiable OPD loss forwards."""
+    cap = max(1, int(seq_cap))
+    if multi_turn or not examples:
+        return cap
+    prompt_max = max(len(prompt_ids) for _ex, _msgs, prompt_ids in examples)
+    return max(1, min(cap, int(prompt_max) + max(1, int(max_completion))))
+
+
 @dataclass(frozen=True)
 class OpdKnobs:
     """Resolved opd knobs from the JobSpec's [train] table (falling back to RECIPE.opd), returned by
@@ -543,9 +558,15 @@ def run_opd():
         _chalk_active = active_kernels(_chalk_report)
         if _chalk_active:
             print(f"[opd] chalk kernels active: {', '.join(_chalk_active)}")
-        # Engine length gates whether gradient checkpointing is needed for the loss forward.
+        # Gate checkpointing on the largest loss sequence we can actually see in this run, not the
+        # larger vLLM/context cap. A 4k context window with ~512-token retained prompts should not pay
+        # reentrant checkpoint recompute on every OPD loss backward.
         seq_cap = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
-        if grad_checkpointing_on(model_id, seq_cap):
+        loss_seq_cap = _opd_loss_seq_cap(
+            seq_cap, knobs.max_completion, examples, multi_turn=multi_turn
+        )
+        _grad_checkpointing = grad_checkpointing_on(model_id, loss_seq_cap)
+        if _grad_checkpointing:
             # GDN/MoE models MUST use reentrant recompute (parity with sft.py / rl.py). The default
             # non-reentrant path asserts recomputed-activation metadata equality and dies on the FIRST
             # backward for GatedDeltaNet (the fused chunk-scan + chalk Triton kernels save shape-/data-
@@ -557,7 +578,15 @@ def run_opd():
                 gradient_checkpointing_kwargs={"use_reentrant": _reentrant}
             )
             model.enable_input_require_grads()
-            print(f"[opd] gradient checkpointing enabled (use_reentrant={_reentrant})")
+            print(
+                f"[opd] gradient checkpointing enabled "
+                f"(use_reentrant={_reentrant}, loss_seq_cap={loss_seq_cap}, engine_seq_cap={seq_cap})"
+            )
+        else:
+            print(
+                f"[opd] gradient checkpointing disabled "
+                f"(loss_seq_cap={loss_seq_cap}, engine_seq_cap={seq_cap})"
+            )
     # The HF/PEFT model only handles differentiable loss forwards; the colocated vLLM engine owns
     # KV-cached student rollout generation.
     model.config.use_cache = False
@@ -1117,6 +1146,8 @@ def run_opd():
             "rollout_backend": "vllm",
             "vllm_model": getattr(vllm_rollout, "model_source", None),
             "vllm_max_model_len": getattr(vllm_rollout, "max_model_len", None),
+            "opd_loss_max_seq_len": loss_seq_cap,
+            "opd_gradient_checkpointing": _grad_checkpointing,
             "vllm_gpu_memory_utilization": getattr(vllm_rollout, "gpu_memory_utilization", None),
             "vllm_kv_cache_dtype": vllm_kwargs.get("kv_cache_dtype"),
             "vllm_rollout_batch_size": vllm_kwargs.get("rollout_batch_size"),
