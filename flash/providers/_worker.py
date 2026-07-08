@@ -154,8 +154,10 @@ _REMOVED_OPTIMIZATION_ENV = frozenset(
         "PYTORCH_ALLOC_CONF",
         "PYTORCH_CUDA_ALLOC_CONF",
         "RL_VLLM_SLEEP",
+        "SFT_PER_DEVICE_BS",
         "FLASH_ALLOC_AUTO",
         "TORCHDYNAMO_DISABLE",
+        "VLLM_USE_V1",
         "VLLM_ATTENTION_BACKEND",
         "VLLM_FLASH_ATTN_VERSION",
         "FLASH_DISABLE_FA2",
@@ -235,11 +237,7 @@ def build_worker_env(
     env["HF_REPO"] = spec.train.hf_repo
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
-    for k in (
-        "SFT_PER_DEVICE_BS",
-        "VLLM_USE_V1",
-        "FLASH_CHALK_SPEC",  # install-source override; kernel selection is fixed in chalk_kernels
-    ):
+    for k in ("FLASH_CHALK_SPEC",):  # install-source override; kernel selection is fixed in chalk_kernels
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]

@@ -294,30 +294,6 @@ def run_rl():
             f"{_cap_completion_len} (engine context), not the per-turn budget {_max_completion}"
         )
     batching = _w.compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
-    # A FORCED per_device (FLASH_RL_PER_DEVICE_COMPS) can differ from the value TRL actually runs for
-    # TWO distinct reasons in compute_grpo_batching, and an MFU sweep that logs/probes a per_device it
-    # never ran needs to know WHICH: (1) overshoot -- a forced value ABOVE the per-step completion
-    # batch (prompts_per_step*group_size) is clamped DOWN to it via min(); (2) non-divisibility -- a
-    # forced value at/below the target that doesn't divide it is shrunk to the largest divisor <= it.
-    if os.environ.get("FLASH_RL_PER_DEVICE_COMPS", "").strip():
-        _used_pd = batching["per_device_train_batch_size"]
-        if _used_pd != per_device_comps:
-            _target = prompts_per_step * group_size
-            if per_device_comps > _target:
-                _why = (
-                    f"exceeds the per-step completion batch "
-                    f"(prompts_per_step*group_size={_target}) and was clamped down to it"
-                )
-            else:
-                _why = (
-                    f"does not divide prompts_per_step*group_size={_target} and was shrunk to the "
-                    f"largest divisor <= it"
-                )
-            print(
-                f"WARN: forced FLASH_RL_PER_DEVICE_COMPS={per_device_comps} {_why}; TRL will run "
-                f"per_device={_used_pd}. Pick a per_device that divides {_target} (and is <= it) "
-                f"to probe the exact value."
-            )
     if not batching["divisible_by_group"]:
         print(
             "WARN: generation batch not divisible by group size; check prompts_per_step/group_size"
