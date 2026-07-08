@@ -24,7 +24,7 @@ import contextlib
 import os
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
@@ -65,6 +65,16 @@ from flash.engine.worker.perf import (
 )
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
+
+OPD_ROLLOUT_PIPELINE_CHUNKS = 2
+
+
+def _opd_rollout_chunk_size(total_prompts: int) -> int:
+    """Split a single OPD step into a small number of rollout chunks so remote teacher scoring for
+    earlier chunks overlaps with vLLM generation for later chunks without collapsing vLLM batching."""
+    total = max(1, int(total_prompts))
+    chunks = max(1, OPD_ROLLOUT_PIPELINE_CHUNKS)
+    return max(1, (total + chunks - 1) // chunks)
 
 
 @dataclass(frozen=True)
@@ -178,7 +188,9 @@ def _thinking_prefill_text(tok) -> str:
         # through: return the think_mid delta ("" only when the model opens <think> inside the completion).
         base_mid_tag = base_mid.lstrip()
         if base_mid_tag.startswith("</") and ">" in base_mid_tag:
-            open_tag = "<" + base_mid_tag[2 : base_mid_tag.index(">") + 1]  # "</think>..." -> "<think>"
+            open_tag = (
+                "<" + base_mid_tag[2 : base_mid_tag.index(">") + 1]
+            )  # "</think>..." -> "<think>"
             cut = think.rfind(open_tag, 0, p)
             if cut != -1:
                 return think[cut:]  # e.g. "<think>\n"
@@ -335,6 +347,7 @@ def run_opd():
             )
     else:
         prompt_budget = RECIPE.opd.max_prompt_len
+
     def _render_prompt_ids(messages):
         text = tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
@@ -442,13 +455,20 @@ def run_opd():
     # KV-cached student rollout generation.
     model.config.use_cache = False
 
+    # vLLM's EngineCore starts in a separate process and cannot reuse CUDA blocks PyTorch is only
+    # caching. Release load/merge leftovers before sizing and launching the rollout engine; otherwise
+    # large warm-started OPD jobs can fail with an opaque EngineCore startup error while torch reports
+    # tens of GiB reserved but unallocated.
+    free_gpu()
+
     vllm_kwargs = _opd_vllm_kwargs(model_id, knobs, seq_cap)
     lora_rank = _opd_lora_rank(
         model, getattr(_w.JOB_SPEC.train, "lora_rank", 32) if _w.JOB_SPEC else 32
     )
     print(
         f"[opd] rollout backend: colocated vLLM model={rollout_model_source} "
-        f"ctx={seq_cap} lora_rank={lora_rank} util={vllm_kwargs['gpu_memory_utilization']:.2f}"
+        f"ctx={seq_cap} lora_rank={lora_rank} util={vllm_kwargs['gpu_memory_utilization']:.2f} "
+        f"rollout_batch={vllm_kwargs.get('rollout_batch_size') or 'auto'}"
     )
     with liveness_heartbeat("opd_vllm_initializing"):
         vllm_rollout = OpdVllmRolloutEngine(
@@ -535,9 +555,7 @@ def run_opd():
         env_glue_fn = make_env_glue(tok, thinking=_w.THINKING)
 
         def render_fn(messages, add_generation_prompt):
-            return render_message_ids(
-                tok, messages, add_generation_prompt, thinking=_w.THINKING
-            )
+            return render_message_ids(tok, messages, add_generation_prompt, thinking=_w.THINKING)
 
         def generate_fn(prefix_ids, max_new):
             """One turn's generation through the colocated vLLM engine."""
@@ -584,6 +602,7 @@ def run_opd():
     # the post-loop guard then turns a shortfall into a RETRY, not a silent under-trained publish.
     step = 0
     max_iters = 2 * steps + 10
+    max_teacher_workers = max(1, knobs.prompts_per_step * knobs.group_size)
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
     # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
@@ -600,6 +619,7 @@ def run_opd():
             "opd_step", progress=_samples_progress, fields=lambda: {"step": opt_steps}
         ),
         _sdpa_cudnn_ctx(_attn),
+        ThreadPoolExecutor(max_workers=max_teacher_workers) as teacher_pool,
     ):
         while opt_steps < steps and step < max_iters:
             it = step  # data-slice + display index for THIS iteration
@@ -610,10 +630,52 @@ def run_opd():
             step_loss = 0.0
             step_cov = 0.0
             nseq = 0
-            # Step in three phases. Phase 1 uses the colocated vLLM engine for every student rollout.
-            # Phase 2 overlaps teacher network calls for all scorable completions. Phase 3 runs the
-            # differentiable GKD loss serially on the training model.
-            pending: list[_Pending] = []
+            # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
+            # handed to the resident teacher pool, and completed teacher futures are converted into
+            # differentiable GKD losses as soon as they finish. This preserves one optimizer update per
+            # OPD step, but removes the old "wait for every teacher response before any loss" barrier.
+            teacher_futures: dict[Future, _Pending] = {}
+
+            def _queue_or_account(
+                p: _Pending, *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+            ) -> None:
+                if p.gen.skip or p.gen.truncated:
+                    _account(_resolve_sample(model, tok, device, p.gen, None, p.prompt_ids, knobs))
+                    return
+                _teacher_futures[
+                    teacher_pool.submit(
+                        _score_one,
+                        teacher,
+                        p.gen,
+                        prompt_messages=p.prompt_messages,
+                        thinking_prefill=thinking_prefill,
+                    )
+                ] = p
+
+            def _cancel_pending_teacher_futures(
+                *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+            ) -> None:
+                for other in _teacher_futures:
+                    other.cancel()
+
+            def _consume_teacher_future(
+                fut: Future, *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+            ) -> None:
+                p = _teacher_futures.pop(fut)
+                try:
+                    p.score = fut.result()
+                except TeacherError:
+                    _cancel_pending_teacher_futures()
+                    raise
+                _account(_resolve_sample(model, tok, device, p.gen, p.score, p.prompt_ids, knobs))
+
+            def _drain_ready_teacher_futures(
+                *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+            ) -> None:
+                for fut in list(_teacher_futures):
+                    if fut.done():
+                        _consume_teacher_future(fut)
+
             if multi_turn:
                 # Multi-turn Phase 1: drive an EPISODE per (prompt x group), each yielding one
                 # per-turn record. Every assistant turn becomes a _Pending distilled independently
@@ -638,14 +700,15 @@ def run_opd():
                         )
                         episodes_seen += 1
                         mt_turn_records += len(records)
-                        pending.extend(
-                            _Pending(
-                                gen=rec["gen"],
-                                prompt_ids=rec["prefix_ids"],
-                                prompt_messages=rec["context_messages"],
+                        for rec in records:
+                            _queue_or_account(
+                                _Pending(
+                                    gen=rec["gen"],
+                                    prompt_ids=rec["prefix_ids"],
+                                    prompt_messages=rec["context_messages"],
+                                )
                             )
-                            for rec in records
-                        )
+                        _drain_ready_teacher_futures()
             else:
                 contexts: list[tuple[list[int], object]] = []
                 prompts: list[list[int]] = []
@@ -653,52 +716,41 @@ def run_opd():
                     for _g in range(group):
                         contexts.append((prompt_ids, prompt_messages))
                         prompts.append(prompt_ids)
-                with liveness_heartbeat(
-                    "opd_step",
-                    progress=_samples_progress,
-                    fields=lambda _step=opt_steps: {"step": _step},
-                    keepalive=True,
-                ):
-                    gens = _generate_many_vllm(
-                        vllm_rollout, tok, prompts, knobs, max_tokens=knobs.max_completion
-                    )
-                for gen, (prompt_ids, prompt_messages) in zip(gens, contexts, strict=True):
-                    pending.append(
-                        _Pending(gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages)
-                    )
-                    samples_seen += 1  # advances the liveness-thread progress signal
-                    _opd_progress(opt_steps, nseq)
+                chunk_size = _opd_rollout_chunk_size(len(prompts))
+                for start in range(0, len(prompts), chunk_size):
+                    end = start + chunk_size
+                    chunk_prompts = prompts[start:end]
+                    chunk_contexts = contexts[start:end]
+                    with liveness_heartbeat(
+                        "opd_step",
+                        progress=_samples_progress,
+                        fields=lambda _step=opt_steps: {"step": _step},
+                        keepalive=True,
+                    ):
+                        gens = _generate_many_vllm(
+                            vllm_rollout,
+                            tok,
+                            chunk_prompts,
+                            knobs,
+                            max_tokens=knobs.max_completion,
+                        )
+                    for gen, (prompt_ids, prompt_messages) in zip(
+                        gens, chunk_contexts, strict=True
+                    ):
+                        _queue_or_account(
+                            _Pending(
+                                gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
+                            )
+                        )
+                        samples_seen += 1  # advances the liveness-thread progress signal
+                        _opd_progress(opt_steps, nseq)
+                    _drain_ready_teacher_futures()
 
-            scorable = [i for i, p in enumerate(pending) if not (p.gen.skip or p.gen.truncated)]
             _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
-            if scorable:
-                permanent_err = None
-                with ThreadPoolExecutor(
-                    max_workers=min(len(scorable), knobs.prompts_per_step * knobs.group_size)
-                ) as pool:
-                    fut_to_idx = {
-                        pool.submit(
-                            _score_one,
-                            teacher,
-                            pending[i].gen,
-                            prompt_messages=pending[i].prompt_messages,
-                            thinking_prefill=thinking_prefill,
-                        ): i
-                        for i in scorable
-                    }
-                    for fut in as_completed(fut_to_idx):
-                        i = fut_to_idx[fut]
-                        try:
-                            pending[i].score = fut.result()
-                        except TeacherError as e:
-                            if permanent_err is None:
-                                permanent_err = e
-                if permanent_err is not None:
-                    raise permanent_err
+            for fut in as_completed(list(teacher_futures)):
+                if fut in teacher_futures:
+                    _consume_teacher_future(fut)
             _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
-
-            for p in pending:
-                _account(_resolve_sample(model, tok, device, p.gen, p.score, p.prompt_ids, knobs))
             if nseq == 0:
                 print(f"[opd] step {it}: no usable teacher signal this step (skipped)")
                 continue
@@ -859,6 +911,7 @@ def run_opd():
             "vllm_max_model_len": getattr(vllm_rollout, "max_model_len", None),
             "vllm_gpu_memory_utilization": getattr(vllm_rollout, "gpu_memory_utilization", None),
             "vllm_kv_cache_dtype": vllm_kwargs.get("kv_cache_dtype"),
+            "vllm_rollout_batch_size": vllm_kwargs.get("rollout_batch_size"),
             "vllm_max_num_batched_tokens": vllm_kwargs.get("max_num_batched_tokens"),
             "vllm_lora_syncs": getattr(vllm_rollout, "sync_count", None),
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
@@ -930,8 +983,8 @@ class _ScoreResult:
 
 @dataclass
 class _Pending:
-    """A Phase-1 rollout awaiting concurrent scoring (Phase 2) then loss (Phase 3), carrying the prompt
-    context both need. Mutable: ``score`` is filled in by the thread pool for scorable rollouts."""
+    """A rollout awaiting concurrent teacher scoring and then loss/backward, carrying the prompt context
+    both need. Mutable: ``score`` is filled in by the thread pool for scorable rollouts."""
 
     gen: _GenResult
     prompt_ids: object
@@ -1109,7 +1162,7 @@ def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -
 
 def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs) -> SampleResult:
     """Map a generated (and, when scorable, teacher-scored) rollout to its ``SampleResult`` — the single
-    truncated/skip/transient/error/ok decision shared by ``run_opd``'s concurrent Phase 3 and the serial
+    truncated/skip/transient/error/ok decision shared by ``run_opd``'s pipelined path and the serial
     ``_train_one``, so the two paths can never drift apart on skip semantics. ``score`` is consulted only
     for a rollout that was actually scored (not truncated, not skip); callers pass ``None`` for the rest."""
     if gen.truncated:
@@ -1146,7 +1199,12 @@ def _train_one(
     mode. ``on_generated`` (optional) is called AFTER generation and BEFORE teacher scoring to refresh
     the stall clock in those direct tests."""
     gen = _generate_one(
-        model=model, tok=tok, device=device, prompt_tensor=prompt_tensor, gen_cfg=gen_cfg, knobs=knobs
+        model=model,
+        tok=tok,
+        device=device,
+        prompt_tensor=prompt_tensor,
+        gen_cfg=gen_cfg,
+        knobs=knobs,
     )
     if gen.truncated or gen.skip:  # dropped before scoring (see _resolve_sample); score unused
         return _resolve_sample(model, tok, device, gen, None, prompt_ids, knobs)
@@ -1158,6 +1216,7 @@ def _train_one(
         teacher, gen, prompt_messages=prompt_messages, thinking_prefill=thinking_prefill
     )
     return _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs)
+
 
 def _save_adapter(model, tok, adapter_dir: str) -> None:
     """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""
