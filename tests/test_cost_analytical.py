@@ -6,7 +6,13 @@ from __future__ import annotations
 import pytest
 
 from flash.cost import RunConfig, estimate_cost
-from flash.cost.analytical import DEFAULT_WALL_CAP_S, seconds_per_step, select_gpu, setup_seconds
+from flash.cost.analytical import (
+    DEFAULT_WALL_CAP_S,
+    VLLM_INIT_S,
+    seconds_per_step,
+    select_gpu,
+    setup_seconds,
+)
 
 SMALL = "Qwen/Qwen3.5-0.8B"
 MID = "Qwen/Qwen3.5-4B"
@@ -100,6 +106,13 @@ def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
     # GRPO pays an extra vLLM-init cost; bigger models download longer.
     assert setup_seconds(RunConfig(MID, "grpo", 1)) > setup_seconds(RunConfig(MID, "sft", 1))
     assert setup_seconds(RunConfig(BIG, "sft", 1)) > setup_seconds(RunConfig(SMALL, "sft", 1))
+
+
+def test_setup_opd_includes_vllm_init():
+    # OPD now starts a colocated vLLM rollout engine too; wall-cap estimates must include that setup.
+    assert setup_seconds(RunConfig(MID, "opd", 1)) == pytest.approx(
+        setup_seconds(RunConfig(MID, "sft", 1)) + VLLM_INIT_S
+    )
 
 
 def test_cold_start_calibrated_to_real_short_sft_run():
