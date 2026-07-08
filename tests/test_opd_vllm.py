@@ -410,6 +410,7 @@ def test_opd_vllm_kwargs_keeps_cuda_graphs_on_datacenter_cards(monkeypatch, cc):
     out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
 
     assert out["enforce_eager"] is None
+    assert out["compilation_config"] is None
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (12, 0)])
