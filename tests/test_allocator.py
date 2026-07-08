@@ -362,6 +362,54 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
         assert get_gpu_info(alloc.gpu).vram_gb >= need, (model, algo, tr, alloc.gpu, need)
 
 
+def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch):
+    """Full catalog matrix guard: every supported model x algorithm route must pick a card that
+    meets the shared VRAM requirement across schema preview, submit allocation, and cost estimate."""
+    from flash.catalog import ALGORITHMS, MODELS
+    from flash.cost import RunConfig, estimate_cost
+    from flash.providers import allocator
+    from flash.providers.base import get_gpu_info, provisional_gpu
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    expected = {
+        (model_id, algo)
+        for model_id, info in MODELS.items()
+        for algo in ALGORITHMS
+        if algo in info.algos
+    }
+    checked = set()
+
+    for model_id, info in MODELS.items():
+        for algo in ALGORITHMS:
+            if algo not in info.algos:
+                continue
+            train = {}
+            need = allocator.required_vram_gb(model_id, algo, train=train, thinking=False)
+
+            preview_gpu = provisional_gpu(model_id, algo, train=train, thinking=False)
+            preview_info = get_gpu_info(preview_gpu)
+            assert preview_info.validated
+            assert preview_info.enum_member
+            assert preview_info.vram_gb >= need, (model_id, algo, preview_gpu, need)
+
+            alloc = allocator.allocate(model_id, algo, train=train, thinking=False)
+            alloc_info = get_gpu_info(alloc.gpu)
+            assert alloc.provider == "runpod"
+            assert alloc.min_vram_gb == need
+            assert alloc_info.validated
+            assert alloc_info.enum_member
+            assert alloc_info.vram_gb >= need, (model_id, algo, alloc.gpu, need)
+            assert all(c.vram_gb >= need for c in alloc.candidates)
+
+            estimate = estimate_cost(RunConfig(model_id, algo, 1, provider="runpod"))
+            assert estimate.required_vram_gb == need
+            assert estimate.gpu_vram_gb >= need, (model_id, algo, estimate.gpu, need)
+            checked.add((model_id, algo))
+
+    assert checked == expected
+    assert {algo for _, algo in checked} == set(ALGORITHMS)
+
+
 def test_sft_big_vocab_logits_term_present_and_bounded():
     """SFT must reserve the [per_device, seq, vocab] fp32-logits VRAM whenever the worker's fused CE
     is OFF (a <3B model AND a <2048-token ctx) -- the big-vocab SFT OOM driver the SFT branch
