@@ -235,10 +235,6 @@ def build_worker_env(
     env["HF_REPO"] = spec.train.hf_repo
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
-    if spec.train.steps is not None:
-        env["RL_STEPS"] = str(spec.train.steps)
-    if spec.train.epochs is not None:
-        env["SFT_EPOCHS"] = str(spec.train.epochs)
     for k in (
         "SFT_PER_DEVICE_BS",
         "VLLM_USE_V1",

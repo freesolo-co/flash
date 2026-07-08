@@ -685,7 +685,7 @@ def _supervised_walk(monkeypatch, failures):
             run_id="wc-walk",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(steps=1),
+            train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)

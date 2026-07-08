@@ -189,7 +189,8 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "steps": 10,
+            "epochs": 1,
+            "max_examples": 10,
             "hf_repo": "owner/runs",
             "group_size": 4,
             "temperature": 0.7,
@@ -241,7 +242,7 @@ def test_opt_int_float_reject_bools() -> None:
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"steps": 10, "group_size": True},
+                "train": {"epochs": 1, "max_examples": 10, "group_size": True},
             }
         )
 
@@ -253,7 +254,7 @@ def _spec_raw(ref: str) -> dict:
         "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
-        "train": {"steps": 10, "hf_repo": "owner/runs", "init_from_adapter": ref},
+        "train": {"epochs": 1, "max_examples": 10, "hf_repo": "owner/runs", "init_from_adapter": ref},
     }
 
 
@@ -326,7 +327,8 @@ def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
-            "steps": 10,
+            "epochs": 1,
+            "max_examples": 10,
             "init_from_adapter": bad_ref,
         },
     }
@@ -342,7 +344,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "train": {"steps": 10},
+        "train": {"epochs": 1, "max_examples": 10},
     }
     # absent -> fine (no longer required); left blank for the control plane to assign
     spec = spec_from_dict(raw, run_id="hf-x")
@@ -350,7 +352,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == ""
     # user-supplied -> ignored (the control plane overrides it at submit)
     spec2 = spec_from_dict(
-        {**raw, "train": {"steps": 10, "hf_repo": "someone-else/their-repo"}},
+        {**raw, "train": {"epochs": 1, "max_examples": 10, "hf_repo": "someone-else/their-repo"}},
         run_id="hf-y",
     )
     assert spec2.train.hf_repo == ""
@@ -646,9 +648,9 @@ def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
     }
 
     with pytest.raises(ConfigError, match=r"group_size.*>= 2.*GRPO"):
-        spec_from_dict({**base, "train": {"steps": 1, "group_size": 1}}, run_id="bad")
+        spec_from_dict({**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 1}}, run_id="bad")
 
-    spec = spec_from_dict({**base, "train": {"steps": 1, "group_size": 2}}, run_id="ok")
+    spec = spec_from_dict({**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 2}}, run_id="ok")
     assert spec.train.group_size == 2
 
 
@@ -659,36 +661,35 @@ def test_opd_allows_single_generation_group() -> None:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"steps": 1, "group_size": 1},
+            "train": {"epochs": 1, "max_examples": 8, "group_size": 1},
         },
         run_id="opd-ok",
     )
     assert spec.train.group_size == 1
 
 
-def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
-    # steps/epochs must run through _train_int like every other integer knob: a
-    # non-integer (e.g. steps=1.5) must 400 at parse time, not slip through to the
+def test_epochs_reject_non_integer_at_parse() -> None:
+    # epochs must run through _train_int like every other integer knob: a
+    # non-integer (e.g. epochs=1.5) must 400 at parse time, not slip through to the
     # worker and crash int("1.5") AFTER a paid GPU is provisioned.
     from flash.schema import ConfigError
 
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
-        "algorithm": "grpo",
+        "algorithm": "sft",
         "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
     }
-    for bad in ({"steps": 1.5}, {"epochs": 2.5}, {"steps": 0}, {"epochs": -1}):
+    for bad in ({"epochs": 2.5}, {"epochs": -1}):
         with pytest.raises(ConfigError):
-            spec_from_dict({**base, "train": {"hf_repo": "o/r", **bad}}, run_id="bad")
+            spec_from_dict({**base, "train": {"hf_repo": "o/r", "max_examples": 8, **bad}}, run_id="bad")
 
     # Genuine integers still parse and round-trip.
     spec = spec_from_dict(
-        {**base, "train": {"hf_repo": "o/r", "steps": 10, "epochs": 3}},
+        {**base, "train": {"hf_repo": "o/r", "max_examples": 8, "epochs": 3}},
         run_id="ok",
     )
-    assert spec.train.steps == 10
     assert spec.train.epochs == 3
 
 

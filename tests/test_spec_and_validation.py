@@ -17,7 +17,7 @@ BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k"},
-    "train": {"steps": 10, "lora_rank": 8, "hf_repo": "owner/runs"},
+    "train": {"epochs": 1, "max_examples": 10, "lora_rank": 8, "hf_repo": "owner/runs"},
     "gpu": {"type": "RTX 4090"},
 }
 
@@ -44,7 +44,6 @@ def _raw(**overrides) -> dict:
         # `seeds` is no longer a valid [train] key (multi-seed removed); it's now rejected
         # as an unknown key rather than seed-validated.
         ({"train.seeds": [0]}, "unknown key"),
-        ({"train.steps": 0}, "steps must be >= 1"),
         # lora_rank/alpha now parse via _train_int(minimum=1), so out-of-range values
         # are rejected at parse time with the shared ">= 1" message (a non-positive int
         # never reaches the later "must be positive" guard).
@@ -119,7 +118,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     # required NOR honored from a user config: a config without it parses fine, and a user-
     # supplied value is ignored (left blank for the control plane to assign at submit).
     raw = _raw()
-    raw["train"] = {"steps": 10, "lora_rank": 8}
+    raw["train"] = {"epochs": 1, "max_examples": 10, "lora_rank": 8}
     assert spec_from_dict(raw).train.hf_repo == ""
     raw["train"]["hf_repo"] = "someone-else/their-repo"
     assert spec_from_dict(raw).train.hf_repo == ""
