@@ -618,7 +618,8 @@ def test_opd_rejects_teacher_model_override():
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {
-                    "steps": 5,
+                    "epochs": 1,
+                    "max_examples": 5,
                     "teacher_model": "accounts/fireworks/models/glm-5p2",
                 },
             },
@@ -637,7 +638,7 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"steps": 5, "hf_repo": "owner/runs", **train_extra},
+                "train": {"epochs": 1, "max_examples": 5, "hf_repo": "owner/runs", **train_extra},
             },
             run_id="x",
         )
@@ -828,7 +829,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
         lambda: opd_mod.OpdKnobs(
             teacher_model="accounts/fireworks/models/glm-5p2",
             teacher_base_url="http://teacher.invalid",
-            steps=1,
+            epochs=1,
             learning_rate=1e-4,
             temperature=0.0,
             top_p=1.0,
@@ -874,7 +875,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     )
 
 
-def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, group=1):
+def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, epochs=1, group=1):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
     module."""
@@ -933,7 +934,7 @@ def _opd_harness(monkeypatch, *, train_one, beats=None, liveness=None, steps=1, 
         lambda: opd_mod.OpdKnobs(
             teacher_model="accounts/fireworks/models/glm-5p2",
             teacher_base_url="http://teacher.invalid",
-            steps=steps,
+            epochs=epochs,
             learning_rate=1e-4,
             temperature=0.0,
             top_p=1.0,
@@ -1140,7 +1141,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         lambda: opd_mod.OpdKnobs(
             teacher_model="accounts/fireworks/models/glm-5p2",
             teacher_base_url="http://teacher.invalid",
-            steps=1,
+            epochs=1,
             learning_rate=1e-4,
             temperature=0.0,
             top_p=1.0,
@@ -1294,7 +1295,7 @@ def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
         loss = model.w.float().sum() * 1e-6
         return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
-    opd_mod = _opd_harness(monkeypatch, train_one=_one_update, steps=1, group=1)
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update, epochs=1, group=1)
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
 
@@ -1575,9 +1576,9 @@ def test_opd_loop_drives_by_optimizer_updates_and_fails_permanently_on_determini
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
         return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
-    # steps=3 but only ONE optimizer update can ever land -> the bounded loop exhausts its iteration
+    # epochs=3 but only ONE optimizer update can ever land -> the bounded loop exhausts its iteration
     # budget at opt_steps=1 and the post-loop guard must fail permanently (deterministic), not retry.
-    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, steps=3, group=1)
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, epochs=3, group=1)
     with pytest.raises(RuntimeError, match="deterministic") as ei:
         opd_mod.run_opd()
     assert not isinstance(ei.value, RetriableInfraError)  # permanent, NOT the retriable path
@@ -1610,7 +1611,7 @@ def test_opd_transient_teacher_shortfall_is_retriable(monkeypatch):
             )
         return SampleResult(teacher_status="transient", gen_tokens=1)  # ...then a retryable outage
 
-    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_transient, steps=3, group=1)
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_transient, epochs=3, group=1)
     with pytest.raises(RetriableInfraError, match="optimizer updates"):
         opd_mod.run_opd()
 
@@ -1735,7 +1736,7 @@ def test_opd_initializes_and_logs_to_wandb_when_configured(monkeypatch):
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
         return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
-    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, steps=3, group=1)
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, epochs=3, group=1)
     # Turn W&B ON for this run (harness defaults it off): wandb_report_to() truthy -> _wandb_on.
     monkeypatch.setattr(opd_mod._w, "wandb_report_to", lambda: ["wandb"])
     # Deterministic shortfall fails permanently (not retriable); the one landed update still logs first.
@@ -1774,7 +1775,7 @@ def test_opd_skips_wandb_logging_when_not_configured(monkeypatch):
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
         return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
 
-    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, steps=3, group=1)
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, epochs=3, group=1)
     # Harness default wandb_report_to -> [] (off). The suppress(Exception) around wandb.log would hide a
     # raise, so the guard here is _wandb_on being False (wandb.log never reached), which _explode proves.
     with pytest.raises(RuntimeError):
@@ -1839,7 +1840,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
         lambda: opd_mod.OpdKnobs(
             teacher_model="accounts/fireworks/models/glm-5p2",
             teacher_base_url="http://teacher.invalid",
-            steps=1,
+            epochs=1,
             learning_rate=1e-4,
             temperature=0.0,
             top_p=1.0,
@@ -1936,7 +1937,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         lambda: opd_mod.OpdKnobs(
             teacher_model="accounts/fireworks/models/glm-5p2",
             teacher_base_url="http://teacher.invalid",
-            steps=1,
+            epochs=1,
             learning_rate=1e-4,
             temperature=0.0,
             top_p=1.0,
@@ -2896,7 +2897,9 @@ def test_opd_spec_json_round_trip():
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {
-                "steps": 25,
+                "epochs": 25,
+                "max_examples": 8,
+                "batch_size": 8,
                 "hf_repo": "owner/runs",
             },
         },
@@ -2914,14 +2917,13 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     from flash.cost.spec import estimate_for_spec, spec_steps
     from flash.schema import spec_from_dict
 
-    # No [train].max_examples set — opd must NOT fall into the SFT example-count path (which
-    # would raise); it is step-driven like GRPO.
+    # No [train].max_examples set — opd falls back to one prompt batch per epoch for pricing.
     spec = spec_from_dict(
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"steps": 30, "hf_repo": "owner/runs"},
+            "train": {"epochs": 30, "hf_repo": "owner/runs"},
         },
         run_id="x",
     )

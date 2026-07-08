@@ -101,7 +101,6 @@ FIXED_SEED = 42
 
 @dataclass(frozen=True)
 class TrainSpec:
-    steps: int | None = None
     epochs: int | None = None
     lora_rank: int = 32
     lora_alpha: int = 64
@@ -191,7 +190,6 @@ class JobSpec:
                 resolved_sha=str(env.get("resolved_sha") or ""),
             ),
             train=TrainSpec(
-                steps=_opt_int(train.get("steps")),
                 epochs=_opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),

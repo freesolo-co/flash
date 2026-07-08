@@ -103,7 +103,7 @@ id = "your-org/my-env"      # the id printed by `flash env push`
                                    # never stored in the spec
 
 [train]
-epochs = 1                  # SFT is epoch-driven; GRPO is step-driven (steps = N)
+epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 lora_rank = 32
 lora_alpha = 64
@@ -114,7 +114,7 @@ GPU and HF artifacts are **fully managed** — do not pick `gpu.type` or set
 `train.hf_repo`; the allocator picks the cheapest validated managed GPU class that fits,
 and run artifacts are stored in a private environment-scoped repo with content-addressed
 Flash code snapshots. Compose or tweak configs without editing files: `--config
-extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.steps=300`).
+extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
 
 ### 4. Submit
 
@@ -201,7 +201,7 @@ spending another GPU run:
 | --- | --- | --- |
 | Environment id is blank or stale | `flash train --dry-run` fails, or the worker uses old reward/data | Run `flash env push --name my-env .` after every environment/data edit and paste the returned id into every config you submit. |
 | Local-only env path in config | Config validation says there is no local path mode | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths. |
-| Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `steps`, `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`. |
+| Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`. |
 | Trying to pin managed infrastructure | `gpu.type`, `train.hf_repo`, or `model_policy` changes do not do what you expected | Treat GPU choice, model policy, and the run artifact repo as managed. Tune the model, algorithm, environment, and `[train]` knobs instead. |
 | Secrets are not available on the worker | Reward code works locally but remote logs show missing API keys or auth failures | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never put secret values in `[worker_env]` or hard-code them in the config. |
 | Wrong model / thinking setting | Config validation fails, or chat behavior does not match the run | Use `flash models`; set `thinking = true` only for supported models. Thinking is a training-time/run-level choice and serving preserves that parity, so `flash chat` does not expose an override flag. |
@@ -214,7 +214,7 @@ spending another GPU run:
 | Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash checkpoints <run-id>`, deploy a specific step with `flash deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter. |
 | Export fails before upload | CLI says no HuggingFace token | Pass `flash export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`. |
 | SFT loss improves but quality does not | Train loss falls while held-out behavior stalls or degrades | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes. |
-| Cost surprises | A quick experiment uses more GPU time than intended | Start with `--dry-run` and `--cost`, cap steps/epochs for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time. |
+| Cost surprises | A quick experiment uses more GPU time than intended | Start with `--dry-run` and `--cost`, keep `epochs` and `max_examples` small for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time. |
 
 ---
 
@@ -370,7 +370,9 @@ lora_rank = 16     # for VL warm-starts, SFT rank + GRPO rank must fit the effec
 lora_alpha = 32
 ```
 
-SFT is **epoch-driven** (`epochs`); GRPO is **step-driven** (`steps`).
+SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
+an epoch is one pass over the retained prompt pool after `max_examples` and prompt-budget filtering;
+optimizer-step counts are derived from those epochs.
 
 ---
 
@@ -379,8 +381,8 @@ SFT is **epoch-driven** (`epochs`); GRPO is **step-driven** (`steps`).
 Pick distillation when a much stronger **teacher** model can grade your student's work
 token-by-token. The student samples on-policy (like GRPO), the managed GLM 5.2 teacher scores
 each of *its own* completions, and a dense per-token loss teaches the student to match the teacher —
-far more sample-efficient than reward-based RL and with no reward to design. It is **step-driven**
-(`steps`) and produces a LoRA served exactly like SFT.
+far more sample-efficient than reward-based RL and with no reward to design. It supports `epochs`
+like SFT/GRPO and produces a LoRA served exactly like SFT.
 
 - **No teacher key or model override to set up.** The GLM 5.2 teacher and its Fireworks key are platform-managed: the
   service supplies its own key to every opd run, so there is nothing to export or declare — an opd
@@ -412,7 +414,8 @@ algorithm = "opd"
 id = "your-org/my-env"
 
 [train]
-steps = 100
+epochs = 1
+max_examples = 2
 lora_rank = 32
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 ```
@@ -449,7 +452,7 @@ rollouts score somewhere between all-fail and all-pass — is where GRPO has the
 signal.
 
 - If nearly every prompt is solved (most groups score ~1.0): **increase difficulty** —
-  harder prompts, tighter format/reward, more steps.
+  harder prompts, tighter format/reward, more epochs, or more data.
 - If nearly nothing is solved (most groups score ~0.0): **decrease difficulty** —
   easier or few-shot prompts, a more lenient (denser) reward, or warm-start with SFT.
 - In between: good signal — keep iterating at this difficulty.
@@ -500,8 +503,8 @@ on a beyond-noise improvement.
 
 ## Scale the evidence
 
-- **A smoke test is not proof.** A single-digit `steps`, a tiny dataset, or a handful
-  of rollouts only validates the wiring. Scale `steps` / `epochs`, the dataset size,
+- **A smoke test is not proof.** A single-digit derived step count, a tiny dataset, or a handful
+  of rollouts only validates the wiring. Scale `epochs`, the dataset size,
   and `group_size` to the model and the data you actually have before you trust a
   result. Don't cite budget alone as the reason for an underpowered run.
 - **Use the data you have.** Deliberately assign every usable row to training or to a

@@ -487,7 +487,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
             "run_id": "flash-1",
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
-            "train": {"steps": 1, "hf_repo": "Freesolo-Co/flashrun-flash-1"},
+            "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/flashrun-flash-1"},
         }
     )
     runner._save_status(

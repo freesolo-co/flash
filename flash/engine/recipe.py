@@ -40,7 +40,7 @@ class RLConfig:
     max_completion_len_thinking: int = 1536
     prompts_per_step: int = 64
     group_size: int = 8
-    num_steps: int = 150
+    num_epochs: int = 1
     sampling_temperature: float = 1.0
     sampling_top_p: float = 1.0
 
@@ -54,8 +54,6 @@ class OPDConfig:
     # platform-managed and intentionally not configurable from [train].
     teacher_model: str = "accounts/fireworks/models/glm-5p2"
     teacher_base_url: str = "https://api.fireworks.ai/inference/v1"
-    # OPD is step-driven like GRPO (on-policy sampling), not epoch-driven like SFT.
-    num_steps: int = 100
     learning_rate: float = 1e-5
     max_prompt_len: int = 1024
     max_completion_len: int = 512
@@ -65,6 +63,7 @@ class OPDConfig:
     # Student samples per prompt. 1 is enough for a direct KD loss (no group-relative baseline
     # as in GRPO); raise for more teacher-scored coverage per prompt at higher cost.
     group_size: int = 1
+    num_epochs: int = 1
     sampling_temperature: float = 1.0
     sampling_top_p: float = 1.0
     # Reverse-KL coefficient for the groupwise reverse-KL loss; scales the per-span

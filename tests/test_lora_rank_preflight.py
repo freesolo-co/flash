@@ -12,11 +12,10 @@ _ADAPTER_REF = "owner/runs:sft/sft-run"
 
 def _spec(*, model: str = "Qwen/Qwen3.5-4B", rank: int = 16, algorithm: str = "grpo"):
     train = {
-        "steps": 1,
+        "epochs": 1,
+        "max_examples": 8,
         "lora_rank": rank,
     }
-    if algorithm == "sft":
-        train["max_examples"] = 8
     spec = spec_from_dict(
         {
             "model": model,

@@ -190,7 +190,6 @@ _TOP_LEVEL_KEYS = frozenset(
 )
 _TRAIN_KEYS = frozenset(
     {
-        "steps",
         "epochs",
         "lora_rank",
         "lora_alpha",
@@ -333,7 +332,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             secrets=environment_secrets,
         ),
         train=TrainSpec(
-            steps=_train_int(train_raw, "steps", minimum=1),
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
@@ -379,9 +377,7 @@ def _validate_sft(spec: JobSpec) -> None:
 
 
 def _validate_grpo(spec: JobSpec) -> None:
-    """GRPO contract: step-driven, so steps (when pinned) must be positive."""
-    if spec.train.steps is not None and spec.train.steps <= 0:
-        raise ConfigError("train.steps must be positive for GRPO")
+    """GRPO contract: epochs derive passes over retained prompts."""
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
             "train.group_size must be >= 2 for GRPO (TRL needs at least two generations "
@@ -390,13 +386,10 @@ def _validate_grpo(spec: JobSpec) -> None:
 
 
 def _validate_opd(spec: JobSpec) -> None:
-    """OPD contract: step-driven (positive steps) with a usable prompt budget.
+    """OPD contract: epochs derive passes over retained prompts.
 
     The teacher key (FIREWORKS_API_KEY) is a platform-owned credential the control plane injects into
     the worker env (build_worker_env), like HF_TOKEN — never a user-declared secret."""
-    if spec.train.steps is not None and spec.train.steps <= 0:
-        # OPD is step-driven (on-policy sampling), like GRPO — not epoch-driven.
-        raise ConfigError("train.steps must be positive for opd")
     if spec.train.max_context_tokens:
         # Mirror run_opd's prompt-budget guard at PARSE time: a context budget that leaves no room
         # for any prompt after the completion budget is rejected here, BEFORE a paid worker is

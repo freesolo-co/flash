@@ -675,7 +675,7 @@ def test_catalog_model_algorithm_config_gpu_matrix_resolves_to_fitting_cards(mon
         for algo in ALGORITHMS:
             if algo not in info.algos:
                 continue
-            train = {"epochs": 1, "max_examples": 8} if algo == "sft" else {"steps": 1}
+            train = {"epochs": 1, "max_examples": 8}
             need = allocator.required_vram_gb(model_id, algo, train=train, thinking=False)
             expected_gpu = provisional_gpu(model_id, algo, train=train, thinking=False)
 
