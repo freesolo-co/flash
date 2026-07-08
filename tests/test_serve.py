@@ -14,17 +14,38 @@ import types
 import pytest
 
 
-def _stub_adapter_config(monkeypatch, tmp_path, *, rank: int = 32, config: dict | None = None):
+def _stub_adapter_config(
+    monkeypatch,
+    tmp_path,
+    *,
+    rank: int = 32,
+    config: dict | None = None,
+    tensor_files: dict[str, int | None] | None = None,
+):
     cfg = tmp_path / "adapter_config.json"
     cfg.write_text(json.dumps({"r": rank} if config is None else config), encoding="utf-8")
-    seen = {}
+    seen: dict = {}
 
     def fake_hf_hub_download(**kwargs):
         seen.update(kwargs)
         return str(cfg)
 
+    if tensor_files is None:
+        tensor_files = {"adapter_model.safetensors": 123}
+
+    class _HfApi:
+        def list_repo_tree(self, **kwargs):
+            seen["list_repo_tree"] = kwargs
+            prefix = str(kwargs.get("path_in_repo") or "").rstrip("/")
+            return [
+                types.SimpleNamespace(path=f"{prefix}/{name}", size=size)
+                for name, size in tensor_files.items()
+            ]
+
     monkeypatch.setitem(
-        sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(hf_hub_download=fake_hf_hub_download, HfApi=_HfApi),
     )
     return seen
 
@@ -180,6 +201,47 @@ def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
             dry_run=False,
             lora_rank=32,
         )
+
+
+def test_deploy_adapter_missing_tensor_file_is_adapter_tensor_missing(monkeypatch, tmp_path):
+    import flash.serve.deploy as d
+
+    _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"README.md": 123})
+
+    with pytest.raises(d.AdapterTensorMissing, match="no adapter_model tensor file"):
+        d.deploy_adapter(
+            run_id="r-missing-tensors",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-missing-tensors/seed0",
+            dry_run=False,
+            lora_rank=32,
+        )
+
+
+def test_deploy_adapter_zero_byte_tensor_file_is_adapter_tensor_missing(monkeypatch, tmp_path):
+    import flash.serve.deploy as d
+
+    _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.safetensors": 0})
+
+    with pytest.raises(d.AdapterTensorMissing, match="zero-byte adapter tensor"):
+        d.deploy_adapter(
+            run_id="r-empty-tensors",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/r-empty-tensors/seed0",
+            dry_run=False,
+            lora_rank=32,
+        )
+
+
+def test_deploy_accepts_legacy_bin_adapter_tensor(monkeypatch, tmp_path):
+    from flash.serve.deploy import adapter_artifact_lora_rank
+
+    seen = _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.bin": None})
+
+    assert adapter_artifact_lora_rank("org/repo", "sft/r-bin/seed0/adapter") == 32
+    assert seen["list_repo_tree"]["path_in_repo"] == "sft/r-bin/seed0/adapter"
 
 
 def test_deploy_adapter_options_are_keyword_only():
