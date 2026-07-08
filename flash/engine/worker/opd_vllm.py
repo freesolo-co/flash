@@ -145,22 +145,35 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
         force_vit_sdpa_on_blackwell()
         kwargs["mm_encoder_attn_backend"] = "TORCH_SDPA"
 
+    # The 35B thinking OPD path repeatedly reached a resident V1 EngineCore subprocess on B200, then
+    # stalled before the first rollout. Keep V1, but run it in-process on sm100 so startup failures are
+    # surfaced directly and the SyncMPClient/child-process path cannot hang between trainer and rollout.
+    b200_inproc_v1 = cc == (10, 0)
+    if b200_inproc_v1:
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        print(
+            "[opd][warn] B200/sm100: VLLM_ENABLE_V1_MULTIPROCESSING=0 for OPD rollout "
+            "(avoid V1 SyncMPClient EngineCore startup stall)"
+        )
+
     try:
         import vllm as _vllm_mod
 
         ver_base = _vllm_mod.__version__.split("+")[0]
         vllm_ver = tuple(int(x) for x in ver_base.split(".")[:3])
         # vLLM 0.19.1 regressed graph capture on several consumer/untested arches, but forcing eager
-        # on datacenter cards is a large OPD rollout tax. Keep CUDA graphs on the GPU families we run
-        # long OPD jobs on and have direct coverage for: A100 (sm80), H100/H200 (sm90), B200 (sm100).
-        cudagraph_safe = cc in {(8, 0), (9, 0), (10, 0)}
-        if vllm_ver > (0, 19, 0) and not cudagraph_safe:
+        # on stable datacenter cards is a large OPD rollout tax. Keep CUDA graphs on A100 (sm80) and
+        # H100/H200 (sm90). B200/sm100 is excluded here: a live 35B thinking OPD run reached a
+        # resident EngineCore, then stalled in graph initialization for minutes before any rollout.
+        cudagraph_safe = cc in {(8, 0), (9, 0)}
+        if vllm_ver >= (0, 19, 0) and not cudagraph_safe:
             kwargs["enforce_eager"] = True
             print(
                 f"[opd][warn] enforce_eager=True on the vLLM rollout (cc={cc[0]}.{cc[1]} -> "
-                "prevent 0.19.1 aot_compile/slot-mapping crash on this GPU family)"
+                "prevent 0.19.x aot_compile/slot-mapping crash or EngineCore graph-init stall on "
+                "this GPU family)"
             )
-        elif vllm_ver > (0, 19, 0):
+        elif vllm_ver >= (0, 19, 0):
             print(f"[opd] cc={cc[0]}.{cc[1]}: keeping vLLM CUDA graphs for OPD rollout speed")
     except Exception:
         pass

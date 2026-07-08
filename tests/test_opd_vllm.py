@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -334,7 +335,7 @@ def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monk
     assert out["rollout_batch_size"] == 4
 
 
-@pytest.mark.parametrize("cc", [(8, 0), (9, 0), (10, 0)])
+@pytest.mark.parametrize("cc", [(8, 0), (9, 0)])
 def test_opd_vllm_kwargs_keeps_cuda_graphs_on_datacenter_cards(monkeypatch, cc):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
@@ -365,8 +366,8 @@ def test_opd_vllm_kwargs_keeps_cuda_graphs_on_datacenter_cards(monkeypatch, cc):
     assert out["enforce_eager"] is None
 
 
-@pytest.mark.parametrize("cc", [(8, 9), (12, 0)])
-def test_opd_vllm_kwargs_keeps_eager_workaround_on_untested_cards(monkeypatch, cc):
+@pytest.mark.parametrize("cc", [(8, 9), (10, 0), (12, 0)])
+def test_opd_vllm_kwargs_keeps_eager_workaround_on_b200_and_untested_cards(monkeypatch, cc):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
     from flash.engine.worker.opd_vllm import opd_vllm_kwargs
@@ -394,3 +395,35 @@ def test_opd_vllm_kwargs_keeps_eager_workaround_on_untested_cards(monkeypatch, c
     out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
 
     assert out["enforce_eager"] is True
+
+
+def test_opd_vllm_kwargs_forces_b200_v1_inprocess_on_vllm_0190(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker import gpu_setup
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    class _Cuda:
+        @staticmethod
+        def get_device_capability():
+            return (10, 0)
+
+        @staticmethod
+        def get_device_properties(_idx):
+            return SimpleNamespace(total_memory=180e9)
+
+    torch_mod = types.ModuleType("torch")
+    torch_mod.cuda = _Cuda
+    vllm_mod = types.ModuleType("vllm")
+    vllm_mod.__version__ = "0.19.0"
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+    monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
+    monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: None)
+    monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 35.0)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *a, **k: 0.37)
+
+    out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=1, group_size=1), 4096)
+
+    assert out["enforce_eager"] is True
+    assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"

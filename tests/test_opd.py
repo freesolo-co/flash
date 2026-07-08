@@ -1998,6 +1998,121 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
     )
 
 
+def test_run_opd_releases_torch_cache_before_vllm_sizing(monkeypatch):
+    """Warm-started OPD must release PyTorch's cached CUDA blocks before constructing vLLM.
+
+    vLLM's EngineCore starts outside the trainer's allocator view, so reserved-but-unused PyTorch
+    blocks can make vLLM's startup preflight fail even though the trainer could reuse that memory.
+    """
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    order: list[str] = []
+
+    class _Tok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+        pad_token_id = 0
+
+        def apply_chat_template(self, messages, **kw):
+            return "PROMPT"
+
+        def __call__(self, text, add_special_tokens=False):
+            return SimpleNamespace(input_ids=[1, 2])
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join("x" for _ in ids)
+
+    class _Model(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=4, V=8)
+            self.config = SimpleNamespace(use_cache=False)
+
+    env = SimpleNamespace(
+        dataset=lambda: [{"q": "a"}],
+        prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
+    )
+    fake_w = SimpleNamespace(
+        require_active_env=lambda: env,
+        JOB_SPEC=SimpleNamespace(
+            train=SimpleNamespace(init_from_adapter=""),
+            model="fake/model",
+            gpu=SimpleNamespace(type=None),
+        ),
+        THINKING=False,
+        SEED=1234,
+        heartbeat=lambda stage, **kw: None,
+        prefetch_model=lambda mid: 0.0,
+        hf_resume_checkpoint=lambda: "",
+        publish_deployable_checkpoint=lambda *a, **k: None,
+        hf_upload_folder=lambda *a, **k: None,
+        write_train_meta=lambda **k: None,
+        wandb_report_to=lambda: [],
+        wandb_run_info=lambda: {},
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: opd_mod.OpdKnobs(
+            teacher_model="accounts/fireworks/models/glm-5p2",
+            teacher_base_url="http://teacher.invalid",
+            epochs=1,
+            learning_rate=1e-4,
+            temperature=0.0,
+            top_p=1.0,
+            max_completion=8,
+            prompts_per_step=1,
+            group_size=1,
+            kl_coef=1.0,
+            save_every=0,
+            max_length=0,
+            stop_sequences=(),
+        ),
+    )
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
+    _patch_opd_run_vllm_stub(monkeypatch, opd_mod, train_one=_skip)
+
+    def _rec_student(*a, **k):
+        order.append("student_model")
+        return _Model(), "fake/model"
+
+    def _rec_free_gpu(*a, **k):
+        order.append("free_gpu")
+
+    def _rec_vllm_kwargs(*a, **k):
+        order.append("_opd_vllm_kwargs")
+        return {
+            "gpu_memory_utilization": 0.10,
+            "kv_cache_dtype": None,
+            "max_num_batched_tokens": None,
+            "attention_backend": None,
+            "mm_encoder_attn_backend": None,
+            "enforce_eager": None,
+        }
+
+    monkeypatch.setattr(opd_mod, "_student_model", _rec_student)
+    monkeypatch.setattr(opd_mod, "free_gpu", _rec_free_gpu)
+    monkeypatch.setattr(opd_mod, "_opd_vllm_kwargs", _rec_vllm_kwargs)
+
+    import transformers
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok())
+    import flash.engine.worker.teacher as tmod
+
+    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
+    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+
+    with pytest.raises(RuntimeError, match="no trained step"):
+        opd_mod.run_opd()
+
+    assert order[:3] == ["student_model", "free_gpu", "_opd_vllm_kwargs"]
+
+
 def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     """Regression (codex[bot], opd.py): when every prompt exceeds the context budget the run fails
     deterministically — and that guard must fire BEFORE _student_model (which for a VL warm-start

@@ -455,6 +455,12 @@ def run_opd():
     # KV-cached student rollout generation.
     model.config.use_cache = False
 
+    # vLLM's EngineCore starts in a separate process and cannot reuse CUDA blocks PyTorch is only
+    # caching. Release load/merge leftovers before sizing and launching the rollout engine; otherwise
+    # large warm-started OPD jobs can fail with an opaque EngineCore startup error while torch reports
+    # tens of GiB reserved but unallocated.
+    free_gpu()
+
     vllm_kwargs = _opd_vllm_kwargs(model_id, knobs, seq_cap)
     lora_rank = _opd_lora_rank(
         model, getattr(_w.JOB_SPEC.train, "lora_rank", 32) if _w.JOB_SPEC else 32
