@@ -413,54 +413,6 @@ def test_opd_vllm_kwargs_keeps_cuda_graphs_on_datacenter_cards(monkeypatch, cc):
     assert out["compilation_config"] is None
 
 
-@pytest.mark.parametrize(
-    ("graph_mode", "enforce_eager", "compilation_config"),
-    [
-        (
-            "decode-only",
-            False,
-            {
-                "mode": 0,
-                "cudagraph_mode": "FULL_DECODE_ONLY",
-            },
-        ),
-        ("eager", True, None),
-    ],
-)
-def test_opd_vllm_kwargs_can_override_graph_mode_on_datacenter_cards(
-    monkeypatch, graph_mode, enforce_eager, compilation_config
-):
-    from flash.engine import vram
-    from flash.engine.worker import gpu_setup
-    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
-
-    class _Cuda:
-        @staticmethod
-        def get_device_capability():
-            return (9, 0)
-
-        @staticmethod
-        def get_device_properties(_idx):
-            return SimpleNamespace(total_memory=80e9)
-
-    torch_mod = types.ModuleType("torch")
-    torch_mod.cuda = _Cuda
-    vllm_mod = types.ModuleType("vllm")
-    vllm_mod.__version__ = "0.19.1"
-    monkeypatch.setitem(sys.modules, "torch", torch_mod)
-    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
-    monkeypatch.setenv("FLASH_OPD_VLLM_GRAPH_MODE", graph_mode)
-    monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: None)
-    monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
-    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.0)
-    monkeypatch.setattr(vram, "colocate_kv_util", lambda *a, **k: 0.37)
-
-    out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
-
-    assert out["enforce_eager"] is enforce_eager
-    assert out["compilation_config"] == compilation_config
-
-
 @pytest.mark.parametrize("cc", [(10, 0), (12, 0)])
 def test_opd_vllm_kwargs_uses_decode_cuda_graphs_on_blackwell(monkeypatch, cc):
     from flash.engine import vram

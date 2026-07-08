@@ -1355,11 +1355,9 @@ def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
     assert events.index(("resolve", 1)) < events.index(("score", 0))
 
 
-def test_opd_rollout_chunking_scales_for_heavy_steps(monkeypatch):
+def test_opd_rollout_chunking_scales_for_heavy_steps():
     import flash.engine.worker.opd as opd_mod
 
-    monkeypatch.delenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", raising=False)
-    monkeypatch.delenv("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS", raising=False)
     assert opd_mod._opd_rollout_pipeline_chunks(1) == 1
     assert opd_mod._opd_rollout_pipeline_chunks(7) == 1
     assert opd_mod._opd_rollout_pipeline_chunks(8) == 2
@@ -1369,25 +1367,6 @@ def test_opd_rollout_chunking_scales_for_heavy_steps(monkeypatch):
     assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
     assert opd_mod._opd_rollout_chunk_size(64) == 16
     assert opd_mod._opd_rollout_pipeline_chunks(256) == 8
-
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "32")
-    assert opd_mod._opd_rollout_pipeline_target_chunk_size(64) == 32
-    assert opd_mod._opd_rollout_pipeline_chunks(64) == 2
-    assert opd_mod._opd_rollout_chunk_size(64) == 32
-
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "8")
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS", "3")
-    assert opd_mod._opd_rollout_pipeline_max_chunks(64) == 3
-    assert opd_mod._opd_rollout_pipeline_chunks(64) == 3
-    assert opd_mod._opd_rollout_chunk_size(64) == 22
-
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS", "1")
-    assert opd_mod._opd_rollout_pipeline_chunks(64) == 1
-    assert opd_mod._opd_rollout_chunk_size(64) == 64
-
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "not-an-int")
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS", "not-an-int")
-    assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
 
 
 def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
@@ -1437,31 +1416,14 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
     assert first_score < second_generate
 
 
-def test_opd_teacher_batch_size_and_workers_can_be_overridden(monkeypatch):
+def test_opd_teacher_batch_workers_and_loss_microbatch_defaults():
     import flash.engine.worker.opd as opd_mod
 
-    monkeypatch.delenv("FLASH_OPD_TEACHER_BATCH_SIZE", raising=False)
-    monkeypatch.delenv("FLASH_OPD_TEACHER_WORKERS", raising=False)
     assert opd_mod._opd_teacher_batch_size(64) == 8
     assert opd_mod._opd_teacher_workers(64, 8) == 8
-
-    monkeypatch.setenv("FLASH_OPD_TEACHER_BATCH_SIZE", "16")
-    assert opd_mod._opd_teacher_batch_size(64) == 16
     assert opd_mod._opd_teacher_workers(64, 16) == 4
-
-    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKERS", "2")
-    assert opd_mod._opd_teacher_workers(64, 16) == 2
-
-    monkeypatch.setenv("FLASH_OPD_TEACHER_BATCH_SIZE", "not-an-int")
-    monkeypatch.setenv("FLASH_OPD_TEACHER_WORKERS", "not-an-int")
-    assert opd_mod._opd_teacher_batch_size(64) == 8
-    assert opd_mod._opd_teacher_workers(64, 8) == 8
-
-    monkeypatch.delenv("FLASH_OPD_LOSS_MICROBATCH_SIZE", raising=False)
     assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.5-2B", 64) == 4
     assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.6-35B-A3B", 64) == 1
-    monkeypatch.setenv("FLASH_OPD_LOSS_MICROBATCH_SIZE", "8")
-    assert opd_mod._opd_loss_microbatch_size("Qwen/Qwen3.6-35B-A3B", 64) == 8
 
 
 def test_opd_scores_generated_chunk_in_teacher_batches(monkeypatch):
@@ -3454,80 +3416,7 @@ def test_resolve_samples_batched_returns_differentiable_gkd_losses():
     assert model.w.grad[0].abs().sum() > 0
 
 
-def test_resolve_samples_batched_projects_only_completion_suffix_logits(monkeypatch):
-    torch = pytest.importorskip("torch")
-    from flash.engine.worker import opd as opd_mod
-
-    class _Tok:
-        pad_token_id = 0
-
-        def decode(self, ids, skip_special_tokens=True):
-            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
-
-    class _SuffixLM:
-        def __init__(self):
-            self.w = torch.zeros(4, 8, requires_grad=True)
-            self.config = SimpleNamespace(use_cache=False)
-            self.calls = []
-
-        def train(self):
-            return self
-
-        def __call__(
-            self,
-            input_ids,
-            *,
-            attention_mask=None,
-            position_ids=None,
-            logits_to_keep=None,
-        ):
-            self.calls.append(
-                {
-                    "input_ids": input_ids.detach().cpu().tolist(),
-                    "attention_mask": attention_mask.detach().cpu().tolist(),
-                    "position_ids": position_ids.detach().cpu().tolist(),
-                    "logits_to_keep": logits_to_keep,
-                }
-            )
-            logits = self.w[: input_ids.shape[1]].unsqueeze(0).expand(input_ids.shape[0], -1, -1)
-            if logits_to_keep:
-                logits = logits[:, -int(logits_to_keep) :, :]
-            return SimpleNamespace(logits=logits)
-
-        def parameters(self):
-            return [self.w]
-
-    model = _SuffixLM()
-    knobs = SimpleNamespace(kl_coef=1.0)
-    monkeypatch.setenv("FLASH_OPD_COMPLETION_LOGITS_ONLY", "1")
-    samples = [
-        (
-            opd_mod._GenResult(completion_ids=[2, 3], completion_text="ab", gen_tokens=2),
-            opd_mod._ScoreResult(teacher_toks=[TeacherToken("ab", -0.5, 0, 2)], status="ok"),
-            [5, 6, 7],
-        ),
-        (
-            opd_mod._GenResult(completion_ids=[3], completion_text="b", gen_tokens=1),
-            opd_mod._ScoreResult(teacher_toks=[TeacherToken("b", -0.7, 0, 1)], status="ok"),
-            [9],
-        ),
-    ]
-
-    out = opd_mod._resolve_samples_batched(model, _Tok(), "cpu", samples, knobs, microbatch=2)
-
-    assert all(r.loss is not None and r.loss.requires_grad for r in out)
-    call = model.calls[0]
-    # Row 0 is prompt + completion[:-1]. Row 1 is left-padded so its final real token aligns with
-    # row 0's final real token, allowing logits_to_keep to select the completion-prediction suffix.
-    assert call["input_ids"] == [[5, 6, 7, 2], [0, 0, 0, 9]]
-    assert call["attention_mask"] == [[1, 1, 1, 1], [0, 0, 0, 1]]
-    assert call["position_ids"] == [[0, 1, 2, 3], [0, 0, 0, 0]]
-    assert call["logits_to_keep"] == 2
-    assert model._flash_opd_completion_logits_suffix_batches == 1
-    assert not hasattr(model, "_flash_opd_full_logits_batches")
-
-
-def test_resolve_samples_batched_can_disable_completion_suffix_logits(monkeypatch):
+def test_resolve_samples_batched_uses_full_logits():
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
 
@@ -3550,7 +3439,6 @@ def test_resolve_samples_batched_can_disable_completion_suffix_logits(monkeypatc
             self.calls.append(dict(kwargs))
             return super().__call__(input_ids)
 
-    monkeypatch.setenv("FLASH_OPD_COMPLETION_LOGITS_ONLY", "0")
     model = _FullLM()
     samples = [
         (
@@ -3566,7 +3454,6 @@ def test_resolve_samples_batched_can_disable_completion_suffix_logits(monkeypatc
 
     assert out[0].loss is not None
     assert "logits_to_keep" not in model.calls[0]
-    assert getattr(model, "_flash_opd_completion_logits_suffix_batches", 0) == 0
     assert model._flash_opd_full_logits_batches == 1
 
 

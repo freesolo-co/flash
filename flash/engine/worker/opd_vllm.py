@@ -72,19 +72,6 @@ def _startup_oom_error(
         return RuntimeError(msg)
 
 
-def _opd_vllm_graph_mode_override() -> str | None:
-    raw = os.environ.get("FLASH_OPD_VLLM_GRAPH_MODE", "").strip().lower().replace("_", "-")
-    if not raw or raw == "default":
-        return None
-    if raw in {"decode-only", "eager"}:
-        return raw
-    print(
-        "[opd] ignoring invalid FLASH_OPD_VLLM_GRAPH_MODE="
-        f"{os.environ.get('FLASH_OPD_VLLM_GRAPH_MODE')!r}; expected default, decode-only, or eager"
-    )
-    return None
-
-
 def _decode_only_compilation_config() -> dict[str, Any]:
     return {
         "mode": 0,  # CompilationMode.NONE: no torch.compile/AOT.
@@ -238,18 +225,6 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
             print(f"[opd] cc={cc[0]}.{cc[1]}: keeping vLLM CUDA graphs for OPD rollout speed")
     except Exception:
         pass
-    graph_mode = _opd_vllm_graph_mode_override()
-    if graph_mode == "decode-only":
-        kwargs["enforce_eager"] = False
-        kwargs["compilation_config"] = _decode_only_compilation_config()
-        print(
-            "[opd] FLASH_OPD_VLLM_GRAPH_MODE=decode-only: disabling torch.compile/AOT while "
-            "keeping decode-only CUDA graphs for rollout"
-        )
-    elif graph_mode == "eager":
-        kwargs["enforce_eager"] = True
-        kwargs["compilation_config"] = None
-        print("[opd] FLASH_OPD_VLLM_GRAPH_MODE=eager: forcing vLLM rollout eager mode")
     return kwargs
 
 
