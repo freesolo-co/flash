@@ -1257,7 +1257,8 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
 
 def test_opd_vllm_generation_uses_keepalive_heartbeat(monkeypatch):
     """A large batched vLLM rollout can block before samples_seen advances; keepalive emits real
-    heartbeats during that blocking generate call so provider stall detection sees the job is alive."""
+    opd_step heartbeats during that blocking generate call so provider stall detection sees the job is
+    alive and actual_steps_run floors a cancellation during first-step GPU work to one step."""
     import contextlib
 
     calls = []
@@ -1271,11 +1272,30 @@ def test_opd_vllm_generation_uses_keepalive_heartbeat(monkeypatch):
     with pytest.raises(RuntimeError):  # all-skip -> no trained step
         opd_mod.run_opd()
 
-    generate_calls = [c for c in calls if c[0] == "opd_vllm_generating"]
-    assert generate_calls, f"missing vLLM generate liveness context; saw {[c[0] for c in calls]}"
+    generate_calls = [c for c in calls if c[0] == "opd_step" and c[3].get("keepalive") is True]
+    assert generate_calls, f"missing vLLM generate keepalive context; saw {[c[0] for c in calls]}"
     assert all(c[3].get("keepalive") is True for c in generate_calls)
     assert callable(generate_calls[0][2])
     assert generate_calls[0][2]() == {"step": 0}
+
+
+def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        loss = model.w.float().sum() * 1e-6
+        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_one_update, steps=1, group=1)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    opd_mod.run_opd()
+
+    engine = opd_mod.OpdVllmRolloutEngine.instances[0]
+    assert engine.sync_count == 1  # initial LoRA sync only; no rollout remains after step 1
 
 
 def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
@@ -2088,6 +2108,22 @@ def test_opd_vram_sizes_rollout_kv_for_full_prompt_batch():
     one_prompt = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, group_size=1, **kw)
     eight_prompts = estimate_vram_gb(4.0, "opd", "bf16", batch_size=8, group_size=1, **kw)
     assert eight_prompts > one_prompt + 20.0
+
+
+def test_model_required_vram_uses_opd_group_default_not_grpo_default():
+    from flash.engine.vram import model_required_vram_gb
+
+    train = {"max_length": 8192, "max_tokens": 512, "batch_size": 8, "lora_rank": 16}
+    default_group = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train, headroom=1.0)
+    explicit_opd_default = model_required_vram_gb(
+        "Qwen/Qwen3.5-4B", "opd", train={**train, "group_size": 1}, headroom=1.0
+    )
+    grpo_default_group = model_required_vram_gb(
+        "Qwen/Qwen3.5-4B", "opd", train={**train, "group_size": 8}, headroom=1.0
+    )
+
+    assert default_group == explicit_opd_default
+    assert grpo_default_group > default_group
 
 
 def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():

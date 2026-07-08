@@ -630,7 +630,7 @@ def run_opd():
                         contexts.append((prompt_ids, prompt_messages))
                         prompts.append(prompt_ids)
                 with liveness_heartbeat(
-                    "opd_vllm_generating",
+                    "opd_step",
                     fields=lambda _step=opt_steps: {"step": _step},
                     keepalive=True,
                 ):
@@ -689,10 +689,13 @@ def run_opd():
             optimizer.step()
             opt_steps += 1
             # On-policy means the next rollout must sample from the just-updated student LoRA.
-            with liveness_heartbeat(
-                "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
-            ):
-                vllm_rollout.sync_from_model(model)
+            # The final trained adapter is saved from the HF/PEFT model below, so skip a useless
+            # post-final vLLM sync that can fail after all optimizer updates have already landed.
+            if opt_steps < steps:
+                with liveness_heartbeat(
+                    "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
+                ):
+                    vllm_rollout.sync_from_model(model)
             avg_loss = step_loss / nseq
             avg_cov = step_cov / nseq
             loss_curve.append(avg_loss)

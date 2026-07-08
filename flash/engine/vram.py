@@ -549,13 +549,15 @@ def model_required_vram_gb(
         _default_len = 1024
     seq_len = _pos_int(_g(train, "max_length"), _default_len)
     lora_rank = _pos_int(_g(train, "lora_rank"), 32)
-    group_size = _pos_int(_g(train, "group_size"), 8)
     if _algo == "opd":
         from flash.engine.recipe import RECIPE
 
         batch_size_default = int(RECIPE.opd.prompts_per_step)
+        group_size_default = int(RECIPE.opd.group_size)
     else:
         batch_size_default = _sft_per_device_bs()
+        group_size_default = 8
+    group_size = _pos_int(_g(train, "group_size"), group_size_default)
     batch_size = _pos_int(_g(train, "batch_size"), batch_size_default)
 
     def _need(
