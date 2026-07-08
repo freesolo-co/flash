@@ -187,6 +187,7 @@ def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, train_one=None, outputs=No
             "attention_backend": None,
             "mm_encoder_attn_backend": None,
             "enforce_eager": None,
+            "compilation_config": None,
         },
     )
     queued = list(outputs or [])
@@ -2093,6 +2094,7 @@ def test_run_opd_releases_torch_cache_before_vllm_sizing(monkeypatch):
             "attention_backend": None,
             "mm_encoder_attn_backend": None,
             "enforce_eager": None,
+            "compilation_config": None,
         }
 
     monkeypatch.setattr(opd_mod, "_student_model", _rec_student)
