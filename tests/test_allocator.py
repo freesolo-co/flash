@@ -394,7 +394,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
     from flash.providers.base import get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    train = {"steps": 60, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
+    train = {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
 
     need = required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train)
     assert need > 40
@@ -433,7 +433,7 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     train = {
-        "steps": 1,
+        "epochs": 1,
         "max_context_tokens": 8192,
         "max_completion_tokens": 128,
         "lora_rank": 32,
@@ -488,14 +488,14 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
     configs = {
         # Matches the failed continuation shape from the OPD/vLLM RTX 5090 report.
         "observed_2b_128tok_r32": {
-            "steps": 1,
+            "epochs": 1,
             "max_completion_tokens": 128,
             "lora_rank": 32,
             "lora_alpha": 64,
         },
-        "recipe_default": {"steps": 1},
+        "recipe_default": {"epochs": 1},
         "opd_prompt_batch": {
-            "steps": 1,
+            "epochs": 1,
             "batch_size": 8,
             "group_size": 1,
             "max_context_tokens": 1536,
@@ -503,7 +503,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "lora_rank": 16,
         },
         "longer_context": {
-            "steps": 1,
+            "epochs": 1,
             "batch_size": 8,
             "group_size": 1,
             "max_context_tokens": 4096,
@@ -511,7 +511,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "lora_rank": 16,
         },
         "longer_completion": {
-            "steps": 1,
+            "epochs": 1,
             "batch_size": 1,
             "group_size": 1,
             "max_context_tokens": 4096,
@@ -519,7 +519,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "lora_rank": 16,
         },
         "wide_rollout_batch": {
-            "steps": 1,
+            "epochs": 1,
             "batch_size": 8,
             "group_size": 4,
             "max_context_tokens": 4096,
@@ -538,7 +538,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             rc = RunConfig(
                 model_id,
                 "opd",
-                int(train.get("steps", 1)),
+                int(train.get("epochs", 1)),
                 seq_len=train.get("max_context_tokens"),
                 completion_len=train.get("max_completion_tokens"),
                 batch_size=train.get("batch_size"),

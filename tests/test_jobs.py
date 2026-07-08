@@ -1971,7 +1971,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
             run_id="oom-walk",
             model="Qwen/Qwen3.5-4B",
             algorithm="opd",
-            train=TrainSpec(steps=1),
+            train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
