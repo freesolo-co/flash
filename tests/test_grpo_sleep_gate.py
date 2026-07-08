@@ -55,8 +55,8 @@ def test_sleep_unsupported_model_rejected_at_parse_time_for_long_context():
     from flash.engine.vram import model_required_vram_gb
 
     mid = "Qwen/Qwen3.6-35B-A3B"
-    fits = {"max_length": 4096, "group_size": 8, "max_tokens": 384, "lora_rank": 16}
-    over = {"max_length": 8192, "group_size": 8, "max_tokens": 384, "lora_rank": 16}
+    fits = {"max_context_tokens": 4096, "group_size": 8, "max_completion_tokens": 384, "lora_rank": 16}
+    over = {"max_context_tokens": 8192, "group_size": 8, "max_completion_tokens": 384, "lora_rank": 16}
     assert model_required_vram_gb(mid, "grpo", train=fits) <= 180  # admitted on the B200
     assert model_required_vram_gb(mid, "grpo", train=over) > 180  # past every GPU -> rejected
 
@@ -106,7 +106,7 @@ def test_moe_resident_fit_sizes_activations_on_active_params():
 
 
 def test_rollout_seq_len_mirrors_run_rl_defaults():
-    # When [train].max_length is unset, the gate must size to the engine context run_rl() launches
+    # When [train].max_context_tokens is unset, the gate must size to the engine context run_rl() launches
     # (max(1024, prompt+completion)), not a flat 1024 -- the Codex P2 fix.
     from flash.engine.recipe import RECIPE
 
@@ -180,7 +180,7 @@ def test_moe_grpo_fits_resident_sizes_compute_on_active_params():
 
 
 def test_sleep_gate_resolves_unset_max_length_against_real_rollout_length():
-    # Cursor High / Codex P2: a sub-3B model with [train].max_length UNSET (0) but a real rollout
+    # Cursor High / Codex P2: a sub-3B model with [train].max_context_tokens UNSET (0) but a real rollout
     # (max_tokens) must NOT short-circuit the size/context pre-filter as a 0-length "short" run --
     # the effective rollout (~2112 tokens here, >= the 2048 long-context threshold) makes the gate
     # reach the resident-fit check. Before the fix `_memory_mode(model, 0)` was False for a sub-3B

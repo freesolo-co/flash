@@ -101,13 +101,14 @@ def run_rl():
             gcfg.get("max_tokens")
             or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
         )
-        _train_ctx = _t.max_length if (_t and _t.max_length) else 0
+        _train_ctx = _t.max_context_tokens if (_t and _t.max_context_tokens) else 0
         vllm_max_len = int(_train_ctx or max(1024, rl.max_prompt_len + _max_completion))
         # Engine must fit completion + some prompt; fail fast rather than OOM mid-rollout.
         if vllm_max_len <= _max_completion:
             raise ValueError(
                 f"engine length {vllm_max_len} leaves no room for the {_max_completion}-token "
-                "completion; raise [train].max_length or lower [train].max_tokens"
+                "completion; raise [train].max_context_tokens or lower "
+                "[train].max_completion_tokens"
             )
         prompt_budget = vllm_max_len - _max_completion
 
@@ -148,8 +149,8 @@ def run_rl():
     if not kept:
         raise ValueError(
             f"every training prompt exceeds the {prompt_budget}-token prompt budget (engine "
-            f"{vllm_max_len} - completion {_max_completion}); raise [train].max_length, lower "
-            "[train].max_tokens, or shorten the environment's prompts"
+            f"{vllm_max_len} - completion {_max_completion}); raise [train].max_context_tokens, "
+            "lower [train].max_completion_tokens, or shorten the environment's prompts"
         )
     prompts = kept
     resolved_prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
@@ -623,7 +624,7 @@ def run_rl():
                 f"retained_prompts={len(prompts)}, prompts_per_step={prompts_per_step}, "
                 f"generations_per_step={batching['generations_per_step']}. This usually means "
                 "TRL built an empty dataloader; add training examples, lower [train].batch_size, "
-                "or reduce prompt length/max_tokens so more examples fit."
+                "or reduce prompt length/max_completion_tokens so more examples fit."
             )
         raise RuntimeError(
             f"GRPO scored no reward in {train_wall:.1f}s over {_steps_run} step(s) — the rollout "

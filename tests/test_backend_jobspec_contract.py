@@ -48,7 +48,7 @@ def _representative_config() -> dict:
             "learning_rate": 1e-5,
             "group_size": 8,
             "temperature": 0.9,
-            "max_tokens": 512,
+            "max_completion_tokens": 512,
         },
         "gpu": {"type": "RTX 5090"},
     }

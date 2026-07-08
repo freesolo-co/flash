@@ -202,6 +202,12 @@ def colocate_kv_util(
 _TRAIN_COEF = 0.27
 # Small-model colocated GRPO floor: 0.8B OOMs 20 GB; 2B OOMs 24 GB -> both need 32 GB tier.
 _VLLM_COLOCATE_FLOOR_GB = 28.0
+# OPD builds its resident vLLM engine after the HF/PEFT student is already loaded. A real
+# Qwen3.5-2B OPD run with vLLM failed vLLM startup on a 32 GB RTX 5090 despite the raw equation
+# estimating ~28 GB with headroom, because vLLM requires the requested executor budget to be free at
+# init time. Keep 2B+ OPD off <=40 GB classes so the allocator picks an 80 GB-class card instead of a
+# consumer GPU that passes the aggregate estimate but fails the vLLM free-memory preflight.
+_OPD_VLLM_COLOCATE_FLOOR_GB = 41.0
 _VOCAB_DEFAULT = 248_320
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
@@ -380,7 +386,10 @@ def estimate_vram_gb(
         logits_bwd = (seq_len * 2 + completion * 4) * vocab
         logits = (logits_fwd + logits_bwd) / 1e9
         return base + rollout + activations + logits
-    fused = sft_logits_fused(params_b, seq_len) if sft_fused_ce is None else bool(sft_fused_ce)
+    # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even
+    # for long-context / >=3B models. Callers can pass sft_fused_ce=True only for theoretical
+    # comparisons; the default must mirror the worker.
+    fused = False if sft_fused_ce is None else bool(sft_fused_ce)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
     # Don't clamp to budget: pd=1 is irreducible and the logits can exceed the budget at near-2048 ctx.
@@ -538,7 +547,7 @@ def model_required_vram_gb(
         except (TypeError, ValueError):
             return default
 
-    max_tokens = _pos_int(_g(train, "max_tokens"), None)
+    max_tokens = _pos_int(_g(train, "max_completion_tokens"), None)
     _algo = (algorithm or "").lower()
     if _algo in ("grpo", "rl"):
         _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
@@ -547,7 +556,7 @@ def model_required_vram_gb(
         _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
         _default_len = 1024
-    seq_len = _pos_int(_g(train, "max_length"), _default_len)
+    seq_len = _pos_int(_g(train, "max_context_tokens"), _default_len)
     lora_rank = _pos_int(_g(train, "lora_rank"), 32)
     if _algo == "opd":
         from flash.engine.recipe import RECIPE
@@ -587,7 +596,6 @@ def model_required_vram_gb(
         return math.ceil(est * headroom)
 
     from flash.catalog import MODELS, vocab_size_for
-    from flash.engine.chalk_kernels import chalk_supports_fused_ce_model
 
     info = MODELS.get(model_id)
     model_vocab = vocab_size_for(model_id)
@@ -597,12 +605,12 @@ def model_required_vram_gb(
     vllm_concurrency = (
         opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
     )
-    sft_fused_ce = (
-        None
-        if is_grpo
-        else sft_logits_fused(resolve_params_b(model_id), seq_len)
-        and chalk_supports_fused_ce_model(model_id)
-    )
+    # Worker parity: TRL SFT deliberately calls install_chalk_kernels(..., fused_ce=False), because
+    # SFTTrainer.compute_loss reads outputs.logits and crashes when fused CE returns logits=None. So
+    # every SFT run materializes dense logits, even for long context / >=3B models where the old
+    # allocator assumed a fused CE path. Size SFT with fused CE OFF up front or long-context Qwen SFT
+    # routes to consumer cards and OOMs on the first backward.
+    sft_fused_ce = None if is_grpo else False
     if info is not None:
         params_b = info.params_b  # curated, authoritative (required field) — no string parsing
         quant = getattr(info, "quant", "bf16") or "bf16"
@@ -657,6 +665,8 @@ def model_required_vram_gb(
         need = max(need, floor)
         if is_vllm_rollout and use_vllm:
             floor_gb = 24 if (params_b or 0.0) <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
+            if is_opd and (params_b or 0.0) >= 2.0:
+                floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))
             need = max(need, floor_gb)
             # vLLM KV-cache init preflight: the card must leave a viable cache-block pool
             # under the colocate utilization cap, or the engine dies at init ("No available
@@ -683,6 +693,8 @@ def model_required_vram_gb(
         need += grpo_seq_escalation_gb(params_b, seq_len)
     if is_vllm_rollout:
         floor_gb = 24 if params_b <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
+        if is_opd and params_b >= 2.0:
+            floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))
         need = max(need, floor_gb, grpo_kv_floor_gb(params_b, seq_len, vllm_concurrency))
     return need
 
