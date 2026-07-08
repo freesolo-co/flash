@@ -71,6 +71,19 @@ def test_grpo_batching_matches_requested_prompts_when_per_device_does_not_divide
             assert b["divisible_by_group"] is True, (prompts, per_device, b)
 
 
+def test_on_policy_epochs_resolve_to_prompt_pool_passes():
+    from flash.engine.steps import on_policy_steps
+
+    assert (
+        on_policy_steps(
+            epochs=2,
+            prompt_count=33,
+            prompts_per_step=16,
+        )
+        == 5
+    )
+
+
 def test_reward_heartbeat_callback_accumulates_history():
     """The live-signal feature: the GRPO callback records a per-step reward_history (only
     from step logs that carry a 'reward') and ignores non-reward logs. Uses a minimal

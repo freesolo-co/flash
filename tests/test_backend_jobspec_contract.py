@@ -42,7 +42,8 @@ def _representative_config() -> dict:
         "environment": {"id": "github:owner/repo@main:my-env/environment.py", "params": {"split": "train"}},
         "train": {
             "hf_repo": "owner/my-runs",
-            "steps": 120,
+            "epochs": 2,
+            "max_examples": 120,
             "lora_rank": 32,
             "lora_alpha": 64,
             "learning_rate": 1e-5,
@@ -66,7 +67,8 @@ def test_backend_run_config_parses_into_valid_jobspec() -> None:
     # hf_repo is platform-managed: a user/backend-supplied value is ignored (left blank for the
     # control plane to assign per run at submit), so it must NOT survive parsing.
     assert spec.train.hf_repo == ""
-    assert spec.train.steps == 120
+    assert spec.train.epochs == 2
+    assert spec.train.max_examples == 120
     assert spec.train.group_size == 8
     assert spec.run_id == "flash-test-1"
 
@@ -125,7 +127,7 @@ def test_backend_config_missing_required_fields_is_rejected_consistently() -> No
     no_env = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"steps": 10},
+        "train": {"epochs": 1, "max_examples": 10},
         "gpu": {"type": "RTX 5090"},
     }
     with pytest.raises(ConfigError):
@@ -142,7 +144,7 @@ def test_stale_local_env_path_is_rejected_at_both_layers() -> None:
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"path": "environments/local_env.py"},
-        "train": {"hf_repo": "owner/my-runs", "steps": 10},
+        "train": {"hf_repo": "owner/my-runs", "epochs": 1, "max_examples": 10},
         "gpu": {"type": "RTX 5090"},
     }
     with pytest.raises(ConfigError):
