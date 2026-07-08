@@ -102,7 +102,7 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
             run_id="quoted",
             model="Qwen/Qwen3.5-4B",
             algorithm="grpo",
-            train=TrainSpec(steps=2),
+            train=TrainSpec(epochs=1, max_examples=2),
             gpu=GpuSpec(type="RTX 4090"),
         )
     )
@@ -359,7 +359,7 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
         run_id="quote",
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=2),
+        train=TrainSpec(epochs=1, max_examples=2),
         gpu=GpuSpec(type="RTX 4090"),
     )
     runner._save_status(

@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
+from flash.engine.steps import on_policy_steps
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -75,7 +76,7 @@ class OpdKnobs:
 
     teacher_model: str = ""
     teacher_base_url: str = ""
-    steps: int = 0
+    epochs: int = RECIPE.opd.num_epochs
     learning_rate: float = 0.0
     temperature: float = 0.0
     top_p: float = 1.0
@@ -116,7 +117,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
     return OpdKnobs(
         teacher_model=d.teacher_model,
         teacher_base_url=d.teacher_base_url,
-        steps=int(opt("steps", 0) or d.num_steps),
+        epochs=int(t.epochs) if t and t.epochs is not None else d.num_epochs,
         learning_rate=float(opt("learning_rate", 0) or d.learning_rate),
         temperature=float(
             opt("temperature", None)
@@ -263,7 +264,7 @@ def run_opd():
     warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     print(
         f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
-        f"steps={knobs.steps} warm_start={warm_start or 'none'} "
+        f"epochs={knobs.epochs} warm_start={warm_start or 'none'} "
         f"mode={'multi-turn' if multi_turn else 'single-turn'}"
     )
 
@@ -309,9 +310,12 @@ def run_opd():
             "opd: the environment dataset is empty — no prompts to sample on-policy. Check the "
             "environment's dataset()/train split before provisioning a GPU."
         )
+    _max_examples = getattr(_w.JOB_SPEC.train, "max_examples", None) if _w.JOB_SPEC else None
+    max_examples = int(_max_examples or 0) if _max_examples is not None else 0
+    if max_examples > 0:
+        train = train[:max_examples]
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
-    steps = knobs.steps
     ppl_step = knobs.prompts_per_step
     group = knobs.group_size
     # Prompt budget mirrors GRPO: DROP (not truncate) prompts over the context budget, so the student
@@ -375,6 +379,21 @@ def run_opd():
             f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
             f"{prompt_budget}-token budget; pool = {len(examples)}"
         )
+    if ppl_step > len(examples):
+        print(
+            f"[opd] lowering prompts_per_step from {ppl_step} to {len(examples)}: "
+            "only that many prompt(s) fit after filtering"
+        )
+        ppl_step = len(examples)
+    steps = on_policy_steps(
+        epochs=knobs.epochs,
+        prompt_count=len(examples),
+        prompts_per_step=ppl_step,
+    )
+    print(
+        f"[opd] epochs={knobs.epochs} over {len(examples)} retained prompt(s) at "
+        f"{ppl_step} prompts/step -> steps={steps}"
+    )
 
     # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
     # setup so an all-over-budget dataset fails before this download). Still inside the setup phase
@@ -573,9 +592,12 @@ def run_opd():
     # but opd only set attn_implementation at LOAD, so both the on-policy generate and the gkd loss
     # forward ran under the default SDPA dispatch and silently lost the cuDNN kernel (codex[bot]).
     # No-op (nullcontext) on non-Blackwell GPUs / when _attn isn't "sdpa".
+    def _samples_progress():
+        return samples_seen
+
     with (
         liveness_heartbeat(
-            "opd_step", progress=lambda: samples_seen, fields=lambda: {"step": opt_steps}
+            "opd_step", progress=_samples_progress, fields=lambda: {"step": opt_steps}
         ),
         _sdpa_cudnn_ctx(_attn),
     ):
@@ -633,6 +655,7 @@ def run_opd():
                         prompts.append(prompt_ids)
                 with liveness_heartbeat(
                     "opd_step",
+                    progress=_samples_progress,
                     fields=lambda _step=opt_steps: {"step": _step},
                     keepalive=True,
                 ):
@@ -804,6 +827,8 @@ def run_opd():
         generated_tokens=generated_tokens,
         notes={
             "steps": steps,
+            "epochs": knobs.epochs,
+            "retained_prompts": len(examples),
             # Optimizer steps actually applied; < steps if any iteration had no usable teacher
             # signal (skipped). loss_curve length == opt_steps, so reporting stays honest.
             "opt_steps": opt_steps,
@@ -976,8 +1001,11 @@ def _generate_one(*, model, tok, device, prompt_tensor, gen_cfg, knobs) -> _GenR
 def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
     """Apply OPD's pre-scoring gates to one vLLM completion."""
     completion_ids = [int(t) for t in out.token_ids]
-    completion_text = out.text or tok.decode(completion_ids, skip_special_tokens=True)
-    stop_text = tok.decode(completion_ids, skip_special_tokens=False)
+    decode = getattr(tok, "decode", None)
+    completion_text = out.text or (
+        decode(completion_ids, skip_special_tokens=True) if decode else ""
+    )
+    stop_text = decode(completion_ids, skip_special_tokens=False) if decode else completion_text
     if not (
         out.terminated
         or _rollout_terminated(
