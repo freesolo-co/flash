@@ -24,6 +24,7 @@ import contextlib
 import os
 import random
 import time
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -249,6 +250,14 @@ def _opd_progress(step: int, done: int) -> None:
     update has landed (opt_steps>=1) they tighten it as intended, and the throttle bounds the HF upload
     rate."""
     _w.heartbeat("opd_step", step=step, samples_done=done)
+
+
+def _format_skip_counts(counts: Counter[str]) -> str:
+    """Compact human-readable summary for OPD no-signal diagnostics."""
+
+    if not counts:
+        return "unknown=0"
+    return ", ".join(f"{k}={counts[k]}" for k in sorted(counts))
 
 
 def run_opd():
@@ -528,6 +537,10 @@ def run_opd():
     # (transient) from one where scoring succeeded but never aligned — the former is retriable infra.
     teacher_ok = 0
     teacher_transient = 0
+    teacher_error = 0
+    skip_counts: Counter[str] = Counter()
+    no_signal_resamples = 0
+    no_signal_skipped_steps = 0
 
     # OPD rollouts always use the colocated vLLM engine. The HF model remains the authoritative
     # training target for the GKD loss forward/backward; vLLM only samples the current LoRA.
@@ -568,15 +581,20 @@ def run_opd():
         sample (scaled 1/accum_target for gradient accumulation), advance the step aggregates, and
         refresh the stall clock. Called after vLLM generation and teacher scoring; ``samples_seen`` is
         advanced by the caller once per generated rollout so its timing is unchanged."""
-        nonlocal teacher_ok, teacher_transient, truncated_rollouts, step_loss, step_cov
+        nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
         if r.teacher_status == "ok":
             teacher_ok += 1
         elif r.teacher_status == "transient":
             teacher_transient += 1
+        elif r.teacher_status == "error":
+            teacher_error += 1
         if r.truncated:
             truncated_rollouts += 1
         if r.loss is None:
+            reason = _sample_skip_reason(r)
+            skip_counts[reason] += 1
+            step_skip_counts[reason] += 1
             # Refresh the stall clock even when a sample yields no teacher signal (rationale in
             # _opd_progress) — else an all-skip stretch emits only ignored liveness pings.
             _opd_progress(opt_steps, nseq)
@@ -597,11 +615,14 @@ def run_opd():
     # completions / a flaky teacher) skips optimizer.step() below, so `for step in range(steps)` could
     # exit with opt_steps < steps -- shipping an under-trained adapter as the served DEFAULT while the
     # run is billed the full submit-time `steps` quote (codex[bot]). Loop until `steps` real updates
-    # land, visiting a fresh data slice each iteration (`it` advances on a skip so a bad batch is not
-    # re-tried). Bound the iterations so a persistently degraded teacher cannot spin unboundedly --
-    # the post-loop guard then turns a shortfall into a RETRY, not a silent under-trained publish.
+    # land. A no-signal attempt is retried a few times with a fresh rollout/data slice before the
+    # optimizer step is abandoned, so sporadic empty teacher responses or degenerate samples do not
+    # waste a requested optimizer update. Bound total attempts so a persistently degraded teacher cannot
+    # spin unboundedly -- the post-loop guard then turns a shortfall into a RETRY, not a silent
+    # under-trained publish.
     step = 0
-    max_iters = 2 * steps + 10
+    max_iters = 3 * steps + 10
+    max_no_signal_attempts = 3
     max_teacher_workers = max(1, knobs.prompts_per_step * knobs.group_size)
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
@@ -622,137 +643,153 @@ def run_opd():
         ThreadPoolExecutor(max_workers=max_teacher_workers) as teacher_pool,
     ):
         while opt_steps < steps and step < max_iters:
-            it = step  # data-slice + display index for THIS iteration
-            step += 1  # advance up front so the nseq==0 `continue` below can't spin the while loop
-            batch = [examples[(it * ppl_step + i) % len(examples)] for i in range(ppl_step)]
-            accum_target = max(1, ppl_step * group)
             optimizer.zero_grad(set_to_none=True)
-            step_loss = 0.0
-            step_cov = 0.0
-            nseq = 0
-            # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
-            # handed to the resident teacher pool, and completed teacher futures are converted into
-            # differentiable GKD losses as soon as they finish. This preserves one optimizer update per
-            # OPD step, but removes the old "wait for every teacher response before any loss" barrier.
-            teacher_futures: dict[Future, _Pending] = {}
+            for no_signal_attempt in range(1, max_no_signal_attempts + 1):
+                it = step  # data-slice + display index for THIS rollout attempt
+                step += 1  # advance up front so the nseq==0 retry path can't spin forever
+                batch = [examples[(it * ppl_step + i) % len(examples)] for i in range(ppl_step)]
+                accum_target = max(1, ppl_step * group)
+                step_loss = 0.0
+                step_cov = 0.0
+                nseq = 0
+                step_skip_counts: Counter[str] = Counter()
+                # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
+                # handed to the resident teacher pool, and completed teacher futures are converted into
+                # differentiable GKD losses as soon as they finish. This preserves one optimizer update
+                # per OPD step, but removes the old "wait for every teacher response before any loss"
+                # barrier.
+                teacher_futures: dict[Future, _Pending] = {}
 
-            def _queue_or_account(
-                p: _Pending, *, _teacher_futures: dict[Future, _Pending] = teacher_futures
-            ) -> None:
-                if p.gen.skip or p.gen.truncated:
-                    _account(_resolve_sample(model, tok, device, p.gen, None, p.prompt_ids, knobs))
-                    return
-                _teacher_futures[
-                    teacher_pool.submit(
-                        _score_one,
-                        teacher,
-                        p.gen,
-                        prompt_messages=p.prompt_messages,
-                        thinking_prefill=thinking_prefill,
-                    )
-                ] = p
-
-            def _cancel_pending_teacher_futures(
-                *, _teacher_futures: dict[Future, _Pending] = teacher_futures
-            ) -> None:
-                for other in _teacher_futures:
-                    other.cancel()
-
-            def _consume_teacher_future(
-                fut: Future, *, _teacher_futures: dict[Future, _Pending] = teacher_futures
-            ) -> None:
-                p = _teacher_futures.pop(fut)
-                try:
-                    p.score = fut.result()
-                except TeacherError:
-                    _cancel_pending_teacher_futures()
-                    raise
-                _account(_resolve_sample(model, tok, device, p.gen, p.score, p.prompt_ids, knobs))
-
-            def _drain_ready_teacher_futures(
-                *, _teacher_futures: dict[Future, _Pending] = teacher_futures
-            ) -> None:
-                for fut in list(_teacher_futures):
-                    if fut.done():
-                        _consume_teacher_future(fut)
-
-            if multi_turn:
-                # Multi-turn Phase 1: drive an EPISODE per (prompt x group), each yielding one
-                # per-turn record. Every assistant turn becomes a _Pending distilled independently
-                # against its transcript-so-far prefix.
-                def _on_turn(_s=opt_steps, _n=nseq):
-                    nonlocal samples_seen
-                    samples_seen += 1
-                    _opd_progress(_s, _n)
-
-                for _ex, _prompt_messages, _prompt_ids in batch:
-                    for _g in range(group):
-                        records = rollout_one_records(
-                            example=_ex,
-                            active_env=env,
-                            render=render_fn,
-                            generate=generate_fn,
-                            env_glue=env_glue_fn,
-                            max_turns=mt_max_turns,
-                            per_turn_max_tokens=knobs.max_completion,
-                            engine_max_len=mt_engine_max_len,
-                            on_turn_generated=_on_turn,
+                def _queue_or_account(
+                    p: _Pending, *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+                ) -> None:
+                    if p.gen.skip or p.gen.truncated:
+                        _account(_resolve_sample(model, tok, device, p.gen, None, p.prompt_ids, knobs))
+                        return
+                    _teacher_futures[
+                        teacher_pool.submit(
+                            _score_one,
+                            teacher,
+                            p.gen,
+                            prompt_messages=p.prompt_messages,
+                            thinking_prefill=thinking_prefill,
                         )
-                        episodes_seen += 1
-                        mt_turn_records += len(records)
-                        for rec in records:
+                    ] = p
+
+                def _cancel_pending_teacher_futures(
+                    *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+                ) -> None:
+                    for other in _teacher_futures:
+                        other.cancel()
+
+                def _consume_teacher_future(
+                    fut: Future, *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+                ) -> None:
+                    p = _teacher_futures.pop(fut)
+                    try:
+                        p.score = fut.result()
+                    except TeacherError:
+                        _cancel_pending_teacher_futures()
+                        raise
+                    _account(_resolve_sample(model, tok, device, p.gen, p.score, p.prompt_ids, knobs))
+
+                def _drain_ready_teacher_futures(
+                    *, _teacher_futures: dict[Future, _Pending] = teacher_futures
+                ) -> None:
+                    for fut in list(_teacher_futures):
+                        if fut.done():
+                            _consume_teacher_future(fut)
+
+                if multi_turn:
+                    # Multi-turn Phase 1: drive an EPISODE per (prompt x group), each yielding one
+                    # per-turn record. Every assistant turn becomes a _Pending distilled independently
+                    # against its transcript-so-far prefix.
+                    def _on_turn(_s=opt_steps, _n=nseq):
+                        nonlocal samples_seen
+                        samples_seen += 1
+                        _opd_progress(_s, _n)
+
+                    for _ex, _prompt_messages, _prompt_ids in batch:
+                        for _g in range(group):
+                            records = rollout_one_records(
+                                example=_ex,
+                                active_env=env,
+                                render=render_fn,
+                                generate=generate_fn,
+                                env_glue=env_glue_fn,
+                                max_turns=mt_max_turns,
+                                per_turn_max_tokens=knobs.max_completion,
+                                engine_max_len=mt_engine_max_len,
+                                on_turn_generated=_on_turn,
+                            )
+                            episodes_seen += 1
+                            mt_turn_records += len(records)
+                            for rec in records:
+                                _queue_or_account(
+                                    _Pending(
+                                        gen=rec["gen"],
+                                        prompt_ids=rec["prefix_ids"],
+                                        prompt_messages=rec["context_messages"],
+                                    )
+                                )
+                            _drain_ready_teacher_futures()
+                else:
+                    contexts: list[tuple[list[int], object]] = []
+                    prompts: list[list[int]] = []
+                    for _ex, prompt_messages, prompt_ids in batch:
+                        for _g in range(group):
+                            contexts.append((prompt_ids, prompt_messages))
+                            prompts.append(prompt_ids)
+                    chunk_size = _opd_rollout_chunk_size(len(prompts))
+                    for start in range(0, len(prompts), chunk_size):
+                        end = start + chunk_size
+                        chunk_prompts = prompts[start:end]
+                        chunk_contexts = contexts[start:end]
+                        with liveness_heartbeat(
+                            "opd_step",
+                            progress=_samples_progress,
+                            fields=lambda _step=opt_steps: {"step": _step},
+                            keepalive=True,
+                        ):
+                            gens = _generate_many_vllm(
+                                vllm_rollout,
+                                tok,
+                                chunk_prompts,
+                                knobs,
+                                max_tokens=knobs.max_completion,
+                            )
+                        for gen, (prompt_ids, prompt_messages) in zip(
+                            gens, chunk_contexts, strict=True
+                        ):
                             _queue_or_account(
                                 _Pending(
-                                    gen=rec["gen"],
-                                    prompt_ids=rec["prefix_ids"],
-                                    prompt_messages=rec["context_messages"],
+                                    gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
                                 )
                             )
+                            samples_seen += 1  # advances the liveness-thread progress signal
+                            _opd_progress(opt_steps, nseq)
                         _drain_ready_teacher_futures()
-            else:
-                contexts: list[tuple[list[int], object]] = []
-                prompts: list[list[int]] = []
-                for _ex, prompt_messages, prompt_ids in batch:
-                    for _g in range(group):
-                        contexts.append((prompt_ids, prompt_messages))
-                        prompts.append(prompt_ids)
-                chunk_size = _opd_rollout_chunk_size(len(prompts))
-                for start in range(0, len(prompts), chunk_size):
-                    end = start + chunk_size
-                    chunk_prompts = prompts[start:end]
-                    chunk_contexts = contexts[start:end]
-                    with liveness_heartbeat(
-                        "opd_step",
-                        progress=_samples_progress,
-                        fields=lambda _step=opt_steps: {"step": _step},
-                        keepalive=True,
-                    ):
-                        gens = _generate_many_vllm(
-                            vllm_rollout,
-                            tok,
-                            chunk_prompts,
-                            knobs,
-                            max_tokens=knobs.max_completion,
-                        )
-                    for gen, (prompt_ids, prompt_messages) in zip(
-                        gens, chunk_contexts, strict=True
-                    ):
-                        _queue_or_account(
-                            _Pending(
-                                gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
-                            )
-                        )
-                        samples_seen += 1  # advances the liveness-thread progress signal
-                        _opd_progress(opt_steps, nseq)
-                    _drain_ready_teacher_futures()
 
-            _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
-            for fut in as_completed(list(teacher_futures)):
-                if fut in teacher_futures:
-                    _consume_teacher_future(fut)
-            _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
+                _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
+                for fut in as_completed(list(teacher_futures)):
+                    if fut in teacher_futures:
+                        _consume_teacher_future(fut)
+                _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
+
+                if nseq:
+                    break
+                reasons = _format_skip_counts(step_skip_counts)
+                if no_signal_attempt < max_no_signal_attempts and step < max_iters:
+                    no_signal_resamples += 1
+                    print(
+                        f"[opd] step {it}: no usable teacher signal ({reasons}); "
+                        f"resampling rollout {no_signal_attempt}/{max_no_signal_attempts}"
+                    )
+                    continue
+                no_signal_skipped_steps += 1
+                print(f"[opd] step {it}: no usable teacher signal this step (skipped; {reasons})")
+                break
             if nseq == 0:
-                print(f"[opd] step {it}: no usable teacher signal this step (skipped)")
                 continue
             # Each seq's grad was scaled by 1/accum_target; if some seqs were skipped (teacher call
             # failed / empty completion), rescale to a true 1/nseq mean so a partial step isn't a
@@ -837,7 +874,9 @@ def run_opd():
         diag = (
             f"opd reached only {opt_steps}/{steps} optimizer updates within {max_iters} iterations "
             f"({n_over_budget} prompts pre-filtered over budget, {truncated_rollouts} non-terminated "
-            f"rollouts, {teacher_transient} transient teacher failures)"
+            f"rollouts, {teacher_transient} transient teacher failures, {teacher_error} teacher errors, "
+            f"{no_signal_resamples} no-signal resamples, {no_signal_skipped_steps} no-signal skipped "
+            f"steps, skip reasons: {_format_skip_counts(skip_counts)})"
         )
         if teacher_transient > 0:
             # SOME scoring calls hit a RETRYABLE teacher outage: a healthier teacher next attempt may
@@ -898,6 +937,11 @@ def run_opd():
             # generating runaway/non-terminating filters (cold start, untrained stop token) and
             # warm-starting from SFT — which encodes termination — would help.
             "truncated_rollouts": truncated_rollouts,
+            "teacher_transient_failures": teacher_transient,
+            "teacher_errors": teacher_error,
+            "no_signal_resamples": no_signal_resamples,
+            "no_signal_skipped_steps": no_signal_skipped_steps,
+            "skip_reasons": dict(sorted(skip_counts.items())),
             # Real alignment-health signal (mean student-tokens-per-group); mean_coverage is ~1.0 even
             # for a degenerate collapsed alignment, so it can't flag that failure mode.
             "mean_align_granularity": (granularity_sum / granularity_n) if granularity_n else 0.0,
@@ -952,6 +996,8 @@ class SampleResult:
     teacher_tokens: int = 0
     # Mean student-tokens-per-alignment-group; a real health signal where coverage is not.
     group_granularity: float = 0.0
+    # Machine-readable reason when loss is None. Used for skipped-step diagnostics and train_meta.
+    skip_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -968,6 +1014,7 @@ class _GenResult:
     gen_tokens: int = 0
     truncated: bool = False
     skip: bool = False
+    skip_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -979,6 +1026,23 @@ class _ScoreResult:
 
     teacher_toks: object = None
     status: str = "ok"
+    error: str = ""
+
+
+def _sample_skip_reason(r: SampleResult) -> str:
+    """Classify a no-loss OPD sample for skipped-step diagnostics."""
+
+    if r.skip_reason:
+        return r.skip_reason
+    if r.truncated:
+        return "truncated_rollout"
+    if r.teacher_status == "transient":
+        return "teacher_transient"
+    if r.teacher_status == "error":
+        return "teacher_error"
+    if r.teacher_status == "ok":
+        return "alignment_empty"
+    return "pre_teacher_skip"
 
 
 @dataclass
@@ -1026,7 +1090,9 @@ def _generate_one(*, model, tok, device, prompt_tensor, gen_cfg, knobs) -> _GenR
     if not _rollout_terminated(
         completion_ids, stop_text, _generation_eos_ids(model, tok), knobs.stop_sequences
     ):
-        return _GenResult(truncated=True, gen_tokens=len(completion_ids))
+        return _GenResult(
+            truncated=True, gen_tokens=len(completion_ids), skip_reason="truncated_rollout"
+        )
     # `stop_sequences` halt generation on-policy (gen_cfg.stop_strings), but HF emits the delimiter
     # before stopping — trim it from BOTH ids and text (token-level) so the teacher scores/distils
     # only the answer, and ids/text stay consistent for gkd_loss + token counting.
@@ -1036,7 +1102,7 @@ def _generate_one(*, model, tok, device, prompt_tensor, gen_cfg, knobs) -> _GenR
         )
     gen_tokens = len(completion_ids)
     if not completion_text.strip():
-        return _GenResult(skip=True, gen_tokens=gen_tokens)
+        return _GenResult(skip=True, gen_tokens=gen_tokens, skip_reason="empty_completion")
     # A completion carrying U+FFFD (the Unicode replacement char) decoded a PARTIAL/invalid UTF-8 byte
     # sequence — the student emitted a lone byte-level BPE token that is not a whole character. Echo-
     # scoring it is impossible: the replacement char does not re-tokenize to the same char span, so
@@ -1045,7 +1111,7 @@ def _generate_one(*, model, tok, device, prompt_tensor, gen_cfg, knobs) -> _GenR
     # 1.0) occasionally emits these, so skip the rollout like a truncated/empty one and keep training;
     # the shortfall guard still fails the run if too many samples end up unusable.
     if "\ufffd" in completion_text:  # U+FFFD replacement char
-        return _GenResult(skip=True, gen_tokens=gen_tokens)
+        return _GenResult(skip=True, gen_tokens=gen_tokens, skip_reason="replacement_char")
     return _GenResult(
         completion_ids=completion_ids, completion_text=completion_text, gen_tokens=gen_tokens
     )
@@ -1068,7 +1134,9 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
             knobs.stop_sequences,
         )
     ):
-        return _GenResult(truncated=True, gen_tokens=len(completion_ids))
+        return _GenResult(
+            truncated=True, gen_tokens=len(completion_ids), skip_reason="truncated_rollout"
+        )
     # vLLM may strip stop strings unless include_stop_str_in_output is supported. Trim when the
     # delimiter is present; otherwise keep the already-stripped ids/text.
     if knobs.stop_sequences and any(
@@ -1079,9 +1147,9 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
         )
     gen_tokens = len(completion_ids)
     if not completion_text.strip():
-        return _GenResult(skip=True, gen_tokens=gen_tokens)
+        return _GenResult(skip=True, gen_tokens=gen_tokens, skip_reason="empty_completion")
     if "\ufffd" in completion_text:
-        return _GenResult(skip=True, gen_tokens=gen_tokens)
+        return _GenResult(skip=True, gen_tokens=gen_tokens, skip_reason="replacement_char")
     return _GenResult(
         completion_ids=completion_ids,
         completion_text=completion_text,
@@ -1098,7 +1166,9 @@ def _generate_many_vllm(
     ]
 
 
-def _score_one(teacher, gen_result, *, prompt_messages, thinking_prefill) -> _ScoreResult:
+def _score_one(
+    teacher, gen_result, *, prompt_messages, thinking_prefill, max_attempts: int = 2
+) -> _ScoreResult:
     """[THREAD POOL — network only] Build the teacher prompt and echo-score the completion over the
     API. MUST NOT touch the torch model or any shared mutable state — it reads only the completion
     string + prompt messages and calls the stateless teacher HTTP client, so it is safe to run
@@ -1108,17 +1178,28 @@ def _score_one(teacher, gen_result, *, prompt_messages, thinking_prefill) -> _Sc
     ``TeacherError`` propagates (the run aborts), a transient one -> status "transient", any other
     exception -> status "error"; both leave the sample skipped with no teacher signal."""
     teacher_prompt = _teacher_prompt_text(prompt_messages, thinking_prefill)
-    try:
-        teacher_toks = teacher.score(teacher_prompt, gen_result.completion_text)
-    except TeacherError as e:
-        if e.permanent:  # bad key / model id / malformed -> abort now, don't burn the whole run
-            raise
-        print(f"[opd] teacher score failed (transient, skipping sample): {e}")
-        return _ScoreResult(status="transient")
-    except Exception as e:
-        print(f"[opd] teacher score failed (skipping sample): {e}")
-        return _ScoreResult(status="error")
-    return _ScoreResult(teacher_toks=teacher_toks, status="ok")
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            teacher_toks = teacher.score(teacher_prompt, gen_result.completion_text)
+        except TeacherError as e:
+            if e.permanent:  # bad key / model id / malformed -> abort now, don't burn the whole run
+                raise
+            if attempt < attempts:
+                print(
+                    f"[opd] teacher score failed (transient, retrying sample {attempt}/{attempts}): {e}"
+                )
+                continue
+            print(f"[opd] teacher score failed (transient, skipping sample): {e}")
+            return _ScoreResult(status="transient", error=str(e))
+        except Exception as e:
+            if attempt < attempts:
+                print(f"[opd] teacher score failed (retrying sample {attempt}/{attempts}): {e}")
+                continue
+            print(f"[opd] teacher score failed (skipping sample): {e}")
+            return _ScoreResult(status="error", error=str(e))
+        return _ScoreResult(teacher_toks=teacher_toks, status="ok")
+    return _ScoreResult(status="error", error="teacher scoring attempts exhausted")
 
 
 def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -> SampleResult:
@@ -1133,7 +1214,10 @@ def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -
     )
     if not student_ids:
         return SampleResult(
-            teacher_status="ok", gen_tokens=gen_result.gen_tokens, teacher_tokens=teacher_tokens
+            teacher_status="ok",
+            gen_tokens=gen_result.gen_tokens,
+            teacher_tokens=teacher_tokens,
+            skip_reason="student_tokens_empty",
         )
 
     model.train()
@@ -1150,8 +1234,18 @@ def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -
     # teacher logprob across many student tokens.
     _n_align = sum(1 for st in student_toks if st.end > st.start)
     group_granularity = (_n_align / len(groups)) if groups else 0.0
+    loss = gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs.kl_coef)
+    if loss is None:
+        return SampleResult(
+            teacher_status="ok",
+            coverage=coverage,
+            gen_tokens=gen_result.gen_tokens,
+            teacher_tokens=teacher_tokens,
+            group_granularity=group_granularity,
+            skip_reason="alignment_empty",
+        )
     return SampleResult(
-        loss=gkd_loss(model, prompt_ids, student_ids, groups, device, kl_coef=knobs.kl_coef),
+        loss=loss,
         teacher_status="ok",
         coverage=coverage,
         gen_tokens=gen_result.gen_tokens,
@@ -1167,13 +1261,34 @@ def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs) -> Sample
     for a rollout that was actually scored (not truncated, not skip); callers pass ``None`` for the rest."""
     if gen.truncated:
         # Didn't terminate naturally (cap/max_time cut) — skipped, not distilled.
-        return SampleResult(truncated=True, gen_tokens=gen.gen_tokens)
+        return SampleResult(
+            truncated=True,
+            gen_tokens=gen.gen_tokens,
+            skip_reason=gen.skip_reason or "truncated_rollout",
+        )
     if gen.skip:  # empty completion or U+FFFD — skipped before scoring
-        return SampleResult(gen_tokens=gen.gen_tokens)
+        return SampleResult(
+            gen_tokens=gen.gen_tokens,
+            skip_reason=gen.skip_reason or "pre_teacher_skip",
+        )
+    if score is None:
+        return SampleResult(
+            teacher_status="error",
+            gen_tokens=gen.gen_tokens,
+            skip_reason="teacher_missing_score",
+        )
     if score.status == "transient":  # retryable teacher outage — skipped + counted
-        return SampleResult(teacher_status="transient", gen_tokens=gen.gen_tokens)
+        return SampleResult(
+            teacher_status="transient",
+            gen_tokens=gen.gen_tokens,
+            skip_reason="teacher_transient",
+        )
     if score.status != "ok":  # any other teacher exception — skipped, teacher uncounted
-        return SampleResult(gen_tokens=gen.gen_tokens)
+        return SampleResult(
+            teacher_status="error",
+            gen_tokens=gen.gen_tokens,
+            skip_reason="teacher_error",
+        )
     return _loss_one(model, tok, device, gen, score, prompt_ids, knobs)
 
 
