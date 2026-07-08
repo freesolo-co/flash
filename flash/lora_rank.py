@@ -221,9 +221,10 @@ def preflight_train_context_within_serving(spec: JobSpec) -> None:
     a run — CPU-only (catalog lookup, no GPU, no network), like the rank preflight above.
     Open-policy / uncataloged models have no serving cap and are skipped.
 
-    SFT training context is ``train.max_length``; GRPO is the rollout prompt+completion length
-    (``grpo_rollout_seq_len``, which folds in ``train.max_tokens`` and the recipe defaults). An unset
-    SFT ``max_length`` uses the worker's small recipe default (always within the cap) and is skipped.
+    SFT training context is ``train.max_context_tokens``; GRPO is the rollout prompt+completion
+    length (``grpo_rollout_seq_len``, which folds in ``train.max_completion_tokens`` and the recipe
+    defaults). An unset SFT ``max_context_tokens`` uses the worker's small recipe default (always
+    within the cap) and is skipped.
     """
     from flash.catalog import serving_context_cap
     from flash.engine.vram import grpo_rollout_seq_len
@@ -234,14 +235,14 @@ def preflight_train_context_within_serving(spec: JobSpec) -> None:
 
     if spec.algorithm == "grpo":
         effective = grpo_rollout_seq_len(
-            spec.train.max_length or 0, spec.train.max_tokens, spec.thinking
+            spec.train.max_context_tokens or 0, spec.train.max_completion_tokens, spec.thinking
         )
-        knob = "train.max_length / train.max_tokens (GRPO rollout prompt+completion)"
+        knob = "train.max_context_tokens / train.max_completion_tokens (GRPO rollout prompt+completion)"
     else:
-        effective = int(spec.train.max_length or 0)
+        effective = int(spec.train.max_context_tokens or 0)
         if effective <= 0:  # unset -> worker recipe default, always within the cap
             return
-        knob = "train.max_length"
+        knob = "train.max_context_tokens"
 
     if effective > cap:
         raise ValueError(

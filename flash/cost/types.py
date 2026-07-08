@@ -17,10 +17,10 @@ class RunConfig:
     method: str  # "sft" | "grpo" | "opd"
     steps: int
 
-    # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
+    # Engine context length (forwarded as [train].max_context_tokens, NOT prompt length). When unset the
     # GRPO default mirrors the worker's max(1024, max_prompt_len + completion); see normalized().
     seq_len: int | None = None
-    completion_len: int | None = None  # GRPO only (max_tokens)
+    completion_len: int | None = None  # GRPO/OPD only (max_completion_tokens)
     batch_size: int | None = None  # SFT effective batch / GRPO prompts_per_step
     group_size: int | None = None  # GRPO completions per prompt (G)
     lora_rank: int | None = None
@@ -82,7 +82,7 @@ class RunConfig:
             comp = self.completion_len
             if comp is None:
                 comp = rc.max_completion_len_thinking if self.thinking else rc.max_completion_len
-            # Explicit pin wins; else mirror the allocator's rollout sizing of an unset max_length:
+            # Explicit pin wins; else mirror the allocator's rollout sizing of an unset context:
             # max(1024, max_prompt_len + completion), not bare max_prompt_len (which under-sizes).
             seq = (
                 self.seq_len
@@ -116,9 +116,9 @@ class RunConfig:
         if self.batch_size is not None:
             knobs["batch_size"] = self.batch_size
         if n.seq_len is not None:
-            knobs["max_length"] = n.seq_len
+            knobs["max_context_tokens"] = n.seq_len
         if n.completion_len is not None:
-            knobs["max_tokens"] = n.completion_len
+            knobs["max_completion_tokens"] = n.completion_len
         if n.group_size is not None:
             knobs["group_size"] = n.group_size
         return knobs

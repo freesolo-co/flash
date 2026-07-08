@@ -53,16 +53,27 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "gpu_memory_utilization": 0.10,
         "kv_cache_dtype": None,
+        "max_num_seqs": None,
         "max_num_batched_tokens": None,
+        "rollout_batch_size": None,
         "attention_backend": None,
         "mm_encoder_attn_backend": None,
         "enforce_eager": None,
+        "compilation_config": None,
     }
+    free_gb = 0.0
     try:
         import torch
 
         cc = torch.cuda.get_device_capability()
-        card_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        card_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024**3)
+            if total_bytes:
+                card_gb = total_bytes / (1024**3)
+        except Exception:
+            pass
     except Exception:
         cc, card_gb = (0, 0), 0.0
 
@@ -80,19 +91,46 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
             )
 
             info = MODELS.get(model_id)
+            params_b = resolve_params_b(model_id)
             active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
-            kwargs["gpu_memory_utilization"] = colocate_kv_util(
-                resolve_params_b(model_id),
-                int(seq_cap),
-                card_gb,
-                False,
-                num_generations=opd_rollout_concurrency(
-                    getattr(knobs, "prompts_per_step", 1),
-                    getattr(knobs, "group_size", 1),
-                ),
-                active_params_b=active_b,
-                fp8_kv=fp8_kv,
+            target_concurrency = opd_rollout_concurrency(
+                getattr(knobs, "prompts_per_step", 1),
+                getattr(knobs, "group_size", 1),
             )
+            rollout_concurrency = target_concurrency
+
+            def _util_for(num_generations: int) -> float:
+                return colocate_kv_util(
+                    params_b,
+                    int(seq_cap),
+                    card_gb,
+                    False,
+                    num_generations=num_generations,
+                    active_params_b=active_b,
+                    fp8_kv=fp8_kv,
+                )
+
+            util = _util_for(rollout_concurrency)
+            if free_gb > 0:
+                # vLLM rejects startup unless its whole executor budget is free right now. OPD builds
+                # the rollout engine after the student + warm-start adapter are resident, so choose the
+                # largest rollout chunk that fits the observed residual memory instead of reserving for
+                # every prompt in the optimizer step.
+                startup_margin_gb = max(1.0, min(4.0, card_gb * 0.03))
+                max_startup_util = max(0.10, (free_gb - startup_margin_gb) / max(1.0, card_gb))
+                while rollout_concurrency > 1 and util > max_startup_util:
+                    rollout_concurrency -= 1
+                    util = _util_for(rollout_concurrency)
+                if rollout_concurrency < target_concurrency:
+                    print(
+                        "[opd] reduced vLLM rollout batch "
+                        f"{target_concurrency}->{rollout_concurrency} to fit startup memory "
+                        f"(free={free_gb:.1f} GiB, request={util * card_gb:.1f} GiB, "
+                        f"margin={startup_margin_gb:.1f} GiB)"
+                    )
+            kwargs["gpu_memory_utilization"] = util
+            kwargs["max_num_seqs"] = rollout_concurrency
+            kwargs["rollout_batch_size"] = rollout_concurrency
         except Exception as exc:
             print(f"[opd] vLLM memory-util sizing failed; using 0.10: {exc}")
 
@@ -108,17 +146,44 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
         force_vit_sdpa_on_blackwell()
         kwargs["mm_encoder_attn_backend"] = "TORCH_SDPA"
 
+    # Blackwell OPD startup is more reliable with the V1 engine core in-process: the old B200 failure
+    # reached a resident SyncMPClient child process and then died/hung before the first rollout. This
+    # does NOT disable CUDA graphs; it only avoids the fragile parent/child EngineCore startup seam.
+    blackwell_inproc_v1 = cc and cc[0] in (10, 12)
+    if blackwell_inproc_v1:
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        print(
+            f"[opd][warn] Blackwell/sm{cc[0]}{cc[1]}: VLLM_ENABLE_V1_MULTIPROCESSING=0 "
+            "for OPD rollout (avoid V1 SyncMPClient EngineCore startup stall)"
+        )
+
     try:
         import vllm as _vllm_mod
 
         ver_base = _vllm_mod.__version__.split("+")[0]
         vllm_ver = tuple(int(x) for x in ver_base.split(".")[:3])
-        if vllm_ver > (0, 19, 0) and cc != (10, 0):
+        # vLLM's default 0.19.x graph path malfunctioned on Blackwell OPD startup, but full eager mode
+        # throws away the decode CUDA graph speed path. Use a narrower graph profile instead: disable
+        # torch.compile/AOT while keeping decode-only CUDA graph capture. That avoids the fragile
+        # compile/slot-mapping path but still exercises CUDA graphs on B200/RTX 5090.
+        if vllm_ver >= (0, 19, 0) and blackwell_inproc_v1:
+            kwargs["enforce_eager"] = False
+            kwargs["compilation_config"] = {
+                "mode": 0,  # CompilationMode.NONE: no torch.compile/AOT.
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+            }
+            print(
+                f"[opd] cc={cc[0]}.{cc[1]}: using decode-only vLLM CUDA graphs for OPD rollout "
+                "(torch.compile disabled, V1 EngineCore in-process)"
+            )
+        elif vllm_ver >= (0, 19, 0) and cc not in {(8, 0), (9, 0)}:
             kwargs["enforce_eager"] = True
             print(
                 f"[opd][warn] enforce_eager=True on the vLLM rollout (cc={cc[0]}.{cc[1]} -> "
-                "prevent 0.19.1 aot_compile/slot-mapping crash; B200/sm100 keeps CUDA graphs)"
+                "prevent 0.19.x aot_compile/slot-mapping crash on this unvalidated GPU family)"
             )
+        elif vllm_ver >= (0, 19, 0):
+            print(f"[opd] cc={cc[0]}.{cc[1]}: keeping vLLM CUDA graphs for OPD rollout speed")
     except Exception:
         pass
     return kwargs
@@ -136,10 +201,13 @@ class OpdVllmRolloutEngine:
     lora_rank: int = 32
     gpu_memory_utilization: float = 0.10
     kv_cache_dtype: str | None = None
+    max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
+    rollout_batch_size: int | None = None
     attention_backend: str | None = None
     mm_encoder_attn_backend: str | None = None
     enforce_eager: bool | None = None
+    compilation_config: dict[str, Any] | None = None
     seed: int | None = None
     adapter_root: str | None = None
     _version: int = 0
@@ -168,6 +236,8 @@ class OpdVllmRolloutEngine:
         }
         if self.kv_cache_dtype:
             kwargs["kv_cache_dtype"] = self.kv_cache_dtype
+        if self.max_num_seqs:
+            kwargs["max_num_seqs"] = int(self.max_num_seqs)
         if self.max_num_batched_tokens:
             kwargs["max_num_batched_tokens"] = int(self.max_num_batched_tokens)
         if self.attention_backend:
@@ -176,13 +246,46 @@ class OpdVllmRolloutEngine:
             kwargs["mm_encoder_attn_backend"] = self.mm_encoder_attn_backend
         if self.enforce_eager is not None:
             kwargs["enforce_eager"] = bool(self.enforce_eager)
+        if self.compilation_config:
+            kwargs["compilation_config"] = dict(self.compilation_config)
         if self.seed is not None:
             kwargs["seed"] = int(self.seed)
-        self.llm = LLM(**kwargs)
+        try:
+            self.llm = LLM(**kwargs)
+        except RuntimeError as exc:
+            startup_oom = self._enginecore_startup_oom(exc)
+            if startup_oom is not None:
+                raise startup_oom from exc
+            raise
         if self.adapter_root is None:
             self.adapter_root = tempfile.mkdtemp(prefix="flash_opd_vllm_lora_")
         else:
             os.makedirs(self.adapter_root, exist_ok=True)
+
+    def _enginecore_startup_oom(self, exc: RuntimeError) -> BaseException | None:
+        """Recast vLLM's parent EngineCore wrapper as OOM when the hidden root is memory preflight."""
+        msg = str(exc).lower()
+        if (
+            "enginecore initialization failed" not in msg
+            and "engine core initialization failed" not in msg
+        ):
+            return None
+        try:
+            import torch
+
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024**3)
+            total_gb = total_bytes / (1024**3)
+            requested_gb = float(self.gpu_memory_utilization) * total_gb
+            if free_gb < requested_gb:
+                return torch.cuda.OutOfMemoryError(
+                    "vLLM EngineCore startup OOM: "
+                    f"free={free_gb:.2f} GiB < requested={requested_gb:.2f} GiB "
+                    f"(gpu_memory_utilization={float(self.gpu_memory_utilization):.3f})"
+                )
+        except Exception:
+            return None
+        return None
 
     @property
     def sync_count(self) -> int:
@@ -207,7 +310,10 @@ class OpdVllmRolloutEngine:
 
     def _remove_lora(self, lora_id: int) -> bool:
         """Best-effort dynamic-LoRA cache cleanup across vLLM API variants."""
-        for obj in (getattr(self, "llm", None), getattr(getattr(self, "llm", None), "llm_engine", None)):
+        for obj in (
+            getattr(self, "llm", None),
+            getattr(getattr(self, "llm", None), "llm_engine", None),
+        ):
             remover = getattr(obj, "remove_lora", None)
             if callable(remover):
                 try:
@@ -236,19 +342,29 @@ class OpdVllmRolloutEngine:
             kwargs.pop("include_stop_str_in_output", None)
             return self._SamplingParams(**kwargs)
 
-    def generate(self, prompt_ids_batch: list[list[int]], *, max_tokens: int) -> list[OpdVllmOutput]:
+    def generate(
+        self, prompt_ids_batch: list[list[int]], *, max_tokens: int
+    ) -> list[OpdVllmOutput]:
         if not prompt_ids_batch:
             return []
         if self._lora_request is None:
             raise RuntimeError("opd vLLM rollout used before sync_from_model()")
-        prompts = [{"prompt_token_ids": [int(t) for t in ids]} for ids in prompt_ids_batch]
-        outputs = self.llm.generate(
-            prompts,
-            sampling_params=self._sampling_params(max_tokens),
-            lora_request=self._lora_request,
-            use_tqdm=False,
-        )
-        return [_normalize_output(out) for out in outputs]
+        limit = max(1, int(self.rollout_batch_size or len(prompt_ids_batch)))
+        out: list[OpdVllmOutput] = []
+        sampling_params = self._sampling_params(max_tokens)
+        for start in range(0, len(prompt_ids_batch), limit):
+            prompts = [
+                {"prompt_token_ids": [int(t) for t in ids]}
+                for ids in prompt_ids_batch[start : start + limit]
+            ]
+            outputs = self.llm.generate(
+                prompts,
+                sampling_params=sampling_params,
+                lora_request=self._lora_request,
+                use_tqdm=False,
+            )
+            out.extend(_normalize_output(item) for item in outputs)
+        return out
 
     def generate_one(self, prompt_ids: list[int], *, max_tokens: int) -> OpdVllmOutput:
         return self.generate([prompt_ids], max_tokens=max_tokens)[0]

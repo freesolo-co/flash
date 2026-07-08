@@ -137,7 +137,7 @@ def grpo_overrides() -> dict:
     cfg = {
         "group_size": train.group_size,
         "temperature": train.temperature,
-        "max_tokens": train.max_tokens,
+        "max_tokens": train.max_completion_tokens,
         "kl_penalty_coef": train.kl_penalty_coef,
         "advantage_clip": train.advantage_clip,
         "thinking_length_penalty_coef": train.thinking_length_penalty_coef,
@@ -173,7 +173,7 @@ def resolve_grpo_sleep_mode() -> tuple[bool, int, float, bool]:
     spec = _w.JOB_SPEC
     train = spec.train if spec else None
     model_id = spec.model if spec else ""
-    ctx = int(train.max_length if train and train.max_length else 0)
+    ctx = int(train.max_context_tokens if train and train.max_context_tokens else 0)
     gcfg = _w.grpo_overrides()
     group_size = int(gcfg.get("group_size") or RECIPE.rl.group_size)
     lora_rank = int(train.lora_rank) if train and train.lora_rank else 32

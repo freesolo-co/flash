@@ -497,7 +497,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert sft.is_file()
     assert not (tmp_path / "configs/endpoints.toml").exists()
     assert 'algorithm = "grpo"' in grpo.read_text()
-    assert "steps = 150" in grpo.read_text()
+    assert "epochs = 1" in grpo.read_text()
+    assert "max_examples = 2" in grpo.read_text()
     assert "cheapest fitting managed class" in grpo.read_text()
     assert "private environment-scoped repo" in grpo.read_text()
     assert 'algorithm = "sft"' in sft.read_text()
@@ -509,7 +510,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert opd.is_file()
     opd_text = opd.read_text()
     assert 'algorithm = "opd"' in opd_text
-    assert "steps = 100" in opd_text
+    assert "epochs = 1" in opd_text
+    assert "max_examples = 2" in opd_text
     # The teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
     # the user to export it, so the generated config must not mention FIREWORKS_API_KEY at all.
     assert "FIREWORKS_API_KEY" not in opd_text
@@ -578,7 +580,7 @@ def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
     sft = (tmp_path / "configs/sft.toml").read_text()
     assert "thinking = true" not in rl
     assert "thinking = true" not in sft
-    assert "max_tokens" not in rl
+    assert "max_completion_tokens" not in rl
     assert "EnvironmentSingleTurn" in (tmp_path / "environment.py").read_text()
 
 
@@ -590,10 +592,10 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     assert "thinking = true" in rl
     assert "thinking = true" in sft
     # GRPO raises the generation budget so reasoning does not truncate the answer.
-    assert "max_tokens = 2048" in rl
+    assert "max_completion_tokens = 2048" in rl
     # SFT can't share a token budget it doesn't generate; it gets the gold think-tag guidance instead.
     assert "warn_missing_think_tags" in sft
-    assert "max_tokens" not in sft
+    assert "max_completion_tokens" not in sft
 
 
 def test_env_setup_no_reasoning_flag_is_explicit_off(monkeypatch, tmp_path) -> None:
@@ -623,7 +625,7 @@ def test_env_setup_interactive_survey_picks_multi_and_reasoning(monkeypatch, tmp
     assert "EnvironmentMultiTurn" in (tmp_path / "environment.py").read_text()
     rl = (tmp_path / "configs/rl.toml").read_text()
     assert "thinking = true" in rl
-    assert "max_tokens = 2048" in rl
+    assert "max_completion_tokens = 2048" in rl
 
 
 def test_env_setup_interactive_enter_takes_defaults(monkeypatch, tmp_path) -> None:
