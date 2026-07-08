@@ -3454,6 +3454,121 @@ def test_resolve_samples_batched_returns_differentiable_gkd_losses():
     assert model.w.grad[0].abs().sum() > 0
 
 
+def test_resolve_samples_batched_projects_only_completion_suffix_logits(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
+
+    class _SuffixLM:
+        def __init__(self):
+            self.w = torch.zeros(4, 8, requires_grad=True)
+            self.config = SimpleNamespace(use_cache=False)
+            self.calls = []
+
+        def train(self):
+            return self
+
+        def __call__(
+            self,
+            input_ids,
+            *,
+            attention_mask=None,
+            position_ids=None,
+            logits_to_keep=None,
+        ):
+            self.calls.append(
+                {
+                    "input_ids": input_ids.detach().cpu().tolist(),
+                    "attention_mask": attention_mask.detach().cpu().tolist(),
+                    "position_ids": position_ids.detach().cpu().tolist(),
+                    "logits_to_keep": logits_to_keep,
+                }
+            )
+            logits = self.w[: input_ids.shape[1]].unsqueeze(0).expand(input_ids.shape[0], -1, -1)
+            if logits_to_keep:
+                logits = logits[:, -int(logits_to_keep) :, :]
+            return SimpleNamespace(logits=logits)
+
+        def parameters(self):
+            return [self.w]
+
+    model = _SuffixLM()
+    knobs = SimpleNamespace(kl_coef=1.0)
+    samples = [
+        (
+            opd_mod._GenResult(completion_ids=[2, 3], completion_text="ab", gen_tokens=2),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("ab", -0.5, 0, 2)], status="ok"),
+            [5, 6, 7],
+        ),
+        (
+            opd_mod._GenResult(completion_ids=[3], completion_text="b", gen_tokens=1),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("b", -0.7, 0, 1)], status="ok"),
+            [9],
+        ),
+    ]
+
+    out = opd_mod._resolve_samples_batched(model, _Tok(), "cpu", samples, knobs, microbatch=2)
+
+    assert all(r.loss is not None and r.loss.requires_grad for r in out)
+    call = model.calls[0]
+    # Row 0 is prompt + completion[:-1]. Row 1 is left-padded so its final real token aligns with
+    # row 0's final real token, allowing logits_to_keep to select the completion-prediction suffix.
+    assert call["input_ids"] == [[5, 6, 7, 2], [0, 0, 0, 9]]
+    assert call["attention_mask"] == [[1, 1, 1, 1], [0, 0, 0, 1]]
+    assert call["position_ids"] == [[0, 1, 2, 3], [0, 0, 0, 0]]
+    assert call["logits_to_keep"] == 2
+    assert model._flash_opd_completion_logits_suffix_batches == 1
+    assert not hasattr(model, "_flash_opd_full_logits_batches")
+
+
+def test_resolve_samples_batched_can_disable_completion_suffix_logits(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a"}.get(int(i), "x") for i in ids)
+
+    class _FullLM(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=2, V=8)
+            self.config = SimpleNamespace(use_cache=False)
+            self.calls = []
+
+        def train(self):
+            return self
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls.append(dict(kwargs))
+            return super().__call__(input_ids)
+
+    monkeypatch.setenv("FLASH_OPD_COMPLETION_LOGITS_ONLY", "0")
+    model = _FullLM()
+    samples = [
+        (
+            opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+            [1],
+        )
+    ]
+
+    out = opd_mod._resolve_samples_batched(
+        model, _Tok(), "cpu", samples, SimpleNamespace(kl_coef=1.0), microbatch=1
+    )
+
+    assert out[0].loss is not None
+    assert "logits_to_keep" not in model.calls[0]
+    assert getattr(model, "_flash_opd_completion_logits_suffix_batches", 0) == 0
+    assert model._flash_opd_full_logits_batches == 1
+
+
 def test_gkd_loss_none_without_groups_or_tokens():
     torch = pytest.importorskip("torch")
     from flash.engine.worker.opd import gkd_loss

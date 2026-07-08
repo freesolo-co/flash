@@ -84,6 +84,22 @@ def _opd_env_int(name: str) -> int | None:
         return None
 
 
+def _opd_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    print(f"[opd] ignoring invalid {name}={raw!r}")
+    return bool(default)
+
+
+def _opd_completion_logits_only_enabled() -> bool:
+    return _opd_env_bool("FLASH_OPD_COMPLETION_LOGITS_ONLY", True)
+
+
 def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:
     total = max(1, int(total_prompts))
     override = _opd_env_int("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE")
@@ -1103,6 +1119,11 @@ def run_opd():
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
             "opd_loss_microbatch_size": loss_microbatch_size,
+            "opd_completion_logits_only_enabled": _opd_completion_logits_only_enabled(),
+            "opd_completion_logits_suffix_batches": getattr(
+                model, "_flash_opd_completion_logits_suffix_batches", 0
+            ),
+            "opd_full_logits_batches": getattr(model, "_flash_opd_full_logits_batches", 0),
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
             # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
             # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
@@ -1447,11 +1468,71 @@ def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
     return (coeff_vec * sp_sel).mean()
 
 
-def _forward_logits(model, input_ids, attention_mask):
+def _forward_logits(
+    model, input_ids, attention_mask=None, *, position_ids=None, logits_to_keep=None
+):
+    kwargs = {}
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask
+    if position_ids is not None:
+        kwargs["position_ids"] = position_ids
+    if logits_to_keep is not None:
+        kwargs["logits_to_keep"] = logits_to_keep
     try:
-        return model(input_ids, attention_mask=attention_mask).logits
+        return model(input_ids, **kwargs).logits
     except TypeError:
-        return model(input_ids).logits
+        if position_ids is not None or logits_to_keep is not None:
+            raise
+        if attention_mask is not None:
+            return model(input_ids).logits
+        raise
+
+
+def _bump_model_counter(model, name: str, inc: int = 1) -> None:
+    with contextlib.suppress(Exception):
+        setattr(model, name, int(getattr(model, name, 0) or 0) + int(inc))
+
+
+def _forward_completion_suffix_logits(model, device, chunk: list[_PreparedLoss], pad_id: int):
+    """Forward only ``prompt + completion[:-1]`` and request just the suffix rows that predict the
+    completion tokens.
+
+    Transformers Qwen/Llama-style CausalLMs support ``logits_to_keep`` and project only those rows
+    through the huge vocab ``lm_head``. OPD never trains on prompt-token logits, so this keeps the exact
+    objective while avoiding a large prompt-length x vocab projection. Left padding aligns each row's
+    last real token, and explicit ``position_ids`` keep token positions identical to the old right-pad
+    full-logits path. Returns ``None`` when a wrapper does not accept the needed kwargs.
+    """
+    import torch
+
+    if not chunk:
+        return None
+    max_comp = max(len(p.student_ids) for p in chunk)
+    if max_comp <= 0:
+        return None
+    seqs = [list(p.prompt_ids) + list(p.student_ids[:-1]) for p in chunk]
+    max_len = max(len(seq) for seq in seqs)
+    input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
+    position_ids = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
+    for row, seq in enumerate(seqs):
+        offset = max_len - len(seq)
+        input_ids[row, offset:] = torch.tensor(seq, dtype=torch.long, device=device)
+        attention_mask[row, offset:] = 1
+        position_ids[row, offset:] = torch.arange(len(seq), dtype=torch.long, device=device)
+    try:
+        logits = _forward_logits(
+            model,
+            input_ids,
+            attention_mask,
+            position_ids=position_ids,
+            logits_to_keep=max_comp,
+        )
+    except TypeError:
+        return None
+    if getattr(logits, "shape", (0, 0))[1] < max_comp:
+        return None
+    return logits
 
 
 def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -> SampleResult:
@@ -1563,20 +1644,36 @@ def _resolve_samples_batched(
         model.config.use_cache = False
         pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
         mb = max(1, int(microbatch))
+        completion_logits_only = _opd_completion_logits_only_enabled()
         for start in range(0, len(prepared), mb):
             chunk = prepared[start : start + mb]
-            seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
-            max_len = max(len(seq) for seq in seqs)
-            input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-            attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
-            for row, seq in enumerate(seqs):
-                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-                attention_mask[row, : len(seq)] = 1
-            logits = _forward_logits(model, input_ids, attention_mask)
+            logits = (
+                _forward_completion_suffix_logits(model, device, chunk, pad_id)
+                if completion_logits_only
+                else None
+            )
+            if logits is not None:
+                _bump_model_counter(model, "_flash_opd_completion_logits_suffix_batches")
+                completion_suffix = True
+            else:
+                _bump_model_counter(model, "_flash_opd_full_logits_batches")
+                completion_suffix = False
+                seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
+                max_len = max(len(seq) for seq in seqs)
+                input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+                attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
+                for row, seq in enumerate(seqs):
+                    input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+                    attention_mask[row, : len(seq)] = 1
+                logits = _forward_logits(model, input_ids, attention_mask)
             for row, p in enumerate(chunk):
                 prompt_len = len(p.prompt_ids)
                 comp_len = len(p.student_ids)
-                rows = logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
+                rows = (
+                    logits[row, -comp_len:]
+                    if completion_suffix
+                    else logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
+                )
                 loss = _gkd_loss_from_logits_rows(
                     rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
                 )
