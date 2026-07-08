@@ -225,7 +225,9 @@ def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, train_one=None, outputs=No
         )
 
         def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs):
-            return train_one(model=model, tok=tok, device=device, prompt_ids=prompt_ids, knobs=knobs)
+            return train_one(
+                model=model, tok=tok, device=device, prompt_ids=prompt_ids, knobs=knobs
+            )
 
         monkeypatch.setattr(opd_mod, "_resolve_sample", _resolve_sample)
     return _FakeOpdVllmRolloutEngine
@@ -663,7 +665,9 @@ def test_train_one_full_loop_forwards_sampled_ids_and_ignores_zero_width_eos():
     completion_ids = [2, 3, 5]  # 2->'h', 3->'i', 5->eos (in-vocab id, decodes to '')
 
     class _Tok:
-        eos_token_id = 5  # completion ends in id 5 -> _rollout_terminated sees natural EOS termination
+        eos_token_id = (
+            5  # completion ends in id 5 -> _rollout_terminated sees natural EOS termination
+        )
 
         def decode(self, ids, skip_special_tokens=True):
             m = {2: "h", 3: "i", 5: ""}
@@ -1212,7 +1216,9 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
 def test_opd_passes_worker_env_teacher_key_to_client(monkeypatch):
     """run_opd reads the platform-injected FIREWORKS_API_KEY from the worker env and uses it to
     construct the TeacherClient."""
-    opd_mod = _opd_harness(monkeypatch, train_one=_skip)  # sets FIREWORKS_API_KEY=unit-test-teacher-key
+    opd_mod = _opd_harness(
+        monkeypatch, train_one=_skip
+    )  # sets FIREWORKS_API_KEY=unit-test-teacher-key
     captured = {}
     import flash.engine.worker.teacher as tmod
 
@@ -1293,7 +1299,9 @@ def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
         from flash.engine.worker.opd import SampleResult
 
         loss = model.w.float().sum() * 1e-6
-        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
+        return SampleResult(
+            loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
+        )
 
     opd_mod = _opd_harness(monkeypatch, train_one=_one_update, epochs=1, group=1)
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
@@ -1303,6 +1311,94 @@ def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
 
     engine = opd_mod.OpdVllmRolloutEngine.instances[0]
     assert engine.sync_count == 1  # initial LoRA sync only; no rollout remains after step 1
+
+
+def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
+    """Regression: a slow teacher response must not hold back loss/backward for faster responses in the
+    same OPD step. The old step barrier waited for every teacher future before resolving any sample."""
+    import threading
+    import time
+
+    torch = pytest.importorskip("torch")
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip, epochs=1, group=2)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    events: list[tuple[str, int]] = []
+    lock = threading.Lock()
+    calls = {"n": 0}
+
+    def _score_one(*_args, **_kwargs):
+        with lock:
+            idx = calls["n"]
+            calls["n"] += 1
+        if idx == 0:
+            time.sleep(0.05)
+        events.append(("score", idx))
+        return opd_mod._ScoreResult(teacher_toks=[idx], status="ok")
+
+    def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs):
+        idx = int(score.teacher_toks[0])
+        events.append(("resolve", idx))
+        loss = model.w.float().sum() * 1e-6
+        return opd_mod.SampleResult(
+            loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
+        )
+
+    monkeypatch.setattr(opd_mod, "_score_one", _score_one)
+    monkeypatch.setattr(opd_mod, "_resolve_sample", _resolve_sample)
+
+    opd_mod.run_opd()
+
+    assert events.index(("resolve", 1)) < events.index(("score", 0))
+
+
+def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
+    """Default OPD steps have 8 rollouts. Generate them in chunks so teacher scoring for the first
+    chunk can run while vLLM generates the later chunk."""
+    import threading
+
+    torch = pytest.importorskip("torch")
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip, epochs=1, group=8)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    events: list[tuple[str, int, int]] = []
+    first_score_started = threading.Event()
+
+    def _generate_many_vllm(_rollout, _tok, prompt_ids_batch, _knobs, *, max_tokens):
+        call_idx = sum(1 for e in events if e[0] == "generate")
+        if call_idx == 1:
+            first_score_started.wait(timeout=1.0)
+        events.append(("generate", call_idx, len(prompt_ids_batch)))
+        return [
+            opd_mod._GenResult(completion_ids=[3], completion_text="x", gen_tokens=1)
+            for _ in prompt_ids_batch
+        ]
+
+    def _score_one(*_args, **_kwargs):
+        events.append(("score", len([e for e in events if e[0] == "score"]), 0))
+        first_score_started.set()
+        return opd_mod._ScoreResult(teacher_toks=[], status="ok")
+
+    def _resolve_sample(model, tok, device, gen, score, prompt_ids, knobs):
+        loss = model.w.float().sum() * 1e-6
+        return opd_mod.SampleResult(
+            loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
+        )
+
+    monkeypatch.setattr(opd_mod, "_generate_many_vllm", _generate_many_vllm)
+    monkeypatch.setattr(opd_mod, "_score_one", _score_one)
+    monkeypatch.setattr(opd_mod, "_resolve_sample", _resolve_sample)
+
+    opd_mod.run_opd()
+
+    assert [e[2] for e in events if e[0] == "generate"] == [4, 4]
+    first_score = next(i for i, e in enumerate(events) if e[0] == "score")
+    second_generate = events.index(("generate", 1, 4))
+    assert first_score < second_generate
 
 
 def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
@@ -1533,7 +1629,9 @@ def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(mon
     assert opd_mod._thinking_prefill_text(_WhitespaceEmptyBlockTok()) == "<think>\n"
 
 
-def test_thinking_prefill_recovers_opener_when_closed_block_leaves_whitespace_remainder(monkeypatch):
+def test_thinking_prefill_recovers_opener_when_closed_block_leaves_whitespace_remainder(
+    monkeypatch,
+):
     """Regression (codex[bot], opd.py:134): a closed-block hybrid whose disabled render closes IMMEDIATELY
     after the opener (enable_thinking=False -> '...<think></think>', True -> '...<think>\\n') shares only
     '<think>' in the common prefix, so think_mid is the NON-EMPTY whitespace remainder '\\n'. The old
@@ -1574,7 +1672,9 @@ def test_opd_loop_drives_by_optimizer_updates_and_fails_permanently_on_determini
         # exactly one real, backward-able update lands first; then every sample skips (loss=None). The
         # teacher stays "ok" throughout, so teacher_transient == 0 -> the shortfall is deterministic.
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
-        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
+        return SampleResult(
+            loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
+        )
 
     # epochs=3 but only ONE optimizer update can ever land -> the bounded loop exhausts its iteration
     # budget at opt_steps=1 and the post-loop guard must fail permanently (deterministic), not retry.
@@ -1702,7 +1802,9 @@ def test_opd_wraps_training_loop_in_sdpa_cudnn_ctx(monkeypatch):
     # Force the Blackwell branch and record what the loop wraps itself in.
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: "sdpa")
     monkeypatch.setattr(opd_mod, "_sdpa_cudnn_ctx", _rec_ctx)
-    with pytest.raises(RuntimeError):  # all-skip -> no trained step, but the ctx wrapped the loop first
+    with pytest.raises(
+        RuntimeError
+    ):  # all-skip -> no trained step, but the ctx wrapped the loop first
         opd_mod.run_opd()
     assert entered.get("attn") == "sdpa", (
         "run_opd must wrap the training loop in _sdpa_cudnn_ctx(_attn) so the cuDNN SDPA backend is "
@@ -1734,7 +1836,9 @@ def test_opd_initializes_and_logs_to_wandb_when_configured(monkeypatch):
         state["n"] += 1
         # one real optimizer step lands (W&B logs it), then the run shortfalls (loss=None)
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
-        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
+        return SampleResult(
+            loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
+        )
 
     opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, epochs=3, group=1)
     # Turn W&B ON for this run (harness defaults it off): wandb_report_to() truthy -> _wandb_on.
@@ -1773,7 +1877,9 @@ def test_opd_skips_wandb_logging_when_not_configured(monkeypatch):
         state["n"] += 1
         # one real, backward-able update lands first; then every sample skips (loss=None)
         loss = model.w.float().sum() * 1e-6 if state["n"] == 1 else None
-        return SampleResult(loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1)
+        return SampleResult(
+            loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
+        )
 
     opd_mod = _opd_harness(monkeypatch, train_one=_one_update_then_skip, epochs=3, group=1)
     # Harness default wandb_report_to -> [] (off). The suppress(Exception) around wandb.log would hide a
@@ -2169,7 +2275,9 @@ def test_opd_vram_budgets_dense_logit_backward_buffers():
     delta = estimate_vram_gb(4.0, "opd", "bf16", vocab=v2, **kw) - estimate_vram_gb(
         4.0, "opd", "bf16", vocab=v1, **kw
     )
-    forward_only = (seq * 2 + comp * 4) * (v2 - v1) / 1e9  # what the old fwd-only formula would grow by
+    forward_only = (
+        (seq * 2 + comp * 4) * (v2 - v1) / 1e9
+    )  # what the old fwd-only formula would grow by
     assert delta == pytest.approx(2 * forward_only, rel=1e-9), (
         "opd dense-logit budget must include the backward buffers (2x the forward-only reservation); "
         f"got delta={delta} GB, forward-only would be {forward_only} GB"
@@ -2201,8 +2309,12 @@ def test_opd_vram_is_single_sequence_not_batch_scaled():
     opd_bs16 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=16, group_size=1, **kw)
     assert opd_bs1 == opd_bs16  # batch_size does not scale the single-sequence training term
     # contrast: SFT DOES scale with the micro-batch when it is not floored by the dense-logits cap.
-    sft_bs1 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=1, seq_len=1024, vocab=1, lora_rank=16)
-    sft_bs16 = estimate_vram_gb(4.0, "sft", "bf16", batch_size=16, seq_len=1024, vocab=1, lora_rank=16)
+    sft_bs1 = estimate_vram_gb(
+        4.0, "sft", "bf16", batch_size=1, seq_len=1024, vocab=1, lora_rank=16
+    )
+    sft_bs16 = estimate_vram_gb(
+        4.0, "sft", "bf16", batch_size=16, seq_len=1024, vocab=1, lora_rank=16
+    )
     assert sft_bs16 > sft_bs1
 
 
@@ -2736,7 +2848,11 @@ def test_teacher_score_rejects_interior_tiling_gap_as_permanent(monkeypatch):
                 "logprobs": {
                     "tokens": ["P", "h", "yo"],
                     "token_logprobs": [0.0, -0.3, -0.5],
-                    "text_offset": [0, 1, 3],  # token 1 'h' ends at 2 but next offset is 3 -> gap at 2
+                    "text_offset": [
+                        0,
+                        1,
+                        3,
+                    ],  # token 1 'h' ends at 2 but next offset is 3 -> gap at 2
                 }
             }
         ]
@@ -2762,7 +2878,10 @@ def test_teacher_score_rejects_echo_not_starting_at_offset_0_as_permanent(monkey
         "choices": [
             {
                 "logprobs": {
-                    "tokens": ["B", "cd"],  # tiles full[1:4]=='Bcd' cleanly, but drops the 'A' prefix
+                    "tokens": [
+                        "B",
+                        "cd",
+                    ],  # tiles full[1:4]=='Bcd' cleanly, but drops the 'A' prefix
                     "token_logprobs": [0.0, -0.5],
                     "text_offset": [1, 2],  # starts at 1, not 0
                 }
@@ -2819,7 +2938,9 @@ def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkey
     client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
     with pytest.raises(TeacherError) as ei:
         client.score("P", "hi")
-    assert ei.value.permanent is False  # 503 retryable -> transient TeacherError, not a raw exception
+    assert (
+        ei.value.permanent is False
+    )  # 503 retryable -> transient TeacherError, not a raw exception
     assert "503" in str(ei.value)
 
 
@@ -2840,7 +2961,9 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
     monkeypatch.setattr(
         opd_mod,
         "_w",
-        SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=0.0)), THINKING=False),
+        SimpleNamespace(
+            JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=0.0)), THINKING=False
+        ),
     )
     with pytest.raises(RuntimeError, match="kl_penalty_coef must be > 0"):
         opd_mod._resolve_opd_knobs()
@@ -2849,7 +2972,9 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
     monkeypatch.setattr(
         opd_mod,
         "_w",
-        SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=None)), THINKING=False),
+        SimpleNamespace(
+            JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=None)), THINKING=False
+        ),
     )
     assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
 
