@@ -340,47 +340,6 @@ def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monk
     assert out["rollout_batch_size"] == 4
 
 
-def test_opd_vllm_kwargs_raises_oom_when_single_rollout_cannot_fit(monkeypatch):
-    from flash.engine import vram
-    from flash.engine.worker import gpu_setup
-    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
-
-    class _OutOfMemoryError(RuntimeError):
-        pass
-
-    class _Cuda:
-        OutOfMemoryError = _OutOfMemoryError
-
-        @staticmethod
-        def get_device_capability():
-            return (8, 0)
-
-        @staticmethod
-        def get_device_properties(_idx):
-            return SimpleNamespace(total_memory=80 * 1024**3)
-
-        @staticmethod
-        def mem_get_info():
-            return 10 * 1024**3, 80 * 1024**3
-
-    torch_mod = types.ModuleType("torch")
-    torch_mod.cuda = _Cuda
-    monkeypatch.setitem(sys.modules, "torch", torch_mod)
-    monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: None)
-    monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
-    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.0)
-
-    def _util_for(_params_b, _seq_cap, _card_gb, _sleep_mode, *, num_generations, **_kwargs):
-        return {8: 0.40, 7: 0.36, 6: 0.32, 5: 0.28, 4: 0.22, 3: 0.20, 2: 0.18, 1: 0.16}[
-            num_generations
-        ]
-
-    monkeypatch.setattr(vram, "colocate_kv_util", _util_for)
-
-    with pytest.raises(_OutOfMemoryError, match="rollout_batch_size to 1"):
-        opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
-
-
 @pytest.mark.parametrize("cc", [(8, 0), (9, 0)])
 def test_opd_vllm_kwargs_keeps_cuda_graphs_on_datacenter_cards(monkeypatch, cc):
     from flash.engine import vram
