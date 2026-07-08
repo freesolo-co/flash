@@ -1362,13 +1362,13 @@ def test_opd_rollout_chunking_scales_for_heavy_steps(monkeypatch):
     monkeypatch.delenv("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS", raising=False)
     assert opd_mod._opd_rollout_pipeline_chunks(1) == 1
     assert opd_mod._opd_rollout_pipeline_chunks(7) == 1
-    assert opd_mod._opd_rollout_pipeline_chunks(8) == 1
-    assert opd_mod._opd_rollout_chunk_size(8) == 8
-    assert opd_mod._opd_rollout_pipeline_chunks(32) == 1
-    assert opd_mod._opd_rollout_chunk_size(32) == 32
-    assert opd_mod._opd_rollout_pipeline_chunks(64) == 1
-    assert opd_mod._opd_rollout_chunk_size(64) == 64
-    assert opd_mod._opd_rollout_pipeline_chunks(256) == 4
+    assert opd_mod._opd_rollout_pipeline_chunks(8) == 2
+    assert opd_mod._opd_rollout_chunk_size(8) == 4
+    assert opd_mod._opd_rollout_pipeline_chunks(32) == 2
+    assert opd_mod._opd_rollout_chunk_size(32) == 16
+    assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
+    assert opd_mod._opd_rollout_chunk_size(64) == 16
+    assert opd_mod._opd_rollout_pipeline_chunks(256) == 8
 
     monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "32")
     assert opd_mod._opd_rollout_pipeline_target_chunk_size(64) == 32
@@ -1387,17 +1387,17 @@ def test_opd_rollout_chunking_scales_for_heavy_steps(monkeypatch):
 
     monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "not-an-int")
     monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS", "not-an-int")
-    assert opd_mod._opd_rollout_pipeline_chunks(64) == 1
+    assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
 
 
 def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
-    """When configured to chunk, score the first rollout chunk while vLLM generates the later chunk."""
+    """Default OPD steps have 8 rollouts. Generate them in chunks so teacher scoring for the first
+    chunk can run while vLLM generates the later chunk."""
     import threading
 
     torch = pytest.importorskip("torch")
 
     opd_mod = _opd_harness(monkeypatch, train_one=_skip, epochs=1, group=8)
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE", "4")
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
 
@@ -3568,6 +3568,94 @@ def test_resolve_samples_batched_can_disable_completion_suffix_logits(monkeypatc
     assert "logits_to_keep" not in model.calls[0]
     assert getattr(model, "_flash_opd_completion_logits_suffix_batches", 0) == 0
     assert model._flash_opd_full_logits_batches == 1
+
+
+def test_resolve_samples_batched_can_use_selective_logprobs(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    chalk = types.ModuleType("chalk")
+    chalk_ops = types.ModuleType("chalk.ops")
+    chalk_grpo = types.ModuleType("chalk.ops.grpo")
+
+    def selective_log_softmax(hidden, weight, target_ids, *, bias=None, **_kwargs):
+        logits = hidden @ weight.t()
+        if bias is not None:
+            logits = logits + bias
+        return torch.log_softmax(logits.float(), dim=-1).gather(
+            1, target_ids.unsqueeze(-1)
+        ).squeeze(-1)
+
+    chalk_grpo.selective_log_softmax = selective_log_softmax
+    monkeypatch.setitem(sys.modules, "chalk", chalk)
+    monkeypatch.setitem(sys.modules, "chalk.ops", chalk_ops)
+    monkeypatch.setitem(sys.modules, "chalk.ops.grpo", chalk_grpo)
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
+
+    class _Backbone:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def forward(self, *, input_ids, attention_mask=None, use_cache=False, return_dict=True):
+            self.owner.backbone_calls += 1
+            hidden = self.owner.emb[input_ids]
+            return SimpleNamespace(last_hidden_state=hidden)
+
+    class _SelectiveLM:
+        def __init__(self):
+            self.emb = torch.nn.Parameter(torch.randn(10, 5) * 0.1)
+            self.head = torch.nn.Linear(5, 8, bias=False)
+            self.model = _Backbone(self)
+            self.config = SimpleNamespace(use_cache=False)
+            self.backbone_calls = 0
+            self.full_calls = 0
+
+        def train(self):
+            return self
+
+        def get_base_model(self):
+            return self
+
+        def get_output_embeddings(self):
+            return self.head
+
+        def __call__(self, input_ids, **_kwargs):
+            self.full_calls += 1
+            hidden = self.model.forward(input_ids=input_ids).last_hidden_state
+            return SimpleNamespace(logits=self.head(hidden))
+
+        def parameters(self):
+            return [self.emb, *self.head.parameters()]
+
+    monkeypatch.setenv("FLASH_OPD_SELECTIVE_LOGPROBS", "1")
+    model = _SelectiveLM()
+    samples = [
+        (
+            opd_mod._GenResult(completion_ids=[2, 3], completion_text="ab", gen_tokens=2),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("ab", -0.5, 0, 2)], status="ok"),
+            [5, 6],
+        )
+    ]
+
+    out = opd_mod._resolve_samples_batched(
+        model, _Tok(), "cpu", samples, SimpleNamespace(kl_coef=1.0), microbatch=1
+    )
+
+    assert out[0].loss is not None
+    assert model.backbone_calls == 1
+    assert model.full_calls == 0
+    assert model._flash_opd_selective_logprob_batches == 1
+    assert getattr(model, "_flash_opd_full_logits_batches", 0) == 0
+    out[0].loss.backward()
+    assert model.emb.grad is not None
+    assert model.emb.grad.abs().sum() > 0
+    assert model.head.weight.grad is not None
+    assert model.head.weight.grad.abs().sum() > 0
 
 
 def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():

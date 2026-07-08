@@ -67,7 +67,7 @@ from flash.engine.worker.perf import (
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 
-OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 64
+OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
 OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
@@ -100,6 +100,10 @@ def _opd_completion_logits_only_enabled() -> bool:
     return _opd_env_bool("FLASH_OPD_COMPLETION_LOGITS_ONLY", False)
 
 
+def _opd_selective_logprobs_enabled() -> bool:
+    return _opd_env_bool("FLASH_OPD_SELECTIVE_LOGPROBS", False)
+
+
 def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:
     total = max(1, int(total_prompts))
     override = _opd_env_int("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE")
@@ -129,8 +133,6 @@ def _opd_rollout_pipeline_chunks(total_prompts: int) -> int:
     target_chunk = _opd_rollout_pipeline_target_chunk_size(total)
     max_chunks = _opd_rollout_pipeline_max_chunks(total)
     chunks = (total + target_chunk - 1) // target_chunk
-    if chunks <= 1:
-        return 1
     if max_chunks == 1:
         return 1
     return max(2, min(max_chunks, chunks))
@@ -1156,6 +1158,10 @@ def run_opd():
             "opd_teacher_batch_size": teacher_batch_size,
             "opd_loss_microbatch_size": loss_microbatch_size,
             "opd_completion_logits_only_enabled": _opd_completion_logits_only_enabled(),
+            "opd_selective_logprobs_enabled": _opd_selective_logprobs_enabled(),
+            "opd_selective_logprob_batches": getattr(
+                model, "_flash_opd_selective_logprob_batches", 0
+            ),
             "opd_completion_logits_suffix_batches": getattr(
                 model, "_flash_opd_completion_logits_suffix_batches", 0
             ),
@@ -1513,6 +1519,17 @@ def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
     rows = rows.float()
     ids_t = torch.tensor(student_ids, device=rows.device)
     sp_t = -F.cross_entropy(rows, ids_t, reduction="none")
+    return _gkd_loss_from_logps(sp_t, prepared, kl_coef=kl_coef)
+
+
+def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
+    import torch
+
+    if sp_t is None or not groups:
+        return None
+    prepared = groups if isinstance(groups, _PreparedGkdGroups) else _prepare_gkd_groups(groups)
+    if prepared is None:
+        return None
     sp_det = sp_t.detach()
     flat_idx_t = torch.tensor(prepared.token_indices, device=sp_t.device)
     group_lengths_t = torch.tensor(prepared.group_lengths, device=sp_t.device)
@@ -1597,6 +1614,134 @@ def _forward_completion_suffix_logits(model, device, chunk: list[_PreparedLoss],
     if getattr(logits, "shape", (0, 0))[1] < max_comp:
         return None
     return logits
+
+
+def _unwrapped_causal_lm(model):
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        with contextlib.suppress(Exception):
+            return get_base_model()
+    return model
+
+
+def _plain_lm_head(model):
+    base = _unwrapped_causal_lm(model)
+    getter = getattr(base, "get_output_embeddings", None)
+    head = getter() if callable(getter) else getattr(base, "lm_head", None)
+    if head is None or getattr(head, "weight", None) is None:
+        return None
+    # PEFT wraps adapted linears with LoRA attributes. Using only .weight would ignore lm_head LoRA,
+    # so the selected-logprob fast path is exact only for a plain output embedding.
+    if any(hasattr(head, attr) for attr in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")):
+        return None
+    return head
+
+
+def _candidate_backbones(model):
+    base = _unwrapped_causal_lm(model)
+    out = []
+
+    def add(obj):
+        if obj is not None and callable(getattr(obj, "forward", None)) and obj not in out:
+            out.append(obj)
+
+    decoder = getattr(base, "get_decoder", None)
+    if callable(decoder):
+        with contextlib.suppress(Exception):
+            add(decoder())
+    prefix = getattr(base, "base_model_prefix", None)
+    if prefix:
+        add(getattr(base, str(prefix), None))
+    add(getattr(base, "model", None))
+    language_model = getattr(base, "language_model", None)
+    add(getattr(language_model, "model", None))
+    add(language_model)
+    add(getattr(base, "transformer", None))
+    return out
+
+
+def _backbone_hidden(backbone, input_ids, attention_mask=None, *, position_ids=None):
+    kwargs = {"input_ids": input_ids, "use_cache": False, "return_dict": True}
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask
+    if position_ids is not None:
+        kwargs["position_ids"] = position_ids
+    try:
+        out = backbone(**kwargs)
+    except TypeError:
+        kwargs.pop("return_dict", None)
+        try:
+            out = backbone(**kwargs)
+        except TypeError:
+            kwargs.pop("use_cache", None)
+            out = backbone(**kwargs)
+    hidden = getattr(out, "last_hidden_state", None)
+    if hidden is None and isinstance(out, (tuple, list)) and out:
+        hidden = out[0]
+    return hidden
+
+
+def _forward_selective_logps(model, device, chunk: list[_PreparedLoss], pad_id: int):
+    """Return realized-token logprobs via Chalk's selected-logprob LM-head path.
+
+    This avoids materializing ``[completion, vocab]`` logits. It is opt-in and best-effort because the
+    exact module path differs across HF model classes; any unsupported shape falls back to dense logits.
+    """
+    import torch
+
+    if not chunk:
+        return None
+    try:
+        from chalk.ops.grpo import selective_log_softmax
+    except Exception:
+        return None
+    head = _plain_lm_head(model)
+    if head is None:
+        return None
+    seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
+    max_len = max(len(seq) for seq in seqs)
+    input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
+    for row, seq in enumerate(seqs):
+        input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+        attention_mask[row, : len(seq)] = 1
+    target_ids = torch.tensor(
+        [int(t) for p in chunk for t in p.student_ids], dtype=torch.long, device=device
+    )
+    if target_ids.numel() == 0:
+        return None
+    for backbone in _candidate_backbones(model):
+        try:
+            hidden = _backbone_hidden(backbone, input_ids, attention_mask)
+        except Exception:
+            continue
+        if hidden is None or getattr(hidden, "ndim", 0) != 3:
+            continue
+        if int(hidden.shape[-1]) != int(head.weight.shape[1]):
+            continue
+        rows = []
+        for row, p in enumerate(chunk):
+            prompt_len = len(p.prompt_ids)
+            comp_len = len(p.student_ids)
+            rows.append(hidden[row, prompt_len - 1 : prompt_len - 1 + comp_len])
+        try:
+            flat_hidden = torch.cat(rows, dim=0)
+            flat_logps = selective_log_softmax(
+                flat_hidden,
+                head.weight,
+                target_ids,
+                bias=getattr(head, "bias", None),
+            )
+        except Exception:
+            continue
+        out = []
+        offset = 0
+        for p in chunk:
+            end = offset + len(p.student_ids)
+            out.append(flat_logps[offset:end])
+            offset = end
+        return out
+    return None
 
 
 def _loss_one(model, tok, device, gen_result, score_result, prompt_ids, knobs) -> SampleResult:
@@ -1710,38 +1855,58 @@ def _resolve_samples_batched(
         pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
         mb = max(1, int(microbatch))
         completion_logits_only = _opd_completion_logits_only_enabled()
+        selective_logprobs = _opd_selective_logprobs_enabled()
         for start in range(0, len(prepared), mb):
             chunk = prepared[start : start + mb]
-            logits = (
-                _forward_completion_suffix_logits(model, device, chunk, pad_id)
-                if completion_logits_only
+            chunk_logps = (
+                _forward_selective_logps(model, device, chunk, pad_id)
+                if selective_logprobs
                 else None
             )
-            if logits is not None:
-                _bump_model_counter(model, "_flash_opd_completion_logits_suffix_batches")
-                completion_suffix = True
-            else:
-                _bump_model_counter(model, "_flash_opd_full_logits_batches")
+            if chunk_logps is not None:
+                _bump_model_counter(model, "_flash_opd_selective_logprob_batches")
+                logits = None
                 completion_suffix = False
-                seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
-                max_len = max(len(seq) for seq in seqs)
-                input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-                attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
-                for row, seq in enumerate(seqs):
-                    input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-                    attention_mask[row, : len(seq)] = 1
-                logits = _forward_logits(model, input_ids, attention_mask)
+            else:
+                logits = (
+                    _forward_completion_suffix_logits(model, device, chunk, pad_id)
+                    if completion_logits_only
+                    else None
+                )
+                if logits is not None:
+                    _bump_model_counter(model, "_flash_opd_completion_logits_suffix_batches")
+                    completion_suffix = True
+                else:
+                    _bump_model_counter(model, "_flash_opd_full_logits_batches")
+                    completion_suffix = False
+                    seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
+                    max_len = max(len(seq) for seq in seqs)
+                    input_ids = torch.full(
+                        (len(seqs), max_len), pad_id, dtype=torch.long, device=device
+                    )
+                    attention_mask = torch.zeros(
+                        (len(seqs), max_len), dtype=torch.long, device=device
+                    )
+                    for row, seq in enumerate(seqs):
+                        input_ids[row, : len(seq)] = torch.tensor(
+                            seq, dtype=torch.long, device=device
+                        )
+                        attention_mask[row, : len(seq)] = 1
+                    logits = _forward_logits(model, input_ids, attention_mask)
             for row, p in enumerate(chunk):
-                prompt_len = len(p.prompt_ids)
-                comp_len = len(p.student_ids)
-                rows = (
-                    logits[row, -comp_len:]
-                    if completion_suffix
-                    else logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
-                )
-                loss = _gkd_loss_from_logits_rows(
-                    rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
-                )
+                if chunk_logps is not None:
+                    loss = _gkd_loss_from_logps(chunk_logps[row], p.groups, kl_coef=knobs.kl_coef)
+                else:
+                    prompt_len = len(p.prompt_ids)
+                    comp_len = len(p.student_ids)
+                    rows = (
+                        logits[row, -comp_len:]
+                        if completion_suffix
+                        else logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
+                    )
+                    loss = _gkd_loss_from_logits_rows(
+                        rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
+                    )
                 if loss is None:
                     results[p.idx] = SampleResult(
                         teacher_status="ok",
