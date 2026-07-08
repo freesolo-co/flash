@@ -1355,6 +1355,33 @@ def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
     assert events.index(("resolve", 1)) < events.index(("score", 0))
 
 
+def test_opd_rollout_chunking_scales_for_heavy_steps(monkeypatch):
+    import flash.engine.worker.opd as opd_mod
+
+    monkeypatch.delenv("FLASH_OPD_ROLLOUT_PIPELINE_CHUNKS", raising=False)
+
+    assert opd_mod._opd_rollout_pipeline_chunks(1) == 1
+    assert opd_mod._opd_rollout_pipeline_chunks(7) == 1
+    assert opd_mod._opd_rollout_pipeline_chunks(8) == 2
+    assert opd_mod._opd_rollout_chunk_size(8) == 4
+    assert opd_mod._opd_rollout_pipeline_chunks(32) == 2
+    assert opd_mod._opd_rollout_chunk_size(32) == 16
+    assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
+    assert opd_mod._opd_rollout_chunk_size(64) == 16
+    assert opd_mod._opd_rollout_pipeline_chunks(256) == 8
+
+
+def test_opd_rollout_chunking_can_be_overridden_for_experiments(monkeypatch):
+    import flash.engine.worker.opd as opd_mod
+
+    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_CHUNKS", "4")
+    assert opd_mod._opd_rollout_pipeline_chunks(8) == 4
+    assert opd_mod._opd_rollout_chunk_size(8) == 2
+
+    monkeypatch.setenv("FLASH_OPD_ROLLOUT_PIPELINE_CHUNKS", "not-an-int")
+    assert opd_mod._opd_rollout_pipeline_chunks(64) == 4
+
+
 def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
     """Default OPD steps have 8 rollouts. Generate them in chunks so teacher scoring for the first
     chunk can run while vLLM generates the later chunk."""
