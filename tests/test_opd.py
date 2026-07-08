@@ -225,13 +225,20 @@ def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, sample_result=None, output
             lambda *a, **k: opd_mod._ScoreResult(teacher_toks=[], status="ok"),
         )
 
-        def _resolve_samples_batched(model, tok, device, samples, knobs, microbatch):
-            return [
+        def _resolve_samples_batched(
+            model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+        ):
+            out = [
                 sample_result(
                     model=model, tok=tok, device=device, prompt_ids=prompt_ids, knobs=knobs
                 )
                 for (_gen, _score, prompt_ids) in samples
             ]
+            if backward_scale is not None:
+                losses = [r.loss for r in out if r.loss is not None]
+                if losses:
+                    (sum(losses) * backward_scale).backward()
+            return out
 
         monkeypatch.setattr(opd_mod, "_resolve_samples_batched", _resolve_samples_batched)
     return _FakeOpdVllmRolloutEngine
@@ -965,8 +972,12 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     loss_calls = []
     real_resolve_samples_batched = opd_mod._resolve_samples_batched
 
-    def _spy_resolve_samples_batched(model, tok_, device, samples, knobs, microbatch):
-        out = real_resolve_samples_batched(model, tok_, device, samples, knobs, microbatch)
+    def _spy_resolve_samples_batched(
+        model, tok_, device, samples, knobs, microbatch, *, backward_scale=None
+    ):
+        out = real_resolve_samples_batched(
+            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale
+        )
         for (gen, _score, prompt_ids), r in zip(samples, out, strict=True):
             loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
         return out
@@ -1194,7 +1205,9 @@ def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
         events.append(("score", idx))
         return opd_mod._ScoreResult(teacher_toks=[idx], status="ok")
 
-    def _resolve_samples_batched(model, tok, device, samples, knobs, microbatch):
+    def _resolve_samples_batched(
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+    ):
         out = []
         for _gen, score, _prompt_ids in samples:
             idx = int(score.teacher_toks[0])
@@ -1205,6 +1218,10 @@ def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
                     loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
                 )
             )
+        if backward_scale is not None:
+            losses = [r.loss for r in out if r.loss is not None]
+            if losses:
+                (sum(losses) * backward_scale).backward()
         return out
 
     monkeypatch.setattr(opd_mod, "_score_one", _score_one)
@@ -1258,8 +1275,10 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
         first_score_started.set()
         return opd_mod._ScoreResult(teacher_toks=[], status="ok")
 
-    def _resolve_samples_batched(model, tok, device, samples, knobs, microbatch):
-        return [
+    def _resolve_samples_batched(
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+    ):
+        out = [
             opd_mod.SampleResult(
                 loss=model.w.float().sum() * 1e-6,
                 teacher_status="ok",
@@ -1269,6 +1288,11 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
             )
             for _sample in samples
         ]
+        if backward_scale is not None:
+            losses = [r.loss for r in out if r.loss is not None]
+            if losses:
+                (sum(losses) * backward_scale).backward()
+        return out
 
     monkeypatch.setattr(opd_mod, "_generate_many_vllm", _generate_many_vllm)
     monkeypatch.setattr(opd_mod, "_score_one", _score_one)
@@ -1307,8 +1331,10 @@ def test_opd_scores_generated_chunk_in_teacher_batches(monkeypatch):
         batches.append(len(pendings))
         return [opd_mod._ScoreResult(teacher_toks=[], status="ok") for _ in pendings]
 
-    def _resolve_samples_batched(model, tok, device, samples, knobs, microbatch):
-        return [
+    def _resolve_samples_batched(
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+    ):
+        out = [
             opd_mod.SampleResult(
                 loss=model.w.float().sum() * 1e-6,
                 teacher_status="ok",
@@ -1318,6 +1344,11 @@ def test_opd_scores_generated_chunk_in_teacher_batches(monkeypatch):
             )
             for _sample in samples
         ]
+        if backward_scale is not None:
+            losses = [r.loss for r in out if r.loss is not None]
+            if losses:
+                (sum(losses) * backward_scale).backward()
+        return out
 
     monkeypatch.setattr(opd_mod, "_score_many", _score_many)
     monkeypatch.setattr(opd_mod, "_resolve_samples_batched", _resolve_samples_batched)
@@ -2365,7 +2396,13 @@ def test_opd_vram_budgets_dense_logit_backward_buffers():
     from flash.engine.vram import estimate_vram_gb
 
     seq, comp = 9216, 8192
-    kw = {"seq_len": seq, "max_tokens": comp, "lora_rank": 16}
+    kw = {
+        "seq_len": seq,
+        "max_tokens": comp,
+        "lora_rank": 16,
+        "batch_size": 1,
+        "group_size": 1,
+    }
     v1, v2 = 100_000, 248_320
     delta = estimate_vram_gb(4.0, "opd", "bf16", vocab=v2, **kw) - estimate_vram_gb(
         4.0, "opd", "bf16", vocab=v1, **kw
@@ -2391,17 +2428,29 @@ def test_opd_vram_thinking_completion_default_not_underbudgeted():
     assert think > non_think  # thinking's longer completion budgets strictly more logits
 
 
-def test_opd_vram_is_single_sequence_not_batch_scaled():
-    """Regression (codex[bot], vram.py): OPD's VRAM estimate must NOT scale its activations with
-    batch_size (the SFT per-device micro-batch term over-budgeted opd and bumped the GPU tier). At a
-    short seq_len and group_size=1, OPD's rollout KV stays on its floor, isolating the training term:
-    the estimate stays flat across batch_size while SFT's grows."""
+def test_opd_vram_scales_to_loss_microbatch_not_full_batch():
+    """OPD's dense-logit loss budget tracks the worker's loss microbatch.
+
+    It should grow from one to four samples for <=10B models, then stop at the loss microbatch cap
+    instead of scaling with the full prompt batch. The 35B path remains serial by default.
+    """
     from flash.engine.vram import estimate_vram_gb
 
     kw = {"seq_len": 1024, "vocab": 248_320, "lora_rank": 16}
     opd_bs1 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=1, group_size=1, **kw)
+    opd_bs4 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=4, group_size=1, **kw)
     opd_bs16 = estimate_vram_gb(4.0, "opd", "bf16", batch_size=16, group_size=1, **kw)
-    assert opd_bs1 == opd_bs16  # batch_size does not scale the single-sequence training term
+    assert opd_bs4 > opd_bs1
+    assert opd_bs16 == opd_bs4  # capped at OPD_LOSS_MICROBATCH_SIZE, not full batch_size
+    kw_35b = {"seq_len": 1024, "lora_rank": 16, "group_size": 1}
+    v1, v2 = 100_000, 248_320
+    opd_35b_delta_bs1 = estimate_vram_gb(
+        35.0, "opd", "bf16", batch_size=1, vocab=v2, **kw_35b
+    ) - estimate_vram_gb(35.0, "opd", "bf16", batch_size=1, vocab=v1, **kw_35b)
+    opd_35b_delta_bs16 = estimate_vram_gb(
+        35.0, "opd", "bf16", batch_size=16, vocab=v2, **kw_35b
+    ) - estimate_vram_gb(35.0, "opd", "bf16", batch_size=16, vocab=v1, **kw_35b)
+    assert opd_35b_delta_bs16 == pytest.approx(opd_35b_delta_bs1, rel=1e-9)
     # contrast: SFT DOES scale with the micro-batch when it is not floored by the dense-logits cap.
     sft_bs1 = estimate_vram_gb(
         4.0, "sft", "bf16", batch_size=1, seq_len=1024, vocab=1, lora_rank=16
@@ -3177,6 +3226,7 @@ class _TinyLM:
 
     def __init__(self, torch, T, V):
         self.w = torch.zeros(T, V, requires_grad=True)
+        self.config = SimpleNamespace(use_cache=True)
 
     def __call__(self, input_ids):
         B = input_ids.shape[0]
@@ -3235,6 +3285,52 @@ def test_resolve_samples_batched_returns_differentiable_gkd_losses():
     assert all(r.loss is not None and r.loss.requires_grad for r in out)
     (sum(r.loss for r in out if r.loss is not None) / 2).backward()
     assert model.w.grad[0].abs().sum() > 0
+
+
+def test_resolve_samples_batched_backprops_before_next_loss_microbatch():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
+
+    class _GradObservedLM(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=3, V=8)
+            self.grad_seen_before_forward = []
+
+        def __call__(self, input_ids):
+            self.grad_seen_before_forward.append(
+                bool(self.w.grad is not None and self.w.grad.abs().sum() > 0)
+            )
+            return super().__call__(input_ids)
+
+    model = _GradObservedLM()
+    knobs = SimpleNamespace(kl_coef=1.0)
+    samples = [
+        (
+            opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+            [1],
+        ),
+        (
+            opd_mod._GenResult(completion_ids=[3], completion_text="b", gen_tokens=1),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("b", -0.7, 0, 1)], status="ok"),
+            [1],
+        ),
+    ]
+
+    out = opd_mod._resolve_samples_batched(
+        model, _Tok(), "cpu", samples, knobs, microbatch=1, backward_scale=0.5
+    )
+
+    assert [r.loss is not None and not r.loss.requires_grad for r in out] == [True, True]
+    assert model.grad_seen_before_forward == [False, True]
+    assert model.w.grad is not None
+    assert model.w.grad.abs().sum() > 0
 
 
 def test_resolve_samples_batched_uses_full_logits():
