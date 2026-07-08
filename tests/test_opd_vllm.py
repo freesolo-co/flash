@@ -76,6 +76,7 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
         attention_backend="TRITON_ATTN",
         mm_encoder_attn_backend="TORCH_SDPA",
         enforce_eager=True,
+        compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"},
         seed=123,
         adapter_root=str(tmp_path / "sync"),
     )
@@ -94,6 +95,10 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
     assert _FakeLLM.last_kwargs["attention_backend"] == "TRITON_ATTN"
     assert _FakeLLM.last_kwargs["mm_encoder_attn_backend"] == "TORCH_SDPA"
     assert _FakeLLM.last_kwargs["enforce_eager"] is True
+    assert _FakeLLM.last_kwargs["compilation_config"] == {
+        "mode": 0,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+    }
     assert _FakeLLM.last_kwargs["seed"] == 123
     assert first.lora_int_id == 1
     assert second.lora_int_id == 2
@@ -366,8 +371,8 @@ def test_opd_vllm_kwargs_keeps_cuda_graphs_on_datacenter_cards(monkeypatch, cc):
     assert out["enforce_eager"] is None
 
 
-@pytest.mark.parametrize("cc", [(8, 9), (10, 0), (12, 0)])
-def test_opd_vllm_kwargs_keeps_eager_workaround_on_b200_and_untested_cards(monkeypatch, cc):
+@pytest.mark.parametrize("cc", [(10, 0), (12, 0)])
+def test_opd_vllm_kwargs_uses_decode_cuda_graphs_on_blackwell(monkeypatch, cc):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
     from flash.engine.worker.opd_vllm import opd_vllm_kwargs
@@ -387,6 +392,7 @@ def test_opd_vllm_kwargs_keeps_eager_workaround_on_b200_and_untested_cards(monke
     vllm_mod.__version__ = "0.19.1"
     monkeypatch.setitem(sys.modules, "torch", torch_mod)
     monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+    monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
     monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: "FLASHINFER")
     monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
     monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.0)
@@ -394,7 +400,43 @@ def test_opd_vllm_kwargs_keeps_eager_workaround_on_b200_and_untested_cards(monke
 
     out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
 
+    assert out["enforce_eager"] is False
+    assert out["compilation_config"] == {
+        "mode": 0,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+    }
+    assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
+
+
+def test_opd_vllm_kwargs_keeps_eager_workaround_on_unvalidated_non_blackwell(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker import gpu_setup
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    class _Cuda:
+        @staticmethod
+        def get_device_capability():
+            return (8, 9)
+
+        @staticmethod
+        def get_device_properties(_idx):
+            return SimpleNamespace(total_memory=32e9)
+
+    torch_mod = types.ModuleType("torch")
+    torch_mod.cuda = _Cuda
+    vllm_mod = types.ModuleType("vllm")
+    vllm_mod.__version__ = "0.19.1"
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+    monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: None)
+    monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.0)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *a, **k: 0.37)
+
+    out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
+
     assert out["enforce_eager"] is True
+    assert out["compilation_config"] is None
 
 
 def test_opd_vllm_kwargs_forces_b200_v1_inprocess_on_vllm_0190(monkeypatch):
@@ -425,5 +467,9 @@ def test_opd_vllm_kwargs_forces_b200_v1_inprocess_on_vllm_0190(monkeypatch):
 
     out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=1, group_size=1), 4096)
 
-    assert out["enforce_eager"] is True
+    assert out["enforce_eager"] is False
+    assert out["compilation_config"] == {
+        "mode": 0,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+    }
     assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
