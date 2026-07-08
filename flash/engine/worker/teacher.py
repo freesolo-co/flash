@@ -47,8 +47,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
 
     # The length checks and index loop below assume these are sequences. A malformed 200 with
     # token_logprobs=null or a scalar text_offset would make len()/indexing raise TypeError HERE,
-    # OUTSIDE the guard above — _train_one then swallows it as a generic (transient) skipped sample
-    # without setting last_teacher_status, so a consistently malformed teacher burns every OPD step
+    # outside teacher classification, so a consistently malformed teacher could burn every OPD step
     # before the no-signal failure. Reject non-list fields up front as a PERMANENT contract break.
     if not all(isinstance(v, list) for v in (tokens, token_logprobs, offsets)):
         _bad(
@@ -59,8 +58,8 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
     n = len(tokens)
     # A well-formed echo response returns tokens / token_logprobs / text_offset of EQUAL length,
     # so require EXACT equality (not merely "not shorter than tokens"). A SHORTER logprobs/offsets
-    # array makes the loop below IndexError (escapes as a generic exception _train_one swallows as a
-    # transient skip). A LONGER one is just as broken: `n = len(tokens)` would then silently ignore
+    # array makes the loop below IndexError outside teacher classification. A LONGER one is just as
+    # broken: `n = len(tokens)` would then silently ignore
     # the offsets/logprobs tail, and the last token (i == n-1) takes `end = len(full)` (the i+1<n
     # fallback), reinterpreting a token that should end mid-string as spanning through the whole
     # completion and training on the wrong logprob. Both are a broken teacher contract that won't
@@ -72,8 +71,8 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
         )
     # The loop coerces each offset with int(offsets[i]). A malformed 200 can still put a
     # non-numeric value in text_offset (e.g. [0, null] or [0, "bad"]) that passes the list/length
-    # guards above -- int() then raises TypeError/ValueError OUTSIDE any TeacherError, so _train_one
-    # swallows it as an unclassified skip and a consistently malformed teacher burns every OPD step
+    # guards above -- int() then raises TypeError/ValueError OUTSIDE any TeacherError, so a consistently
+    # malformed teacher could burn every OPD step
     # (codex[bot]). Validate the offsets are numeric (bools excluded) and non-decreasing up front
     # and reject as a PERMANENT contract break. token_logprobs[i] may still be null (handled below).
     prev_off = None
@@ -83,8 +82,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
             _bad(f"teacher echo response text_offset has a non-numeric value: {o!r}")
         # int(offsets[i]) below coerces each offset to a character index into `full`. A value that
         # is merely numeric still corrupts the alignment three ways that the check above misses:
-        # NaN/inf makes int() RAISE (outside any TeacherError -> _train_one swallows it as an
-        # unclassified skip); a fractional float silently TRUNCATES to a wrong index; an offset
+        # NaN/inf makes int() RAISE outside TeacherError; a fractional float silently TRUNCATES to a wrong index; an offset
         # outside [0, len(full)] yields a token span that starts before the completion or overshoots
         # it. Require a FINITE INTEGER within range up front and reject as PERMANENT (codex[bot]).
         # isfinite() must precede int() -- int(NaN) raises -- so the order here is load-bearing.
@@ -112,8 +110,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
     # token_logprobs[i] is coerced with float(...) below (None -> 0.0 for a null realized logprob,
     # e.g. the first token). A malformed 200 can still put a non-numeric value (e.g. a "NaN" string)
     # or a non-finite float (NaN/inf) here that passes the list/length guards: a non-numeric value
-    # makes float() RAISE ValueError OUTSIDE any TeacherError (-> _train_one swallows it as an
-    # unclassified skip), and a NaN/inf feeds straight into the gkd teacher_logsum and poisons the
+    # makes float() RAISE ValueError OUTSIDE any TeacherError, and a NaN/inf feeds straight into the gkd teacher_logsum and poisons the
     # loss with a non-finite gradient. Validate up front and reject as PERMANENT (codex[bot]). None
     # is allowed HERE (prompt-context tokens legitimately carry a null realized logprob); a null on
     # a token we actually KEEP (a completion token) is rejected in the emit loop below.
@@ -198,10 +195,9 @@ class TeacherClient:
             except urllib.error.HTTPError as e:
                 # Retry transient server/rate-limit errors; fail fast on 4xx client errors. Guard the
                 # error-body preview read: a retryable 429/5xx whose body is truncated or times out
-                # makes e.read() raise IncompleteRead/OSError BEFORE last_err is set, so it would
-                # escape the loop as a generic exception that _train_one swallows without classifying
-                # (last_teacher_status stays None) — repeated retryable errors then end as permanent
-                # no-signal instead of a retriable outage. Classify by e.code regardless (codex[bot]).
+                # makes e.read() raise IncompleteRead/OSError BEFORE last_err is set, so repeated
+                # retryable errors could end as permanent no-signal instead of a retriable outage.
+                # Classify by e.code regardless (codex[bot]).
                 try:
                     body_txt = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
                 except (http.client.IncompleteRead, OSError):
@@ -217,20 +213,18 @@ class TeacherClient:
             except http.client.IncompleteRead as e:
                 # The server sent an HTTP 200 header but the body was truncated mid-read() (dropped
                 # connection / short Content-Length). IncompleteRead is an http.client.HTTPException,
-                # NOT an OSError, so without this clause it escapes the retry loop and _train_one
-                # swallows it as an unclassified skipped sample (last_teacher_status stays None) -- a
-                # stream of truncated 200s then burns every OPD step and fails as a permanent no-signal
-                # run instead of retrying. Classify as TRANSIENT teacher infra, like the unparseable-
-                # body case below (codex[bot]).
+                # NOT an OSError, so without this clause it escapes the retry loop. A stream of truncated
+                # 200s could then burn every OPD step and fail as a permanent no-signal run instead of
+                # retrying. Classify as TRANSIENT teacher infra, like the unparseable-body case below
+                # (codex[bot]).
                 last_err = TeacherError(f"teacher HTTP 200 body truncated mid-read on {path}: {e}")
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 # HTTP 200 with a malformed / non-JSON body (a flaky proxy or gateway returning an
                 # error page under a 200, a truncated read). The teacher contract is 200 => JSON, so
                 # classify this as TRANSIENT teacher infra: retry in the loop, and if it persists the
-                # exhausted last_err surfaces as a TeacherError -- NOT a raw JSONDecodeError, which
-                # _train_one would swallow as an unclassified skip (last_teacher_status stays None) and
-                # a run hammered by malformed 200s would then fail as permanent no-signal instead of
-                # being retried as teacher infra.
+                # exhausted last_err surfaces as a TeacherError -- NOT a raw JSONDecodeError, so a run
+                # hammered by malformed 200s is retried as teacher infra instead of failing as permanent
+                # no-signal.
                 last_err = TeacherError(
                     f"teacher returned HTTP 200 with unparseable body on {path}: {e}"
                 )
@@ -347,8 +341,8 @@ class TeacherClient:
             )
         # A non-empty completion must produce at least one completion-region teacher token. An empty
         # `out` means every returned token fell ENTIRELY in the prompt (end <= plen) -- a prompt-only /
-        # no-completion-token echo. The caller (_train_one) would otherwise mark this teacher call "ok"
-        # (it returned without error) yet get no gkd signal from it, so a persistently prompt-only teacher
+        # no-completion-token echo. The caller would otherwise see this teacher call as "ok" (it returned
+        # without error) yet get no gkd signal from it, so a persistently prompt-only teacher
         # burns every OPD step before the generic no-signal failure instead of aborting on the first bad
         # echo. Reject as a PERMANENT contract break (codex[bot]). This is the downstream backstop to the
         # tiling check above: a covering echo of a non-empty completion always yields a completion token,
