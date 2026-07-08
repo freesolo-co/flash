@@ -97,7 +97,7 @@ def _opd_env_bool(name: str, default: bool) -> bool:
 
 
 def _opd_completion_logits_only_enabled() -> bool:
-    return _opd_env_bool("FLASH_OPD_COMPLETION_LOGITS_ONLY", True)
+    return _opd_env_bool("FLASH_OPD_COMPLETION_LOGITS_ONLY", False)
 
 
 def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:

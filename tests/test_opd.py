@@ -3499,6 +3499,7 @@ def test_resolve_samples_batched_projects_only_completion_suffix_logits(monkeypa
 
     model = _SuffixLM()
     knobs = SimpleNamespace(kl_coef=1.0)
+    monkeypatch.setenv("FLASH_OPD_COMPLETION_LOGITS_ONLY", "1")
     samples = [
         (
             opd_mod._GenResult(completion_ids=[2, 3], completion_text="ab", gen_tokens=2),
