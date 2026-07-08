@@ -110,6 +110,19 @@ def opd_rollout_concurrency(prompts_per_step: int = 1, group_size: int = 1) -> i
     return _positive_int(prompts_per_step, 1) * _positive_int(group_size, 1)
 
 
+def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: int = 1) -> int:
+    """Loss microbatch size used by OPD's dense-logit GKD backward.
+
+    Keep this in lockstep with worker.opd._opd_loss_microbatch_size without importing the worker from
+    the sizing path. Small/medium catalog models run up to four loss samples per forward; 35B-class
+    models stay serial for VRAM safety.
+    """
+    total = opd_rollout_concurrency(prompts_per_step, group_size)
+    params = float(params_b or 0.0)
+    default = 4 if params and params <= 10.0 else 1
+    return max(1, min(total, default))
+
+
 def _resident_kv_gb(
     params_b: float | None, vllm_max_len: int, num_generations: int = 8, fp8_kv: bool = False
 ) -> float:
@@ -366,11 +379,10 @@ def estimate_vram_gb(
         # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
         # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
         completion = opd_completion_len(max_tokens, thinking)
-        # run_opd backprops a small loss microbatch, but OPD's placement budget stays conservative by
-        # treating activations + dense logits as SINGLE-sequence — NOT sft_per_device(batch_size). The
-        # batch-size activation term over-budgeted opd and bumped the GPU tier unnecessarily (reported by
-        # codex[bot]).
-        activations = _ACT_COEF * (seq_len / 1024.0) * width
+        # run_opd backprops a small loss microbatch. Budget that actual dense-logit microbatch, not
+        # the full rollout/teacher batch and not a single sequence.
+        loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
+        activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
         # Dense-logit peak spans BOTH the forward and the loss BACKWARD (OPD has no fused CE):
         #   - forward:  bf16 full-sequence logits [seq, vocab]        (seq * 2)
         #               fp32 completion rows [completion, vocab] for logsumexp, saved for backward
@@ -383,8 +395,8 @@ def estimate_vram_gb(
         # so a long-completion / large-vocab (248k) opd job under-budgeted the loss backward by
         # ~(completion*4 + seq*2)*vocab bytes and could route to a GPU that OOMs in OPD loss backward
         # (codex[bot]). Mirror the SFT dense-logit sizing by budgeting the backward buffers too.
-        logits_fwd = (seq_len * 2 + completion * 4) * vocab
-        logits_bwd = (seq_len * 2 + completion * 4) * vocab
+        logits_fwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
+        logits_bwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
         logits = (logits_fwd + logits_bwd) / 1e9
         return base + rollout + activations + logits
     # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even

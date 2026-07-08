@@ -463,7 +463,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            "A100 PCIe",
+            "RTX Pro 6000",
         ),
         (
             "max_context_16384",
@@ -474,7 +474,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            "RTX Pro 6000",
+            "B200",
         ),
         (
             "max_context_24576",
@@ -485,7 +485,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            "H200",
+            None,
         ),
         (
             "group_size_8",
@@ -511,20 +511,33 @@ def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(monkeypatch, la
 
     model = "Qwen/Qwen3.5-2B"
     need = required_vram_gb(model, "opd", train=train)
+    run_config = RunConfig(
+        model,
+        "opd",
+        int(train.get("epochs", 1)),
+        seq_len=train.get("max_context_tokens"),
+        completion_len=train.get("max_completion_tokens"),
+        group_size=train.get("group_size"),
+        lora_rank=train.get("lora_rank"),
+        provider="runpod",
+    )
+
+    assert need > 40
+    if expected_gpu is None:
+        from flash.providers.base import GPU_INFO, UnsupportedGpuError
+
+        assert need > max(g.vram_gb for g in GPU_INFO.values() if g.validated)
+        with pytest.raises(UnsupportedGpuError):
+            provisional_gpu(model, "opd", train=train)
+        with pytest.raises(UnsupportedGpuError):
+            allocator.allocate(model, "opd", train=train)
+        with pytest.raises(ValueError, match="no GPU class fits"):
+            estimate_cost(run_config)
+        return
+
     preview_gpu = provisional_gpu(model, "opd", train=train)
     alloc = allocator.allocate(model, "opd", train=train)
-    estimate = estimate_cost(
-        RunConfig(
-            model,
-            "opd",
-            int(train.get("epochs", 1)),
-            seq_len=train.get("max_context_tokens"),
-            completion_len=train.get("max_completion_tokens"),
-            group_size=train.get("group_size"),
-            lora_rank=train.get("lora_rank"),
-            provider="runpod",
-        )
-    )
+    estimate = estimate_cost(run_config)
     spec = spec_from_dict(
         {
             "model": model,
@@ -536,7 +549,6 @@ def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(monkeypatch, la
         run_id=f"opd-sweep-{label}",
     )
 
-    assert need > 40
     assert preview_gpu == expected_gpu
     assert alloc.gpu == expected_gpu
     assert estimate.gpu == expected_gpu
@@ -568,7 +580,7 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
     }
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train)
-    assert 40 < need <= 80
+    assert 80 < need <= 141
 
     preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "opd", train=train)
     alloc = allocator.allocate("Qwen/Qwen3.5-4B", "opd", train=train)
@@ -584,7 +596,7 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
         )
     )
 
-    assert preview_gpu == "A100 PCIe"
+    assert preview_gpu == "H200"
     assert alloc.gpu == preview_gpu
     assert alloc.min_vram_gb == need
     assert estimate.required_vram_gb == need
