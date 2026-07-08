@@ -73,6 +73,33 @@ OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
 
 
+def _opd_env_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[opd] ignoring invalid {name}={raw!r}")
+        return None
+
+
+def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:
+    total = max(1, int(total_prompts))
+    override = _opd_env_int("FLASH_OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE")
+    if override is not None:
+        return max(1, min(total, override))
+    return max(1, min(total, OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE))
+
+
+def _opd_rollout_pipeline_max_chunks(total_prompts: int) -> int:
+    total = max(1, int(total_prompts))
+    override = _opd_env_int("FLASH_OPD_ROLLOUT_PIPELINE_MAX_CHUNKS")
+    if override is not None:
+        return max(1, min(total, override))
+    return max(1, min(total, OPD_ROLLOUT_PIPELINE_MAX_CHUNKS))
+
+
 def _opd_rollout_pipeline_chunks(total_prompts: int) -> int:
     """Number of single-turn rollout chunks in one OPD step.
 
@@ -83,10 +110,12 @@ def _opd_rollout_pipeline_chunks(total_prompts: int) -> int:
     total = max(1, int(total_prompts))
     if total < 8:
         return 1
-    chunks = (total + OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE - 1) // (
-        OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE
-    )
-    return max(2, min(OPD_ROLLOUT_PIPELINE_MAX_CHUNKS, chunks))
+    target_chunk = _opd_rollout_pipeline_target_chunk_size(total)
+    max_chunks = _opd_rollout_pipeline_max_chunks(total)
+    chunks = (total + target_chunk - 1) // target_chunk
+    if max_chunks == 1:
+        return 1
+    return max(2, min(max_chunks, chunks))
 
 
 def _opd_rollout_chunk_size(total_prompts: int) -> int:
@@ -95,17 +124,6 @@ def _opd_rollout_chunk_size(total_prompts: int) -> int:
     total = max(1, int(total_prompts))
     chunks = _opd_rollout_pipeline_chunks(total)
     return max(1, (total + chunks - 1) // chunks)
-
-
-def _opd_env_int(name: str) -> int | None:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        print(f"[opd] ignoring invalid {name}={raw!r}")
-        return None
 
 
 def _opd_teacher_batch_size(total_samples: int) -> int:
@@ -1067,6 +1085,14 @@ def run_opd():
             ),
             "opd_rollout_chunk_size": (
                 _opd_rollout_chunk_size(ppl_step * group) if not multi_turn else None
+            ),
+            "opd_rollout_pipeline_target_chunk_size": (
+                _opd_rollout_pipeline_target_chunk_size(ppl_step * group)
+                if not multi_turn
+                else None
+            ),
+            "opd_rollout_pipeline_max_chunks": (
+                _opd_rollout_pipeline_max_chunks(ppl_step * group) if not multi_turn else None
             ),
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
