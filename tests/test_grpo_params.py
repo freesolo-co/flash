@@ -630,6 +630,37 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
             spec_from_dict({**base, "train": {**bad}}, run_id="bad")
 
 
+def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
+    """TRL rejects GRPO group_size=1 on the GPU worker; reject it at parse time instead."""
+    from flash.schema import ConfigError
+
+    base = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+    }
+
+    with pytest.raises(ConfigError, match=r"group_size.*>= 2.*GRPO"):
+        spec_from_dict({**base, "train": {"steps": 1, "group_size": 1}}, run_id="bad")
+
+    spec = spec_from_dict({**base, "train": {"steps": 1, "group_size": 2}}, run_id="ok")
+    assert spec.train.group_size == 2
+
+
+def test_opd_allows_single_generation_group() -> None:
+    """OPD distils individual completions, so group_size=1 remains a valid smoke/test setting."""
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "opd",
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "train": {"steps": 1, "group_size": 1},
+        },
+        run_id="opd-ok",
+    )
+    assert spec.train.group_size == 1
+
+
 def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
     # steps/epochs must run through _train_int like every other integer knob: a
     # non-integer (e.g. steps=1.5) must 400 at parse time, not slip through to the
