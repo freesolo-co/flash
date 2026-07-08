@@ -59,6 +59,7 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
         "attention_backend": None,
         "mm_encoder_attn_backend": None,
         "enforce_eager": None,
+        "compilation_config": None,
     }
     free_gb = 0.0
     try:
@@ -145,15 +146,15 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
         force_vit_sdpa_on_blackwell()
         kwargs["mm_encoder_attn_backend"] = "TORCH_SDPA"
 
-    # The 35B thinking OPD path repeatedly reached a resident V1 EngineCore subprocess on B200, then
-    # stalled before the first rollout. Keep V1, but run it in-process on sm100 so startup failures are
-    # surfaced directly and the SyncMPClient/child-process path cannot hang between trainer and rollout.
-    b200_inproc_v1 = cc == (10, 0)
-    if b200_inproc_v1:
+    # Blackwell OPD startup is more reliable with the V1 engine core in-process: the old B200 failure
+    # reached a resident SyncMPClient child process and then died/hung before the first rollout. This
+    # does NOT disable CUDA graphs; it only avoids the fragile parent/child EngineCore startup seam.
+    blackwell_inproc_v1 = cc and cc[0] in (10, 12)
+    if blackwell_inproc_v1:
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         print(
-            "[opd][warn] B200/sm100: VLLM_ENABLE_V1_MULTIPROCESSING=0 for OPD rollout "
-            "(avoid V1 SyncMPClient EngineCore startup stall)"
+            f"[opd][warn] Blackwell/sm{cc[0]}{cc[1]}: VLLM_ENABLE_V1_MULTIPROCESSING=0 "
+            "for OPD rollout (avoid V1 SyncMPClient EngineCore startup stall)"
         )
 
     try:
@@ -161,17 +162,25 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
 
         ver_base = _vllm_mod.__version__.split("+")[0]
         vllm_ver = tuple(int(x) for x in ver_base.split(".")[:3])
-        # vLLM 0.19.1 regressed graph capture on several consumer/untested arches, but forcing eager
-        # on stable datacenter cards is a large OPD rollout tax. Keep CUDA graphs on A100 (sm80) and
-        # H100/H200 (sm90). B200/sm100 is excluded here: a live 35B thinking OPD run reached a
-        # resident EngineCore, then stalled in graph initialization for minutes before any rollout.
-        cudagraph_safe = cc in {(8, 0), (9, 0)}
-        if vllm_ver >= (0, 19, 0) and not cudagraph_safe:
+        # vLLM's default 0.19.x graph path malfunctioned on Blackwell OPD startup, but full eager mode
+        # throws away the decode CUDA graph speed path. Use a narrower graph profile instead: disable
+        # torch.compile/AOT while keeping decode-only CUDA graph capture. That avoids the fragile
+        # compile/slot-mapping path but still exercises CUDA graphs on B200/RTX 5090.
+        if vllm_ver >= (0, 19, 0) and blackwell_inproc_v1:
+            kwargs["enforce_eager"] = False
+            kwargs["compilation_config"] = {
+                "mode": 0,  # CompilationMode.NONE: no torch.compile/AOT.
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+            }
+            print(
+                f"[opd] cc={cc[0]}.{cc[1]}: using decode-only vLLM CUDA graphs for OPD rollout "
+                "(torch.compile disabled, V1 EngineCore in-process)"
+            )
+        elif vllm_ver >= (0, 19, 0) and cc not in {(8, 0), (9, 0)}:
             kwargs["enforce_eager"] = True
             print(
                 f"[opd][warn] enforce_eager=True on the vLLM rollout (cc={cc[0]}.{cc[1]} -> "
-                "prevent 0.19.x aot_compile/slot-mapping crash or EngineCore graph-init stall on "
-                "this GPU family)"
+                "prevent 0.19.x aot_compile/slot-mapping crash on this unvalidated GPU family)"
             )
         elif vllm_ver >= (0, 19, 0):
             print(f"[opd] cc={cc[0]}.{cc[1]}: keeping vLLM CUDA graphs for OPD rollout speed")
@@ -198,6 +207,7 @@ class OpdVllmRolloutEngine:
     attention_backend: str | None = None
     mm_encoder_attn_backend: str | None = None
     enforce_eager: bool | None = None
+    compilation_config: dict[str, Any] | None = None
     seed: int | None = None
     adapter_root: str | None = None
     _version: int = 0
@@ -236,6 +246,8 @@ class OpdVllmRolloutEngine:
             kwargs["mm_encoder_attn_backend"] = self.mm_encoder_attn_backend
         if self.enforce_eager is not None:
             kwargs["enforce_eager"] = bool(self.enforce_eager)
+        if self.compilation_config:
+            kwargs["compilation_config"] = dict(self.compilation_config)
         if self.seed is not None:
             kwargs["seed"] = int(self.seed)
         try:
