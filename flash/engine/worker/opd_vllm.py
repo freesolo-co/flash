@@ -228,7 +228,14 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                 f"[opd] cc={cc[0]}.{cc[1]}: using decode-only vLLM CUDA graphs for OPD rollout "
                 "(torch.compile disabled, V1 EngineCore in-process)"
             )
-        elif vllm_ver >= (0, 19, 0) and cc not in {(8, 0), (9, 0)}:
+        elif vllm_ver >= (0, 19, 0) and cc == (9, 0):
+            kwargs["enforce_eager"] = False
+            kwargs["compilation_config"] = _decode_only_compilation_config()
+            print(
+                "[opd] Hopper/H200: using decode-only vLLM CUDA graphs for OPD rollout "
+                "(torch.compile disabled)"
+            )
+        elif vllm_ver >= (0, 19, 0) and cc != (8, 0):
             kwargs["enforce_eager"] = True
             print(
                 f"[opd][warn] enforce_eager=True on the vLLM rollout (cc={cc[0]}.{cc[1]} -> "
