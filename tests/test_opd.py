@@ -1264,9 +1264,9 @@ def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
     assert captured["stage"] == "opd_step"
     assert callable(captured["progress"]), "opd must pass a progress callback to liveness_heartbeat"
     # The callback reports the monotonic sample count. An all-skip run lands no optimizer update, so
-    # the bounded-retry loop visits its full budget of max_iters = 2*steps + 10 = 12 fresh slices
-    # (1 prompt x 1 group each) before the post-loop guard raises -> samples_seen advanced to 12.
-    assert captured["progress"]() == 12
+    # the bounded-retry loop visits its full budget of max_iters = 3*steps + 10 = 13 fresh slices
+    # (1 prompt x 1 group each) before the post-loop guard raises -> samples_seen advanced to 13.
+    assert captured["progress"]() == 13
 
 
 def test_opd_vllm_generation_uses_keepalive_heartbeat(monkeypatch):
@@ -1425,6 +1425,59 @@ def test_opd_no_signal_from_transient_teacher_is_retriable(monkeypatch):
         opd_mod.run_opd()
     assert not isinstance(ei.value, RetriableInfraError)
     assert "no trained step" in str(ei.value)
+
+
+def test_opd_resamples_no_signal_rollout_before_skipping_step(monkeypatch):
+    """A single all-skip rollout attempt should not consume a requested optimizer update. OPD should
+    resample within the same optimizer step and train when the replacement yields teacher signal."""
+
+    torch = pytest.importorskip("torch")
+
+    state = {"n": 0}
+    metas = []
+
+    def _skip_once_then_update(*, model, **_k):
+        from flash.engine.worker.opd import SampleResult
+
+        state["n"] += 1
+        if state["n"] == 1:
+            return SampleResult(teacher_status="ok", skip_reason="alignment_empty")
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_skip_once_then_update, epochs=1, group=1)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._w, "write_train_meta", lambda **kw: metas.append(kw))
+
+    opd_mod.run_opd()
+
+    assert state["n"] == 2
+    notes = metas[-1]["notes"]
+    assert notes["opt_steps"] == 1
+    assert notes["no_signal_resamples"] == 1
+    assert notes["no_signal_skipped_steps"] == 0
+    assert notes["skip_reasons"] == {"alignment_empty": 1}
+
+
+def test_opd_no_signal_log_includes_skip_reasons(monkeypatch, capsys):
+    """The skipped-step line must explain why the signal was unusable."""
+
+    def _all_empty(**_k):
+        return opd_mod.SampleResult(skip_reason="empty_completion")
+
+    opd_mod = _opd_harness(monkeypatch, train_one=_all_empty)
+    with pytest.raises(RuntimeError, match="no trained step"):
+        opd_mod.run_opd()
+
+    out = capsys.readouterr().out
+    assert "no usable teacher signal" in out
+    assert "empty_completion" in out
 
 
 def test_opd_emits_progress_heartbeat_while_filtering_prompts(monkeypatch):
@@ -1684,7 +1737,7 @@ def test_opd_loop_drives_by_optimizer_updates_and_fails_permanently_on_determini
         opd_mod.run_opd()
     assert not isinstance(ei.value, RetriableInfraError)  # permanent, NOT the retriable path
     # The loop is BOUNDED: it did not spin forever waiting for updates that never come.
-    assert state["n"] <= 2 * 3 + 10
+    assert state["n"] <= 3 * 3 + 10
 
 
 def test_opd_transient_teacher_shortfall_is_retriable(monkeypatch):
@@ -3027,6 +3080,35 @@ def test_teacher_score_rejects_echo_with_no_completion_tokens_as_permanent(monke
         client.score("P", "hi")
     assert ei.value.permanent is True
     assert "no completion-region tokens" in str(ei.value).lower()
+
+
+def test_score_one_retries_same_completion_after_transient_teacher_failure():
+    """A flaky teacher response should retry scoring the realized completion before OPD spends another
+    GPU rollout."""
+
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.teacher import TeacherError
+
+    calls = {"n": 0}
+
+    class _Teacher:
+        def score(self, prompt, completion):
+            calls["n"] += 1
+            assert completion == "hi"
+            if calls["n"] == 1:
+                raise TeacherError("temporary 503")
+            return [TeacherToken(text="hi", logprob=-1.0, start=0, end=2)]
+
+    result = opd_mod._score_one(
+        _Teacher(),
+        opd_mod._GenResult(completion_text="hi"),
+        prompt_messages=[{"role": "user", "content": "say hi"}],
+        thinking_prefill="",
+    )
+
+    assert calls["n"] == 2
+    assert result.status == "ok"
+    assert result.teacher_toks
 
 
 def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkeypatch):
