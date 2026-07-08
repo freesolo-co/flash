@@ -181,12 +181,13 @@ def test_build_worker_env():
         run_id="r1",
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        train=TrainSpec(steps=20),
+        train=TrainSpec(epochs=1, max_examples=8),
     )
     env = build_worker_env(spec, 0)
     assert env["RUN_ID"] == "r1"
     assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-4B"
-    assert env["RL_STEPS"] == "20"
+    assert "RL_STEPS" not in env
+    assert "SFT_EPOCHS" not in env
 
 
 def test_grpo_kv_floor_escalates_large_group_long_context():

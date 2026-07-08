@@ -496,7 +496,7 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         run_id="reattach",
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
-        train=TrainSpec(steps=1, hf_repo=""),
+        train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
         gpu=GpuSpec(type="A100"),
     )
     base = {
@@ -1257,7 +1257,7 @@ def _spec(run_id):
         run_id=run_id,
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
-        train=TrainSpec(steps=1),
+        train=TrainSpec(epochs=1, max_examples=1),
         gpu=GpuSpec(type="RTX 4090", max_retries=2),
     )
 
@@ -1310,7 +1310,8 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
                 "train": {
-                    "steps": 1,
+                    "epochs": 1,
+                    "max_examples": 1,
                     "hf_repo": "Freesolo-Co/flashrun-source-env",
                 },
             }
@@ -1360,7 +1361,7 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
         orch._save_status(
@@ -1399,7 +1400,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
@@ -1435,7 +1436,7 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
         orch._save_status(
@@ -1464,7 +1465,7 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
@@ -1492,7 +1493,7 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
@@ -1526,7 +1527,7 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
         orch._save_status(
@@ -1566,7 +1567,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
         orch._save_status(
@@ -1614,7 +1615,7 @@ def test_attach_resolves_public_init_ref_before_recovery_launch(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"steps": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
         orch._save_status(
@@ -1871,7 +1872,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id="no-retry", model="Qwen/Qwen3.5-0.8B", algorithm="grpo",
-            train=TrainSpec(steps=1), gpu=GpuSpec(type="RTX 4090", max_retries=0),
+            train=TrainSpec(epochs=1, max_examples=1), gpu=GpuSpec(type="RTX 4090", max_retries=0),
         )
         with pytest.raises(RuntimeError):
             orch.submit_job(spec, dry_run=False, background=False)
@@ -1908,7 +1909,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             run_id="walk",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(steps=1),
+            train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
@@ -1970,7 +1971,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
             run_id="oom-walk",
             model="Qwen/Qwen3.5-4B",
             algorithm="opd",
-            train=TrainSpec(steps=1),
+            train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
@@ -2004,7 +2005,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
             run_id="code-crash",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(steps=1),
+            train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         with pytest.raises(RuntimeError, match="bad reward fn"):
@@ -2062,7 +2063,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
             run_id="clamp",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(steps=1),
+            train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
@@ -2114,7 +2115,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
             run_id="lastgpu",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(steps=1),
+            train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
@@ -2166,7 +2167,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             run_id="alloc-blip",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
-            train=TrainSpec(steps=1),
+            train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)

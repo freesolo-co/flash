@@ -497,7 +497,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert sft.is_file()
     assert not (tmp_path / "configs/endpoints.toml").exists()
     assert 'algorithm = "grpo"' in grpo.read_text()
-    assert "steps = 150" in grpo.read_text()
+    assert "epochs = 1" in grpo.read_text()
+    assert "max_examples = 2" in grpo.read_text()
     assert "cheapest fitting managed class" in grpo.read_text()
     assert "private environment-scoped repo" in grpo.read_text()
     assert 'algorithm = "sft"' in sft.read_text()
@@ -509,7 +510,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert opd.is_file()
     opd_text = opd.read_text()
     assert 'algorithm = "opd"' in opd_text
-    assert "steps = 100" in opd_text
+    assert "epochs = 1" in opd_text
+    assert "max_examples = 2" in opd_text
     # The teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
     # the user to export it, so the generated config must not mention FIREWORKS_API_KEY at all.
     assert "FIREWORKS_API_KEY" not in opd_text

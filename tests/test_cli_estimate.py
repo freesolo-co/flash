@@ -19,7 +19,8 @@ GRPO_RAW = {
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {
-        "steps": 50,
+        "epochs": 1,
+        "max_examples": 800,
         "group_size": 8,
         "batch_size": 16,
         "max_completion_tokens": 512,
@@ -54,10 +55,29 @@ def test_runconfig_from_grpo_spec_maps_fields():
     assert cfg.environment == "github:freesolo-co/envs@main:gsm8k/environment.py"
 
 
-def test_grpo_uses_recipe_steps_when_omitted():
+def test_grpo_default_epochs_mirror_recipe():
     spec = _spec()
-    object.__setattr__(spec.train, "steps", None)
-    assert _spec_steps(spec) == RECIPE.rl.num_steps
+    object.__setattr__(spec.train, "epochs", None)
+    assert RECIPE.rl.num_epochs == 1
+    assert _spec_steps(spec) == 50
+
+
+def test_grpo_epochs_derive_steps_from_max_examples():
+    spec = _spec(**{"train.epochs": 2, "train.max_examples": 33})
+    assert _spec_steps(spec) == 5  # ceil(33 rows * 2 epochs / batch_size 16)
+
+
+def test_grpo_epochs_need_max_examples_for_cost():
+    spec = _spec(**{"train.max_examples": None, "train.epochs": 2})
+    assert _spec_steps(spec) == 2
+
+
+def test_opd_epochs_derive_steps_from_max_examples():
+    raw = copy.deepcopy(GRPO_RAW)
+    raw["algorithm"] = "opd"
+    raw["train"].update({"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1})
+    spec = spec_from_dict(raw)
+    assert _spec_steps(spec) == 5  # ceil(17 rows * 2 epochs / batch_size 8)
 
 
 def test_sft_steps_derived_from_examples():
@@ -122,13 +142,6 @@ def test_sft_steps_use_worker_realized_grad_accum_batch():
     # ceil(320/6)*2 = 108 the old derivation produced.
     spec = _sft_spec(max_examples=320, batch_size=6, epochs=2)
     assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=6, epochs=2) == 80
-
-
-def test_sft_ignores_train_steps_for_step_count():
-    # train.steps is a GRPO concept; SFT must derive from epochs/examples/realized-batch and NOT
-    # honor a stray train.steps.
-    spec = _sft_spec(max_examples=320, batch_size=16, epochs=2, steps=9999)
-    assert _spec_steps(spec) == 40
 
 
 def test_sft_steps_unpinned_requires_max_examples():
@@ -207,7 +220,9 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         "[environment]\n"
         'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
         "[train]\n"
-        "steps = 50\n"
+        "epochs = 1\n"
+        "max_examples = 800\n"
+        "batch_size = 16\n"
         'hf_repo = "owner/runs"\n'
         "[gpu]\n"
         'type = "RTX 5090"\n'
@@ -241,7 +256,8 @@ def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
         "[environment]\n"
         'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
         "[train]\n"
-        "steps = 10\n"
+        "epochs = 1\n"
+        "max_examples = 10\n"
         'hf_repo = "owner/runs"\n'
     )
     args = types.SimpleNamespace(
