@@ -590,6 +590,7 @@ def model_required_vram_gb(
         use_vllm: bool = True,
         vocab: int = _VOCAB_DEFAULT,
         active_params_b: float | None = None,
+        fp8_kv: bool = False,
     ) -> int:
         est = estimate_vram_gb(
             params_b,
@@ -604,9 +605,44 @@ def model_required_vram_gb(
             use_vllm=use_vllm,
             vocab=vocab,
             active_params_b=active_params_b,
+            fp8_kv=fp8_kv,
             sft_fused_ce=sft_fused_ce,
         )
         return math.ceil(est * headroom)
+
+    def _opd_fp8_adjust(
+        need: int,
+        params_b: float,
+        *,
+        quant: str = "bf16",
+        use_vllm: bool = True,
+        vocab: int = _VOCAB_DEFAULT,
+        active_params_b: float | None = None,
+    ) -> int:
+        """Re-size an OPD requirement with an fp8 KV cache once the run is provably modern-card-only.
+
+        The colocated OPD vLLM rollout engine reserves an fp8 KV cache on cc >= 8.9 hardware
+        (engine/worker/opd_vllm.py), but the estimate defaults to a bf16 KV pool. Any OPD run needing
+        more VRAM than the biggest non-fp8 validated card (the 80 GB A100) can ONLY land on a modern
+        (cc >= 8.9) card, so that bf16 pool is a phantom: it doubles the real KV and wrongly rejects
+        full-context / grouped OPD configs on the 35B that actually fit a B200. Halve it — but only
+        while the fp8-sized requirement still clears the non-fp8 ceiling, so the discount can never
+        pull the run back onto a card that would NOT use fp8 (which would then OOM)."""
+        from flash.providers.base import max_non_fp8_kv_vram_gb
+
+        ceiling = max_non_fp8_kv_vram_gb()
+        if need <= ceiling:
+            return need
+        fp8_need = _need(
+            params_b,
+            "opd",
+            quant=quant,
+            use_vllm=use_vllm,
+            vocab=vocab,
+            active_params_b=active_params_b,
+            fp8_kv=True,
+        )
+        return fp8_need if fp8_need > ceiling else need
 
     from flash.catalog import MODELS, vocab_size_for
 
@@ -637,6 +673,15 @@ def model_required_vram_gb(
             vocab=model_vocab,
             active_params_b=active_b,
         )
+        if is_opd:
+            need = _opd_fp8_adjust(
+                need,
+                params_b or 4.0,
+                quant=quant,
+                use_vllm=use_vllm,
+                vocab=model_vocab,
+                active_params_b=active_b,
+            )
         floor = 0
         if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
             floor = int(info.grpo_min_vram_gb)
@@ -702,6 +747,8 @@ def model_required_vram_gb(
     # open-model OPD uses its own dense-logit + colocated-vLLM estimator. The grpo-only sequence
     # escalation stays gated on is_grpo.
     need = _need(params_b, algorithm, vocab=model_vocab)
+    if is_opd:
+        need = _opd_fp8_adjust(need, params_b, vocab=model_vocab)
     if is_grpo:
         need += grpo_seq_escalation_gb(params_b, seq_len)
     if is_vllm_rollout:

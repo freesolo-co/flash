@@ -72,6 +72,27 @@ def test_expanded_gpu_table():
     assert all(int(g.sm.removeprefix("sm")) >= 80 for g in GPU_INFO.values())
 
 
+def test_sm_capability_and_fp8_kv_support():
+    """fp8 KV cache is a cc >= 8.9 feature the OPD/GRPO workers enable off get_device_capability();
+    sizing infers it from a class's ``sm`` string. Ada (4090, sm89), Hopper (H100/H200, sm90) and
+    Blackwell (B200 sm100, RTX Pro 6000/5090 sm120) qualify; Ampere (A100 sm80, A10 sm86) does not."""
+    from flash.providers.base import _sm_capability, max_non_fp8_kv_vram_gb, supports_fp8_kv
+
+    assert _sm_capability("sm80") == (8, 0)
+    assert _sm_capability("sm89") == (8, 9)
+    assert _sm_capability("sm90") == (9, 0)
+    assert _sm_capability("sm100") == (10, 0)
+    assert _sm_capability("sm120") == (12, 0)
+    assert _sm_capability("bogus") == (0, 0)  # unparseable -> pre-fp8
+    for name in ("RTX 4090", "H100", "H200", "B200", "RTX Pro 6000", "RTX 5090"):
+        assert supports_fp8_kv(name), name
+    for name in ("A100 PCIe", "A100 SXM", "A10"):
+        assert not supports_fp8_kv(name), name
+    # the largest validated card WITHOUT fp8 KV is the 80 GB A100 -> a run needing more can only land
+    # on a modern (fp8-capable) card.
+    assert max_non_fp8_kv_vram_gb() == 80
+
+
 def test_blackwell_min_cuda_pin():
     from flash.providers.base import min_cuda_modern
 
