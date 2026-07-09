@@ -525,8 +525,13 @@ def run_sft():
     # from recycling the worker. include_torch=False: side-thread torch.cuda telemetry serializes on
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
     with liveness_heartbeat("sft_initializing"):
+        sft_model = _w.prepare_fresh_lora_base(
+            model_id, model_id, mik, phase="sft"
+        )
+        if not isinstance(sft_model, str):
+            cfg.model_init_kwargs = None
         trainer = _SFT(
-            model=model_id,
+            model=sft_model,
             args=cfg,
             train_dataset=ds,
             peft_config=_w.make_lora(model_id),

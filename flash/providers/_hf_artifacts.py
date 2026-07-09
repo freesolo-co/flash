@@ -93,10 +93,10 @@ def make_hf_failure_detail_reader(
         parts: list[str] = []
         error_text = error_reader(force=force)
         if error_text:
-            parts.append(f"--- {err_name} ---\n{error_text[-4000:]}")
+            parts.append(f"--- {err_name} ---\n{error_text}")
         console_text = console_reader(force=force)
         if console_text:
-            parts.append(f"--- console_{phase}.txt ---\n{console_text[-4000:]}")
+            parts.append(f"--- console_{phase}.txt ---\n{console_text}")
         return "\n".join(parts) if parts else None
 
     return read

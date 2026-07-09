@@ -46,9 +46,13 @@ def test_decode_output_success():
 def test_decode_output_error_includes_stdout_tail():
     from flash.providers.runpod.jobs import decode_output
 
+    stdout = "STDOUT-BEGIN\n" + ("x" * 5000) + "\nSTDOUT-END"
     with pytest.raises(RuntimeError) as ei:
-        decode_output({"success": False, "error": "boom", "stdout": "x" * 5000})
-    assert "boom" in str(ei.value)
+        decode_output({"success": False, "error": "boom", "stdout": stdout})
+    msg = str(ei.value)
+    assert "boom" in msg
+    assert "STDOUT-BEGIN" in msg
+    assert "STDOUT-END" in msg
 
 
 def test_decode_output_client_mode_serverless_handler():
@@ -68,11 +72,14 @@ def test_decode_output_client_mode_error_includes_stdout_tail():
     crashes from it) — same as the Flash envelope path."""
     from flash.providers.runpod.jobs import decode_output
 
+    stdout = "STDOUT-BEGIN\n" + ("z" * 5000) + "\nSTDOUT-END"
     with pytest.raises(RuntimeError) as ei:
-        decode_output({"error": "vllm crashed", "stdout": "trace-line\n" + "z" * 5000})
+        decode_output({"error": "vllm crashed", "stdout": stdout})
     msg = str(ei.value)
     assert "vllm crashed" in msg
     assert "worker stdout tail" in msg
+    assert "STDOUT-BEGIN" in msg
+    assert "STDOUT-END" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -1191,6 +1198,32 @@ def test_failure_detail_reader_is_attempt_scoped(monkeypatch, tmp_path):
     assert "sft/run-1/seed0/error_sft_attempt0.txt" not in requested
     assert "--- error_sft_attempt2.txt ---" in detail
     assert "BOOM traceback" in detail
+
+
+def test_failure_detail_reader_preserves_full_worker_artifacts(monkeypatch):
+    from flash.providers import _hf_artifacts
+
+    def fake_reader(hf_repo, path_in_repo, min_interval_s):
+        def read(force=False):
+            if path_in_repo.endswith("error_sft_attempt2.txt"):
+                return "ERROR-BEGIN\n" + ("e" * 5000) + "\nERROR-END"
+            if path_in_repo.endswith("console_sft.txt"):
+                return "CONSOLE-BEGIN\n" + ("c" * 5000) + "\nCONSOLE-END"
+            return None
+
+        return read
+
+    monkeypatch.setattr(_hf_artifacts, "make_hf_text_reader", fake_reader)
+    reader = _hf_artifacts.make_hf_failure_detail_reader(
+        "org/repo", "sft/run-1/seed0", "sft", attempt=2
+    )
+
+    detail = reader(force=True)
+
+    assert "ERROR-BEGIN" in detail
+    assert "ERROR-END" in detail
+    assert "CONSOLE-BEGIN" in detail
+    assert "CONSOLE-END" in detail
 
 
 def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
