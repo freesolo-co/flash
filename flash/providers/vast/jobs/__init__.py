@@ -338,11 +338,11 @@ def _failure_detail(
     err_name = error_artifact_name(phase, attempt)
     content = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
     if content:
-        parts.append(f"--- {err_name} ---\n{content[-2000:]}")
+        parts.append(f"--- {err_name} ---\n{content}")
     if instance_id:
         logs = vast_api.instance_logs(int(instance_id))
         if logs:
-            parts.append(f"--- instance log tail ---\n{logs[-3000:]}")
+            parts.append(f"--- instance log tail ---\n{logs}")
     return "\n".join(parts) or "vast worker terminated without a DONE sentinel"
 
 
