@@ -262,10 +262,10 @@ def _failure_detail(hf_repo: str, prefix: str, phase: str, marker: dict | None, 
     err_name = error_artifact_name(phase, attempt)
     err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
     if err:
-        parts.append(f"--- {err_name} ---\n{err[-2000:]}")
+        parts.append(f"--- {err_name} ---\n{err}")
     boot = _make_hf_file_reader(hf_repo, f"{prefix}/lambda_attempt{attempt}_boot.log")(force=True)
     if boot:
-        parts.append(f"--- lambda_attempt{attempt}_boot.log (host) ---\n{boot[-3000:]}")
+        parts.append(f"--- lambda_attempt{attempt}_boot.log (host) ---\n{boot}")
     return "\n".join(parts) or "lambda worker terminated without a DONE sentinel"
 
 
