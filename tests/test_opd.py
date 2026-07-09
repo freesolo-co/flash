@@ -2386,6 +2386,81 @@ def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
     assert 141 < need <= 180
 
 
+def test_opd_35b_fp8_kv_admits_full_context_group1_on_b200():
+    """L5 regression: OPD's colocated vLLM rollout reserves an fp8 KV cache on cc >= 8.9 hardware
+    (worker/opd_vllm.py), but model_required_vram_gb sized that KV as bf16 — DOUBLE the real bytes —
+    so a full-context (4096) group_size=1 35B OPD run that actually fits a 180 GB B200 was rejected
+    ('no validated GPU has >= 185 GB VRAM'). Size the KV fp8 once the run is provably modern-card-only,
+    so the B200-fitting config is admitted."""
+    from flash.catalog import MODELS, vocab_size_for
+    from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
+    from flash.providers.allocator import vram_headroom
+    from flash.providers.base import cheapest_gpu
+
+    moe = "Qwen/Qwen3.6-35B-A3B"
+    info = MODELS[moe]
+    train = {
+        "max_context_tokens": 4096,
+        "max_completion_tokens": 2048,
+        "batch_size": 8,
+        "group_size": 1,
+        "lora_rank": 32,
+    }
+    need = model_required_vram_gb(moe, "opd", train=train, headroom=vram_headroom())
+    assert need <= 180
+    assert cheapest_gpu(need) == "B200"
+    # Prove the fp8 KV sizing is what flips it: the bf16-KV estimate * headroom overflows the B200,
+    # the fp8-KV estimate clears it (same shape as the GRPO resident-fit fp8 test).
+    kw = {
+        "seq_len": 4096,
+        "max_tokens": 2048,
+        "batch_size": 8,
+        "group_size": 1,
+        "lora_rank": 32,
+        "vocab": vocab_size_for(moe),
+        "active_params_b": info.active_params_b,
+    }
+    fp8 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=True, **kw)
+    bf16 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=False, **kw)
+    assert fp8 < bf16
+    hr = vram_headroom()
+    assert fp8 * hr <= 180 < bf16 * hr
+
+
+def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
+    """The fp8-KV discount must apply only when a run can ONLY land on a modern (cc >= 8.9) card. A
+    smaller OPD run that fits the 80 GB A100 (sm80, no fp8) must keep its bf16 KV sizing and its A100
+    route — never dropping onto a card that would not actually use fp8 (and would then OOM)."""
+    from flash.engine.vram import model_required_vram_gb
+    from flash.providers.base import cheapest_gpu, max_non_fp8_kv_vram_gb, supports_fp8_kv
+
+    train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
+    need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
+    assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
+    assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
+
+
+def test_opd_oversized_reject_names_the_knobs_to_shrink():
+    """When even the biggest GPU can't hold an OPD run, the reject must be actionable: it names that
+    OPD is resident-only (trainer + colocated vLLM student = two weight copies + rollout KV) and the
+    knobs that shrink it, not the opaque 'no GPU that big' message the raw cheapest_gpu emits."""
+    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+
+    train = {
+        "max_context_tokens": 4096,
+        "max_completion_tokens": 2048,
+        "batch_size": 8,
+        "group_size": 4,
+    }
+    with pytest.raises(UnsupportedGpuError) as exc:
+        provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", train=train)
+    msg = str(exc.value)
+    assert "resident-only" in msg
+    assert "group_size" in msg
+    assert "batch_size" in msg
+    assert "max_completion_tokens" in msg
+
+
 def test_opd_vram_budgets_dense_logit_backward_buffers():
     """Regression (codex[bot], vram.py): OPD's loss has no fused CE and, at the loss BACKWARD peak, holds
     the fp32 completion rows + their fp32 gradient AND the bf16 full-sequence logits + their bf16
