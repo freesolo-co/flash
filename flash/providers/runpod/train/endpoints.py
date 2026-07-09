@@ -435,8 +435,7 @@ def _train_body(input_data: dict) -> dict:
             spec = json.loads(input_data["job_spec_json"])
             phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
             prefix = f"{phase_ns}/{spec['run_id']}"
-            # Read only the last 64 KB (seek from the end) — the console can be very large on long
-            # runs, so f.read()[-64_000:] would pull the whole file into memory just to slice it.
+            # Keep the newest bytes only; the uploaded tail's end is never truncated.
             tail_bytes = 64_000
             with open(console, "rb") as f:
                 f.seek(0, os.SEEK_END)

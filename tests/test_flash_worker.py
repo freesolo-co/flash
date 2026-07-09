@@ -702,7 +702,13 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
             assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
-            self.stdout = iter(["worker booting\n", "torch.cuda.OutOfMemoryError: CUDA OOM\n"])
+            self.stdout = iter(
+                [
+                    "worker booting\n",
+                    ("x" * 70_000) + "\n",
+                    "torch.cuda.OutOfMemoryError: CUDA OOM\n",
+                ]
+            )
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
         def wait(self):
@@ -732,6 +738,11 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
             f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
         )
         assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
+        with open(console_uploads[0]["path_or_fileobj"], encoding="utf-8") as f:
+            uploaded_console = f.read()
+        assert not uploaded_console.startswith("worker booting\n")
+        assert uploaded_console.endswith("torch.cuda.OutOfMemoryError: CUDA OOM\n")
+        assert len(uploaded_console) == 64_000
         assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",

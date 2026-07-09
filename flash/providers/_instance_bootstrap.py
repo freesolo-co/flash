@@ -280,14 +280,14 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
 
     def upload_console_tail(extra: str = "") -> None:
         tail_path = console + ".tail"
-        # Read last 64k binary; decode with errors="replace" so a seek mid-UTF-8 can't raise.
+        # Keep the newest bytes only; the tail's end is never truncated.
         with open(console, "rb") as f:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - 64_000))
             tail = f.read().decode("utf-8", "replace")
         if extra:
             tail += extra
-        with open(tail_path, "w") as f:
+        with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
             f.write(tail)
         hf_upload(payload, tail_path, f"console_{mode}.txt")
 
@@ -348,7 +348,7 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
         "ts": time.time(),
         "attempt": int(payload.get("attempt") or 0),
         "retriable": bool(retriable),
-        "error": error[:2000],
+        "error": str(error)[-2000:],
     }
     p = "/tmp/attempt_marker.json"
     with open(p, "w") as f:
