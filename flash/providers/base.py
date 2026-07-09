@@ -153,6 +153,44 @@ _GPU_INFO_ALL: dict[str, GpuClass] = {**GPU_INFO, **{g.name: g for g in LEGACY_G
 KNOWN = tuple(GPU_INFO)
 VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
+# fp8 KV cache is an Ada/Hopper/Blackwell feature; the training workers enable it exactly when the
+# device compute capability is >= (8, 9) (see engine/worker/opd_vllm.py, grpo.py, rl.py). Sizing has
+# no live device, so it infers fp8 support from a candidate class's ``sm`` string.
+_FP8_KV_MIN_CAPABILITY = (8, 9)
+
+
+def _sm_capability(sm: str) -> tuple[int, int]:
+    """(major, minor) compute capability from a GpuClass ``sm`` string.
+
+    ``'sm80' -> (8, 0)``, ``'sm89' -> (8, 9)``, ``'sm90' -> (9, 0)``, ``'sm100' -> (10, 0)``,
+    ``'sm120' -> (12, 0)``. Unparseable -> ``(0, 0)`` (treated as pre-fp8)."""
+    digits = sm[2:] if sm.startswith("sm") else sm
+    if not digits.isdigit():
+        return (0, 0)
+    n = int(digits)
+    return (n // 10, n % 10)
+
+
+def supports_fp8_kv(gpu_name: str) -> bool:
+    """Whether this GPU class's compute capability supports an fp8 KV cache (cc >= 8.9)."""
+    return _sm_capability(get_gpu_info(gpu_name).sm) >= _FP8_KV_MIN_CAPABILITY
+
+
+def max_non_fp8_kv_vram_gb() -> int:
+    """Largest VRAM (GB) among validated GPU classes that do NOT support fp8 KV cache.
+
+    A run whose requirement exceeds this can only be placed on a modern (cc >= 8.9) card, so a
+    colocated vLLM rollout on it is guaranteed to use an fp8 KV cache — half the bytes a bf16
+    estimate reserves. Derived from the catalog so it tracks any GPU-class changes."""
+    return max(
+        (
+            g.vram_gb
+            for g in GPU_CLASSES
+            if g.validated and _sm_capability(g.sm) < _FP8_KV_MIN_CAPABILITY
+        ),
+        default=0,
+    )
+
 
 def _alias_keys(name: str) -> set[str]:
     """All accepted spellings of a friendly name (lowercased)."""
@@ -325,7 +363,26 @@ def provisional_gpu(
         thinking=thinking,
         headroom=vram_headroom(),
     )
-    return cheapest_gpu(min_vram)
+    try:
+        return cheapest_gpu(min_vram)
+    except UnsupportedGpuError as exc:
+        if (algorithm or "").lower() == "opd":
+            biggest = max(
+                (g.vram_gb for g in GPU_CLASSES if g.enum_member and g.validated), default=0
+            )
+            # OPD is resident-only: the HF/PEFT trainer AND the colocated vLLM student rollout engine
+            # both stay resident, so the card must hold two model-weight copies plus the rollout KV
+            # cache (which scales with batch_size x group_size) at the loss backward peak. Point the
+            # user at the knobs that shrink it instead of the opaque "no GPU that big" message.
+            raise UnsupportedGpuError(
+                f"opd needs >= {min_vram} GB VRAM, more than any single validated GPU "
+                f"({biggest} GB max). opd is resident-only: the trainer and the colocated vLLM student "
+                f"rollout engine hold two model-weight copies plus the rollout KV cache at once. "
+                f"Lower [train].group_size and/or [train].batch_size (rollout concurrency = "
+                f"batch_size x group_size; distillation needs no group variance, so group_size=1 is "
+                f"fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit."
+            ) from exc
+        raise
 
 
 @dataclass
