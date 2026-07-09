@@ -122,6 +122,9 @@ class TrainSpec:
     kl_penalty_coef: float | None = None
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
+    # OPD only: weight of the terminal-EOS behaviour-cloning term (recipe default when None). 0
+    # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
+    opd_eos_loss_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
 
 
@@ -207,6 +210,7 @@ class JobSpec:
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
+                opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
             ),
             gpu=GpuSpec(

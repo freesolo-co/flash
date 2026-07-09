@@ -418,7 +418,17 @@ epochs = 1
 max_examples = 2
 lora_rank = 32
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
+# opd_eos_loss_coef = 0.5                               # terminal-EOS reinforcement; raise if the
+#                                                       # student runs past the length cap without
+#                                                       # stopping, 0 to disable
 ```
+
+The cross-tokenizer reverse-KL is computed over shared decoded-text spans and so **cannot supervise
+the zero-width stop token** — distilling toward a verbose teacher (GLM-5.2) erodes the student's
+termination and rollouts run away to `max_completion_tokens`. `opd_eos_loss_coef` (default 0.5) adds a
+bounded, self-limiting behaviour-cloning term that reinstates the stop signal on rollouts that
+terminated naturally; watch `truncated_rollouts` fall and `mean_eos_logprob` rise in the run metrics.
+Warm-starting from an SFT adapter (which already encodes termination) compounds it.
 
 ---
 
@@ -472,6 +482,7 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 | Repetition / looping collapse | the same phrase repeats until truncation | repetition or length penalty; lower `temperature` |
 | Overthinking / verbose reasoning | reasoning eats the whole token budget | `thinking_length_penalty_coef`; tighten the prompt |
 | Completion truncation | answers cut off mid-thought | raise `max_completion_tokens` / `max_context_tokens` |
+| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | raise `opd_eos_loss_coef` and warm-start from SFT — the reverse-KL can't supervise the stop token on its own |
 | Unparsed / over-escaped output | reward can't read the answer | robust parser; return `0.0` on parse fail; format gate |
 | Wrapper / markdown around structured output | prose around the JSON/answer | a format gate; `stop_sequences` |
 | Uniform-reward groups | every rollout in a group scores the same → no gradient | shape the reward for partial credit; raise `temperature` |
