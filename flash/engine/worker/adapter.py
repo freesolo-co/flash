@@ -21,7 +21,7 @@ from flash.engine.worker.perf import optimal_attn_impl
 
 def make_lora(model_id: str | None = None):
     """Build LoRA config targeting all linear layers (VL models included: the vision tower /
-    projector / MTP linears are adapted too; on text-only data they simply get no gradient)."""
+    projector / MTP linears are adapted too; on examples without images they simply get no gradient)."""
     from peft import LoraConfig
 
     targets = "all-linear"
@@ -58,10 +58,10 @@ def prepare_fresh_lora_base(
     loader can resolve Qwen VL checkpoints to a language-only tree, while OPD and serving use the full
     image-text tree. Therefore every fresh LoRA on a VL checkpoint must preload
     ``AutoModelForImageTextToText`` so SFT/GRPO/OPD adapter tensor sets stay identical, including
-    zero-gradient vision-tower LoRA tensors on text-only data. Non-VL checkpoints keep the original
+    zero-gradient vision-tower LoRA tensors on examples without images. Non-VL checkpoints keep the original
     model path for TRL's normal loader. ``force`` is used after a VL warm-start merge already proved
     the source adapter is VL, so a transient config-probe failure cannot send the fresh stage back to
-    text-only.
+    a language-only loader.
     """
     if not (force or is_vl_checkpoint(model_id)):
         return model_source
@@ -98,10 +98,10 @@ def _merge_vl_warmstart_adapter(adir: str, model_id: str, attn_kw: dict) -> str:
     """VL warm-start (#296): MERGE the SFT into the FULL multimodal base and save the merged model to a
     fresh temp dir — the new training base for a GRPO LoRA trained from scratch. Continuing the live SFT
     LoRA instead makes the colocated vLLM rollout AND KL reference run off the BARE base (the SFT only
-    reaches vLLM via a text<->VL weight-sync that round-trips poorly for ``*ForConditionalGeneration``
+    reaches vLLM via a language/VL weight-sync that round-trips poorly for ``*ForConditionalGeneration``
     models), so GRPO rolls out base-verbose and collapses a working SFT back to base (observed: every
     Qwen3.5 GRPO reverts; non-VL MiniCPM does not). Merging into the full multimodal model (NOT the
-    text-only tree) keeps the VL config + ``language_model.*`` keys that both the trainer reload and
+    language-only tree) keeps the VL config + ``language_model.*`` keys that both the trainer reload and
     vLLM's VL loader expect; the SFT keys match here WITHOUT the infix strip. Records the SFT dir for the
     finalize recombine and returns the merged dir."""
     import gc

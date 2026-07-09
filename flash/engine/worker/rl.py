@@ -367,7 +367,7 @@ def run_rl():
         _w.force_vllm_backend_for_sm120()
         # Blackwell (sm100 B200 / sm120): force the VL model's ViT attention to TORCH_SDPA — vLLM
         # 0.19.1's CUTE flash-attn ViT path is unimportable vs every nvidia-cutlass-dsl and crashes
-        # every B200 rollout (no version pin fixes it). No-op off Blackwell / on text-only models.
+        # every B200 rollout (no version pin fixes it). No-op off Blackwell / on non-VL models.
         _w.force_vit_sdpa_on_blackwell()
         # colocate_kv_util sizes vLLM's KV pool from flash's per-model estimate; the old blanket
         # 0.45 over-reserved (e.g. 36 GB on an 80 GB A100) and dominated the step peak.

@@ -88,7 +88,6 @@ from flash.engine.worker.lora import (
     is_vl_checkpoint,
     patch_grpo_mask_aware_lm_head,
     recombine_lora_adapters,
-    strip_language_model_infix,
 )
 from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
@@ -462,7 +461,6 @@ __all__ = [
     "run_rl",
     "run_sft",
     "setup_perf_backends",
-    "strip_language_model_infix",
     "strip_think",
     "think_token_count",
     "thinking_text",

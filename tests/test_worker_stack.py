@@ -48,7 +48,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
 
 
 # ---------------------------------------------------------------------------
-# is_vl_checkpoint: qwen3_5* are VL (gates the vLLM text-only patches); text models are not
+# is_vl_checkpoint: qwen3_5* are VL; text models are not
 # ---------------------------------------------------------------------------
 def _import_worker(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
@@ -70,9 +70,8 @@ def _fake_transformers(monkeypatch, model_type: str):
 
 
 def test_is_vl_checkpoint_qwen35(monkeypatch):
-    # qwen3_5* stay VL checkpoints WITHOUT the (removed) LoRA module exclusion: this flag
-    # gates the vLLM text-only load + weight-sync patches, so it must not have been coupled
-    # to lora_exclude_modules' (now deleted) exclusion list.
+    # qwen3_5* stay VL checkpoints WITHOUT a LoRA module exclusion: this flag must not be coupled to
+    # any deleted exclusion list.
     worker = _import_worker(monkeypatch)
     for model_type in ("qwen3_5", "qwen3_5_moe", "qwen3_6"):
         _fake_transformers(monkeypatch, model_type)
@@ -414,7 +413,7 @@ def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
 def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
     """The dual of the rollback test: a SUCCESSFUL commit (or a mock that doesn't report False) must
     KEEP the advanced slot so the throttle works. ``is False`` — not falsy — gates the rollback, so a
-    None-returning mock (legacy tests) counts as success."""
+    None-returning mock counts as success."""
     import importlib
 
     hbmod = importlib.import_module("flash.engine.worker.heartbeat")

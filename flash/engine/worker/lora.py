@@ -10,9 +10,9 @@ CPU-importable.
 from __future__ import annotations
 
 # Natively-multimodal model types (Qwen3.5/3.6). Their LoRA adapters adapt the FULL module
-# tree — vision tower / projector / MTP head included, like every other linear (on text-only
+# tree — vision tower / projector / MTP head included, like every other linear (on no-image
 # data those get no gradient, so their lora_B stays zero-init). The engine loads and serves
-# the whole VL model (vision tower included); there is no text-only / language_model_only path.
+# the whole VL model (vision tower included); there is no language-only VL adapter path.
 _VL_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "qwen3_6")
 
 
@@ -172,30 +172,10 @@ def disable_liger_grpo_torch_compile(trainer) -> bool:
 # Warm-start (init_from_adapter) SFT-adapter key namespace for VL checkpoints.
 #
 # SFT/GRPO/OPD now force fresh LoRA training for VL checkpoints through the FULL multimodal model so
-# their module sets match. Older adapters can still carry a namespace mismatch: full-VL adapters name
-# LM tensors ``base_model.model.model.language_model.layers.X...``, while text-only trainer adapters
-# used ``base_model.model.model.layers.X...``. ``strip_language_model_infix`` lines those equivalent
-# modules up for legacy ``recombine_lora_adapters`` SFT⊕GRPO stacking (deploy-time), then the recombine
-# re-emits the serving ``language_model`` namespace. ``_LANGUAGE_MODEL_INFIX`` is also the signal
-# ``adapter_is_vl_warmstart`` reads to detect a VL warm-start adapter from its keys.
+# their module sets match exactly. ``_LANGUAGE_MODEL_INFIX`` is the signal
+# ``adapter_is_vl_warmstart`` reads to detect a full-VL warm-start adapter from its keys.
 
 _LANGUAGE_MODEL_INFIX = ".language_model."
-
-
-def strip_language_model_infix(key: str) -> str:
-    """Strip the FIRST ``.language_model.`` infix from a peft adapter weight key.
-
-    ``base_model.model.model.language_model.layers.0.linear_attn.out_proj.lora_A.default.weight``
-    -> ``base_model.model.model.layers.0.linear_attn.out_proj.lora_A.default.weight``.
-
-    Only the first occurrence is removed (the LM-vs-VL boundary appears once in the path); keys
-    without the infix are returned unchanged.
-    """
-    i = key.find(_LANGUAGE_MODEL_INFIX)
-    if i == -1:
-        return key
-    # Replace ".language_model." with "." (keep one separator dot).
-    return key[:i] + "." + key[i + len(_LANGUAGE_MODEL_INFIX) :]
 
 
 # Substrings that identify a peft LoRA weight key (vs a base-model param). The whole adapter file
@@ -216,7 +196,7 @@ _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
     """Tensor key names in the downloaded adapter.
 
-    For safetensors, read ONLY the JSON header (pure stdlib, no tensor data). For legacy PEFT
+    For safetensors, read ONLY the JSON header (pure stdlib, no tensor data). For PEFT
     ``adapter_model.bin``, use Torch's weights-only loader and inspect the state-dict keys. Returns
     ``None`` when no adapter weights exist in ``adir``.
     """
@@ -289,12 +269,12 @@ def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
 
     Robust to a transient ``is_vl_checkpoint`` config-probe failure (it calls
     ``AutoConfig.from_pretrained`` and swallows EVERY exception to return False, so an HF
-    rate-limit / network hiccup / uncached config could silently route a genuine VL warm-start down
-    the text-only path and reintroduce the trainer<->vLLM mismatch — issue #286). An adapter that
-    actually carries ``.language_model.`` LoRA keys was saved against the full multimodal model and
+    rate-limit / network hiccup / uncached config could silently route a genuine VL warm-start away
+    from the full-VL merge path and reintroduce the trainer<->vLLM mismatch — issue #286). An adapter
+    that actually carries ``.language_model.`` LoRA keys was saved against the full multimodal model and
     IS a VL warm-start regardless of the probe (the adapter's own keys are the authoritative signal).
     Falls back to the config probe only when the adapter can't be read or carries no
-    ``.language_model.`` LoRA keys (already-text-only / non-VL)."""
+    ``.language_model.`` LoRA keys."""
     try:
         keys = _read_adapter_tensor_keys(adir)
         if keys and any(_LANGUAGE_MODEL_INFIX in k for k in keys if _is_lora_key(k)):
@@ -447,38 +427,6 @@ def recombine_lora_adapters(
     old_cfg, old_sd = _load(old_dir)
     new_cfg, new_sd = _load(new_dir)
 
-    # Normalize the ``.language_model.`` infix on BOTH adapters' keys before comparing/stacking.
-    # The VL merge warm-start (#296) may receive legacy adapters where one side was trained against the
-    # full multimodal model (``base_model.model.model.language_model.layers...``) and the other against
-    # a text-only tree (``base_model.model.model.layers...``). Without this, equivalent LM modules
-    # compare as DIFFERENT targets and the recombine wrongly aborts. The normalized form is only an
-    # INTERNAL math key: if either source adapter used the VL ``language_model`` namespace for a tensor,
-    # the recombined output uses that same serving-compatible key instead of the stripped text-only key.
-    def _normalize_infix(sd, which):
-        norm: dict = {}
-        infixed_keys: dict[str, str] = {}
-        for k, v in sd.items():
-            nk = strip_language_model_infix(k)
-            # Fail closed on ANY post-normalization collision. A malformed adapter carrying BOTH the
-            # infixed and the already-text-only form of a key would otherwise let the second write
-            # silently overwrite the first (the text-only key has nk == k, so a ``nk != k`` guard
-            # would skip it) — recombining whichever duplicate wins instead of rejecting the mix.
-            if nk in norm:
-                raise ValueError(
-                    f"recombine: {which} adapter key {k!r} collides with another after stripping "
-                    "the '.language_model.' infix — cannot normalize a mixed VL adapter"
-                )
-            norm[nk] = v
-            if _LANGUAGE_MODEL_INFIX in k:
-                infixed_keys[nk] = k
-        return norm, infixed_keys
-
-    old_sd, old_infixed_keys = _normalize_infix(old_sd, "warm-start")
-    new_sd, new_infixed_keys = _normalize_infix(new_sd, "fresh")
-
-    def _output_key(k: str) -> str:
-        return old_infixed_keys.get(k) or new_infixed_keys.get(k) or k
-
     for name, cfg in (("warm-start", old_cfg), ("fresh", new_cfg)):
         # peft_type defaults to LORA for older configs that omit it; anything else (e.g. ADALORA)
         # has different tensor/scale semantics the cat-recombine math doesn't model.
@@ -579,15 +527,8 @@ def recombine_lora_adapters(
                 f"recombine: lora_A key {ak!r} has no matching lora_B key {bk!r} — the adapter is "
                 "malformed (unpaired LoRA tensors)"
             )
-        out_ak = _output_key(ak)
-        out_bk = _output_key(bk)
-        if out_ak in out or out_bk in out:
-            raise ValueError(
-                "recombine: output key collision while restoring the '.language_model.' infix "
-                f"(A={out_ak!r}, B={out_bk!r})"
-            )
         # A: (r, in_features) — stacked along the rank axis (no scaling; scale lives on B).
-        out[out_ak] = torch.cat([old_sd[ak], new_sd[ak]], dim=0).contiguous()
+        out[ak] = torch.cat([old_sd[ak], new_sd[ak]], dim=0).contiguous()
         # B: (out_features, r) — bake each adapter's own scale, then stack along the rank axis. The
         # combined adapter carries unit scale, so the per-component scales survive intact.
         # Promote to the higher of the two input dtypes (don't force the warm-start's, which would
@@ -596,16 +537,7 @@ def recombine_lora_adapters(
         dt = torch.promote_types(old_sd[bk].dtype, new_sd[bk].dtype)
         b_old = old_sd[bk].to(torch.float32) * s_old
         b_new = new_sd[bk].to(torch.float32) * s_new
-        out[out_bk] = torch.cat([b_old, b_new], dim=1).to(dt).contiguous()
-
-    if old_infixed_keys or new_infixed_keys:
-        plain_layer_keys = sorted(k for k in out if k.startswith("base_model.model.model.layers."))
-        if plain_layer_keys:
-            raise ValueError(
-                "recombine: VL warm-start output would use plain model.layers LoRA keys "
-                f"(e.g. {plain_layer_keys[:3]}). Serving expects the language_model namespace; "
-                "refusing to write a known-bad deploy artifact."
-            )
+        out[bk] = torch.cat([b_old, b_new], dim=1).to(dt).contiguous()
 
     out_cfg = dict(new_cfg)
     out_cfg["r"] = r_out
@@ -615,7 +547,7 @@ def recombine_lora_adapters(
     out_cfg["alpha_pattern"] = {}
     # The fresh adapter was trained on the ephemeral warm-start-merged temp dir, so out_cfg (copied
     # from new_cfg) still names that temp path as base_model_name_or_path. Replace it with the real
-    # catalog base from the warm-start config; if that config carries none (e.g. an external/legacy
+    # catalog base from the warm-start config; if that config carries none (e.g. an external
     # adapter), DROP the field rather than ship a deployed config pointing at a now-deleted temp dir.
     old_base = old_cfg.get("base_model_name_or_path")
     if old_base:

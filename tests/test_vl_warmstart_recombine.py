@@ -31,15 +31,12 @@ from flash.engine.worker.lora import (
 )
 
 # Realistic Qwen3.5 VL adapter key stems. Full multimodal adapters have LM modules under
-# ``language_model.`` (MODULES). Legacy text-only adapters saved the SAME modules with no infix
-# (TEXT_MODULES). The recombine must line these equivalent modules up for math, then emit the
-# serving-compatible language_model form.
+# ``language_model.`` and SFT/GRPO/OPD must all target this same namespace.
 MODULES = [
     "base_model.model.model.language_model.layers.0.self_attn.q_proj",
     "base_model.model.model.language_model.layers.0.self_attn.v_proj",
     "base_model.model.model.language_model.layers.5.mlp.gate_proj",
 ]
-TEXT_MODULES = [m.replace(".language_model.", ".") for m in MODULES]
 
 
 def _write_adapter(adir: str, *, modules, r, alpha, in_f=8, out_f=6, use_rslora=False, seed=0,
@@ -104,9 +101,8 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
-    # Compatibility form: an infixed full-VL adapter stacked with a legacy text-only adapter.
     _write_adapter(sft, modules=MODULES, r=r_sft, alpha=a_sft, use_rslora=rs_sft, seed=1)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=r_grpo, alpha=a_grpo, use_rslora=rs_grpo, seed=2)
+    _write_adapter(grpo, modules=MODULES, r=r_grpo, alpha=a_grpo, use_rslora=rs_grpo, seed=2)
 
     rank = recombine_lora_adapters(sft, grpo, out)
     assert rank == r_sft + r_grpo
@@ -122,33 +118,11 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
     assert all(".language_model." in k for k in out_sd), "recombined keys must target language_model"
     assert not any(k.startswith("base_model.model.model.layers.") for k in out_sd)
 
-    # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base. The legacy
-    # text-only module maps back to the language_model module the full-VL/output adapters use.
-    for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True):
-        want = _delta(sft, m_sft) + _delta(grpo, m_text)
-        got = _delta(out, m_sft)
-        assert torch.allclose(got, want, atol=1e-6, rtol=1e-5), f"{m_sft}: recombine delta mismatch"
-
-
-def test_recombine_normalizes_language_model_infix(tmp_path):
-    # Regression: historical Qwen3.5 VL warm-starts could stack an infixed full-VL adapter with a
-    # text-only LoRA. The recombine must treat the equivalent LM modules as the SAME target (not raise
-    # "DIFFERENT modules") and emit language_model keys — otherwise the artifact does not load under
-    # the serving wrapper.
-    sft = str(tmp_path / "sft")
-    grpo = str(tmp_path / "grpo")
-    out = str(tmp_path / "out")
-    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)  # infixed (full VL model)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)  # legacy text-only form
-
-    rank = recombine_lora_adapters(sft, grpo, out)
-    assert rank == 8
-
-    out_sd = load_file(os.path.join(out, "adapter_model.safetensors"))
-    out_modules = {k.rsplit(".lora_", 1)[0] for k in out_sd}
-    assert out_modules == set(MODULES), "recombined modules must use the serving language_model set"
-    assert all(".language_model." in k for k in out_sd)
-    assert not any(k.startswith("base_model.model.model.layers.") for k in out_sd)
+    # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base.
+    for module in MODULES:
+        want = _delta(sft, module) + _delta(grpo, module)
+        got = _delta(out, module)
+        assert torch.allclose(got, want, atol=1e-6, rtol=1e-5), f"{module}: recombine delta mismatch"
 
 
 def test_recombined_rank_preflight_allows_sum_at_serving_cap(tmp_path):
@@ -208,7 +182,7 @@ def test_recombine_allows_rank128_for_model_with_serving_cap128(tmp_path):
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
     _write_adapter(sft, modules=MODULES, r=64, alpha=128, seed=1)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=64, alpha=128, seed=2)
+    _write_adapter(grpo, modules=MODULES, r=64, alpha=128, seed=2)
     _set_base(sft, "Qwen/Qwen3.5-2B")
 
     assert recombine_lora_adapters(sft, grpo, out) == 128
@@ -395,16 +369,13 @@ def test_recombine_missing_safetensors_raises(tmp_path):
         recombine_lora_adapters(sft, grpo, out)
 
 
-def test_recombine_accepts_legacy_bin_adapter_weights(tmp_path):
+def test_recombine_accepts_bin_adapter_weights(tmp_path):
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
     _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
-    expected = {
-        m_sft: _delta(sft, m_sft) + _delta(grpo, m_text)
-        for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True)
-    }
+    _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2)
+    expected = {module: _delta(sft, module) + _delta(grpo, module) for module in MODULES}
     _convert_adapter_to_bin(sft)
     _convert_adapter_to_bin(grpo)
 
@@ -420,7 +391,7 @@ def test_recombine_missing_adapter_config_raises(tmp_path):
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
     _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2)
     os.remove(os.path.join(grpo, "adapter_config.json"))  # weights present, config gone
     with pytest.raises(ValueError, match=r"no adapter_config\.json"):
         recombine_lora_adapters(sft, grpo, out)
@@ -433,7 +404,7 @@ def test_recombine_rejects_unpaired_lora_tensors(tmp_path):
     # Both adapters carry a lora_A with NO paired lora_B (same key set, so the module-set check
     # passes) — recombine must name the missing B key rather than throw a bare KeyError.
     for adir in (sft, grpo):
-        _write_adapter(adir, modules=TEXT_MODULES, r=4, alpha=8, seed=1)
+        _write_adapter(adir, modules=MODULES, r=4, alpha=8, seed=1)
         st = os.path.join(adir, "adapter_model.safetensors")
         sd = {k: v for k, v in load_file(st).items() if ".lora_B." not in k}
         save_file(sd, st, metadata={"format": "pt"})
@@ -449,7 +420,7 @@ def test_recombine_rejects_lora_b_without_paired_lora_a(tmp_path):
     # check passes). The recombine loop iterates only lora_A keys, so an orphan B would be SILENTLY
     # dropped — recombine must instead fail loudly and name the unpaired key.
     for adir in (sft, grpo):
-        _write_adapter(adir, modules=TEXT_MODULES, r=4, alpha=8, seed=1)
+        _write_adapter(adir, modules=MODULES, r=4, alpha=8, seed=1)
         st = os.path.join(adir, "adapter_model.safetensors")
         sd = {k: v for k, v in load_file(st).items() if ".lora_A." not in k}
         save_file(sd, st, metadata={"format": "pt"})
@@ -472,19 +443,19 @@ def test_recombine_names_catalog_base_from_sft_not_grpo_temp(tmp_path):
     # its base. The recombined config must name the real catalog base (from the SFT config), never the
     # GRPO temp path.
     sft, grpo, out = str(tmp_path / "sft"), str(tmp_path / "grpo"), str(tmp_path / "out")
-    _write_adapter(sft, modules=TEXT_MODULES, r=4, alpha=8, seed=1)  # base = Qwen/Qwen3.5-2B
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)  # base = Qwen/Qwen3.5-2B
+    _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2)
     _set_base(grpo, "/tmp/flash_sft_merged_xyz")
     recombine_lora_adapters(sft, grpo, out)
     assert _read_cfg(out)["base_model_name_or_path"] == "Qwen/Qwen3.5-2B"
 
 
 def test_recombine_drops_stale_temp_base_when_sft_lacks_base(tmp_path):
-    # If the SFT config carries no base to override with (external/legacy adapter), recombine must DROP
+    # If the SFT config carries no base to override with (external adapter), recombine must DROP
     # the field rather than inherit the GRPO adapter's now-deleted /tmp merged-base path.
     sft, grpo, out = str(tmp_path / "sft"), str(tmp_path / "grpo"), str(tmp_path / "out")
-    _write_adapter(sft, modules=TEXT_MODULES, r=4, alpha=8, seed=1)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
+    _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2)
     _set_base(sft, None)
     _set_base(grpo, "/tmp/flash_sft_merged_xyz")
     recombine_lora_adapters(sft, grpo, out)
@@ -494,8 +465,8 @@ def test_recombine_drops_stale_temp_base_when_sft_lacks_base(tmp_path):
 def test_recombine_preserves_higher_dtype_of_either_adapter(tmp_path):
     # A higher-precision GRPO B must not be downcast to the SFT's dtype; output A and B stay consistent.
     sft, grpo, out = str(tmp_path / "sft"), str(tmp_path / "grpo"), str(tmp_path / "out")
-    _write_adapter(sft, modules=TEXT_MODULES, r=4, alpha=8, seed=1, dtype=torch.float16)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2, dtype=torch.float32)
+    _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1, dtype=torch.float16)
+    _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2, dtype=torch.float32)
     recombine_lora_adapters(sft, grpo, out)
     sd = load_file(os.path.join(out, "adapter_model.safetensors"))
     b = next(v for k, v in sd.items() if ".lora_B." in k)
@@ -521,9 +492,8 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
     # Marker set (VL merge happened): stack the SFT back into the GRPO-only saved adapter.
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
-    # Compatibility form: SFT infixed (full VL model), GRPO in the legacy text-only namespace.
     _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
+    _write_adapter(grpo, modules=MODULES, r=4, alpha=8, seed=2)
     # an aux file should be carried into the deployable dir; trainer state must NOT be.
     with open(os.path.join(grpo, "special_tokens_map.json"), "w") as f:
         f.write("{}")
@@ -537,11 +507,10 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
     assert _read_cfg(out)["r"] == 8  # r_sft + r_grpo
     assert os.path.isfile(os.path.join(out, "special_tokens_map.json"))  # aux carried over
     assert not os.path.exists(os.path.join(out, "optimizer.pt"))  # trainer state skipped
-    # exactness: recombined delta == SFT_delta + GRPO_delta. Output uses the serving language_model
-    # namespace, so the legacy text-only GRPO module maps back to the SFT/output module.
-    for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True):
+    # exactness: recombined delta == SFT_delta + GRPO_delta.
+    for module in MODULES:
         assert torch.allclose(
-            _delta(out, m_sft), _delta(sft, m_sft) + _delta(grpo, m_text), atol=1e-6, rtol=1e-5
+            _delta(out, module), _delta(sft, module) + _delta(grpo, module), atol=1e-6, rtol=1e-5
         )
 
 
@@ -551,7 +520,7 @@ def test_orchestrator_recombine_uses_recorded_model_cap(tmp_path, monkeypatch):
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     _write_adapter(sft, modules=MODULES, r=32, alpha=64, seed=1)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=32, alpha=64, seed=2)
+    _write_adapter(grpo, modules=MODULES, r=32, alpha=64, seed=2)
     _set_base(sft, None)
     monkeypatch.setattr(W, "_VL_WARMSTART_SFT_DIR", sft, raising=False)
     monkeypatch.setattr(W, "_VL_WARMSTART_MODEL_ID", "Qwen/Qwen3.5-2B", raising=False)
