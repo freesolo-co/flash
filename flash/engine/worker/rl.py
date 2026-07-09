@@ -567,7 +567,7 @@ def run_rl():
         trainer_model = init_model
         if init_peft is not None:
             model_init_kwargs = dict(grpo_kwargs.get("model_init_kwargs") or {})
-            model_init_kwargs.setdefault("device_map", "auto")
+            model_init_kwargs["device_map"] = None
             trainer_model = _w.prepare_fresh_lora_base(
                 init_model,
                 model_id,
