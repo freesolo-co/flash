@@ -22,6 +22,9 @@ class OpdVllmOutput:
     text: str
     finish_reason: str | None = None
     stop_reason: object = None
+    # Per-token grammar-forced mask (parallel to token_ids): True where guided decoding left exactly
+    # one legal token, so the student had no real choice. Empty when logprobs were unavailable.
+    forced: tuple[bool, ...] = ()
 
     @property
     def terminated(self) -> bool:
@@ -386,6 +389,11 @@ class OpdVllmRolloutEngine:
             kwargs["include_stop_str_in_output"] = True
         if self._StructuredOutputsParams is not None:
             kwargs["structured_outputs"] = self._StructuredOutputsParams(**self.structured_outputs)
+            # Request 2 logprobs so a grammar-forced position (only one legal token) is detectable:
+            # its top-2 dict carries a single finite logprob, the other padded with -inf. Those
+            # positions are masked out of the OPD reverse-KL, where the unconstrained teacher would
+            # otherwise inject spurious signal the student had no choice about (_forced_from_logprobs).
+            kwargs["logprobs"] = 2
         try:
             return self._SamplingParams(**kwargs)
         except TypeError:
@@ -435,11 +443,37 @@ class OpdVllmRolloutEngine:
             shutil.rmtree(self.adapter_root, ignore_errors=True)
 
 
+def _forced_from_logprobs(lps, n_tokens: int) -> tuple[bool, ...]:
+    """Per-token grammar-forced mask derived from vLLM logprobs.
+
+    A guided-decoding position is *forced* when exactly one token was grammatically legal: the
+    backend sets every other logit to -inf, so the single legal token gets logprob 0.0. With
+    ``logprobs>=2`` requested, vLLM's top-k is ``torch.topk``-based and returns a FIXED-size dict,
+    padding the surplus slot(s) with -inf entries -- so dict *length* does not distinguish forced
+    from free. Counting the finite (non -inf) logprobs does: one finite entry == forced. Returns ()
+    when logprobs are unavailable (unconstrained rollouts request none) -> the OPD loss runs
+    unmasked, exactly as before.
+    """
+    if lps is None or len(lps) < n_tokens:
+        return ()
+    forced: list[bool] = []
+    for i in range(n_tokens):
+        legal = sum(
+            1
+            for lp in lps[i].values()
+            if (val := getattr(lp, "logprob", lp)) is not None and val > float("-inf")
+        )
+        forced.append(legal <= 1)
+    return tuple(forced)
+
+
 def _normalize_output(out) -> OpdVllmOutput:
     comp = out.outputs[0]
+    token_ids = [int(t) for t in getattr(comp, "token_ids", ())]
     return OpdVllmOutput(
-        token_ids=[int(t) for t in getattr(comp, "token_ids", ())],
+        token_ids=token_ids,
         text=str(getattr(comp, "text", "") or ""),
         finish_reason=getattr(comp, "finish_reason", None),
         stop_reason=getattr(comp, "stop_reason", None),
+        forced=_forced_from_logprobs(getattr(comp, "logprobs", None), len(token_ids)),
     )

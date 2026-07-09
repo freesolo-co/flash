@@ -620,3 +620,56 @@ def test_opd_vllm_structured_outputs_never_silently_dropped(monkeypatch, tmp_pat
     engine.sync_from_model(_Model())
     with pytest.raises(TypeError, match="structured_outputs"):
         engine.generate([[1, 2]], max_tokens=5)
+
+
+def _lp(value):
+    """A stand-in for vLLM's Logprob (only its .logprob float matters here)."""
+    return SimpleNamespace(logprob=value)
+
+
+def test_forced_from_logprobs_counts_finite_entries_not_dict_length():
+    """The critical case: vLLM's top-k dict is fixed-size, so a forced position is a length-2 dict
+    with one finite logprob and one -inf pad. Detection must count finite entries, not dict length."""
+    from flash.engine.worker.opd_vllm import _forced_from_logprobs
+
+    neg_inf = float("-inf")
+    lps = [
+        {1: _lp(0.0)},  # backend filtered the -inf -> single entry, forced
+        {2: _lp(0.0), 7: _lp(neg_inf)},  # top-2 padded with -inf -> still one legal token, forced
+        {3: _lp(-0.2), 8: _lp(-2.0)},  # two genuinely-legal tokens -> free
+    ]
+    assert _forced_from_logprobs(lps, 3) == (True, True, False)
+
+
+def test_forced_from_logprobs_empty_when_logprobs_missing_or_short():
+    from flash.engine.worker.opd_vllm import _forced_from_logprobs
+
+    assert _forced_from_logprobs(None, 3) == ()
+    assert _forced_from_logprobs([{1: _lp(0.0)}], 3) == ()  # fewer logprob rows than tokens
+
+
+def test_normalize_output_marks_grammar_forced_positions():
+    """_normalize_output surfaces the per-token ``forced`` mask so the OPD loss can drop spans the
+    student had no choice over. Positions 0 and 2 are grammar-forced (one finite logprob, the top-2
+    slot padded with -inf); position 1 had two legal tokens."""
+    from flash.engine.worker.opd_vllm import _normalize_output
+
+    neg_inf = float("-inf")
+    comp = SimpleNamespace(
+        token_ids=[3, 4, 5],
+        text="ok",
+        finish_reason="stop",
+        stop_reason=None,
+        logprobs=[{3: _lp(0.0), 99: _lp(neg_inf)}, {4: _lp(-0.3), 9: _lp(-1.4)}, {5: _lp(0.0), 88: _lp(neg_inf)}],
+    )
+    out = _normalize_output(SimpleNamespace(outputs=[comp]))
+    assert out.forced == (True, False, True)
+
+
+def test_normalize_output_without_logprobs_has_no_forced_mask():
+    """Unconstrained rollouts request no logprobs; ``forced`` stays empty (a no-op mask downstream)."""
+    from flash.engine.worker.opd_vllm import _normalize_output
+
+    comp = SimpleNamespace(token_ids=[3, 4], text="ok", finish_reason="stop", stop_reason=None)
+    out = _normalize_output(SimpleNamespace(outputs=[comp]))
+    assert out.forced == ()

@@ -43,6 +43,28 @@ def _skip(**k):
     return SampleResult()
 
 
+def test_drop_fully_forced_groups_removes_all_forced_spans():
+    from flash.engine.worker.opd import _drop_fully_forced_groups
+
+    groups = [([0], -1.0), ([1, 2], -2.0), ([3], -3.0)]
+    # Student tokens 0 and 3 were grammar-forced; the [1, 2] group has a free token so it survives.
+    assert _drop_fully_forced_groups(groups, (True, False, False, True)) == [([1, 2], -2.0)]
+
+
+def test_drop_fully_forced_groups_is_a_noop_without_a_mask():
+    from flash.engine.worker.opd import _drop_fully_forced_groups
+
+    groups = [([0], -1.0), ([1], -2.0)]
+    assert _drop_fully_forced_groups(groups, ()) == groups
+
+
+def test_drop_fully_forced_groups_keeps_a_partially_forced_span():
+    from flash.engine.worker.opd import _drop_fully_forced_groups
+
+    # Token 0 forced, token 1 free -> the group still carries real signal, so it is kept.
+    assert _drop_fully_forced_groups([([0, 1], -1.0)], (True, False)) == [([0, 1], -1.0)]
+
+
 def _install_student_loader_fakes(monkeypatch, *, causal_raises=False, vl_raises=False):
     """Install tiny peft/transformers fakes for _student_model loader-selection tests."""
     calls = []

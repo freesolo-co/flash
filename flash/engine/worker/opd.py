@@ -1210,6 +1210,9 @@ class _GenResult:
     truncated: bool = False
     skip: bool = False
     skip_reason: str = ""
+    # Grammar-forced mask (parallel to completion_ids): True where guided decoding left one legal
+    # token. Threaded from OpdVllmOutput.forced (sliced in lockstep with stop-trimming); () = none.
+    forced: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1254,6 +1257,7 @@ class _Pending:
 def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
     """Apply OPD's pre-scoring gates to one vLLM completion."""
     completion_ids = [int(t) for t in out.token_ids]
+    forced = tuple(bool(f) for f in (getattr(out, "forced", ()) or ()))
     decode = getattr(tok, "decode", None)
     completion_text = out.text or (
         decode(completion_ids, skip_special_tokens=True) if decode else ""
@@ -1288,6 +1292,8 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
         completion_ids=completion_ids,
         completion_text=completion_text,
         gen_tokens=gen_tokens,
+        # Trimming drops a trailing stop suffix, so the kept ids are a prefix -> slice forced to match.
+        forced=forced[: len(completion_ids)],
     )
 
 
@@ -1400,6 +1406,20 @@ class _PreparedGkdGroups:
     token_indices: tuple[int, ...]
     group_lengths: tuple[int, ...]
     teacher_logsums: tuple[float, ...]
+
+
+def _drop_fully_forced_groups(groups, forced):
+    """Remove alignment groups whose student tokens were ALL grammar-forced: the student had no
+    choice there, so the teacher's (unconstrained) logprob over that span is spurious signal.
+    Dropping the whole ``(student_idx, teacher_logsum)`` tuple keeps both sides of the reverse-KL
+    balanced. ``forced`` is parallel to the student tokens (== completion_ids); empty -> no-op."""
+    if not forced:
+        return groups
+    return [
+        (s_idx, tsum)
+        for (s_idx, tsum) in groups
+        if not (s_idx and all(i < len(forced) and forced[i] for i in s_idx))
+    ]
 
 
 def _prepare_gkd_groups(groups) -> _PreparedGkdGroups | None:
@@ -1605,6 +1625,9 @@ def _resolve_samples_batched(
             )
             continue
         groups = groupwise_alignment(student_toks, score.teacher_toks)
+        # Drop groups whose student tokens were ALL grammar-forced (a fully-forced completion drops
+        # to zero groups -> alignment_empty, handled below).
+        groups = _drop_fully_forced_groups(groups, gen.forced or ())
         coverage = groupwise_coverage(groups, student_toks)
         n_align = sum(1 for st in student_toks if st.end > st.start)
         group_granularity = (n_align / len(groups)) if groups else 0.0
