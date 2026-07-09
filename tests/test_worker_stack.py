@@ -680,6 +680,8 @@ def test_sft_and_rl_wire_vl_full_lora_base_loader():
     assert "model=sft_model" in sft_src
     assert "trainer_model = _w.prepare_fresh_lora_base(" in rl_src
     assert 'force=bool(getattr(_w, "_VL_WARMSTART_SFT_DIR", None))' in rl_src
+    assert 'model_init_kwargs["device_map"] = None' in rl_src
+    assert 'device_map", "auto"' not in rl_src
     assert "model=trainer_model" in rl_src
 
 
