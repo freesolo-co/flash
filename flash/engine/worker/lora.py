@@ -171,15 +171,12 @@ def disable_liger_grpo_torch_compile(trainer) -> bool:
 # --------------------------------------------------------------------------------------------
 # Warm-start (init_from_adapter) SFT-adapter key namespace for VL checkpoints.
 #
-# SFT (run_sft) trains the FULL multimodal model: ``SFTTrainer(model=model_id,
-# peft_config=make_lora(...))`` loads ``Qwen3_5ForConditionalGeneration`` whose LM modules live
-# under ``language_model.``, so the SAVED adapter's keys are
-# ``base_model.model.model.language_model.layers.X...``. Warm-started GRPO (``_init_adapter_model``)
-# loads the base via ``AutoModelForCausalLM``; when that resolves to the TEXT-ONLY module tree its
-# LoRA targets are named ``base_model.model.model.layers.X...`` (no ``language_model.`` infix), so
-# the two adapters name the SAME modules differently. ``strip_language_model_infix`` lines them up
-# for the ``recombine_lora_adapters`` SFT⊕GRPO stacking (deploy-time), then the recombine re-emits
-# the serving ``language_model`` namespace. ``_LANGUAGE_MODEL_INFIX`` is also the signal
+# SFT/GRPO/OPD now force fresh LoRA training for VL checkpoints through the FULL multimodal model so
+# their module sets match. Older adapters can still carry a namespace mismatch: full-VL adapters name
+# LM tensors ``base_model.model.model.language_model.layers.X...``, while text-only trainer adapters
+# used ``base_model.model.model.layers.X...``. ``strip_language_model_infix`` lines those equivalent
+# modules up for legacy ``recombine_lora_adapters`` SFT⊕GRPO stacking (deploy-time), then the recombine
+# re-emits the serving ``language_model`` namespace. ``_LANGUAGE_MODEL_INFIX`` is also the signal
 # ``adapter_is_vl_warmstart`` reads to detect a VL warm-start adapter from its keys.
 
 _LANGUAGE_MODEL_INFIX = ".language_model."
@@ -451,13 +448,12 @@ def recombine_lora_adapters(
     new_cfg, new_sd = _load(new_dir)
 
     # Normalize the ``.language_model.`` infix on BOTH adapters' keys before comparing/stacking.
-    # The VL merge warm-start (#296) trains the prior adapter against the FULL multimodal model, so the
-    # warm-start adapter's keys carry the infix (``base_model.model.model.language_model.layers...``),
-    # while a fresh LoRA saved by the text-only ``AutoModelForCausalLM`` trainer has no infix
-    # (``base_model.model.model.layers...``). Without this, the equivalent LM modules compare as
-    # DIFFERENT targets and the recombine wrongly aborts. The normalized form is only an INTERNAL math
-    # key: if either source adapter used the VL ``language_model`` namespace for a tensor, the
-    # recombined output uses that same serving-compatible key instead of the stripped text-only key.
+    # The VL merge warm-start (#296) may receive legacy adapters where one side was trained against the
+    # full multimodal model (``base_model.model.model.language_model.layers...``) and the other against
+    # a text-only tree (``base_model.model.model.layers...``). Without this, equivalent LM modules
+    # compare as DIFFERENT targets and the recombine wrongly aborts. The normalized form is only an
+    # INTERNAL math key: if either source adapter used the VL ``language_model`` namespace for a tensor,
+    # the recombined output uses that same serving-compatible key instead of the stripped text-only key.
     def _normalize_infix(sd, which):
         norm: dict = {}
         infixed_keys: dict[str, str] = {}

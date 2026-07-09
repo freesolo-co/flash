@@ -21,6 +21,7 @@ from flash.engine.worker.adapter import (
     _init_adapter_model,
     _resolve_adapter_ref,
     make_lora,
+    prepare_fresh_lora_base,
     recombined_warmstart_adapter_dir,
     require_vllm_for_rollout_func,
 )
@@ -447,6 +448,7 @@ __all__ = [
     "patch_grpo_mask_aware_lm_head",
     "patch_trl_colocate_llm_kwargs",
     "prefetch_model",
+    "prepare_fresh_lora_base",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "recombine_lora_adapters",

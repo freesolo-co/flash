@@ -623,6 +623,67 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert captured.get("use_rslora") is False
 
 
+def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
+    """Fresh LoRA on a VL checkpoint must wrap the full image-text tree, not TRL's default loader."""
+    import flash.engine.worker.adapter as adapter_mod
+
+    calls = []
+
+    class _ImageText:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            calls.append((args, kwargs))
+            return {"loader": "vl", "args": args, "kwargs": kwargs}
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoModelForImageTextToText = _ImageText
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id: True)
+
+    out = adapter_mod.prepare_fresh_lora_base(
+        "/tmp/flash_sft_merged_x",
+        "Qwen/Qwen3.5-4B",
+        {"dtype": "bfloat16", "attn_implementation": "sdpa"},
+        phase="sft",
+    )
+
+    assert out["loader"] == "vl"
+    assert calls == [
+        (
+            ("/tmp/flash_sft_merged_x",),
+            {"trust_remote_code": True, "dtype": "bfloat16", "attn_implementation": "sdpa"},
+        )
+    ]
+
+
+def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
+    import flash.engine.worker.adapter as adapter_mod
+
+    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id: False)
+
+    assert (
+        adapter_mod.prepare_fresh_lora_base(
+            "openbmb/MiniCPM5-1B", "openbmb/MiniCPM5-1B", {}, phase="sft"
+        )
+        == "openbmb/MiniCPM5-1B"
+    )
+
+
+def test_sft_and_rl_wire_vl_full_lora_base_loader():
+    import inspect
+
+    from flash.engine.worker import rl, sft
+
+    sft_src = inspect.getsource(sft.run_sft)
+    rl_src = inspect.getsource(rl.run_rl)
+
+    assert "sft_model = _w.prepare_fresh_lora_base(" in sft_src
+    assert "model=sft_model" in sft_src
+    assert "trainer_model = _w.prepare_fresh_lora_base(" in rl_src
+    assert 'force=bool(getattr(_w, "_VL_WARMSTART_SFT_DIR", None))' in rl_src
+    assert "model=trainer_model" in rl_src
+
+
 def test_force_vllm_backend_for_sm120(monkeypatch):
     """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); deterministic, no operator
     override. Codex MsOqv: on the pinned vLLM 0.19.1 the VLLM_ATTENTION_BACKEND env was DROPPED from

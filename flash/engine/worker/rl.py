@@ -564,8 +564,27 @@ def run_rl():
     # heartbeat must use the nvidia-smi-only path (include_torch=False) — torch.cuda calls would
     # serialize on the CUDA/allocator locks held by the init thread and false-flag a hang.
     with liveness_heartbeat("rl_initializing"):
+        trainer_model = init_model
+        if init_peft is not None:
+            model_init_kwargs = dict(grpo_kwargs.get("model_init_kwargs") or {})
+            if getattr(getattr(cfg, "distributed_state", None), "distributed_type", None) in [
+                "MULTI_GPU",
+                "DEEPSPEED",
+            ]:
+                model_init_kwargs["device_map"] = None
+            else:
+                model_init_kwargs.setdefault("device_map", "auto")
+            trainer_model = _w.prepare_fresh_lora_base(
+                init_model,
+                model_id,
+                model_init_kwargs,
+                force=bool(getattr(_w, "_VL_WARMSTART_SFT_DIR", None)),
+                phase="rl",
+            )
+            if not isinstance(trainer_model, str):
+                cfg.model_init_kwargs = None
         trainer = GRPOTrainer(
-            model=init_model,
+            model=trainer_model,
             args=cfg,
             train_dataset=ds,
             reward_funcs=reward_fn,

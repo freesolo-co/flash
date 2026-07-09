@@ -30,11 +30,10 @@ from flash.engine.worker.lora import (
     validate_recombined_lora_rank,
 )
 
-# Realistic Qwen3.5 VL adapter key stems. The SFT adapter is trained against the FULL multimodal
-# model, so its LM modules live under ``language_model.`` (MODULES). The fresh GRPO LoRA is saved by
-# the text-only AutoModelForCausalLM trainer, so the SAME modules have no infix (TEXT_MODULES). The
-# recombine must line these equivalent modules up for math, then emit the serving-compatible
-# language_model form.
+# Realistic Qwen3.5 VL adapter key stems. Full multimodal adapters have LM modules under
+# ``language_model.`` (MODULES). Legacy text-only adapters saved the SAME modules with no infix
+# (TEXT_MODULES). The recombine must line these equivalent modules up for math, then emit the
+# serving-compatible language_model form.
 MODULES = [
     "base_model.model.model.language_model.layers.0.self_attn.q_proj",
     "base_model.model.model.language_model.layers.0.self_attn.v_proj",
@@ -105,7 +104,7 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
-    # Production forms: SFT keys carry the `.language_model.` infix; the GRPO LoRA is text-only.
+    # Compatibility form: an infixed full-VL adapter stacked with a legacy text-only adapter.
     _write_adapter(sft, modules=MODULES, r=r_sft, alpha=a_sft, use_rslora=rs_sft, seed=1)
     _write_adapter(grpo, modules=TEXT_MODULES, r=r_grpo, alpha=a_grpo, use_rslora=rs_grpo, seed=2)
 
@@ -123,8 +122,8 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
     assert all(".language_model." in k for k in out_sd), "recombined keys must target language_model"
     assert not any(k.startswith("base_model.model.model.layers.") for k in out_sd)
 
-    # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base. GRPO's
-    # text-only module maps back to the language_model module the SFT and output adapters use.
+    # The recombined delta must EXACTLY equal SFT_delta + GRPO_delta on the original base. The legacy
+    # text-only module maps back to the language_model module the full-VL/output adapters use.
     for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True):
         want = _delta(sft, m_sft) + _delta(grpo, m_text)
         got = _delta(out, m_sft)
@@ -132,15 +131,15 @@ def test_recombine_reproduces_sum_of_deltas(tmp_path, r_sft, a_sft, rs_sft, r_gr
 
 
 def test_recombine_normalizes_language_model_infix(tmp_path):
-    # Regression: the default Qwen3.5 VL warm-start saves an infixed SFT adapter and a text-only
-    # GRPO LoRA. The recombine must treat the equivalent LM modules as the SAME target (not raise
+    # Regression: historical Qwen3.5 VL warm-starts could stack an infixed full-VL adapter with a
+    # text-only LoRA. The recombine must treat the equivalent LM modules as the SAME target (not raise
     # "DIFFERENT modules") and emit language_model keys — otherwise the artifact does not load under
     # the serving wrapper.
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
     out = str(tmp_path / "out")
     _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)  # infixed (full VL model)
-    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)  # text-only (AutoModelForCausalLM)
+    _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)  # legacy text-only form
 
     rank = recombine_lora_adapters(sft, grpo, out)
     assert rank == 8
@@ -522,7 +521,7 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
     # Marker set (VL merge happened): stack the SFT back into the GRPO-only saved adapter.
     sft = str(tmp_path / "sft")
     grpo = str(tmp_path / "grpo")
-    # Production forms: SFT infixed (full VL model), GRPO text-only (AutoModelForCausalLM trainer).
+    # Compatibility form: SFT infixed (full VL model), GRPO in the legacy text-only namespace.
     _write_adapter(sft, modules=MODULES, r=4, alpha=8, seed=1)
     _write_adapter(grpo, modules=TEXT_MODULES, r=4, alpha=8, seed=2)
     # an aux file should be carried into the deployable dir; trainer state must NOT be.
@@ -539,7 +538,7 @@ def test_orchestrator_recombines_for_vl_warmstart(tmp_path, monkeypatch):
     assert os.path.isfile(os.path.join(out, "special_tokens_map.json"))  # aux carried over
     assert not os.path.exists(os.path.join(out, "optimizer.pt"))  # trainer state skipped
     # exactness: recombined delta == SFT_delta + GRPO_delta. Output uses the serving language_model
-    # namespace, so the text-only GRPO module maps back to the SFT/output module.
+    # namespace, so the legacy text-only GRPO module maps back to the SFT/output module.
     for m_sft, m_text in zip(MODULES, TEXT_MODULES, strict=True):
         assert torch.allclose(
             _delta(out, m_sft), _delta(sft, m_sft) + _delta(grpo, m_text), atol=1e-6, rtol=1e-5
