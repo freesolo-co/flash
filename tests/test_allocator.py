@@ -466,6 +466,8 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
             "RTX Pro 6000",
         ),
         (
+            # fp8 KV (cc >= 8.9) halves the resident rollout KV, so this fits the 141 GB H200 and no
+            # longer needs the 180 GB B200 — still far off the 32/40 GB consumer classes this guards.
             "max_context_16384",
             {
                 "epochs": 1,
@@ -474,7 +476,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            "B200",
+            "H200",
         ),
         (
             "max_context_24576",
@@ -580,7 +582,10 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
     }
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train)
-    assert 80 < need <= 141
+    # Off the 40 GB class, but no longer forced onto the 141 GB H200: the colocated OPD rollout uses an
+    # fp8 KV cache on cc >= 8.9 hardware, and a run this size can only land on a modern (cc >= 8.9)
+    # card, so its KV pool is fp8-sized — it fits the cheaper 96 GB RTX Pro 6000 (Blackwell).
+    assert 80 < need <= 96
 
     preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "opd", train=train)
     alloc = allocator.allocate("Qwen/Qwen3.5-4B", "opd", train=train)
@@ -596,7 +601,7 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
         )
     )
 
-    assert preview_gpu == "H200"
+    assert preview_gpu == "RTX Pro 6000"
     assert alloc.gpu == preview_gpu
     assert alloc.min_vram_gb == need
     assert estimate.required_vram_gb == need
