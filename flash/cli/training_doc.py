@@ -446,6 +446,7 @@ in a sensible value, so only override with a reason.
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy. |
 | `learning_rate` | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it. |
 | `batch_size` | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable. |
+| `structured_outputs` | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, `choice`, or OpenAI `response_format` form. The sampler then *cannot* emit off-format text, so the reward measures content instead of formatting — but with `thinking = true` the constraint binds the reasoning phase too, so set `thinking = false` if the model should reason freely first. |
 
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the

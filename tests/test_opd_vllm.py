@@ -515,3 +515,108 @@ def test_opd_vllm_kwargs_forces_b200_v1_inprocess_on_vllm_0190(monkeypatch):
         "cudagraph_mode": "FULL_DECODE_ONLY",
     }
     assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
+
+
+def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
+    """Minimal fake vllm (LLM + SamplingParams + lora + sampling_params) for engine tests."""
+
+    class _SamplingParams:
+        last_kwargs: ClassVar[dict] = {}
+
+        def __init__(self, **kwargs):
+            _SamplingParams.last_kwargs = dict(kwargs)
+
+    class _StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+
+    class _LoRARequest:
+        def __init__(self, lora_name, lora_int_id, lora_path):
+            self.lora_name = lora_name
+            self.lora_int_id = lora_int_id
+            self.lora_path = lora_path
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            self.llm_engine = SimpleNamespace(remove_lora=lambda _id: None)
+
+        def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
+            comp = SimpleNamespace(token_ids=[3], text="x", finish_reason="stop", stop_reason=None)
+            return [SimpleNamespace(outputs=[comp]) for _ in prompts]
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM = _FakeLLM
+    vllm.SamplingParams = _SamplingParams
+    lora_pkg = types.ModuleType("vllm.lora")
+    req_mod = types.ModuleType("vllm.lora.request")
+    req_mod.LoRARequest = _LoRARequest
+    sp_mod = types.ModuleType("vllm.sampling_params")
+    if with_structured_outputs:
+        sp_mod.StructuredOutputsParams = _StructuredOutputsParams
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.lora", lora_pkg)
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", req_mod)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sp_mod)
+    return _SamplingParams, _StructuredOutputsParams
+
+
+def test_opd_vllm_structured_outputs_reaches_sampling_params(monkeypatch, tmp_path):
+    """[train] structured_outputs must constrain every OPD student rollout: the parsed spec is
+    rebuilt into a StructuredOutputsParams and handed to SamplingParams alongside the stop knobs."""
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    _SamplingParams, _SOParams = _install_fake_vllm(monkeypatch)
+
+    class _Model:
+        def save_pretrained(self, path):
+            pass
+
+    spec = {"json": {"type": "object"}, "disable_any_whitespace": True}
+    engine = OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        stop_sequences=("</answer>",),
+        structured_outputs=spec,
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    engine.generate([[1, 2]], max_tokens=5)
+
+    so = _SamplingParams.last_kwargs["structured_outputs"]
+    assert isinstance(so, _SOParams)
+    assert so.kwargs == spec
+    assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]  # coexists with the stop knobs
+
+
+def test_opd_vllm_structured_outputs_never_silently_dropped(monkeypatch, tmp_path):
+    """A configured constraint the sampler can't apply must FAIL the run — the include_stop retry
+    must not swallow it and train on unconstrained text the reward believes is schema-bound."""
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    _SamplingParams, _ = _install_fake_vllm(monkeypatch)
+
+    def _reject_structured(self, **kwargs):
+        _SamplingParams.last_kwargs = dict(kwargs)
+        if "structured_outputs" in kwargs:
+            raise TypeError("unexpected keyword argument 'structured_outputs'")
+
+    monkeypatch.setattr(_SamplingParams, "__init__", _reject_structured)
+
+    class _Model:
+        def save_pretrained(self, path):
+            pass
+
+    engine = OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        stop_sequences=("</answer>",),
+        structured_outputs={"json_object": True},
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    with pytest.raises(TypeError, match="structured_outputs"):
+        engine.generate([[1, 2]], max_tokens=5)

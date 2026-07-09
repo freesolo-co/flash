@@ -237,6 +237,8 @@ class OpdVllmRolloutEngine:
     temperature: float
     top_p: float
     stop_sequences: tuple[str, ...] = ()
+    # StructuredOutputsParams kwargs (parsed [train] structured_outputs); None = unconstrained.
+    structured_outputs: dict[str, Any] | None = None
     lora_rank: int = 32
     gpu_memory_utilization: float = 0.10
     kv_cache_dtype: str | None = None
@@ -260,6 +262,13 @@ class OpdVllmRolloutEngine:
 
         self._SamplingParams = SamplingParams
         self._LoRARequest = LoRARequest
+        # Import fails loudly at engine build (not first generate) when a constraint is configured
+        # against a vLLM without structured-outputs support — never silently roll unconstrained.
+        self._StructuredOutputsParams = None
+        if self.structured_outputs:
+            from vllm.sampling_params import StructuredOutputsParams
+
+            self._StructuredOutputsParams = StructuredOutputsParams
         kwargs: dict[str, Any] = {
             "model": self.model_source,
             "dtype": "bfloat16",
@@ -375,9 +384,16 @@ class OpdVllmRolloutEngine:
         # raising.
         if self.stop_sequences:
             kwargs["include_stop_str_in_output"] = True
+        if self._StructuredOutputsParams is not None:
+            kwargs["structured_outputs"] = self._StructuredOutputsParams(**self.structured_outputs)
         try:
             return self._SamplingParams(**kwargs)
         except TypeError:
+            # Retry only for the cosmetic stop-echo kwarg. structured_outputs stays in the retry:
+            # a configured constraint the sampler can't apply must fail the run, not silently
+            # train on unconstrained text the reward believes is schema-bound.
+            if "include_stop_str_in_output" not in kwargs:
+                raise
             kwargs.pop("include_stop_str_in_output", None)
             return self._SamplingParams(**kwargs)
 
