@@ -367,7 +367,7 @@ def run_rl():
         _w.force_vllm_backend_for_sm120()
         # Blackwell (sm100 B200 / sm120): force the VL model's ViT attention to TORCH_SDPA — vLLM
         # 0.19.1's CUTE flash-attn ViT path is unimportable vs every nvidia-cutlass-dsl and crashes
-        # every B200 rollout (no version pin fixes it). No-op off Blackwell / on text-only models.
+        # every B200 rollout (no version pin fixes it). No-op off Blackwell / on non-VL models.
         _w.force_vit_sdpa_on_blackwell()
         # colocate_kv_util sizes vLLM's KV pool from flash's per-model estimate; the old blanket
         # 0.45 over-reserved (e.g. 36 GB on an 80 GB A100) and dominated the step peak.
@@ -564,8 +564,21 @@ def run_rl():
     # heartbeat must use the nvidia-smi-only path (include_torch=False) — torch.cuda calls would
     # serialize on the CUDA/allocator locks held by the init thread and false-flag a hang.
     with liveness_heartbeat("rl_initializing"):
+        trainer_model = init_model
+        if init_peft is not None:
+            model_init_kwargs = dict(grpo_kwargs.get("model_init_kwargs") or {})
+            model_init_kwargs.setdefault("device_map", "auto")
+            trainer_model = _w.prepare_fresh_lora_base(
+                init_model,
+                model_id,
+                model_init_kwargs,
+                force=bool(getattr(_w, "_VL_WARMSTART_SFT_DIR", None)),
+                phase="rl",
+            )
+            if not isinstance(trainer_model, str):
+                cfg.model_init_kwargs = None
         trainer = GRPOTrainer(
-            model=init_model,
+            model=trainer_model,
             args=cfg,
             train_dataset=ds,
             reward_funcs=reward_fn,

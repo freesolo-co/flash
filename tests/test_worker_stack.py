@@ -48,7 +48,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
 
 
 # ---------------------------------------------------------------------------
-# is_vl_checkpoint: qwen3_5* are VL (gates the vLLM text-only patches); text models are not
+# is_vl_checkpoint: qwen3_5* are VL; text models are not
 # ---------------------------------------------------------------------------
 def _import_worker(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
@@ -70,9 +70,8 @@ def _fake_transformers(monkeypatch, model_type: str):
 
 
 def test_is_vl_checkpoint_qwen35(monkeypatch):
-    # qwen3_5* stay VL checkpoints WITHOUT the (removed) LoRA module exclusion: this flag
-    # gates the vLLM text-only load + weight-sync patches, so it must not have been coupled
-    # to lora_exclude_modules' (now deleted) exclusion list.
+    # qwen3_5* stay VL checkpoints WITHOUT a LoRA module exclusion: this flag must not be coupled to
+    # any deleted exclusion list.
     worker = _import_worker(monkeypatch)
     for model_type in ("qwen3_5", "qwen3_5_moe", "qwen3_6"):
         _fake_transformers(monkeypatch, model_type)
@@ -414,7 +413,7 @@ def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
 def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
     """The dual of the rollback test: a SUCCESSFUL commit (or a mock that doesn't report False) must
     KEEP the advanced slot so the throttle works. ``is False`` — not falsy — gates the rollback, so a
-    None-returning mock (legacy tests) counts as success."""
+    None-returning mock counts as success."""
     import importlib
 
     hbmod = importlib.import_module("flash.engine.worker.heartbeat")
@@ -621,6 +620,67 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert captured.get("init_lora_weights") is True
         assert "pissa" not in str(captured.get("init_lora_weights")).lower()
         assert captured.get("use_rslora") is False
+
+
+def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
+    """Fresh LoRA on a VL checkpoint must wrap the full image-text tree, not TRL's default loader."""
+    import flash.engine.worker.adapter as adapter_mod
+
+    calls = []
+
+    class _ImageText:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            calls.append((args, kwargs))
+            return {"loader": "vl", "args": args, "kwargs": kwargs}
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoModelForImageTextToText = _ImageText
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id: True)
+
+    out = adapter_mod.prepare_fresh_lora_base(
+        "/tmp/flash_sft_merged_x",
+        "Qwen/Qwen3.5-4B",
+        {"dtype": "bfloat16", "attn_implementation": "sdpa"},
+        phase="sft",
+    )
+
+    assert out["loader"] == "vl"
+    assert calls == [
+        (
+            ("/tmp/flash_sft_merged_x",),
+            {"trust_remote_code": True, "dtype": "bfloat16", "attn_implementation": "sdpa"},
+        )
+    ]
+
+
+def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
+    import flash.engine.worker.adapter as adapter_mod
+
+    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id: False)
+
+    assert (
+        adapter_mod.prepare_fresh_lora_base(
+            "openbmb/MiniCPM5-1B", "openbmb/MiniCPM5-1B", {}, phase="sft"
+        )
+        == "openbmb/MiniCPM5-1B"
+    )
+
+
+def test_sft_and_rl_wire_vl_full_lora_base_loader():
+    import inspect
+
+    from flash.engine.worker import rl, sft
+
+    sft_src = inspect.getsource(sft.run_sft)
+    rl_src = inspect.getsource(rl.run_rl)
+
+    assert "sft_model = _w.prepare_fresh_lora_base(" in sft_src
+    assert "model=sft_model" in sft_src
+    assert "trainer_model = _w.prepare_fresh_lora_base(" in rl_src
+    assert 'force=bool(getattr(_w, "_VL_WARMSTART_SFT_DIR", None))' in rl_src
+    assert "model=trainer_model" in rl_src
 
 
 def test_force_vllm_backend_for_sm120(monkeypatch):

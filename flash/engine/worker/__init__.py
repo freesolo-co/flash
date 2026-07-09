@@ -21,6 +21,7 @@ from flash.engine.worker.adapter import (
     _init_adapter_model,
     _resolve_adapter_ref,
     make_lora,
+    prepare_fresh_lora_base,
     recombined_warmstart_adapter_dir,
     require_vllm_for_rollout_func,
 )
@@ -87,7 +88,6 @@ from flash.engine.worker.lora import (
     is_vl_checkpoint,
     patch_grpo_mask_aware_lm_head,
     recombine_lora_adapters,
-    strip_language_model_infix,
 )
 from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
@@ -447,6 +447,7 @@ __all__ = [
     "patch_grpo_mask_aware_lm_head",
     "patch_trl_colocate_llm_kwargs",
     "prefetch_model",
+    "prepare_fresh_lora_base",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "recombine_lora_adapters",
@@ -460,7 +461,6 @@ __all__ = [
     "run_rl",
     "run_sft",
     "setup_perf_backends",
-    "strip_language_model_infix",
     "strip_think",
     "think_token_count",
     "thinking_text",
