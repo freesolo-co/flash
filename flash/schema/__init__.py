@@ -205,6 +205,7 @@ _TRAIN_KEYS = frozenset(
         "kl_penalty_coef",
         "advantage_clip",
         "thinking_length_penalty_coef",
+        "opd_eos_loss_coef",
         "stop_sequences",
         "max_steps",
         "max_examples",
@@ -349,6 +350,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
+            # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
+            opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),
             stop_sequences=_train_stops(train_raw),
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),

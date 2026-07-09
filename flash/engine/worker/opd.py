@@ -149,6 +149,10 @@ class OpdKnobs:
     group_size: int = 0
     # gkd reverse-KL scale; reuses the existing [train] kl_penalty_coef knob (default 1.0).
     kl_coef: float = 1.0
+    # Weight of the terminal-EOS behaviour-cloning term (see _eos_reinforce_term). The reverse-KL
+    # over shared decoded-text spans cannot supervise the zero-width stop token, so this restores the
+    # stop signal; 0 disables it. [train].opd_eos_loss_coef, else RECIPE.opd.eos_loss_coef.
+    eos_loss_coef: float = RECIPE.opd.eos_loss_coef
     save_every: int = 0
     max_length: int = 0
     # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher never
@@ -193,6 +197,14 @@ def _resolve_opd_knobs() -> OpdKnobs:
         prompts_per_step=int(opt("batch_size", 0) or d.prompts_per_step),
         group_size=int(opt("group_size", 0) or d.group_size),
         kl_coef=kl_coef,
+        # 0 is a VALID explicit value here (disable EOS reinforcement), unlike kl_coef, so only fall
+        # back to the recipe default when the field is UNSET (None) — a plain `or` would swallow 0.0.
+        eos_loss_coef=max(
+            0.0,
+            float(
+                _eos if (_eos := opt("opd_eos_loss_coef", None)) is not None else d.eos_loss_coef
+            ),
+        ),
         save_every=int(opt("save_every", 0) or 20),
         max_length=int(opt("max_context_tokens", 0) or 0),
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
@@ -339,7 +351,8 @@ def run_opd():
     print(
         f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
         f"epochs={knobs.epochs} warm_start={warm_start or 'none'} "
-        f"mode={'multi-turn' if multi_turn else 'single-turn'}"
+        f"mode={'multi-turn' if multi_turn else 'single-turn'} "
+        f"eos_loss_coef={knobs.eos_loss_coef}"
     )
 
     # The GLM teacher key is a platform-owned credential the control plane injects into the worker
@@ -576,6 +589,10 @@ def run_opd():
     truncated_rollouts = 0
     granularity_sum = 0.0
     granularity_n = 0
+    # Running mean of the reinforced terminal log P(eos): should RISE over a run as the student learns
+    # to stop, the counterpart to truncated_rollouts FALLING. Surfaced in train_meta.
+    eos_logprob_sum = 0.0
+    eos_logprob_n = 0
     opt_steps = (
         0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
     )
@@ -639,6 +656,7 @@ def run_opd():
         advanced by the caller once per generated rollout so its timing is unchanged."""
         nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
+        nonlocal eos_logprob_sum, eos_logprob_n
         if r.teacher_status == "ok":
             teacher_ok += 1
         elif r.teacher_status == "transient":
@@ -663,6 +681,9 @@ def run_opd():
         granularity_n += 1
         generated_tokens += r.gen_tokens
         teacher_input_tokens += r.teacher_tokens
+        if r.eos_logprob is not None:
+            eos_logprob_sum += r.eos_logprob
+            eos_logprob_n += 1
         nseq += 1
         # Non-liveness progress ping WITHIN the step (rationale in _opd_progress).
         _opd_progress(opt_steps, nseq)
@@ -1054,9 +1075,16 @@ def run_opd():
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,
             # Rollouts that didn't terminate naturally (max_new_tokens cap OR max_time cut, no EOS/stop)
             # — skipped, not distilled (see _rollout_terminated). A high count means the student is
-            # generating runaway/non-terminating filters (cold start, untrained stop token) and
-            # warm-starting from SFT — which encodes termination — would help.
+            # generating runaway/non-terminating filters (cold start, untrained stop token); the
+            # terminal-EOS reinforcement below (opd_eos_loss_coef) and warm-starting from SFT both help.
             "truncated_rollouts": truncated_rollouts,
+            # Terminal-EOS behaviour-cloning (see _eos_reinforce_term): the coefficient, how many
+            # distilled samples got the stop signal, and the mean reinforced log P(eos). The last
+            # should RISE as truncated_rollouts falls — visible confirmation the student is learning
+            # to stop. mean_eos_logprob is None when reinforcement is disabled (coef 0).
+            "eos_loss_coef": knobs.eos_loss_coef,
+            "eos_reinforced_samples": eos_logprob_n,
+            "mean_eos_logprob": (eos_logprob_sum / eos_logprob_n) if eos_logprob_n else None,
             "teacher_transient_failures": teacher_transient,
             "teacher_errors": teacher_error,
             "no_signal_resamples": no_signal_resamples,
@@ -1150,6 +1178,9 @@ class SampleResult:
     group_granularity: float = 0.0
     # Machine-readable reason when loss is None. Used for skipped-step diagnostics and train_meta.
     skip_reason: str = ""
+    # Detached log P(eos) at the reinforced terminal position, when the EOS behaviour-cloning term
+    # was applied (else None). Surfaced as mean_eos_logprob so a run's rising termination is visible.
+    eos_logprob: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1456,6 +1487,71 @@ def _bump_model_counter(model, name: str, inc: int = 1) -> None:
         setattr(model, name, int(getattr(model, name, 0) or 0) + int(inc))
 
 
+def _primary_eos_id(tok, eos_ids: frozenset) -> int | None:
+    """The single eos id to behaviour-clone in ``_eos_reinforce_term``'s stripped-eos case: the
+    tokenizer's ``eos_token_id`` (the chat terminator — ``<|im_end|>`` for Qwen chat models), falling
+    back to any member of the model's generation-halting set. ``None`` when no eos is defined (a bare
+    test stand-in), which disables reinforcement."""
+    tid = getattr(tok, "eos_token_id", None)
+    if isinstance(tid, int) and not isinstance(tid, bool):
+        return tid
+    if isinstance(tid, (list, tuple)) and tid:
+        for x in tid:
+            if isinstance(x, int) and not isinstance(x, bool):
+                return x
+    return min(eos_ids) if eos_ids else None
+
+
+def _eos_reinforce_term(
+    sample_logits, prompt_len: int, student_ids, eos_ids, eos_primary_id, stop_sequences, eos_coef
+):
+    """Positive supervision for the terminal stop token the cross-tokenizer alignment drops.
+
+    OPD's reverse-KL is computed over shared DECODED-TEXT spans (``groupwise_alignment``); a special/eos
+    token is zero-width (decodes to nothing) so it lands in no alignment group and receives NO gradient
+    — the student is never taught to STOP. Distilling only the content tokens toward a strong, verbose
+    teacher (GLM-5.2) then erodes the student's termination and rollouts run away to the length cap. This
+    adds a plain cross-entropy on log P(eos) at the position the rollout naturally terminated. It has a
+    BOUNDED gradient (softmax - onehot, ‖·‖ ≤ √2, unlike the reverse-KL surrogate whose magnitude grows
+    as P(eos)->0) so it never dominates grad-clipping, and it SELF-LIMITS (vanishes as P(eos)->1), so a
+    student that already stops cleanly — the models that currently train fine — is unaffected.
+
+    Two shapes, because vLLM may or may not keep the terminal eos in ``token_ids``:
+      * eos KEPT (``student_ids`` ends in an eos id) — reinforce that token's own predictive row.
+      * eos STRIPPED (content-only ids) — reinforce the FIRST post-content row toward the primary eos.
+        The forward covers ``prompt+content``, so that row (the last real position's next-token
+        prediction) already exists; no extra token is appended. Skipped when ``stop_sequences`` are
+        configured (the rollout terminates on the delimiter — ordinary text the reverse-KL already
+        trains — not on eos).
+
+    Returns ``(term, logp)`` — the differentiable scalar loss addend (``-eos_coef * log P(eos)``) plus
+    the detached log-prob for logging — or ``None`` when there is no eos to reinforce.
+    """
+    import torch
+
+    if eos_coef <= 0:
+        return None
+    comp_len = len(student_ids)
+    if comp_len == 0:
+        return None
+    last_id = int(student_ids[-1])
+    if eos_ids and last_id in eos_ids:
+        # rows[-1]: the row that predicted the sampled terminal eos.
+        row_index = prompt_len - 1 + comp_len - 1
+        target = last_id
+    elif not stop_sequences and eos_primary_id is not None:
+        # First post-content position: log P(eos | prompt + content).
+        row_index = prompt_len - 1 + comp_len
+        target = int(eos_primary_id)
+    else:
+        return None
+    if row_index < 0 or row_index >= sample_logits.shape[0]:
+        return None
+    logits_row = sample_logits[row_index].float()
+    logp = logits_row[target] - torch.logsumexp(logits_row, dim=-1)
+    return (-float(eos_coef)) * logp, float(logp.detach())
+
+
 def _resolve_samples_batched(
     model,
     tok,
@@ -1472,6 +1568,13 @@ def _resolve_samples_batched(
         return []
     results: list[SampleResult | None] = [None] * len(samples)
     prepared: list[_PreparedLoss] = []
+    # Terminal-EOS supervision config (see _eos_reinforce_term). Resolved once — the model/tokenizer
+    # don't change across the chunk. getattr defaults keep bare test stand-ins (SimpleNamespace knobs)
+    # and eos-less fake tokenizers working with reinforcement OFF.
+    eos_coef = float(getattr(knobs, "eos_loss_coef", 0.0) or 0.0)
+    eos_stop_sequences = tuple(getattr(knobs, "stop_sequences", ()) or ())
+    eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 else frozenset()
+    eos_primary = _primary_eos_id(tok, eos_ids) if eos_coef > 0 else None
     for idx, (gen, score, prompt_ids) in enumerate(samples):
         if gen.truncated or gen.skip or score is None or score.status != "ok":
             results[idx] = _resolve_no_loss_sample(gen, score)
@@ -1554,6 +1657,24 @@ def _resolve_samples_batched(
                         skip_reason="alignment_empty",
                     )
                 else:
+                    # Behaviour-clone the terminal stop the reverse-KL alignment cannot reach. Added
+                    # to the distilled samples only (loss is not None), so no-signal skip accounting is
+                    # unchanged. logits[row] is this sample's per-position logits [max_len, V]; the term
+                    # self-limits, so a student that already stops cleanly contributes ~0.
+                    eos_logprob = None
+                    if eos_coef > 0:
+                        eos_out = _eos_reinforce_term(
+                            logits[row],
+                            prompt_len,
+                            p.student_ids,
+                            eos_ids,
+                            eos_primary,
+                            eos_stop_sequences,
+                            eos_coef,
+                        )
+                        if eos_out is not None:
+                            eos_term, eos_logprob = eos_out
+                            loss = loss + eos_term
                     loss_for_result = loss
                     if backward_scale is not None:
                         losses.append(loss)
@@ -1565,6 +1686,7 @@ def _resolve_samples_batched(
                         gen_tokens=p.gen_tokens,
                         teacher_tokens=p.teacher_tokens,
                         group_granularity=p.group_granularity,
+                        eos_logprob=eos_logprob,
                     )
             if losses:
                 (sum(losses) * float(backward_scale)).backward()
