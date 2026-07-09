@@ -1,7 +1,7 @@
 """[train] structured_outputs: TOML parsing/normalization, spec roundtrip, and worker decode.
 
-The knob must accept every reasonable spelling (canonical vLLM constraint table, aliases, OpenAI
-response_format forms, bare JSON-schema table, JSON strings, shorthands), normalize ALL of them to
+The knob must accept every reasonable spelling (canonical vLLM constraint table, aliases, bare
+JSON-schema table, JSON strings, shorthands), normalize ALL of them to
 one canonical StructuredOutputsParams-kwargs JSON string at parse time, survive the
 schema -> JobSpec -> worker to_dict/from_dict hops byte-for-byte, and decode losslessly in the
 worker. Anything ambiguous or contradictory must be a parse-time ConfigError — a mis-specified
@@ -71,12 +71,9 @@ def test_bare_json_schema_table_is_a_json_constraint():
     assert _canonical(_SCHEMA) == {"json": _SCHEMA}
 
 
-def test_openai_response_format_forms():
-    assert _canonical({"type": "json_object"}) == {"json_object": True}
-    assert _canonical({"type": "json_schema", "json_schema": {"name": "a", "schema": _SCHEMA}}) == {
-        "json": _SCHEMA
-    }
-    assert _canonical({"type": "json_schema", "schema": _SCHEMA}) == {"json": _SCHEMA}  # flattened
+def test_former_openai_json_object_is_now_a_raw_schema():
+    # {"type": "json_object"} is no longer an OpenAI mode; with no constraint keys it is a raw schema.
+    assert _canonical({"type": "json_object"}) == {"json": {"type": "json_object"}}
 
 
 def test_string_forms():
@@ -101,7 +98,9 @@ def test_backend_options_pass_through():
 
 
 def test_explicit_off_forms_are_unset():
-    for off in (False, "", "none", "text", {"type": "text"}):
+    # A user can always opt out of structured outputs: false, "", "none", or omitting the key all
+    # leave the rollout unconstrained (the canonical "" spec).
+    for off in (False, "", "none"):
         spec = spec_from_dict(_raw(off), run_id="so-off")
         assert spec.train.structured_outputs == ""
     # and omitting the key entirely
@@ -123,7 +122,7 @@ def test_explicit_off_forms_are_unset():
         ({"json_object": False}, "must be true"),
         ({"json": 42}, "schema table"),
         ({"json": "{not json"}, "not valid JSON"),
-        ({"type": "json_schema"}, "needs a schema table"),
+        ({"type": "json_schema", "schema": _SCHEMA}, "unknown key"),
         ({"json": _SCHEMA, "disable_any_whitespace": "yes"}, "boolean"),
         ({"json": _SCHEMA, "whitespace_pattern": 1}, "whitespace_pattern"),
         ("{not json", "unparseable"),

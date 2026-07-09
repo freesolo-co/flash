@@ -473,8 +473,8 @@ def cmd_env_setup(args) -> int:
             "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
             f"{rl_reasoning_train}"
             "lora_rank = 32\n"
-            "# Constrain every rollout with guided decoding (JSON schema shown; regex/choice\n"
-            "# and OpenAI response_format forms also parse) — see `flash train --doc`:\n"
+            "# Constrain every rollout with guided decoding (a JSON schema is shown; regex and\n"
+            "# choice forms also parse) — see `flash train --doc`:\n"
             '# structured_outputs = \'{"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}\'\n'
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"

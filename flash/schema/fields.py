@@ -100,15 +100,14 @@ def _so_error(msg: str) -> ConfigError:
 def _so_canonical(value: Any) -> dict | None:
     """Fold one structured_outputs value into canonical StructuredOutputsParams kwargs.
 
-    Accepts (flexibility over one blessed spelling): a canonical/aliased constraint table, an
-    OpenAI-style ``response_format`` table ({type = "json_object"} / {type = "json_schema", ...}),
-    a bare JSON-schema table, a JSON string of any of those, or the "json"/"json_object"
-    shorthand. Returns None for the explicit "unconstrained" forms (false/""/"none"/"text")."""
+    Accepts (flexibility over one blessed spelling): a canonical/aliased constraint table, a bare
+    JSON-schema table, a JSON string of either, or the "json"/"json_object" shorthand. Returns
+    None for the explicit "unconstrained" forms (false/""/"none")."""
     if value is None or value is False:
         return None
     if isinstance(value, str):
         s = value.strip()
-        if not s or s.lower() in ("none", "text"):
+        if not s or s.lower() == "none":
             return None
         if s.lower() in ("json", "json_object"):
             return {"json_object": True}
@@ -130,22 +129,6 @@ def _so_canonical(value: Any) -> dict | None:
             f"{', '.join(removed)} constraint(s) are not supported; use one of "
             f"{', '.join(_SO_CONSTRAINT_KEYS)}"
         )
-
-    # OpenAI response_format spelling: {type = "text" | "json_object" | "json_schema"}.
-    rf_type = value.get("type")
-    if rf_type == "text" and set(value) == {"type"}:
-        return None
-    if rf_type == "json_object" and set(value) == {"type"}:
-        return {"json_object": True}
-    if rf_type == "json_schema" and not any(k in _SO_CONSTRAINT_KEYS for k in value):
-        inner = value.get("json_schema") if isinstance(value.get("json_schema"), dict) else value
-        schema = inner.get("schema")
-        if not isinstance(schema, dict):
-            raise _so_error(
-                'response_format type "json_schema" needs a schema table '
-                "(json_schema.schema = {...} or schema = {...})"
-            )
-        return {"json": schema}
 
     folded = {_SO_ALIASES.get(k, k): v for k, v in value.items()}
     if len(folded) < len(value):
