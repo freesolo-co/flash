@@ -80,6 +80,17 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
+def test_opd_eos_loss_coef_accepted_by_schema() -> None:
+    # Regression: opd_eos_loss_coef was added to flash.spec.TrainSpec + the worker, but NOT the
+    # client/server schema allowlist, so `[train] opd_eos_loss_coef` was hard-rejected as an unknown
+    # key at submit — the documented override never reached the worker. It must round-trip here.
+    assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 0.0})).train.opd_eos_loss_coef == 0.0
+    assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 1.5})).train.opd_eos_loss_coef == 1.5
+    assert spec_from_dict(_raw()).train.opd_eos_loss_coef is None  # unset -> recipe default at resolve
+    with pytest.raises(ConfigError, match="opd_eos_loss_coef"):
+        spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
+
+
 def test_falsy_algorithm_defaults_to_sft() -> None:
     # The type guard must preserve the `(value or "sft")` semantics: falsy values default.
     # Supply SFT-valid [train] fields so validation reaches the algorithm assertion instead of
