@@ -1,11 +1,10 @@
 """Offline tests for the warm-start (init_from_adapter) VL adapter key handling + load guards.
 
 VL SFT trains the FULL multimodal model, so its adapter keys carry the ``.language_model.`` infix
-(``base_model.model.model.language_model.layers.*``). ``strip_language_model_infix`` removes it (used
-by the recombine path); ``adapter_is_vl_warmstart`` gates the #296 merge-into-base path off the
-adapter's own keys (not just the config probe); and the three load guards (``assert_adapter_load_clean``
-/ ``assert_lora_applied`` / ``assert_adapter_delta_nonzero``) fail closed on a silently-discarded
-adapter. All exercised without a GPU / transformers / peft / vllm.
+(``base_model.model.model.language_model.layers.*``). ``adapter_is_vl_warmstart`` gates the #296
+merge-into-base path off the adapter's own keys (not just the config probe); and the three load guards
+(``assert_adapter_load_clean`` / ``assert_lora_applied`` / ``assert_adapter_delta_nonzero``) fail
+closed on a silently-discarded adapter. All exercised without a GPU / transformers / peft / vllm.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
-    strip_language_model_infix,
 )
 
 # Realistic Qwen3.5 SFT-adapter keys (FULL multimodal model -> LM under language_model.).
@@ -31,7 +29,7 @@ VL_KEYS = [
     "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.default.weight",
     "base_model.model.model.language_model.layers.31.mlp.gate_proj.lora_B.default.weight",
 ]
-# The corresponding AutoModelForCausalLM-named LoRA params the GRPO trainer expects (no infix).
+# Plain LoRA params with no full-VL ``language_model`` namespace.
 CAUSAL_LM_KEYS = [
     "base_model.model.model.layers.0.linear_attn.out_proj.lora_A.default.weight",
     "base_model.model.model.layers.0.linear_attn.out_proj.lora_B.default.weight",
@@ -62,23 +60,6 @@ def _write_safetensors(path: str, names: list[str]) -> None:
 def _write_torch_bin(path: str, names: list[str]) -> None:
     torch = pytest.importorskip("torch")
     torch.save({name: torch.zeros(1) for name in names}, path)
-
-
-# ---------------------------------------------------------------------------
-# Pure key remap (strip_language_model_infix — used by the recombine path)
-# ---------------------------------------------------------------------------
-def test_strip_infix_matches_causal_lm_param_set():
-    # The stripped keys must EXACTLY equal the AutoModelForCausalLM-named LoRA param set.
-    assert [strip_language_model_infix(k) for k in VL_KEYS] == CAUSAL_LM_KEYS
-
-
-def test_strip_infix_leaves_non_language_model_keys_untouched():
-    text_key = "base_model.model.model.layers.5.self_attn.k_proj.lora_A.default.weight"
-    assert strip_language_model_infix(text_key) == text_key
-    # And only the LM-vs-VL boundary infix is removed (a hypothetical second token is left alone).
-    assert (
-        strip_language_model_infix("a.language_model.b.language_model.c") == "a.b.language_model.c"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +112,7 @@ def test_read_adapter_keys_corrupt_json_reraises_with_path(tmp_path):
         lora._read_adapter_tensor_keys(str(adir))
 
 
-def test_read_adapter_keys_reads_legacy_bin_state_dict(tmp_path):
+def test_read_adapter_keys_reads_bin_state_dict(tmp_path):
     import flash.engine.worker.lora as lora
 
     adir = tmp_path / "adapter"
@@ -154,8 +135,7 @@ def test_read_adapter_keys_rejects_malformed_bin_state_dict(tmp_path):
 
 
 def test_vl_keys_are_what_sft_actually_saves():
-    # Guard: every VL fixture key must contain the infix the strip removes (so the fixtures stay
-    # representative of the real SFT-saved adapter described in the bug report).
+    # Guard: every VL fixture key must contain the infix used by full multimodal Qwen adapters.
     assert all(".language_model." in k for k in VL_KEYS)
     assert all(".language_model." not in k for k in CAUSAL_LM_KEYS)
     # And the file path the rewriter targets exists in our fixture writer.
@@ -210,8 +190,8 @@ def test_assert_adapter_load_clean_passes_on_full_match():
 
 
 def test_assert_adapter_load_clean_raises_on_vl_infix_mismatch():
-    # The #67 silent-discard: the saved VL keys (infixed) match no injected text-only module ->
-    # unexpected; the injected text-only modules get no saved weight -> missing. This is the exact
+    # The #67 silent-discard: the saved VL keys match no injected plain module -> unexpected; the
+    # injected plain modules get no saved weight -> missing. This is the exact
     # case the module-count check waves through and this check must catch.
     lr = _LoadResult(missing_keys=list(CAUSAL_LM_KEYS), unexpected_keys=list(VL_KEYS))
     with pytest.raises(RuntimeError, match="did NOT load cleanly"):
@@ -316,7 +296,7 @@ def test_adapter_is_vl_warmstart_trusts_bin_adapter_evidence_over_failed_probe(
     assert lora.adapter_is_vl_warmstart(str(adir), "some/model") is True
 
 
-def test_adapter_is_vl_warmstart_falls_back_to_probe_for_text_only(monkeypatch, tmp_path):
+def test_adapter_is_vl_warmstart_falls_back_to_probe_when_keys_are_not_vl(monkeypatch, tmp_path):
     from flash.engine.worker import lora
 
     adir = tmp_path / "adapter"

@@ -429,7 +429,7 @@ def decode_output(output) -> dict:
         try:
             output = json.loads(output)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"unexpected job output: {output[:200]}") from exc
+            raise RuntimeError(f"unexpected job output tail: {output[-200:]}") from exc
     if not isinstance(output, dict):
         raise RuntimeError(f"unexpected job output type: {type(output)}")
     if "success" in output or "result" in output:
@@ -441,12 +441,12 @@ def decode_output(output) -> dict:
                 raise RuntimeError(f"flash job returned no metrics: {result!r}")
             return result
         err = output.get("error") or "unknown worker error"
-        stdout_tail = (output.get("stdout") or "")[-1500:]
+        stdout_tail = output.get("stdout") or ""
         raise RuntimeError(
             f"Remote execution failed: {err}\n--- worker stdout tail ---\n{stdout_tail}"
         )
     if output.get("error"):
-        stdout_tail = (output.get("stdout") or "")[-1500:]
+        stdout_tail = output.get("stdout") or ""
         msg = f"Remote execution failed: {output['error']}"
         if stdout_tail:
             msg += f"\n--- worker stdout tail ---\n{stdout_tail}"
@@ -546,12 +546,12 @@ def poll_job(
                     detail=detail,
                 )
         if status in TERMINAL_FAIL:
-            detail = str(st.get("error") or "")[:1500]
+            detail = str(st.get("error") or "")[-1500:]
             out = st.get("output")
             if isinstance(out, dict) and out.get("stdout"):
-                detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])[-2000:]
+                detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])
             elif not detail:
-                detail = str(out)[:1500]
+                detail = str(out)[-1500:]
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
             last_hb_key, retriable, oom = surfaced_worker_flags(
